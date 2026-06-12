@@ -122,12 +122,7 @@ pub async fn show_url(
             (wizard_progress(&wizard, "url").await)
             h2 class="text-lg font-semibold mt-6 mb-4" { "Step 1: Enter URL" }
             (form.form_tag("/bookmarks/add/url", "post", html! {
-                div class="mb-4" {
-                    label for="url" class="block text-sm font-medium text-gray-700 mb-1" {
-                        "URL"
-                    }
-                    (form.text_input("url", "https://example.com"))
-                }
+                (form.text_input("url", "URL"))
                 (form.submit_button("Continue →"))
             }))
         },
@@ -158,12 +153,7 @@ pub async fn submit_url(session: Session, form: ChangesetForm<UrlStep>) -> impl 
                     (wizard_progress(&wizard, "url").await)
                     h2 class="text-lg font-semibold mt-6 mb-4" { "Step 1: Enter URL" }
                     (form.form_tag("/bookmarks/add/url", "post", html! {
-                        div class="mb-4" {
-                            label for="url" class="block text-sm font-medium text-gray-700 mb-1" {
-                                "URL"
-                            }
-                            (form.text_input("url", "https://example.com"))
-                        }
+                        (form.text_input("url", "URL"))
                         (form.submit_button("Continue →"))
                     }))
                 },
@@ -194,19 +184,9 @@ pub async fn show_details(
             (wizard_progress(&wizard, "details").await)
             h2 class="text-lg font-semibold mt-6 mb-4" { "Step 2: Add Details" }
             (form.form_tag("/bookmarks/add/details", "post", html! {
-                div class="mb-4" {
-                    label for="title" class="block text-sm font-medium text-gray-700 mb-1" {
-                        "Title"
-                    }
-                    (form.text_input("title", "Page title"))
-                }
-                div class="mb-6" {
-                    label for="tag" class="block text-sm font-medium text-gray-700 mb-1" {
-                        "Tag"
-                    }
-                    (form.text_input("tag", "e.g. rust, tools, reading"))
-                }
-                div class="flex gap-3" {
+                (form.text_input("title", "Title"))
+                (form.text_input("tag", "Tag"))
+                div class="flex gap-3 mt-4" {
                     a href="/bookmarks/add/url"
                       class="px-4 py-2 border border-gray-300 rounded text-sm" {
                         "← Back"
@@ -245,19 +225,9 @@ pub async fn submit_details(
                     (wizard_progress(&wizard, "details").await)
                     h2 class="text-lg font-semibold mt-6 mb-4" { "Step 2: Add Details" }
                     (form.form_tag("/bookmarks/add/details", "post", html! {
-                        div class="mb-4" {
-                            label for="title" class="block text-sm font-medium text-gray-700 mb-1" {
-                                "Title"
-                            }
-                            (form.text_input("title", "Page title"))
-                        }
-                        div class="mb-6" {
-                            label for="tag" class="block text-sm font-medium text-gray-700 mb-1" {
-                                "Tag"
-                            }
-                            (form.text_input("tag", "e.g. rust, tools, reading"))
-                        }
-                        div class="flex gap-3" {
+                        (form.text_input("title", "Title"))
+                        (form.text_input("tag", "Tag"))
+                        div class="flex gap-3 mt-4" {
                             a href="/bookmarks/add/url"
                               class="px-4 py-2 border border-gray-300 rounded text-sm" {
                                 "← Back"

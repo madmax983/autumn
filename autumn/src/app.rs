@@ -1374,9 +1374,7 @@ impl AppBuilder {
         L: crate::config::ConfigLoader,
     {
         if self.config_loader_factory.is_some() {
-            tracing::warn!(
-                "config loader replaced; the previously-installed loader was overwritten"
-            );
+            tracing::warn!("config loader replaced; the previously-installed loader was overwritten");
         }
         self.config_loader_factory = Some(Box::new(move || {
             Box::pin(async move { loader.load().await })
@@ -1398,9 +1396,7 @@ impl AppBuilder {
         P: crate::db::DatabasePoolProvider,
     {
         if self.pool_provider_factory.is_some() {
-            tracing::warn!(
-                "database pool provider replaced; the previously-installed provider was overwritten"
-            );
+            tracing::warn!("database pool provider replaced; the previously-installed provider was overwritten");
         }
         self.pool_provider_factory =
             Some(Box::new(move |config: crate::config::DatabaseConfig| {
@@ -1421,9 +1417,7 @@ impl AppBuilder {
         T: crate::telemetry::TelemetryProvider,
     {
         if self.telemetry_provider.is_some() {
-            tracing::warn!(
-                "telemetry provider replaced; the previously-installed provider was overwritten"
-            );
+            tracing::warn!("telemetry provider replaced; the previously-installed provider was overwritten");
         }
         self.telemetry_provider = Some(Box::new(provider));
         self
@@ -1441,9 +1435,7 @@ impl AppBuilder {
         S: crate::session::SessionStore,
     {
         if self.session_store.is_some() {
-            tracing::warn!(
-                "session store replaced; the previously-installed store was overwritten"
-            );
+            tracing::warn!("session store replaced; the previously-installed store was overwritten");
         }
         self.session_store = Some(Arc::new(store));
         self
@@ -1462,9 +1454,7 @@ impl AppBuilder {
         B: crate::channels::ChannelsBackend,
     {
         if self.channels_backend.is_some() {
-            tracing::warn!(
-                "channels backend replaced; the previously-installed backend was overwritten"
-            );
+            tracing::warn!("channels backend replaced; the previously-installed backend was overwritten");
         }
         self.channels_backend = Some(Arc::new(backend));
         self
@@ -1537,9 +1527,7 @@ impl AppBuilder {
     #[must_use]
     pub fn with_cache_backend<C: crate::cache::Cache>(mut self, cache: C) -> Self {
         if self.cache_backend.is_some() {
-            tracing::warn!(
-                "cache backend replaced; the previously-installed backend was overwritten"
-            );
+            tracing::warn!("cache backend replaced; the previously-installed backend was overwritten");
         }
         self.cache_backend = Some(Arc::new(cache) as Arc<dyn crate::cache::Cache>);
         self

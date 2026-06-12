@@ -1730,9 +1730,7 @@ pub(crate) fn install_mailer(
             ));
         }
         if !has_durable_queue {
-            tracing::warn!(
-                "mail.deliver_later is using the in-process Tokio fallback in prod; this is acknowledged via mail.allow_in_process_deliver_later_in_production but is not durable across restarts or replicas"
-            );
+            tracing::warn!("mail.deliver_later is using the in-process Tokio fallback in prod; this is acknowledged via mail.allow_in_process_deliver_later_in_production but is not durable across restarts or replicas");
         }
     }
 
