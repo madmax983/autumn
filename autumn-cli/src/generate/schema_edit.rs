@@ -797,10 +797,10 @@ fn add_feature_to_multiline_inline_table(
         .position(|l| l.trim_start().starts_with('}'))
         .map(|p| open_idx + 1 + p)?;
 
-    if lines[open_idx..=close_idx]
-        .iter()
-        .any(|l| l.contains(feature_quoted))
-    {
+    if lines[open_idx..=close_idx].iter().any(|l| {
+        let line_code = l.split_once('#').map_or(*l, |(before, _)| before);
+        line_code.contains(feature_quoted)
+    }) {
         return Some(existing.to_owned());
     }
 
@@ -865,10 +865,10 @@ fn patch_dotted_dep(
         .position(|l| is_toml_table_header(l.trim()))
         .map_or(lines.len(), |p| dep_line_idx + 1 + p);
 
-    if lines[dep_line_idx..section_end]
-        .iter()
-        .any(|l| l.trim_start().starts_with("autumn-web") && l.contains(feature_quoted))
-    {
+    if lines[dep_line_idx..section_end].iter().any(|l| {
+        let line_code = l.split_once('#').map_or(*l, |(before, _)| before);
+        line_code.trim_start().starts_with("autumn-web") && line_code.contains(feature_quoted)
+    }) {
         return existing.to_owned();
     }
 
@@ -1063,10 +1063,10 @@ fn add_feature_to_deps_section(
         })
         .map_or(lines.len(), |p| section_start + p);
 
-    if lines[section_start..section_end]
-        .iter()
-        .any(|l| l.contains(feature_quoted))
-    {
+    if lines[section_start..section_end].iter().any(|l| {
+        let line_code = l.split_once('#').map_or(*l, |(before, _)| before);
+        line_code.contains(feature_quoted)
+    }) {
         return existing.to_owned();
     }
 
@@ -2726,6 +2726,24 @@ async fn main() {\n\
         let cargo = "[package]\nname=\"x\"\n\n[dependencies]\nautumn-web.workspace = true\nautumn-web.features = [\"inbound-mailgun\"]\n";
         let updated = ensure_autumn_web_feature(cargo, "inbound-mailgun");
         assert_eq!(cargo, updated, "already-present feature must be a no-op");
+    }
+
+    #[test]
+    fn ensure_feature_ignores_commented_features() {
+        // commented out in multiline section
+        let cargo_multiline = "[package]\nname=\"x\"\n\n[dependencies.autumn-web]\nversion = \"0.6\"\n# features = [\"inbound-mailgun\"]\n";
+        let updated_multiline = ensure_autumn_web_feature(cargo_multiline, "inbound-mailgun");
+        assert!(updated_multiline.contains("features = [\"inbound-mailgun\"]"));
+
+        // commented out in dotted dependency section
+        let cargo_dotted = "[package]\nname=\"x\"\n\n[dependencies]\nautumn-web.workspace = true\n# autumn-web.features = [\"inbound-mailgun\"]\n";
+        let updated_dotted = ensure_autumn_web_feature(cargo_dotted, "inbound-mailgun");
+        assert!(updated_dotted.contains("autumn-web.features = [\"inbound-mailgun\"]"));
+
+        // commented out in multiline inline table section
+        let cargo_inline = "[package]\nname=\"x\"\n\n[dependencies]\nautumn-web = {\n  version = \"0.6\",\n  # features = [\"inbound-mailgun\"]\n}\n";
+        let updated_inline = ensure_autumn_web_feature(cargo_inline, "inbound-mailgun");
+        assert!(updated_inline.contains("features = [\"inbound-mailgun\"]"));
     }
 
     #[test]

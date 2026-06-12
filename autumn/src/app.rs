@@ -2696,10 +2696,10 @@ impl AppBuilder {
                     .iter()
                     .any(|r| r.method == http::Method::POST && r.path == path)
                     || scoped_groups.iter().any(|g| {
-                        let prefix = g.prefix.trim_end_matches('/');
                         g.routes.iter().any(|r| {
                             r.method == http::Method::POST
-                                && format!("{prefix}{}", r.path) == path.as_str()
+                                && crate::router::join_nested_path(&g.prefix, r.path)
+                                    == path.as_str()
                         })
                     })
                     || nest_routers.iter().any(|(nest_path, _)| {
@@ -2976,18 +2976,19 @@ impl AppBuilder {
         }
 
         if !state.probes().is_shutting_down() {
-            if !tasks.is_empty()
-                && let Err(error) = start_task_scheduler_with_config(
+            if !tasks.is_empty() {
+                let res = start_task_scheduler_with_config(
                     tasks,
                     &state,
                     &server_shutdown,
                     &config.scheduler,
-                )
-            {
-                tracing::error!(error = %error, "scheduled task runtime initialization failed");
-                server_shutdown.cancel();
-                server_task.abort();
-                std::process::exit(1);
+                );
+                if let Err(err) = res {
+                    tracing::error!(error = %err, "scheduled task runtime initialization failed");
+                    server_shutdown.cancel();
+                    server_task.abort();
+                    std::process::exit(1);
+                }
             }
             state.probes().mark_startup_complete();
         }
