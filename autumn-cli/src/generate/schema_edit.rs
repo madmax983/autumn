@@ -750,9 +750,23 @@ fn splice_feature_at(
             if k == close_idx {
                 out.push_str(&new_entry);
                 out.push('\n');
+                out.push_str(l);
+                out.push('\n');
+            } else if k + 1 == close_idx && k > feat_idx {
+                // Ensure the last existing item has a trailing comma before the
+                // new entry is inserted; without it the TOML would be invalid.
+                let content = l.trim_end();
+                if !content.is_empty() && !content.ends_with(',') {
+                    out.push_str(content);
+                    out.push_str(",\n");
+                } else {
+                    out.push_str(l);
+                    out.push('\n');
+                }
+            } else {
+                out.push_str(l);
+                out.push('\n');
             }
-            out.push_str(l);
-            out.push('\n');
         }
     } else {
         for (k, &l) in lines.iter().enumerate() {
