@@ -2578,7 +2578,20 @@ impl AppBuilder {
             )
             .await;
             let seo_router = crate::seo::build_seo_router_from_bodies(robots_body, sitemap_body);
-            merge_routers.push(seo_router);
+            let seo_collision = all_routes
+                .iter()
+                .any(|r| r.path == "/robots.txt" || r.path == "/sitemap.xml")
+                || static_metas
+                    .iter()
+                    .any(|m| m.path == "/robots.txt" || m.path == "/sitemap.xml");
+            if seo_collision {
+                tracing::warn!(
+                    "seo: /robots.txt or /sitemap.xml is already registered by the application; \
+                     skipping automatic SEO routes to prevent a startup panic"
+                );
+            } else {
+                merge_routers.push(seo_router);
+            }
         }
 
         #[cfg(feature = "inbound-mail")]
@@ -2592,7 +2605,7 @@ impl AppBuilder {
                 // so the application can still start and the conflict is visible.
                 if all_routes
                     .iter()
-                    .any(|r| r.method == http::Method::POST && r.path == path.as_str())
+                    .any(|r| r.method == http::Method::POST && r.path == path)
                     || scoped_groups.iter().any(|g| {
                         g.routes.iter().any(|r| {
                             r.method == http::Method::POST

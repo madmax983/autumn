@@ -2412,16 +2412,20 @@ async fn execute_local_job(
                 // still in flight until it settles). A pending-window key was
                 // released when execution started, so re-acquire it now to
                 // keep duplicates coalescing while the retry waits out its
-                // backoff as a pending job again. Best effort by design: if a
-                // duplicate was legitimately accepted while this job ran, it
-                // owns the key and this retry proceeds without one (see the
-                // pending-window contract in docs/guide/jobs.md).
+                // backoff as a pending job again. If a duplicate was accepted
+                // while this job ran it now owns the key; in that case drop
+                // the retry (coalesce into the duplicate) rather than letting
+                // both run unprotected.
                 if let Some(unique) = &uniqueness
                     && unique.window == JobUniquenessWindow::Pending
                 {
                     let key = job_unique_key(unique, &job.payload);
-                    let _ =
-                        coordination.try_acquire_unique(&job.name, &key, &job.id, unique.window);
+                    if !coordination.try_acquire_unique(&job.name, &key, &job.id, unique.window) {
+                        state.job_registry.record_deduplicated(&job.name);
+                        job_admin.record_deduplicated(&job.id);
+                        finish_local_slot(coordination, concurrency_group.as_ref(), tx, state);
+                        return;
+                    }
                 }
                 state
                     .job_registry
@@ -3571,11 +3575,15 @@ if ARGV[4] == 'success' then
   redis.call('LTRIM', KEYS[5], 0, tonumber(ARGV[7]) - 1)
   redis.call('DEL', key)
 elseif ARGV[4] == 'retry' then
+  if ARGV[10] == 'pending' then
+    if not redis.call('SET', KEYS[7], ARGV[1], 'NX', 'PX', tonumber(ARGV[11])) then
+      redis.call('DEL', key)
+      return 1
+    end
+  end
   redis.call('SET', key, ARGV[5])
   redis.call('ZADD', KEYS[3], ARGV[6], ARGV[1])
-  if ARGV[10] == 'pending' then
-    redis.call('SET', KEYS[7], ARGV[1], 'NX', 'PX', tonumber(ARGV[11]))
-  elseif ARGV[10] == 'running' then
+  if ARGV[10] == 'running' then
     redis.call('PEXPIRE', KEYS[7], tonumber(ARGV[11]))
   end
 elseif ARGV[4] == 'dead' then
@@ -3758,11 +3766,15 @@ if ARGV[7] == '1' and redis.call('GET', KEYS[6]) == ARGV[1] then
   redis.call('DEL', KEYS[6])
 end
 if ARGV[4] == 'requeue' then
+  if ARGV[9] == 'pending' then
+    if not redis.call('SET', KEYS[6], ARGV[1], 'NX', 'PX', tonumber(ARGV[10])) then
+      redis.call('DEL', key)
+      return 1
+    end
+  end
   redis.call('SET', key, ARGV[5])
   redis.call('LPUSH', KEYS[3], ARGV[1])
-  if ARGV[9] == 'pending' then
-    redis.call('SET', KEYS[6], ARGV[1], 'NX', 'PX', tonumber(ARGV[10]))
-  elseif ARGV[9] == 'running' then
+  if ARGV[9] == 'running' then
     redis.call('PEXPIRE', KEYS[6], tonumber(ARGV[10]))
   end
 elseif ARGV[4] == 'dead' then
@@ -4671,12 +4683,16 @@ async fn pg_insert_job(
 ) -> AutumnResult<EnqueueOutcome> {
     use diesel_async::RunQueryDsl as _;
 
+    // For TTL-window jobs we check ONLY the time window so a long-running job
+    // that outlives its TTL does not block replacement enqueues.  For all other
+    // windows (pending, running) we check status instead.
     const DEDUP_GUARD: &str = "($6::TEXT IS NULL OR NOT EXISTS ( \
            SELECT 1 FROM autumn_jobs dup \
            WHERE dup.name = $2 AND dup.unique_key = $6 \
-             AND (dup.status IN ('enqueued', 'running') \
-                  OR ($8::BIGINT IS NOT NULL \
-                      AND dup.enqueued_at > NOW() - ($8 * INTERVAL '1 millisecond'))) \
+             AND CASE WHEN $8::BIGINT IS NOT NULL \
+                      THEN dup.enqueued_at > NOW() - ($8::BIGINT * INTERVAL '1 millisecond') \
+                      ELSE dup.status IN ('enqueued', 'running') \
+                 END \
          ))";
     const UNIQUE_CONFLICT: &str = "ON CONFLICT (name, unique_key) \
          WHERE unique_key IS NOT NULL AND status IN ('enqueued', 'running') DO NOTHING";
@@ -4701,6 +4717,26 @@ async fn pg_insert_job(
     } else {
         None
     };
+
+    // For TTL-window jobs, evict any expired unique holds before the INSERT.
+    // Without this, a long-running job whose TTL has elapsed would still occupy
+    // the partial unique index (idx_autumn_jobs_unique_inflight) and cause the
+    // ON CONFLICT DO NOTHING to silently drop a legitimate replacement enqueue.
+    if let (Some(ttl), Some(key)) = (unique_ttl_ms, &constraints.unique_key) {
+        let _ = diesel::sql_query(
+            "UPDATE autumn_jobs \
+             SET unique_key = NULL \
+             WHERE name = $1 AND unique_key = $2 \
+               AND unique_window = 'ttl' \
+               AND enqueued_at <= NOW() - ($3::BIGINT * INTERVAL '1 millisecond') \
+               AND status IN ('enqueued', 'running')",
+        )
+        .bind::<diesel::sql_types::Text, _>(name)
+        .bind::<diesel::sql_types::Text, _>(key.as_str())
+        .bind::<diesel::sql_types::BigInt, _>(ttl)
+        .execute(conn)
+        .await;
+    }
 
     #[cfg(not(feature = "telemetry-otlp"))]
     let query = diesel::sql_query(format!(
@@ -4830,6 +4866,7 @@ fn pg_claim_sql() -> String {
     format!(
         "UPDATE autumn_jobs \
          SET status = 'running', started_at = NOW(), claimed_by = $1, claimed_at = NOW(), \
+             pending_unique_key = CASE WHEN unique_window = 'pending' THEN unique_key ELSE NULL END, \
              unique_key = CASE WHEN unique_window = 'pending' THEN NULL ELSE unique_key END \
          WHERE id = ( \
            SELECT candidate.id FROM autumn_jobs candidate \
@@ -4981,6 +5018,13 @@ async fn pg_nack_failure(
 
     if row.attempt < row.max_attempts {
         let delay_ms = pg_retry_delay_ms(row.initial_backoff_ms, row.attempt);
+        // Re-enqueue and restore the pending-window unique key atomically in one
+        // UPDATE to eliminate the window where status='enqueued' and
+        // unique_key=NULL co-exist, which would let a concurrent enqueue bypass
+        // the dedup index.  The CASE subquery checks for an already-committed
+        // duplicate; pending-window jobs keep NULL if a duplicate won the race,
+        // while running/ttl-window jobs keep their existing key (unique_key was
+        // never cleared at claim time, so $5 is NULL and the ELSE branch applies).
         let applied = diesel::sql_query(
             "UPDATE autumn_jobs \
              SET status = 'enqueued', \
@@ -4990,39 +5034,31 @@ async fn pg_nack_failure(
                  finished_at = NULL, \
                  claimed_by = NULL, \
                  claimed_at = NULL, \
-                 last_error = $2 \
+                 last_error = $2, \
+                 unique_key = CASE \
+                   WHEN $5::TEXT IS NOT NULL \
+                        AND NOT EXISTS ( \
+                            SELECT 1 FROM autumn_jobs dup \
+                            WHERE dup.name = autumn_jobs.name \
+                              AND dup.unique_key = $5::TEXT \
+                              AND dup.id != autumn_jobs.id \
+                              AND dup.status IN ('enqueued', 'running') \
+                        ) \
+                   THEN $5::TEXT \
+                   ELSE unique_key \
+                   END, \
+                 pending_unique_key = NULL \
              WHERE id = $3 AND claimed_by = $4 AND status = 'running'",
         )
         .bind::<diesel::sql_types::BigInt, _>(delay_ms)
         .bind::<diesel::sql_types::Text, _>(error)
         .bind::<diesel::sql_types::Text, _>(job_id)
         .bind::<diesel::sql_types::Text, _>(worker_id)
+        .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(pending_unique_key)
         .execute(&mut *conn)
         .await
         .map(pg_claim_transition_applied)
         .map_err(|e| AutumnError::internal_server_error_msg(format!("pg job retry failed: {e}")))?;
-
-        // A pending-window unique key was cleared when the job was claimed.
-        // The retried row is pending again, so restore the key best-effort:
-        // if a duplicate was accepted in the meantime, the partial unique
-        // index rejects this UPDATE and the retry simply runs without the key.
-        if applied && let Some(key) = pending_unique_key {
-            let restored = diesel::sql_query(
-                "UPDATE autumn_jobs SET unique_key = $1 \
-                 WHERE id = $2 AND status = 'enqueued'",
-            )
-            .bind::<diesel::sql_types::Text, _>(key)
-            .bind::<diesel::sql_types::Text, _>(job_id)
-            .execute(&mut *conn)
-            .await;
-            if let Err(error) = restored {
-                tracing::debug!(
-                    job_id = %job_id,
-                    error = %error,
-                    "pending unique key not restored on retry (duplicate already in flight)"
-                );
-            }
-        }
         Ok(applied)
     } else {
         diesel::sql_query(
@@ -5093,6 +5129,10 @@ async fn pg_recover_stale_claims(pool: &PgPool, visibility_timeout_ms: u64) {
         tracing::warn!("postgres stale-claim recovery could not acquire connection");
         return;
     };
+    // Restore pending-window unique keys atomically with the status change so
+    // there is no window where status='enqueued' and unique_key=NULL co-exist.
+    // The CASE subquery checks for already-committed duplicates; if one exists
+    // the key stays NULL (best-effort, same behaviour as pg_nack_failure).
     let _ = diesel::sql_query(
         "UPDATE autumn_jobs \
          SET \
@@ -5115,7 +5155,25 @@ async fn pg_recover_stale_claims(pool: &PgPool, visibility_timeout_ms: u64) {
            END, \
            claimed_by = NULL, \
            claimed_at = NULL, \
-           last_error = 'visibility timeout expired' \
+           last_error = 'visibility timeout expired', \
+           unique_key = CASE \
+             WHEN attempt < max_attempts \
+                  AND pending_unique_key IS NOT NULL \
+                  AND NOT EXISTS ( \
+                    SELECT 1 FROM autumn_jobs dup \
+                    WHERE dup.unique_key = autumn_jobs.pending_unique_key \
+                      AND dup.name = autumn_jobs.name \
+                      AND dup.id != autumn_jobs.id \
+                      AND dup.status IN ('enqueued', 'running') \
+                  ) \
+             THEN pending_unique_key \
+             ELSE unique_key \
+           END, \
+           pending_unique_key = CASE \
+             WHEN attempt < max_attempts AND pending_unique_key IS NOT NULL \
+             THEN NULL \
+             ELSE pending_unique_key \
+           END \
          WHERE id IN ( \
            SELECT id FROM autumn_jobs \
            WHERE status = 'running' \

@@ -806,7 +806,7 @@ fn emit_state_machine_impl(model_name: &syn::Ident, spec: &StateMachineSpec) -> 
             ///
             /// For guarded transitions the corresponding guard method is called first.
             pub fn #can_fn(&self, target: &str) -> bool {
-                match (self.#field.as_str(), target) {
+                match (&*self.#field, target) {
                     #(#match_arms,)*
                     _ => false,
                 }

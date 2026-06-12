@@ -1,10 +1,15 @@
-//! Repository error types for framework-generated CRUD operations.
+//! Repository support types for framework-generated CRUD operations.
 //!
-//! Framework-generated repositories use the [`Db`](crate::Db) extractor, which
-//! is bound to the primary/write database role. If an application wants a
-//! primary/replica read split, use an explicit repository seam and route reads
-//! through [`crate::AppState::read_pool`] while keeping writes on
-//! [`crate::AppState::pool`].
+//! Generated `#[repository]` read-only methods (`find_by_id`, `find_all`,
+//! `count`, `paginate`, `cursor_page`, derived `find_by_*`, full-text-search
+//! reads) route to the configured read replica automatically: set
+//! `database.replica_url` and the extractor snapshots a [`ReadRoute`] per
+//! request via [`crate::AppState::read_pool`]. Mutating methods (`save`,
+//! `update`, `delete_by_id`, bulk writes) always run on the primary pool.
+//! Pin a read-after-write-sensitive repository to the primary with
+//! `#[repository(Model, primary_reads)]`, or pin a single call chain with
+//! the generated `on_primary()` method. When no replica is configured, all
+//! methods use the primary — nothing changes for single-pool apps.
 //!
 //! [`RepositoryError`] surfaces typed errors that arise during repository
 //! operations — most notably optimistic-lock conflicts when two replicas
@@ -12,6 +17,65 @@
 
 use sha2::{Digest, Sha256};
 use thiserror::Error;
+
+/// Where a generated repository routes its read-only methods (`find_by_id`,
+/// `find_all`, `count`, `paginate`, `cursor_page`, derived `find_by_*`,
+/// full-text-search reads, …).
+///
+/// The route is snapshotted from [`crate::AppState`] when the repository is
+/// extracted, so every read within a request sees one consistent decision.
+/// Mutating methods (`save`, `update`, `delete_by_id`, bulk writes) always
+/// use the primary pool regardless of this route, as do pessimistic-lock
+/// reads (`with_lock`) and reads running on an explicit transaction
+/// connection.
+#[cfg(feature = "db")]
+#[derive(Clone)]
+pub enum ReadRoute {
+    /// Reads use the primary/write pool: no replica is configured, the
+    /// repository was declared with `#[repository(..., primary_reads)]`, or
+    /// the caller pinned this instance with `on_primary()`.
+    Primary,
+    /// Reads use this read-role pool snapshot — the replica when healthy,
+    /// or the primary when the replica is unready and the
+    /// [`ReplicaFallback::Primary`](crate::config::ReplicaFallback) policy
+    /// applies.
+    ReadPool(diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>),
+    /// A replica is configured but currently unready, and the
+    /// [`ReplicaFallback::FailReadiness`](crate::config::ReplicaFallback)
+    /// policy forbids falling back to the primary. Generated reads fail
+    /// fast with `503 Service Unavailable` instead of silently serving
+    /// from the wrong role.
+    Unavailable,
+}
+
+#[cfg(feature = "db")]
+impl ReadRoute {
+    /// Snapshot the read-routing decision for one request from the app
+    /// state, mirroring [`crate::AppState::read_pool`] semantics.
+    #[must_use]
+    pub fn from_state(state: &crate::AppState) -> Self {
+        if state.replica_pool().is_some() {
+            state
+                .read_pool()
+                .map_or(Self::Unavailable, |pool| Self::ReadPool(pool.clone()))
+        } else {
+            Self::Primary
+        }
+    }
+}
+
+#[cfg(feature = "db")]
+impl std::fmt::Debug for ReadRoute {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Primary => f.write_str("ReadRoute::Primary"),
+            Self::ReadPool(pool) => {
+                write!(f, "ReadRoute::ReadPool(max={})", pool.status().max_size)
+            }
+            Self::Unavailable => f.write_str("ReadRoute::Unavailable"),
+        }
+    }
+}
 
 /// Typed errors returned by generated repository methods.
 ///

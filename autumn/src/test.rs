@@ -1098,7 +1098,7 @@ impl TestApp {
                 if self
                     .routes
                     .iter()
-                    .any(|r| r.method == Method::POST && r.path == path.as_str())
+                    .any(|r| r.method == Method::POST && r.path == path)
                     || self.scoped_groups.iter().any(|g| {
                         g.routes.iter().any(|r| {
                             r.method == Method::POST
