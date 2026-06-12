@@ -223,6 +223,34 @@ fn disable_maintenance_after_migrate() {
 /// Apply app + framework migrations to one database. Returns whether
 /// everything succeeded; the caller decides how to fail.
 fn run_single_target(database_url: &str, migrations_dir: &str) -> bool {
+    use autumn_web::migrate::{DEFAULT_LOCK_WAIT_TIMEOUT, hold_migration_lock};
+
+    // Acquire this target database's Postgres advisory lock before reading
+    // the pending-migration list. This serializes concurrent callers
+    // (rolling-deploy replicas or parallel `autumn migrate run`
+    // invocations): only one process runs migrations against a given
+    // database at a time; the rest wait and then find no pending work.
+    // The lock is released when `_lock_guard` drops (end of this function
+    // or process exit — both are safe because PostgreSQL releases
+    // session-level advisory locks on connection close).
+    //
+    // Known limitation: the advisory lock lives on the parent process's
+    // connection, not inside the child `diesel` subprocess. If the parent is
+    // killed (SIGKILL or SIGTERM) while the child is still running, Postgres
+    // releases the session lock and a second caller can acquire it before the
+    // child finishes. SIGKILL is not fixable at the Rust level (no destructors
+    // run); for SIGTERM a kill-on-drop child guard would close the window but
+    // could abort an in-progress transaction. In practice most orchestrators
+    // kill the whole cgroup, and Postgres's transaction isolation prevents
+    // concurrent dirty writes either way.
+    let _lock_guard = match hold_migration_lock(database_url, DEFAULT_LOCK_WAIT_TIMEOUT) {
+        Ok(guard) => guard,
+        Err(e) => {
+            eprintln!("\u{274C} Failed to acquire migration lock: {e}");
+            return false;
+        }
+    };
+
     eprintln!("  Running pending migrations...\n");
     let dir = std::path::Path::new(migrations_dir);
     let status = Command::new("diesel")
@@ -648,6 +676,38 @@ fn show_diesel_migration_status(database_url: &str, migrations_dir: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Advisory-lock API accessibility ───────────────────────────────────
+
+    #[test]
+    fn migration_lock_key_exported_from_autumn_web() {
+        let key = autumn_web::migrate::MIGRATION_ADVISORY_LOCK_KEY;
+        assert!(key > 0, "lock key must be a positive i64");
+    }
+
+    #[test]
+    fn default_lock_wait_timeout_is_sixty_seconds() {
+        let timeout = autumn_web::migrate::DEFAULT_LOCK_WAIT_TIMEOUT;
+        assert_eq!(timeout.as_secs(), 60);
+    }
+
+    #[test]
+    fn hold_migration_lock_returns_connection_error_on_bad_url() {
+        let result = autumn_web::migrate::hold_migration_lock(
+            "postgres://invalid_user:invalid_password@0.0.0.0:1/invalid_db",
+            std::time::Duration::from_secs(1),
+        );
+        assert!(result.is_err());
+        assert!(
+            matches!(
+                result.unwrap_err(),
+                autumn_web::migrate::MigrationError::Connection(_)
+            ),
+            "unreachable host must produce Connection error"
+        );
+    }
+
+    // ── Existing tests ────────────────────────────────────────────────────
 
     #[test]
     fn migrate_action_eq() {

@@ -2667,12 +2667,15 @@ impl AppBuilder {
             )
             .await;
             let seo_router = crate::seo::build_seo_router_from_bodies(robots_body, sitemap_body);
-            let seo_collision = all_routes
-                .iter()
-                .any(|r| r.path == "/robots.txt" || r.path == "/sitemap.xml")
-                || static_metas
-                    .iter()
-                    .any(|m| m.path == "/robots.txt" || m.path == "/sitemap.xml");
+            let is_seo_path = |p: &str| p == "/robots.txt" || p == "/sitemap.xml";
+            let seo_collision = all_routes.iter().any(|r| is_seo_path(r.path))
+                || static_metas.iter().any(|m| is_seo_path(m.path))
+                || scoped_groups.iter().any(|g| {
+                    let prefix = g.prefix.trim_end_matches('/');
+                    g.routes
+                        .iter()
+                        .any(|r| is_seo_path(&format!("{prefix}{}", r.path)))
+                });
             if seo_collision {
                 tracing::warn!(
                     "seo: /robots.txt or /sitemap.xml is already registered by the application; \
@@ -4973,38 +4976,7 @@ async fn setup_database(
     // `Ok(None)`) — even if `database.url` is configured. Custom providers
     // signal "this app runs without a DB" by returning None; running
     // migrations against the URL anyway would defeat the opt-out.
-    //
-    // Targets run control-first, then shards in declaration order, failing
-    // fast on the first apply error: a half-migrated fleet that boots is
-    // worse than a crashed deploy, and already-migrated targets are
-    // idempotently skipped on retry.
-    if topology.is_some()
-        && let Some(url) = config.database.effective_primary_url()
-    {
-        for mig in &migrations {
-            crate::migrate::auto_migrate(
-                url,
-                config.profile.as_deref(),
-                config.database.auto_migrate_in_production,
-                mig,
-                "control",
-            );
-        }
-    }
-    if shards.is_some() {
-        for shard in &config.database.shards {
-            let target = format!("shard:{}", shard.name);
-            for mig in &migrations {
-                crate::migrate::auto_migrate(
-                    &shard.primary_url,
-                    config.profile.as_deref(),
-                    config.database.auto_migrate_in_production,
-                    mig,
-                    &target,
-                );
-            }
-        }
-    }
+    run_startup_migrations(config, topology.is_some(), shards.is_some(), migrations).await;
 
     let (replica_readiness, replica_migration_check) = if topology
         .as_ref()
@@ -5046,6 +5018,63 @@ async fn setup_database(
 /// (the analogue of `ProbeState`'s control-replica dependency), which
 /// gates that shard's replica reads per its `replica_fallback`.
 #[cfg(feature = "db")]
+/// Apply the embedded migration sets control-first, then to each shard in
+/// declaration order, failing fast on the first apply error: a
+/// half-migrated fleet that boots is worse than a crashed deploy, and
+/// already-migrated targets are idempotently skipped on retry.
+///
+/// `run_pending_locked` polls with `std::thread::sleep` (up to 60 s under
+/// contention), so the whole sequence runs off the Tokio worker threads in
+/// one blocking task that owns the embedded migration sets.
+#[cfg(feature = "db")]
+async fn run_startup_migrations(
+    config: &AutumnConfig,
+    control_configured: bool,
+    shards_configured: bool,
+    migrations: Vec<crate::migrate::EmbeddedMigrations>,
+) {
+    let control_url = if control_configured {
+        config.database.effective_primary_url().map(str::to_owned)
+    } else {
+        None
+    };
+    let shard_targets: Vec<(String, String)> = if shards_configured {
+        config
+            .database
+            .shards
+            .iter()
+            .map(|shard| (format!("shard:{}", shard.name), shard.primary_url.clone()))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let profile = config.profile.clone();
+    let auto_in_prod = config.database.auto_migrate_in_production;
+    tokio::task::spawn_blocking(move || {
+        if let Some(url) = control_url {
+            for mig in &migrations {
+                crate::migrate::auto_migrate(
+                    &url,
+                    profile.as_deref(),
+                    auto_in_prod,
+                    mig,
+                    "control",
+                );
+            }
+        }
+        for (target, url) in &shard_targets {
+            for mig in &migrations {
+                crate::migrate::auto_migrate(url, profile.as_deref(), auto_in_prod, mig, target);
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|e| {
+        tracing::error!(error = %e, "Migration task panicked");
+        std::process::exit(1);
+    });
+}
+
 async fn check_shard_replica_migration_parity(
     config: &AutumnConfig,
     set: &crate::sharding::ShardSet,

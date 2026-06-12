@@ -60,6 +60,55 @@ pub enum MigrationError {
     /// A migration failed to apply.
     #[error("migration failed: {0}")]
     Migration(String),
+
+    /// The migration advisory lock could not be acquired within the timeout.
+    ///
+    /// Another process is likely running migrations. Increase `wait_timeout`
+    /// or investigate the blocking session in `pg_locks`.
+    #[error(
+        "migration advisory lock not acquired within {timeout_secs}s; \
+         another process may still be running migrations"
+    )]
+    LockTimeout {
+        /// Configured wait timeout in seconds.
+        timeout_secs: u64,
+    },
+}
+
+/// `PostgreSQL` advisory lock key used to serialize concurrent migration runs.
+///
+/// Derived from the big-endian encoding of the ASCII bytes `autn_mig` (`i64`).
+/// The value is stable across framework versions so operators can monitor
+/// contention without consulting source code.
+///
+/// Monitor contention with:
+///
+/// ```sql
+/// SELECT pid, granted, mode
+/// FROM pg_locks
+/// WHERE locktype = 'advisory'
+///   AND classid = 1635087470
+///   AND objid   = 1601005927
+///   AND objsubid = 1;
+/// ```
+pub const MIGRATION_ADVISORY_LOCK_KEY: i64 = 0x6175_746E_5F6D_6967_u64.cast_signed();
+
+/// Default time to wait for the migration advisory lock before failing.
+///
+/// Override per call via the `wait_timeout` parameter of [`run_pending_locked`]
+/// or [`hold_migration_lock`].
+pub const DEFAULT_LOCK_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+#[derive(diesel::QueryableByName)]
+struct AdvisoryLockRow {
+    #[diesel(sql_type = diesel::sql_types::Bool)]
+    acquired: bool,
+}
+
+#[derive(diesel::QueryableByName)]
+struct AdvisoryUnlockRow {
+    #[diesel(sql_type = diesel::sql_types::Bool)]
+    released: bool,
 }
 
 #[derive(diesel::QueryableByName)]
@@ -242,6 +291,194 @@ pub(crate) async fn check_replica_migration_readiness_blocking(
     })
 }
 
+/// Acquire the `PostgreSQL` session-level advisory lock that serializes migration runs.
+///
+/// Polls `pg_try_advisory_lock` at 500 ms intervals until the lock is
+/// acquired or `timeout` elapses. Logs at `INFO` on acquisition and `DEBUG`
+/// while waiting.
+///
+/// **Non-`PostgreSQL` note:** advisory locks are a `PostgreSQL`-specific primitive.
+/// `SQLite` and in-memory test harnesses do not support them. Those backends are
+/// single-process by nature; `run_pending` (the unlocked variant) is the right
+/// choice there.
+///
+/// # Errors
+///
+/// Returns [`MigrationError::Migration`] if the database query fails, or
+/// [`MigrationError::LockTimeout`] if the lock is not acquired within `timeout`.
+pub fn acquire_migration_lock(
+    conn: &mut diesel::PgConnection,
+    timeout: std::time::Duration,
+) -> Result<(), MigrationError> {
+    let start = std::time::Instant::now();
+    let poll = std::time::Duration::from_millis(500);
+
+    tracing::info!(
+        lock_key = MIGRATION_ADVISORY_LOCK_KEY,
+        timeout_secs = timeout.as_secs(),
+        "Acquiring migration advisory lock",
+    );
+
+    loop {
+        let acquired = diesel::sql_query("SELECT pg_try_advisory_lock($1) AS acquired")
+            .bind::<diesel::sql_types::BigInt, _>(MIGRATION_ADVISORY_LOCK_KEY)
+            .get_result::<AdvisoryLockRow>(conn)
+            .map_err(|e| MigrationError::Migration(e.to_string()))?
+            .acquired;
+
+        if acquired {
+            tracing::info!("Migration advisory lock acquired");
+            return Ok(());
+        }
+
+        let elapsed = start.elapsed();
+        if elapsed >= timeout {
+            return Err(MigrationError::LockTimeout {
+                timeout_secs: timeout.as_secs(),
+            });
+        }
+
+        tracing::debug!(
+            elapsed_secs = elapsed.as_secs(),
+            timeout_secs = timeout.as_secs(),
+            "Waiting for migration advisory lock; another process may be running migrations",
+        );
+
+        std::thread::sleep(poll.min(timeout.saturating_sub(elapsed)));
+    }
+}
+
+/// Release the `PostgreSQL` session-level advisory lock acquired by
+/// [`acquire_migration_lock`].
+///
+/// Called automatically by [`MigrationLockGuard`] on drop. Logs at `INFO` on
+/// success and `WARN` if the lock was not held or the query fails. `PostgreSQL`
+/// also releases session-level advisory locks automatically when the connection
+/// closes, so a missed explicit release is safe.
+pub fn release_migration_lock(conn: &mut diesel::PgConnection) {
+    match diesel::sql_query("SELECT pg_advisory_unlock($1) AS released")
+        .bind::<diesel::sql_types::BigInt, _>(MIGRATION_ADVISORY_LOCK_KEY)
+        .get_result::<AdvisoryUnlockRow>(conn)
+    {
+        Ok(row) if row.released => {
+            tracing::info!("Migration advisory lock released");
+        }
+        Ok(_) => {
+            tracing::warn!("Migration advisory unlock returned false: lock was not held");
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "Failed to release migration advisory lock");
+        }
+    }
+}
+
+/// RAII guard that holds a `PostgreSQL` advisory lock for the duration of a
+/// migration run.
+///
+/// Created by [`hold_migration_lock`]. The lock is released when this guard
+/// drops, or automatically when the underlying connection closes on process
+/// exit (so `std::process::exit` is safe).
+///
+/// # Non-`PostgreSQL` backends
+///
+/// `SQLite` and in-memory test harnesses do not support advisory locks and do
+/// not need cross-process serialization (they are single-process by nature).
+/// Skip this guard when running against those backends.
+pub struct MigrationLockGuard {
+    conn: diesel::PgConnection,
+}
+
+impl std::fmt::Debug for MigrationLockGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MigrationLockGuard").finish_non_exhaustive()
+    }
+}
+
+impl Drop for MigrationLockGuard {
+    fn drop(&mut self) {
+        release_migration_lock(&mut self.conn);
+    }
+}
+
+/// Open a new Postgres connection and acquire the migration advisory lock,
+/// returning a [`MigrationLockGuard`] that releases it on drop.
+///
+/// This is the right primitive when migrations are run by an external process
+/// (e.g. the `diesel` CLI subprocess in `autumn migrate run`): the guard keeps
+/// the lock connection alive for the duration of the external run.
+///
+/// Use [`run_pending_locked`] when the Rust harness runs migrations directly.
+///
+/// # Errors
+///
+/// Returns [`MigrationError::Connection`] if the database is unreachable, or
+/// [`MigrationError::LockTimeout`] if the lock cannot be acquired within
+/// `wait_timeout`.
+pub fn hold_migration_lock(
+    database_url: &str,
+    wait_timeout: std::time::Duration,
+) -> Result<MigrationLockGuard, MigrationError> {
+    let mut conn = diesel::PgConnection::establish(database_url)
+        .map_err(|e| MigrationError::Connection(e.to_string()))?;
+
+    acquire_migration_lock(&mut conn, wait_timeout)?;
+
+    Ok(MigrationLockGuard { conn })
+}
+
+/// Run all pending migrations under a Postgres advisory lock.
+///
+/// Serializes concurrent migration attempts across processes: exactly one
+/// process applies pending migrations while the rest wait, find no pending
+/// work, and return a [`MigrationResult`] with an empty `applied` list.
+///
+/// The lock is acquired **before** the pending-migration list is read,
+/// closing the check-then-apply race. It is released after the harness
+/// commits or rolls back all migrations.
+///
+/// Pass `wait_timeout = None` to use [`DEFAULT_LOCK_WAIT_TIMEOUT`] (60 s).
+///
+/// # Non-`PostgreSQL` note
+///
+/// Advisory locks are `PostgreSQL`-specific. For `SQLite` or in-memory test
+/// harnesses call [`run_pending`] directly — those backends are single-process
+/// and do not require cross-process serialization.
+///
+/// # Errors
+///
+/// Returns [`MigrationError::Connection`] if the database is unreachable,
+/// [`MigrationError::LockTimeout`] if the advisory lock cannot be acquired
+/// within `wait_timeout`, or [`MigrationError::Migration`] if a migration
+/// fails to apply.
+pub fn run_pending_locked(
+    database_url: &str,
+    migrations: impl diesel::migration::MigrationSource<diesel::pg::Pg>,
+    wait_timeout: Option<std::time::Duration>,
+) -> Result<MigrationResult, MigrationError> {
+    let timeout = wait_timeout.unwrap_or(DEFAULT_LOCK_WAIT_TIMEOUT);
+
+    let mut conn = diesel::PgConnection::establish(database_url)
+        .map_err(|e| MigrationError::Connection(e.to_string()))?;
+
+    acquire_migration_lock(&mut conn, timeout)?;
+
+    // Collect migration names eagerly so the harness borrow on `conn` is
+    // dropped before we call release_migration_lock on the same connection.
+    let migration_result: Result<Vec<String>, MigrationError> = {
+        let mut harness = HarnessWithOutput::write_to_stdout(&mut conn);
+        harness
+            .run_pending_migrations(migrations)
+            .map(|applied| applied.iter().map(|m| format!("{m}")).collect())
+            .map_err(|e| MigrationError::Migration(e.to_string()))
+    };
+
+    release_migration_lock(&mut conn);
+
+    Ok(MigrationResult {
+        applied: migration_result?,
+    })
+}
+
 fn should_auto_apply(profile: Option<&str>, allow_auto_migrate_in_production: bool) -> bool {
     let profile_name = profile.unwrap_or("none");
     matches!(profile_name, "dev" | "development")
@@ -286,7 +523,7 @@ pub(crate) fn auto_migrate(
                 "Production auto-migration is enabled; running pending database migrations"
             );
         }
-        match run_pending(database_url, EmbeddedMigrationsRef(migrations)) {
+        match run_pending_locked(database_url, EmbeddedMigrationsRef(migrations), None) {
             Ok(result) if result.applied.is_empty() => {
                 tracing::info!(target = %target, "No pending migrations");
             }
@@ -341,6 +578,111 @@ pub(crate) fn auto_migrate(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Red-phase tests for advisory-lock API (fail until implemented) ─────
+
+    #[test]
+    fn lock_timeout_error_display() {
+        let err = MigrationError::LockTimeout { timeout_secs: 60 };
+        let msg = err.to_string();
+        assert!(msg.contains("60"), "message must contain the timeout value");
+        assert!(
+            msg.to_lowercase().contains("lock") || msg.to_lowercase().contains("timeout"),
+            "message must mention lock or timeout: {msg}"
+        );
+    }
+
+    #[test]
+    fn migration_advisory_lock_key_is_positive_and_stable() {
+        const { assert!(MIGRATION_ADVISORY_LOCK_KEY > 0) };
+        // Exact value is part of the public API; it must not drift across versions.
+        assert_eq!(
+            MIGRATION_ADVISORY_LOCK_KEY,
+            0x6175_746E_5F6D_6967_u64.cast_signed()
+        );
+    }
+
+    #[test]
+    fn default_lock_wait_timeout_is_sixty_seconds() {
+        assert_eq!(DEFAULT_LOCK_WAIT_TIMEOUT.as_secs(), 60);
+    }
+
+    #[test]
+    fn run_pending_locked_fails_with_connection_error_on_bad_url() {
+        const MIGRATIONS: EmbeddedMigrations =
+            diesel_migrations::embed_migrations!("../examples/todo-app/migrations");
+        let url = "postgres://invalid_user:invalid_password@0.0.0.0:1/invalid_db";
+        let result = run_pending_locked(url, MIGRATIONS, None);
+        assert!(result.is_err());
+        assert!(
+            matches!(result.unwrap_err(), MigrationError::Connection(_)),
+            "unreachable host must produce Connection error, not LockTimeout"
+        );
+    }
+
+    /// Spawns 4 concurrent migration runners against a real Postgres container
+    /// and asserts that exactly one applies the pending migrations while the
+    /// rest find no pending work and exit successfully.
+    #[cfg(feature = "test-support")]
+    #[tokio::test]
+    #[ignore = "requires Docker (testcontainers)"]
+    async fn four_concurrent_runners_serialize_and_exactly_one_applies() {
+        use testcontainers::runners::AsyncRunner as _;
+        use testcontainers_modules::postgres::Postgres;
+
+        const TEST_MIGRATIONS: EmbeddedMigrations =
+            diesel_migrations::embed_migrations!("../examples/todo-app/migrations");
+
+        let container = Postgres::default()
+            .start()
+            .await
+            .expect("failed to start Postgres testcontainer (is Docker running?)");
+
+        let host = container.get_host().await.unwrap();
+        let port = container.get_host_port_ipv4(5432).await.unwrap();
+        let url = format!("postgres://postgres:postgres@{host}:{port}/postgres");
+
+        let handles: Vec<_> = (0..4)
+            .map(|_| {
+                let url = url.clone();
+                tokio::task::spawn_blocking(move || run_pending_locked(&url, TEST_MIGRATIONS, None))
+            })
+            .collect();
+
+        let mut results = Vec::new();
+        for handle in handles {
+            results.push(handle.await.expect("task panicked"));
+        }
+
+        // (c) No runner should produce an error.
+        for result in &results {
+            assert!(
+                result.is_ok(),
+                "runner produced unexpected error: {result:?}"
+            );
+        }
+
+        // (a) Exactly one runner applied migrations.
+        let applied_count = results
+            .iter()
+            .filter(|r| r.as_ref().is_ok_and(|m| !m.applied.is_empty()))
+            .count();
+        assert_eq!(
+            applied_count, 1,
+            "exactly one runner should apply migrations; results={results:?}"
+        );
+
+        // (b) The final schema must include all expected tables.
+        // We verify by checking that a subsequent run finds no pending migrations.
+        let final_check =
+            run_pending_locked(&url, TEST_MIGRATIONS, None).expect("post-run check failed");
+        assert!(
+            final_check.applied.is_empty(),
+            "schema must be fully applied after concurrent run"
+        );
+    }
+
+    // ── Existing tests ─────────────────────────────────────────────────────
 
     #[test]
     fn migration_result_debug() {
@@ -403,5 +745,71 @@ mod tests {
 
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), MigrationError::Connection(_)));
+    }
+
+    #[test]
+    fn replica_migration_readiness_ready_is_ready_and_has_no_detail() {
+        assert!(ReplicaMigrationReadiness::Ready.is_ready());
+        assert_eq!(ReplicaMigrationReadiness::Ready.detail(), None);
+    }
+
+    #[test]
+    fn replica_migration_readiness_unknown_is_not_ready_and_has_detail() {
+        let r = ReplicaMigrationReadiness::Unknown("db error xyz".to_string());
+        assert!(!r.is_ready());
+        let detail = r.detail().expect("Unknown must have detail");
+        assert!(
+            detail.contains("db error xyz"),
+            "detail must contain the error: {detail}"
+        );
+    }
+
+    #[test]
+    fn compare_migration_versions_equal_returns_ready() {
+        let versions = vec!["00000000000001".to_owned(), "00000000000002".to_owned()];
+        let readiness = compare_replica_migration_versions(&versions, &versions.clone());
+        assert!(readiness.is_ready());
+        assert_eq!(readiness.detail(), None);
+    }
+
+    #[test]
+    fn hold_migration_lock_fails_with_connection_error_on_bad_url() {
+        let result = hold_migration_lock(
+            "postgres://invalid_user:invalid_password@0.0.0.0:1/invalid_db",
+            DEFAULT_LOCK_WAIT_TIMEOUT,
+        );
+        assert!(
+            matches!(result.unwrap_err(), MigrationError::Connection(_)),
+            "unreachable host must produce Connection error"
+        );
+    }
+
+    #[test]
+    fn pending_migrations_fails_with_connection_error_on_bad_url() {
+        const MIGRATIONS: EmbeddedMigrations =
+            diesel_migrations::embed_migrations!("../examples/todo-app/migrations");
+        let url = "postgres://invalid_user:invalid_password@0.0.0.0:1/invalid_db";
+        let result = pending_migrations(url, MIGRATIONS);
+        assert!(matches!(result.unwrap_err(), MigrationError::Connection(_)));
+    }
+
+    #[test]
+    fn stale_detail_uses_none_placeholder_when_primary_is_empty() {
+        let empty: Vec<String> = vec![];
+        let replica = vec!["00000000000001".to_owned()];
+        let r = compare_replica_migration_versions(&empty, &replica);
+        assert!(!r.is_ready());
+        let detail = r.detail().expect("stale must have detail");
+        assert!(
+            detail.contains("<none>"),
+            "empty primary must use <none>: {detail}"
+        );
+        assert!(detail.contains("00000000000001"));
+    }
+
+    #[test]
+    fn should_auto_apply_returns_false_for_none_profile() {
+        assert!(!should_auto_apply(None, false));
+        assert!(!should_auto_apply(None, true));
     }
 }
