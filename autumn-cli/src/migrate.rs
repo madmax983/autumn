@@ -94,39 +94,57 @@ pub fn run(action: MigrateAction, with_maintenance: bool, target: &MigrateTarget
 /// Resolve the `(label, database_url)` pairs the command operates on,
 /// in apply order (control first, then shards in declaration order).
 fn resolve_targets(target: &MigrateTarget) -> Vec<(String, String)> {
+    let control = try_resolve_database_url();
     let shards = resolve_shard_database_urls();
-    match target {
-        MigrateTarget::ControlOnly => {
-            vec![("control".to_owned(), resolve_database_url())]
+    match build_targets(control, shards, target) {
+        Ok(targets) => targets,
+        Err(message) => {
+            eprintln!("{message}");
+            if matches!(target, MigrateTarget::All | MigrateTarget::ControlOnly) {
+                // Reuse the standard missing-URL guidance (prints and exits).
+                resolve_database_url();
+            }
+            std::process::exit(1);
         }
+    }
+}
+
+/// Pure target-selection logic behind [`resolve_targets`], separated so
+/// every branch is unit-testable without touching the environment.
+fn build_targets(
+    control: Option<String>,
+    shards: Vec<(String, String)>,
+    target: &MigrateTarget,
+) -> Result<Vec<(String, String)>, String> {
+    match target {
+        MigrateTarget::ControlOnly => control
+            .map(|url| vec![("control".to_owned(), url)])
+            .ok_or_else(|| "\u{2717} No control database URL found.".to_owned()),
         MigrateTarget::Shard(name) => {
             let Some((_, url)) = shards.iter().find(|(shard, _)| shard == name) else {
-                eprintln!("\u{2717} Unknown shard {name:?}.");
-                if shards.is_empty() {
-                    eprintln!(
-                        "  No [[database.shards]] entries found in autumn.toml or environment."
-                    );
+                let detail = if shards.is_empty() {
+                    "No [[database.shards]] entries found in autumn.toml or environment.".to_owned()
                 } else {
                     let known: Vec<&str> = shards.iter().map(|(n, _)| n.as_str()).collect();
-                    eprintln!("  Known shards: {}", known.join(", "));
-                }
-                std::process::exit(1);
+                    format!("Known shards: {}", known.join(", "))
+                };
+                return Err(format!("\u{2717} Unknown shard {name:?}.\n  {detail}"));
             };
-            vec![(format!("shard:{name}"), url.clone())]
+            Ok(vec![(format!("shard:{name}"), url.clone())])
         }
         MigrateTarget::All => {
             // Shard-only deployments (no control role) are a valid shape:
             // include the control target only when a control URL resolves.
             let mut targets = Vec::new();
-            if let Some(control_url) = try_resolve_database_url() {
+            if let Some(control_url) = control {
                 targets.push(("control".to_owned(), control_url));
             } else if shards.is_empty() {
-                resolve_database_url(); // prints the standard guidance and exits
+                return Err("\u{2717} No database URL found.".to_owned());
             }
             for (name, url) in shards {
                 targets.push((format!("shard:{name}"), url));
             }
-            targets
+            Ok(targets)
         }
     }
 }
@@ -899,6 +917,85 @@ replica_url = "postgres://replica:5432/app"
         let url = resolve_primary_database_url_from_sources(env_var, Some(&table)).unwrap();
 
         assert_eq!(url, "postgres://primary:5432/app");
+    }
+
+    // ── build_targets ──────────────────────────────────────────────────────
+
+    fn two_shards() -> Vec<(String, String)> {
+        vec![
+            ("shard0".to_owned(), "postgres://s0/app".to_owned()),
+            ("shard1".to_owned(), "postgres://s1/app".to_owned()),
+        ]
+    }
+
+    #[test]
+    fn build_targets_all_orders_control_first_then_shards() {
+        let targets = build_targets(
+            Some("postgres://control/app".to_owned()),
+            two_shards(),
+            &MigrateTarget::All,
+        )
+        .unwrap();
+
+        let labels: Vec<&str> = targets.iter().map(|(label, _)| label.as_str()).collect();
+        assert_eq!(labels, ["control", "shard:shard0", "shard:shard1"]);
+        assert_eq!(targets[0].1, "postgres://control/app");
+    }
+
+    #[test]
+    fn build_targets_all_supports_shard_only_deployments() {
+        let targets = build_targets(None, two_shards(), &MigrateTarget::All).unwrap();
+        let labels: Vec<&str> = targets.iter().map(|(label, _)| label.as_str()).collect();
+        assert_eq!(labels, ["shard:shard0", "shard:shard1"]);
+    }
+
+    #[test]
+    fn build_targets_all_errors_with_no_databases_at_all() {
+        let error = build_targets(None, Vec::new(), &MigrateTarget::All).unwrap_err();
+        assert!(error.contains("No database URL"));
+    }
+
+    #[test]
+    fn build_targets_control_only_requires_control() {
+        let targets = build_targets(
+            Some("postgres://control/app".to_owned()),
+            two_shards(),
+            &MigrateTarget::ControlOnly,
+        )
+        .unwrap();
+        assert_eq!(
+            targets,
+            vec![("control".to_owned(), "postgres://control/app".to_owned())]
+        );
+
+        let error = build_targets(None, two_shards(), &MigrateTarget::ControlOnly).unwrap_err();
+        assert!(error.contains("control database"));
+    }
+
+    #[test]
+    fn build_targets_selects_single_shard_by_name() {
+        let targets = build_targets(
+            None,
+            two_shards(),
+            &MigrateTarget::Shard("shard1".to_owned()),
+        )
+        .unwrap();
+        assert_eq!(
+            targets,
+            vec![("shard:shard1".to_owned(), "postgres://s1/app".to_owned())]
+        );
+    }
+
+    #[test]
+    fn build_targets_unknown_shard_lists_known_names() {
+        let error = build_targets(None, two_shards(), &MigrateTarget::Shard("nope".to_owned()))
+            .unwrap_err();
+        assert!(error.contains("Unknown shard"));
+        assert!(error.contains("shard0, shard1"));
+
+        let error =
+            build_targets(None, Vec::new(), &MigrateTarget::Shard("nope".to_owned())).unwrap_err();
+        assert!(error.contains("No [[database.shards]] entries"));
     }
 
     // ── resolve_shard_database_urls ────────────────────────────────────────

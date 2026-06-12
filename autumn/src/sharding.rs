@@ -1463,6 +1463,126 @@ mod tests {
         assert!(shard.runtime().detail().expect("detail").contains("lags"));
     }
 
+    // ── Shards routing surface ──────────────────────────────────────────
+
+    fn shards_handle(names: &[&str]) -> Shards {
+        Shards {
+            set: shard_set(names),
+            ctx: crate::db::RequestDbContext {
+                statement_timeout: None,
+                route_key: Some("GET /test".to_owned()),
+                metrics: None,
+                slow_query_threshold: std::time::Duration::from_millis(500),
+                interceptors: Vec::new(),
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn db_on_rejects_unknown_shard_names() {
+        let shards = shards_handle(&["alpha"]);
+        let Err(error) = shards.db_on("beta").await else {
+            panic!("unknown shard name must be rejected");
+        };
+        assert!(error.to_string().contains("beta"));
+    }
+
+    #[tokio::test]
+    async fn read_for_fails_closed_without_checkout_under_fail_readiness() {
+        let mut config = sharded_config(&["a"]);
+        config.shards[0].replica_url = Some("postgres://localhost/a_ro".to_owned());
+        config.shards[0].replica_fallback = Some(ReplicaFallback::FailReadiness);
+        let shards = Shards {
+            set: create_shard_set(&config, Arc::new(HashShardRouter))
+                .expect("build")
+                .expect("configured"),
+            ctx: crate::db::RequestDbContext {
+                statement_timeout: None,
+                route_key: None,
+                metrics: None,
+                slow_query_threshold: std::time::Duration::from_millis(500),
+                interceptors: Vec::new(),
+            },
+        };
+
+        // The replica has not passed a readiness check, so the rejection
+        // must be the fallback-policy error, not a connection failure.
+        let Err(error) = shards.read_for("tenant-1").await else {
+            panic!("unready replica under fail_readiness must be rejected");
+        };
+        assert!(error.to_string().contains("fail_readiness"));
+    }
+
+    #[test]
+    fn shards_exposes_set_and_iter() {
+        let shards = shards_handle(&["alpha", "beta"]);
+        assert_eq!(shards.set().len(), 2);
+        let names: Vec<&str> = shards.iter().map(Shard::name).collect();
+        assert_eq!(names, ["alpha", "beta"]);
+    }
+
+    #[tokio::test]
+    async fn route_rejects_out_of_range_router_results() {
+        struct BadRouter;
+        impl ShardRouter for BadRouter {
+            fn route<'a>(
+                &'a self,
+                _key: ShardKey<'a>,
+                _shards: &'a ShardSet,
+            ) -> futures::future::BoxFuture<'a, Result<ShardId, AutumnError>> {
+                Box::pin(std::future::ready(Ok(ShardId(99))))
+            }
+        }
+
+        let set = create_shard_set(&sharded_config(&["a"]), Arc::new(BadRouter))
+            .expect("build")
+            .expect("configured");
+        let error = set.route("k").await.expect_err("out of range");
+        assert!(error.to_string().contains("out-of-range"));
+    }
+
+    #[test]
+    fn shard_key_from_impls_route_consistently() {
+        // i32 widens to the same slot as the equivalent i64.
+        assert_eq!(
+            slot_for_key(ShardKey::from(42i32), 64),
+            slot_for_key(ShardKey::from(42i64), 64),
+        );
+        // Owned strings, str slices, and byte arrays agree.
+        let owned = "tenant-1".to_owned();
+        let bytes: [u8; 16] = *b"0123456789abcdef";
+        assert_eq!(
+            slot_for_key(ShardKey::from(&owned), 64),
+            slot_for_key(ShardKey::from("tenant-1"), 64),
+        );
+        assert_eq!(
+            slot_for_key(ShardKey::from(&bytes), 64),
+            slot_for_key(ShardKey::from(&b"0123456789abcdef"[..]), 64),
+        );
+    }
+
+    #[test]
+    fn build_errors_and_debug_render_usefully() {
+        let error = ShardSetBuildError::TopologyCountMismatch {
+            expected: 2,
+            actual: 0,
+        };
+        assert!(error.to_string().contains("expected 2"));
+
+        let set = shard_set(&["alpha"]);
+        let debug = format!("{set:?}");
+        assert!(
+            debug.contains("alpha"),
+            "ShardSet Debug names shards: {debug}"
+        );
+        let shard_debug = format!("{:?}", set.get(ShardId(0)).expect("shard"));
+        assert!(shard_debug.contains("alpha"));
+        assert_eq!(
+            set.shard_for_slot(SlotId(0)).expect("owner").name(),
+            "alpha"
+        );
+    }
+
     // ── per-shard health indicator ──────────────────────────────────────
 
     fn shard_with_unreachable_replica(fallback: ReplicaFallback) -> Shard {
