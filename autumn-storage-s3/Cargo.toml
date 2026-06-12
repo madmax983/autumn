@@ -15,6 +15,12 @@ categories = ["web-programming", "web-programming::http-server"]
 autumn-web = { version = "0.5.0", path = "../autumn", features = ["storage"] }
 aws-config = { version = "1", features = ["behavior-version-latest"] }
 aws-credential-types = { version = "1", features = ["hardcoded-credentials"] }
+# Direct constraint on the transitive aws-runtime dependency: the 1.7.x
+# series fails to compile under recent rustc (type-inference regression in
+# its sigv4 signer), which breaks any fresh resolution of this crate —
+# including cargo-semver-checks' isolated builds in CI. Lift once upstream
+# ships a fixed release.
+aws-runtime = ">=1.6, <1.7"
 aws-sdk-s3 = "1"
 bytes = "1"
 futures = { workspace = true }
