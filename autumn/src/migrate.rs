@@ -756,4 +756,33 @@ mod tests {
             "unreachable host must produce Connection error"
         );
     }
+
+    #[test]
+    fn pending_migrations_fails_with_connection_error_on_bad_url() {
+        const MIGRATIONS: EmbeddedMigrations =
+            diesel_migrations::embed_migrations!("../examples/todo-app/migrations");
+        let url = "postgres://invalid_user:invalid_password@0.0.0.0:1/invalid_db";
+        let result = pending_migrations(url, MIGRATIONS);
+        assert!(matches!(result.unwrap_err(), MigrationError::Connection(_)));
+    }
+
+    #[test]
+    fn stale_detail_uses_none_placeholder_when_primary_is_empty() {
+        let empty: Vec<String> = vec![];
+        let replica = vec!["00000000000001".to_owned()];
+        let r = compare_replica_migration_versions(&empty, &replica);
+        assert!(!r.is_ready());
+        let detail = r.detail().expect("stale must have detail");
+        assert!(
+            detail.contains("<none>"),
+            "empty primary must use <none>: {detail}"
+        );
+        assert!(detail.contains("00000000000001"));
+    }
+
+    #[test]
+    fn should_auto_apply_returns_false_for_none_profile() {
+        assert!(!should_auto_apply(None, false));
+        assert!(!should_auto_apply(None, true));
+    }
 }
