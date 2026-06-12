@@ -1878,7 +1878,7 @@ pub(crate) async fn metrics_endpoint<S: ProvideActuatorState + Send + Sync + 'st
         let status = pool.status();
         let db_stats = serde_json::json!({
             "pool_size": status.max_size,
-            "active_connections": (status.max_size as u64).saturating_sub(status.available as u64),
+            "active_connections": (status.size as u64).saturating_sub(status.available as u64),
             "idle_connections": status.available,
         });
         if let serde_json::Value::Object(ref mut map) = result {
@@ -1895,7 +1895,7 @@ pub(crate) async fn metrics_endpoint<S: ProvideActuatorState + Send + Sync + 'st
             let mut entry = serde_json::json!({
                 "pool_size": status.max_size,
                 "active_connections":
-                    (status.max_size as u64).saturating_sub(status.available as u64),
+                    (status.size as u64).saturating_sub(status.available as u64),
                 "idle_connections": status.available,
                 "slots": shard.slots().len(),
             });
@@ -1906,7 +1906,7 @@ pub(crate) async fn metrics_endpoint<S: ProvideActuatorState + Send + Sync + 'st
                         "replica".to_string(),
                         serde_json::json!({
                             "pool_size": replica_status.max_size,
-                            "active_connections": (replica_status.max_size as u64)
+                            "active_connections": (replica_status.size as u64)
                                 .saturating_sub(replica_status.available as u64),
                             "idle_connections": replica_status.available,
                         }),
