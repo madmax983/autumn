@@ -5014,10 +5014,6 @@ async fn setup_database(
     })
 }
 
-/// Per-shard replica migration parity feeds each shard's runtime state
-/// (the analogue of `ProbeState`'s control-replica dependency), which
-/// gates that shard's replica reads per its `replica_fallback`.
-#[cfg(feature = "db")]
 /// Apply the embedded migration sets control-first, then to each shard in
 /// declaration order, failing fast on the first apply error: a
 /// half-migrated fleet that boots is worse than a crashed deploy, and
@@ -5075,6 +5071,10 @@ async fn run_startup_migrations(
     });
 }
 
+/// Per-shard replica migration parity feeds each shard's runtime state
+/// (the analogue of `ProbeState`'s control-replica dependency), which
+/// gates that shard's replica reads per its `replica_fallback`.
+#[cfg(feature = "db")]
 async fn check_shard_replica_migration_parity(
     config: &AutumnConfig,
     set: &crate::sharding::ShardSet,
