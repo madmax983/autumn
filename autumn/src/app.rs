@@ -6520,6 +6520,22 @@ mod tests {
 
     #[cfg(feature = "i18n")]
     #[tokio::test]
+    #[should_panic(expected = "i18n_auto: i18n default locale `en` is missing")]
+    async fn i18n_auto_panics_with_path_when_bundle_missing() {
+        let project = tempfile::tempdir().expect("project dir");
+        let mut config = AutumnConfig::default();
+        config.i18n.dir = "nonexistent-i18n".to_owned();
+
+        let env = crate::config::MockEnv::new().with(
+            "AUTUMN_MANIFEST_DIR",
+            project.path().to_str().expect("utf-8 path"),
+        );
+
+        let _ = resolve_i18n_bundle(None, true, &config, &env);
+    }
+
+    #[cfg(feature = "i18n")]
+    #[tokio::test]
     async fn i18n_auto_uses_config_loader_output_for_bundle_dir() {
         let project = tempfile::tempdir().expect("project dir");
         let i18n_dir = project.path().join("custom-i18n");

@@ -870,6 +870,24 @@ fn parse_attr_pred(chars: &[char], i: &mut usize, full: &str) -> Result<AttrPred
     Ok(AttrPred { name, op })
 }
 
+#[cfg(test)]
+mod operator_tests {
+    use super::*;
+
+    #[test]
+    fn parse_attr_predicate_rejects_unsupported_operator() {
+        let chars: Vec<char> = "name~='value']".chars().collect();
+        let mut i = 0;
+        let result = parse_attr_pred(&chars, &mut i, "div[name~='value']");
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .contains("unsupported attribute operator")
+        );
+    }
+}
+
 fn read_attr_value(chars: &[char], i: &mut usize, full: &str) -> Result<String, String> {
     if let Some(&q @ ('"' | '\'')) = chars.get(*i) {
         *i += 1;

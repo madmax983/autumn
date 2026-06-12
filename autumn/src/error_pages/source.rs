@@ -271,6 +271,13 @@ mod tests {
     }
 
     #[test]
+    fn parse_location_ignores_invalid_line_number() {
+        let (file, line) = parse_location("src/lib.rs:not_a_number");
+        assert_eq!(file, "src/lib.rs:not_a_number");
+        assert_eq!(line, 0);
+    }
+
+    #[test]
     fn read_source_context_returns_empty_for_zero_line() {
         let lines = read_source_context("src/lib.rs", 0);
         assert!(lines.is_empty());

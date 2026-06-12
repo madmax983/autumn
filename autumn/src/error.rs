@@ -1227,4 +1227,38 @@ mod tests {
         assert_eq!(hx_trigger, r#"{"autumn:conflict":true}"#);
         Ok(())
     }
+
+    #[test]
+    fn problem_title_for_fallback_uses_canonical_reason() {
+        assert_eq!(super::problem_title_for(StatusCode::from_u16(599).unwrap(), false), "Error");
+        assert_eq!(super::problem_title_for(StatusCode::from_u16(418).unwrap(), false), "I'm a teapot");
+    }
+
+    #[test]
+    fn problem_code_with_explicit_type_infers_slug() {
+        let json = super::problem_details_json_string(
+            StatusCode::BAD_REQUEST,
+            "test",
+            None,
+            Some("https://example.com/custom-error"),
+            None,
+            None,
+            false,
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["code"], "autumn.custom_error");
+
+        // Edge case: when type doesn't contain a slash, it uses the whole thing
+        let json_no_slash = super::problem_details_json_string(
+            StatusCode::BAD_REQUEST,
+            "test",
+            None,
+            Some("custom-error"),
+            None,
+            None,
+            false,
+        );
+        let parsed_no_slash: serde_json::Value = serde_json::from_str(&json_no_slash).unwrap();
+        assert_eq!(parsed_no_slash["code"], "autumn.custom_error");
+    }
 }
