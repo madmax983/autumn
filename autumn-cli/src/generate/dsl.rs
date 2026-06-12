@@ -306,10 +306,10 @@ fn is_valid_ident(s: &str) -> bool {
 /// list.
 pub(super) const RUST_KEYWORDS: &[&str] = &[
     "as", "async", "await", "break", "const", "continue", "crate", "do", "dyn", "else", "enum",
-    "extern", "false", "fn", "for", "if", "impl", "in", "let", "loop", "match", "mod", "move",
-    "mut", "pub", "ref", "return", "self", "static", "struct", "super", "trait", "true", "try",
-    "type", "unsafe", "use", "where", "while", "yield", "abstract", "become", "box", "final",
-    "macro", "override", "priv", "typeof", "unsized", "virtual",
+    "extern", "false", "fn", "for", "gen", "if", "impl", "in", "let", "loop", "match", "mod",
+    "move", "mut", "pub", "ref", "return", "self", "static", "struct", "super", "trait", "true",
+    "try", "type", "unsafe", "use", "where", "while", "yield", "abstract", "become", "box",
+    "final", "macro", "override", "priv", "typeof", "unsized", "virtual",
 ];
 
 pub(super) fn is_rust_keyword(s: &str) -> bool {

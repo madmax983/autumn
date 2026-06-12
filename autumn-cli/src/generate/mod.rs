@@ -25,6 +25,7 @@ pub mod scaffold;
 pub mod schema_edit;
 pub mod system_test;
 pub mod task;
+pub mod wizard;
 
 use std::path::{Path, PathBuf};
 

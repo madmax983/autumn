@@ -226,6 +226,11 @@ pub mod ui;
 /// See [`widgets`] for the full API including [`widgets::active_search`],
 /// [`widgets::autocomplete_input`], and their configuration types.
 pub mod widgets;
+/// First-class multi-step form wizards with session-backed state and per-step validation.
+///
+/// See [`wizard`] for the full API including [`wizard::WizardContext`] and
+/// [`wizard::wizard_progress`].
+pub mod wizard;
 /// Changeset type carrying submitted values + per-field errors.
 pub use form::Changeset;
 /// Changeset form extractor — decodes body + validates, captures errors in [`form::Changeset`].

@@ -1207,6 +1207,28 @@ enum GenerateCommands {
         #[arg(long)]
         force: bool,
     },
+    /// Scaffold a multi-step form wizard with session-backed state and per-step validation.
+    ///
+    /// Emits step structs, GET + POST handlers, progress rendering, commit and
+    /// cancel handlers, and a generated integration test.  All step state is
+    /// persisted through the existing `Session` under namespaced keys.
+    ///
+    /// Example:
+    ///
+    ///   autumn generate wizard checkout shipping payment review
+    #[command(verbatim_doc_comment)]
+    Wizard {
+        /// Wizard name (`snake_case` or `PascalCase`, e.g. `checkout`).
+        name: String,
+        /// Ordered list of step names (`snake_case`, e.g. `shipping payment review`).
+        steps: Vec<String>,
+        /// Print the file plan and exit without writing anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Overwrite existing files instead of erroring on collision.
+        #[arg(long)]
+        force: bool,
+    },
     /// Generate model, migration, repository, HTML routes, smoke test, and
     /// register the new routes in `src/main.rs`.
     Scaffold {
@@ -1847,6 +1869,14 @@ fn run_generate_command(cmd: GenerateCommands) {
                 ..Default::default()
             };
             generate::admin::run(&name, &fields, generate::Flags { dry_run, force }, &options);
+        }
+        GenerateCommands::Wizard {
+            name,
+            steps,
+            dry_run,
+            force,
+        } => {
+            generate::wizard::run(&name, &steps, generate::Flags { dry_run, force });
         }
         GenerateCommands::Scaffold {
             name,

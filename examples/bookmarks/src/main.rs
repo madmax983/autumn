@@ -3,6 +3,7 @@ mod repositories;
 mod routes;
 mod schema;
 mod tasks;
+mod wizards;
 
 use autumn_web::migrate::{EmbeddedMigrations, embed_migrations};
 use autumn_web::openapi::OpenApiConfig;
@@ -35,6 +36,13 @@ async fn main() {
             repositories::bookmark::bookmark_api_create,
             repositories::bookmark::bookmark_api_update,
             repositories::bookmark::bookmark_api_delete,
+            wizards::add_bookmark::show_url,
+            wizards::add_bookmark::submit_url,
+            wizards::add_bookmark::show_details,
+            wizards::add_bookmark::submit_details,
+            wizards::add_bookmark::show_confirm,
+            wizards::add_bookmark::commit,
+            wizards::add_bookmark::cancel,
         ])
         .tasks(tasks![tasks::check_links])
         .openapi(OpenApiConfig::new("Bookmarks API", "1.0.0"))
