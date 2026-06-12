@@ -863,14 +863,13 @@ impl RequestBuilder {
 
         // ── Real network request with retries ───────────────────────────────
         let start = Instant::now();
-        let max_attempts =
-            if suppress_retries {
-                1
-            } else if is_idempotent_method(&self.method) || !self.retry_policy.retry_idempotent_only {
-                self.retry_policy.max_retries.saturating_add(1)
-            } else {
-                1
-            };
+        let max_attempts = if suppress_retries {
+            1
+        } else if is_idempotent_method(&self.method) || !self.retry_policy.retry_idempotent_only {
+            self.retry_policy.max_retries.saturating_add(1)
+        } else {
+            1
+        };
 
         for attempt in 0..max_attempts {
             if attempt > 0 {

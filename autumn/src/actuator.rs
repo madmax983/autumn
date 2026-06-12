@@ -1641,7 +1641,10 @@ fn build_health_components(
     // Custom indicators first so the built-in "db" key inserted below can never
     // be overwritten by a user-registered indicator with the same name.
     for result in indicator_results {
-        if !detailed && result.name.starts_with("circuit_breaker.") && result.output.status.is_healthy() {
+        if !detailed
+            && result.name.starts_with("circuit_breaker.")
+            && result.output.status.is_healthy()
+        {
             continue;
         }
         let details = (detailed && !result.output.details.is_empty())

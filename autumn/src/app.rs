@@ -2877,12 +2877,13 @@ impl AppBuilder {
 
         if !state.probes().is_shutting_down() {
             if !tasks.is_empty() {
-                if let Err(err) = start_task_scheduler_with_config(
+                let res = start_task_scheduler_with_config(
                     tasks,
                     &state,
                     &server_shutdown,
                     &config.scheduler,
-                ) {
+                );
+                if let Err(err) = res {
                     tracing::error!(error = %err, "scheduled task runtime initialization failed");
                     server_shutdown.cancel();
                     server_task.abort();

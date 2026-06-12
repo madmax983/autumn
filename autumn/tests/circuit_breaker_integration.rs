@@ -543,7 +543,11 @@ async fn test_circuit_breaker_non_detailed_unhealthy_visibility() {
     health_resp_1.assert_ok();
     health_resp_1.assert_json::<serde_json::Value, _>(|val| {
         assert_eq!(val["status"], "UP");
-        assert!(val["components"].get(&format!("circuit_breaker.127.0.0.1:{port}")).is_none());
+        assert!(
+            val["components"]
+                .get(format!("circuit_breaker.127.0.0.1:{port}"))
+                .is_none()
+        );
     });
 
     // 2. Trigger failures to trip the breaker
@@ -581,9 +585,7 @@ async fn test_circuit_breaker_half_open_suppresses_retries() {
         get(move || {
             let hits = hit_count_clone.fetch_add(1, Ordering::SeqCst);
             println!("Downstream hit: {}", hits + 1);
-            async move {
-                StatusCode::INTERNAL_SERVER_ERROR
-            }
+            async move { StatusCode::INTERNAL_SERVER_ERROR }
         }),
     );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -645,31 +647,36 @@ async fn test_circuit_breaker_half_open_suppresses_retries() {
     assert!(resp.text().contains("500"));
 
     let total_hits = hit_count.load(Ordering::SeqCst);
-    assert_eq!(total_hits, 1, "HalfOpen trial probe must issue exactly 1 downstream request");
+    assert_eq!(
+        total_hits, 1,
+        "HalfOpen trial probe must issue exactly 1 downstream request"
+    );
 
     autumn_web::circuit_breaker::global_registry().clear();
 }
 
 #[tokio::test]
 async fn test_circuit_breaker_generic_open_error_mapping() {
-    use autumn_web::circuit_breaker::{CircuitBreaker, CircuitBreakerPolicy, CircuitBreakerError};
+    use autumn_web::circuit_breaker::{CircuitBreaker, CircuitBreakerError, CircuitBreakerPolicy};
     use autumn_web::error::AutumnError;
 
-    let mut policy = CircuitBreakerPolicy::default();
-    policy.minimum_sample_count = 1;
-    policy.failure_ratio_threshold = 0.1;
+    let policy = CircuitBreakerPolicy {
+        minimum_sample_count: 1,
+        failure_ratio_threshold: 0.1,
+        ..Default::default()
+    };
     let breaker = CircuitBreaker::new("test_generic_open", policy);
 
     // Trip the breaker by running a failing future
-    let res = breaker.run(async {
-        Result::<(), std::io::Error>::Err(std::io::Error::other("failure"))
-    }).await;
+    let res = breaker
+        .run(async { Result::<(), std::io::Error>::Err(std::io::Error::other("failure")) })
+        .await;
     assert!(res.is_err());
 
     // Now execution via run should return CircuitBreakerError::Open immediately
-    let res2 = breaker.run(async {
-        Result::<(), std::io::Error>::Ok(())
-    }).await;
+    let res2 = breaker
+        .run(async { Result::<(), std::io::Error>::Ok(()) })
+        .await;
 
     assert!(res2.is_err());
     let err = res2.unwrap_err();
@@ -679,4 +686,3 @@ async fn test_circuit_breaker_generic_open_error_mapping() {
     let autumn_err = AutumnError::from(err);
     assert_eq!(autumn_err.status(), StatusCode::SERVICE_UNAVAILABLE);
 }
-
