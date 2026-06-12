@@ -107,9 +107,15 @@ pub async fn index(repo: PgBookmarkRepository) -> AutumnResult<Markup> {
         html! {
             div class="flex justify-between items-center mb-6" {
                 h1 class="text-2xl font-bold" { "All Bookmarks" }
-                a href="/bookmarks/new"
-                  class="bg-indigo-600 text-white px-4 py-2 rounded hover:bg-indigo-700" {
-                    "+ Add"
+                div class="flex gap-2" {
+                    a href="/bookmarks/new"
+                      class="bg-indigo-600 text-white px-4 py-2 rounded hover:bg-indigo-700" {
+                        "+ Add"
+                    }
+                    a href="/bookmarks/add/url"
+                      class="border border-indigo-600 text-indigo-600 px-4 py-2 rounded hover:bg-indigo-50" {
+                        "+ Add (wizard)"
+                    }
                 }
             }
             // ── Active search widget ──────────────────────────────────────

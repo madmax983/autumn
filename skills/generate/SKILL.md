@@ -30,6 +30,7 @@ preview and get confirmation before executing any mutating generator.
 | `admin` | `admin Post title:String body:Text` | Admin plugin resource page — fields must be supplied explicitly; generator does not read the model |
 | `system-test` | `system-test checkout_flow` | System test fixture (name must be `snake_case` or `PascalCase` — no hyphens) |
 | `pwa` | `pwa` | PWA scaffolding — manifest, service worker, offline shell, icons, route handlers, smoke test |
+| `wizard` | `wizard checkout shipping payment review` | Session-backed multi-step form — step structs, GET/POST handlers, confirm/commit/cancel, and ignored integration test skeletons |
 
 ## Field type reference
 
@@ -153,6 +154,36 @@ Next steps:
 3. Invoke with: autumn task recalculate_counts -- --dry-run
 ```
 
+### wizard
+```
+Next steps:
+1. The generator writes three files:
+     src/wizards/<name>.rs       # step structs + handlers
+     src/wizards/mod.rs          # pub mod <name>;  (created or appended)
+     tests/<name>_wizard.rs      # ignored integration test skeletons
+
+2. Fill in the generated TODO sections:
+   - Replace `// TODO` in each step struct with real fields + #[validate(...)] attributes.
+   - Replace `// TODO: render form fields` in each show_<step> handler with
+     real form.text_input(...) / form.select(...) calls — copy the same block
+     into the Err(form) branch of the matching POST handler.
+   - Add a summary display in show_confirm for each step's data.
+   - Replace `// TODO: use the step data` in commit with the actual DB write,
+     then call wizard.clear().await after success.
+
+3. Wire into src/main.rs:
+   mod wizards;   // alongside other mod declarations
+   // routes![...]:
+   wizards::<name>::show_<step1>,
+   wizards::<name>::submit_<step1>,
+   // ... one pair per step ...
+   wizards::<name>::show_confirm,
+   wizards::<name>::commit,
+   wizards::<name>::cancel,
+
+4. Run: cargo check
+```
+
 ### pwa
 ```
 Next steps:
@@ -178,6 +209,19 @@ Next steps:
 - `--oauth github,google`: For `auth` subcommand — add OAuth providers
 - `--totp`: For `auth` — add TOTP two-factor auth
 - `--passkeys`: For `auth` — add WebAuthn passkeys
+- `--dry-run`: Print what would be written without touching the filesystem (supported by `wizard`)
+- `--force`: Overwrite existing files without prompting (supported by `wizard`)
+
+## Wizard name constraints
+
+The wizard subcommand has stricter naming rules than other generators:
+
+- Wizard name and all step names: ASCII letters, digits, underscores only — no hyphens.
+- Must start with a letter or `_` and must not be a Rust keyword.
+- Minimum two steps.
+- Step names `confirm`, `commit`, and `cancel` are reserved (auto-generated); using them causes a conflict error.
+- Duplicate step names (after snake_case normalization) are rejected.
+- PascalCase step names are accepted and converted to snake_case (`ShippingAddress` → `shipping_address`).
 
 ## Error handling
 
