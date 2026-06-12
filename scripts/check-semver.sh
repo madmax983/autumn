@@ -131,6 +131,13 @@ for crate in "${CRATES[@]}"; do
     # unrelated to our public API surface; skip rather than hard-fail so the
     # gate remains actionable for real semver breaks.
     echo "  SKIP: $crate — aws-runtime E0282 upstream regression on Rust $semver_toolchain (not a semver issue)"
+  elif echo "$crate_output" | grep -qE "error\[E0119\]" && echo "$crate_output" | grep -q "HourBase"; then
+    # time 0.3.48 introduced a blanket From<HourBase> impl that creates orphan-
+    # rule violations with aws-smithy-types and ratatui-widgets.  The isolated
+    # workspace used by cargo-semver-checks resolves time fresh and may pick
+    # 0.3.48; our workspace constraint (<0.3.48) does not carry over.  Skip
+    # rather than hard-fail until the upstream coherence issue is resolved.
+    echo "  SKIP: $crate — time 0.3.48 E0119 coherence regression (not a semver issue)"
   elif echo "$crate_output" | grep -qE "checks failed|semver requires"; then
     # Exit 1 with semver-violation output → actual breaking API changes found.
     # Allow them through only when BOTH conditions hold:
