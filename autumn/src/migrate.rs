@@ -719,4 +719,38 @@ mod tests {
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), MigrationError::Connection(_)));
     }
+
+    #[test]
+    fn replica_migration_readiness_ready_is_ready_and_has_no_detail() {
+        assert!(ReplicaMigrationReadiness::Ready.is_ready());
+        assert_eq!(ReplicaMigrationReadiness::Ready.detail(), None);
+    }
+
+    #[test]
+    fn replica_migration_readiness_unknown_is_not_ready_and_has_detail() {
+        let r = ReplicaMigrationReadiness::Unknown("db error xyz".to_string());
+        assert!(!r.is_ready());
+        let detail = r.detail().expect("Unknown must have detail");
+        assert!(detail.contains("db error xyz"), "detail must contain the error: {detail}");
+    }
+
+    #[test]
+    fn compare_migration_versions_equal_returns_ready() {
+        let versions = vec!["00000000000001".to_owned(), "00000000000002".to_owned()];
+        let readiness = compare_replica_migration_versions(&versions, &versions.clone());
+        assert!(readiness.is_ready());
+        assert_eq!(readiness.detail(), None);
+    }
+
+    #[test]
+    fn hold_migration_lock_fails_with_connection_error_on_bad_url() {
+        let result = hold_migration_lock(
+            "postgres://invalid_user:invalid_password@0.0.0.0:1/invalid_db",
+            DEFAULT_LOCK_WAIT_TIMEOUT,
+        );
+        assert!(
+            matches!(result.unwrap_err(), MigrationError::Connection(_)),
+            "unreachable host must produce Connection error"
+        );
+    }
 }
