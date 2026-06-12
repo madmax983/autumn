@@ -791,11 +791,10 @@ fn splice_feature_at(
                         out.push(' ');
                         out.push_str(comment.trim_start());
                     }
-                    out.push('\n');
                 } else {
                     out.push_str(l);
-                    out.push('\n');
                 }
+                out.push('\n');
             } else {
                 out.push_str(l);
                 out.push('\n');
