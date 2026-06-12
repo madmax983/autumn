@@ -2578,12 +2578,15 @@ impl AppBuilder {
             )
             .await;
             let seo_router = crate::seo::build_seo_router_from_bodies(robots_body, sitemap_body);
-            let seo_collision = all_routes
-                .iter()
-                .any(|r| r.path == "/robots.txt" || r.path == "/sitemap.xml")
-                || static_metas
-                    .iter()
-                    .any(|m| m.path == "/robots.txt" || m.path == "/sitemap.xml");
+            let is_seo_path = |p: &str| p == "/robots.txt" || p == "/sitemap.xml";
+            let seo_collision = all_routes.iter().any(|r| is_seo_path(r.path))
+                || static_metas.iter().any(|m| is_seo_path(m.path))
+                || scoped_groups.iter().any(|g| {
+                    let prefix = g.prefix.trim_end_matches('/');
+                    g.routes
+                        .iter()
+                        .any(|r| is_seo_path(&format!("{prefix}{}", r.path)))
+                });
             if seo_collision {
                 tracing::warn!(
                     "seo: /robots.txt or /sitemap.xml is already registered by the application; \

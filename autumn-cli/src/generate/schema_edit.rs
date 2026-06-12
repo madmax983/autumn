@@ -717,6 +717,31 @@ fn insert_mail_previews_call(existing: &str, mailer_type: &str) -> String {
 
 /// Rewrite `lines` so that a feature is added at or near `feat_idx`.
 ///
+/// Split a TOML line into its value portion and any trailing inline comment
+/// (`# ...`).  The split point is the first `#` that is not inside a
+/// double-quoted string.  Returns `(value, comment)` where `comment` is
+/// empty when there is no inline comment.
+fn split_toml_inline_comment(s: &str) -> (&str, &str) {
+    let mut in_string = false;
+    let mut prev_was_backslash = false;
+    for (i, c) in s.char_indices() {
+        if in_string {
+            if c == '\\' && !prev_was_backslash {
+                prev_was_backslash = true;
+                continue;
+            } else if c == '"' && !prev_was_backslash {
+                in_string = false;
+            }
+        } else if c == '"' {
+            in_string = true;
+        } else if c == '#' {
+            return (&s[..i], &s[i..]);
+        }
+        prev_was_backslash = false;
+    }
+    (s, "")
+}
+
 /// If `new_feat_line != original_line` the single-line `features = [...]` was
 /// already rewritten; just splice it in. Otherwise the array is multiline:
 /// scan forward for the closing `]` and insert a new entry before it.
@@ -755,10 +780,18 @@ fn splice_feature_at(
             } else if k + 1 == close_idx && k > feat_idx {
                 // Ensure the last existing item has a trailing comma before the
                 // new entry is inserted; without it the TOML would be invalid.
-                let content = l.trim_end();
-                if !content.is_empty() && !content.ends_with(',') {
-                    out.push_str(content);
-                    out.push_str(",\n");
+                // Split off any inline comment first so the comma lands in the
+                // value portion, not inside `# ...` where TOML ignores it.
+                let (code, comment) = split_toml_inline_comment(l);
+                let code_trimmed = code.trim_end();
+                if !code_trimmed.is_empty() && !code_trimmed.ends_with(',') {
+                    out.push_str(code_trimmed);
+                    out.push(',');
+                    if !comment.is_empty() {
+                        out.push(' ');
+                        out.push_str(comment.trim_start());
+                    }
+                    out.push('\n');
                 } else {
                     out.push_str(l);
                     out.push('\n');
