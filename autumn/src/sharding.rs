@@ -647,11 +647,21 @@ pub fn build_shard_set(
             }
         })
         .collect();
-    let by_name = shards
-        .iter()
-        .enumerate()
-        .map(|(idx, shard)| (shard.name().to_owned(), idx))
-        .collect();
+    // `AutumnConfig::validate()` already rejects duplicate names, but this
+    // builder is public and reachable with unvalidated configs (custom
+    // loaders, direct callers); a silently-shadowed map would make one of
+    // the duplicates unaddressable via by_name/db_on and health components.
+    let mut by_name = HashMap::with_capacity(shards.len());
+    for (idx, shard) in shards.iter().enumerate() {
+        if by_name.insert(shard.name().to_owned(), idx).is_some() {
+            return Err(ConfigError::Validation(format!(
+                "database.shards: shard name {:?} is declared more than once; \
+                 shard names must be unique",
+                shard.name()
+            ))
+            .into());
+        }
+    }
 
     Ok(ShardSet {
         inner: Arc::new(ShardSetInner {
@@ -1367,6 +1377,26 @@ mod tests {
                 .expect("ok")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn build_shard_set_rejects_duplicate_names_without_config_validation() {
+        // The builder is public: configs that bypassed
+        // AutumnConfig::validate() must still not produce a shadowed
+        // by_name map.
+        let config = sharded_config(&["twin", "twin"]);
+        let topologies = config
+            .shards
+            .iter()
+            .map(|shard| crate::db::create_shard_topology(shard, &config).expect("lazy pools"))
+            .collect();
+
+        let result = build_shard_set(&config, topologies, Arc::new(HashShardRouter));
+
+        let Err(ShardSetBuildError::Config(error)) = result else {
+            panic!("duplicate shard names must be rejected, got {result:?}");
+        };
+        assert!(error.to_string().contains("twin"));
     }
 
     #[test]
