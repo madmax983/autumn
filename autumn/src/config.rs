@@ -51,7 +51,6 @@
 //! | `AUTUMN_DATABASE__REPLICA_FALLBACK` | `database.replica_fallback` | `fail_readiness` / `primary` |
 //! | `AUTUMN_DATABASE__CONNECT_TIMEOUT_SECS` | `database.connect_timeout_secs` | `u64` |
 //! | `AUTUMN_DATABASE__AUTO_MIGRATE_IN_PRODUCTION` | `database.auto_migrate_in_production` | `bool` |
-//! | `AUTUMN_DATABASE__SLOT_COUNT` | `database.slot_count` | `u16` |
 //! | `AUTUMN_DATABASE__SHARDS__{i}__NAME` | `database.shards[i].name` | `String` |
 //! | `AUTUMN_DATABASE__SHARDS__{i}__PRIMARY_URL` | `database.shards[i].primary_url` | `String` |
 //! | `AUTUMN_DATABASE__SHARDS__{i}__SLOTS` | `database.shards[i].slots` | CSV of indices / `A-B` ranges |
@@ -2106,11 +2105,6 @@ impl AutumnConfig {
             "AUTUMN_DATABASE__AUTO_MIGRATE_IN_PRODUCTION",
             &mut self.database.auto_migrate_in_production,
         );
-        parse_env(
-            env,
-            "AUTUMN_DATABASE__SLOT_COUNT",
-            &mut self.database.slot_count,
-        );
         self.apply_shard_env_overrides(env);
     }
 
@@ -3043,12 +3037,12 @@ impl SlotSpec {
 ///
 /// # Routing: keys → logical slots → shards
 ///
-/// Routing keys hash onto a fixed set of **logical slots**
-/// (`database.slot_count`, default 64), and each slot maps to one shard.
-/// The key→slot hash is a permanent contract; the slot→shard map is
-/// plain configuration. Growing from two shards to three means moving
-/// whole slots — copy a slot's rows to the new shard, flip its `slots`
-/// entry, deploy — without rehashing any keys.
+/// Routing keys hash onto a fixed set of [`SLOT_COUNT`] (16384) **logical
+/// slots**, and each slot maps to one shard. The key→slot hash is a
+/// permanent contract; the slot→shard map is plain configuration. Growing
+/// from two shards to three means moving whole slots — copy a slot's rows
+/// to the new shard, flip its `slots` entry, deploy — without rehashing
+/// any keys.
 ///
 /// When **every** shard declares [`slots`](Self::slots), declaration
 /// order is meaningless and entries can be reordered, renamed, or
@@ -3067,12 +3061,12 @@ impl SlotSpec {
 /// [[database.shards]]
 /// name = "shard0"
 /// primary_url = "postgres://db-shard0/app"
-/// slots = ["0-31"]
+/// slots = ["0-8191"]
 ///
 /// [[database.shards]]
 /// name = "shard1"
 /// primary_url = "postgres://db-shard1/app"
-/// slots = ["32-63"]
+/// slots = ["8192-16383"]
 /// replica_url = "postgres://db-shard1-ro/app"
 /// replica_fallback = "primary"
 /// ```
@@ -3089,10 +3083,10 @@ pub struct ShardConfig {
     pub primary_url: String,
 
     /// Logical slots this shard owns, as indices and/or `"A-B"` inclusive
-    /// ranges (e.g. `slots = ["0-15", 40, "62-63"]`).
+    /// ranges (e.g. `slots = ["0-8191", 16000, "16382-16383"]`).
     ///
     /// All-or-none across shards: either every shard declares `slots`
-    /// (explicit map covering `0..slot_count` exactly once; an empty list
+    /// (explicit map covering `0..16384` exactly once; an empty list
     /// marks a drained shard being decommissioned) or none does
     /// (contiguous auto-split by declaration order).
     #[serde(default)]
@@ -3160,7 +3154,6 @@ impl ShardConfig {
 /// | `replica_fallback` | `fail_readiness` |
 /// | `connect_timeout_secs` | `5` |
 /// | `auto_migrate_in_production` | `false` |
-/// | `slot_count` | `64` |
 /// | `shards` | `[]` |
 ///
 /// # Examples
@@ -3242,18 +3235,6 @@ pub struct DatabaseConfig {
     )]
     pub slow_query_threshold: std::time::Duration,
 
-    /// Number of logical routing slots shared across all shards.
-    /// Default: `64`. Maximum: `8192`.
-    ///
-    /// Keys hash onto `0..slot_count` and each slot maps to one shard, so
-    /// resharding means moving whole slots between shards rather than
-    /// rehashing keys. **Choose this once, before data lands on shards**:
-    /// changing it later re-routes every key — a full reshard. Pick a value
-    /// comfortably above the number of physical shards you ever expect
-    /// (the default 64 supports up to 64 shards).
-    #[serde(default = "default_slot_count")]
-    pub slot_count: u16,
-
     /// Horizontal shards, declared as `[[database.shards]]` entries.
     ///
     /// Empty (the default) means the application is unsharded and only the
@@ -3265,12 +3246,45 @@ pub struct DatabaseConfig {
     pub shards: Vec<ShardConfig>,
 }
 
-const fn default_slot_count() -> u16 {
-    64
+/// Render a sorted slot list as compact `A-B` ranges for error messages
+/// (a gap in a 16384-slot map would otherwise print thousands of indices).
+fn format_slot_ranges(slots: &[usize]) -> String {
+    fn render(start: usize, end: usize) -> String {
+        if start == end {
+            start.to_string()
+        } else {
+            format!("{start}-{end}")
+        }
+    }
+    let mut ranges: Vec<String> = Vec::new();
+    let mut iter = slots.iter().copied();
+    let Some(mut start) = iter.next() else {
+        return String::new();
+    };
+    let mut end = start;
+    for slot in iter {
+        if slot != end + 1 {
+            ranges.push(render(start, end));
+            start = slot;
+        }
+        end = slot;
+    }
+    ranges.push(render(start, end));
+    ranges.join(", ")
 }
 
-/// Hard ceiling for `database.slot_count`.
-pub const MAX_SLOT_COUNT: u16 = 8192;
+/// Number of logical routing slots shared across all shards. Fixed,
+/// not configurable — the same constant for every Autumn deployment,
+/// matching Redis Cluster and Valkey.
+///
+/// Keys hash onto `0..SLOT_COUNT` and each slot maps to one shard, so
+/// resharding means moving whole slots between shards rather than
+/// rehashing keys. Slots are pure routing-table entries (no pools, no
+/// per-slot resources), so the fixed count costs almost nothing while
+/// removing the classic "chose too few partitions on day one"
+/// failure mode: there is no value to pick and nothing to outgrow
+/// short of 16384 physical shards.
+pub const SLOT_COUNT: u16 = 16384;
 
 impl DatabaseConfig {
     /// Resolved primary/write database URL.
@@ -3307,22 +3321,15 @@ impl DatabaseConfig {
     /// - When **no** shard declares `slots`, the slot space is auto-split
     ///   into contiguous even ranges by declaration order.
     /// - When **every** shard declares `slots`, the explicit assignments are
-    ///   used and must cover `0..slot_count` exactly once.
+    ///   used and must cover <code>0..[SLOT_COUNT]</code> exactly once.
     /// - Mixing declared and undeclared `slots` is an error.
     ///
     /// # Errors
     ///
-    /// Returns [`ConfigError::Validation`] for an invalid `slot_count`,
-    /// mixed declarations, malformed/out-of-range/duplicate slots, or
-    /// incomplete coverage.
+    /// Returns [`ConfigError::Validation`] for mixed declarations,
+    /// malformed/out-of-range/duplicate slots, or incomplete coverage.
     pub fn resolved_slot_map(&self) -> Result<Vec<usize>, ConfigError> {
-        let slot_count = usize::from(self.slot_count);
-        if self.slot_count == 0 || self.slot_count > MAX_SLOT_COUNT {
-            return Err(ConfigError::Validation(format!(
-                "database.slot_count must be between 1 and {MAX_SLOT_COUNT}, got {}",
-                self.slot_count
-            )));
-        }
+        let slot_count = usize::from(SLOT_COUNT);
 
         if self.shards.is_empty() {
             return Ok(Vec::new());
@@ -3341,8 +3348,8 @@ impl DatabaseConfig {
             // Contiguous even auto-split by declaration order.
             if self.shards.len() > slot_count {
                 return Err(ConfigError::Validation(format!(
-                    "database.slot_count ({slot_count}) must be at least the number of \
-                     shards ({})",
+                    "database.shards: at most {slot_count} shards are supported \
+                     (one per logical slot), got {}",
                     self.shards.len()
                 )));
             }
@@ -3361,7 +3368,7 @@ impl DatabaseConfig {
                     if usize::from(slot) >= slot_count {
                         return Err(ConfigError::Validation(format!(
                             "database.shards[{idx}].slots: slot {slot} is out of range \
-                             (slot_count is {slot_count})"
+                             (slots are 0..{slot_count})"
                         )));
                     }
                     if let Some(owner) = map[usize::from(slot)] {
@@ -3383,7 +3390,8 @@ impl DatabaseConfig {
         if !unassigned.is_empty() {
             return Err(ConfigError::Validation(format!(
                 "database.shards: slot map must cover every slot in 0..{slot_count}; \
-                 unassigned slots: {unassigned:?}"
+                 unassigned slots: {}",
+                format_slot_ranges(&unassigned)
             )));
         }
         // Coverage was just verified, so flatten cannot drop entries.
@@ -4059,7 +4067,6 @@ impl Default for DatabaseConfig {
             auto_migrate_in_production: false,
             statement_timeout: None,
             slow_query_threshold: default_slow_query_threshold(),
-            slot_count: default_slot_count(),
             shards: Vec::new(),
         }
     }
@@ -4857,7 +4864,6 @@ primary_url = "postgres://toml.example/app"
     #[test]
     fn slot_map_auto_splits_contiguously_by_declaration_order() {
         let config = DatabaseConfig {
-            slot_count: 8,
             shards: vec![
                 shard("a", "postgres://a/app"),
                 shard("b", "postgres://b/app"),
@@ -4868,31 +4874,42 @@ primary_url = "postgres://toml.example/app"
         let map = config
             .resolved_slot_map()
             .expect("auto-split should resolve");
-        assert_eq!(map, vec![0, 0, 0, 1, 1, 1, 2, 2]);
+        assert_eq!(map.len(), usize::from(SLOT_COUNT));
+        // slot * 3 / 16384 — contiguous, near-even thirds.
+        assert_eq!((map[0], map[5461]), (0, 0));
+        assert_eq!((map[5462], map[10922]), (1, 1));
+        assert_eq!((map[10923], map[16383]), (2, 2));
+        assert!(map.windows(2).all(|w| w[0] <= w[1]), "must be contiguous");
+        for owner in 0..3 {
+            let count = map.iter().filter(|&&o| o == owner).count();
+            assert!(
+                (5461..=5462).contains(&count),
+                "shard {owner} owns {count} slots (expected near-even split)"
+            );
+        }
     }
 
     #[test]
     fn slot_map_uses_explicit_assignments_regardless_of_order() {
         let config = DatabaseConfig {
-            slot_count: 8,
             shards: vec![
-                shard_with_slots("late", "postgres://late/app", &["4-7"]),
-                shard_with_slots("early", "postgres://early/app", &["0-3"]),
+                shard_with_slots("late", "postgres://late/app", &["8192-16383"]),
+                shard_with_slots("early", "postgres://early/app", &["0-8191"]),
             ],
             ..Default::default()
         };
         let map = config
             .resolved_slot_map()
             .expect("explicit map should resolve");
-        assert_eq!(map, vec![1, 1, 1, 1, 0, 0, 0, 0]);
+        assert!(map[..8192].iter().all(|&owner| owner == 1));
+        assert!(map[8192..].iter().all(|&owner| owner == 0));
     }
 
     #[test]
     fn slot_map_allows_drained_shard_with_empty_slots() {
         let config = DatabaseConfig {
-            slot_count: 4,
             shards: vec![
-                shard_with_slots("live", "postgres://live/app", &["0-3"]),
+                shard_with_slots("live", "postgres://live/app", &["0-16383"]),
                 shard_with_slots("drained", "postgres://drained/app", &[]),
             ],
             ..Default::default()
@@ -4900,15 +4917,15 @@ primary_url = "postgres://toml.example/app"
         let map = config
             .resolved_slot_map()
             .expect("drained shard is allowed");
-        assert_eq!(map, vec![0, 0, 0, 0]);
+        assert_eq!(map.len(), usize::from(SLOT_COUNT));
+        assert!(map.iter().all(|&owner| owner == 0));
     }
 
     #[test]
     fn slot_map_rejects_mixed_declared_and_undeclared_slots() {
         let config = DatabaseConfig {
-            slot_count: 8,
             shards: vec![
-                shard_with_slots("a", "postgres://a/app", &["0-7"]),
+                shard_with_slots("a", "postgres://a/app", &["0-16383"]),
                 shard("b", "postgres://b/app"),
             ],
             ..Default::default()
@@ -4920,10 +4937,9 @@ primary_url = "postgres://toml.example/app"
     fn slot_map_rejects_overlap_gap_and_out_of_range() {
         // Overlap.
         let config = DatabaseConfig {
-            slot_count: 8,
             shards: vec![
-                shard_with_slots("a", "postgres://a/app", &["0-4"]),
-                shard_with_slots("b", "postgres://b/app", &["4-7"]),
+                shard_with_slots("a", "postgres://a/app", &["0-8192"]),
+                shard_with_slots("b", "postgres://b/app", &["8192-16383"]),
             ],
             ..Default::default()
         };
@@ -4932,12 +4948,11 @@ primary_url = "postgres://toml.example/app"
         };
         assert!(message.contains("already owned"));
 
-        // Gap.
+        // Gap — reported as compact ranges, not thousands of indices.
         let config = DatabaseConfig {
-            slot_count: 8,
             shards: vec![
-                shard_with_slots("a", "postgres://a/app", &["0-2"]),
-                shard_with_slots("b", "postgres://b/app", &["4-7"]),
+                shard_with_slots("a", "postgres://a/app", &["0-8000"]),
+                shard_with_slots("b", "postgres://b/app", &["8192-16383"]),
             ],
             ..Default::default()
         };
@@ -4945,57 +4960,43 @@ primary_url = "postgres://toml.example/app"
             panic!("uncovered slots should fail");
         };
         assert!(message.contains("unassigned"));
+        assert!(message.contains("8001-8191"), "got: {message}");
 
         // Out of range.
         let config = DatabaseConfig {
-            slot_count: 8,
-            shards: vec![shard_with_slots("a", "postgres://a/app", &["0-8"])],
+            shards: vec![shard_with_slots("a", "postgres://a/app", &["0-16384"])],
             ..Default::default()
         };
         assert!(config.resolved_slot_map().is_err());
     }
 
     #[test]
-    fn slot_map_rejects_bad_slot_count() {
-        for slot_count in [0u16, MAX_SLOT_COUNT + 1] {
-            let config = DatabaseConfig {
-                slot_count,
-                shards: vec![shard("a", "postgres://a/app")],
-                ..Default::default()
-            };
-            assert!(
-                config.resolved_slot_map().is_err(),
-                "slot_count {slot_count} should be rejected"
-            );
-        }
-        // More shards than slots cannot auto-split.
+    fn slot_map_rejects_more_shards_than_slots() {
         let config = DatabaseConfig {
-            slot_count: 1,
-            shards: vec![
-                shard("a", "postgres://a/app"),
-                shard("b", "postgres://b/app"),
-            ],
+            shards: (0..=usize::from(SLOT_COUNT))
+                .map(|i| shard(&format!("s{i}"), "postgres://s/app"))
+                .collect(),
             ..Default::default()
         };
-        assert!(config.resolved_slot_map().is_err());
+        let Err(ConfigError::Validation(message)) = config.resolved_slot_map() else {
+            panic!("more shards than slots cannot auto-split");
+        };
+        assert!(message.contains("at most"), "got: {message}");
     }
 
     #[test]
     fn slots_parse_from_toml_ints_and_ranges() {
         let config: AutumnConfig = toml::from_str(
             r#"
-[database]
-slot_count = 16
-
 [[database.shards]]
 name = "a"
 primary_url = "postgres://a/app"
-slots = ["0-7", 8, "9"]
+slots = ["0-8191", 8192, "8193"]
 
 [[database.shards]]
 name = "b"
 primary_url = "postgres://b/app"
-slots = ["10-15"]
+slots = ["8194-16383"]
 "#,
         )
         .expect("slots config should parse");
@@ -5003,37 +5004,44 @@ slots = ["10-15"]
             .database
             .resolved_slot_map()
             .expect("mixed int/range specs should resolve");
-        assert_eq!(map[..10], [0; 10]);
-        assert_eq!(map[10..], [1; 6]);
+        assert!(map[..8194].iter().all(|&owner| owner == 0));
+        assert!(map[8194..].iter().all(|&owner| owner == 1));
         config.validate().expect("config should validate");
     }
 
     #[test]
-    fn slot_env_overrides_assignments_and_count() {
+    fn slot_env_overrides_assignments() {
         let mut config = AutumnConfig::default();
         let env = MockEnv::new()
-            .with("AUTUMN_DATABASE__SLOT_COUNT", "4")
             .with("AUTUMN_DATABASE__SHARDS__0__NAME", "a")
             .with(
                 "AUTUMN_DATABASE__SHARDS__0__PRIMARY_URL",
                 "postgres://a/app",
             )
-            .with("AUTUMN_DATABASE__SHARDS__0__SLOTS", "0-1, 3")
+            .with("AUTUMN_DATABASE__SHARDS__0__SLOTS", "0-8191, 12288-16383")
             .with("AUTUMN_DATABASE__SHARDS__1__NAME", "b")
             .with(
                 "AUTUMN_DATABASE__SHARDS__1__PRIMARY_URL",
                 "postgres://b/app",
             )
-            .with("AUTUMN_DATABASE__SHARDS__1__SLOTS", "2");
+            .with("AUTUMN_DATABASE__SHARDS__1__SLOTS", "8192-12287");
 
         config.apply_env_overrides_with_env(&env);
 
-        assert_eq!(config.database.slot_count, 4);
         let map = config
             .database
             .resolved_slot_map()
             .expect("env slot specs should resolve");
-        assert_eq!(map, vec![0, 0, 1, 0]);
+        assert!(map[..8192].iter().all(|&owner| owner == 0));
+        assert!(map[8192..12288].iter().all(|&owner| owner == 1));
+        assert!(map[12288..].iter().all(|&owner| owner == 0));
+    }
+
+    #[test]
+    fn slot_ranges_format_compactly() {
+        assert_eq!(format_slot_ranges(&[]), "");
+        assert_eq!(format_slot_ranges(&[3]), "3");
+        assert_eq!(format_slot_ranges(&[0, 1, 2, 5, 7, 8]), "0-2, 5, 7-8");
     }
 
     #[test]

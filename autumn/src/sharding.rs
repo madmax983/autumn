@@ -1,13 +1,14 @@
 //! Horizontal database sharding.
 //!
 //! Autumn routes sharded data in two steps: a routing key (typically the
-//! tenant id) hashes onto a fixed set of **logical slots**
-//! (`database.slot_count`, default 64), and each slot maps to one physical
-//! shard via the `[[database.shards]]` configuration. The key→slot hash is
-//! a permanent contract — it is deterministic across processes, replicas,
-//! and Autumn versions — while the slot→shard map is plain configuration.
-//! Resharding therefore means moving whole slots between shards and
-//! flipping the map, never rehashing keys.
+//! tenant id) hashes onto a fixed set of [`SLOT_COUNT`] (16384) **logical
+//! slots** — the same constant Redis Cluster and Valkey use — and each
+//! slot maps to one physical shard via the `[[database.shards]]`
+//! configuration. The key→slot hash is a permanent contract — it is
+//! deterministic across processes, replicas, and Autumn versions — while
+//! the slot→shard map is plain configuration. Resharding therefore means
+//! moving whole slots between shards and flipping the map, never
+//! rehashing keys.
 //!
 //! Each shard is a full [`DatabaseTopology`] (primary + optional read
 //! replica), so the primary/replica story composes with sharding.
@@ -25,12 +26,12 @@
 //! [[database.shards]]
 //! name = "shard0"
 //! primary_url = "postgres://db-shard0/app"
-//! slots = ["0-31"]
+//! slots = ["0-8191"]
 //!
 //! [[database.shards]]
 //! name = "shard1"
 //! primary_url = "postgres://db-shard1/app"
-//! slots = ["32-63"]
+//! slots = ["8192-16383"]
 //! ```
 
 use std::collections::HashMap;
@@ -40,6 +41,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use diesel_async::AsyncPgConnection;
 use diesel_async::pooled_connection::deadpool::Pool;
 
+pub use crate::config::SLOT_COUNT;
 use crate::config::{ConfigError, DatabaseConfig, ReplicaFallback};
 use crate::db::{DatabaseTopology, PoolError};
 use crate::error::AutumnError;
@@ -51,7 +53,7 @@ use crate::error::AutumnError;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ShardId(pub usize);
 
-/// A logical routing slot in `0..database.slot_count`.
+/// A logical routing slot in <code>0..[SLOT_COUNT]</code>.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct SlotId(pub u16);
 
@@ -147,16 +149,15 @@ fn key_hash64(key: ShardKey<'_>) -> u64 {
     }
 }
 
-/// Map a routing key onto a logical slot in `0..slot_count`.
+/// Map a routing key onto a logical slot in <code>0..[SLOT_COUNT]</code>.
 ///
 /// This function is deterministic across processes and versions; see the
-/// module docs. `slot_count` must be non-zero (validated at config load).
+/// module docs.
 #[must_use]
-pub fn slot_for_key(key: ShardKey<'_>, slot_count: u16) -> SlotId {
-    debug_assert!(slot_count > 0, "slot_count is validated at config load");
+pub fn slot_for_key(key: ShardKey<'_>) -> SlotId {
     let hash = key_hash64(key);
     #[allow(clippy::cast_possible_truncation)]
-    SlotId((hash % u64::from(slot_count.max(1))) as u16)
+    SlotId((hash % u64::from(SLOT_COUNT)) as u16)
 }
 
 // ── Router ───────────────────────────────────────────────────────────────────
@@ -426,7 +427,6 @@ struct ShardSetInner {
     by_name: HashMap<String, usize>,
     /// `slot_map[slot]` is the index into `shards` of the slot's owner.
     slot_map: Vec<usize>,
-    slot_count: u16,
     router: Arc<dyn ShardRouter>,
 }
 
@@ -453,10 +453,10 @@ impl ShardSet {
         self.inner.shards.is_empty()
     }
 
-    /// Number of logical slots (`database.slot_count`).
+    /// Number of logical slots — the fixed [`SLOT_COUNT`] (16384).
     #[must_use]
-    pub fn slot_count(&self) -> u16 {
-        self.inner.slot_count
+    pub const fn slot_count(&self) -> u16 {
+        SLOT_COUNT
     }
 
     /// Shard by positional id.
@@ -483,7 +483,7 @@ impl ShardSet {
     /// the module docs for the permanence guarantee).
     #[must_use]
     pub fn slot_for_key<'k>(&self, key: impl Into<ShardKey<'k>>) -> SlotId {
-        slot_for_key(key.into(), self.inner.slot_count)
+        slot_for_key(key.into())
     }
 
     /// Owner of a logical slot per the configured slot map.
@@ -537,7 +537,6 @@ impl std::fmt::Debug for ShardSet {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ShardSet")
             .field("shards", &self.inner.shards)
-            .field("slot_count", &self.inner.slot_count)
             .finish_non_exhaustive()
     }
 }
@@ -668,7 +667,6 @@ pub fn build_shard_set(
             shards,
             by_name,
             slot_map,
-            slot_count: config.slot_count,
             router,
         }),
     })
@@ -1211,25 +1209,25 @@ mod tests {
     // keys — do not update the expected values; fix the hash instead.
 
     #[test]
-    fn golden_vector_str_keys_at_64_slots() {
+    fn golden_vector_str_keys() {
         // Expected slots computed independently (Python reference
-        // implementation of FNV-1a 64 mod 64) when the contract was
+        // implementation of FNV-1a 64 mod 16384) when the contract was
         // established.
         let cases: &[(&str, u16)] = &[
-            ("tenant-1", 11),
-            ("tenant-2", 62),
-            ("tenant-3", 49),
-            ("acme-corp", 2),
-            ("globex", 46),
-            ("initech", 1),
-            ("hooli", 6),
-            ("", 37),
-            ("a", 12),
-            ("00000000-0000-0000-0000-000000000001", 62),
+            ("tenant-1", 12427),
+            ("tenant-2", 12862),
+            ("tenant-3", 13297),
+            ("acme-corp", 11394),
+            ("globex", 12846),
+            ("initech", 11329),
+            ("hooli", 3974),
+            ("", 8997),
+            ("a", 11404),
+            ("00000000-0000-0000-0000-000000000001", 6206),
         ];
         for (key, expected_slot) in cases {
             assert_eq!(
-                slot_for_key(ShardKey::Str(key), 64),
+                slot_for_key(ShardKey::Str(key)),
                 SlotId(*expected_slot),
                 "key {key:?} must keep routing to slot {expected_slot} forever",
             );
@@ -1237,23 +1235,23 @@ mod tests {
     }
 
     #[test]
-    fn golden_vector_int_keys_at_64_slots() {
+    fn golden_vector_int_keys() {
         // Expected slots computed independently (Python reference
-        // implementation of splitmix64 mod 64) when the contract was
+        // implementation of splitmix64 mod 16384) when the contract was
         // established.
         let cases: &[(i64, u16)] = &[
-            (0, 47),
-            (1, 1),
-            (2, 14),
-            (42, 21),
-            (1_000_000, 39),
-            (-1, 32),
-            (i64::MAX, 39),
-            (i64::MIN, 27),
+            (0, 3503),
+            (1, 7361),
+            (2, 5838),
+            (42, 11925),
+            (1_000_000, 1511),
+            (-1, 11296),
+            (i64::MAX, 7847),
+            (i64::MIN, 13275),
         ];
         for (key, expected_slot) in cases {
             assert_eq!(
-                slot_for_key(ShardKey::Int(*key), 64),
+                slot_for_key(ShardKey::Int(*key)),
                 SlotId(*expected_slot),
                 "key {key} must keep routing to slot {expected_slot} forever",
             );
@@ -1264,25 +1262,26 @@ mod tests {
     fn golden_vector_bytes_match_equivalent_str() {
         // Str and Bytes share FNV-1a, so identical bytes route identically.
         assert_eq!(
-            slot_for_key(ShardKey::Bytes(b"tenant-1"), 64),
-            slot_for_key(ShardKey::Str("tenant-1"), 64),
+            slot_for_key(ShardKey::Bytes(b"tenant-1")),
+            slot_for_key(ShardKey::Str("tenant-1")),
         );
     }
 
     #[test]
     fn slots_stay_in_range_and_spread_roughly_uniformly() {
-        let slot_count = 16u16;
-        let mut histogram = vec![0usize; usize::from(slot_count)];
+        // 10k keys over 16384 slots is too sparse for per-slot bounds, so
+        // check uniformity over 16 contiguous buckets of 1024 slots each.
+        let mut histogram = [0usize; 16];
         for i in 0..10_000i64 {
-            let slot = slot_for_key(ShardKey::Int(i), slot_count);
-            assert!(slot.0 < slot_count);
-            histogram[usize::from(slot.0)] += 1;
+            let slot = slot_for_key(ShardKey::Int(i));
+            assert!(slot.0 < SLOT_COUNT);
+            histogram[usize::from(slot.0 / 1024)] += 1;
         }
-        let expected = 10_000 / usize::from(slot_count);
-        for (slot, count) in histogram.iter().enumerate() {
+        let expected = 10_000 / histogram.len();
+        for (bucket, count) in histogram.iter().enumerate() {
             assert!(
                 *count > expected / 2 && *count < expected * 2,
-                "slot {slot} has {count} keys (expected ≈{expected})"
+                "bucket {bucket} has {count} keys (expected ≈{expected})"
             );
         }
     }
@@ -1326,16 +1325,15 @@ mod tests {
     #[tokio::test]
     async fn route_is_deterministic_and_respects_slot_map() {
         let mut config = sharded_config(&["a", "b"]);
-        config.slot_count = 4;
-        config.shards[0].slots = Some(vec![SlotSpec::Range("0-2".to_owned())]);
-        config.shards[1].slots = Some(vec![SlotSpec::Index(3)]);
+        config.shards[0].slots = Some(vec![SlotSpec::Range("0-8191".to_owned())]);
+        config.shards[1].slots = Some(vec![SlotSpec::Range("8192-16383".to_owned())]);
         let set = create_shard_set(&config, Arc::new(HashShardRouter))
             .expect("build")
             .expect("configured");
 
         for key in ["k1", "k2", "k3", "k4", "k5"] {
             let slot = set.slot_for_key(key);
-            let expected = if slot.0 == 3 { "b" } else { "a" };
+            let expected = if slot.0 >= 8192 { "b" } else { "a" };
             let routed = set.route(key).await.expect("route");
             assert_eq!(routed.name(), expected, "key {key:?} slot {}", slot.0);
             // Same key always lands on the same shard.
@@ -1345,18 +1343,16 @@ mod tests {
 
     #[tokio::test]
     async fn moving_a_slot_in_config_moves_only_that_slot() {
-        // "Reshard" by reassigning slot 3 from shard b to a new shard c:
-        // keys in slots 0-2 must not move.
+        // "Reshard" by reassigning slots 12288-16383 from shard b to a new
+        // shard c: keys in slots 0-12287 must not move.
         let mut before = sharded_config(&["a", "b"]);
-        before.slot_count = 4;
-        before.shards[0].slots = Some(vec![SlotSpec::Range("0-2".to_owned())]);
-        before.shards[1].slots = Some(vec![SlotSpec::Index(3)]);
+        before.shards[0].slots = Some(vec![SlotSpec::Range("0-8191".to_owned())]);
+        before.shards[1].slots = Some(vec![SlotSpec::Range("8192-16383".to_owned())]);
 
         let mut after = sharded_config(&["a", "b", "c"]);
-        after.slot_count = 4;
-        after.shards[0].slots = Some(vec![SlotSpec::Range("0-2".to_owned())]);
-        after.shards[1].slots = Some(vec![]);
-        after.shards[2].slots = Some(vec![SlotSpec::Index(3)]);
+        after.shards[0].slots = Some(vec![SlotSpec::Range("0-8191".to_owned())]);
+        after.shards[1].slots = Some(vec![SlotSpec::Range("8192-12287".to_owned())]);
+        after.shards[2].slots = Some(vec![SlotSpec::Range("12288-16383".to_owned())]);
 
         let set_before = create_shard_set(&before, Arc::new(HashShardRouter))
             .expect("build")
@@ -1365,19 +1361,21 @@ mod tests {
             .expect("build")
             .expect("configured");
 
+        let mut moved = 0;
         for i in 0..200i64 {
             let slot = set_before.slot_for_key(i);
             assert_eq!(slot, set_after.slot_for_key(i), "key→slot never changes");
             let before_shard = set_before.route(i).await.expect("route");
             let after_shard = set_after.route(i).await.expect("route");
-            if slot.0 == 3 {
+            if slot.0 >= 12288 {
                 assert_eq!(before_shard.name(), "b");
                 assert_eq!(after_shard.name(), "c");
+                moved += 1;
             } else {
-                assert_eq!(before_shard.name(), "a");
-                assert_eq!(after_shard.name(), "a");
+                assert_eq!(before_shard.name(), after_shard.name());
             }
         }
+        assert!(moved > 0, "some keys must exercise the moved slot range");
     }
 
     #[test]
@@ -1395,11 +1393,11 @@ mod tests {
     #[test]
     fn auto_split_assigns_contiguous_slots() {
         let set = shard_set(&["a", "b"]);
-        assert_eq!(set.slot_count(), 64);
-        assert_eq!(set.get(ShardId(0)).expect("a").slots().len(), 32);
+        assert_eq!(set.slot_count(), SLOT_COUNT);
+        assert_eq!(set.get(ShardId(0)).expect("a").slots().len(), 8192);
         assert_eq!(
             set.get(ShardId(1)).expect("b").slots(),
-            (32..64).collect::<Vec<u16>>()
+            (8192..16384).collect::<Vec<u16>>()
         );
     }
 
@@ -1579,19 +1577,19 @@ mod tests {
     fn shard_key_from_impls_route_consistently() {
         // i32 widens to the same slot as the equivalent i64.
         assert_eq!(
-            slot_for_key(ShardKey::from(42i32), 64),
-            slot_for_key(ShardKey::from(42i64), 64),
+            slot_for_key(ShardKey::from(42i32)),
+            slot_for_key(ShardKey::from(42i64)),
         );
         // Owned strings, str slices, and byte arrays agree.
         let owned = "tenant-1".to_owned();
         let bytes: [u8; 16] = *b"0123456789abcdef";
         assert_eq!(
-            slot_for_key(ShardKey::from(&owned), 64),
-            slot_for_key(ShardKey::from("tenant-1"), 64),
+            slot_for_key(ShardKey::from(&owned)),
+            slot_for_key(ShardKey::from("tenant-1")),
         );
         assert_eq!(
-            slot_for_key(ShardKey::from(&bytes), 64),
-            slot_for_key(ShardKey::from(&b"0123456789abcdef"[..]), 64),
+            slot_for_key(ShardKey::from(&bytes)),
+            slot_for_key(ShardKey::from(&b"0123456789abcdef"[..])),
         );
     }
 

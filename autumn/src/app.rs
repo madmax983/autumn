@@ -2425,7 +2425,6 @@ impl AppBuilder {
                 replica_configured = config.database.replica_url.is_some(),
                 replica_max_connections = config.database.effective_replica_pool_size(),
                 shard_count = shards.as_ref().map_or(0, crate::sharding::ShardSet::len),
-                slot_count = config.database.slot_count,
                 total_max_connections = control_max_connections + shard_max_connections,
                 "Database topology configured"
             );

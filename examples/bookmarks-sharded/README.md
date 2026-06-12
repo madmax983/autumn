@@ -8,26 +8,27 @@ handlers use the `ShardedDb` / `Shards` extractors from the prelude.
 ## How routing works
 
 ```
-tenant id ──hash──▶ logical slot (0..64) ──config map──▶ physical shard
+tenant id ──hash──▶ logical slot (0..16384) ──config map──▶ physical shard
 ```
 
-The key→slot hash is deterministic across processes and Autumn versions
-(both web replicas always agree). The slot→shard map is configuration:
+The slot count is fixed at 16384 (the same constant Redis Cluster and
+Valkey use) — there is nothing to choose or outgrow. The key→slot hash
+is deterministic across processes and Autumn versions (both web replicas
+always agree). The slot→shard map is configuration:
 
 ```toml
 [database]
 primary_url = "postgres://.../bookmarks_control"   # control role: NOT sharded
-slot_count  = 64                                   # choose once, before data lands
 
 [[database.shards]]
 name = "shard0"
 primary_url = "postgres://.../bookmarks_shard0"
-slots = ["0-31"]
+slots = ["0-8191"]
 
 [[database.shards]]
 name = "shard1"
 primary_url = "postgres://.../bookmarks_shard1"
-slots = ["32-63"]
+slots = ["8192-16383"]
 ```
 
 Resharding means moving whole slots: copy a slot's rows to the new
@@ -80,7 +81,7 @@ Cross-shard fan-out (concurrent, partial-failure friendly):
 
 ```bash
 curl -s http://localhost:3000/api/stats
-# {"shard0":{"slots":32,"bookmarks":3},"shard1":{"slots":32,"bookmarks":1}}
+# {"shard0":{"slots":8192,"bookmarks":3},"shard1":{"slots":8192,"bookmarks":1}}
 ```
 
 Per-shard health components and pool metrics:

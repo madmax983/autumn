@@ -12,9 +12,9 @@ primary_url = "postgres://autumn:autumn@postgres-control:5432/bookmarks_control"
 [[database.shards]]
 name = "shard0"
 primary_url = "postgres://autumn:autumn@postgres-shard-0:5432/bookmarks_shard0"
-slots = ["0-31"]
+slots = ["0-8191"]
 
 [[database.shards]]
 name = "shard1"
 primary_url = "postgres://autumn:autumn@postgres-shard-1:5432/bookmarks_shard1"
-slots = ["32-63"]
+slots = ["8192-16383"]

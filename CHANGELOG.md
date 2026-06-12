@@ -10,11 +10,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - **db:** Framework-native horizontal sharding (`[[database.shards]]`)
-  - Tenant data routes key → logical slot (`database.slot_count`, default 64;
-    deterministic FNV-1a/splitmix64 hash pinned by golden-vector tests) →
-    physical shard per an explicit `slots` map, so resharding moves whole
-    slots in config instead of rehashing keys. Each shard is a full
-    primary/replica `DatabaseTopology` with per-shard `replica_fallback`.
+  - Tenant data routes key → logical slot (fixed at 16384 slots, matching
+    Redis Cluster/Valkey — nothing to choose or outgrow; deterministic
+    FNV-1a/splitmix64 hash pinned by golden-vector tests) → physical shard
+    per an explicit `slots` map, so resharding moves whole slots in config
+    instead of rehashing keys. Each shard is a full primary/replica
+    `DatabaseTopology` with per-shard `replica_fallback`.
   - New `autumn_web::sharding` module and prelude extractors: `ShardedDb`
     (tenant-routed via `ShardKeyOverride` → tenancy task-local → tenant
     extraction; derefs like `Db` with the same `tx` semantics) and `Shards`

@@ -13,13 +13,12 @@ primary + optional replica topology** of its own, with the same
 ## Keys, slots, and shards
 
 ```
-routing key (tenant id) ──hash──▶ logical slot (0..slot_count) ──config map──▶ shard
+routing key (tenant id) ──hash──▶ logical slot (0..16384) ──config map──▶ shard
 ```
 
 Keys never map to physical shards directly. They hash onto a fixed set
-of **logical slots** (`database.slot_count`, default 64), and each slot
-is owned by exactly one shard per the configuration. Two properties fall
-out of this split:
+of **16384 logical slots**, and each slot is owned by exactly one shard
+per the configuration. Two properties fall out of this split:
 
 - **The key→slot hash is a permanent contract.** It is deterministic
   across processes, replicas, and Autumn versions (FNV-1a/splitmix64 —
@@ -30,8 +29,13 @@ out of this split:
   whole slots: copy a slot's rows to the new shard, flip its `slots`
   entry, deploy. Keys are never rehashed.
 
-`slot_count` is **choose-once**: changing it later re-routes every key —
-a full reshard. The default 64 supports up to 64 physical shards.
+The slot count is **fixed at 16384** — the same constant Redis Cluster
+and Valkey use — and is not configurable. Slots are pure routing-table
+entries (no pools or per-slot resources), so the fixed count costs
+nothing, and it removes the classic "chose too few partitions on day
+one" failure mode: there is no number to pick, nothing to outgrow short
+of 16384 physical shards, and every Autumn deployment routes the same
+key to the same slot.
 
 ## Configuration
 
@@ -39,17 +43,16 @@ a full reshard. The default 64 supports up to 64 physical shards.
 [database]
 # The CONTROL role. Framework state lives here and is never sharded.
 primary_url = "postgres://db-control/app"
-slot_count = 64
 
 [[database.shards]]
 name = "shard0"                              # stable identity for logs/metrics/health/CLI
 primary_url = "postgres://db-shard0/app"
-slots = ["0-31"]                             # indices and/or "A-B" inclusive ranges
+slots = ["0-8191"]                           # indices and/or "A-B" inclusive ranges
 
 [[database.shards]]
 name = "shard1"
 primary_url = "postgres://db-shard1/app"
-slots = ["32-63"]
+slots = ["8192-16383"]
 replica_url = "postgres://db-shard1-ro/app"  # optional: full topology per shard
 replica_fallback = "primary"                 # falls back to [database] defaults
 primary_pool_size = 4
@@ -60,8 +63,8 @@ source = "header"        # the tenant id doubles as the shard routing key
 ```
 
 `slots` is all-or-none: either every shard declares it (the map must
-cover `0..slot_count` exactly once; an explicit empty list marks a
-drained shard being decommissioned) or none does, in which case Autumn
+cover `0..16384` exactly once; an explicit empty list marks a drained
+shard being decommissioned) or none does, in which case Autumn
 auto-splits the slot space into contiguous even ranges **by declaration
 order**. The auto-split is convenient to start with, but reordering
 entries then moves data — pin explicit `slots` before any topology
@@ -71,10 +74,9 @@ Environment overrides address shards positionally:
 
 | Variable | Field |
 |----------|-------|
-| `AUTUMN_DATABASE__SLOT_COUNT` | `database.slot_count` |
 | `AUTUMN_DATABASE__SHARDS__{i}__NAME` | `database.shards[i].name` |
 | `AUTUMN_DATABASE__SHARDS__{i}__PRIMARY_URL` | `database.shards[i].primary_url` |
-| `AUTUMN_DATABASE__SHARDS__{i}__SLOTS` | CSV, e.g. `"0-15,40,62-63"` |
+| `AUTUMN_DATABASE__SHARDS__{i}__SLOTS` | CSV, e.g. `"0-8191,16000,16382-16383"` |
 | `AUTUMN_DATABASE__SHARDS__{i}__REPLICA_URL` | `database.shards[i].replica_url` |
 | `AUTUMN_DATABASE__SHARDS__{i}__PRIMARY_POOL_SIZE` | `database.shards[i].primary_pool_size` |
 | `AUTUMN_DATABASE__SHARDS__{i}__REPLICA_POOL_SIZE` | `database.shards[i].replica_pool_size` |

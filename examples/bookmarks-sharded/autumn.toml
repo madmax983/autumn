@@ -14,19 +14,19 @@ level = "info"
 [database]
 primary_url = "postgres://autumn:autumn@localhost:5442/bookmarks_control"
 pool_size = 4
-slot_count = 64
 
-# Explicit slot assignments: declaration order is inert and resharding is
-# a config flip (move a slot's rows, then move the slot).
+# Explicit slot assignments over the fixed 16384 logical slots (the same
+# constant Redis Cluster uses): declaration order is inert and resharding
+# is a config flip (move a slot's rows, then move the slot).
 [[database.shards]]
 name = "shard0"
 primary_url = "postgres://autumn:autumn@localhost:5443/bookmarks_shard0"
-slots = ["0-31"]
+slots = ["0-8191"]
 
 [[database.shards]]
 name = "shard1"
 primary_url = "postgres://autumn:autumn@localhost:5444/bookmarks_shard1"
-slots = ["32-63"]
+slots = ["8192-16383"]
 
 # The tenant id doubles as the shard routing key: `ShardedDb` resolves it
 # from the X-Tenant-Id header on every request.
