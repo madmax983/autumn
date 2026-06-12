@@ -1506,6 +1506,15 @@ impl axum::extract::FromRequestParts<crate::AppState> for Experiments {
 
 #[cfg(feature = "db")]
 pub mod pg {
+    //! Postgres-backed persistent storage for experiments.
+    //!
+    //! Implements [`ExperimentStore`] using Diesel and `PostgreSQL`, allowing
+    //! experiment configurations and rollout states to be shared consistently
+    //! across a fleet of stateless application servers.
+    //!
+    //! Uses a polling interval to periodically refresh the in-memory cache
+    //! from the database.
+
     use super::{
         Assignment, ChangeRecord, ExperimentConfig, ExperimentState, ExperimentStore,
         ExperimentStoreError, VariantConfig,

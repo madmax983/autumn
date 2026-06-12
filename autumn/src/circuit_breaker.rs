@@ -1,3 +1,44 @@
+//! Circuit Breaker implementation for isolating application failures.
+//!
+//! A circuit breaker monitors requests to external services or internal
+//! components and temporarily blocks them if the failure rate exceeds a threshold.
+//! This prevents cascading failures and gives the failing system time to recover.
+//!
+//! # How it works
+//!
+//! - **Closed**: Requests pass through normally. If the failure rate exceeds the `failure_ratio_threshold` within a sample window, the breaker opens.
+//! - **Open**: Requests fail fast without attempting execution. After `open_duration`, it transitions to Half-Open.
+//! - **Half-Open**: Allows a limited number (`half_open_trial_count`) of requests through. If they succeed, it closes; if any fail, it re-opens.
+//!
+//! # Examples
+//!
+//! Using a circuit breaker standalone:
+//!
+//! ```rust
+//! use autumn_web::circuit_breaker::{CircuitBreaker, CircuitBreakerPolicy, CircuitState, CircuitBreakerError};
+//! use std::time::Duration;
+//!
+//! # tokio_test::block_on(async {
+//! let policy = CircuitBreakerPolicy {
+//!     failure_ratio_threshold: 0.5,
+//!     sample_window: Duration::from_secs(10),
+//!     minimum_sample_count: 5,
+//!     open_duration: Duration::from_secs(60),
+//!     half_open_trial_count: 2,
+//! };
+//!
+//! let breaker = CircuitBreaker::new("payment_service", policy);
+//!
+//! // Execute a block through the breaker
+//! let result = breaker.run(async {
+//!     // Some async operation...
+//!     Ok::<_, &'static str>("success")
+//! }).await;
+//!
+//! assert_eq!(result.unwrap(), "success");
+//! # });
+//! ```
+
 #![allow(
     clippy::missing_panics_doc,
     clippy::missing_errors_doc,

@@ -1,3 +1,35 @@
+//! Idempotency key middleware for safely retrying mutable operations.
+//!
+//! Provides an HTTP layer that intercepts requests carrying an `idempotency-key`
+//! header and ensures that the underlying handler is only executed once for a
+//! given key within a caching window. Subsequent requests with the same key
+//! short-circuit and return the cached response.
+//!
+//! # How it works
+//!
+//! 1. When a request arrives with an `idempotency-key` header, the middleware checks its in-memory cache.
+//! 2. If the key exists and is fully resolved, the cached `Response` is immediately returned with the `x-idempotent-replayed: true` header.
+//! 3. If the key exists but is currently processing, the request waits until the first request finishes.
+//! 4. If the key is new, the request proceeds. Its response is stored upon completion.
+//!
+//! Important: Idempotency keys are typically provided by the client (e.g. a UUID).
+//! This ensures that if the client loses network connectivity before receiving the
+//! response, they can safely retry the exact same request.
+//!
+//! # Examples
+//!
+//! Adding the idempotency layer to an Axum router:
+//!
+//! ```rust
+//! use axum::{Router, routing::post};
+//! use autumn_web::idempotency::IdempotencyLayer;
+//!
+//! let layer = IdempotencyLayer::new();
+//! let app = Router::new()
+//!     .route("/payments", post(|| async { "Payment processed" }))
+//!     .layer(layer);
+//! ```
+
 use bytes::Bytes;
 use futures::StreamExt as FuturesStreamExt;
 
