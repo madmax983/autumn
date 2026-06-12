@@ -2333,16 +2333,20 @@ async fn execute_local_job(
                 // still in flight until it settles). A pending-window key was
                 // released when execution started, so re-acquire it now to
                 // keep duplicates coalescing while the retry waits out its
-                // backoff as a pending job again. Best effort by design: if a
-                // duplicate was legitimately accepted while this job ran, it
-                // owns the key and this retry proceeds without one (see the
-                // pending-window contract in docs/guide/jobs.md).
+                // backoff as a pending job again. If a duplicate was accepted
+                // while this job ran it now owns the key; in that case drop
+                // the retry (coalesce into the duplicate) rather than letting
+                // both run unprotected.
                 if let Some(unique) = &uniqueness
                     && unique.window == JobUniquenessWindow::Pending
                 {
                     let key = job_unique_key(unique, &job.payload);
-                    let _ =
-                        coordination.try_acquire_unique(&job.name, &key, &job.id, unique.window);
+                    if !coordination.try_acquire_unique(&job.name, &key, &job.id, unique.window) {
+                        state.job_registry.record_deduplicated(&job.name);
+                        job_admin.record_deduplicated(&job.id);
+                        finish_local_slot(coordination, concurrency_group.as_ref(), tx, state);
+                        return;
+                    }
                 }
                 state
                     .job_registry
