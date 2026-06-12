@@ -731,7 +731,10 @@ mod tests {
         let r = ReplicaMigrationReadiness::Unknown("db error xyz".to_string());
         assert!(!r.is_ready());
         let detail = r.detail().expect("Unknown must have detail");
-        assert!(detail.contains("db error xyz"), "detail must contain the error: {detail}");
+        assert!(
+            detail.contains("db error xyz"),
+            "detail must contain the error: {detail}"
+        );
     }
 
     #[test]
