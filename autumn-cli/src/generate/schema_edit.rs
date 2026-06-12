@@ -776,7 +776,6 @@ fn splice_feature_at(
                 out.push_str(&new_entry);
                 out.push('\n');
                 out.push_str(l);
-                out.push('\n');
             } else if k + 1 == close_idx && k > feat_idx {
                 // Ensure the last existing item has a trailing comma before the
                 // new entry is inserted; without it the TOML would be invalid.
@@ -794,11 +793,10 @@ fn splice_feature_at(
                 } else {
                     out.push_str(l);
                 }
-                out.push('\n');
             } else {
                 out.push_str(l);
-                out.push('\n');
             }
+            out.push('\n');
         }
     } else {
         for (k, &l) in lines.iter().enumerate() {
