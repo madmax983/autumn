@@ -484,3 +484,199 @@ async fn test_circuit_breaker_blanket_from_smtp() {
 
     autumn_web::circuit_breaker::global_registry().clear();
 }
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn test_circuit_breaker_non_detailed_unhealthy_visibility() {
+    let _lock = autumn_web::circuit_breaker::TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    autumn_web::circuit_breaker::global_registry().clear();
+
+    let is_outage = Arc::new(AtomicBool::new(false));
+    let is_outage_clone = is_outage.clone();
+    let mock_app = Router::new().route(
+        "/downstream-target",
+        get(move || {
+            let outage = is_outage_clone.load(Ordering::SeqCst);
+            async move {
+                if outage {
+                    StatusCode::INTERNAL_SERVER_ERROR
+                } else {
+                    StatusCode::OK
+                }
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let port = addr.port();
+    tokio::spawn(async move {
+        axum::serve(listener, mock_app).await.unwrap();
+    });
+
+    let mut config = AutumnConfig::default();
+    config.health.detailed = false; // non-detailed mode!
+    config
+        .resilience
+        .circuit_breaker
+        .defaults
+        .failure_ratio_threshold = Some(0.5);
+    config
+        .resilience
+        .circuit_breaker
+        .defaults
+        .minimum_sample_count = Some(2);
+    config
+        .resilience
+        .circuit_breaker
+        .defaults
+        .open_duration_secs = Some(10);
+
+    let client = TestApp::new()
+        .config(config)
+        .routes(routes![call_downstream])
+        .build();
+
+    // 1. Initially CLOSED (UP). It should NOT be visible because health.detailed = false.
+    let health_resp_1 = client.get("/actuator/health").send().await;
+    health_resp_1.assert_ok();
+    health_resp_1.assert_json::<serde_json::Value, _>(|val| {
+        assert_eq!(val["status"], "UP");
+        assert!(val["components"].get(&format!("circuit_breaker.127.0.0.1:{port}")).is_none());
+    });
+
+    // 2. Trigger failures to trip the breaker
+    is_outage.store(true, Ordering::SeqCst);
+    for _ in 0..2 {
+        let _ = client.get(&format!("/call-downstream/{port}")).send().await;
+    }
+
+    // 3. Now OPEN (DOWN). It SHOULD be visible because it is unhealthy (DOWN), but its details should be omitted!
+    let health_resp_2 = client.get("/actuator/health").send().await;
+    health_resp_2.assert_status(503);
+    health_resp_2.assert_json::<serde_json::Value, _>(|val| {
+        assert_eq!(val["status"], "DOWN");
+        let cb = &val["components"][&format!("circuit_breaker.127.0.0.1:{port}")];
+        assert_eq!(cb["status"], "DOWN");
+        assert!(cb.get("details").is_none() || cb["details"].is_null());
+    });
+
+    autumn_web::circuit_breaker::global_registry().clear();
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn test_circuit_breaker_half_open_suppresses_retries() {
+    let _lock = autumn_web::circuit_breaker::TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    autumn_web::circuit_breaker::global_registry().clear();
+
+    // 1. Setup mock downstream server that counts hits
+    let hit_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let hit_count_clone = hit_count.clone();
+    let mock_app = Router::new().route(
+        "/downstream-target",
+        get(move || {
+            let hits = hit_count_clone.fetch_add(1, Ordering::SeqCst);
+            println!("Downstream hit: {}", hits + 1);
+            async move {
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let port = addr.port();
+    tokio::spawn(async move {
+        axum::serve(listener, mock_app).await.unwrap();
+    });
+
+    // 2. Configure Autumn app with short circuit settings
+    let mut config = AutumnConfig::default();
+    config.health.detailed = true;
+    config
+        .resilience
+        .circuit_breaker
+        .defaults
+        .failure_ratio_threshold = Some(0.5);
+    config
+        .resilience
+        .circuit_breaker
+        .defaults
+        .minimum_sample_count = Some(2);
+    config
+        .resilience
+        .circuit_breaker
+        .defaults
+        .open_duration_secs = Some(1); // 1s open
+    config
+        .resilience
+        .circuit_breaker
+        .defaults
+        .sample_window_secs = Some(10);
+    config
+        .resilience
+        .circuit_breaker
+        .defaults
+        .half_open_trial_count = Some(1);
+
+    let client = TestApp::new()
+        .config(config)
+        .routes(routes![call_downstream])
+        .build();
+
+    // Trip the breaker to OPEN state by failing 2 times
+    let _ = client.get(&format!("/call-downstream/{port}")).send().await;
+    let _ = client.get(&format!("/call-downstream/{port}")).send().await;
+
+    // Reset hit counter after tripping
+    hit_count.store(0, Ordering::SeqCst);
+
+    // Wait for open duration to expire (breaker moves to HalfOpen on next request)
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+
+    // Send a request. Since the breaker is in HalfOpen, retries should be suppressed.
+    // Downstream always returns 500. Without suppression, it would retry 3 times (4 attempts total).
+    // With suppression, it should only hit downstream exactly 1 time.
+    let resp = client.get(&format!("/call-downstream/{port}")).send().await;
+    resp.assert_ok();
+    assert!(resp.text().contains("500"));
+
+    let total_hits = hit_count.load(Ordering::SeqCst);
+    assert_eq!(total_hits, 1, "HalfOpen trial probe must issue exactly 1 downstream request");
+
+    autumn_web::circuit_breaker::global_registry().clear();
+}
+
+#[tokio::test]
+async fn test_circuit_breaker_generic_open_error_mapping() {
+    use autumn_web::circuit_breaker::{CircuitBreaker, CircuitBreakerPolicy, CircuitBreakerError};
+    use autumn_web::error::AutumnError;
+
+    let mut policy = CircuitBreakerPolicy::default();
+    policy.minimum_sample_count = 1;
+    policy.failure_ratio_threshold = 0.1;
+    let breaker = CircuitBreaker::new("test_generic_open", policy);
+
+    // Trip the breaker by running a failing future
+    let res = breaker.run(async {
+        Result::<(), std::io::Error>::Err(std::io::Error::other("failure"))
+    }).await;
+    assert!(res.is_err());
+
+    // Now execution via run should return CircuitBreakerError::Open immediately
+    let res2 = breaker.run(async {
+        Result::<(), std::io::Error>::Ok(())
+    }).await;
+
+    assert!(res2.is_err());
+    let err = res2.unwrap_err();
+    assert!(matches!(err, CircuitBreakerError::Open));
+
+    // Convert to AutumnError
+    let autumn_err = AutumnError::from(err);
+    assert_eq!(autumn_err.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+

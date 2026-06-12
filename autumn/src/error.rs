@@ -169,6 +169,12 @@ where
         let mut status = StatusCode::INTERNAL_SERVER_ERROR;
         let any_err: &dyn std::any::Any = &err;
 
+        if std::any::type_name::<E>().contains("CircuitBreakerError")
+            && err.to_string() == "circuit breaker is open"
+        {
+            status = StatusCode::SERVICE_UNAVAILABLE;
+        }
+
         #[cfg(feature = "http-client")]
         {
             if matches!(

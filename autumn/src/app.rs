@@ -2863,18 +2863,18 @@ impl AppBuilder {
         }
 
         if !state.probes().is_shutting_down() {
-            if !tasks.is_empty()
-                && let Err(error) = start_task_scheduler_with_config(
+            if !tasks.is_empty() {
+                if let Err(err) = start_task_scheduler_with_config(
                     tasks,
                     &state,
                     &server_shutdown,
                     &config.scheduler,
-                )
-            {
-                tracing::error!(error = %error, "scheduled task runtime initialization failed");
-                server_shutdown.cancel();
-                server_task.abort();
-                std::process::exit(1);
+                ) {
+                    tracing::error!(error = %err, "scheduled task runtime initialization failed");
+                    server_shutdown.cancel();
+                    server_task.abort();
+                    std::process::exit(1);
+                }
             }
             state.probes().mark_startup_complete();
         }

@@ -773,7 +773,7 @@ impl RequestBuilder {
 
         // Bypassing circuit breaker if a mock registry is present.
         if self.mock.is_some() {
-            return self.send_inner().await;
+            return self.send_inner(false).await;
         }
 
         // ── Resilience / Circuit Breaker ──────────────────────────────────
@@ -805,7 +805,8 @@ impl RequestBuilder {
         }
         let guard = crate::circuit_breaker::CircuitBreakerGuard::new(breaker.clone());
 
-        let res = self.send_inner().await;
+        let is_half_open = breaker.state() == crate::circuit_breaker::CircuitState::HalfOpen;
+        let res = self.send_inner(is_half_open).await;
         match &res {
             Ok(resp) => {
                 let success = resp.status().as_u16() < 500;
@@ -822,7 +823,7 @@ impl RequestBuilder {
         res
     }
 
-    async fn send_inner(self) -> Result<Response, ClientError> {
+    async fn send_inner(self, suppress_retries: bool) -> Result<Response, ClientError> {
         // ── Mock short-circuit ──────────────────────────────────────────────
         if let Some(ref mock) = self.mock {
             match mock.find_match(&self.method, &self.url, self.alias.as_deref()) {
@@ -863,7 +864,9 @@ impl RequestBuilder {
         // ── Real network request with retries ───────────────────────────────
         let start = Instant::now();
         let max_attempts =
-            if is_idempotent_method(&self.method) || !self.retry_policy.retry_idempotent_only {
+            if suppress_retries {
+                1
+            } else if is_idempotent_method(&self.method) || !self.retry_policy.retry_idempotent_only {
                 self.retry_policy.max_retries.saturating_add(1)
             } else {
                 1
