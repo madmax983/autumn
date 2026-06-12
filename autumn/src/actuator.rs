@@ -2858,6 +2858,7 @@ pub fn actuator_router<S: ProvideActuatorState + Send + Sync + Clone + 'static>(
 /// `prometheus_enabled` controls the `/actuator/prometheus` scrape endpoint
 /// independently of `sensitive`, so platform metrics scraping can be exposed
 /// without also exposing sensitive actuator surfaces.
+#[allow(clippy::too_many_lines)]
 pub(crate) fn actuator_router_with_prefix<
     S: ProvideActuatorState + Send + Sync + Clone + 'static,
 >(
