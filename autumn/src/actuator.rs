@@ -4000,7 +4000,7 @@ mod tests {
             .get("database_shards")
             .expect("sharded state exposes database_shards");
         assert_eq!(shards["alpha"]["pool_size"], 4);
-        assert_eq!(shards["alpha"]["slots"], 32);
+        assert_eq!(shards["alpha"]["slots"], 8192);
         assert_eq!(shards["beta"]["replica"]["pool_size"], 2);
     }
 
