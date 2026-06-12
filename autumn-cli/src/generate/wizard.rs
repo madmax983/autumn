@@ -124,6 +124,12 @@ fn validate_wizard_name(name: &str) -> Result<(), GenerateError> {
             "only ASCII letters, digits, and underscores are allowed".into(),
         ));
     }
+    if name.chars().all(|c| c == '_') {
+        return Err(GenerateError::InvalidName(
+            name.to_owned(),
+            "name must contain at least one letter or digit".into(),
+        ));
+    }
     let normalized = snake(name);
     if super::dsl::is_rust_keyword(&normalized) {
         return Err(GenerateError::InvalidName(

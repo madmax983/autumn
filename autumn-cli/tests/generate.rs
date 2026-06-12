@@ -3003,3 +3003,39 @@ fn generate_wizard_rejects_rust_keyword_as_step_name() {
         "error must mention the keyword issue; got: {stderr}"
     );
 }
+
+#[test]
+fn generate_wizard_rejects_underscore_only_name() {
+    let (_tmp, project) = fresh_project("wizard-underscore-app");
+    let (_, stderr, code) = run_autumn_failing(
+        &project,
+        &["generate", "wizard", "_", "shipping", "payment"],
+    );
+    assert_eq!(
+        code,
+        Some(1),
+        "underscore-only wizard name must be rejected"
+    );
+    assert!(
+        stderr.contains('_') || stderr.contains("letter") || stderr.contains("digit"),
+        "error must mention the invalid name; got: {stderr}"
+    );
+}
+
+#[test]
+fn generate_wizard_rejects_gen_keyword() {
+    let (_tmp, project) = fresh_project("wizard-gen-app");
+    let (_, stderr, code) = run_autumn_failing(
+        &project,
+        &["generate", "wizard", "gen", "shipping", "payment"],
+    );
+    assert_eq!(
+        code,
+        Some(1),
+        "'gen' (Rust 2024 reserved keyword) must be rejected"
+    );
+    assert!(
+        stderr.contains("keyword") || stderr.contains("gen"),
+        "error must mention the keyword issue; got: {stderr}"
+    );
+}
