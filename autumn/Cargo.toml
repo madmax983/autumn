@@ -158,7 +158,7 @@ sha2 = "0.10"
 sha1 = { version = "0.10", optional = true }
 rsa = { version = "0.9", default-features = false, features = ["std", "pem"], optional = true }
 aes-gcm = "0.10"
-getrandom = "0.2"
+getrandom = "0.4"
 hex = "0.4"
 csv = { workspace = true, optional = true }
 lettre = { version = "0.11.21", default-features = false, features = ["builder", "smtp-transport", "tokio1-rustls-tls"], optional = true }
