@@ -58,18 +58,25 @@ pub fn encode_path_segment(value: impl std::fmt::Display) -> String {
 #[must_use]
 pub fn encode_catch_all_param(value: impl std::fmt::Display) -> String {
     let s = value.to_string();
-    s.split('/')
-        .map(|segment| {
-            if segment == "." {
-                "%2E".to_string()
-            } else if segment == ".." {
-                "%2E%2E".to_string()
-            } else {
-                percent_encode(segment)
-            }
-        })
-        .collect::<Vec<String>>()
-        .join("/")
+    let mut out = String::with_capacity(s.len());
+
+    let mut first = true;
+    for segment in s.split('/') {
+        if !first {
+            out.push('/');
+        }
+        first = false;
+
+        if segment == "." {
+            out.push_str("%2E");
+        } else if segment == ".." {
+            out.push_str("%2E%2E");
+        } else {
+            percent_encode_to(segment, &mut out);
+        }
+    }
+
+    out
 }
 
 /// Percent-encode a query component per RFC 3986.
@@ -78,6 +85,12 @@ pub fn encode_catch_all_param(value: impl std::fmt::Display) -> String {
 /// unchanged; everything else is `%XX`-encoded.
 fn percent_encode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
+    percent_encode_to(s, &mut out);
+    out
+}
+
+/// Writes a percent-encoded string to the provided buffer.
+fn percent_encode_to(s: &str, out: &mut String) {
     for byte in s.bytes() {
         match byte {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
@@ -100,7 +113,6 @@ fn percent_encode(s: &str) -> String {
             }
         }
     }
-    out
 }
 
 #[cfg(test)]
