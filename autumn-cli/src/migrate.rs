@@ -115,6 +115,16 @@ fn run_migrations_with_maintenance(
     // The lock is released when `_lock_guard` drops (end of this function or
     // process exit — both are safe because PostgreSQL releases session-level
     // advisory locks on connection close).
+    //
+    // Known limitation: the advisory lock lives on the parent process's
+    // connection, not inside the child `diesel` subprocess. If the parent is
+    // killed (SIGKILL or SIGTERM) while the child is still running, Postgres
+    // releases the session lock and a second caller can acquire it before the
+    // child finishes. SIGKILL is not fixable at the Rust level (no destructors
+    // run); for SIGTERM a kill-on-drop child guard would close the window but
+    // could abort an in-progress transaction. In practice most orchestrators
+    // kill the whole cgroup, and Postgres's transaction isolation prevents
+    // concurrent dirty writes either way.
     let _lock_guard =
         hold_migration_lock(database_url, DEFAULT_LOCK_WAIT_TIMEOUT).unwrap_or_else(|e| {
             eprintln!("\u{274C} Failed to acquire migration lock: {e}");
