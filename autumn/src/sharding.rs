@@ -1638,12 +1638,20 @@ mod tests {
         register_shard_health_indicators(&set, &registry);
 
         let results = registry.run_all().await;
-        let mut names: Vec<&str> = results.iter().map(|r| r.name.as_str()).collect();
+        // run_all also appends process-global results (e.g. circuit
+        // breakers created by concurrently-running tests), so assert on
+        // the shard components only.
+        let mut names: Vec<&str> = results
+            .iter()
+            .map(|r| r.name.as_str())
+            .filter(|name| name.starts_with("db:shard:"))
+            .collect();
         names.sort_unstable();
         assert_eq!(names, ["db:shard:alpha", "db:shard:beta"]);
         assert!(
             results
                 .iter()
+                .filter(|r| r.name.starts_with("db:shard:"))
                 .all(|r| matches!(r.group, crate::actuator::IndicatorGroup::Readiness)),
             "shard indicators gate readiness"
         );
