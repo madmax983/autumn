@@ -2696,9 +2696,10 @@ impl AppBuilder {
                     .iter()
                     .any(|r| r.method == http::Method::POST && r.path == path)
                     || scoped_groups.iter().any(|g| {
+                        let prefix = g.prefix.trim_end_matches('/');
                         g.routes.iter().any(|r| {
                             r.method == http::Method::POST
-                                && format!("{}{}", g.prefix, r.path) == path.as_str()
+                                && format!("{prefix}{}", r.path) == path.as_str()
                         })
                     })
                     || nest_routers.iter().any(|(nest_path, _)| {
