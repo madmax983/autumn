@@ -24,6 +24,11 @@ aws-runtime = ">=1, <1.7"
 # the known-good series until upstream ships an aws-runtime compatible
 # with smithy-types 1.5.
 aws-smithy-types = ">=1.4, <1.5"
+# time 0.3.48 breaks trait coherence (E0119) in aws-smithy-types 1.4.x's
+# blanket From impl; time is already in this crate's graph via the aws
+# crates, so this only bounds resolution. Lift once upstream releases
+# are compatible.
+time = { version = ">=0.3.36, <0.3.48", default-features = false }
 aws-sdk-s3 = "1"
 bytes = "1"
 futures = { workspace = true }

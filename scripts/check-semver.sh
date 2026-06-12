@@ -131,6 +131,15 @@ for crate in "${CRATES[@]}"; do
     # unrelated to our public API surface; skip rather than hard-fail so the
     # gate remains actionable for real semver breaks.
     echo "  SKIP: $crate — aws-runtime E0282 upstream regression on Rust $semver_toolchain (not a semver issue)"
+  elif echo "$crate_output" | grep -qE "error\[E0119\]" && echo "$crate_output" | grep -q 'conflicting implementation in crate `time`'; then
+    # time 0.3.48 added an impl that breaks trait coherence (E0119) in
+    # downstream crates with blanket From impls — bollard 0.20.x and
+    # aws-smithy-types 1.4.x are both affected. The isolated semver build
+    # resolves dependencies fresh, so it picks up the broken release even
+    # when the workspace pins time below it. Upstream breakage, not a
+    # semver issue; remove once time yanks/fixes 0.3.48 or the affected
+    # crates ship releases compatible with it.
+    echo "  SKIP: $crate — time 0.3.48 coherence regression (E0119) breaking downstream crates (not a semver issue)"
   elif echo "$crate_output" | grep -qE "checks failed|semver requires"; then
     # Exit 1 with semver-violation output → actual breaking API changes found.
     # Allow them through only when BOTH conditions hold:
