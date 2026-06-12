@@ -115,6 +115,36 @@ async fn sharded_db_unconfigured_rejects_before_key_resolution() {
     assert!(rejection.to_string().contains("database.shards"));
 }
 
+#[autumn_web::get("/shard-names")]
+async fn shard_names(shards: Shards) -> String {
+    shards
+        .iter()
+        .map(|shard| shard.name().to_owned())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+#[tokio::test]
+async fn test_app_builds_shards_from_config() {
+    let config = AutumnConfig {
+        database: sharded_config(&["alpha", "beta"]),
+        ..Default::default()
+    };
+
+    let client = autumn_web::test::TestApp::new()
+        .routes(autumn_web::routes![shard_names])
+        .config(config)
+        .build();
+
+    let response = client.get("/shard-names").send().await;
+    response.assert_ok();
+    assert_eq!(
+        response.text(),
+        "alpha,beta",
+        "handlers must see the shard set declared in the test config"
+    );
+}
+
 #[tokio::test]
 async fn each_shard_collects_results_in_declaration_order() {
     // Checkouts fail (no real database), but each_shard must still return

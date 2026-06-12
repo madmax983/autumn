@@ -970,8 +970,17 @@ impl TestApp {
             pool,
             #[cfg(feature = "db")]
             replica_pool,
+            // Build the shard set from the test config so handlers using
+            // the sharding extractors behave as they would in production.
+            // Pools are lazy, so this needs no running databases. Note the
+            // transactional test interceptor wraps only the control pool:
+            // shard checkouts in tests are not rolled back.
             #[cfg(feature = "db")]
-            shards: None,
+            shards: crate::sharding::create_shard_set(
+                &self.config.database,
+                std::sync::Arc::new(crate::sharding::HashShardRouter),
+            )
+            .expect("test shard pools should build from config"),
             profile: self.config.profile.clone(),
             started_at: std::time::Instant::now(),
             health_detailed: self.config.health.detailed,

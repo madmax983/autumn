@@ -2789,6 +2789,17 @@ impl AppBuilder {
                 server_shutdown.child_token(),
             );
         }
+        // Repositories built over a shard pool (`with_pool`) enqueue durable
+        // commit hooks into that shard's queue table; drain each one too.
+        #[cfg(feature = "db")]
+        if let Some(shards) = state.shards() {
+            for shard in shards.iter() {
+                crate::repository_commit_hooks::start_repository_commit_hook_worker(
+                    shard.primary_pool().clone(),
+                    server_shutdown.child_token(),
+                );
+            }
+        }
 
         #[cfg(feature = "presence")]
         {
@@ -3760,6 +3771,17 @@ impl AppBuilder {
                 pool,
                 task_shutdown.child_token(),
             );
+        }
+        // Repositories built over a shard pool (`with_pool`) enqueue durable
+        // commit hooks into that shard's queue table; drain each one too.
+        #[cfg(feature = "db")]
+        if let Some(shards) = state.shards() {
+            for shard in shards.iter() {
+                crate::repository_commit_hooks::start_repository_commit_hook_worker(
+                    shard.primary_pool().clone(),
+                    task_shutdown.child_token(),
+                );
+            }
         }
 
         if let Err(error) = run_startup_hooks(&startup_hooks, state.clone()).await {
