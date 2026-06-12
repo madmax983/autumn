@@ -15,7 +15,7 @@ categories = ["web-programming", "web-programming::http-server"]
 autumn-web = { version = "0.5.0", path = "../autumn", features = ["storage"] }
 aws-config = { version = "1", features = ["behavior-version-latest"] }
 aws-credential-types = { version = "1", features = ["hardcoded-credentials"] }
-aws-runtime = ">=1, <1.7.4"
+aws-runtime = ">=1, <1.7"
 aws-sdk-s3 = "1"
 bytes = "1"
 futures = { workspace = true }
