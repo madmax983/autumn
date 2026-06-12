@@ -341,6 +341,7 @@ async fn setup_pool() -> (
 const fn build_lock_repo(pool: Pool<AsyncPgConnection>) -> PgLockRecordRepository {
     PgLockRecordRepository {
         pool,
+        __autumn_read_route: autumn_web::repository::ReadRoute::Primary,
         __autumn_statement_timeout_ms: 0,
         __autumn_slow_threshold: std::time::Duration::from_millis(500),
         __autumn_route: None,
@@ -350,6 +351,7 @@ const fn build_lock_repo(pool: Pool<AsyncPgConnection>) -> PgLockRecordRepositor
 const fn build_bulk_repo(pool: Pool<AsyncPgConnection>) -> PgBulkRecordRepository {
     PgBulkRecordRepository {
         pool,
+        __autumn_read_route: autumn_web::repository::ReadRoute::Primary,
         __autumn_statement_timeout_ms: 0,
         __autumn_slow_threshold: std::time::Duration::from_millis(500),
         __autumn_route: None,
@@ -360,6 +362,7 @@ const fn build_hooked_repo(pool: Pool<AsyncPgConnection>) -> PgHookedRecordRepos
     PgHookedRecordRepository {
         pool,
         hooks: HookedRecordHooks,
+        __autumn_read_route: autumn_web::repository::ReadRoute::Primary,
         __autumn_statement_timeout_ms: 0,
         __autumn_slow_threshold: std::time::Duration::from_millis(500),
         __autumn_route: None,
@@ -369,6 +372,7 @@ const fn build_hooked_repo(pool: Pool<AsyncPgConnection>) -> PgHookedRecordRepos
 const fn build_zero_col_repo(pool: Pool<AsyncPgConnection>) -> PgZeroColRecordRepository {
     PgZeroColRecordRepository {
         pool,
+        __autumn_read_route: autumn_web::repository::ReadRoute::Primary,
         __autumn_statement_timeout_ms: 0,
         __autumn_slow_threshold: std::time::Duration::from_millis(500),
         __autumn_route: None,
@@ -379,6 +383,7 @@ const fn build_tenant_bulk_repo(pool: Pool<AsyncPgConnection>) -> PgTenantBulkRe
     PgTenantBulkRecordRepository {
         pool,
         across_tenants: false,
+        __autumn_read_route: autumn_web::repository::ReadRoute::Primary,
         __autumn_statement_timeout_ms: 0,
         __autumn_slow_threshold: std::time::Duration::from_millis(500),
         __autumn_route: None,
@@ -391,6 +396,7 @@ const fn build_hooked_versioned_repo(
     PgHookedVersionedRecordRepository {
         pool,
         hooks: HookedVersionedRecordHooks,
+        __autumn_read_route: autumn_web::repository::ReadRoute::Primary,
         __autumn_statement_timeout_ms: 0,
         __autumn_slow_threshold: std::time::Duration::from_millis(500),
         __autumn_route: None,

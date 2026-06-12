@@ -112,6 +112,7 @@ async fn test_tenant_scoping_isolation() {
     let repo = PgTenantPostRepository {
         pool,
         across_tenants: false,
+        __autumn_read_route: autumn_web::repository::ReadRoute::Primary,
         __autumn_statement_timeout_ms: 0,
         __autumn_slow_threshold: ::std::time::Duration::from_millis(100),
         __autumn_route: ::core::option::Option::None,
@@ -186,6 +187,7 @@ async fn test_unscoped_query_without_context_fails() {
     let repo = PgTenantPostRepository {
         pool,
         across_tenants: false,
+        __autumn_read_route: autumn_web::repository::ReadRoute::Primary,
         __autumn_statement_timeout_ms: 0,
         __autumn_slow_threshold: ::std::time::Duration::from_millis(100),
         __autumn_route: ::core::option::Option::None,
@@ -225,6 +227,7 @@ async fn test_escape_hatch_across_tenants() {
     let repo = PgTenantPostRepository {
         pool,
         across_tenants: false,
+        __autumn_read_route: autumn_web::repository::ReadRoute::Primary,
         __autumn_statement_timeout_ms: 0,
         __autumn_slow_threshold: ::std::time::Duration::from_millis(100),
         __autumn_route: ::core::option::Option::None,
@@ -277,6 +280,7 @@ async fn test_immutable_tenant_id_on_update() {
     let repo = PgTenantPostRepository {
         pool,
         across_tenants: false,
+        __autumn_read_route: autumn_web::repository::ReadRoute::Primary,
         __autumn_statement_timeout_ms: 0,
         __autumn_slow_threshold: ::std::time::Duration::from_millis(100),
         __autumn_route: ::core::option::Option::None,
@@ -347,6 +351,7 @@ async fn test_across_tenants_save_without_tenant_id_on_new_struct_works() {
     let repo = PgTenantPostRepository {
         pool,
         across_tenants: false,
+        __autumn_read_route: autumn_web::repository::ReadRoute::Primary,
         __autumn_statement_timeout_ms: 0,
         __autumn_slow_threshold: ::std::time::Duration::from_millis(100),
         __autumn_route: ::core::option::Option::None,
@@ -393,6 +398,7 @@ async fn test_bulk_ops_tenant_scoping() {
     let repo = PgTenantPostRepository {
         pool,
         across_tenants: false,
+        __autumn_read_route: autumn_web::repository::ReadRoute::Primary,
         __autumn_statement_timeout_ms: 0,
         __autumn_slow_threshold: ::std::time::Duration::from_millis(100),
         __autumn_route: ::core::option::Option::None,

@@ -104,6 +104,10 @@ struct RepoConfig {
     /// implementation (custom serialization, non-`i64` primary key, etc.) to
     /// avoid the duplicate-impl compile error (E0119).
     no_versioned_record_impl: bool,
+    /// Pin generated read-only methods to the primary pool even when a read
+    /// replica is configured (#971). Use for read-after-write-sensitive
+    /// aggregates that cannot tolerate replication lag.
+    primary_reads: bool,
 }
 
 #[allow(clippy::too_many_lines)]
@@ -123,6 +127,7 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
     let mut searchable = false;
     let mut versioned = false;
     let mut no_versioned_record_impl = false;
+    let mut primary_reads = false;
 
     syn::meta::parser(|meta| {
         // `hooks = Ident` must be checked before the catch-all model_name case,
@@ -178,12 +183,15 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
         } else if meta.path.is_ident("no_versioned_record_impl") {
             no_versioned_record_impl = true;
             Ok(())
+        } else if meta.path.is_ident("primary_reads") {
+            primary_reads = true;
+            Ok(())
         } else if meta.path.get_ident().is_some() && model_name.is_none() {
             model_name = Some(meta.path.get_ident().unwrap().clone());
             Ok(())
         } else {
             Err(meta.error(
-                "expected model name, table = \"...\", hooks = Type, commit_hooks = true, api = \"/path\", policy = Type, scope = Type, cursor_key = field, cursor_key_type = Type, soft_delete, tenant_scoped, no_upsert_trait, searchable, versioned = true, or no_versioned_record_impl",
+                "expected model name, table = \"...\", hooks = Type, commit_hooks = true, api = \"/path\", policy = Type, scope = Type, cursor_key = field, cursor_key_type = Type, soft_delete, tenant_scoped, no_upsert_trait, searchable, versioned = true, no_versioned_record_impl, or primary_reads",
             ))
         }
     })
@@ -219,6 +227,7 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
         searchable,
         versioned,
         no_versioned_record_impl,
+        primary_reads,
     })
 }
 
@@ -312,7 +321,7 @@ fn generate_derived_query_for_source(
         "find" => {
             quote! {
                 #(#encode_lets)*
-                let mut conn = self.__autumn_acquire_conn().await?;
+                let mut conn = self.__autumn_acquire_read_conn().await?;
                 #query_source
                     #(#filters)*
                     #soft_delete_filter
@@ -324,7 +333,7 @@ fn generate_derived_query_for_source(
         "count" => {
             quote! {
                 #(#encode_lets)*
-                let mut conn = self.__autumn_acquire_conn().await?;
+                let mut conn = self.__autumn_acquire_read_conn().await?;
                 #query_source
                     #(#filters)*
                     #soft_delete_filter
@@ -364,7 +373,7 @@ fn generate_derived_query_for_source(
         "exists" => {
             quote! {
                 #(#encode_lets)*
-                let mut conn = self.__autumn_acquire_conn().await?;
+                let mut conn = self.__autumn_acquire_read_conn().await?;
                 ::autumn_web::reexports::diesel::select(
                     ::autumn_web::reexports::diesel::dsl::exists(
                         #query_source #(#filters)* #soft_delete_filter
@@ -718,6 +727,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         hooks: <#hooks_ident as ::autumn_web::hooks::RepositoryHooksClone>::autumn_clone(&self.hooks),
                         #idempotency_clone_field
                         across_tenants: true,
+                        __autumn_read_route: self.__autumn_read_route.clone(),
                         __autumn_statement_timeout_ms: self.__autumn_statement_timeout_ms,
                         __autumn_slow_threshold: self.__autumn_slow_threshold,
                         __autumn_route: self.__autumn_route.clone(),
@@ -733,6 +743,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     Self {
                         pool: self.pool.clone(),
                         across_tenants: true,
+                        __autumn_read_route: self.__autumn_read_route.clone(),
                         __autumn_statement_timeout_ms: self.__autumn_statement_timeout_ms,
                         __autumn_slow_threshold: self.__autumn_slow_threshold,
                         __autumn_route: self.__autumn_route.clone(),
@@ -774,9 +785,9 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             /// ```
             ///
             /// Framework defaults apply: no statement timeout, 500ms
-            /// slow-query threshold, and no route-level metrics label
-            /// (those come from the request when the repository is used
-            /// as an extractor).
+            /// slow-query threshold, no route-level metrics label (those
+            /// come from the request when the repository is used as an
+            /// extractor), and reads run on the supplied pool.
             #[must_use]
             pub fn with_pool(
                 pool: ::autumn_web::reexports::diesel_async::pooled_connection::deadpool::Pool<
@@ -789,11 +800,28 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     #hooks_field
                     #idempotency_field
                     #tenant_init_field
+                    __autumn_read_route: ::autumn_web::repository::ReadRoute::Primary,
                     __autumn_statement_timeout_ms: 0,
                     __autumn_slow_threshold: ::std::time::Duration::from_millis(500),
                     __autumn_route: ::core::option::Option::None,
                 }
             }
+        }
+    };
+
+    // #971: snapshot the read-routing decision once per extraction. The
+    // `primary_reads` attribute pins read-after-write-sensitive aggregates
+    // to the primary at compile time; otherwise the route follows
+    // `AppState::read_pool` semantics (replica when healthy, primary
+    // fallback or fail-fast per the configured `replica_fallback` policy).
+    let read_route_init = if config.primary_reads {
+        quote! {
+            let __autumn_read_route = ::autumn_web::repository::ReadRoute::Primary;
+        }
+    } else {
+        quote! {
+            let __autumn_read_route =
+                ::autumn_web::repository::ReadRoute::from_state(state);
         }
     };
 
@@ -835,6 +863,8 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             hooks: #hooks_ident,
             #idempotency_struct_field
             #tenant_struct_field
+            /// Read-routing snapshot for generated read-only methods (#971).
+            __autumn_read_route: ::autumn_web::repository::ReadRoute,
             /// Statement timeout to apply on every connection checkout (ms). 0 = no limit.
             __autumn_statement_timeout_ms: u64,
             /// Slow-query logging threshold.
@@ -851,6 +881,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         hooks: <#hooks_ident as ::autumn_web::hooks::RepositoryHooksClone>::autumn_clone(&self.hooks),
                         #idempotency_clone_field
                         #tenant_clone_field
+                        __autumn_read_route: self.__autumn_read_route.clone(),
                         __autumn_statement_timeout_ms: self.__autumn_statement_timeout_ms,
                         __autumn_slow_threshold: self.__autumn_slow_threshold,
                         __autumn_route: self.__autumn_route.clone(),
@@ -875,6 +906,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 .extensions
                 .get::<::autumn_web::reexports::axum::extract::MatchedPath>()
                 .map(|p| p.as_str().to_owned());
+            #read_route_init
         };
 
         let extractor_init = if commit_hooks_enabled {
@@ -889,6 +921,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         .get::<::autumn_web::idempotency::IdempotencyContext>()
                         .cloned(),
                     #tenant_init_field
+                    __autumn_read_route,
                     __autumn_statement_timeout_ms: __autumn_timeout_ms,
                     __autumn_slow_threshold,
                     __autumn_route,
@@ -901,6 +934,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     pool,
                     hooks: <#hooks_ident as ::autumn_web::hooks::RepositoryHooksDefault>::autumn_default(),
                     #tenant_init_field
+                    __autumn_read_route,
                     __autumn_statement_timeout_ms: __autumn_timeout_ms,
                     __autumn_slow_threshold,
                     __autumn_route,
@@ -3941,6 +3975,8 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 ::autumn_web::reexports::diesel_async::AsyncPgConnection,
             >,
             #tenant_struct_field
+            /// Read-routing snapshot for generated read-only methods (#971).
+            __autumn_read_route: ::autumn_web::repository::ReadRoute,
             /// Statement timeout to apply on every connection checkout (ms). 0 = no limit.
             __autumn_statement_timeout_ms: u64,
             /// Slow-query logging threshold.
@@ -3955,6 +3991,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     Self {
                         pool: self.pool.clone(),
                         #tenant_clone_field
+                        __autumn_read_route: self.__autumn_read_route.clone(),
                         __autumn_statement_timeout_ms: self.__autumn_statement_timeout_ms,
                         __autumn_slow_threshold: self.__autumn_slow_threshold,
                         __autumn_route: self.__autumn_route.clone(),
@@ -3979,6 +4016,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 .extensions
                 .get::<::autumn_web::reexports::axum::extract::MatchedPath>()
                 .map(|p| p.as_str().to_owned());
+            #read_route_init
         };
 
         let extractor_init = quote! {
@@ -3986,6 +4024,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             Ok(#pg_name {
                 pool,
                 #tenant_init_field
+                __autumn_read_route,
                 __autumn_statement_timeout_ms: __autumn_timeout_ms,
                 __autumn_slow_threshold,
                 __autumn_route,
@@ -5810,7 +5849,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         .ok_or_else(|| ::autumn_web::AutumnError::internal_server_error_msg("Query scoped to tenant, but no tenant context was established"))?;
                     ::core::option::Option::Some(t)
                 };
-                let mut conn = self.__autumn_acquire_conn().await?;
+                let mut conn = self.__autumn_acquire_read_conn().await?;
 
                 let query = #table_ident::table;
                 if let ::core::option::Option::Some(ref t) = tenant_id {
@@ -5860,7 +5899,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             ) -> ::autumn_web::AutumnResult<::autumn_web::pagination::Page<#model_name>> {
                 use ::autumn_web::reexports::diesel::prelude::*;
                 use ::autumn_web::reexports::diesel_async::RunQueryDsl;
-                let mut conn = self.__autumn_acquire_conn().await?;
+                let mut conn = self.__autumn_acquire_read_conn().await?;
                 let total: i64 = #table_ident::table
                     #sd_filter
                     .count()
@@ -5937,7 +5976,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 ) -> ::autumn_web::AutumnResult<::autumn_web::pagination::CursorPage<#model_name>> {
                     use ::autumn_web::reexports::diesel::prelude::*;
                     use ::autumn_web::reexports::diesel_async::RunQueryDsl;
-                    let mut conn = self.__autumn_acquire_conn().await?;
+                    let mut conn = self.__autumn_acquire_read_conn().await?;
                     let mut query = #table_ident::table.into_boxed();
                     #tenant_query_filter
                     if let ::core::option::Option::Some((after_k, after_id)) =
@@ -5980,7 +6019,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 ) -> ::autumn_web::AutumnResult<::autumn_web::pagination::CursorPage<#model_name>> {
                     use ::autumn_web::reexports::diesel::prelude::*;
                     use ::autumn_web::reexports::diesel_async::RunQueryDsl;
-                    let mut conn = self.__autumn_acquire_conn().await?;
+                    let mut conn = self.__autumn_acquire_read_conn().await?;
                     let mut query = #table_ident::table.into_boxed();
                     #tenant_query_filter
                     if let ::core::option::Option::Some(after_id) = req.decode::<i64>() {
@@ -6129,7 +6168,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         };
         let policy_check_update_pre = if has_policy {
             quote! {
-                let __existing = repo.find_by_id(id).await?
+                let __existing = repo.on_primary().find_by_id(id).await?
                     .ok_or_else(|| ::autumn_web::AutumnError::not_found_msg("not found"))?;
                 ::autumn_web::authorization::__check_policy::<#model_name>(
                     &__autumn_state,
@@ -6144,7 +6183,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         };
         let policy_check_delete_pre = if has_policy {
             quote! {
-                let __existing = repo.find_by_id(id).await?
+                let __existing = repo.on_primary().find_by_id(id).await?
                     .ok_or_else(|| ::autumn_web::AutumnError::not_found_msg("not found"))?;
                 ::autumn_web::authorization::__check_policy::<#model_name>(
                     &__autumn_state,
@@ -6194,7 +6233,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     &__autumn_state,
                     &__autumn_session,
                 ).await;
-                let mut __conn = repo.__autumn_acquire_conn().await?;
+                let mut __conn = repo.__autumn_acquire_read_conn().await?;
                 let records = __scope.list(&__ctx, &mut __conn).await?;
                 Ok(::autumn_web::prelude::Json(records))
             }
@@ -6385,7 +6424,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         };
         let update_body = if has_policy {
             quote! {
-                let __existing = match repo.find_by_id(id).await {
+                let __existing = match repo.on_primary().find_by_id(id).await {
                     ::core::result::Result::Ok(::core::option::Option::Some(existing)) => existing,
                     ::core::result::Result::Ok(::core::option::Option::None) => {
                         return ::autumn_web::idempotency::IdempotencyReplayOr::Inner(
@@ -6455,7 +6494,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         &__autumn_idempotency_replay,
                         "repository.delete.record",
                     );
-                let __existing = match repo.find_by_id(id).await {
+                let __existing = match repo.on_primary().find_by_id(id).await {
                     ::core::result::Result::Ok(::core::option::Option::Some(existing)) => existing,
                     ::core::result::Result::Ok(::core::option::Option::None) => {
                         if let ::core::option::Option::Some(bytes) = __autumn_replay_deleted_record {
@@ -6919,7 +6958,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     use ::autumn_web::reexports::diesel::prelude::*;
                     use ::autumn_web::reexports::diesel_async::RunQueryDsl;
                     #tenant_id_setup
-                    let mut conn = self.__autumn_acquire_conn().await?;
+                    let mut conn = self.__autumn_acquire_read_conn().await?;
                     let query = #table_ident::table;
                     if let ::core::option::Option::Some(ref t) = tenant_id {
                         query.filter(#table_ident::tenant_id.eq(t))
@@ -6937,7 +6976,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     use ::autumn_web::reexports::diesel::prelude::*;
                     use ::autumn_web::reexports::diesel_async::RunQueryDsl;
                     #tenant_id_setup
-                    let mut conn = self.__autumn_acquire_conn().await?;
+                    let mut conn = self.__autumn_acquire_read_conn().await?;
                     let query = #table_ident::table.filter(#table_ident::deleted_at.is_not_null());
                     if let ::core::option::Option::Some(ref t) = tenant_id {
                         query.filter(#table_ident::tenant_id.eq(t))
@@ -6958,7 +6997,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     use ::autumn_web::reexports::diesel::prelude::*;
                     use ::autumn_web::reexports::diesel_async::RunQueryDsl;
                     #tenant_id_setup
-                    let mut conn = self.__autumn_acquire_conn().await?;
+                    let mut conn = self.__autumn_acquire_read_conn().await?;
                     let query = #table_ident::table.filter(#table_ident::deleted_at.is_not_null());
                     if let ::core::option::Option::Some(ref t) = tenant_id {
                         let total: i64 = query
@@ -7035,7 +7074,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 async fn with_deleted(&self) -> ::autumn_web::AutumnResult<Vec<#model_name>> {
                     use ::autumn_web::reexports::diesel::prelude::*;
                     use ::autumn_web::reexports::diesel_async::RunQueryDsl;
-                    let mut conn = self.__autumn_acquire_conn().await?;
+                    let mut conn = self.__autumn_acquire_read_conn().await?;
                     let query = #table_ident::table;
                     query
                         .load::<#model_name>(&mut conn)
@@ -7046,7 +7085,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 async fn only_deleted(&self) -> ::autumn_web::AutumnResult<Vec<#model_name>> {
                     use ::autumn_web::reexports::diesel::prelude::*;
                     use ::autumn_web::reexports::diesel_async::RunQueryDsl;
-                    let mut conn = self.__autumn_acquire_conn().await?;
+                    let mut conn = self.__autumn_acquire_read_conn().await?;
                     let query = #table_ident::table.filter(#table_ident::deleted_at.is_not_null());
                     query
                         .load::<#model_name>(&mut conn)
@@ -7060,7 +7099,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 ) -> ::autumn_web::AutumnResult<::autumn_web::pagination::Page<#model_name>> {
                     use ::autumn_web::reexports::diesel::prelude::*;
                     use ::autumn_web::reexports::diesel_async::RunQueryDsl;
-                    let mut conn = self.__autumn_acquire_conn().await?;
+                    let mut conn = self.__autumn_acquire_read_conn().await?;
                     let query = #table_ident::table.filter(#table_ident::deleted_at.is_not_null());
                     let total: i64 = query
                         .count()
@@ -7350,7 +7389,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 }
 
                 #tenant_id_setup
-                let mut conn = self.__autumn_acquire_conn().await?;
+                let mut conn = self.__autumn_acquire_read_conn().await?;
                 let language = <#model_name as ::autumn_web::repository::AutumnSearchableModel>::SEARCH_LANGUAGE;
 
                 let mut sql = format!(
@@ -7440,7 +7479,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 }
 
                 #tenant_id_setup
-                let mut conn = self.__autumn_acquire_conn().await?;
+                let mut conn = self.__autumn_acquire_read_conn().await?;
                 let language = <#model_name as ::autumn_web::repository::AutumnSearchableModel>::SEARCH_LANGUAGE;
                 let limit = req.limit();
                 let offset = req.offset();
@@ -7700,7 +7739,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     let per_page = filter.per_page();
                     #version_history_tenant_setup
 
-                    let mut conn = self.__autumn_acquire_conn().await?;
+                    let mut conn = self.__autumn_acquire_read_conn().await?;
 
                     // Execute count query, optionally filtered by timestamp range.
                     let total: u64 = if filter.from.is_some() || filter.to.is_some() {
@@ -7870,14 +7909,14 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             async fn find_by_id(&self, id: i64) -> ::autumn_web::AutumnResult<Option<#model_name>> {
                 use ::autumn_web::reexports::diesel::prelude::*;
                 use ::autumn_web::reexports::diesel_async::RunQueryDsl;
-                let mut conn = self.__autumn_acquire_conn().await?;
+                let mut conn = self.__autumn_acquire_read_conn().await?;
                 #find_by_id_impl
             }
 
             async fn find_all(&self) -> ::autumn_web::AutumnResult<Vec<#model_name>> {
                 use ::autumn_web::reexports::diesel::prelude::*;
                 use ::autumn_web::reexports::diesel_async::RunQueryDsl;
-                let mut conn = self.__autumn_acquire_conn().await?;
+                let mut conn = self.__autumn_acquire_read_conn().await?;
                 #find_all_impl
             }
 
@@ -7896,14 +7935,14 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             async fn count(&self) -> ::autumn_web::AutumnResult<i64> {
                 use ::autumn_web::reexports::diesel::prelude::*;
                 use ::autumn_web::reexports::diesel_async::RunQueryDsl;
-                let mut conn = self.__autumn_acquire_conn().await?;
+                let mut conn = self.__autumn_acquire_read_conn().await?;
                 #count_impl
             }
 
             async fn exists_by_id(&self, id: i64) -> ::autumn_web::AutumnResult<bool> {
                 use ::autumn_web::reexports::diesel::prelude::*;
                 use ::autumn_web::reexports::diesel_async::RunQueryDsl;
-                let mut conn = self.__autumn_acquire_conn().await?;
+                let mut conn = self.__autumn_acquire_read_conn().await?;
                 #exists_by_id_impl
             }
 
@@ -7937,9 +7976,47 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             #with_pool_method
             #hook_support_methods
 
-            /// Acquire a database connection from the repository's
-            /// pool. Used by `#[repository(scope = ...)]`-generated
-            /// list endpoints; not part of the public surface.
+            /// Returns a clone of this repository whose generated read
+            /// methods are pinned to the primary pool for the rest of the
+            /// call chain — the read-your-writes escape hatch (#971).
+            ///
+            /// Use immediately after a write when replication lag would
+            /// make a replica read stale:
+            ///
+            /// ```rust,ignore
+            /// let created = repo.save(&new).await?;
+            /// let fresh = repo.on_primary().find_by_id(created.id).await?;
+            /// ```
+            ///
+            /// Mutating methods are unaffected — they always run on the
+            /// primary.
+            #[must_use]
+            pub fn on_primary(&self) -> Self {
+                let mut repo = ::core::clone::Clone::clone(self);
+                repo.__autumn_read_route = ::autumn_web::repository::ReadRoute::Primary;
+                repo
+            }
+
+            /// The read route this repository snapshot uses for generated
+            /// read-only methods. Exposed for tests; not a public API.
+            #[doc(hidden)]
+            pub fn __autumn_read_route(&self) -> &::autumn_web::repository::ReadRoute {
+                &self.__autumn_read_route
+            }
+
+            /// The primary/write pool. Exposed for tests; not a public API.
+            #[doc(hidden)]
+            pub fn __autumn_write_pool(
+                &self,
+            ) -> &::autumn_web::reexports::diesel_async::pooled_connection::deadpool::Pool<
+                ::autumn_web::reexports::diesel_async::AsyncPgConnection,
+            > {
+                &self.pool
+            }
+
+            /// Acquire a primary-pool connection for mutating methods and
+            /// pessimistic locks. Also used by `#[repository(scope = ...)]`
+            /// generated endpoints; not part of the public surface.
             #[doc(hidden)]
             pub async fn __autumn_acquire_conn(
                 &self,
@@ -7948,8 +8025,50 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     ::autumn_web::reexports::diesel_async::AsyncPgConnection,
                 >,
             > {
+                self.__autumn_acquire_from(&self.pool).await
+            }
+
+            /// Acquire a connection for a generated read-only method,
+            /// following the repository's read route: the replica pool when
+            /// one is configured and healthy, otherwise the primary (#971).
+            #[doc(hidden)]
+            pub async fn __autumn_acquire_read_conn(
+                &self,
+            ) -> ::autumn_web::AutumnResult<
+                ::autumn_web::reexports::diesel_async::pooled_connection::deadpool::Object<
+                    ::autumn_web::reexports::diesel_async::AsyncPgConnection,
+                >,
+            > {
+                match &self.__autumn_read_route {
+                    ::autumn_web::repository::ReadRoute::Primary => {
+                        self.__autumn_acquire_from(&self.pool).await
+                    }
+                    ::autumn_web::repository::ReadRoute::ReadPool(pool) => {
+                        self.__autumn_acquire_from(pool).await
+                    }
+                    ::autumn_web::repository::ReadRoute::Unavailable => {
+                        ::core::result::Result::Err(
+                            ::autumn_web::AutumnError::service_unavailable_msg(
+                                "read replica is configured but not ready, and the \
+                                 replica_fallback policy forbids primary reads",
+                            ),
+                        )
+                    }
+                }
+            }
+
+            async fn __autumn_acquire_from(
+                &self,
+                pool: &::autumn_web::reexports::diesel_async::pooled_connection::deadpool::Pool<
+                    ::autumn_web::reexports::diesel_async::AsyncPgConnection,
+                >,
+            ) -> ::autumn_web::AutumnResult<
+                ::autumn_web::reexports::diesel_async::pooled_connection::deadpool::Object<
+                    ::autumn_web::reexports::diesel_async::AsyncPgConnection,
+                >,
+            > {
                 use ::autumn_web::reexports::diesel_async::RunQueryDsl as _;
-                let mut conn = self.pool.get().await.map_err(|e| {
+                let mut conn = pool.get().await.map_err(|e| {
                     ::autumn_web::reexports::tracing::error!(
                         "repository: failed to acquire database connection: {e}"
                     );
@@ -8132,6 +8251,66 @@ mod tests {
         assert!(
             err.to_string().contains("requires hooks"),
             "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_api_mutation_prechecks_pin_reads_to_primary() {
+        let generated = repository_macro(
+            quote! { Post, api = "/api/posts", policy = PostPolicy },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        // The PUT/DELETE handlers load the row before writing (404 + policy
+        // decision). Under replication lag a replica read could 404 or
+        // authorize against a stale row even though the write itself runs on
+        // the primary — mutation prechecks must be read-your-writes safe.
+        assert_eq!(
+            generated
+                .matches("repo . on_primary () . find_by_id")
+                .count(),
+            2,
+            "update/delete prechecks must pin find_by_id to the primary"
+        );
+
+        // The plain GET endpoint is an ordinary read and stays on the
+        // replica route.
+        let get_fn = generated
+            .find("async fn post_api_get")
+            .expect("get handler must be generated");
+        let get_end = generated[get_fn..]
+            .find("async fn post_api_create")
+            .map_or(generated.len(), |offset| get_fn + offset);
+        let section = &generated[get_fn..get_end];
+        assert!(
+            section.contains("repo . find_by_id"),
+            "get handler must read through the repository: {section}"
+        );
+        assert!(
+            !section.contains("on_primary"),
+            "get handler reads must stay replica-eligible: {section}"
+        );
+    }
+
+    #[test]
+    fn parse_repo_args_with_primary_reads() {
+        let tokens: proc_macro2::TokenStream = "Post, primary_reads".parse().unwrap();
+        let config = parse_repo_args(tokens).unwrap();
+        assert_eq!(config.model_name.to_string(), "Post");
+        assert!(
+            config.primary_reads,
+            "primary_reads must pin generated reads to the primary pool"
+        );
+    }
+
+    #[test]
+    fn parse_repo_args_primary_reads_defaults_off() {
+        let tokens: proc_macro2::TokenStream = "Post".parse().unwrap();
+        let config = parse_repo_args(tokens).unwrap();
+        assert!(
+            !config.primary_reads,
+            "reads route to the replica by default"
         );
     }
 

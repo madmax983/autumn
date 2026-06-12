@@ -328,6 +328,16 @@ pub fn model(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// Generates a `PgXxxRepository` struct implementing the annotated trait,
 /// with auto-generated CRUD methods and query-by-name derived methods.
 ///
+/// # Read replica routing
+///
+/// When `database.replica_url` is configured, generated read-only methods
+/// (`find_by_id`, `find_all`, `count`, `paginate`, `cursor_page`, derived
+/// `find_by_*`, search reads) acquire their connection from the replica
+/// pool; mutating methods always use the primary. Add `primary_reads` to
+/// pin a read-after-write-sensitive repository's reads to the primary, or
+/// call the generated `on_primary()` method to pin a single call chain
+/// (read-your-writes).
+///
 /// # Examples
 ///
 /// ```ignore
@@ -337,6 +347,10 @@ pub fn model(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// trait PostRepository {
 ///     fn find_by_published(published: bool) -> Vec<Post>;
 /// }
+///
+/// // Reads pinned to the primary even when a replica is configured.
+/// #[repository(LedgerEntry, primary_reads)]
+/// trait LedgerEntryRepository {}
 /// ```
 #[proc_macro_attribute]
 pub fn repository(attr: TokenStream, item: TokenStream) -> TokenStream {
