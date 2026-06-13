@@ -977,6 +977,14 @@ fn validate_variants(variants: &[VariantConfig]) -> Result<(), ExperimentError> 
     Ok(())
 }
 
+fn parse_excluded_by_group(msg: &str) -> Option<String> {
+    if msg.starts_with("ExcludedByGroup:") {
+        Some(msg.strip_prefix("ExcludedByGroup:")?.trim().to_owned())
+    } else {
+        None
+    }
+}
+
 // ── ExperimentService ─────────────────────────────────────────────────────────
 
 /// The main experiment service.
@@ -1108,19 +1116,14 @@ impl ExperimentService {
             let sticky = Assignment::new(experiment, actor, &override_variant, true);
             if let Err(e) = self.store.record_assignment(sticky) {
                 match e {
-                    ExperimentStoreError::Backend(msg) if msg.starts_with("ExcludedByGroup:") => {
-                        let group = msg
-                            .strip_prefix("ExcludedByGroup:")
-                            .unwrap_or("")
-                            .trim()
-                            .to_owned();
-                        return Err(ExperimentError::ExcludedByGroup(
-                            experiment.to_owned(),
-                            group,
-                        ));
-                    }
-                    other @ ExperimentStoreError::Backend(_) => {
-                        return Err(ExperimentError::Store(other));
+                    ExperimentStoreError::Backend(msg) => {
+                        if let Some(group) = parse_excluded_by_group(&msg) {
+                            return Err(ExperimentError::ExcludedByGroup(
+                                experiment.to_owned(),
+                                group,
+                            ));
+                        }
+                        return Err(ExperimentError::Store(ExperimentStoreError::Backend(msg)));
                     }
                 }
             }
@@ -1163,19 +1166,14 @@ impl ExperimentService {
         let assignment = Assignment::new(experiment, actor, &variant_name, false);
         let persisted_variant = match self.store.record_assignment(assignment) {
             Ok(v) => v,
-            Err(ExperimentStoreError::Backend(msg)) if msg.starts_with("ExcludedByGroup:") => {
-                let group = msg
-                    .strip_prefix("ExcludedByGroup:")
-                    .unwrap_or("")
-                    .trim()
-                    .to_owned();
-                return Err(ExperimentError::ExcludedByGroup(
-                    experiment.to_owned(),
-                    group,
-                ));
-            }
-            Err(other @ ExperimentStoreError::Backend(_)) => {
-                return Err(ExperimentError::Store(other));
+            Err(ExperimentStoreError::Backend(msg)) => {
+                if let Some(group) = parse_excluded_by_group(&msg) {
+                    return Err(ExperimentError::ExcludedByGroup(
+                        experiment.to_owned(),
+                        group,
+                    ));
+                }
+                return Err(ExperimentError::Store(ExperimentStoreError::Backend(msg)));
             }
         };
         self.emit_exposure(experiment, &persisted_variant, actor, request_id, false);
