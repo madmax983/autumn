@@ -1023,6 +1023,10 @@ type ReplayStoreCell =
     std::sync::Arc<std::sync::Mutex<Option<(std::sync::Arc<dyn WebhookReplayStore>, Vec<String>)>>>;
 
 tokio::task_local! {
+    /// A task-local cell holding a thread-safe replay store and a list of recorded events.
+    ///
+    /// This is used internally to track outbound webhook deliveries during a simulated replay,
+    /// preventing them from accidentally being dispatched to live systems during tests.
     pub static WEBHOOK_REPLAY_KEY: ReplayStoreCell;
 }
 

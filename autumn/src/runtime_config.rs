@@ -1331,7 +1331,12 @@ pub enum ConfigError {
 
     /// A declared validator rejected the value.
     #[error("config key '{key}': validation failed — {reason}")]
-    ValidationFailed { key: String, reason: String },
+    ValidationFailed {
+        /// The config key that failed validation.
+        key: String,
+        /// The reason the validation failed.
+        reason: String,
+    },
 
     /// The backing store returned an error.
     #[error("config store error: {0}")]
@@ -1343,11 +1348,17 @@ pub enum ConfigError {
 /// A snapshot of a single config key: schema defaults + current override.
 #[derive(Debug, Clone)]
 pub struct ConfigEntry {
+    /// The unique name of the config key.
     pub name: String,
+    /// The expected data type for this configuration value.
     pub value_type: ConfigValueType,
+    /// The currently active value (override if present, otherwise default).
     pub current: ConfigValue,
+    /// The default value as defined in the registry.
     pub default: ConfigValue,
+    /// True if the current value is overriding the default.
     pub is_overridden: bool,
+    /// Optional human-readable description of the config key.
     pub description: Option<String>,
 }
 

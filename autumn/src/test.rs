@@ -692,6 +692,7 @@ impl TestApp {
         self
     }
 
+    /// Adds a mail interceptor for capturing and inspecting outbound emails in tests.
     #[cfg(feature = "mail")]
     #[must_use]
     pub fn with_mail_interceptor(
@@ -702,6 +703,7 @@ impl TestApp {
         self
     }
 
+    /// Adds a job interceptor for observing and validating background job enqueues.
     #[must_use]
     pub fn with_job_interceptor(
         mut self,
@@ -711,6 +713,7 @@ impl TestApp {
         self
     }
 
+    /// Adds a database interceptor to trace database connections during test execution.
     #[cfg(feature = "db")]
     #[must_use]
     pub fn with_db_interceptor(
@@ -721,6 +724,7 @@ impl TestApp {
         self
     }
 
+    /// Adds a WebSocket channels interceptor to inspect real-time channel events.
     #[cfg(feature = "ws")]
     #[must_use]
     pub fn with_channels_interceptor(
@@ -731,6 +735,7 @@ impl TestApp {
         self
     }
 
+    /// Adds an HTTP client interceptor to observe or mock external API requests.
     #[cfg(feature = "oauth2")]
     #[must_use]
     pub fn with_http_interceptor(
