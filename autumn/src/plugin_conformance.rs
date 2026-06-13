@@ -350,17 +350,26 @@ pub fn check_route_prefix(
 /// Both named params (`{id}`) and catch-all params (`{*rest}`) normalize to
 /// `{}`. matchit (Axum's router) treats a named param and a catch-all at the
 /// same path position as a conflict, so they must map to the same key.
-fn normalize_path_for_collision(path: &str) -> String {
-    path.split('/')
-        .map(|seg| {
-            if seg.starts_with('{') && seg.ends_with('}') {
-                "{}"
-            } else {
-                seg
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("/")
+///
+/// ⚡ Bolt: Optimization - Returns `Cow` to eliminate allocations for static paths
+/// (the vast majority of routes), and uses pre-allocated `String` with in-place
+/// push to eliminate intermediate `Vec` allocations during normalization.
+fn normalize_path_for_collision(path: &str) -> std::borrow::Cow<'_, str> {
+    if !path.contains('{') {
+        return std::borrow::Cow::Borrowed(path);
+    }
+    let mut out = String::with_capacity(path.len());
+    for (i, seg) in path.split('/').enumerate() {
+        if i > 0 {
+            out.push('/');
+        }
+        if seg.starts_with('{') && seg.ends_with('}') {
+            out.push_str("{}");
+        } else {
+            out.push_str(seg);
+        }
+    }
+    std::borrow::Cow::Owned(out)
 }
 
 /// Detect route collisions: any two routes sharing the same (method, path) pair.
@@ -376,7 +385,7 @@ fn normalize_path_for_collision(path: &str) -> String {
 pub fn check_collisions(routes: &[RouteInfo]) -> (CheckResult, Vec<CollisionDiagnostic>) {
     use std::collections::HashMap;
 
-    let mut by_key: HashMap<(&str, String), Vec<&RouteInfo>> = HashMap::new();
+    let mut by_key: HashMap<(&str, std::borrow::Cow<'_, str>), Vec<&RouteInfo>> = HashMap::new();
     for route in routes {
         by_key
             .entry((
@@ -392,7 +401,7 @@ pub fn check_collisions(routes: &[RouteInfo]) -> (CheckResult, Vec<CollisionDiag
         .filter(|(_, rs)| rs.len() > 1)
         .map(|((method, path), rs)| CollisionDiagnostic {
             method: method.to_string(),
-            path,
+            path: path.into_owned(),
             contributors: rs
                 .iter()
                 .map(|r| RouteContributor {
