@@ -179,7 +179,10 @@ where
         .try_with(|registry| {
             let f = f_opt.take().expect("closure only entered once");
             let boxed: CommitCallback = Box::new(move || Box::pin(f()));
-            registry.lock().expect("registry lock").push(boxed);
+            registry
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(boxed);
         })
         .ok();
 
@@ -856,7 +859,9 @@ impl Db {
         // spawning these callbacks to prevent observing uncommitted side effects.
         if result.is_ok() {
             let callbacks: Vec<CommitCallback> = {
-                let mut reg = registry.lock().expect("registry lock");
+                let mut reg = registry
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 std::mem::take(&mut *reg)
             };
 
@@ -1184,7 +1189,9 @@ mod tests {
 
         // Drain and run the callbacks (simulating post-commit)
         let callbacks: Vec<CommitCallback> = {
-            let mut reg = registry.lock().unwrap();
+            let mut reg = registry
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             std::mem::take(&mut *reg)
         };
         for cb in callbacks {
@@ -1230,17 +1237,23 @@ mod tests {
         AFTER_COMMIT_REGISTRY
             .scope(registry.clone(), async {
                 register_after_commit(move || async move {
-                    o1.lock().unwrap().push(1);
+                    o1.lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push(1);
                     Ok(())
                 })
                 .await;
                 register_after_commit(move || async move {
-                    o2.lock().unwrap().push(2);
+                    o2.lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push(2);
                     Ok(())
                 })
                 .await;
                 register_after_commit(move || async move {
-                    o3.lock().unwrap().push(3);
+                    o3.lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push(3);
                     Ok(())
                 })
                 .await;
@@ -1248,14 +1261,21 @@ mod tests {
             .await;
 
         let callbacks: Vec<CommitCallback> = {
-            let mut reg = registry.lock().unwrap();
+            let mut reg = registry
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             std::mem::take(&mut *reg)
         };
         for cb in callbacks {
             cb().await.unwrap();
         }
 
-        assert_eq!(*order.lock().unwrap(), vec![1, 2, 3]);
+        assert_eq!(
+            *order
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            vec![1, 2, 3]
+        );
     }
 
     #[tokio::test]
@@ -1271,13 +1291,19 @@ mod tests {
                     wait_first
                         .await
                         .expect("test should release first callback");
-                    first_order.lock().unwrap().push(1);
+                    first_order
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push(1);
                     Ok(())
                 })
             }),
             Box::new(move || {
                 Box::pin(async move {
-                    second_order.lock().unwrap().push(2);
+                    second_order
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push(2);
                     Ok(())
                 })
             }),
@@ -1288,7 +1314,9 @@ mod tests {
         tokio::task::yield_now().await;
 
         assert_eq!(
-            *order.lock().unwrap(),
+            *order
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
             Vec::<u32>::new(),
             "later callbacks must wait for earlier callbacks to finish"
         );
@@ -1298,7 +1326,12 @@ mod tests {
             .expect("first callback receiver alive");
         drain.await.expect("drain task should not panic");
 
-        assert_eq!(*order.lock().unwrap(), vec![1, 2]);
+        assert_eq!(
+            *order
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            vec![1, 2]
+        );
     }
 
     #[tokio::test]
@@ -1368,7 +1401,9 @@ mod tests {
             .await;
 
         let callbacks: Vec<CommitCallback> = {
-            let mut reg = registry.lock().unwrap();
+            let mut reg = registry
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             std::mem::take(&mut *reg)
         };
         // Running a failing callback should not panic
