@@ -41,7 +41,7 @@
 //!
 //! ## Inline field validation (htmx)
 //!
-//! A field rendered with [`text_input_htmx`] POSTs to a validation endpoint
+//! A field rendered with [`autumn_web::form::text_input_htmx`] POSTs to a validation endpoint
 //! when its value changes. The handler extracts [`ChangesetForm`], validates,
 //! and returns just that field's wrapper partial — htmx swaps it with `outerHTML`.
 //! When JavaScript is disabled, the normal `#[post("/todos")]` handler still
