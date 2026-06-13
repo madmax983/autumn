@@ -89,6 +89,7 @@ async fn setup_pool() -> (
 const fn build_repo(pool: Pool<AsyncPgConnection>) -> PgSearchRecordRepository {
     PgSearchRecordRepository {
         pool,
+        __autumn_read_route: autumn_web::repository::ReadRoute::Primary,
         __autumn_statement_timeout_ms: 0,
         __autumn_slow_threshold: std::time::Duration::from_millis(500),
         __autumn_route: None,

@@ -326,7 +326,7 @@ fn find_features_header_end(cargo_toml: &str) -> Option<usize> {
 /// Patch `Cargo.toml` content to add the `system-tests` feature (under
 /// `[features]` only, not in `[dependencies]`) and a `[[test]]` entry for this
 /// test file if they are not already present.
-fn patch_cargo_toml(existing: &str, snake_name: &str) -> String {
+pub(super) fn patch_cargo_toml(existing: &str, snake_name: &str) -> String {
     let mut out = existing.to_owned();
 
     // 1. Add [features] system-tests entry if not already in the [features] table.

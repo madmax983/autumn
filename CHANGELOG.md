@@ -9,6 +9,123 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **auth:** Active session management with device list and revocation in the auth starter (#819)
+  - `autumn generate auth` now persists a `{user}_sessions` row per login
+    (SHA-256 digest of the opaque session id — never the raw id — plus user id,
+    IP at login, raw + parsed User-Agent, optional device label, `created_at`,
+    `last_seen_at`), created on password login, email confirmation, TOTP verify,
+    and passkey login, and removed on logout.
+  - Generated handler APIs on the user model: `sessions()`, `revoke_session(id)`,
+    `revoke_other_sessions(current_digest)`, and `revoke_all_sessions()`, plus a
+    `require_tracked_session` gate used by every generated authenticated route.
+    The row is the source of truth: revoking it makes the device's **next**
+    request 401 (the cookie session is destroyed too), with no reliance on
+    cookie expiry. `last_seen_at` writes are throttled to at most one per
+    `[auth.sessions].last_seen_update_secs` (default 60 s) per session.
+  - New `/account/sessions` Maud + htmx page: per-session revoke buttons,
+    device labels, and a one-click "Sign out everywhere else".
+  - Credential-changing events — password reset, TOTP enrollment/disable, and
+    passkey add/remove — revoke all *other* sessions by default, configurable
+    via the new `[auth.sessions] revoke_on_credential_change` flag (default on).
+  - New `autumn_web::user_agent` module: a dependency-free heuristic
+    `parse_user_agent` (browser family / OS / device class) with a documented
+    one-line swap point for custom parsers.
+  - Generated `tests/auth_sessions.rs` covers the two-client flow (log in twice,
+    revoke from one client, the other's replayed cookie 401s) and generated
+    `docs/guide/session-management.md` documents the APIs, the privacy posture
+    for stored IP/UA (purpose limitation, retention scrubbing SQL, IP
+    truncation), and the migration path for existing auth-starter apps.
+  - Additive only: one new table in the auth-starter migration; no public API
+    removed.
+- **jobs:** Job uniqueness keys and concurrency limits for `#[job]` (#829)
+  - `#[job(unique)]` dedupes enqueues on a stable hash of the full args;
+    `unique_by = "field, …"` derives the key from selected args fields. The
+    uniqueness window is configurable: `unique_window = "running"` (default:
+    held while pending or running), `"pending"` (released when execution
+    starts), or `unique_for_ms = N` (TTL debounce from enqueue time). A
+    coalesced enqueue is a no-op `Ok(())` — N identical enqueues in a burst
+    execute exactly once.
+  - `#[job(concurrency = N)]` caps simultaneously-executing jobs of the type;
+    `concurrency_key = "field"` scopes the cap per distinct args value
+    (e.g. at most one `recalculate_account` per account). Excess jobs wait
+    for a slot rather than running or being dropped.
+  - Enforced consistently on all three backends and distributed-safe on the
+    durable ones: Postgres uses an additive schema (nullable columns + a
+    partial unique index with `ON CONFLICT DO NOTHING`) and concurrency-aware
+    claims serialized by a transaction-scoped advisory lock only when a
+    limited job is registered; Redis uses `SET NX PX` unique locks and atomic
+    Lua claim/settle scripts with a parked-jobs zset.
+  - Keys and slots are released on success, terminal failure, and worker
+    crash (visibility-timeout recovery / TTL backstop), so a dead worker
+    cannot deadlock a unique key or leak a concurrency slot. Retries keep
+    the key held but free the slot during backoff.
+  - Observability: `/actuator/jobs` adds `total_deduplicated` and
+    `blocked_on_concurrency` per job, and the job admin model gains the
+    `deduplicated` status.
+  - Additive and non-breaking: jobs without the new attributes behave
+    exactly as before; the `autumn_jobs` schema change is additive; minor
+    version bump.
+
+- **log:** Structured per-request access log, on by default (#999)
+  - Every served HTTP request now emits **exactly one** structured access-log
+    event (`tracing` target `autumn::access`, level `INFO`) at the response
+    boundary, carrying `method`, `route` (the matched low-cardinality template,
+    e.g. `/users/{id}` — never the raw path), `status`, `duration_ms`, and the
+    `request_id` that matches the `x-request-id` header and error pages.
+  - Dual placement: the **primary** layer emits inside the request
+    span/log context (correlated, request id from the request extension) and
+    marks the response; an **outermost fallback** at the router assembly
+    boundary logs only responses the primary never saw — startup 503s,
+    pre-built static (SSG/ISR) page hits, session-store outage 503s, and
+    requests to the late-mounted MCP endpoint — with the wire status and no
+    request id (those paths never run `RequestIdLayer`).
+  - Rendered by the standard subscriber, so it honors `log.format`: a readable
+    line under `pretty`, a single JSON object per line under `json`. Works with
+    **no** `telemetry-otlp` feature and no OTLP collector — operators on
+    `docker logs` / platform log drains get request-level visibility for free.
+  - Steady-state probe/asset noise is excluded by default (`/health`,
+    `/live`, `/ready`, `/startup`, `/actuator/*`, `/static/*`); the set is
+    configurable via `log.access_log_exclude` (whole-segment prefix matching)
+    or `AUTUMN_LOG__ACCESS_LOG_EXCLUDE` (comma-separated). Unmatched requests
+    log the low-cardinality `_unmatched` route label.
+  - On by default; turn off with `log.access_log = false` in `autumn.toml`
+    or `AUTUMN_LOG__ACCESS_LOG=false` — no recompile needed.
+  - The line never includes query strings, headers, or bodies, preserving the
+    log-scrubbing posture established for logs (#697) by construction.
+  - Additive `LogConfig` fields only (`access_log`, `access_log_exclude`);
+    non-breaking, minor version bump.
+
+- **log:** Request-scoped log context that auto-tags every log line (#1169)
+  - An always-on `LogContextLayer` establishes a fresh `tokio::task_local`
+    `log::context::LogContext` for **every** HTTP request, seeded with the same
+    `request_id` used by the `x-request-id` header and error pages. It is not
+    gated behind `telemetry-otlp` and is applied inner to `RequestIdLayer` so the
+    request id is always available.
+  - The request is driven inside a `tracing` span carrying
+    `request_id`/`user_id`/`tenant_id`, so every `tracing` event emitted during
+    the request automatically correlates back to it — no manual field threading.
+  - When the request authenticates, `user_id` is added to the context
+    automatically (from both the `#[secured]` session check and the `RequireAuth`
+    middleware); when multi-tenancy resolves a tenant, `tenant_id` is added
+    automatically (from the tenancy middleware).
+  - Handler/service code can attach custom fields with
+    `autumn_web::log::context::with_log_field("order_id", id)` (re-exported from
+    the prelude). The well-known ids (`request_id`/`user_id`/`tenant_id`) ride the
+    request span and render in ordinary `tracing` output; custom fields are
+    carried in the context for **structured** consumers — the actuator log buffer
+    (#1168), the access line (#999), or any context-aware layer — rather than the
+    default stdout formatter. Reserved keys cannot be shadowed by custom fields.
+  - The context stays active while a streaming/SSE response body is produced (the
+    body is re-scoped per frame, mirroring tenancy), and synchronous work in a
+    downstream layer's `Service::call` is correlated too.
+  - Context is isolated per request (nothing leaks across requests) and a
+    `tokio::spawn`'d task does **not** inherit it unless explicitly propagated via
+    `log::context::in_current_context(..)`, which re-enters the request span too.
+  - Sensitive custom-field values are scrubbed through the existing
+    `log/filter.rs` key filter (#697), so secrets never enter the context output.
+  - Additive, non-breaking surface (minor version bump). Establishes the
+    correlating primitive consumed by the per-request access line (#999) and the
+    actuator log-view buffer (#1168).
 - **mcp:** Expose typed endpoints as Model Context Protocol (MCP) tools so AI agents can call your API (#1117)
   - New `mcp` Cargo feature (implies `openapi`). `AppBuilder::mount_mcp("/mcp")` serves a spec-compliant MCP endpoint over Streamable HTTP, handling `initialize`, `tools/list`, and `tools/call`.
   - Endpoints opt in per-route via `#[api_doc(mcp)]`; nothing is exposed implicitly. `#[api_doc(mcp = false)]` force-excludes a route.

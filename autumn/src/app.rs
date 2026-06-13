@@ -124,8 +124,11 @@ pub fn app() -> AppBuilder {
         channels_interceptor: None,
         #[cfg(feature = "oauth2")]
         http_interceptor: None,
+        seo_sources: Vec::new(),
         metrics_sources: Vec::new(),
         health_indicators: Vec::new(),
+        #[cfg(feature = "inbound-mail")]
+        inbound_mail_router: None,
     }
 }
 
@@ -330,6 +333,10 @@ pub struct AppBuilder {
     channels_interceptor: Option<Arc<dyn crate::interceptor::ChannelsInterceptor>>,
     #[cfg(feature = "oauth2")]
     http_interceptor: Option<Arc<dyn crate::interceptor::HttpInterceptor>>,
+    /// Sitemap sources registered via [`AppBuilder::seo_source`].
+    /// Each source provides dynamic URL entries for `/sitemap.xml`.
+    seo_sources: Vec<Arc<dyn crate::seo::SitemapSource>>,
+
     /// Plugin-contributed metrics sources registered via [`AppBuilder::metrics_source`].
     pub(crate) metrics_sources: Vec<(String, Arc<dyn crate::actuator::MetricsSource>)>,
     /// Custom health indicators registered via [`AppBuilder::health_indicator`].
@@ -338,6 +345,11 @@ pub struct AppBuilder {
         crate::actuator::IndicatorGroup,
         Arc<dyn crate::actuator::HealthIndicator>,
     )>,
+    /// Inbound mail router registered via [`AppBuilder::inbound_mail_router`].
+    /// HTTP webhook routes are derived from the router's endpoint configs and
+    /// merged into the Axum router at startup.
+    #[cfg(feature = "inbound-mail")]
+    pub(crate) inbound_mail_router: Option<Arc<crate::inbound_mail::InboundMailRouter>>,
 }
 
 /// Boxed builder closure that constructs a durable
@@ -513,6 +525,49 @@ impl AppBuilder {
     #[must_use]
     pub fn static_routes(mut self, metas: Vec<crate::static_gen::StaticRouteMeta>) -> Self {
         self.static_metas.extend(metas);
+        self
+    }
+
+    /// Register a [`SitemapSource`](crate::seo::SitemapSource) for dynamic sitemap entries.
+    ///
+    /// When called at least once, the framework automatically serves `/sitemap.xml` and
+    /// `/robots.txt`. Dynamic sources (e.g. blog posts from a database) produce entries
+    /// collected at request time.
+    ///
+    /// Combine with `[seo] base_url` in `autumn.toml` to auto-inject the `Sitemap:`
+    /// directive in `robots.txt` and compute canonical URLs.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use autumn_web::prelude::*;
+    /// use autumn_web::seo::{SitemapEntry, SitemapSource};
+    /// use std::pin::Pin;
+    /// use std::future::Future;
+    ///
+    /// struct PostsSitemap;
+    ///
+    /// impl SitemapSource for PostsSitemap {
+    ///     fn entries(&self) -> Pin<Box<dyn Future<Output = Vec<SitemapEntry>> + Send>> {
+    ///         Box::pin(async {
+    ///             vec![SitemapEntry::new("https://example.com/posts/hello")]
+    ///         })
+    ///     }
+    /// }
+    ///
+    /// # #[autumn_web::main]
+    /// # async fn main() {
+    /// # #[get("/")] async fn index() -> &'static str { "" }
+    /// autumn_web::app()
+    ///     .routes(routes![index])
+    ///     .seo_source(PostsSitemap)
+    ///     .run()
+    ///     .await;
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn seo_source<S: crate::seo::SitemapSource + 'static>(mut self, source: S) -> Self {
+        self.seo_sources.push(Arc::new(source));
         self
     }
 
@@ -1750,6 +1805,42 @@ impl AppBuilder {
         self
     }
 
+    /// Register an inbound mail router that creates webhook HTTP endpoints and
+    /// dispatches parsed [`InboundEmail`](crate::inbound_mail::InboundEmail)
+    /// values to registered handlers.
+    ///
+    /// Calling this method twice replaces the previously registered router.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use autumn_web::inbound_mail::{
+    ///     InboundMailRouter, InboundMailEndpointConfig,
+    ///     InboundMailHandlerInfo, ProcessingMode, RecipientPattern,
+    /// };
+    ///
+    /// autumn_web::app()
+    ///     .inbound_mail_router(
+    ///         InboundMailRouter::new()
+    ///             .endpoint(InboundMailEndpointConfig::mailgun("/inbound/mailgun", "key"))
+    ///             .handler(InboundMailHandlerInfo {
+    ///                 name: "support",
+    ///                 pattern: RecipientPattern::Exact("support@company.com".to_string()),
+    ///                 processing: ProcessingMode::Background,
+    ///                 handler: handle_support,
+    ///             })
+    ///     )
+    ///     .routes(routes![...])
+    ///     .run()
+    ///     .await;
+    /// ```
+    #[cfg(feature = "inbound-mail")]
+    #[must_use]
+    pub fn inbound_mail_router(mut self, router: crate::inbound_mail::InboundMailRouter) -> Self {
+        self.inbound_mail_router = Some(Arc::new(router));
+        self
+    }
+
     /// Register mail template previews for the dev mail preview UI.
     ///
     /// Pair this with `#[mailer_preview]` and `mail_previews![...]`.
@@ -2082,7 +2173,7 @@ impl AppBuilder {
             tasks,
             one_off_tasks: _,
             jobs,
-            static_metas: _,
+            static_metas,
             exception_filters,
             scoped_groups,
             merge_routers,
@@ -2133,14 +2224,17 @@ impl AppBuilder {
             channels_interceptor,
             #[cfg(feature = "oauth2")]
             http_interceptor,
+            seo_sources,
             metrics_sources,
             health_indicators,
+            #[cfg(feature = "inbound-mail")]
+            inbound_mail_router,
         } = self;
 
         let all_routes = routes;
 
         // 1 & 2. Load configuration and initialize logging/telemetry
-        let (mut config, _telemetry_guard) =
+        let (mut config, telemetry_guard) =
             load_config_and_telemetry(config_loader_factory, telemetry_provider).await;
 
         // Apply builder-level flag: `.idempotent()` enables the middleware when
@@ -2270,6 +2364,12 @@ impl AppBuilder {
             channels_backend,
         );
 
+        // Wire the in-memory log capture buffer from the telemetry guard into the
+        // app state so the `/actuator/logfile` endpoint can serve it.
+        if let Some(buf) = telemetry_guard.log_buffer.clone() {
+            state.insert_extension(buf);
+        }
+
         // Instantiate MaintenanceState, load flag synchronously at startup, insert as extension, and start background poller task
         let maintenance_state = crate::maintenance::MaintenanceState::new();
         let flag_path = std::path::Path::new(crate::maintenance::MAINTENANCE_FLAG_FILE);
@@ -2309,6 +2409,33 @@ impl AppBuilder {
                 tokio::time::sleep(interval).await;
             }
         });
+
+        // Resolve the canary deploy-version label (AUTUMN_DEPLOY_VERSION /
+        // AUTUMN_CANARY) once at startup and publish it so the actuator metrics
+        // endpoint can tag every metric family with version="stable|canary".
+        let canary_state = crate::canary::CanaryState::from_env();
+        if canary_state.is_canary() {
+            tracing::info!(
+                version = canary_state.version(),
+                "canary: replica labelled as canary cohort"
+            );
+        }
+        state.insert_extension(canary_state);
+
+        // A rollback flag present at startup means a controller already retired
+        // this replica. Flip /ready to draining immediately so a supervisor
+        // restart cannot put a rolled-back replica back into the canary cohort;
+        // `canary_rollback_signal` then drives the clean drain → exit.
+        if crate::canary::CanaryState::rollback_flag_present(std::path::Path::new(
+            crate::canary::CANARY_ROLLBACK_FLAG_FILE,
+        )) {
+            tracing::warn!(
+                "canary: rollback flag present at startup; /ready will report draining until \
+                 the flag is cleared (`autumn canary promote`)"
+            );
+            state.begin_shutdown();
+        }
+
         #[cfg(feature = "mail")]
         if let Some(interceptor) = mail_interceptor {
             state.insert_extension(interceptor);
@@ -2424,11 +2551,101 @@ impl AppBuilder {
         } else {
             None
         };
-        #[cfg_attr(not(feature = "storage"), allow(unused_mut))]
+        #[cfg_attr(
+            not(any(feature = "storage", feature = "inbound-mail")),
+            allow(unused_mut)
+        )]
         let mut merge_routers = merge_routers;
         #[cfg(feature = "storage")]
         if let Some(router) = storage_router {
             merge_routers.push(router);
+        }
+
+        // Register SEO routes (/robots.txt and /sitemap.xml) when any SEO
+        // configuration is present or dynamic sources are registered.
+        if !seo_sources.is_empty() || crate::seo::has_seo_config(&config.seo) {
+            let seo_cfg = &config.seo;
+            let raw_profile = config.profile.as_deref().unwrap_or("dev");
+            let profile = crate::seo::effective_seo_profile(raw_profile, seo_cfg.robots.allow_all);
+            let static_paths: Vec<&str> = static_metas.iter().map(|m| m.path).collect();
+            let (robots_body, sitemap_body) = crate::seo::assemble_seo_bodies(
+                profile,
+                seo_cfg.base_url.as_deref(),
+                seo_cfg.robots.sitemap_url.as_deref(),
+                &seo_cfg.robots.additional_rules,
+                &seo_sources,
+                &static_paths,
+            )
+            .await;
+            let seo_router = crate::seo::build_seo_router_from_bodies(robots_body, sitemap_body);
+            let is_seo_path = |p: &str| p == "/robots.txt" || p == "/sitemap.xml";
+            let seo_collision = all_routes.iter().any(|r| is_seo_path(r.path))
+                || static_metas.iter().any(|m| is_seo_path(m.path))
+                || scoped_groups.iter().any(|g| {
+                    let prefix = g.prefix.trim_end_matches('/');
+                    g.routes
+                        .iter()
+                        .any(|r| is_seo_path(&format!("{prefix}{}", r.path)))
+                });
+            if seo_collision {
+                tracing::warn!(
+                    "seo: /robots.txt or /sitemap.xml is already registered by the application; \
+                     skipping automatic SEO routes to prevent a startup panic"
+                );
+            } else {
+                merge_routers.push(seo_router);
+            }
+        }
+
+        #[cfg(feature = "inbound-mail")]
+        if let Some(ref im_router) = inbound_mail_router {
+            let mut registered_inbound: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
+            for (path, axum_router) in crate::inbound_mail::build_routes(im_router) {
+                // Preflight collision check: if an annotated POST route already
+                // claims this path, merging an opaque router at the same path
+                // would cause Axum to panic at startup.  Warn and skip instead
+                // so the application can still start and the conflict is visible.
+                if all_routes
+                    .iter()
+                    .any(|r| r.method == http::Method::POST && r.path == path)
+                    || scoped_groups.iter().any(|g| {
+                        g.routes.iter().any(|r| {
+                            r.method == http::Method::POST
+                                && crate::router::join_nested_path(&g.prefix, r.path)
+                                    == path.as_str()
+                        })
+                    })
+                    || nest_routers.iter().any(|(nest_path, _)| {
+                        let p = nest_path.as_str();
+                        path.as_str() == p
+                            || path.starts_with(p)
+                                && (p.ends_with('/') || path.as_bytes().get(p.len()) == Some(&b'/'))
+                    })
+                {
+                    tracing::warn!(
+                        path = %path,
+                        "inbound_mail: skipping webhook route — a POST handler is \
+                         already registered at this path by the application"
+                    );
+                    continue;
+                }
+                // Also guard against two inbound endpoints sharing the same path,
+                // which would cause the same Axum merge panic.
+                if !registered_inbound.insert(path.clone()) {
+                    tracing::warn!(
+                        path = %path,
+                        "inbound_mail: skipping duplicate inbound webhook path"
+                    );
+                    continue;
+                }
+                // Exempt each inbound webhook path from both CSRF and CAPTCHA:
+                // these routes receive provider-signed POST requests that never
+                // carry a CSRF or CAPTCHA token.
+                config.security.csrf.exempt_paths.push(path.clone());
+                config.security.captcha_exempt_paths.push(path);
+                merge_routers.push(axum_router);
+            }
         }
         let router = crate::router::try_build_router_with_static_inner(
             all_routes,
@@ -2662,18 +2879,19 @@ impl AppBuilder {
         }
 
         if !state.probes().is_shutting_down() {
-            if !tasks.is_empty()
-                && let Err(error) = start_task_scheduler_with_config(
+            if !tasks.is_empty() {
+                let res = start_task_scheduler_with_config(
                     tasks,
                     &state,
                     &server_shutdown,
                     &config.scheduler,
-                )
-            {
-                tracing::error!(error = %error, "scheduled task runtime initialization failed");
-                server_shutdown.cancel();
-                server_task.abort();
-                std::process::exit(1);
+                );
+                if let Err(err) = res {
+                    tracing::error!(error = %err, "scheduled task runtime initialization failed");
+                    server_shutdown.cancel();
+                    server_task.abort();
+                    std::process::exit(1);
+                }
             }
             state.probes().mark_startup_complete();
         }
@@ -2778,8 +2996,11 @@ impl AppBuilder {
             channels_interceptor,
             #[cfg(feature = "oauth2")]
             http_interceptor,
+            seo_sources,
             metrics_sources,
             health_indicators,
+            #[cfg(feature = "inbound-mail")]
+                inbound_mail_router: _,
         } = self;
 
         let _ = &api_versions;
@@ -2788,7 +3009,7 @@ impl AppBuilder {
         let all_routes = routes;
 
         // Load config (same as normal startup)
-        let (mut config, _telemetry_guard) =
+        let (mut config, telemetry_guard) =
             load_config_and_telemetry(config_loader_factory, telemetry_provider).await;
         if idempotency_enabled {
             let env_disabled = std::env::var("AUTUMN_IDEMPOTENCY__ENABLED")
@@ -2901,6 +3122,9 @@ impl AppBuilder {
             #[cfg(feature = "ws")]
             channels_backend,
         );
+        if let Some(buf) = telemetry_guard.log_buffer.clone() {
+            state.insert_extension(buf);
+        }
         state.insert_extension(RegisteredApiVersions(api_versions.clone()));
         #[cfg(feature = "mail")]
         if let Some(interceptor) = mail_interceptor {
@@ -3063,6 +3287,55 @@ impl AppBuilder {
                 }
                 Err(e) => {
                     eprintln!("  \u{26A0} Failed to write OpenAPI spec: {e}");
+                }
+            }
+        }
+
+        // Write robots.txt and sitemap.xml to dist/ — only when SEO is explicitly
+        // configured or dynamic sources are registered, and never overwrite files
+        // already produced by a custom #[static_get("/robots.txt")] route.
+        if !seo_sources.is_empty() || crate::seo::has_seo_config(&config.seo) {
+            let seo_cfg = &config.seo;
+            let raw_profile = config.profile.as_deref().unwrap_or("dev");
+            let profile = crate::seo::effective_seo_profile(raw_profile, seo_cfg.robots.allow_all);
+            let static_paths: Vec<&str> = static_metas.iter().map(|m| m.path).collect();
+            let (robots_body, sitemap_body) = crate::seo::assemble_seo_bodies(
+                profile,
+                seo_cfg.base_url.as_deref(),
+                seo_cfg.robots.sitemap_url.as_deref(),
+                &seo_cfg.robots.additional_rules,
+                &seo_sources,
+                &static_paths,
+            )
+            .await;
+            // Write each file only if it wasn't already produced by a
+            // custom #[static_get] route.
+            let robots_path = dist_dir.join("robots.txt");
+            let sitemap_path = dist_dir.join("sitemap.xml");
+            if robots_path.exists() {
+                eprintln!(
+                    "  \u{2713} SEO: robots.txt already present (custom static route), skipping"
+                );
+            } else {
+                match tokio::fs::write(&robots_path, robots_body).await {
+                    Ok(()) => eprintln!(
+                        "  \u{2713} SEO: robots.txt written \u{2192} {}",
+                        robots_path.display()
+                    ),
+                    Err(e) => eprintln!("  \u{26A0} Failed to write robots.txt: {e}"),
+                }
+            }
+            if sitemap_path.exists() {
+                eprintln!(
+                    "  \u{2713} SEO: sitemap.xml already present (custom static route), skipping"
+                );
+            } else {
+                match tokio::fs::write(&sitemap_path, sitemap_body).await {
+                    Ok(()) => eprintln!(
+                        "  \u{2713} SEO: sitemap.xml written \u{2192} {}",
+                        sitemap_path.display()
+                    ),
+                    Err(e) => eprintln!("  \u{26A0} Failed to write sitemap.xml: {e}"),
                 }
             }
         }
@@ -3252,7 +3525,7 @@ impl AppBuilder {
             std::process::exit(1);
         });
 
-        let (config, _telemetry_guard) =
+        let (config, telemetry_guard) =
             load_config_and_telemetry(config_loader_factory, telemetry_provider).await;
 
         #[cfg(feature = "i18n")]
@@ -3301,6 +3574,9 @@ impl AppBuilder {
             #[cfg(feature = "ws")]
             channels_backend,
         );
+        if let Some(buf) = telemetry_guard.log_buffer.clone() {
+            state.insert_extension(buf);
+        }
         #[cfg(feature = "mail")]
         if let Some(interceptor) = mail_interceptor {
             state.insert_extension(interceptor);
@@ -4551,13 +4827,22 @@ async fn setup_database(
     if topology.is_some()
         && let Some(url) = config.database.effective_primary_url()
     {
+        let url = url.to_owned();
+        let profile = config.profile.clone();
+        let auto_in_prod = config.database.auto_migrate_in_production;
         for mig in migrations {
-            crate::migrate::auto_migrate(
-                url,
-                config.profile.as_deref(),
-                config.database.auto_migrate_in_production,
-                mig,
-            );
+            let url = url.clone();
+            let profile = profile.clone();
+            // run_pending_locked polls with std::thread::sleep (up to 60 s under
+            // contention), so we must not call auto_migrate on a Tokio worker thread.
+            tokio::task::spawn_blocking(move || {
+                crate::migrate::auto_migrate(&url, profile.as_deref(), auto_in_prod, mig);
+            })
+            .await
+            .unwrap_or_else(|e| {
+                tracing::error!(error = %e, "Migration task panicked");
+                std::process::exit(1);
+            });
         }
     }
 
@@ -5542,10 +5827,16 @@ pub(crate) fn project_dir(subdir: &str, env: &dyn crate::config::Env) -> std::pa
     )
 }
 
-/// Wait for a shutdown signal (Ctrl+C or SIGTERM on Unix).
+/// Wait for a shutdown signal (Ctrl+C, SIGTERM on Unix, or a canary rollback
+/// flag file written by a controller).
 ///
-/// Returns when either signal is received. Axum's `with_graceful_shutdown`
+/// Returns when any signal is received. Axum's `with_graceful_shutdown`
 /// then stops accepting new connections and drains in-flight requests.
+///
+/// The canary rollback arm lets a progressive-delivery controller drain and
+/// retire a bad canary replica without sending `SIGTERM` by hand: it writes
+/// [`crate::canary::CANARY_ROLLBACK_FLAG_FILE`] and Autumn runs the identical
+/// graceful-shutdown sequence (ready → 503, prestop grace, drain, clean exit).
 async fn shutdown_signal() {
     let ctrl_c = async {
         tokio::signal::ctrl_c()
@@ -5566,9 +5857,40 @@ async fn shutdown_signal() {
     #[cfg(not(unix))]
     let terminate = std::future::pending::<()>();
 
+    let canary_rollback = async {
+        canary_rollback_signal(std::path::Path::new(
+            crate::canary::CANARY_ROLLBACK_FLAG_FILE,
+        ))
+        .await;
+        tracing::info!("Canary rollback signalled, starting graceful shutdown");
+    };
+
     tokio::select! {
         () = ctrl_c => {},
         () = terminate => {},
+        () = canary_rollback => {},
+    }
+}
+
+/// Resolve when the canary rollback flag file is present at `path`.
+///
+/// A rollback signal is intentionally **sticky across restarts**: if the flag is
+/// already present at boot (e.g. a supervisor restarted the process after a
+/// rollback), this resolves immediately so the replica drains and exits again
+/// rather than rejoining the canary cohort. The replica keeps draining until a
+/// controller clears the signal with `autumn canary promote` (or scales the
+/// replica to zero). At startup the framework also flips `/ready` to draining
+/// when the flag is present, so a restarted rolled-back replica never serves
+/// canary traffic.
+///
+/// Uses async stat so the 500 ms poll never blocks the executor thread.
+async fn canary_rollback_signal(path: &std::path::Path) {
+    let interval = std::time::Duration::from_millis(500);
+    loop {
+        if tokio::fs::metadata(path).await.is_ok() {
+            return;
+        }
+        tokio::time::sleep(interval).await;
     }
 }
 
@@ -5646,6 +5968,54 @@ mod tests {
             clock: std::sync::Arc::new(crate::time::SystemClock),
         };
         crate::router::build_router(routes, &config, state)
+    }
+
+    #[tokio::test]
+    async fn canary_rollback_signal_resolves_when_flag_newly_written() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("canary-rollback.json");
+
+        // Flag is absent at boot; writing it after start must resolve the signal.
+        let writer_path = path.clone();
+        let writer = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            crate::canary::CanaryState::write_rollback_flag(
+                &writer_path,
+                &crate::canary::RollbackSignal::default(),
+            )
+            .unwrap();
+        });
+
+        let signalled = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            canary_rollback_signal(&path),
+        )
+        .await;
+        assert!(signalled.is_ok(), "rollback signal should resolve");
+        writer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn canary_rollback_signal_resolves_immediately_when_flag_present_at_boot() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("canary-rollback.json");
+        // A rollback flag is sticky across restarts: present at boot must trigger
+        // again so a supervisor restart cannot rejoin a rolled-back replica.
+        crate::canary::CanaryState::write_rollback_flag(
+            &path,
+            &crate::canary::RollbackSignal::default(),
+        )
+        .unwrap();
+
+        let signalled = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            canary_rollback_signal(&path),
+        )
+        .await;
+        assert!(
+            signalled.is_ok(),
+            "a flag present at boot must trigger rollback (sticky across restarts)"
+        );
     }
 
     #[cfg(feature = "db")]
@@ -6405,6 +6775,8 @@ mod tests {
                 name: "startup-seed".to_string(),
                 max_attempts: 1,
                 initial_backoff_ms: 1,
+                uniqueness: None,
+                concurrency: None,
                 handler: startup_noop_job_handler,
             }])
             .on_startup(|_state| async {
@@ -6462,6 +6834,8 @@ mod tests {
                 name: "startup-seed".to_string(),
                 max_attempts: 1,
                 initial_backoff_ms: 1,
+                uniqueness: None,
+                concurrency: None,
                 handler: startup_noop_job_handler,
             }],
             &state,

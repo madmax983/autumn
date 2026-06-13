@@ -19,6 +19,7 @@ mod collect;
 mod feature_flag;
 mod i18n;
 mod idempotency_guard;
+mod inbound_mail;
 mod job;
 mod jobs_macro;
 mod mail_previews_macro;
@@ -235,6 +236,37 @@ pub fn main(_attr: TokenStream, item: TokenStream) -> TokenStream {
     main_macro::main_macro(item.into()).into()
 }
 
+/// Annotate an async inbound mail handler function.
+///
+/// Generates a companion `{name}_handler_info()` function that returns an
+/// `InboundMailHandlerInfo` ready to be passed to `InboundMailRouter::handler`.
+///
+/// # Attributes
+///
+/// - `to = "address@example.com"` — exact recipient match.
+/// - `to = "replies+{token}@app.example"` — plus-address routing; the captured
+///   token is available via `InboundEmail::plus_token()`.
+/// - `to = "prefix+*"` — local-part prefix match.
+/// - `processing = "sync"` | `"background"` (default: `"background"`).
+///
+/// # Example
+///
+/// ```rust,ignore
+/// #[inbound_mail(to = "support@company.com")]
+/// async fn handle_support(email: InboundEmail) -> AutumnResult<()> {
+///     tracing::info!(from = %email.from, "support email received");
+///     Ok(())
+/// }
+///
+/// // Registration:
+/// InboundMailRouter::new()
+///     .handler(handle_support_handler_info())
+/// ```
+#[proc_macro_attribute]
+pub fn inbound_mail(attr: TokenStream, item: TokenStream) -> TokenStream {
+    inbound_mail::inbound_mail_macro(attr.into(), item.into()).into()
+}
+
 /// Generate `send_*` and `deliver_later_*` helpers for a mailer impl block.
 #[proc_macro_attribute]
 pub fn mailer(attr: TokenStream, item: TokenStream) -> TokenStream {
@@ -296,6 +328,16 @@ pub fn model(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// Generates a `PgXxxRepository` struct implementing the annotated trait,
 /// with auto-generated CRUD methods and query-by-name derived methods.
 ///
+/// # Read replica routing
+///
+/// When `database.replica_url` is configured, generated read-only methods
+/// (`find_by_id`, `find_all`, `count`, `paginate`, `cursor_page`, derived
+/// `find_by_*`, search reads) acquire their connection from the replica
+/// pool; mutating methods always use the primary. Add `primary_reads` to
+/// pin a read-after-write-sensitive repository's reads to the primary, or
+/// call the generated `on_primary()` method to pin a single call chain
+/// (read-your-writes).
+///
 /// # Examples
 ///
 /// ```ignore
@@ -305,6 +347,10 @@ pub fn model(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// trait PostRepository {
 ///     fn find_by_published(published: bool) -> Vec<Post>;
 /// }
+///
+/// // Reads pinned to the primary even when a replica is configured.
+/// #[repository(LedgerEntry, primary_reads)]
+/// trait LedgerEntryRepository {}
 /// ```
 #[proc_macro_attribute]
 pub fn repository(attr: TokenStream, item: TokenStream) -> TokenStream {

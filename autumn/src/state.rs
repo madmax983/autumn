@@ -723,6 +723,13 @@ impl crate::actuator::ProvideActuatorState for AppState {
         self.health_detailed
     }
 
+    fn deploy_version(&self) -> String {
+        self.extension::<crate::canary::CanaryState>().map_or_else(
+            || crate::canary::STABLE.to_owned(),
+            |c| c.version().to_owned(),
+        )
+    }
+
     #[cfg(feature = "ws")]
     fn channels(&self) -> &crate::channels::Channels {
         &self.channels
@@ -749,6 +756,11 @@ impl crate::actuator::ProvideActuatorState for AppState {
     #[cfg(feature = "http-client")]
     fn webhook_outbound(&self) -> Option<crate::webhook_outbound::WebhookOutboundManager> {
         self.extension::<crate::webhook_outbound::WebhookOutboundManager>()
+            .map(|x| (*x).clone())
+    }
+
+    fn log_buffer(&self) -> Option<crate::log::capture::LogBuffer> {
+        self.extension::<crate::log::capture::LogBuffer>()
             .map(|x| (*x).clone())
     }
 }
@@ -961,6 +973,21 @@ mod tests {
     fn app_state_profile_accessor() {
         let state = AppState::for_test().with_profile("staging");
         assert_eq!(state.profile(), "staging");
+    }
+
+    #[test]
+    fn app_state_deploy_version_defaults_to_stable() {
+        use crate::actuator::ProvideActuatorState;
+        let state = AppState::for_test();
+        assert_eq!(state.deploy_version(), crate::canary::STABLE);
+    }
+
+    #[test]
+    fn app_state_deploy_version_reads_canary_extension() {
+        use crate::actuator::ProvideActuatorState;
+        let state = AppState::for_test();
+        state.insert_extension(crate::canary::CanaryState::new(crate::canary::CANARY));
+        assert_eq!(state.deploy_version(), crate::canary::CANARY);
     }
 
     #[test]

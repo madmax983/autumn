@@ -332,9 +332,29 @@ pub trait ProvideActuatorState {
         true
     }
 
+    /// Returns the deploy-version label for this replica (e.g. `"stable"` or
+    /// `"canary"`), used to tag Prometheus metrics so a canary controller can
+    /// compare canary vs. stable cohorts.
+    ///
+    /// Defaults to [`crate::canary::STABLE`]. [`crate::AppState`] overrides this
+    /// to return the value resolved from `AUTUMN_DEPLOY_VERSION` /
+    /// `AUTUMN_CANARY` (see [`crate::canary`]).
+    fn deploy_version(&self) -> String {
+        crate::canary::STABLE.to_owned()
+    }
+
     #[cfg(feature = "http-client")]
     /// Returns the optional webhook outbound manager if enabled/registered.
     fn webhook_outbound(&self) -> Option<crate::webhook_outbound::WebhookOutboundManager> {
+        None
+    }
+
+    /// Returns the in-memory log capture buffer, if capture is enabled.
+    ///
+    /// The default returns `None` (capture disabled). [`crate::AppState`]
+    /// overrides this to return the buffer installed at startup when
+    /// `log.capture.enabled = true`.
+    fn log_buffer(&self) -> Option<crate::log::capture::LogBuffer> {
         None
     }
 }
@@ -475,15 +495,34 @@ pub struct JobStatus {
     pub queued: u64,
     /// Number of currently running jobs.
     pub in_flight: u64,
+    /// Approximate jobs currently waiting on a free concurrency slot.
+    pub blocked_on_concurrency: u64,
     /// Total successful executions.
     pub total_successes: u64,
     /// Total failed executions.
     pub total_failures: u64,
     /// Total dead-lettered executions.
     pub dead_letters: u64,
+    /// Total enqueues coalesced because a matching unique job was already held.
+    pub total_deduplicated: u64,
     /// Last observed error for this job, if any.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
+}
+
+impl JobStatus {
+    const fn empty() -> Self {
+        Self {
+            queued: 0,
+            in_flight: 0,
+            blocked_on_concurrency: 0,
+            total_successes: 0,
+            total_failures: 0,
+            dead_letters: 0,
+            total_deduplicated: 0,
+            last_error: None,
+        }
+    }
 }
 
 /// Registry of ad-hoc jobs and their runtime status.
@@ -504,29 +543,59 @@ impl JobRegistry {
     /// Register a job name with initial counters.
     pub fn register(&self, name: &str) {
         if let Ok(mut guard) = self.inner.write() {
-            guard.entry(name.to_string()).or_insert(JobStatus {
-                queued: 0,
-                in_flight: 0,
-                total_successes: 0,
-                total_failures: 0,
-                dead_letters: 0,
-                last_error: None,
-            });
+            guard.entry(name.to_string()).or_insert(JobStatus::empty());
         }
     }
 
     /// Record that a new job instance was enqueued.
     pub fn record_enqueue(&self, name: &str) {
         if let Ok(mut guard) = self.inner.write() {
-            let status = guard.entry(name.to_string()).or_insert(JobStatus {
-                queued: 0,
-                in_flight: 0,
-                total_successes: 0,
-                total_failures: 0,
-                dead_letters: 0,
-                last_error: None,
-            });
+            let status = guard.entry(name.to_string()).or_insert(JobStatus::empty());
             status.queued = status.queued.saturating_add(1);
+        }
+    }
+
+    /// Record that an enqueue was coalesced into an existing unique job.
+    ///
+    /// Reverses the `record_enqueue` bookkeeping for the coalesced instance
+    /// and bumps the deduplication counter.
+    pub fn record_deduplicated(&self, name: &str) {
+        if let Ok(mut guard) = self.inner.write()
+            && let Some(status) = guard.get_mut(name)
+        {
+            status.queued = status.queued.saturating_sub(1);
+            status.total_deduplicated = status.total_deduplicated.saturating_add(1);
+        }
+    }
+
+    /// Record that a job is parked waiting on a free concurrency slot.
+    pub fn record_concurrency_blocked(&self, name: &str) {
+        if let Ok(mut guard) = self.inner.write()
+            && let Some(status) = guard.get_mut(name)
+        {
+            status.blocked_on_concurrency = status.blocked_on_concurrency.saturating_add(1);
+        }
+    }
+
+    /// Record that a parked job was released back to the queue.
+    pub fn record_concurrency_unblocked(&self, name: &str) {
+        if let Ok(mut guard) = self.inner.write()
+            && let Some(status) = guard.get_mut(name)
+        {
+            status.blocked_on_concurrency = status.blocked_on_concurrency.saturating_sub(1);
+        }
+    }
+
+    /// Replace the blocked-on-concurrency gauges from a backend-wide survey.
+    ///
+    /// Names absent from `counts` are reset to zero. Used by the durable
+    /// backends whose blocked set is observed periodically rather than
+    /// tracked per event.
+    pub fn set_concurrency_blocked_counts(&self, counts: &HashMap<String, u64>) {
+        if let Ok(mut guard) = self.inner.write() {
+            for (name, status) in guard.iter_mut() {
+                status.blocked_on_concurrency = counts.get(name).copied().unwrap_or(0);
+            }
         }
     }
 
@@ -887,6 +956,20 @@ impl ConfigProperties {
             "log.format",
             &format!("{:?}", config.log.format),
             &format!("{:?}", defaults.log.format),
+            profile_str,
+        );
+        Self::track_property(
+            props,
+            "log.capture.enabled",
+            &config.log.capture.enabled.to_string(),
+            &defaults.log.capture.enabled.to_string(),
+            profile_str,
+        );
+        Self::track_property(
+            props,
+            "log.capture.capacity",
+            &config.log.capture.capacity.to_string(),
+            &defaults.log.capture.capacity.to_string(),
             profile_str,
         );
     }
@@ -1399,19 +1482,46 @@ impl HealthIndicatorRegistry {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
 
-        futures::future::join_all(
-            entries
-                .into_iter()
-                .map(|(name, group, indicator)| async move {
-                    let output = run_with_timeout(indicator.as_ref()).await;
-                    HealthRunResult {
-                        name,
-                        group,
-                        output,
-                    }
-                }),
-        )
-        .await
+        let mut results = futures::future::join_all(entries.into_iter().map(
+            |(name, group, indicator)| async move {
+                let output = run_with_timeout(indicator.as_ref()).await;
+                HealthRunResult {
+                    name,
+                    group,
+                    output,
+                }
+            },
+        ))
+        .await;
+
+        for breaker in crate::circuit_breaker::global_registry().all_breakers() {
+            let state = breaker.state();
+            let status = match state {
+                crate::circuit_breaker::CircuitState::Open
+                | crate::circuit_breaker::CircuitState::HalfOpen => HealthStatus::Down,
+                crate::circuit_breaker::CircuitState::Closed => HealthStatus::Up,
+            };
+
+            let mut details = HashMap::new();
+            details.insert(
+                "state".to_string(),
+                serde_json::Value::String(state.as_str().to_string()),
+            );
+            if let Some(ratio_num) = serde_json::Number::from_f64(breaker.failure_ratio()) {
+                details.insert(
+                    "failure_ratio".to_string(),
+                    serde_json::Value::Number(ratio_num),
+                );
+            }
+
+            results.push(HealthRunResult {
+                name: format!("circuit_breaker.{}", breaker.name()),
+                group: IndicatorGroup::HealthOnly,
+                output: HealthCheckOutput { status, details },
+            });
+        }
+
+        results
     }
 
     /// Run only `Readiness`-group indicators with per-indicator timeouts.
@@ -1531,6 +1641,12 @@ fn build_health_components(
     // Custom indicators first so the built-in "db" key inserted below can never
     // be overwritten by a user-registered indicator with the same name.
     for result in indicator_results {
+        if !detailed
+            && result.name.starts_with("circuit_breaker.")
+            && result.output.status.is_healthy()
+        {
+            continue;
+        }
         let details = (detailed && !result.output.details.is_empty())
             .then(|| serde_json::to_value(&result.output.details).unwrap_or_default());
         components.insert(
@@ -1798,6 +1914,47 @@ pub(crate) async fn metrics_endpoint<S: ProvideActuatorState + Send + Sync + 'st
     Json(result)
 }
 
+#[derive(Serialize)]
+pub(crate) struct CircuitBreakerActuatorResponse {
+    pub name: String,
+    pub state: &'static str,
+    pub failure_ratio: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure_ratio_threshold: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sample_window_secs: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub minimum_sample_count: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub open_duration_secs: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub half_open_trial_count: Option<u64>,
+}
+
+/// `GET <actuator-prefix>/circuitbreakers`
+pub(crate) async fn circuitbreakers_endpoint<S: ProvideActuatorState + Send + Sync + 'static>(
+    State(state): State<S>,
+) -> Json<Vec<CircuitBreakerActuatorResponse>> {
+    let detailed = state.health_detailed();
+    let mut responses = Vec::new();
+
+    for breaker in crate::circuit_breaker::global_registry().all_breakers() {
+        let policy = breaker.config();
+        responses.push(CircuitBreakerActuatorResponse {
+            name: breaker.name().to_string(),
+            state: breaker.state().as_str(),
+            failure_ratio: breaker.failure_ratio(),
+            failure_ratio_threshold: detailed.then_some(policy.failure_ratio_threshold),
+            sample_window_secs: detailed.then_some(policy.sample_window.as_secs()),
+            minimum_sample_count: detailed.then_some(policy.minimum_sample_count),
+            open_duration_secs: detailed.then_some(policy.open_duration.as_secs()),
+            half_open_trial_count: detailed.then_some(policy.half_open_trial_count),
+        });
+    }
+
+    Json(responses)
+}
+
 // ── Prometheus ─────────────────────────────────────────────────
 
 /// Render label set `{k="v",...}` or empty string for no labels.
@@ -1841,6 +1998,20 @@ fn is_valid_label_name(s: &str) -> bool {
     let mut it = s.chars();
     matches!(it.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
         && it.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Escape a Prometheus label value (backslash, newline, and double-quote).
+fn escape_prometheus_label_value(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for c in value.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '"' => out.push_str("\\\""),
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 /// Escape a Prometheus HELP string (backslash and newline only).
@@ -1967,21 +2138,22 @@ fn render_plugin_sources(
     }
 }
 
-/// `GET <actuator-prefix>/prometheus` -- export metrics in Prometheus format.
-pub(crate) async fn prometheus_endpoint<S: ProvideActuatorState + Send + Sync + 'static>(
-    State(state): State<S>,
-) -> impl IntoResponse {
+/// Render the built-in `autumn_http_*` metric families into `out`, tagged with
+/// the replica's deploy `version` label so canary and stable cohorts can be
+/// compared by a controller scraping both.
+fn write_builtin_http_metrics(
+    out: &mut String,
+    version: &str,
+    snapshot: &crate::middleware::metrics::MetricsSnapshot,
+) {
     use std::fmt::Write;
-
-    let snapshot = state.metrics().snapshot();
-    let mut out = String::with_capacity(2048);
 
     // requests_total
     out.push_str("# HELP autumn_http_requests_total Total number of HTTP requests\n");
     out.push_str("# TYPE autumn_http_requests_total counter\n");
     let _ = writeln!(
         out,
-        "autumn_http_requests_total {}",
+        "autumn_http_requests_total{{version=\"{version}\"}} {}",
         snapshot.http.requests_total
     );
 
@@ -1990,33 +2162,44 @@ pub(crate) async fn prometheus_endpoint<S: ProvideActuatorState + Send + Sync + 
     out.push_str("# TYPE autumn_http_requests_active gauge\n");
     let _ = writeln!(
         out,
-        "autumn_http_requests_active {}",
+        "autumn_http_requests_active{{version=\"{version}\"}} {}",
         snapshot.http.requests_active
     );
 
     // by_status
     out.push_str("# HELP autumn_http_responses_total HTTP responses by status code\n");
     out.push_str("# TYPE autumn_http_responses_total counter\n");
-    let _ = writeln!(
-        out,
-        "autumn_http_responses_total{{status=\"2xx\"}} {}",
-        snapshot.http.by_status.s2xx
+    for (status, count) in [
+        ("2xx", snapshot.http.by_status.s2xx),
+        ("3xx", snapshot.http.by_status.s3xx),
+        ("4xx", snapshot.http.by_status.s4xx),
+        ("5xx", snapshot.http.by_status.s5xx),
+    ] {
+        let _ = writeln!(
+            out,
+            "autumn_http_responses_total{{version=\"{version}\",status=\"{status}\"}} {count}"
+        );
+    }
+
+    // request_duration_seconds — global latency percentiles exposed as Prometheus
+    // summary-style quantiles, labelled by deploy version so a canary controller
+    // can gate promotion on p99 latency per cohort.
+    out.push_str(
+        "# HELP autumn_http_request_duration_seconds HTTP request latency percentiles in seconds\n",
     );
-    let _ = writeln!(
-        out,
-        "autumn_http_responses_total{{status=\"3xx\"}} {}",
-        snapshot.http.by_status.s3xx
-    );
-    let _ = writeln!(
-        out,
-        "autumn_http_responses_total{{status=\"4xx\"}} {}",
-        snapshot.http.by_status.s4xx
-    );
-    let _ = writeln!(
-        out,
-        "autumn_http_responses_total{{status=\"5xx\"}} {}",
-        snapshot.http.by_status.s5xx
-    );
+    out.push_str("# TYPE autumn_http_request_duration_seconds summary\n");
+    for (quantile, millis) in [
+        ("0.5", snapshot.http.latency_ms.p50),
+        ("0.95", snapshot.http.latency_ms.p95),
+        ("0.99", snapshot.http.latency_ms.p99),
+    ] {
+        #[allow(clippy::cast_precision_loss)]
+        let seconds = millis as f64 / 1000.0;
+        let _ = writeln!(
+            out,
+            "autumn_http_request_duration_seconds{{version=\"{version}\",quantile=\"{quantile}\"}} {seconds}"
+        );
+    }
 
     // autumn_shutdown_aborted_requests_total
     out.push_str(
@@ -2026,7 +2209,7 @@ pub(crate) async fn prometheus_endpoint<S: ProvideActuatorState + Send + Sync + 
     out.push_str("# TYPE autumn_shutdown_aborted_requests_total counter\n");
     let _ = writeln!(
         out,
-        "autumn_shutdown_aborted_requests_total {}",
+        "autumn_shutdown_aborted_requests_total{{version=\"{version}\"}} {}",
         snapshot.http.shutdown_aborted_requests_total
     );
 
@@ -2038,7 +2221,7 @@ pub(crate) async fn prometheus_endpoint<S: ProvideActuatorState + Send + Sync + 
     out.push_str("# TYPE autumn_request_timeouts_total counter\n");
     let _ = writeln!(
         out,
-        "autumn_request_timeouts_total {}",
+        "autumn_request_timeouts_total{{version=\"{version}\"}} {}",
         snapshot.http.request_timeouts_total
     );
 
@@ -2054,12 +2237,26 @@ pub(crate) async fn prometheus_endpoint<S: ProvideActuatorState + Send + Sync + 
             if let Some((method, path)) = route_key.split_once(' ') {
                 let _ = writeln!(
                     out,
-                    "autumn_http_route_requests_total{{method=\"{}\",route=\"{}\"}} {}",
-                    method, path, metrics.count
+                    "autumn_http_route_requests_total{{version=\"{version}\",method=\"{method}\",route=\"{path}\"}} {}",
+                    metrics.count
                 );
             }
         }
     }
+}
+
+/// `GET <actuator-prefix>/prometheus` -- export metrics in Prometheus format.
+pub(crate) async fn prometheus_endpoint<S: ProvideActuatorState + Send + Sync + 'static>(
+    State(state): State<S>,
+) -> impl IntoResponse {
+    let snapshot = state.metrics().snapshot();
+    // Deploy-version label so a canary controller can compare canary vs. stable
+    // cohorts. Escaped defensively in case an operator sets an exotic value via
+    // AUTUMN_DEPLOY_VERSION.
+    let version = escape_prometheus_label_value(&state.deploy_version());
+    let mut out = String::with_capacity(2048);
+
+    write_builtin_http_metrics(&mut out, &version, &snapshot);
 
     // Plugin-contributed metric families — seed with built-in names so
     // plugins cannot shadow or duplicate them.
@@ -2068,6 +2265,7 @@ pub(crate) async fn prometheus_endpoint<S: ProvideActuatorState + Send + Sync + 
             "autumn_http_requests_total",
             "autumn_http_requests_active",
             "autumn_http_responses_total",
+            "autumn_http_request_duration_seconds",
             "autumn_shutdown_aborted_requests_total",
             "autumn_request_timeouts_total",
             "autumn_http_route_requests_total",
@@ -2165,6 +2363,82 @@ pub(crate) async fn loggers_put<S: ProvideActuatorState + Send + Sync + 'static>
             "previous": previous,
         })),
     )
+}
+
+// ── Logfile (sensitive) ────────────────────────────────────────
+
+/// Query parameters for `GET <actuator-prefix>/logfile`.
+#[derive(Debug, Deserialize, Default)]
+pub(crate) struct LogfileQuery {
+    /// Minimum log level to include (case-insensitive).
+    ///
+    /// Valid values: `trace`, `debug`, `info`, `warn`, `error`.
+    /// When absent all levels are returned.
+    pub level: Option<String>,
+    /// Maximum number of entries to return (most-recent N, newest-last).
+    pub limit: Option<usize>,
+}
+
+/// JSON response shape for `GET <actuator-prefix>/logfile`.
+#[derive(Debug, Serialize)]
+pub(crate) struct LogfileResponse {
+    /// Captured log entries, oldest first.
+    pub entries: Vec<crate::log::capture::CapturedLogEntry>,
+    /// Total entries in the buffer (before `limit` is applied).
+    pub total: usize,
+    /// `true` when the capture buffer is enabled and populated by the layer.
+    pub capture_enabled: bool,
+}
+
+/// `GET <actuator-prefix>/logfile` — recent structured log entries.
+///
+/// Returns entries from the in-memory capture buffer, filtered by `?level=`
+/// and capped by `?limit=`. Only available when `actuator.sensitive = true`
+/// and `log.capture.enabled = true`.  When capture is disabled the endpoint
+/// still responds with `200` and an empty list so API consumers can handle
+/// the case uniformly.
+///
+/// Returns `400 Bad Request` when an unrecognised `?level=` value is supplied
+/// so that typos (e.g. `?level=warning`) are rejected rather than silently
+/// broadening the response to all captured entries.
+pub(crate) async fn logfile_endpoint<S: ProvideActuatorState + Send + Sync + 'static>(
+    State(state): State<S>,
+    axum::extract::Query(query): axum::extract::Query<LogfileQuery>,
+) -> Result<axum::Json<LogfileResponse>, (StatusCode, axum::Json<serde_json::Value>)> {
+    let min_level = match query.level.as_deref() {
+        None => None,
+        Some(s) => match crate::log::capture::level_from_str(s) {
+            Some(level) => Some(level),
+            None => {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    axum::Json(serde_json::json!({
+                        "error": format!(
+                            "invalid level {:?}; valid values: TRACE, DEBUG, INFO, WARN, ERROR",
+                            s
+                        )
+                    })),
+                ));
+            }
+        },
+    };
+
+    Ok(match state.log_buffer() {
+        None => axum::Json(LogfileResponse {
+            entries: vec![],
+            total: 0,
+            capture_enabled: false,
+        }),
+        Some(buf) => {
+            let total = buf.len();
+            let entries = buf.snapshot(min_level, query.limit);
+            axum::Json(LogfileResponse {
+                entries,
+                total,
+                capture_enabled: true,
+            })
+        }
+    })
 }
 
 // ── Tasks (sensitive) ──────────────────────────────────────────
@@ -2540,9 +2814,11 @@ pub(crate) fn actuator_endpoint_paths(
     }
 
     if sensitive {
+        paths.push(actuator_route_path(prefix, "/circuitbreakers"));
         paths.push(actuator_route_path(prefix, "/env"));
         paths.push(actuator_route_path(prefix, "/configprops"));
         paths.push(actuator_route_path(prefix, "/loggers"));
+        paths.push(actuator_route_path(prefix, "/logfile"));
         paths.push(actuator_route_path(prefix, "/tasks"));
         paths.push(actuator_route_path(prefix, "/jobs"));
         paths.push(actuator_route_path(prefix, "/ui/tasks"));
@@ -2582,6 +2858,7 @@ pub fn actuator_router<S: ProvideActuatorState + Send + Sync + Clone + 'static>(
 /// `prometheus_enabled` controls the `/actuator/prometheus` scrape endpoint
 /// independently of `sensitive`, so platform metrics scraping can be exposed
 /// without also exposing sensitive actuator surfaces.
+#[allow(clippy::too_many_lines)]
 pub(crate) fn actuator_router_with_prefix<
     S: ProvideActuatorState + Send + Sync + Clone + 'static,
 >(
@@ -2617,6 +2894,10 @@ pub(crate) fn actuator_router_with_prefix<
     if sensitive {
         router = router
             .route(
+                &actuator_route_path(prefix, "/circuitbreakers"),
+                axum::routing::get(circuitbreakers_endpoint::<S>),
+            )
+            .route(
                 &actuator_route_path(prefix, "/env"),
                 axum::routing::get(env_endpoint::<S>),
             )
@@ -2631,6 +2912,10 @@ pub(crate) fn actuator_router_with_prefix<
             .route(
                 &actuator_route_path(prefix, "/loggers/{name}"),
                 axum::routing::put(loggers_put::<S>),
+            )
+            .route(
+                &actuator_route_path(prefix, "/logfile"),
+                axum::routing::get(logfile_endpoint::<S>),
             )
             .route(
                 &actuator_route_path(prefix, "/tasks"),
@@ -2807,12 +3092,16 @@ mod tests {
     #[derive(Clone)]
     struct TestActuatorState {
         profile: String,
+        deploy_version: String,
         metrics: crate::middleware::MetricsCollector,
         log_levels: LogLevels,
         task_registry: TaskRegistry,
         job_registry: JobRegistry,
         config_props: ConfigProperties,
         metrics_source_registry: MetricsSourceRegistry,
+        health_indicator_registry: HealthIndicatorRegistry,
+        health_detailed: bool,
+        log_buffer: Option<crate::log::capture::LogBuffer>,
         #[cfg(feature = "http-client")]
         webhook_outbound: Option<crate::webhook_outbound::WebhookOutboundManager>,
         #[cfg(feature = "db")]
@@ -2847,6 +3136,9 @@ mod tests {
         fn uptime_display(&self) -> String {
             "test_uptime".to_string()
         }
+        fn deploy_version(&self) -> String {
+            self.deploy_version.clone()
+        }
         fn metrics_source_registry(&self) -> Option<&MetricsSourceRegistry> {
             Some(&self.metrics_source_registry)
         }
@@ -2869,6 +3161,15 @@ mod tests {
         fn shutdown_token(&self) -> tokio_util::sync::CancellationToken {
             self.shutdown.clone()
         }
+        fn health_indicator_registry(&self) -> Option<&HealthIndicatorRegistry> {
+            Some(&self.health_indicator_registry)
+        }
+        fn health_detailed(&self) -> bool {
+            self.health_detailed
+        }
+        fn log_buffer(&self) -> Option<crate::log::capture::LogBuffer> {
+            self.log_buffer.clone()
+        }
     }
 
     fn test_state() -> TestActuatorState {
@@ -2878,12 +3179,16 @@ mod tests {
     fn test_state_with_config(config: &AutumnConfig) -> TestActuatorState {
         TestActuatorState {
             profile: config.profile.clone().unwrap_or_else(|| "dev".into()),
+            deploy_version: crate::canary::STABLE.to_owned(),
             metrics: crate::middleware::MetricsCollector::new(),
             log_levels: LogLevels::new("info"),
             task_registry: TaskRegistry::new(),
             job_registry: JobRegistry::new(),
             config_props: ConfigProperties::from_config(config),
             metrics_source_registry: MetricsSourceRegistry::new(),
+            health_indicator_registry: HealthIndicatorRegistry::new(),
+            health_detailed: config.health.detailed,
+            log_buffer: None,
             #[cfg(feature = "http-client")]
             webhook_outbound: None,
             #[cfg(feature = "db")]
@@ -3084,6 +3389,8 @@ mod tests {
                 name: "autumn_webhook_delivery".to_string(),
                 max_attempts: 1,
                 initial_backoff_ms: 1,
+                uniqueness: None,
+                concurrency: None,
                 handler: |_state, _payload| Box::pin(async move { Ok(()) }),
             }],
             &runtime_state,
@@ -3156,6 +3463,8 @@ mod tests {
                 name: "autumn_webhook_delivery".to_string(),
                 max_attempts: 1,
                 initial_backoff_ms: 1,
+                uniqueness: None,
+                concurrency: None,
                 handler: |_state, _payload| Box::pin(async move { Ok(()) }),
             }],
             &runtime_state,
@@ -3249,6 +3558,158 @@ mod tests {
             crate::db::AFTER_COMMIT_FAILURES_TOTAL.load(std::sync::atomic::Ordering::Relaxed),
             "/actuator/health should expose the documented after_commit counter"
         );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn actuator_circuitbreakers_returns_breakers() {
+        let _lock = crate::circuit_breaker::TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::circuit_breaker::global_registry().clear();
+        let breaker = crate::circuit_breaker::global_registry().get_or_create(
+            "actuator_endpoint_test_breaker",
+            crate::circuit_breaker::CircuitBreakerPolicy {
+                failure_ratio_threshold: 0.5,
+                sample_window: std::time::Duration::from_secs(10),
+                minimum_sample_count: 2,
+                open_duration: std::time::Duration::from_secs(60),
+                half_open_trial_count: 2,
+            },
+        );
+        assert_eq!(
+            breaker.state(),
+            crate::circuit_breaker::CircuitState::Closed
+        );
+
+        let mut detailed_config = AutumnConfig::default();
+        detailed_config.health.detailed = true;
+        let state = test_state_with_config(&detailed_config);
+        let app = actuator_router(true).with_state(state);
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/actuator/circuitbreakers")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let list = json.as_array().expect("Should be a JSON array");
+        let item = list
+            .iter()
+            .find(|i| i["name"] == "actuator_endpoint_test_breaker")
+            .expect("Should find our breaker");
+        assert_eq!(item["state"], "CLOSED");
+        assert_eq!(item["failure_ratio_threshold"], 0.5);
+        assert_eq!(item["minimum_sample_count"], 2);
+
+        let mut undetailed_config = AutumnConfig::default();
+        undetailed_config.health.detailed = false;
+        let undetailed_state = test_state_with_config(&undetailed_config);
+        let app_undetailed = actuator_router(true).with_state(undetailed_state);
+        let resp_undetailed = app_undetailed
+            .oneshot(
+                Request::builder()
+                    .uri("/actuator/circuitbreakers")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp_undetailed.status(), StatusCode::OK);
+        let body_undetailed = axum::body::to_bytes(resp_undetailed.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json_undetailed: serde_json::Value = serde_json::from_slice(&body_undetailed).unwrap();
+        let list_undetailed = json_undetailed.as_array().expect("Should be a JSON array");
+        let item_undetailed = list_undetailed
+            .iter()
+            .find(|i| i["name"] == "actuator_endpoint_test_breaker")
+            .expect("Should find our breaker");
+        assert_eq!(item_undetailed["state"], "CLOSED");
+        assert!(item_undetailed.get("failure_ratio_threshold").is_none());
+        assert!(item_undetailed.get("minimum_sample_count").is_none());
+        crate::circuit_breaker::global_registry().clear();
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_health_hides_circuit_breakers_when_undetailed() {
+        let _lock = crate::circuit_breaker::TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::circuit_breaker::global_registry().clear();
+
+        let _breaker = crate::circuit_breaker::global_registry().get_or_create(
+            "test_health_hide_breaker",
+            crate::circuit_breaker::CircuitBreakerPolicy {
+                failure_ratio_threshold: 0.5,
+                sample_window: std::time::Duration::from_secs(10),
+                minimum_sample_count: 2,
+                open_duration: std::time::Duration::from_secs(60),
+                half_open_trial_count: 2,
+            },
+        );
+
+        let mut detailed_config = AutumnConfig::default();
+        detailed_config.health.detailed = true;
+        let state = test_state_with_config(&detailed_config);
+        let app = actuator_router(true).with_state(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/actuator/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["components"]["circuit_breaker.test_health_hide_breaker"].is_object());
+
+        let mut undetailed_config = AutumnConfig::default();
+        undetailed_config.health.detailed = false;
+        let undetailed_state = test_state_with_config(&undetailed_config);
+        let app_undetailed = actuator_router(true).with_state(undetailed_state);
+        let resp_undetailed = app_undetailed
+            .oneshot(
+                Request::builder()
+                    .uri("/actuator/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp_undetailed.status(), StatusCode::OK);
+        let body_undetailed = axum::body::to_bytes(resp_undetailed.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json_undetailed: serde_json::Value = serde_json::from_slice(&body_undetailed).unwrap();
+
+        if let Some(components) = json_undetailed.get("components") {
+            assert!(
+                components
+                    .get("circuit_breaker.test_health_hide_breaker")
+                    .is_none()
+            );
+        }
+
+        crate::circuit_breaker::global_registry().clear();
     }
 
     #[tokio::test]
@@ -3357,6 +3818,21 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri("/actuator/env")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn actuator_circuitbreakers_hidden_in_nonsensitive_mode() {
+        let app = actuator_router(false).with_state(test_state());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/actuator/circuitbreakers")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -3664,22 +4140,81 @@ mod tests {
 
         assert!(text.contains("# HELP autumn_http_requests_total Total number of HTTP requests"));
         assert!(text.contains("# TYPE autumn_http_requests_total counter"));
-        assert!(text.contains("autumn_http_requests_total 2"));
+        assert!(text.contains("autumn_http_requests_total{version=\"stable\"} 2"));
 
-        assert!(text.contains("autumn_http_requests_active "));
-        assert!(text.contains("autumn_http_responses_total{status=\"2xx\"} 1"));
-        assert!(text.contains("autumn_http_responses_total{status=\"5xx\"} 1"));
+        assert!(text.contains("autumn_http_requests_active{version=\"stable\"} "));
+        assert!(text.contains("autumn_http_responses_total{version=\"stable\",status=\"2xx\"} 1"));
+        assert!(text.contains("autumn_http_responses_total{version=\"stable\",status=\"5xx\"} 1"));
 
-        assert!(
-            text.contains("autumn_http_route_requests_total{method=\"GET\",route=\"/test\"} 1")
-        );
-        assert!(
-            text.contains("autumn_http_route_requests_total{method=\"POST\",route=\"/test\"} 1")
-        );
+        // Latency percentiles are exposed in seconds, labelled by version.
+        assert!(text.contains("# TYPE autumn_http_request_duration_seconds summary"));
+        assert!(text.contains(
+            "autumn_http_request_duration_seconds{version=\"stable\",quantile=\"0.99\"}"
+        ));
+
+        assert!(text.contains(
+            "autumn_http_route_requests_total{version=\"stable\",method=\"GET\",route=\"/test\"} 1"
+        ));
+        assert!(text.contains(
+            "autumn_http_route_requests_total{version=\"stable\",method=\"POST\",route=\"/test\"} 1"
+        ));
 
         assert!(text.contains("# HELP autumn_request_timeouts_total"));
         assert!(text.contains("# TYPE autumn_request_timeouts_total counter"));
-        assert!(text.contains("autumn_request_timeouts_total 0"));
+        assert!(text.contains("autumn_request_timeouts_total{version=\"stable\"} 0"));
+    }
+
+    #[tokio::test]
+    async fn actuator_prometheus_labels_metrics_with_canary_version() {
+        // A replica whose deploy_version() is "canary" must tag its metric
+        // families with version="canary" so a controller can compare cohorts.
+        let mut state = test_state();
+        state.deploy_version = crate::canary::CANARY.to_owned();
+        // Latencies in ms: spread so p50 < p95/p99 and the slowest is 1200 ms.
+        state.metrics().record("GET", "/test", 200, 10);
+        state.metrics().record("GET", "/test", 200, 20);
+        state.metrics().record("GET", "/test", 500, 1200);
+
+        let app = actuator_router(true).with_state(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/actuator/prometheus")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+
+        assert!(text.contains("autumn_http_requests_total{version=\"canary\"} 3"));
+        assert!(text.contains("autumn_http_responses_total{version=\"canary\",status=\"5xx\"} 1"));
+        // Must not leak the default "stable" label when running as canary.
+        assert!(!text.contains("version=\"stable\""));
+
+        // Verify the percentile math: values are reported in seconds (ms / 1000)
+        // and satisfy the quantile invariant p50 <= p95 <= p99.
+        let quantile = |q: &str| -> f64 {
+            let needle = format!(
+                "autumn_http_request_duration_seconds{{version=\"canary\",quantile=\"{q}\"}} "
+            );
+            let line = text
+                .lines()
+                .find(|l| l.starts_with(&needle))
+                .unwrap_or_else(|| panic!("missing duration line for quantile {q}"));
+            line[needle.len()..].trim().parse().unwrap()
+        };
+        let (p50, p95, p99) = (quantile("0.5"), quantile("0.95"), quantile("0.99"));
+        assert!(p50 <= p95, "p50 ({p50}) must be <= p95 ({p95})");
+        assert!(p95 <= p99, "p95 ({p95}) must be <= p99 ({p99})");
+        // Slowest sample was 1200 ms, so the top quantile must read 1.2 seconds.
+        assert!(
+            (p99 - 1.2).abs() < f64::EPSILON,
+            "p99 should be 1.2s, got {p99}"
+        );
     }
 
     #[tokio::test]
@@ -4830,6 +5365,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prometheus_endpoint_skips_builtin_duration_family_collision() {
+        // The new built-in latency family must be in the duplicate guard so a
+        // plugin emitting the same family cannot produce a second HELP/TYPE block.
+        struct ShadowLatency;
+        impl MetricsSource for ShadowLatency {
+            fn collect(&self) -> Vec<MetricFamily> {
+                vec![MetricFamily {
+                    name: "autumn_http_request_duration_seconds".to_string(),
+                    help: "plugin trying to shadow built-in latency".to_string(),
+                    kind: MetricKind::Gauge,
+                    samples: vec![MetricSample {
+                        labels: vec![],
+                        value: 999.0,
+                    }],
+                }]
+            }
+        }
+
+        let state = test_state();
+        state
+            .metrics_source_registry
+            .register("shadow_latency", Arc::new(ShadowLatency))
+            .unwrap();
+
+        let app = actuator_router(true).with_state(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/actuator/prometheus")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+
+        let occurrences = text
+            .matches("# HELP autumn_http_request_duration_seconds")
+            .count();
+        assert_eq!(
+            occurrences, 1,
+            "built-in latency family must not be shadowed by plugin:\n{text}"
+        );
+        assert!(
+            !text.contains("999"),
+            "plugin shadow value must not appear:\n{text}"
+        );
+    }
+
+    #[tokio::test]
     async fn prometheus_endpoint_skips_duplicate_series_within_family() {
         struct DupSeriesSource;
         impl MetricsSource for DupSeriesSource {
@@ -4882,6 +5470,216 @@ mod tests {
             !text.contains("dup_series_metric{region=\"us\"} 20"),
             "duplicate series must be dropped:\n{text}"
         );
+    }
+
+    // ── RED then GREEN: /actuator/logfile endpoint ─────────────
+
+    fn make_log_buffer_with_entries() -> crate::log::capture::LogBuffer {
+        use crate::log::capture::{CapturedLogEntry, LogBuffer};
+        use crate::log::filter::ParameterFilter;
+        let buf = LogBuffer::new(100, ParameterFilter::default());
+        buf.push(CapturedLogEntry {
+            timestamp: "2024-01-01T00:00:00.000Z".to_owned(),
+            level: "INFO".to_owned(),
+            target: "myapp::orders".to_owned(),
+            message: "order created".to_owned(),
+            fields: {
+                let mut m = serde_json::Map::new();
+                m.insert("order_id".to_owned(), serde_json::json!("A-1001"));
+                m
+            },
+            request_id: Some("req-abc".to_owned()),
+        });
+        buf.push(CapturedLogEntry {
+            timestamp: "2024-01-01T00:00:01.000Z".to_owned(),
+            level: "WARN".to_owned(),
+            target: "myapp::payments".to_owned(),
+            message: "payment slow".to_owned(),
+            fields: serde_json::Map::new(),
+            request_id: None,
+        });
+        buf.push(CapturedLogEntry {
+            timestamp: "2024-01-01T00:00:02.000Z".to_owned(),
+            level: "ERROR".to_owned(),
+            target: "myapp::payments".to_owned(),
+            message: "payment failed".to_owned(),
+            fields: serde_json::Map::new(),
+            request_id: None,
+        });
+        buf
+    }
+
+    #[tokio::test]
+    async fn green_logfile_returns_empty_when_capture_disabled() {
+        let state = test_state(); // log_buffer = None
+        let response =
+            logfile_endpoint(State(state), axum::extract::Query(LogfileQuery::default()))
+                .await
+                .unwrap();
+        let body = response.0;
+        assert!(!body.capture_enabled);
+        assert!(body.entries.is_empty());
+        assert_eq!(body.total, 0);
+    }
+
+    #[tokio::test]
+    async fn green_logfile_returns_all_entries_when_no_filter() {
+        let mut state = test_state();
+        state.log_buffer = Some(make_log_buffer_with_entries());
+
+        let response =
+            logfile_endpoint(State(state), axum::extract::Query(LogfileQuery::default()))
+                .await
+                .unwrap();
+        let body = response.0;
+        assert!(body.capture_enabled);
+        assert_eq!(body.total, 3);
+        assert_eq!(body.entries.len(), 3);
+        // newest-last ordering
+        assert_eq!(body.entries[0].level, "INFO");
+        assert_eq!(body.entries[2].level, "ERROR");
+    }
+
+    #[tokio::test]
+    async fn green_logfile_level_filter_excludes_info_when_min_warn() {
+        let mut state = test_state();
+        state.log_buffer = Some(make_log_buffer_with_entries());
+
+        let response = logfile_endpoint(
+            State(state),
+            axum::extract::Query(LogfileQuery {
+                level: Some("warn".to_owned()),
+                limit: None,
+            }),
+        )
+        .await
+        .unwrap();
+        let body = response.0;
+        assert_eq!(body.entries.len(), 2);
+        assert!(body.entries.iter().all(|e| e.level != "INFO"));
+    }
+
+    #[tokio::test]
+    async fn green_logfile_limit_returns_most_recent_n() {
+        let mut state = test_state();
+        state.log_buffer = Some(make_log_buffer_with_entries());
+
+        let response = logfile_endpoint(
+            State(state),
+            axum::extract::Query(LogfileQuery {
+                level: None,
+                limit: Some(2),
+            }),
+        )
+        .await
+        .unwrap();
+        let body = response.0;
+        assert_eq!(body.entries.len(), 2);
+        // Most recent 2 = WARN and ERROR
+        assert_eq!(body.entries[0].level, "WARN");
+        assert_eq!(body.entries[1].level, "ERROR");
+    }
+
+    #[tokio::test]
+    async fn green_logfile_sensitive_fields_in_response_are_served_scrubbed() {
+        use crate::log::capture::{CapturedLogEntry, LogBuffer};
+        use crate::log::filter::{FILTERED_PLACEHOLDER, ParameterFilter};
+        let buf = LogBuffer::new(10, ParameterFilter::default());
+        // The layer scrubs before storage; simulate stored entry with scrubbed value.
+        buf.push(CapturedLogEntry {
+            timestamp: "2024-01-01T00:00:00.000Z".to_owned(),
+            level: "INFO".to_owned(),
+            target: "auth".to_owned(),
+            message: "login attempt".to_owned(),
+            fields: {
+                let mut m = serde_json::Map::new();
+                m.insert(
+                    "password".to_owned(),
+                    serde_json::Value::String(FILTERED_PLACEHOLDER.to_owned()),
+                );
+                m
+            },
+            request_id: None,
+        });
+
+        let mut state = test_state();
+        state.log_buffer = Some(buf);
+
+        let response =
+            logfile_endpoint(State(state), axum::extract::Query(LogfileQuery::default()))
+                .await
+                .unwrap();
+        let body = response.0;
+        assert_eq!(
+            body.entries[0].fields["password"].as_str().unwrap(),
+            FILTERED_PLACEHOLDER,
+            "sensitive value must remain scrubbed in the response"
+        );
+    }
+
+    #[tokio::test]
+    async fn green_logfile_invalid_level_returns_400() {
+        let state = test_state();
+        let result = logfile_endpoint(
+            State(state),
+            axum::extract::Query(LogfileQuery {
+                level: Some("warning".to_owned()), // invalid — should be "warn"
+                limit: None,
+            }),
+        )
+        .await;
+        let (status, _body) = result.unwrap_err();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn green_logfile_endpoint_in_sensitive_router() {
+        // The endpoint must be reachable when sensitive=true.
+        let state = test_state();
+        let app = actuator_router::<TestActuatorState>(true).with_state(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/actuator/logfile")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn green_logfile_endpoint_not_in_non_sensitive_router() {
+        // The endpoint must NOT be reachable when sensitive=false.
+        let state = test_state();
+        let app = actuator_router::<TestActuatorState>(false).with_state(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/actuator/logfile")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn green_logfile_structured_fields_preserved() {
+        let mut state = test_state();
+        state.log_buffer = Some(make_log_buffer_with_entries());
+
+        let response =
+            logfile_endpoint(State(state), axum::extract::Query(LogfileQuery::default()))
+                .await
+                .unwrap();
+        let body = response.0;
+        let first = &body.entries[0];
+        assert_eq!(first.target, "myapp::orders");
+        assert_eq!(first.fields["order_id"].as_str().unwrap(), "A-1001");
+        assert_eq!(first.request_id.as_deref(), Some("req-abc"));
     }
 }
 
@@ -4960,7 +5758,6 @@ mod health_indicator_tests {
             .unwrap();
 
         let results = registry.run_all().await;
-        assert_eq!(results.len(), 2);
         assert!(
             results
                 .iter()
@@ -5011,11 +5808,89 @@ mod health_indicator_tests {
             .register("slow", IndicatorGroup::Readiness, Arc::new(SlowIndicator))
             .unwrap();
         let results = registry.run_all().await;
-        assert_eq!(results[0].output.status, HealthStatus::Unknown);
+        let slow_res = results
+            .iter()
+            .find(|r| r.name == "slow")
+            .expect("slow indicator not found");
+        assert_eq!(slow_res.output.status, HealthStatus::Unknown);
         assert_eq!(
-            results[0].output.details.get("timed_out"),
+            slow_res.output.details.get("timed_out"),
             Some(&serde_json::Value::Bool(true))
         );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_circuit_breakers_in_health_indicator_registry() {
+        let _lock = crate::circuit_breaker::TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::circuit_breaker::global_registry().clear();
+        let registry = HealthIndicatorRegistry::new();
+        let breaker = crate::circuit_breaker::global_registry().get_or_create(
+            "actuator_test_breaker",
+            crate::circuit_breaker::CircuitBreakerPolicy {
+                failure_ratio_threshold: 0.5,
+                sample_window: std::time::Duration::from_secs(10),
+                minimum_sample_count: 2,
+                open_duration: std::time::Duration::from_secs(60),
+                half_open_trial_count: 2,
+            },
+        );
+
+        let results = registry.run_all().await;
+        let found = results
+            .iter()
+            .find(|r| r.name == "circuit_breaker.actuator_test_breaker");
+        assert!(found.is_some(), "Should find circuit breaker in run_all");
+        let result = found.unwrap();
+        assert_eq!(result.group, IndicatorGroup::HealthOnly);
+        assert_eq!(result.output.status, HealthStatus::Up);
+        assert_eq!(result.output.details.get("state").unwrap(), "CLOSED");
+
+        breaker.after_call(false);
+        breaker.after_call(false);
+        assert_eq!(breaker.state(), crate::circuit_breaker::CircuitState::Open);
+
+        let results = registry.run_all().await;
+        let found = results
+            .iter()
+            .find(|r| r.name == "circuit_breaker.actuator_test_breaker");
+        assert_eq!(found.unwrap().output.status, HealthStatus::Down);
+        assert_eq!(found.unwrap().output.details.get("state").unwrap(), "OPEN");
+
+        // Transition to HalfOpen manually to check status
+        {
+            let mut inner = breaker.inner.lock().unwrap();
+            inner.state = crate::circuit_breaker::CircuitState::HalfOpen;
+            inner.half_open_in_flight = 0;
+            inner.half_open_successes = 0;
+            inner.half_open_failures = 0;
+        }
+        assert_eq!(
+            breaker.state(),
+            crate::circuit_breaker::CircuitState::HalfOpen
+        );
+
+        let results = registry.run_all().await;
+        let found = results
+            .iter()
+            .find(|r| r.name == "circuit_breaker.actuator_test_breaker");
+        assert_eq!(found.unwrap().output.status, HealthStatus::Down);
+        assert_eq!(
+            found.unwrap().output.details.get("state").unwrap(),
+            "HALF_OPEN"
+        );
+
+        let readiness_results = registry.run_readiness().await;
+        let found_readiness = readiness_results
+            .iter()
+            .find(|r| r.name == "circuit_breaker.actuator_test_breaker");
+        assert!(
+            found_readiness.is_none(),
+            "Should NOT find circuit breaker in run_readiness"
+        );
+        crate::circuit_breaker::global_registry().clear();
     }
 }
 

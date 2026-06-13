@@ -75,7 +75,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-autumn-web = { version = "0.4", features = ["db", "htmx", "maud"] }
+autumn-web = { version = "0.5", features = ["db", "htmx", "maud"] }
 chrono = { version = "0.4", features = ["serde"] }
 diesel = { version = "2", features = ["postgres", "chrono"] }
 diesel-async = { version = "0.8", features = ["postgres"] }
@@ -90,6 +90,19 @@ validator = { version = "0.20", features = ["derive"] }
 Use `pq-sys = { version = "0.7", features = ["bundled_without_openssl"] }`
 when avoiding a system libpq install.
 
+For a reddit-clone-style app with live feeds, file uploads, and blob variants:
+```toml
+autumn-web = { version = "0.5", features = [
+    "mail",       # transactional email + mailer previews
+    "ws",         # WebSocket routes, SSE, broadcast channels
+    "presence",   # Presence extractor for online-user tracking
+    "storage",    # BlobStore + Blob columns + signed URLs
+    "multipart",  # multipart/form-data file uploads
+    "redis",      # Redis sessions, channels, and job backend
+    "variants",   # blob.variant(...) image transformation
+] }
+```
+
 ## Feature flags
 
 Defaults: `maud`, `htmx`, `tailwind`, `db`, `cache-moka`.
@@ -100,8 +113,10 @@ Defaults: `maud`, `htmx`, `tailwind`, `db`, `cache-moka`.
 | `flash` | Flash messages |
 | `multipart` | Multipart uploads |
 | `redis` | Redis sessions, channels, jobs, webhook replay, and integration points |
-| `oauth2` | OAuth2/OIDC callback support |
+| `oauth2` | OAuth2/OIDC helpers and `autumn generate auth --oauth` scaffolding |
 | `openapi` | OpenAPI route metadata and spec generation |
+| `mcp` | Project typed JSON endpoints as MCP tools; implies `openapi` |
+| `markdown` | Markdown rendering with frontmatter and static-site support |
 | `telemetry-otlp` | OpenTelemetry OTLP export |
 | `test-support` | Testcontainers-backed `TestApp`, `TestClient`, and `TestDb` |
 | `i18n` | Locale extractor and compile-time checked translations |
@@ -110,14 +125,16 @@ Defaults: `maud`, `htmx`, `tailwind`, `db`, `cache-moka`.
 | `seed` | `SeedContext` for seed binaries |
 | `system-info` | Optional system information in actuator surfaces |
 
-For S3 storage add `autumn-storage-s3 = "0.4"`; `storage-s3` is no longer an
-`autumn-web` feature. For a shared Redis cache add `autumn-cache-redis = "0.4"`.
+For S3 storage add `autumn-storage-s3 = "0.5"`; `storage-s3` is no longer an
+`autumn-web` feature. For a shared Redis cache add `autumn-cache-redis = "0.5"`.
 
 ## main.rs pattern
 
 ```rust
+mod jobs;
 mod routes;
 mod schema;
+mod tasks;
 
 use autumn_web::migrate::{embed_migrations, EmbeddedMigrations};
 use autumn_web::prelude::*;
@@ -182,9 +199,11 @@ async fn create(db: Db, Valid(Form(input)): Valid<Form<CreatePost>>) -> AutumnRe
 }
 
 #[patch("/posts/{id}")]
+#[secured]
 async fn patch(Path(id): Path<i64>, db: Db) -> AutumnResult<Markup> { /* ... */ }
 
 #[delete("/posts/{id}")]
+#[secured]
 async fn delete_post(Path(id): Path<i64>, db: Db) -> AutumnResult<Markup> { /* ... */ }
 
 #[static_get("/about")]
@@ -212,7 +231,8 @@ Autumn uses Diesel + diesel-async for Postgres. Primary keys are `i64` /
 when external correlation needs them.
 
 ```rust
-#[model(table = "posts")]
+// #[model] and #[repository] are NOT in prelude — use qualified paths:
+#[autumn_web::model(table = "posts")]
 #[derive(Validate)]
 pub struct Post {
     pub id: i64,
@@ -226,7 +246,7 @@ Repository-generated APIs in production must either declare a policy or be
 explicitly acknowledged in config:
 
 ```rust
-#[repository(Post, api = "/api/posts", policy = PostPolicy, scope = PostScope)]
+#[autumn_web::repository(Post, api = "/api/posts", policy = PostPolicy, scope = PostScope)]
 pub trait PostRepository {}
 ```
 
@@ -246,10 +266,28 @@ async fn dashboard(session: Session) -> AutumnResult<Markup> { /* ... */ }
 #[secured("admin")]
 async fn admin_panel() -> AutumnResult<Markup> { /* ... */ }
 
+// Record-level auth on repository-generated REST endpoints:
+#[autumn_web::repository(Post, api = "/api/posts", policy = PostPolicy, scope = PostScope)]
+pub trait PostRepository {}
+
+// Manual handler: load the record first, then check inline.
+// #[authorize] is used by the repository macro; for manual handlers
+// the pattern is explicit ownership checks in the body:
 #[post("/posts/{id}")]
 #[secured]
-#[authorize("update", resource = Post)]
-async fn update_post(post: Post) -> AutumnResult<Markup> { /* ... */ }
+async fn update_post(Path(id): Path<i64>, mut db: Db, session: Session) -> AutumnResult<Markup> {
+    // session.get() returns Option<String>; parse to i64
+    let user_id: i64 = session.get("user_id").await
+        .ok_or_else(|| AutumnError::unauthorized_msg("Login required"))?
+        .parse()
+        .map_err(|_| AutumnError::bad_request_msg("Invalid session"))?;
+    let post = find_post(&mut *db, id).await?;
+    if post.user_id != user_id {
+        return Err(AutumnError::forbidden_msg("not your post"));
+    }
+    /* ... */
+    Ok(html! { "updated" })
+}
 ```
 
 In `prod` / `production`, configure a stable signing secret or startup fails:
@@ -261,11 +299,31 @@ export AUTUMN_SECURITY__SIGNING_SECRET="$(openssl rand -hex 32)"
 For rotation, set `[security.signing_secret].previous_secrets` until old
 cookies, CSRF tokens, flash state, and signed storage URLs expire.
 
+## OAuth2/OIDC scaffolding
+
+OAuth2/OIDC social login is in the 0.5.0 line. Do not repeat the stale
+changelog claim that it was reverted; the revert was followed by a reapply and
+review fixes. Prefer the current tree and `docs/guide/oauth.md` over that old
+summary line.
+
+```bash
+autumn generate auth User --oauth github,google
+```
+
+The generator creates `src/routes/oauth.rs`, an `oauth_identities` migration,
+login buttons, and `[auth.oauth2.<provider>]` config stubs. The flow uses
+PKCE S256, state validation, OIDC nonce validation, and provider presets for
+GitHub, Google, and Microsoft. OAuth support stays behind the `oauth2` feature.
+
 ## Signed webhooks
 
 Autumn 0.4.0 added `SignedWebhook` for Stripe, GitHub, Slack, and generic
-HMAC callbacks. The extractor verifies the exact raw body bytes, timestamp, and
-replay key before handler logic runs.
+HMAC callbacks. The extractor verifies the exact raw body bytes and replay key
+before handler logic runs. Timestamp freshness is **provider-specific**: Stripe
+(signature `t=` field) and Slack (`X-Slack-Request-Timestamp`) validate staleness
+automatically; GitHub and generic-HMAC providers only check the body signature
+unless you add `timestamp_header` to the `[webhooks.<name>]` config block
+explicitly.
 
 ```rust
 #[post("/webhooks/stripe")]
@@ -317,8 +375,8 @@ lower-level counters.
 For local or pluggable file storage:
 
 ```toml
-autumn-web = { version = "0.4", features = ["storage", "multipart"] }
-autumn-storage-s3 = "0.4" # when storage.backend = "s3"
+autumn-web = { version = "0.5", features = ["storage", "multipart"] }
+autumn-storage-s3 = "0.5" # when storage.backend = "s3"
 ```
 
 ```rust
@@ -331,8 +389,8 @@ autumn_web::app().with_blob_store(store).run().await;
 For shared Redis cache:
 
 ```toml
-autumn-web = { version = "0.4", features = ["redis"] }
-autumn-cache-redis = "0.4"
+autumn-web = { version = "0.5", features = ["redis"] }
+autumn-cache-redis = "0.5"
 ```
 
 ```rust
@@ -367,7 +425,7 @@ Use `AUTUMN_SECTION__FIELD` for env overrides, for example
 
 ## Error handling
 
-JSON errors are standardized as RFC 7807-style Problem Details in 0.4.0.
+JSON errors are standardized as RFC 7807-style Problem Details.
 Handlers should return `AutumnResult<T>` and use the typed constructors:
 
 ```rust
@@ -383,6 +441,48 @@ Err(AutumnError::service_unavailable_msg("queue unavailable"))?;
 Clients that prefer JSON receive `application/problem+json` with `type`,
 `title`, `status`, `detail`, `instance`, `code`, `request_id`, and `errors`.
 
+## Canary deploys
+
+Autumn provides framework primitives a canary controller drives — it does not
+own the load-balancer traffic split (that stays a platform concern).
+
+**Label the canary replica** (env var, no code change):
+```bash
+AUTUMN_DEPLOY_VERSION=canary   # explicit label (any string)
+# …or the boolean shorthand:
+AUTUMN_CANARY=true             # resolves to version="canary"
+```
+
+Stable replicas leave both unset → `version="stable"`.
+
+**Prometheus metrics** are tagged with the `version` label so a controller can
+compare cohorts:
+```
+autumn_http_requests_total{version="canary"} 412
+autumn_http_responses_total{version="canary",status="5xx"} 3
+autumn_http_request_duration_seconds{version="canary",quantile="0.99"} 1.2
+```
+
+**`CanaryRoute` extractor** (in `prelude::*`) — lets a handler see whether the
+LB routed this specific request to the canary (`X-Canary: true`):
+```rust
+async fn handler(canary: CanaryRoute) -> String {
+    if canary.routed_to_canary { "canary".into() } else { "stable".into() }
+}
+```
+
+**Rollback** — when a controller decides the canary is unhealthy:
+```bash
+autumn canary rollback --reason "p99 latency exceeded" --by ci-controller
+# The replica flips /ready → 503 and drains cleanly (same as SIGTERM).
+autumn canary status    # check flag state
+autumn canary promote   # clear the rollback flag after traffic is moved
+```
+
+The rollback flag file lives at `tmp/autumn-canary-rollback.json`. A controller
+that cannot exec into the replica can write it directly. The flag is sticky
+across restarts — clear it with `autumn canary promote` once traffic has moved.
+
 ## CLI
 
 ```bash
@@ -392,29 +492,49 @@ autumn new my-app
 autumn setup
 autumn dev
 autumn build
-autumn migrate
-autumn task <name>
+autumn migrate check
+autumn migrate --with-maintenance
+autumn task --list
+autumn task <name> -- --arg value
 autumn generate model Post title:String body:Text
 autumn generate migration add_posts
-autumn generate scaffold Post title:String body:Text
-autumn generate admin Post
-autumn plugin-check
+autumn generate scaffold Post title:String body:Text --api
+autumn generate auth User --oauth github,google --totp --passkeys
+autumn generate admin Post title:String body:Text published:bool
+autumn generate mailer User
+autumn generate system-test todo_flow
+autumn generate pwa
+autumn routes --format json --user-only
+autumn doctor --strict --json
+autumn config list
+autumn flags list
+autumn experiments list
+autumn maintenance on --message "Migrating database"
+autumn canary rollback --reason "p99 latency exceeded"
+autumn canary status
+autumn canary promote
+autumn webhook sim generic http://localhost:3000/webhooks/test --secret mysecret --payload '{"ok":true}'
+autumn dev-loop-bench --dry-run
+autumn plugin-check --plugin-name autumn-admin-plugin --prefix /admin
 ```
 
 `autumn doctor --strict` is the deployment sanity check. It reports unsafe
 production defaults, missing primaries, stale replica migrations, missing
 signing secrets, and other config problems without printing credentials.
 
-## 0.4.0 migration traps
+## 0.5.0 release traps
 
 - `AUTUMN_SECURITY__SIGNING_SECRET` is required in `prod` / `production`.
-- `storage-s3` was removed from `autumn-web`; use `autumn-storage-s3 = "0.4"`.
+- Use `autumn-storage-s3 = "0.5"` and `autumn-cache-redis = "0.5"`; these
+  are companion crates, not `autumn-web` feature names.
 - Repository-generated APIs require a policy in production unless
   `security.allow_unauthorized_repository_api = true` is explicit.
 - `Mailer::deliver_later` requires a durable queue in production unless
   `mail.allow_in_process_deliver_later_in_production = true` is explicit.
 - Signed webhook replay protection should use Redis in multi-replica prod.
-- Read `docs/migrations/0.4.0.md` before upgrading production apps.
+- OAuth2/OIDC social-login scaffolding is present. If release notes disagree,
+  verify `autumn-cli/src/generate/auth.rs`, `docs/guide/oauth.md`, and current
+  branch history before summarizing the release.
 
 ## Design invariants
 
@@ -477,9 +597,16 @@ touched crate so examples compile from an external-consumer perspective.
 - `docs/guide/getting-started.md`
 - `docs/guide/docs-smoke.md`
 - `docs/guide/cloud-native.md`
+- `docs/guide/oauth.md`
+- `docs/guide/mcp.md`
+- `docs/guide/feature-flags.md`
+- `docs/guide/experiments.md`
+- `docs/guide/runtime-config.md`
 - `docs/guide/signed-webhooks.md`
 - `docs/guide/storage.md`
-- `docs/guide/operating-background-jobs.md`
-- `docs/guide/scheduled-multi-replica.md`
+- `docs/guide/jobs.md`
+- `docs/guide/maintenance-mode.md`
+- `docs/guide/dev-loop-latency.md`
+- `docs/guide/system-tests.md`
 - `docs/guide/testing.md`
 - `docs/autumn-workflow-architecture.md`

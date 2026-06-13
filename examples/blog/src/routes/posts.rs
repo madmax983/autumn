@@ -6,6 +6,7 @@
 use autumn_web::assets::asset_url;
 use autumn_web::extract::{Form, Path};
 use autumn_web::i18n::Locale;
+use autumn_web::seo::SeoMeta;
 use autumn_web::{AutumnError, AutumnResult, Db, Markup, Redirect, delete, get, html, post, t};
 use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
@@ -21,15 +22,28 @@ use crate::schema::posts;
 /// are translated through the [`t!`] macro. Pages reachable via
 /// `#[static_get]` (e.g. `about.rs`) use the same extractor during static
 /// rendering, so pre-rendered HTML receives the configured bundle too.
+///
+/// Accepts an optional [`SeoMeta`] to inject per-page meta tags. Falls back
+/// to a sensible site-wide description when omitted.
 pub fn layout(locale: &Locale, title: &str, content: Markup) -> Markup {
+    layout_with_seo(
+        locale,
+        SeoMeta::new()
+            .title(title)
+            .description("A blog built with the Autumn web framework for Rust."),
+        content,
+    )
+}
+
+/// Layout variant accepting an explicit [`SeoMeta`] builder.
+pub fn layout_with_seo(locale: &Locale, seo: SeoMeta, content: Markup) -> Markup {
     html! {
         (autumn_web::PreEscaped("<!DOCTYPE html>"))
         html lang=(locale.tag()) {
             head {
                 meta charset="utf-8";
                 meta name="viewport" content="width=device-width, initial-scale=1";
-                title { (title) }
-                meta name="description" content="A blog built with the Autumn web framework for Rust.";
+                (seo.render())
                 link rel="stylesheet" href=(asset_url("css/autumn.css"));
                 script src=(asset_url("js/htmx.min.js")) {}
             }
@@ -244,9 +258,22 @@ pub async fn show(locale: Locale, slug: Path<String>, mut db: Db) -> AutumnResul
     // Simple paragraph rendering — split on double newlines
     let paragraphs: Vec<&str> = p.body.split("\n\n").collect();
 
-    Ok(layout(
+    let seo = SeoMeta::new()
+        .title(format!("{} • Autumn Blog", p.title))
+        .description(
+            p.body
+                .split('\n')
+                .next()
+                .unwrap_or(&p.title)
+                .chars()
+                .take(160)
+                .collect::<String>(),
+        )
+        .og_type("article");
+
+    Ok(layout_with_seo(
         &locale,
-        &p.title,
+        seo,
         html! {
             article {
                 // Back link

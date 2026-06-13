@@ -46,6 +46,8 @@ pub use crate::assets::asset_url;
 pub use maud::{Markup, PreEscaped, html};
 
 // ── Extractors ───────────────────────────────────────────────────
+/// Canary traffic-routing extractor (reads the `X-Canary` header).
+pub use crate::canary::CanaryRoute;
 /// Database connection extractor.
 #[cfg(feature = "db")]
 pub use crate::db::Db;
@@ -156,6 +158,11 @@ pub use crate::auth::ApiToken;
 pub use crate::auth::Auth;
 /// Tower layer that validates `Authorization: Bearer <token>` on API routes.
 pub use crate::auth::RequireApiToken;
+/// Request-scoped log context helper: attach a custom field to the current
+/// request so it is carried in the context for structured log consumers (the
+/// actuator log buffer, the access line, any context-aware layer). See
+/// [`crate::log::context`] for the full surface.
+pub use crate::log::context::with_log_field;
 /// Session extractor for accessing per-user session data.
 pub use crate::session::Session;
 /// Tenant extractor and context helpers.
@@ -193,6 +200,21 @@ pub use crate::webhook::{
 /// `[http.client]` config and wired into the test mock harness.
 #[cfg(feature = "http-client")]
 pub use crate::http_client::Client;
+
+// ── Circuit Breaker ──────────────────────────────────────────────
+pub use crate::circuit_breaker::{
+    CircuitBreaker, CircuitBreakerError, CircuitBreakerPolicy, CircuitState,
+};
+
+// ── SEO helpers ──────────────────────────────────────────────────
+/// Per-page SEO meta tag builder (title, description, canonical, OG, Twitter).
+pub use crate::seo::SeoMeta;
+/// Sitemap change frequency values.
+pub use crate::seo::SitemapChangefreq;
+/// A single sitemap entry (URL, lastmod, changefreq, priority).
+pub use crate::seo::SitemapEntry;
+/// Trait for dynamic sitemap URL providers (e.g. database-driven blog posts).
+pub use crate::seo::SitemapSource;
 
 // ── Application state ────────────────────────────────────────────
 /// Shared application state (for custom extractors).

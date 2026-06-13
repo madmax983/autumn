@@ -70,6 +70,9 @@ pub enum ClientError {
     /// No mock entry matched the outgoing request.
     #[error("no mock registered for {0} {1}")]
     NoMock(String, String),
+    /// The outbound circuit breaker is open.
+    #[error("outbound circuit breaker is open")]
+    CircuitBreakerOpen,
 }
 
 // ── Response ─────────────────────────────────────────────────────────────────
@@ -447,6 +450,8 @@ pub struct Client {
     retry_policy: RetryPolicy,
     /// When present (test builds), matching requests bypass the network.
     mock: Option<Arc<MockRegistry>>,
+    /// Resilience configuration for circuit breakers.
+    resilience_config: Option<Arc<crate::config::ResilienceConfig>>,
 }
 
 impl Client {
@@ -481,6 +486,7 @@ impl Client {
                 request_timeout: Some(timeout),
             },
             mock: None,
+            resilience_config: None,
         }
     }
 
@@ -509,6 +515,7 @@ impl Client {
                 request_timeout: Some(timeout),
             },
             mock: None,
+            resilience_config: None,
         }
     }
 
@@ -526,6 +533,11 @@ impl Client {
                 .map(|c| Arc::new(c.http.clone()))
         });
         let mut client = config.map_or_else(Self::new, |cfg| Self::from_config(&cfg.client));
+
+        let resilience = state
+            .extension::<crate::config::AutumnConfig>()
+            .map(|c| Arc::new(c.resilience.clone()));
+        client.resilience_config = resilience;
 
         if let Some(ext) = state.extension::<HttpMockRegistryExt>() {
             client = client.with_mock(ext.0.clone());
@@ -554,6 +566,7 @@ impl Client {
             base_urls: self.base_urls.clone(),
             retry_policy: self.retry_policy.clone(),
             mock: self.mock.clone(),
+            resilience_config: self.resilience_config.clone(),
         }
     }
 
@@ -567,6 +580,7 @@ impl Client {
             base_urls: self.base_urls.clone(),
             retry_policy: self.retry_policy.clone(),
             mock: self.mock.clone(),
+            resilience_config: self.resilience_config.clone(),
         }
     }
 
@@ -594,6 +608,7 @@ impl Client {
             mock: self.mock.clone(),
             alias: self.alias.clone(),
             pending_error: None,
+            resilience_config: self.resilience_config.clone(),
         }
     }
 
@@ -656,6 +671,8 @@ pub struct RequestBuilder {
     alias: Option<String>,
     /// Captures errors from `json()` or invalid headers to surface in `send()`.
     pending_error: Option<ClientError>,
+    /// Resilience configuration for circuit breakers.
+    resilience_config: Option<Arc<crate::config::ResilienceConfig>>,
 }
 
 impl RequestBuilder {
@@ -754,6 +771,59 @@ impl RequestBuilder {
             return Err(err);
         }
 
+        // Bypassing circuit breaker if a mock registry is present.
+        if self.mock.is_some() {
+            return self.send_inner(false).await;
+        }
+
+        // ── Resilience / Circuit Breaker ──────────────────────────────────
+        let host = url::Url::parse(&self.url).ok().map_or_else(
+            || "unknown".to_owned(),
+            |u| {
+                let h = u.host_str().unwrap_or("unknown");
+                u.port()
+                    .map_or_else(|| h.to_owned(), |port| format!("{h}:{port}"))
+            },
+        );
+
+        let breaker = self.resilience_config.as_ref().map_or_else(
+            || {
+                crate::circuit_breaker::global_registry().get_or_create(
+                    &host,
+                    crate::circuit_breaker::CircuitBreakerPolicy::default(),
+                )
+            },
+            |rc| {
+                let policy = crate::circuit_breaker::CircuitBreakerPolicy::from_config(rc, &host);
+                crate::circuit_breaker::global_registry().get_or_create_with_config(&host, policy)
+            },
+        );
+
+        // Check if circuit breaker is open
+        if breaker.before_call().is_err() {
+            return Err(ClientError::CircuitBreakerOpen);
+        }
+        let guard = crate::circuit_breaker::CircuitBreakerGuard::new(breaker.clone());
+
+        let is_half_open = breaker.state() == crate::circuit_breaker::CircuitState::HalfOpen;
+        let res = self.send_inner(is_half_open).await;
+        match &res {
+            Ok(resp) => {
+                let success = resp.status().as_u16() < 500;
+                if success {
+                    guard.success();
+                } else {
+                    guard.failure();
+                }
+            }
+            Err(_) => {
+                guard.failure();
+            }
+        }
+        res
+    }
+
+    async fn send_inner(self, suppress_retries: bool) -> Result<Response, ClientError> {
         // ── Mock short-circuit ──────────────────────────────────────────────
         if let Some(ref mock) = self.mock {
             match mock.find_match(&self.method, &self.url, self.alias.as_deref()) {
@@ -793,12 +863,13 @@ impl RequestBuilder {
 
         // ── Real network request with retries ───────────────────────────────
         let start = Instant::now();
-        let max_attempts =
-            if is_idempotent_method(&self.method) || !self.retry_policy.retry_idempotent_only {
-                self.retry_policy.max_retries.saturating_add(1)
-            } else {
-                1
-            };
+        let max_attempts = if suppress_retries {
+            1
+        } else if is_idempotent_method(&self.method) || !self.retry_policy.retry_idempotent_only {
+            self.retry_policy.max_retries.saturating_add(1)
+        } else {
+            1
+        };
 
         for attempt in 0..max_attempts {
             if attempt > 0 {
@@ -1556,8 +1627,14 @@ mod tests {
     // TEST 35: Real GET request exercises inject_trace_context, log_request, and
     // the success branch of the retry loop.
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn real_get_request_covers_network_path() {
         use axum::{Router, routing::get};
+
+        let _lock = crate::circuit_breaker::TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::circuit_breaker::global_registry().clear();
 
         let app = Router::new().route("/ping", get(|| async { "pong" }));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1575,13 +1652,21 @@ mod tests {
         assert_eq!(resp.status().as_u16(), 200);
         assert!(resp.url().is_some());
         assert_eq!(resp.text(), "pong");
+
+        crate::circuit_breaker::global_registry().clear();
     }
 
     // TEST 36: Real POST with JSON body covers the body-sending code path.
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn real_post_with_json_body_covers_body_path() {
         use axum::{Json, Router, routing::post};
         use serde_json::Value;
+
+        let _lock = crate::circuit_breaker::TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::circuit_breaker::global_registry().clear();
 
         let app = Router::new().route(
             "/echo",
@@ -1602,14 +1687,22 @@ mod tests {
         assert_eq!(resp.status().as_u16(), 200);
         let body: Value = resp.json().unwrap();
         assert_eq!(body["hello"], "world");
+
+        crate::circuit_breaker::global_registry().clear();
     }
 
     // TEST 37: GET with one 503 then 200 covers the retry-sleep and 5xx-retry paths.
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn real_get_retries_on_503_then_succeeds() {
         use axum::{Router, routing::get};
         use std::sync::Arc;
         use std::sync::atomic::{AtomicU32, Ordering as SeqOrdering};
+
+        let _lock = crate::circuit_breaker::TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::circuit_breaker::global_registry().clear();
 
         let hit = Arc::new(AtomicU32::new(0));
         let hit2 = hit.clone();
@@ -1639,7 +1732,9 @@ mod tests {
             .unwrap();
 
         assert_eq!(resp.status().as_u16(), 200);
-        assert_eq!(hit.load(Ordering::SeqCst), 2);
+        assert_eq!(hit.load(SeqOrdering::SeqCst), 2);
+
+        crate::circuit_breaker::global_registry().clear();
     }
 
     // TEST 38: text_body sets a plain-text body.
@@ -1656,5 +1751,64 @@ mod tests {
         let err = ClientError::NoMock("GET".to_owned(), "/path".to_owned());
         assert!(err.to_string().contains("GET"));
         assert!(err.to_string().contains("/path"));
+    }
+
+    // TEST 40: Outbound circuit breaker integration trips and fails fast.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_http_client_circuit_breaker_integration() {
+        use axum::{Router, routing::get};
+        use std::sync::atomic::{AtomicU32, Ordering as SeqOrdering};
+
+        let _lock = crate::circuit_breaker::TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::circuit_breaker::global_registry().clear();
+
+        let hit = Arc::new(AtomicU32::new(0));
+        let hit2 = hit.clone();
+        let app = Router::new().route(
+            "/flaky",
+            get(move || {
+                let c = hit2.clone();
+                async move {
+                    c.fetch_add(1, SeqOrdering::SeqCst);
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        // Build a resilience config with custom thresholds
+        let mut rc = crate::config::ResilienceConfig::default();
+        rc.circuit_breaker.defaults.failure_ratio_threshold = Some(0.5);
+        rc.circuit_breaker.defaults.minimum_sample_count = Some(3);
+        rc.circuit_breaker.defaults.open_duration_secs = Some(10);
+
+        let client = Client::new();
+        // Attach the resilience config
+        let client = Client {
+            resilience_config: Some(Arc::new(rc)),
+            ..client
+        };
+
+        let url = format!("http://127.0.0.1:{}/flaky", addr.port());
+
+        // Send 3 requests (all fail with 500)
+        for _ in 0..3 {
+            let res = client.get(&url).send().await;
+            let res = res.unwrap();
+            assert_eq!(res.status().as_u16(), 500);
+        }
+
+        // Now the breaker for 127.0.0.1 should be OPEN, and next request should fail fast
+        let res = client.get(&url).send().await;
+        assert!(matches!(res, Err(ClientError::CircuitBreakerOpen)));
+
+        // Assert that the server was only hit 3 times
+        assert_eq!(hit.load(SeqOrdering::SeqCst), 3);
+        crate::circuit_breaker::global_registry().clear();
     }
 }

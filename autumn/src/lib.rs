@@ -80,6 +80,8 @@ pub use channels::{
     Broadcast, BroadcastError, BroadcastPayload, ChannelBackendConfigError, ChannelMessage,
     ChannelPublishError, ChannelStats, Channels, ChannelsBackend, LocalChannelsBackend,
 };
+pub mod canary;
+pub mod circuit_breaker;
 pub mod config;
 pub mod credentials;
 #[cfg(feature = "db")]
@@ -94,12 +96,15 @@ pub mod hooks;
 #[cfg(feature = "i18n")]
 pub mod i18n;
 pub mod idempotency;
+pub mod seo;
 /// Translation lookup macro with compile-time key validation.
 ///
 /// Re-exported from [`crate::i18n::t`] for ergonomic
 /// `autumn_web::t!(locale, "key")` usage.
 #[cfg(feature = "i18n")]
 pub use crate::i18n::t;
+#[cfg(feature = "inbound-mail")]
+pub mod inbound_mail;
 pub mod inspector;
 pub mod interceptor;
 #[cfg(feature = "mail")]
@@ -200,6 +205,7 @@ pub mod step_up;
 pub mod storage;
 pub mod tenancy;
 pub mod time;
+pub mod user_agent;
 
 pub mod experiments;
 pub mod feature_flags;
@@ -217,6 +223,11 @@ pub mod ui;
 /// See [`widgets`] for the full API including [`widgets::active_search`],
 /// [`widgets::autocomplete_input`], and their configuration types.
 pub mod widgets;
+/// First-class multi-step form wizards with session-backed state and per-step validation.
+///
+/// See [`wizard`] for the full API including [`wizard::WizardContext`] and
+/// [`wizard::wizard_progress`].
+pub mod wizard;
 /// Changeset type carrying submitted values + per-field errors.
 pub use form::Changeset;
 /// Changeset form extractor — decodes body + validates, captures errors in [`form::Changeset`].
@@ -405,6 +416,11 @@ pub use autumn_macros::api_doc;
 /// }
 /// ```
 pub use autumn_macros::get;
+/// Annotate an async function as a first-class inbound mail handler.
+///
+/// See [`inbound_mail`] for usage documentation.
+#[cfg(feature = "inbound-mail")]
+pub use autumn_macros::inbound_mail;
 /// Collect mailer preview registrations into an `AppBuilder`.
 #[cfg(feature = "mail")]
 pub use autumn_macros::mail_previews;

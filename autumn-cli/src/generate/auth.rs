@@ -12,6 +12,7 @@
 //! - Login and reset-password rotate the session ID (prevents session fixation).
 //! - Logout destroys the session (old session cannot remain authenticated).
 
+use std::fmt::Write as _;
 use std::path::Path;
 
 use super::emit::Plan;
@@ -438,10 +439,13 @@ pub fn plan_auth_with_providers(
     let mig_dir = project_root
         .join("migrations")
         .join(format!("{timestamp}_create_{table}"));
-    plan.create(mig_dir.join("up.sql"), render_migration_up(&table, totp));
+    plan.create(
+        mig_dir.join("up.sql"),
+        render_migration_up(&snake_name, &table, totp),
+    );
     plan.create(
         mig_dir.join("down.sql"),
-        render_migration_down(&table, totp),
+        render_migration_down(&snake_name, &table, totp),
     );
 
     // ── Model ──────────────────────────────────────────────────────────────
@@ -460,6 +464,12 @@ pub fn plan_auth_with_providers(
         );
         model_mod = add_mod_declaration(&model_mod, "recovery_code");
     }
+    // Active login sessions (issue #819) live in their own model + table.
+    plan.create(
+        models_dir.join(format!("{snake_name}_session.rs")),
+        render_session_model_file(&pascal_name, &snake_name, &table),
+    );
+    model_mod = add_mod_declaration(&model_mod, &format!("{snake_name}_session"));
     plan.modify(model_mod_path, model_mod);
 
     // ── src/schema.rs entry ────────────────────────────────────────────────
@@ -506,6 +516,23 @@ pub fn plan_auth_with_providers(
                 .to_owned(),
         ));
     }
+    // Same guard for the session-tracking helper table (issue #819). Only
+    // reject a *foreign* table: when the auth table itself is also present,
+    // this is a re-run over our own output (`--force`), where the schema
+    // append below is an idempotent no-op.
+    let sess_table = sessions_table_name(&snake_name);
+    if schema_has_table(&schema_existing, &sess_table)
+        && !schema_has_table(&schema_existing, &table)
+    {
+        return Err(GenerateError::InvalidName(
+            name.to_owned(),
+            format!(
+                "this project already defines a `{sess_table}` table, which the auth \
+                 starter needs for login-session tracking; rename or remove the \
+                 existing table first."
+            ),
+        ));
+    }
     let mut schema_new = append_schema_table(&schema_existing, &table, &auth_fields);
     if totp {
         let recovery_fields: Vec<super::dsl::Field> = [
@@ -518,6 +545,21 @@ pub fn plan_auth_with_providers(
         .collect();
         schema_new = append_schema_table(&schema_new, "recovery_codes", &recovery_fields);
     }
+    let session_fields: Vec<super::dsl::Field> = [
+        "user_id:i64",
+        "token_digest:String",
+        "ip:String",
+        "user_agent:String",
+        "ua_family:String",
+        "ua_os:String",
+        "ua_device:String",
+        "label:Option<String>",
+        "last_seen_at:NaiveDateTime",
+    ]
+    .iter()
+    .map(|t| super::dsl::parse_field(t).expect("session field tokens are always valid"))
+    .collect();
+    schema_new = append_schema_table(&schema_new, &sess_table, &session_fields);
     plan.modify(schema_path, schema_new);
 
     // ── Auth routes ────────────────────────────────────────────────────────
@@ -544,6 +586,11 @@ pub fn plan_auth_with_providers(
             render_2fa_tests_file(&pascal_name, &snake_name),
         );
     }
+    // Active-session management integration tests (issue #819).
+    plan.create(
+        tests_dir.join("auth_sessions.rs"),
+        render_sessions_tests_file(&pascal_name, &snake_name),
+    );
 
     // ── Documentation ─────────────────────────────────────────────────────
     let docs_dir = project_root.join("docs").join("guide");
@@ -552,6 +599,10 @@ pub fn plan_auth_with_providers(
         render_docs_file(&pascal_name, totp),
     );
     plan.create(docs_dir.join("gdpr-compliance.md"), render_gdpr_docs_file());
+    plan.create(
+        docs_dir.join("session-management.md"),
+        render_sessions_docs_file(&pascal_name, &snake_name, &table),
+    );
 
     // ── src/main.rs — module declarations + route registration ────────────
     let main_path = project_root.join("src").join("main.rs");
@@ -1313,7 +1364,13 @@ scope = "openid profile email"
 
 // ── Template rendering ────────────────────────────────────────────────────────
 
-fn render_migration_up(table: &str, totp: bool) -> String {
+/// Name of the per-login session-tracking table (issue #819), derived from
+/// the auth resource: `User` → `user_sessions`, `Account` → `account_sessions`.
+fn sessions_table_name(snake_name: &str) -> String {
+    format!("{snake_name}_sessions")
+}
+
+fn render_migration_up(snake_name: &str, table: &str, totp: bool) -> String {
     // TOTP columns are inserted after password_digest so the column order
     // matches the generated model struct and `schema.rs` block.
     let totp_columns = if totp {
@@ -1360,15 +1417,39 @@ fn render_migration_up(table: &str, totp: bool) -> String {
              CREATE INDEX recovery_codes_user_id_idx ON recovery_codes (user_id);\n",
         );
     }
+    // Active login sessions (issue #819): one row per login, keyed by the
+    // SHA-256 digest of the opaque server-side session id. Only the digest
+    // is stored so a database leak cannot be replayed as a session cookie.
+    let sess_table = sessions_table_name(snake_name);
+    let _ = write!(
+        out,
+        "\n\
+         CREATE TABLE {sess_table} (\n\
+         \x20   id BIGSERIAL PRIMARY KEY,\n\
+         \x20   user_id BIGINT NOT NULL REFERENCES {table}(id) ON DELETE CASCADE,\n\
+         \x20   token_digest TEXT NOT NULL UNIQUE,\n\
+         \x20   ip TEXT NOT NULL DEFAULT '',\n\
+         \x20   user_agent TEXT NOT NULL DEFAULT '',\n\
+         \x20   ua_family TEXT NOT NULL DEFAULT '',\n\
+         \x20   ua_os TEXT NOT NULL DEFAULT '',\n\
+         \x20   ua_device TEXT NOT NULL DEFAULT '',\n\
+         \x20   label TEXT NULL,\n\
+         \x20   last_seen_at TIMESTAMP NOT NULL DEFAULT NOW(),\n\
+         \x20   created_at TIMESTAMP NOT NULL DEFAULT NOW()\n\
+         );\n\
+         \n\
+         CREATE INDEX {sess_table}_user_id_idx ON {sess_table} (user_id);\n",
+    );
     out
 }
 
-fn render_migration_down(table: &str, totp: bool) -> String {
-    // Drop the dependent table first so the FK constraint is satisfied.
+fn render_migration_down(snake_name: &str, table: &str, totp: bool) -> String {
+    // Drop the dependent tables first so the FK constraints are satisfied.
+    let sess_table = sessions_table_name(snake_name);
     if totp {
-        format!("DROP TABLE recovery_codes;\nDROP TABLE {table};\n")
+        format!("DROP TABLE {sess_table};\nDROP TABLE recovery_codes;\nDROP TABLE {table};\n")
     } else {
-        format!("DROP TABLE {table};\n")
+        format!("DROP TABLE {sess_table};\nDROP TABLE {table};\n")
     }
 }
 
@@ -1455,6 +1536,158 @@ pub struct RecoveryCode {{
     )
 }
 
+/// Render `src/models/{snake}_session.rs` — the active-login-session row and
+/// the revocation APIs on the user model (issue #819).
+///
+/// Only the SHA-256 digest of the opaque session id is stored, so a database
+/// leak cannot be replayed as a session cookie. Revocation deletes the row;
+/// the per-request gate in `routes/auth.rs` treats a missing row as a revoked
+/// session and 401s immediately.
+#[allow(clippy::too_many_lines)]
+fn render_session_model_file(user_pascal: &str, user_snake: &str, user_table: &str) -> String {
+    let sess_table = sessions_table_name(user_snake);
+    format!(
+        r#"//! Generated by `autumn generate auth`.
+//!
+//! Active login sessions for {user_pascal} — one row per logged-in device.
+//! Edit freely — once generated, this is ordinary user code.
+//!
+//! Security notes:
+//! - `token_digest` is the SHA-256 of the opaque server-side session id;
+//!   the raw id is never stored, so a database leak cannot be replayed as
+//!   a session cookie.
+//! - Revocation deletes the row. The per-request gate in `routes/auth.rs`
+//!   (`require_tracked_session`) treats a missing row as revoked and
+//!   responds 401 immediately, even if the cookie is replayed.
+
+use diesel::prelude::*;
+use diesel_async::RunQueryDsl;
+
+use crate::models::{user_snake}::{user_pascal};
+use crate::schema::{sess_table};
+
+#[autumn_web::model]
+pub struct {user_pascal}Session {{
+    pub id: i64,
+    // References {user_table}(id).
+    pub user_id: i64,
+    pub token_digest: String,
+    pub ip: String,
+    pub user_agent: String,
+    pub ua_family: String,
+    pub ua_os: String,
+    pub ua_device: String,
+    #[default]
+    pub label: Option<String>,
+    #[default]
+    pub last_seen_at: chrono::NaiveDateTime,
+    #[default]
+    pub created_at: chrono::NaiveDateTime,
+}}
+
+impl {user_pascal}Session {{
+    /// Human-readable device line for the sessions page, preferring the
+    /// user-set label over the parsed User-Agent.
+    #[must_use]
+    pub fn device_description(&self) -> String {{
+        if let Some(label) = self.label.as_deref().filter(|l| !l.trim().is_empty()) {{
+            return label.to_owned();
+        }}
+        match (self.ua_family.as_str(), self.ua_os.as_str()) {{
+            ("" | "Unknown", "" | "Unknown") => "Unknown device".to_owned(),
+            (family, "" | "Unknown") => family.to_owned(),
+            ("" | "Unknown", os) => os.to_owned(),
+            (family, os) => format!("{{family}} on {{os}}"),
+        }}
+    }}
+}}
+
+/// Active-session APIs available from any request handler that has loaded
+/// the current user (issue #819).
+impl {user_pascal} {{
+    /// All active login sessions for this account, most recently seen first.
+    pub async fn sessions(
+        &self,
+        conn: &mut impl diesel_async::AsyncConnection<Backend = diesel::pg::Pg>,
+    ) -> autumn_web::AutumnResult<Vec<{user_pascal}Session>> {{
+        {sess_table}::table
+            .filter({sess_table}::user_id.eq(self.id))
+            .order({sess_table}::last_seen_at.desc())
+            .select({user_pascal}Session::as_select())
+            .load(conn)
+            .await
+            .map_err(|e| {{
+                autumn_web::AutumnError::internal_server_error_msg(format!(
+                    "Failed to load sessions: {{e}}"
+                ))
+            }})
+    }}
+
+    /// Revoke a single session by row id. Scoped to this account — revoking
+    /// another user's session id is a no-op. Returns `true` when a session
+    /// was actually revoked.
+    pub async fn revoke_session(
+        &self,
+        conn: &mut impl diesel_async::AsyncConnection<Backend = diesel::pg::Pg>,
+        session_id: i64,
+    ) -> autumn_web::AutumnResult<bool> {{
+        let rows = diesel::delete(
+            {sess_table}::table
+                .filter({sess_table}::id.eq(session_id))
+                .filter({sess_table}::user_id.eq(self.id)),
+        )
+        .execute(conn)
+        .await
+        .map_err(|e| {{
+            autumn_web::AutumnError::internal_server_error_msg(format!(
+                "Failed to revoke session: {{e}}"
+            ))
+        }})?;
+        Ok(rows == 1)
+    }}
+
+    /// Revoke every session except the one identified by
+    /// `current_token_digest` ("sign out everywhere else"). Returns the
+    /// number of sessions revoked.
+    pub async fn revoke_other_sessions(
+        &self,
+        conn: &mut impl diesel_async::AsyncConnection<Backend = diesel::pg::Pg>,
+        current_token_digest: &str,
+    ) -> autumn_web::AutumnResult<usize> {{
+        diesel::delete(
+            {sess_table}::table
+                .filter({sess_table}::user_id.eq(self.id))
+                .filter({sess_table}::token_digest.ne(current_token_digest)),
+        )
+        .execute(conn)
+        .await
+        .map_err(|e| {{
+            autumn_web::AutumnError::internal_server_error_msg(format!(
+                "Failed to revoke sessions: {{e}}"
+            ))
+        }})
+    }}
+
+    /// Revoke every session for this account, including the current one.
+    /// Used on password change, where all existing sessions are suspect.
+    pub async fn revoke_all_sessions(
+        &self,
+        conn: &mut impl diesel_async::AsyncConnection<Backend = diesel::pg::Pg>,
+    ) -> autumn_web::AutumnResult<usize> {{
+        diesel::delete({sess_table}::table.filter({sess_table}::user_id.eq(self.id)))
+            .execute(conn)
+            .await
+            .map_err(|e| {{
+                autumn_web::AutumnError::internal_server_error_msg(format!(
+                    "Failed to revoke sessions: {{e}}"
+                ))
+            }})
+    }}
+}}
+"#
+    )
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "Single auth-routes template — splitting fragments makes the template harder to read."
@@ -1466,6 +1699,7 @@ fn render_routes_file(
     providers: &[String],
     totp: bool,
 ) -> String {
+    let sess_table = sessions_table_name(snake_name);
     let oauth_buttons = if providers.is_empty() {
         String::new()
     } else {
@@ -1522,7 +1756,7 @@ fn render_routes_file(
     };
 
     format!(
-        r#"//! Generated by `autumn generate auth`.
+        r##"//! Generated by `autumn generate auth`.
 //!
 //! Complete browser authentication flow. Edit freely — once generated,
 //! this is ordinary user code.
@@ -1533,6 +1767,10 @@ fn render_routes_file(
 //! - Duplicate signup and failed login return identical non-enumerating errors.
 //! - Login and reset-password rotate the session ID to prevent fixation.
 //! - Logout destroys the session so the old session cannot remain authenticated.
+//! - Every login is tracked as a `{sess_table}` row (digest of the opaque
+//!   session id + device attribution); revoking the row signs that device out
+//!   immediately — see `require_tracked_session` and
+//!   docs/guide/session-management.md.
 
 use autumn_web::auth::{{hash_password, verify_password}};
 use autumn_web::extract::Query;
@@ -1540,10 +1778,13 @@ use autumn_web::prelude::*;
 use axum::extract::Path;
 use axum::response::{{IntoResponse, Response}};
 use diesel::prelude::*;
+use diesel_async::AsyncConnection as _;
 use diesel_async::RunQueryDsl;
 use serde::Deserialize;
 
 use crate::models::{snake_name}::{{New{pascal_name}, {pascal_name}}};
+use crate::models::{snake_name}_session::{{New{pascal_name}Session, {pascal_name}Session}};
+use crate::schema::{sess_table};
 use crate::schema::{table};
 {totp_imports}
 
@@ -1564,6 +1805,376 @@ fn layout(title: &str, content: Markup) -> Markup {{
 
 fn redirect_to(url: &str) -> Response {{
     axum::response::Redirect::to(url).into_response()
+}}
+
+// ── Active session tracking (issue #819) ─────────────────────────────────────
+//
+// Every login persists a `{sess_table}` row keyed by the SHA-256 digest of the
+// opaque session id. Authenticated handlers call `require_tracked_session`,
+// which (1) 401s — and destroys the cookie session — when the row has been
+// revoked, even if the cookie is replayed, and (2) updates `last_seen_at` at
+// most once per `[auth.sessions].last_seen_update_secs` to bound write
+// amplification. See docs/guide/session-management.md.
+
+/// SHA-256 digest of the current opaque session id. Only the digest is ever
+/// stored server-side, so a database leak cannot be replayed as a cookie.
+pub async fn session_token_digest(session: &Session) -> String {{
+    sha256_hex(&session.id().await)
+}}
+
+/// Build the tracked-session row for the current session id and device.
+///
+/// To plug in a custom User-Agent parser, replace the
+/// `autumn_web::user_agent::parse_user_agent` call below — this is the only
+/// parse site. See docs/guide/session-management.md.
+pub async fn build_session_row(
+    session: &Session,
+    {snake_name}_id: i64,
+    ip: std::net::IpAddr,
+    headers: &axum::http::HeaderMap,
+) -> New{pascal_name}Session {{
+    let user_agent = headers
+        .get(axum::http::header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .chars()
+        .take(512)
+        .collect::<String>();
+    let parsed = autumn_web::user_agent::parse_user_agent(&user_agent);
+    New{pascal_name}Session {{
+        user_id: {snake_name}_id,
+        token_digest: session_token_digest(session).await,
+        ip: ip.to_string(),
+        user_agent,
+        ua_family: parsed.family,
+        ua_os: parsed.os,
+        ua_device: parsed.device_class.to_string(),
+    }}
+}}
+
+/// Persist a `{sess_table}` row for a successful login on this device.
+pub async fn record_login_session(
+    db: &mut Db,
+    session: &Session,
+    {snake_name}_id: i64,
+    ip: std::net::IpAddr,
+    headers: &axum::http::HeaderMap,
+) -> AutumnResult<()> {{
+    let row = build_session_row(session, {snake_name}_id, ip, headers).await;
+    diesel::insert_into({sess_table}::table)
+        .values(&row)
+        .execute(&mut **db)
+        .await
+        .map_err(|e| {{
+            AutumnError::internal_server_error_msg(format!(
+                "Failed to record login session: {{e}}"
+            ))
+        }})?;
+    Ok(())
+}}
+
+/// Re-point the tracked session row at the current (rotated) session id.
+///
+/// `session.rotate_id()` changes the opaque id, and with it the digest the
+/// row is keyed by. Any flow that rotates while *staying logged in* (e.g.
+/// step-up reauth) must call this with the digest captured before the
+/// rotation, or the very next request would look up a missing row, be
+/// treated as revoked, and 401.
+pub async fn rebind_tracked_session(
+    db: &mut Db,
+    session: &Session,
+    old_token_digest: &str,
+) -> AutumnResult<()> {{
+    let new_digest = session_token_digest(session).await;
+    diesel::update(
+        {sess_table}::table.filter({sess_table}::token_digest.eq(old_token_digest)),
+    )
+    .set({sess_table}::token_digest.eq(&new_digest))
+    .execute(&mut **db)
+    .await
+    .map_err(|e| {{
+        AutumnError::internal_server_error_msg(format!(
+            "Failed to rebind tracked session: {{e}}"
+        ))
+    }})?;
+    Ok(())
+}}
+
+/// Delete the tracked row for the *current* session id, if any.
+///
+/// Login flows call this before `session.rotate_id()`: the rotation
+/// destroys the old server-side session, so a row keyed to its digest
+/// could never authenticate again and would linger as a phantom device on
+/// the previous account's sessions page. Logout uses it too.
+pub async fn untrack_current_session(db: &mut Db, session: &Session) -> AutumnResult<()> {{
+    let token_digest = session_token_digest(session).await;
+    diesel::delete(
+        {sess_table}::table.filter({sess_table}::token_digest.eq(&token_digest)),
+    )
+    .execute(&mut **db)
+    .await
+    .map_err(|e| {{
+        AutumnError::internal_server_error_msg(format!(
+            "Failed to clean up tracked session: {{e}}"
+        ))
+    }})?;
+    Ok(())
+}}
+
+/// Validate the tracked session row for the authenticated user and return
+/// the current {pascal_name}.
+///
+/// The `{sess_table}` row is the source of truth: deleting it signs the
+/// device out *immediately* — the next request 401s and the cookie session
+/// is destroyed, so a replayed cookie cannot resurrect it. `last_seen_at`
+/// is refreshed at most once per `[auth.sessions].last_seen_update_secs`
+/// per session, bounding write amplification.
+///
+/// Call this at the top of every handler that requires authentication.
+pub async fn require_tracked_session(
+    session: &Session,
+    db: &mut Db,
+    state: &AppState,
+) -> AutumnResult<{pascal_name}> {{
+    let {snake_name}_id: i64 = session
+        .get("{snake_name}_id")
+        .await
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| AutumnError::unauthorized_msg("Not authenticated."))?;
+
+    let token_digest = session_token_digest(session).await;
+    let tracked: Option<{pascal_name}Session> = {sess_table}::table
+        .filter({sess_table}::token_digest.eq(&token_digest))
+        .filter({sess_table}::user_id.eq({snake_name}_id))
+        .select({pascal_name}Session::as_select())
+        .first(&mut **db)
+        .await
+        .optional()
+        .map_err(|e| {{
+            AutumnError::internal_server_error_msg(format!("Failed to load session: {{e}}"))
+        }})?;
+
+    let Some(tracked) = tracked else {{
+        // Revoked (or never recorded): destroy the cookie session so a
+        // replayed cookie cannot resurrect it, then reject.
+        session.destroy().await;
+        return Err(AutumnError::unauthorized_msg("Session revoked."));
+    }};
+
+    // Bounded write amplification: skip the UPDATE inside the window.
+    let sessions_cfg = state.config().auth.sessions;
+    let now = chrono::Utc::now().naive_utc();
+    let window =
+        chrono::Duration::seconds(i64::try_from(sessions_cfg.last_seen_update_secs).unwrap_or(60));
+    if now.signed_duration_since(tracked.last_seen_at) >= window {{
+        let _ = diesel::update({sess_table}::table.find(tracked.id))
+            .set({sess_table}::last_seen_at.eq(now))
+            .execute(&mut **db)
+            .await;
+    }}
+
+    {table}::table
+        .find({snake_name}_id)
+        .select({pascal_name}::as_select())
+        .first(&mut **db)
+        .await
+        .map_err(|_| AutumnError::unauthorized_msg("Account not found."))
+}}
+
+/// Render the device list. Shared by the full page and the htmx partial.
+fn sessions_list_fragment(
+    sessions: &[{pascal_name}Session],
+    current_digest: &str,
+    csrf: Option<&CsrfToken>,
+    csrf_field: Option<&CsrfFormField>,
+) -> Markup {{
+    let csrf_name = csrf_field.map_or("_csrf", |f| f.0.as_str());
+    html! {{
+        div id="session-list" {{
+            @if sessions.is_empty() {{
+                p {{ "No active sessions." }}
+            }}
+            ul style="list-style:none;padding:0;" {{
+                @for s in sessions {{
+                    @let current = s.token_digest == current_digest;
+                    li style="border:1px solid #ccc;padding:0.75rem;margin-bottom:0.5rem;" {{
+                        p {{
+                            strong {{ (s.device_description()) }}
+                            @if current {{ " — this device" }}
+                        }}
+                        p {{
+                            "Signed in " (s.created_at.format("%Y-%m-%d %H:%M UTC").to_string())
+                            " from " (s.ip)
+                            " · last seen " (s.last_seen_at.format("%Y-%m-%d %H:%M UTC").to_string())
+                        }}
+                        @if !current {{
+                            // Real form so revocation works without JavaScript;
+                            // htmx intercepts the submit for an in-place swap.
+                            form method="post" action={{ "/account/sessions/" (s.id) "/revoke" }}
+                                hx-post={{ "/account/sessions/" (s.id) "/revoke" }}
+                                hx-target="#session-list" hx-swap="outerHTML"
+                                style="display:inline" {{
+                                @if let Some(csrf) = csrf {{
+                                    input type="hidden" name=(csrf_name) value=(csrf.token());
+                                }}
+                                button type="submit" {{ "Revoke" }}
+                            }}
+                        }}
+                        form action={{ "/account/sessions/" (s.id) "/label" }} method="post"
+                            style="margin-top:0.25rem;" {{
+                            @if let Some(csrf) = csrf {{
+                                input type="hidden" name=(csrf_name) value=(csrf.token());
+                            }}
+                            input type="text" name="label" placeholder="Device label"
+                                value=[s.label.as_deref()];
+                            button type="submit" {{ "Save label" }}
+                        }}
+                    }}
+                }}
+            }}
+            // Real form so bulk revocation works without JavaScript; htmx
+            // intercepts the submit for an in-place swap.
+            form method="post" action="/account/sessions/revoke-others"
+                hx-post="/account/sessions/revoke-others"
+                hx-target="#session-list" hx-swap="outerHTML" {{
+                @if let Some(csrf) = csrf {{
+                    input type="hidden" name=(csrf_name) value=(csrf.token());
+                }}
+                button type="submit" {{ "Sign out everywhere else" }}
+            }}
+        }}
+    }}
+}}
+
+/// Re-render after a mutation: htmx requests get the refreshed partial,
+/// plain form posts get a redirect back to the page.
+async fn sessions_after_mutation(
+    session: &Session,
+    db: &mut Db,
+    state: &AppState,
+    hx: HxRequest,
+    csrf: Option<CsrfToken>,
+    csrf_field: Option<CsrfFormField>,
+) -> AutumnResult<Response> {{
+    if !hx.is_htmx {{
+        return Ok(redirect_to("/account/sessions"));
+    }}
+    let {snake_name} = require_tracked_session(session, db, state).await?;
+    let current_digest = session_token_digest(session).await;
+    let sessions = {snake_name}.sessions(&mut **db).await?;
+    Ok(
+        sessions_list_fragment(&sessions, &current_digest, csrf.as_ref(), csrf_field.as_ref())
+            .into_response(),
+    )
+}}
+
+/// `GET /account/sessions` — list active sessions with revocation controls.
+/// Requires authentication.
+#[secured]
+#[get("/account/sessions")]
+pub async fn sessions_page(
+    session: Session,
+    State(state): State<AppState>,
+    mut db: Db,
+    hx: HxRequest,
+    csrf: Option<CsrfToken>,
+    csrf_field: Option<CsrfFormField>,
+) -> AutumnResult<Response> {{
+    let {snake_name} = require_tracked_session(&session, &mut db, &state).await?;
+    let current_digest = session_token_digest(&session).await;
+    let sessions = {snake_name}.sessions(&mut *db).await?;
+    let fragment =
+        sessions_list_fragment(&sessions, &current_digest, csrf.as_ref(), csrf_field.as_ref());
+    if hx.is_htmx {{
+        return Ok(fragment.into_response());
+    }}
+    Ok(layout("Active Sessions", html! {{
+        @if let Some(ref csrf) = csrf {{ meta name="csrf-token" content=(csrf.token()); }}
+        script src=(HTMX_JS_PATH) {{}}
+        script src=(HTMX_CSRF_JS_PATH) {{}}
+        h1 {{ "Active Sessions" }}
+        p {{
+            "These are the devices currently signed in to your account. \
+             Revoke any session you don't recognise — that device is signed \
+             out immediately."
+        }}
+        (fragment)
+        p {{ a href="/account" {{ "← Back to account" }} }}
+    }}).into_response())
+}}
+
+/// `POST /account/sessions/{{id}}/revoke` — sign a single device out.
+/// The revoked device's next request 401s. Requires authentication.
+#[secured]
+#[post("/account/sessions/{{id}}/revoke")]
+pub async fn sessions_revoke(
+    session: Session,
+    State(state): State<AppState>,
+    mut db: Db,
+    hx: HxRequest,
+    csrf: Option<CsrfToken>,
+    csrf_field: Option<CsrfFormField>,
+    Path(id): Path<i64>,
+) -> AutumnResult<Response> {{
+    let {snake_name} = require_tracked_session(&session, &mut db, &state).await?;
+    {snake_name}.revoke_session(&mut *db, id).await?;
+    sessions_after_mutation(&session, &mut db, &state, hx, csrf, csrf_field).await
+}}
+
+/// `POST /account/sessions/revoke-others` — "Sign out everywhere else":
+/// revoke every session except the current one. Requires authentication.
+#[secured]
+#[post("/account/sessions/revoke-others")]
+pub async fn sessions_revoke_others(
+    session: Session,
+    State(state): State<AppState>,
+    mut db: Db,
+    hx: HxRequest,
+    csrf: Option<CsrfToken>,
+    csrf_field: Option<CsrfFormField>,
+) -> AutumnResult<Response> {{
+    let {snake_name} = require_tracked_session(&session, &mut db, &state).await?;
+    let current_digest = session_token_digest(&session).await;
+    {snake_name}
+        .revoke_other_sessions(&mut *db, &current_digest)
+        .await?;
+    sessions_after_mutation(&session, &mut db, &state, hx, csrf, csrf_field).await
+}}
+
+#[derive(Deserialize)]
+pub struct SessionLabelForm {{
+    pub label: String,
+}}
+
+/// `POST /account/sessions/{{id}}/label` — set a human-readable device label
+/// (e.g. "Work laptop"). An empty label clears it. Requires authentication.
+#[secured]
+#[post("/account/sessions/{{id}}/label")]
+pub async fn sessions_label(
+    session: Session,
+    State(state): State<AppState>,
+    mut db: Db,
+    hx: HxRequest,
+    csrf: Option<CsrfToken>,
+    csrf_field: Option<CsrfFormField>,
+    Path(id): Path<i64>,
+    Form(form): Form<SessionLabelForm>,
+) -> AutumnResult<Response> {{
+    let {snake_name} = require_tracked_session(&session, &mut db, &state).await?;
+    let label = form.label.trim().chars().take(100).collect::<String>();
+    let label = if label.is_empty() {{ None }} else {{ Some(label) }};
+    diesel::update(
+        {sess_table}::table
+            .filter({sess_table}::id.eq(id))
+            .filter({sess_table}::user_id.eq({snake_name}.id)),
+    )
+    .set({sess_table}::label.eq(label))
+    .execute(&mut *db)
+    .await
+    .map_err(|e| {{
+        AutumnError::internal_server_error_msg(format!("Failed to set label: {{e}}"))
+    }})?;
+    sessions_after_mutation(&session, &mut db, &state, hx, csrf, csrf_field).await
 }}
 
 // ── Signup ────────────────────────────────────────────────────────────────────
@@ -1661,7 +2272,13 @@ pub async fn signup(
 
     // Rotate session to prevent any pending 2FA or enrollment state from a
     // previous flow in this browser from being resumed under the new account.
+    // The rotation preserves any existing login's keys, so re-point that
+    // login's tracked row at the new session id — otherwise the next
+    // authenticated request would miss the row (treated as revoked) and the
+    // old row would linger as a phantom device.
+    let pre_rotation_digest = session_token_digest(&session).await;
     session.rotate_id().await;
+    rebind_tracked_session(&mut db, &session, &pre_rotation_digest).await?;
     session.remove("totp_pending_id").await;
     session.remove("totp_pending_reset_digest").await;
     session.remove("totp_pending_reset_token").await;
@@ -1720,7 +2337,7 @@ pub struct LoginForm {{
 /// `UNSPECIFIED` so the handler compiles and runs correctly in both production
 /// (where `into_make_service_with_connect_info` injects the extension) and
 /// in test environments where it is absent.
-pub struct MaybeClientIp(std::net::IpAddr);
+pub struct MaybeClientIp(pub std::net::IpAddr);
 
 impl<S: Send + Sync> axum::extract::FromRequestParts<S> for MaybeClientIp {{
     type Rejection = std::convert::Infallible;
@@ -1752,6 +2369,7 @@ pub async fn login(
     State(state): State<AppState>,
     session: Session,
     MaybeClientIp(addr_ip): MaybeClientIp,
+    headers: axum::http::HeaderMap,
     Form(form): Form<LoginForm>,
 ) -> AutumnResult<Response> {{
     let email = form.email.trim().to_lowercase();
@@ -1935,6 +2553,10 @@ pub async fn login(
         return Err(auth_err());
     }}
 
+    // This browser may already hold a tracked session (re-login or account
+    // switch). The rotation below destroys that session id, so drop its row
+    // now — otherwise it would linger as a phantom device.
+    untrack_current_session(&mut db, &session).await?;
 {totp_login_branch}
     session.rotate_id().await;
 {totp_clear_pending}    session.insert("{snake_name}_id", {snake_name}.id.to_string()).await;
@@ -1943,6 +2565,8 @@ pub async fn login(
     session.insert(state.auth_session_key(), {snake_name}.id.to_string()).await;
     // Stamp the step-up claim so `#[step_up]` routes are immediately accessible.
     autumn_web::step_up::set_last_strong_auth_at(&session).await;
+    // Track this login as an active session (device list + revocation).
+    record_login_session(&mut db, &session, {snake_name}.id, addr_ip, &headers).await?;
     Ok(redirect_to("/account"))
 }}
 
@@ -1951,9 +2575,12 @@ pub async fn login(
 /// `POST /logout` — destroy the session and redirect to the login page.
 ///
 /// Destroying (not just clearing) the session ensures an old session cookie
-/// cannot be replayed after logout.
+/// cannot be replayed after logout. The tracked `{sess_table}` row is removed
+/// too so the device disappears from the active-sessions list.
 #[post("/logout")]
-pub async fn logout(session: Session) -> AutumnResult<Response> {{
+pub async fn logout(session: Session, mut db: Db) -> AutumnResult<Response> {{
+    // Best-effort: the device must sign out even if the row delete hiccups.
+    let _ = untrack_current_session(&mut db, &session).await;
     session.destroy().await;
     Ok(redirect_to("/login"))
 }}
@@ -2026,19 +2653,10 @@ pub async fn unlock_account(
 /// anonymous requests before the handler body runs.
 #[secured]
 #[get("/account")]
-pub async fn account(session: Session, mut db: Db, csrf: Option<CsrfToken>, csrf_field: Option<CsrfFormField>) -> AutumnResult<Response> {{
-    let {snake_name}_id: i64 = session
-        .get("{snake_name}_id")
-        .await
-        .and_then(|s| s.parse().ok())
-        .ok_or_else(|| AutumnError::unauthorized_msg("Not authenticated."))?;
-
-    let {snake_name}: {pascal_name} = {table}::table
-        .find({snake_name}_id)
-        .select({pascal_name}::as_select())
-        .first(&mut *db)
-        .await
-        .map_err(|_| AutumnError::not_found_msg("Account not found."))?;
+pub async fn account(session: Session, State(state): State<AppState>, mut db: Db, csrf: Option<CsrfToken>, csrf_field: Option<CsrfFormField>) -> AutumnResult<Response> {{
+    // Validates the tracked session row (401s immediately if revoked) and
+    // refreshes `last_seen_at` with bounded write amplification.
+    let {snake_name} = require_tracked_session(&session, &mut db, &state).await?;
 
     // Email-confirmed gate: demonstrates how to require a confirmed address on
     // any route. Remove this block to allow unconfirmed users to access the
@@ -2076,6 +2694,7 @@ pub async fn account(session: Session, mut db: Db, csrf: Option<CsrfToken>, csrf
             @if let Some(ref csrf) = csrf {{ input type="hidden" name=(csrf_field.as_ref().map_or("_csrf", |f| f.0.as_str())) value=(csrf.token()); }}
             button type="submit" {{ "Log Out" }}
         }}
+        p {{ a href="/account/sessions" {{ "Manage active sessions" }} }}
         p {{
             a href="/account/delete" {{ "Delete my account" }}
             " (30-day grace period — GDPR Article 17)"
@@ -2095,14 +2714,13 @@ pub async fn account(session: Session, mut db: Db, csrf: Option<CsrfToken>, csrf
 #[post("/account/destroy")]
 pub async fn account_destroy(
     session: Session,
+    State(state): State<AppState>,
     mut db: Db,
 ) -> AutumnResult<Response> {{
-    let {snake_name}_id: i64 = session
-        .get("{snake_name}_id")
-        .await
-        .and_then(|s| s.parse().ok())
-        .ok_or_else(|| AutumnError::unauthorized_msg("Not authenticated."))?;
+    let {snake_name}_id: i64 = require_tracked_session(&session, &mut db, &state).await?.id;
 
+    // Deleting the account cascades to {sess_table} (FK ON DELETE CASCADE),
+    // signing every device out immediately.
     diesel::delete({table}::table.find({snake_name}_id))
         .execute(&mut *db)
         .await
@@ -2134,6 +2752,8 @@ pub struct ReauthForm {{
 #[get("/reauth")]
 pub async fn reauth_form(
     session: Session,
+    State(state): State<AppState>,
+    mut db: Db,
     Query(params): Query<std::collections::HashMap<String, String>>,
     csrf: Option<CsrfToken>,
     csrf_field: Option<CsrfFormField>,
@@ -2141,6 +2761,8 @@ pub async fn reauth_form(
     if session.get("{snake_name}_id").await.is_none() {{
         return Ok(redirect_to("/login").into_response());
     }}
+    // Validates the tracked session row (401s immediately if revoked).
+    let _ = require_tracked_session(&session, &mut db, &state).await?;
     let return_to = params.get("return_to").cloned().unwrap_or_default();
     Ok(layout("Confirm your identity", html! {{
         h1 {{ "Confirm your identity" }}
@@ -2176,18 +2798,8 @@ pub async fn reauth(
         return Ok(redirect_to("/login").into_response());
     }}
 
-    let {snake_name}_id: i64 = session
-        .get("{snake_name}_id")
-        .await
-        .and_then(|s| s.parse().ok())
-        .ok_or_else(|| AutumnError::unauthorized_msg("Not authenticated."))?;
-
-    let {snake_name}: {pascal_name} = {table}::table
-        .find({snake_name}_id)
-        .select({pascal_name}::as_select())
-        .first(&mut *db)
-        .await
-        .map_err(|_| AutumnError::not_found_msg("Account not found."))?;
+    // Validates the tracked session row (401s immediately if revoked).
+    let {snake_name} = require_tracked_session(&session, &mut db, &state).await?;
 
     // In the TOTP multi-step flow, the password is verified in one request and the
     // TOTP code in the next. Rather than echoing the password into a hidden DOM
@@ -2334,7 +2946,12 @@ pub async fn reauth(
     {totp_reauth_check}
     // Rotate session ID before elevating privileges to prevent session fixation
     // attacks where a stolen cookie is used to benefit from a legitimate reauth.
+    // The tracked session row is keyed by the digest of the id, so capture the
+    // pre-rotation digest and re-point the row at the new id — otherwise the
+    // redirected step-up request would find no row and be treated as revoked.
+    let pre_rotation_digest = session_token_digest(&session).await;
     session.rotate_id().await;
+    rebind_tracked_session(&mut db, &session, &pre_rotation_digest).await?;
     session.remove("reauth_pw_ok").await;
     // Refresh the step-up claim.
     autumn_web::step_up::set_last_strong_auth_at(&session).await;
@@ -2494,6 +3111,8 @@ pub async fn reset_password(
     mut db: Db,
     State(state): State<AppState>,
     session: Session,
+    MaybeClientIp(addr_ip): MaybeClientIp,
+    headers: axum::http::HeaderMap,
     Form(form): Form<ResetPasswordForm>,
 ) -> AutumnResult<Response> {{
     if form.password.len() < 8 {{
@@ -2525,18 +3144,58 @@ pub async fn reset_password(
     if {snake_name}.email_confirmed_at.is_none() {{
         return Ok(redirect_to("/check-your-email"));
     }}
-{totp_reset_branch}
-    diesel::update({table}::table.find({snake_name}.id))
-        .set((
-            {table}::password_digest.eq(&new_digest),
-            {table}::reset_token_digest.eq(None::<String>),
-            {table}::reset_token_expires_at.eq(None::<chrono::NaiveDateTime>),
-        ))
-        .execute(&mut *db)
-        .await?;
 
-    // Rotate session to invalidate any previous authenticated state.
+    // This browser may already hold a tracked session. The rotation below
+    // (or inside the 2FA branch) destroys that session id, so drop its row
+    // now — otherwise it would linger as a phantom device.
+    untrack_current_session(&mut db, &session).await?;
+{totp_reset_branch}
+    // Rotate before the commit so the fresh session's row can be inserted
+    // in the same transaction (the rotation itself is in-memory until the
+    // response is sent, so a rollback leaves no half-applied state).
     session.rotate_id().await;
+    let new_session_row = build_session_row(&session, {snake_name}.id, addr_ip, &headers).await;
+
+    // Commit the password change, the reset-token consumption, the session
+    // revocation, and the new session row atomically: if any part fails
+    // everything rolls back, so the reset link stays usable and no state is
+    // half-applied. Revoking every existing session is the standard
+    // response to credential theft (defaulted on, configurable via
+    // [auth.sessions].revoke_on_credential_change).
+    let revoke_existing_sessions = state.config().auth.sessions.revoke_on_credential_change;
+    let {snake_name}_id = {snake_name}.id;
+    (*db)
+        .transaction::<_, diesel::result::Error, _>(|conn| {{
+            Box::pin(async move {{
+                diesel::update({table}::table.find({snake_name}_id))
+                    .set((
+                        {table}::password_digest.eq(&new_digest),
+                        {table}::reset_token_digest.eq(None::<String>),
+                        {table}::reset_token_expires_at.eq(None::<chrono::NaiveDateTime>),
+                    ))
+                    .execute(conn)
+                    .await?;
+                // Revoke before inserting so the bulk delete cannot eat the
+                // fresh row.
+                if revoke_existing_sessions {{
+                    diesel::delete(
+                        {sess_table}::table.filter({sess_table}::user_id.eq({snake_name}_id)),
+                    )
+                    .execute(conn)
+                    .await?;
+                }}
+                diesel::insert_into({sess_table}::table)
+                    .values(&new_session_row)
+                    .execute(conn)
+                    .await?;
+                Ok(())
+            }})
+        }})
+        .await
+        .map_err(|e| {{
+            AutumnError::internal_server_error_msg(format!("Failed to reset password: {{e}}"))
+        }})?;
+
 {totp_clear_pending}    session.insert("{snake_name}_id", {snake_name}.id.to_string()).await;
     session.insert("{snake_name}_email", &{snake_name}.email).await;
     // Use the same session key checked by `#[secured]` / `#[authorize]`.
@@ -2643,6 +3302,8 @@ pub async fn confirm_email(
     mut db: Db,
     State(state): State<AppState>,
     session: Session,
+    MaybeClientIp(addr_ip): MaybeClientIp,
+    headers: axum::http::HeaderMap,
     Path(params): Path<ConfirmEmailPath>,
 ) -> AutumnResult<Response> {{
     let token_digest = sha256_hex(&params.token);
@@ -2671,6 +3332,11 @@ pub async fn confirm_email(
         )
     }})?;
 
+    // This browser may already hold a tracked session for another account.
+    // The rotation below (or inside the 2FA branch) destroys that session
+    // id, so drop its row now — otherwise it would linger as a phantom device.
+    untrack_current_session(&mut db, &session).await?;
+
     // For 2FA-enabled accounts, redirect to /login/verify before granting a
     // full session — email confirmation proves address ownership, not TOTP possession.
 {totp_confirm_branch}    // Grant an authenticated session on confirmation.
@@ -2683,6 +3349,8 @@ pub async fn confirm_email(
     session.insert("{snake_name}_email", &{snake_name}.email).await;
     // Use the same session key checked by `#[secured]` / `#[authorize]`.
     session.insert(state.auth_session_key(), {snake_name}.id.to_string()).await;
+    // Track this login as an active session (device list + revocation).
+    record_login_session(&mut db, &session, {snake_name}.id, addr_ip, &headers).await?;
     // Step-up protected routes will redirect to /reauth as designed.
     Ok(redirect_to("/account"))
 }}
@@ -2855,14 +3523,13 @@ async fn send_confirmation_email(mailer: &Mailer, to: &str, token: &str) -> Autu
 #[get("/account/data-export")]
 pub async fn data_export_form(
     session: Session,
+    State(state): State<AppState>,
+    mut db: Db,
     csrf: Option<CsrfToken>,
     csrf_field: Option<CsrfFormField>,
 ) -> AutumnResult<Response> {{
-    let auth = session
-        .get("{snake_name}_id")
-        .await
-        .ok_or_else(|| AutumnError::unauthorized_msg("Not authenticated."))?;
-    let _ = auth;
+    // Validates the tracked session row (401s immediately if revoked).
+    let _ = require_tracked_session(&session, &mut db, &state).await?;
     Ok(layout("Download My Data", html! {{
         h1 {{ "Download My Data" }}
         p {{
@@ -2892,11 +3559,7 @@ pub async fn data_export(
     mut db: Db,
     State(state): State<AppState>,
 ) -> AutumnResult<Response> {{
-    let {snake_name}_id: i64 = session
-        .get("{snake_name}_id")
-        .await
-        .and_then(|s| s.parse().ok())
-        .ok_or_else(|| AutumnError::unauthorized_msg("Not authenticated."))?;
+    let {snake_name}_id: i64 = require_tracked_session(&session, &mut db, &state).await?.id;
 
     let mailer = state.extension::<Mailer>();
     let now = chrono::Utc::now().naive_utc();
@@ -2984,14 +3647,13 @@ pub struct DeleteAccountForm {{
 #[get("/account/delete")]
 pub async fn delete_account_form(
     session: Session,
+    State(state): State<AppState>,
+    mut db: Db,
     csrf: Option<CsrfToken>,
     csrf_field: Option<CsrfFormField>,
 ) -> AutumnResult<Response> {{
-    let auth = session
-        .get("{snake_name}_id")
-        .await
-        .ok_or_else(|| AutumnError::unauthorized_msg("Not authenticated."))?;
-    let _ = auth;
+    // Validates the tracked session row (401s immediately if revoked).
+    let _ = require_tracked_session(&session, &mut db, &state).await?;
     Ok(layout("Delete My Account", html! {{
         h1 {{ "Delete My Account" }}
         p class="warning" {{
@@ -3034,11 +3696,7 @@ pub async fn delete_account(
     State(state): State<AppState>,
     axum::Form(form): axum::Form<DeleteAccountForm>,
 ) -> AutumnResult<Response> {{
-    let {snake_name}_id: i64 = session
-        .get("{snake_name}_id")
-        .await
-        .and_then(|s| s.parse().ok())
-        .ok_or_else(|| AutumnError::unauthorized_msg("Not authenticated."))?;
+    let {snake_name}_id: i64 = require_tracked_session(&session, &mut db, &state).await?.id;
 
     // Require the user to type DELETE as a confirmation step.
     if form.confirmation.trim() != "DELETE" {{
@@ -3101,11 +3759,7 @@ pub async fn cancel_delete_account(
     mut db: Db,
     State(state): State<AppState>,
 ) -> AutumnResult<Response> {{
-    let {snake_name}_id: i64 = session
-        .get("{snake_name}_id")
-        .await
-        .and_then(|s| s.parse().ok())
-        .ok_or_else(|| AutumnError::unauthorized_msg("Not authenticated."))?;
+    let {snake_name}_id: i64 = require_tracked_session(&session, &mut db, &state).await?.id;
 
     // Only cancel if a future deletion is scheduled; reject once the deadline has passed.
     let rows = diesel::update({table}::table.find({snake_name}_id))
@@ -3156,7 +3810,8 @@ pub struct AdminGdprActionForm {{
 ///
 /// Stamps `export_requested_at` and enqueues the export job.
 /// Records `actor_id` (the operator) + `reason` in the audit log.
-/// Mount behind your admin authentication middleware.
+/// Requires the caller to have the `"admin"` role in their session.
+#[secured("admin")]
 #[post("/admin/{table}/{{id}}/data-export")]
 pub async fn admin_data_export(
     Path(user_id): Path<i64>,
@@ -3209,7 +3864,8 @@ pub async fn admin_data_export(
 ///
 /// Schedules the account for deletion (30-day grace period).
 /// Records `actor_id` (the operator), `reason`, and timestamp in the audit log.
-/// Mount behind your admin authentication middleware.
+/// Requires the caller to have the `"admin"` role in their session.
+#[secured("admin")]
 #[post("/admin/{table}/{{id}}/delete")]
 pub async fn admin_delete_account(
     Path(user_id): Path<i64>,
@@ -3258,7 +3914,7 @@ pub async fn admin_delete_account(
 
     Ok(redirect_to(&format!("/admin/{table}/{{user_id}}")).into_response())
 }}
-{totp_section}"#
+{totp_section}"##
     )
 }
 
@@ -3668,6 +4324,361 @@ fn email_change_reenters_unconfirmed() {{
         "GET /auth/confirm/resend must return 200:\n{{resp}}"
     );
 }}
+"#
+    )
+}
+
+#[allow(clippy::too_many_lines)]
+/// Render `tests/auth_sessions.rs` — integration tests for active-session
+/// management (issue #819), including the two-client revocation flow.
+fn render_sessions_tests_file(pascal_name: &str, _snake_name: &str) -> String {
+    format!(
+        r#"//! Active-session management integration tests for {pascal_name},
+//! generated by `autumn generate auth` (issue #819).
+//!
+//! These tests run against a live server started with `AUTUMN_TEST_BASE_URL`.
+//! They skip when the env var is unset, so they compile and pass out of the box.
+//!
+//! The revocation tests additionally need a *confirmed* account because login
+//! is gated on email confirmation. Provide one via:
+//!
+//! ```sh
+//! export AUTUMN_TEST_CONFIRMED_EMAIL=tester@example.com
+//! export AUTUMN_TEST_CONFIRMED_PASSWORD=some-password-123
+//! ```
+//!
+//! Seed it directly if needed (replace `users` with your table name):
+//!
+//! ```sql
+//! UPDATE users SET email_confirmed_at = NOW() WHERE email = 'tester@example.com';
+//! ```
+
+use std::io::{{Read, Write}};
+use std::net::TcpStream;
+
+fn base_url() -> Option<String> {{
+    std::env::var("AUTUMN_TEST_BASE_URL").ok()
+}}
+
+fn confirmed_account() -> Option<(String, String)> {{
+    let email = std::env::var("AUTUMN_TEST_CONFIRMED_EMAIL").ok()?;
+    let password = std::env::var("AUTUMN_TEST_CONFIRMED_PASSWORD").ok()?;
+    Some((email, password))
+}}
+
+fn host_port(base: &str) -> String {{
+    base.trim_start_matches("http://")
+        .trim_start_matches("https://")
+        .to_owned()
+}}
+
+fn request(base: &str, method: &str, path: &str, body: &str, cookie: &str) -> String {{
+    let hp = host_port(base);
+    let mut stream =
+        TcpStream::connect(&hp).unwrap_or_else(|_| panic!("cannot connect to {{base}}"));
+    let req = format!(
+        "{{method}} {{path}} HTTP/1.1\r\n\
+         Host: {{hp}}\r\n\
+         Content-Type: application/x-www-form-urlencoded\r\n\
+         Content-Length: {{}}\r\n\
+         Cookie: {{cookie}}\r\n\
+         User-Agent: auth-sessions-integration-test\r\n\
+         Connection: close\r\n\r\n\
+         {{body}}",
+        body.len()
+    );
+    stream.write_all(req.as_bytes()).expect("write failed");
+    let mut resp = String::new();
+    stream.read_to_string(&mut resp).expect("read failed");
+    resp
+}}
+
+fn get(base: &str, path: &str, cookie: &str) -> String {{
+    request(base, "GET", path, "", cookie)
+}}
+
+fn post_form(base: &str, path: &str, body: &str, cookie: &str) -> String {{
+    request(base, "POST", path, body, cookie)
+}}
+
+/// Extract the session cookie (`name=value`) from a `Set-Cookie` header.
+fn session_cookie(resp: &str) -> Option<String> {{
+    resp.lines()
+        .filter(|l| l.to_ascii_lowercase().starts_with("set-cookie:"))
+        .filter_map(|l| l.splitn(2, ':').nth(1))
+        .map(|v| v.split(';').next().unwrap_or("").trim().to_owned())
+        .find(|c| !c.is_empty())
+}}
+
+/// Log in and return the authenticated session cookie. Panics on failure.
+fn login(base: &str, email: &str, password: &str) -> String {{
+    let body = format!("email={{email}}&password={{password}}");
+    let resp = post_form(base, "/login", &body, "");
+    assert!(
+        resp.contains("HTTP/1.1 30") || resp.contains("HTTP/1.0 30"),
+        "login did not redirect — is the account confirmed?\n{{resp}}"
+    );
+    session_cookie(&resp).expect("login response missing Set-Cookie")
+}}
+
+/// The revocation tests share one confirmed account, so a concurrent
+/// `revoke-others` from one test would tear down another test's sessions.
+/// Serialize them.
+static REVOKE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[test]
+fn sessions_page_rejects_anonymous() {{
+    let Some(base) = base_url() else {{
+        eprintln!("skipping: AUTUMN_TEST_BASE_URL not set");
+        return;
+    }};
+    let resp = get(&base, "/account/sessions", "");
+    let is_rejected = resp.contains("HTTP/1.1 401")
+        || resp.contains("HTTP/1.0 401")
+        || resp.contains("HTTP/1.1 30")
+        || resp.contains("HTTP/1.0 30");
+    assert!(
+        is_rejected,
+        "GET /account/sessions should reject anonymous requests:\n{{resp}}"
+    );
+}}
+
+/// AC — log in on two clients, revoke from one, and the revoked client's
+/// next request 401s even though it replays the same (still-valid-looking)
+/// cookie. No reliance on cookie expiry.
+#[test]
+fn revoked_session_next_request_401s() {{
+    let Some(base) = base_url() else {{
+        eprintln!("skipping: AUTUMN_TEST_BASE_URL not set");
+        return;
+    }};
+    let Some((email, password)) = confirmed_account() else {{
+        eprintln!("skipping: AUTUMN_TEST_CONFIRMED_EMAIL/PASSWORD not set");
+        return;
+    }};
+    let _serial = REVOKE_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    // Two independent clients (e.g. laptop + phone).
+    let cookie_a = login(&base, &email, &password);
+    let cookie_b = login(&base, &email, &password);
+
+    // Both sessions work.
+    assert!(
+        get(&base, "/account", &cookie_a).contains(" 200"),
+        "client A should be signed in"
+    );
+    assert!(
+        get(&base, "/account", &cookie_b).contains(" 200"),
+        "client B should be signed in"
+    );
+
+    // Client A signs everything else out — one click.
+    let resp = post_form(&base, "/account/sessions/revoke-others", "", &cookie_a);
+    assert!(
+        resp.contains(" 200") || resp.contains(" 30"),
+        "revoke-others failed:\n{{resp}}"
+    );
+
+    // Client B's replayed cookie must 401 on its very next request.
+    let resp_b = get(&base, "/account", &cookie_b);
+    assert!(
+        resp_b.contains("HTTP/1.1 401") || resp_b.contains("HTTP/1.0 401"),
+        "revoked client's next request must 401:\n{{resp_b}}"
+    );
+}}
+
+/// "Sign out everywhere else" must never revoke the session that asked.
+#[test]
+fn revoke_other_sessions_keeps_current_session_alive() {{
+    let Some(base) = base_url() else {{
+        eprintln!("skipping: AUTUMN_TEST_BASE_URL not set");
+        return;
+    }};
+    let Some((email, password)) = confirmed_account() else {{
+        eprintln!("skipping: AUTUMN_TEST_CONFIRMED_EMAIL/PASSWORD not set");
+        return;
+    }};
+    let _serial = REVOKE_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    let cookie_a = login(&base, &email, &password);
+    let _cookie_b = login(&base, &email, &password);
+
+    post_form(&base, "/account/sessions/revoke-others", "", &cookie_a);
+
+    let resp_a = get(&base, "/account", &cookie_a);
+    assert!(
+        resp_a.contains(" 200"),
+        "current session must survive revoke-others:\n{{resp_a}}"
+    );
+    let resp_page = get(&base, "/account/sessions", &cookie_a);
+    assert!(
+        resp_page.contains(" 200"),
+        "sessions page must render for the surviving session:\n{{resp_page}}"
+    );
+}}
+"#
+    )
+}
+
+/// Render `docs/guide/session-management.md` — covers the data model, the
+/// handler APIs, the auto-revocation policy, the privacy posture for stored
+/// IP / User-Agent data, and how to plug in a custom UA parser (issue #819).
+#[allow(clippy::too_many_lines)]
+fn render_sessions_docs_file(pascal_name: &str, snake_name: &str, user_table: &str) -> String {
+    let sess_table = sessions_table_name(snake_name);
+    format!(
+        r#"# Active Session Management
+
+Generated by `autumn generate auth`. Every login persists a `{sess_table}`
+row so users can answer "where am I signed in?" and revoke any device —
+per-session or all-at-once — from `/account/sessions`.
+
+## How it works
+
+- **One row per login.** A successful login (password, email confirmation,
+  TOTP verify, or passkey) inserts a `{sess_table}` row holding the SHA-256
+  digest of the opaque server-side session id, the {pascal_name} id, the IP
+  at login, the raw and parsed User-Agent, an optional user-set device
+  label, `created_at`, and `last_seen_at`.
+- **The row is the source of truth.** Authenticated handlers call
+  `require_tracked_session(&session, &mut db, &state)`, which loads the row
+  by digest. If the row is gone the request is rejected with `401` and the
+  cookie session is destroyed — a revoked session dies on its *next*
+  request, even if the cookie is replayed. There is no reliance on cookie
+  expiry.
+- **Bounded write amplification.** `last_seen_at` is refreshed at most once
+  per `[auth.sessions].last_seen_update_secs` (default 60 s) per session,
+  so a busy session costs one `UPDATE` per window, not one per request.
+- **Only the digest is stored.** The raw session id never touches the
+  database, so a database leak cannot be replayed as a session cookie.
+
+## Handler APIs
+
+From any request handler that has loaded the current {pascal_name}:
+
+```rust
+// List active sessions, most recently seen first.
+let sessions = current_{snake_name}.sessions(&mut *db).await?;
+
+// Revoke one session by row id (scoped to this account).
+current_{snake_name}.revoke_session(&mut *db, session_id).await?;
+
+// "Sign out everywhere else."
+let digest = session_token_digest(&session).await;
+current_{snake_name}.revoke_other_sessions(&mut *db, &digest).await?;
+
+// Revoke everything, including the current session (password change).
+current_{snake_name}.revoke_all_sessions(&mut *db).await?;
+```
+
+Protect your own routes the same way the generated ones are protected:
+
+```rust
+let current_{snake_name} = require_tracked_session(&session, &mut db, &state).await?;
+```
+
+## The /account/sessions page
+
+`GET /account/sessions` lists every active session with device description
+(parsed from the User-Agent), IP, sign-in and last-seen times, a per-row
+**Revoke** button, a device-label form, and a one-click **Sign out
+everywhere else** button. The page is Maud + htmx: revocations swap the
+list in place without a full reload, and fall back to normal form posts
+when JavaScript is unavailable.
+
+## Automatic revocation on credential change
+
+Password change (reset flow), TOTP enrollment, TOTP disable, and passkey
+add/remove revoke all *other* sessions by default — the standard response
+to credential theft. Disable or tune it in `autumn.toml`:
+
+```toml
+[auth.sessions]
+revoke_on_credential_change = true  # default
+last_seen_update_secs = 60          # default
+```
+
+## Privacy posture for stored IP and User-Agent
+
+The session row stores the login IP and User-Agent so a person can
+recognise their own devices. Treat both as personal data:
+
+- **Purpose limitation.** The data exists for device recognition and
+  incident response only. Don't repurpose it for analytics.
+- **Retention.** Rows are deleted on logout, revocation, and account
+  deletion (`ON DELETE CASCADE`). Sessions that simply go stale keep their
+  rows until revoked — pick a retention window and scrub on a schedule:
+
+  ```sql
+  DELETE FROM {sess_table} WHERE last_seen_at < NOW() - INTERVAL '90 days';
+  ```
+
+  Pair this with your session cookie `max_age_secs` so rows do not outlive
+  the cookies that reference them.
+- **Scrubbing/minimisation.** If full IPs are more than you need, truncate
+  before storing (e.g. zero the last IPv4 octet) in `build_session_row`,
+  or store only the parsed UA fields and set `user_agent` to `""`.
+- **No geolocation.** The framework stores the IP only; GeoIP lookups are
+  deliberately left to userland.
+- **Data export.** Include `{sess_table}` in your GDPR export job — see
+  docs/guide/gdpr-compliance.md.
+
+## Plugging in a custom User-Agent parser
+
+The default parser (`autumn_web::user_agent::parse_user_agent`) is a small
+heuristic covering the major browser/OS families. Every parse goes through
+one call site — `build_session_row` in `src/routes/auth.rs` — so
+swapping in a dedicated crate is a one-line change:
+
+```rust
+// In build_session_row, replace:
+let parsed = autumn_web::user_agent::parse_user_agent(&user_agent);
+// with your parser of choice, mapping into the same three fields:
+let ua = my_ua_crate::parse(&user_agent);
+let parsed = autumn_web::user_agent::ParsedUserAgent {{
+    family: ua.browser_name,
+    os: ua.os_name,
+    device_class: autumn_web::user_agent::DeviceClass::Unknown,
+}};
+```
+
+The parsed fields are stored denormalised (`ua_family`, `ua_os`,
+`ua_device`), so changing the parser only affects *new* sessions.
+
+## Migration path for existing apps
+
+Already generated the auth starter before session management existed? The
+upgrade is one additive table:
+
+```sql
+CREATE TABLE {sess_table} (
+    id BIGSERIAL PRIMARY KEY,
+    user_id BIGINT NOT NULL REFERENCES {user_table}(id) ON DELETE CASCADE,
+    token_digest TEXT NOT NULL UNIQUE,
+    ip TEXT NOT NULL DEFAULT '',
+    user_agent TEXT NOT NULL DEFAULT '',
+    ua_family TEXT NOT NULL DEFAULT '',
+    ua_os TEXT NOT NULL DEFAULT '',
+    ua_device TEXT NOT NULL DEFAULT '',
+    label TEXT NULL,
+    last_seen_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    created_at TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX {sess_table}_user_id_idx ON {sess_table} (user_id);
+```
+
+Existing logged-in sessions have no row, so `require_tracked_session`
+treats them as revoked: every user re-authenticates once after the
+deploy. That is the safe default after introducing revocation.
+
+## Integration tests
+
+`tests/auth_sessions.rs` covers the two-client flow: log in on two
+clients, revoke from one, and assert the revoked client's next request
+401s while the surviving client keeps working. Set `AUTUMN_TEST_BASE_URL`
+plus `AUTUMN_TEST_CONFIRMED_EMAIL`/`AUTUMN_TEST_CONFIRMED_PASSWORD` to run
+them against a live server.
 "#
     )
 }
@@ -4172,6 +5183,10 @@ fn auth_route_entries(totp: bool) -> Vec<String> {
         "routes::auth::unlock_account".to_owned(),
         "routes::auth::account".to_owned(),
         "routes::auth::account_destroy".to_owned(),
+        "routes::auth::sessions_page".to_owned(),
+        "routes::auth::sessions_revoke".to_owned(),
+        "routes::auth::sessions_revoke_others".to_owned(),
+        "routes::auth::sessions_label".to_owned(),
         "routes::auth::reauth_form".to_owned(),
         "routes::auth::reauth".to_owned(),
         "routes::auth::forgot_password_form".to_owned(),
@@ -4397,6 +5412,11 @@ pub async fn oauth_callback(
     //
     //   session.insert(&auth_cfg.session_key, local_user_id.to_string()).await;
     //
+    //   // Track the OAuth login as an active session (device list + revocation,
+    //   // issue #819) — add `MaybeClientIp(addr_ip)` and `headers: HeaderMap`
+    //   // extractors to this handler, then:
+    //   crate::routes::auth::record_login_session(&mut db, &session, local_user_id, addr_ip, &headers).await?;
+    //
     // Until the above is implemented the user will NOT be logged in after the OAuth
     // callback — that is intentional to avoid authenticating without a local account.
 {totp_callback_note}    let _ = identity;
@@ -4584,7 +5604,6 @@ const fn totp_imports_src() -> &'static str {
      use aes_gcm::{Aes256Gcm, Key, Nonce};\n\
      use base64::Engine as _;\n\
      use base64::engine::general_purpose::STANDARD as B64;\n\
-     use diesel_async::AsyncConnection as _;\n\
      use totp_rs::{Algorithm, Secret, TOTP};\n\
      use crate::models::recovery_code::{NewRecoveryCode, RecoveryCode};\n\
      use crate::schema::recovery_codes;\n"
@@ -5034,21 +6053,13 @@ fn generate_recovery_code() -> String {
 #[get("/account/2fa")]
 pub async fn two_factor_status(
     session: Session,
+    State(state): State<AppState>,
     mut db: Db,
     csrf: Option<CsrfToken>,
     csrf_field: Option<CsrfFormField>,
 ) -> AutumnResult<Markup> {
-    let __SNAKE___id: i64 = session
-        .get("__SNAKE___id")
-        .await
-        .and_then(|s| s.parse().ok())
-        .ok_or_else(|| AutumnError::unauthorized_msg("Not authenticated."))?;
-    let __SNAKE__: __PASCAL__ = __TABLE__::table
-        .find(__SNAKE___id)
-        .select(__PASCAL__::as_select())
-        .first(&mut *db)
-        .await
-        .map_err(|_| AutumnError::not_found_msg("Account not found."))?;
+    // Validates the tracked session row (401s immediately if revoked).
+    let __SNAKE__ = require_tracked_session(&session, &mut db, &state).await?;
 
     let remaining: i64 = if __SNAKE__.totp_enabled {
         recovery_codes::table
@@ -5117,17 +6128,8 @@ pub async fn two_factor_enable(
              Choose a different [auth].session_key.",
         ));
     }
-    let __SNAKE___id: i64 = session
-        .get("__SNAKE___id")
-        .await
-        .and_then(|s| s.parse().ok())
-        .ok_or_else(|| AutumnError::unauthorized_msg("Not authenticated."))?;
-    let __SNAKE__: __PASCAL__ = __TABLE__::table
-        .find(__SNAKE___id)
-        .select(__PASCAL__::as_select())
-        .first(&mut *db)
-        .await
-        .map_err(|_| AutumnError::not_found_msg("Account not found."))?;
+    // Validates the tracked session row (401s immediately if revoked).
+    let __SNAKE__ = require_tracked_session(&session, &mut db, &state).await?;
 
     // Step-up re-auth: a logged-in but unattended/hijacked session must not be
     // able to enroll an attacker's authenticator. Require the account password
@@ -5191,20 +6193,12 @@ pub async fn two_factor_enable(
 #[post("/account/2fa/confirm")]
 pub async fn two_factor_confirm(
     session: Session,
+    State(state): State<AppState>,
     mut db: Db,
     Form(form): Form<TotpCodeForm>,
 ) -> AutumnResult<Markup> {
-    let __SNAKE___id: i64 = session
-        .get("__SNAKE___id")
-        .await
-        .and_then(|s| s.parse().ok())
-        .ok_or_else(|| AutumnError::unauthorized_msg("Not authenticated."))?;
-    let __SNAKE__: __PASCAL__ = __TABLE__::table
-        .find(__SNAKE___id)
-        .select(__PASCAL__::as_select())
-        .first(&mut *db)
-        .await
-        .map_err(|_| AutumnError::not_found_msg("Account not found."))?;
+    // Validates the tracked session row (401s immediately if revoked).
+    let __SNAKE__ = require_tracked_session(&session, &mut db, &state).await?;
 
     // Re-enrollment guard (defense in depth — `two_factor_enable` blocks this too):
     // never replace an active factor without first disabling (which re-authenticates).
@@ -5241,6 +6235,11 @@ pub async fn two_factor_confirm(
         plaintext_codes.push(code);
     }
 
+    // Capture the revocation policy up front so the delete can run inside
+    // the same transaction as the enablement (a post-commit failure here
+    // would 500 before the one-time recovery codes are ever shown).
+    let revoke_other_sessions_in_txn = state.config().auth.sessions.revoke_on_credential_change;
+    let current_token_digest = session_token_digest(&session).await;
     let txn_result = (*db)
         .transaction::<_, diesel::result::Error, _>(|conn| {
         Box::pin(async move {
@@ -5280,6 +6279,18 @@ pub async fn two_factor_confirm(
             .await?;
             if claimed != 1 {
                 return Err(diesel::result::Error::RollbackTransaction);
+            }
+            // Credential change (second factor enrolled): sign out every
+            // *other* device in the same transaction (defaulted on,
+            // configurable via [auth.sessions].revoke_on_credential_change).
+            if revoke_other_sessions_in_txn {
+                diesel::delete(
+                    __SESSTABLE__::table
+                        .filter(__SESSTABLE__::user_id.eq(user_id))
+                        .filter(__SESSTABLE__::token_digest.ne(current_token_digest)),
+                )
+                .execute(conn)
+                .await?;
             }
             Ok(())
         })
@@ -5323,20 +6334,12 @@ pub async fn two_factor_confirm(
 #[post("/account/2fa/disable")]
 pub async fn two_factor_disable(
     session: Session,
+    State(state): State<AppState>,
     mut db: Db,
     Form(form): Form<TotpDisableForm>,
 ) -> AutumnResult<Response> {
-    let __SNAKE___id: i64 = session
-        .get("__SNAKE___id")
-        .await
-        .and_then(|s| s.parse().ok())
-        .ok_or_else(|| AutumnError::unauthorized_msg("Not authenticated."))?;
-    let __SNAKE__: __PASCAL__ = __TABLE__::table
-        .find(__SNAKE___id)
-        .select(__PASCAL__::as_select())
-        .first(&mut *db)
-        .await
-        .map_err(|_| AutumnError::not_found_msg("Account not found."))?;
+    // Validates the tracked session row (401s immediately if revoked).
+    let __SNAKE__ = require_tracked_session(&session, &mut db, &state).await?;
 
     // Re-authenticate: accept a current TOTP code or the account password.
     // A TOTP code used here is consumed with the same atomic replay guard as
@@ -5379,10 +6382,14 @@ pub async fn two_factor_disable(
         ));
     }
 
-    // Disable the factor and delete the recovery codes in one transaction so a
-    // mid-operation failure can't leave the account with 2FA turned off but
-    // stale recovery codes still present (or vice versa).
+    // Disable the factor, delete the recovery codes, and revoke every
+    // *other* session in one transaction so a mid-operation failure can't
+    // leave the account half-changed — and so a revocation failure can't
+    // 500 after the factor was already removed. Revocation is defaulted on,
+    // configurable via [auth.sessions].revoke_on_credential_change.
     let user_id = __SNAKE__.id;
+    let revoke_other_sessions_in_txn = state.config().auth.sessions.revoke_on_credential_change;
+    let current_token_digest = session_token_digest(&session).await;
     (*db)
         .transaction::<_, diesel::result::Error, _>(|conn| {
             Box::pin(async move {
@@ -5397,6 +6404,15 @@ pub async fn two_factor_disable(
                 diesel::delete(recovery_codes::table.filter(recovery_codes::user_id.eq(user_id)))
                     .execute(conn)
                     .await?;
+                if revoke_other_sessions_in_txn {
+                    diesel::delete(
+                        __SESSTABLE__::table
+                            .filter(__SESSTABLE__::user_id.eq(user_id))
+                            .filter(__SESSTABLE__::token_digest.ne(current_token_digest)),
+                    )
+                    .execute(conn)
+                    .await?;
+                }
                 Ok(())
             })
         })
@@ -5440,6 +6456,8 @@ pub async fn login_verify(
     mut db: Db,
     State(state): State<AppState>,
     session: Session,
+    MaybeClientIp(addr_ip): MaybeClientIp,
+    headers: axum::http::HeaderMap,
     Form(form): Form<TotpCodeForm>,
 ) -> AutumnResult<Response> {
     let pending_id: i64 = session
@@ -5535,17 +6553,41 @@ pub async fn login_verify(
         session.remove("totp_pending_reset_token").await;
         let committed = if let Some(token) = stored_token {
             let now = chrono::Utc::now().naive_utc();
-            let updated = diesel::update(__TABLE__::table.find(__SNAKE__.id))
-                .filter(__TABLE__::reset_token_digest.eq(Some(token.as_str())))
-                .filter(__TABLE__::reset_token_expires_at.gt(now))
-                .set((
-                    __TABLE__::password_digest.eq(&new_digest),
-                    __TABLE__::reset_token_digest.eq(None::<String>),
-                    __TABLE__::reset_token_expires_at.eq(None::<chrono::NaiveDateTime>),
-                ))
-                .execute(&mut *db)
-                .await?;
-            updated == 1
+            // Commit the password change and the session revocation
+            // atomically; a transaction error rolls both back (token
+            // preserved) and is treated as not-committed below.
+            let revoke_existing_sessions =
+                state.config().auth.sessions.revoke_on_credential_change;
+            let user_id = __SNAKE__.id;
+            (*db)
+                .transaction::<_, diesel::result::Error, _>(|conn| {
+                    Box::pin(async move {
+                        let updated = diesel::update(__TABLE__::table.find(user_id))
+                            .filter(__TABLE__::reset_token_digest.eq(Some(token.as_str())))
+                            .filter(__TABLE__::reset_token_expires_at.gt(now))
+                            .set((
+                                __TABLE__::password_digest.eq(&new_digest),
+                                __TABLE__::reset_token_digest.eq(None::<String>),
+                                __TABLE__::reset_token_expires_at.eq(None::<chrono::NaiveDateTime>),
+                            ))
+                            .execute(conn)
+                            .await?;
+                        // Password changed: revoke every existing session in
+                        // the same transaction (defaulted on, configurable via
+                        // [auth.sessions].revoke_on_credential_change). The
+                        // fresh login is recorded below.
+                        if updated == 1 && revoke_existing_sessions {
+                            diesel::delete(
+                                __SESSTABLE__::table.filter(__SESSTABLE__::user_id.eq(user_id)),
+                            )
+                            .execute(conn)
+                            .await?;
+                        }
+                        Ok(updated == 1)
+                    })
+                })
+                .await
+                .unwrap_or(false)
         } else {
             false
         };
@@ -5563,7 +6605,9 @@ pub async fn login_verify(
         }
     }
 
-    // Promote the pending session to a fully authenticated one.
+    // Promote the pending session to a fully authenticated one. Drop any
+    // tracked row for the pending id first — the rotation destroys it.
+    untrack_current_session(&mut db, &session).await?;
     let from_confirmation = session.get("totp_pending_confirmation").await.is_some();
     session.rotate_id().await;
     session.remove("totp_pending_id").await;
@@ -5578,6 +6622,8 @@ pub async fn login_verify(
     if !from_confirmation {
         autumn_web::step_up::set_last_strong_auth_at(&session).await;
     }
+    // Track this login as an active session (device list + revocation).
+    record_login_session(&mut db, &session, __SNAKE__.id, addr_ip, &headers).await?;
 
     let remaining: i64 = recovery_codes::table
         .filter(recovery_codes::user_id.eq(__SNAKE__.id))
@@ -5593,6 +6639,7 @@ pub async fn login_verify(
     TPL.replace("__PASCAL__", pascal_name)
         .replace("__SNAKE__", snake_name)
         .replace("__TABLE__", table)
+        .replace("__SESSTABLE__", &sessions_table_name(snake_name))
 }
 
 /// Markdown appended to `docs/guide/authentication.md` under `--totp`.
@@ -5802,6 +6849,7 @@ fn render_passkeys_routes_file(pascal_name: &str, snake_name: &str, user_table: 
 
 use autumn_web::prelude::*;
 use diesel::prelude::*;
+use diesel_async::AsyncConnection as _;
 use diesel_async::RunQueryDsl;
 use serde::{Deserialize, Serialize};
 use webauthn_rs::prelude::*;
@@ -5866,11 +6914,13 @@ pub struct PasskeyRevokeForm {
 pub async fn passkey_register_page(
     session: Session,
     State(state): State<AppState>,
+    mut db: Db,
     csrf: Option<CsrfToken>,
     csrf_header: Option<CsrfTokenHeader>,
     nonce: Option<CspNonce>,
 ) -> AutumnResult<Markup> {
-    let _ = (session, state);
+    // Validates the tracked session row (401s immediately if revoked).
+    let _ = crate::routes::auth::require_tracked_session(&session, &mut db, &state).await?;
     let csrf_token = csrf.map(|t| t.token().to_owned()).unwrap_or_default();
     let csrf_header_name = csrf_header.map(|h| h.0.clone()).unwrap_or_else(|| "X-CSRF-Token".to_owned());
     let script_nonce = nonce.map(|n| n.value().to_owned());
@@ -5916,19 +6966,21 @@ document.getElementById('register-btn').addEventListener('click', async () => {
 
 /// `POST /passkeys/register/begin` — start a registration ceremony.
 ///
-/// Requires authentication. Stores the pending challenge in the session.
+/// Requires authentication and a fresh step-up claim to prevent a hijacked
+/// session from silently adding a new authenticator.
 #[secured]
+#[step_up]
 #[post("/passkeys/register/begin")]
 pub async fn passkey_register_begin(
     session: Session,
     State(state): State<AppState>,
     mut db: Db,
 ) -> AutumnResult<axum::Json<serde_json::Value>> {
-    let __SNAKE___id: i64 = session
-        .get(state.auth_session_key())
-        .await
-        .and_then(|s| s.parse().ok())
-        .ok_or_else(|| AutumnError::unauthorized_msg("Not authenticated."))?;
+    // Validates the tracked session row (401s immediately if revoked).
+    let __SNAKE___id: i64 =
+        crate::routes::auth::require_tracked_session(&session, &mut db, &state)
+            .await?
+            .id;
     let __SNAKE___email = session
         .get("__SNAKE___email")
         .await
@@ -5984,11 +7036,10 @@ pub async fn passkey_register_finish(
     mut db: Db,
     axum::Json(body): axum::Json<PasskeyRegisterFinishBody>,
 ) -> AutumnResult<axum::Json<serde_json::Value>> {
-    let current_id: i64 = session
-        .get(state.auth_session_key())
-        .await
-        .and_then(|s| s.parse().ok())
-        .ok_or_else(|| AutumnError::unauthorized_msg("Not authenticated."))?;
+    // Validates the tracked session row (401s immediately if revoked).
+    let current =
+        crate::routes::auth::require_tracked_session(&session, &mut db, &state).await?;
+    let current_id: i64 = current.id;
     let envelope_str: String = session
         .get("passkey_reg_state")
         .await
@@ -6021,14 +7072,38 @@ pub async fn passkey_register_finish(
     let cred_id = passkey.cred_id().to_string();
     let cred_json = serde_json::to_string(&passkey)
         .map_err(|_| AutumnError::internal_server_error_msg("Failed to serialise passkey."))?;
-    diesel::insert_into(crate::schema::webauthn_credentials::table)
-        .values((
-            crate::schema::webauthn_credentials::user_id.eq(__SNAKE___id),
-            crate::schema::webauthn_credentials::credential_id.eq(&cred_id),
-            crate::schema::webauthn_credentials::credential_json.eq(&cred_json),
-            crate::schema::webauthn_credentials::name.eq("Passkey"),
-        ))
-        .execute(&mut *db)
+    // Store the passkey and revoke every *other* session in one
+    // transaction: the documented revoke-on-credential-change guarantee
+    // (defaulted on, configurable via
+    // [auth.sessions].revoke_on_credential_change) can never be silently
+    // skipped, and a failure rolls the credential back so the client can
+    // retry without storing a duplicate.
+    let revoke_other_sessions_in_txn = state.config().auth.sessions.revoke_on_credential_change;
+    let current_token_digest = crate::routes::auth::session_token_digest(&session).await;
+    (*db)
+        .transaction::<_, diesel::result::Error, _>(|conn| {
+            Box::pin(async move {
+                diesel::insert_into(crate::schema::webauthn_credentials::table)
+                    .values((
+                        crate::schema::webauthn_credentials::user_id.eq(__SNAKE___id),
+                        crate::schema::webauthn_credentials::credential_id.eq(&cred_id),
+                        crate::schema::webauthn_credentials::credential_json.eq(&cred_json),
+                        crate::schema::webauthn_credentials::name.eq("Passkey"),
+                    ))
+                    .execute(conn)
+                    .await?;
+                if revoke_other_sessions_in_txn {
+                    diesel::delete(
+                        crate::schema::__SESSTABLE__::table
+                            .filter(crate::schema::__SESSTABLE__::user_id.eq(__SNAKE___id))
+                            .filter(crate::schema::__SESSTABLE__::token_digest.ne(current_token_digest)),
+                    )
+                    .execute(conn)
+                    .await?;
+                }
+                Ok(())
+            })
+        })
         .await
         .map_err(|_| AutumnError::internal_server_error_msg("Failed to store passkey."))?;
     Ok(axum::Json(serde_json::json!({ "ok": true })))
@@ -6122,6 +7197,8 @@ pub async fn passkey_login_finish(
     session: Session,
     State(state): State<AppState>,
     mut db: Db,
+    crate::routes::auth::MaybeClientIp(addr_ip): crate::routes::auth::MaybeClientIp,
+    headers: axum::http::HeaderMap,
     axum::Json(body): axum::Json<PasskeyLoginFinishBody>,
 ) -> AutumnResult<axum::Json<serde_json::Value>> {
     let auth_state_str: String = session
@@ -6207,6 +7284,9 @@ pub async fn passkey_login_finish(
                 AutumnError::internal_server_error_msg("Failed to update credential timestamp.")
             })?;
     }
+    // Drop any tracked row for the pre-login session — the rotation below
+    // destroys its id, which would otherwise leave a phantom device.
+    crate::routes::auth::untrack_current_session(&mut db, &session).await?;
     session.rotate_id().await;
     session
         .insert("__SNAKE___id", __SNAKE___id.to_string())
@@ -6215,6 +7295,12 @@ pub async fn passkey_login_finish(
     session
         .insert(state.auth_session_key(), __SNAKE___id.to_string())
         .await;
+    // Stamp the step-up claim so `#[step_up]` routes (e.g. passkey management)
+    // are immediately accessible after a passkey login.
+    autumn_web::step_up::set_last_strong_auth_at(&session).await;
+    // Track this login as an active session (device list + revocation).
+    crate::routes::auth::record_login_session(&mut db, &session, __SNAKE___id, addr_ip, &headers)
+        .await?;
     Ok(axum::Json(serde_json::json!({ "ok": true })))
 }
 
@@ -6230,11 +7316,10 @@ pub async fn passkey_list(
     csrf: Option<CsrfToken>,
     csrf_field: Option<CsrfFormField>,
 ) -> AutumnResult<Markup> {
-    let __SNAKE___id: i64 = session
-        .get(state.auth_session_key())
-        .await
-        .and_then(|s| s.parse().ok())
-        .ok_or_else(|| AutumnError::unauthorized_msg("Not authenticated."))?;
+    // Validates the tracked session row (401s immediately if revoked).
+    let __SNAKE___id: i64 = crate::routes::auth::require_tracked_session(&session, &mut db, &state)
+        .await?
+        .id;
     let rows: Vec<(i64, String, chrono::NaiveDateTime)> = {
         use crate::schema::webauthn_credentials;
         webauthn_credentials::table
@@ -6289,25 +7374,50 @@ pub async fn passkey_revoke(
     mut db: Db,
     Form(form): Form<PasskeyRevokeForm>,
 ) -> AutumnResult<impl IntoResponse> {
-    let __SNAKE___id: i64 = session
-        .get(state.auth_session_key())
+    // Validates the tracked session row (401s immediately if revoked).
+    let current =
+        crate::routes::auth::require_tracked_session(&session, &mut db, &state).await?;
+    // Remove the passkey and revoke every *other* session in one
+    // transaction: the documented revoke-on-credential-change guarantee
+    // (defaulted on, configurable via
+    // [auth.sessions].revoke_on_credential_change) can never be silently
+    // skipped, and a failure rolls the removal back instead of 500ing
+    // after it.
+    let user_id = current.id;
+    let credential_id = form.id;
+    let revoke_other_sessions_in_txn = state.config().auth.sessions.revoke_on_credential_change;
+    let current_token_digest = crate::routes::auth::session_token_digest(&session).await;
+    (*db)
+        .transaction::<_, diesel::result::Error, _>(|conn| {
+            Box::pin(async move {
+                diesel::delete(
+                    crate::schema::webauthn_credentials::table
+                        .filter(crate::schema::webauthn_credentials::id.eq(credential_id))
+                        .filter(crate::schema::webauthn_credentials::user_id.eq(user_id)),
+                )
+                .execute(conn)
+                .await?;
+                if revoke_other_sessions_in_txn {
+                    diesel::delete(
+                        crate::schema::__SESSTABLE__::table
+                            .filter(crate::schema::__SESSTABLE__::user_id.eq(user_id))
+                            .filter(crate::schema::__SESSTABLE__::token_digest.ne(current_token_digest)),
+                    )
+                    .execute(conn)
+                    .await?;
+                }
+                Ok(())
+            })
+        })
         .await
-        .and_then(|s| s.parse().ok())
-        .ok_or_else(|| AutumnError::unauthorized_msg("Not authenticated."))?;
-    diesel::delete(
-        crate::schema::webauthn_credentials::table
-            .filter(crate::schema::webauthn_credentials::id.eq(form.id))
-            .filter(crate::schema::webauthn_credentials::user_id.eq(__SNAKE___id)),
-    )
-    .execute(&mut *db)
-    .await
-    .map_err(|_| AutumnError::internal_server_error_msg("Failed to revoke passkey."))?;
+        .map_err(|_| AutumnError::internal_server_error_msg("Failed to revoke passkey."))?;
     Ok(redirect_to("/passkeys"))
 }
 "##;
     tpl.replace("__PASCAL__", pascal_name)
         .replace("__SNAKE__", snake_name)
         .replace("__TABLE__", user_table)
+        .replace("__SESSTABLE__", &sessions_table_name(snake_name))
 }
 
 fn render_passkeys_tests_file(pascal_name: &str, _snake_name: &str) -> String {
@@ -8250,7 +9360,8 @@ mod tests {
         let reset_pos = routes
             .find("pub async fn reset_password(")
             .expect("reset_password fn");
-        let reset_body = &routes[reset_pos..reset_pos + 3200.min(routes.len() - reset_pos)];
+        let reset_tail = &routes[reset_pos..];
+        let reset_body = &reset_tail[..reset_tail.find("\n/// `").unwrap_or(reset_tail.len())];
         // The deferral branch (which returns to /login/verify) must come BEFORE
         // the password_digest UPDATE in the handler body.
         let park_at = reset_body
@@ -8286,7 +9397,8 @@ mod tests {
         let reset_pos = routes
             .find("pub async fn reset_password(")
             .expect("reset_password fn");
-        let reset_body = &routes[reset_pos..reset_pos + 3200.min(routes.len() - reset_pos)];
+        let reset_tail = &routes[reset_pos..];
+        let reset_body = &reset_tail[..reset_tail.find("\n/// `").unwrap_or(reset_tail.len())];
         assert!(
             reset_body.contains("totp_pending_reset_token"),
             "reset_password 2FA branch must park the token digest: {reset_body}"
@@ -9281,8 +10393,12 @@ mod tests {
             .find("data_export")
             .expect("data_export route must be present");
         let export_body = &routes[export_pos..export_pos + 500.min(routes.len() - export_pos)];
+        // Authentication is enforced either via the tracked-session gate
+        // (#819) or a session/Auth extractor check.
         assert!(
-            export_body.contains("Auth") || export_body.contains("auth"),
+            export_body.contains("require_tracked_session")
+                || export_body.contains("Auth")
+                || export_body.contains("auth"),
             "data_export route must require authentication: {export_body}"
         );
     }

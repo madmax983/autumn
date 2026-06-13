@@ -15,14 +15,17 @@ pub mod auth;
 pub mod config;
 pub mod dsl;
 pub mod emit;
+pub mod inbound_mail;
 pub mod mailer;
 pub mod migration;
 pub mod model;
 pub mod naming;
+pub mod pwa;
 pub mod scaffold;
 pub mod schema_edit;
 pub mod system_test;
 pub mod task;
+pub mod wizard;
 
 use std::path::{Path, PathBuf};
 

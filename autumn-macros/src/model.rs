@@ -53,7 +53,8 @@ fn validate_attrs(field: &Field) -> Vec<&syn::Attribute> {
 }
 
 /// Filter out framework-specific attributes (`#[id]`, `#[indexed]`, `#[validate]`,
-/// `#[default]`, `#[factory_assoc]`, `#[lock_version]`, `#[searchable]`) that shouldn't be on the query struct
+/// `#[default]`, `#[factory_assoc]`, `#[lock_version]`, `#[searchable]`,
+/// `#[state_machine]`) that shouldn't be on the query struct
 /// (they'd confuse Diesel derives).
 fn user_attrs(field: &Field) -> Vec<&syn::Attribute> {
     field
@@ -68,6 +69,7 @@ fn user_attrs(field: &Field) -> Vec<&syn::Attribute> {
                 && !a.path().is_ident("lock_version")
                 && !a.path().is_ident("searchable")
                 && !a.path().is_ident("encrypted")
+                && !a.path().is_ident("state_machine")
         })
         .collect()
 }
@@ -514,6 +516,8 @@ fn excluded_from_new(field: &Field) -> bool {
 
 /// Convert a `snake_case` identifier to `PascalCase`.
 fn pascal_case(s: &str) -> String {
+    // Strip the raw-identifier prefix so `r#type` produces `Type`, not `R#type`.
+    let s = s.strip_prefix("r#").unwrap_or(s);
     s.split('_')
         .map(|word| {
             let mut chars = word.chars();
@@ -649,6 +653,186 @@ fn emit_schema_fn_body_ext(
     }
 }
 
+// ── State machine support ────────────────────────────────────────────────────
+
+/// A single allowed transition between two named states.
+struct StateMachineTransition {
+    from: String,
+    to: String,
+    /// Optional guard: name of a `&self` bool method that must return `true`.
+    guard: Option<String>,
+}
+
+/// Parsed `#[state_machine(transitions(...))]` spec for one field.
+struct StateMachineSpec {
+    field_ident: syn::Ident,
+    transitions: Vec<StateMachineTransition>,
+}
+
+/// Parse the inner `transitions(a -> b, b -> c: "guard", ...)` token tree.
+fn parse_transitions(
+    input: syn::parse::ParseStream<'_>,
+) -> syn::Result<Vec<StateMachineTransition>> {
+    let kw: syn::Ident = input.parse()?;
+    if kw != "transitions" {
+        return Err(syn::Error::new(kw.span(), "expected `transitions(...)`"));
+    }
+    let content;
+    syn::parenthesized!(content in input);
+
+    let mut transitions = Vec::new();
+    while !content.is_empty() {
+        let from: syn::Ident = content.parse()?;
+        content.parse::<syn::Token![->]>()?;
+        let to: syn::Ident = content.parse()?;
+        let guard = if content.peek(syn::Token![:]) {
+            content.parse::<syn::Token![:]>()?;
+            let lit: syn::LitStr = content.parse()?;
+            let guard_str = lit.value();
+            // Validate that the guard name is a plain Rust identifier so that
+            // format_ident! doesn't panic on names like "can-ship" or "can ship".
+            syn::parse_str::<syn::Ident>(&guard_str).map_err(|_| {
+                syn::Error::new_spanned(
+                    &lit,
+                    format!(
+                        "`{guard_str}` is not a valid Rust identifier; \
+                         guard names must be a plain function name such as `can_ship`"
+                    ),
+                )
+            })?;
+            Some(guard_str)
+        } else {
+            None
+        };
+        transitions.push(StateMachineTransition {
+            from: from.to_string(),
+            to: to.to_string(),
+            guard,
+        });
+        if content.peek(syn::Token![,]) {
+            content.parse::<syn::Token![,]>()?;
+        }
+    }
+    Ok(transitions)
+}
+
+/// Parse `#[state_machine(transitions(...))]` from a field, returning the spec when present.
+///
+/// Validates:
+/// - Only `String` fields are supported (the generated `.as_str()` call requires it).
+/// - Multiple `#[state_machine]` attributes on the same field are rejected.
+fn parse_state_machine_spec(field: &syn::Field) -> syn::Result<Option<StateMachineSpec>> {
+    let Some(ident) = field.ident.as_ref() else {
+        return Ok(None);
+    };
+    let mut spec: Option<StateMachineSpec> = None;
+    for attr in &field.attrs {
+        if attr.path().is_ident("state_machine") {
+            if spec.is_some() {
+                return Err(syn::Error::new_spanned(
+                    attr,
+                    "multiple `#[state_machine]` attributes are not allowed on a single field",
+                ));
+            }
+            let is_string = matches!(&field.ty, syn::Type::Path(p)
+                if p.path.segments.last().is_some_and(|s| s.ident == "String"));
+            if !is_string {
+                return Err(syn::Error::new_spanned(
+                    &field.ty,
+                    "`#[state_machine]` is only supported on `String` fields",
+                ));
+            }
+            let transitions = attr.parse_args_with(parse_transitions)?;
+            spec = Some(StateMachineSpec {
+                field_ident: ident.clone(),
+                transitions,
+            });
+        }
+    }
+    Ok(spec)
+}
+
+/// Emit the three state machine items for one field: a transitions constant,
+/// a `can_transition_{field}_to` predicate, and a `transition_{field}_to` method.
+fn emit_state_machine_impl(model_name: &syn::Ident, spec: &StateMachineSpec) -> TokenStream {
+    let field = &spec.field_ident;
+    let raw_field_str = field.to_string();
+    // Strip the raw-identifier prefix so `r#type` produces `type`-derived names
+    // rather than trying to create identifiers like `can_transition_r#type_to`.
+    let field_str = raw_field_str.strip_prefix("r#").unwrap_or(&raw_field_str);
+    let field_upper = field_str.to_uppercase();
+
+    let const_name = format_ident!("__AUTUMN_SM_{field_upper}_TRANSITIONS");
+    let can_fn = format_ident!("can_transition_{field_str}_to");
+    let transition_fn = format_ident!("transition_{field_str}_to");
+
+    let const_entries: Vec<TokenStream> = spec
+        .transitions
+        .iter()
+        .map(|t| {
+            let from = &t.from;
+            let to = &t.to;
+            t.guard.as_ref().map_or_else(
+                || quote! { (#from, #to, ::core::option::Option::None) },
+                |g| quote! { (#from, #to, ::core::option::Option::Some(#g)) },
+            )
+        })
+        .collect();
+
+    let match_arms: Vec<TokenStream> = spec
+        .transitions
+        .iter()
+        .map(|t| {
+            let from = &t.from;
+            let to = &t.to;
+            t.guard.as_ref().map_or_else(
+                || quote! { (#from, #to) => true },
+                |g| {
+                    let guard_fn = format_ident!("{g}");
+                    quote! { (#from, #to) => self.#guard_fn() }
+                },
+            )
+        })
+        .collect();
+
+    quote! {
+        impl #model_name {
+            #[doc(hidden)]
+            pub const #const_name: &'static [(&'static str, &'static str, ::core::option::Option<&'static str>)] = &[
+                #(#const_entries,)*
+            ];
+
+            /// Returns `true` when this record's `{field}` can transition to `target`.
+            ///
+            /// For guarded transitions the corresponding guard method is called first.
+            pub fn #can_fn(&self, target: &str) -> bool {
+                match (&*self.#field, target) {
+                    #(#match_arms,)*
+                    _ => false,
+                }
+            }
+
+            /// Attempts to transition `{field}` to `target`, returning the new state value.
+            ///
+            /// Returns `Err` if the transition is not defined or a guard rejects it.
+            pub fn #transition_fn(&self, target: &str) -> ::autumn_web::AutumnResult<::std::string::String> {
+                if self.#can_fn(target) {
+                    ::core::result::Result::Ok(::std::string::String::from(target))
+                } else {
+                    ::core::result::Result::Err(::autumn_web::AutumnError::bad_request_msg(
+                        ::std::format!(
+                            "Cannot transition `{}` from `{}` to `{}`",
+                            #field_str,
+                            self.#field,
+                            target,
+                        ),
+                    ))
+                }
+            }
+        }
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 #[allow(clippy::cognitive_complexity)]
 pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
@@ -696,6 +880,18 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     // Classify fields
     let all_fields: Vec<&Field> = fields.named.iter().collect();
+
+    // Collect state machine specs from all fields (RED → GREEN: declarative SM support).
+    let mut state_machine_impls: Vec<TokenStream> = Vec::new();
+    for field in &all_fields {
+        match parse_state_machine_spec(field) {
+            Ok(Some(spec)) => {
+                state_machine_impls.push(emit_state_machine_impl(name, &spec));
+            }
+            Ok(None) => {}
+            Err(err) => return err.to_compile_error(),
+        }
+    }
 
     let mut search_field_names = Vec::new();
     let mut search_field_weights = Vec::new();
@@ -2229,6 +2425,9 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 #((#search_field_names, #search_field_weights)),*
             ];
         }
+
+        // ── State machine impls (one per #[state_machine] field) ────────────
+        #(#state_machine_impls)*
     }
 }
 
@@ -2553,6 +2752,346 @@ mod tests {
         assert!(
             generated.contains("lock_version"),
             "etag() method body must reference the lock_version field: {generated}"
+        );
+    }
+
+    // ── RED: declarative state machines ───────────────────────────────────────
+    // These tests define the expected generated API for `#[state_machine(...)]`
+    // field attributes. All will fail until the feature is implemented.
+
+    #[test]
+    fn state_machine_emits_can_transition_method() {
+        let output = model_macro(
+            TokenStream::new(),
+            quote! {
+                pub struct Order {
+                    #[id]
+                    pub id: i64,
+                    #[state_machine(transitions(
+                        pending -> processing,
+                        processing -> shipped,
+                    ))]
+                    pub status: String,
+                }
+            },
+        );
+        let generated = output.to_string();
+        assert!(
+            generated.contains("can_transition_status_to"),
+            "#[state_machine] must emit `can_transition_status_to`: {generated}"
+        );
+    }
+
+    #[test]
+    fn state_machine_emits_transition_to_method() {
+        let output = model_macro(
+            TokenStream::new(),
+            quote! {
+                pub struct Order {
+                    #[id]
+                    pub id: i64,
+                    #[state_machine(transitions(
+                        pending -> processing,
+                    ))]
+                    pub status: String,
+                }
+            },
+        );
+        let generated = output.to_string();
+        assert!(
+            generated.contains("transition_status_to"),
+            "#[state_machine] must emit `transition_status_to`: {generated}"
+        );
+    }
+
+    #[test]
+    fn state_machine_emits_transitions_constant() {
+        let output = model_macro(
+            TokenStream::new(),
+            quote! {
+                pub struct Order {
+                    #[id]
+                    pub id: i64,
+                    #[state_machine(transitions(
+                        pending -> processing,
+                        processing -> shipped,
+                    ))]
+                    pub status: String,
+                }
+            },
+        );
+        let generated = output.to_string();
+        assert!(
+            generated.contains("__AUTUMN_SM_STATUS_TRANSITIONS"),
+            "#[state_machine] must emit `__AUTUMN_SM_STATUS_TRANSITIONS` constant: {generated}"
+        );
+    }
+
+    #[test]
+    fn state_machine_transition_table_contains_from_to_pairs() {
+        let output = model_macro(
+            TokenStream::new(),
+            quote! {
+                pub struct Order {
+                    #[id]
+                    pub id: i64,
+                    #[state_machine(transitions(
+                        pending -> processing,
+                        processing -> shipped,
+                    ))]
+                    pub status: String,
+                }
+            },
+        );
+        let generated = output.to_string();
+        assert!(
+            generated.contains("\"pending\"") && generated.contains("\"processing\""),
+            "transition table must contain the from/to state strings: {generated}"
+        );
+        assert!(
+            generated.contains("\"shipped\""),
+            "transition table must contain all destination states: {generated}"
+        );
+    }
+
+    #[test]
+    fn state_machine_with_guard_calls_guard_method() {
+        let output = model_macro(
+            TokenStream::new(),
+            quote! {
+                pub struct Order {
+                    #[id]
+                    pub id: i64,
+                    #[state_machine(transitions(
+                        processing -> shipped: "can_ship",
+                    ))]
+                    pub status: String,
+                }
+            },
+        );
+        let generated = output.to_string();
+        assert!(
+            generated.contains("can_ship"),
+            "guarded transition must call the guard method `can_ship`: {generated}"
+        );
+    }
+
+    #[test]
+    fn state_machine_guard_stored_in_transition_table() {
+        let output = model_macro(
+            TokenStream::new(),
+            quote! {
+                pub struct Order {
+                    #[id]
+                    pub id: i64,
+                    #[state_machine(transitions(
+                        processing -> shipped: "can_ship",
+                    ))]
+                    pub status: String,
+                }
+            },
+        );
+        let generated = output.to_string();
+        assert!(
+            generated.contains("Some (\"can_ship\")") || generated.contains("Some(\"can_ship\")"),
+            "guarded transition must store the guard name in the transition table: {generated}"
+        );
+    }
+
+    #[test]
+    fn state_machine_unguarded_transition_table_entry_has_none() {
+        let output = model_macro(
+            TokenStream::new(),
+            quote! {
+                pub struct Order {
+                    #[id]
+                    pub id: i64,
+                    #[state_machine(transitions(
+                        pending -> processing,
+                    ))]
+                    pub status: String,
+                }
+            },
+        );
+        let generated = output.to_string();
+        assert!(
+            generated.contains("None"),
+            "unguarded transition must store None in the transition table: {generated}"
+        );
+    }
+
+    #[test]
+    fn state_machine_transition_method_returns_autumn_result() {
+        let output = model_macro(
+            TokenStream::new(),
+            quote! {
+                pub struct Order {
+                    #[id]
+                    pub id: i64,
+                    #[state_machine(transitions(
+                        pending -> processing,
+                    ))]
+                    pub status: String,
+                }
+            },
+        );
+        let generated = output.to_string();
+        assert!(
+            generated.contains("AutumnResult"),
+            "transition_*_to must return AutumnResult: {generated}"
+        );
+    }
+
+    #[test]
+    fn state_machine_attribute_not_leaked_to_diesel_struct() {
+        let output = model_macro(
+            TokenStream::new(),
+            quote! {
+                pub struct Order {
+                    #[id]
+                    pub id: i64,
+                    #[state_machine(transitions(
+                        pending -> processing,
+                    ))]
+                    pub status: String,
+                }
+            },
+        );
+        let generated = output.to_string();
+        // The `state_machine` attribute must not appear inside the Diesel struct
+        // definition — Diesel doesn't know about it and would emit errors.
+        // We check that it does NOT appear as a field-level #[state_machine].
+        // The generated constant/methods may contain the word though.
+        let struct_block = generated
+            .find("pub struct Order")
+            .map_or("", |i| &generated[i..i + 500]);
+        assert!(
+            !struct_block.contains("# [state_machine]")
+                && !struct_block.contains("#[state_machine]"),
+            "`state_machine` attribute must not appear on the generated Diesel struct field: {struct_block}"
+        );
+    }
+
+    #[test]
+    fn state_machine_on_non_string_field_is_rejected() {
+        let output = model_macro(
+            TokenStream::new(),
+            quote! {
+                pub struct Order {
+                    #[id]
+                    pub id: i64,
+                    #[state_machine(transitions(pending -> processing))]
+                    pub amount: i64,
+                }
+            },
+        );
+        let generated = output.to_string();
+        assert!(
+            generated.contains("only supported on `String` fields"),
+            "#[state_machine] on a non-String field must emit a compile error: {generated}"
+        );
+    }
+
+    #[test]
+    fn state_machine_duplicate_attribute_on_same_field_is_rejected() {
+        let output = model_macro(
+            TokenStream::new(),
+            quote! {
+                pub struct Order {
+                    #[id]
+                    pub id: i64,
+                    #[state_machine(transitions(pending -> processing))]
+                    #[state_machine(transitions(processing -> shipped))]
+                    pub status: String,
+                }
+            },
+        );
+        let generated = output.to_string();
+        assert!(
+            generated.contains("multiple `#[state_machine]` attributes are not allowed"),
+            "duplicate #[state_machine] on same field must emit a compile error: {generated}"
+        );
+    }
+
+    #[test]
+    fn state_machine_invalid_guard_identifier_is_rejected() {
+        let output = model_macro(
+            TokenStream::new(),
+            quote! {
+                pub struct Order {
+                    #[id]
+                    pub id: i64,
+                    #[state_machine(transitions(
+                        pending -> processing: "can-ship",
+                    ))]
+                    pub status: String,
+                }
+            },
+        );
+        let generated = output.to_string();
+        assert!(
+            generated.contains("not a valid Rust identifier"),
+            "invalid guard identifier must emit a compile error: {generated}"
+        );
+    }
+
+    #[test]
+    fn state_machine_raw_identifier_field_generates_clean_names() {
+        let output = model_macro(
+            TokenStream::new(),
+            quote! {
+                pub struct Order {
+                    #[id]
+                    pub id: i64,
+                    #[state_machine(transitions(
+                        pending -> processing,
+                    ))]
+                    pub r#type: String,
+                }
+            },
+        );
+        let generated = output.to_string();
+        assert!(
+            generated.contains("can_transition_type_to"),
+            "raw identifier field must strip r# prefix for generated method name: {generated}"
+        );
+        assert!(
+            generated.contains("__AUTUMN_SM_TYPE_TRANSITIONS"),
+            "raw identifier field must strip r# prefix for generated const name: {generated}"
+        );
+    }
+
+    #[test]
+    fn state_machine_multiple_fields_emit_separate_methods() {
+        let output = model_macro(
+            TokenStream::new(),
+            quote! {
+                pub struct Ticket {
+                    #[id]
+                    pub id: i64,
+                    #[state_machine(transitions(open -> in_progress, in_progress -> closed))]
+                    pub status: String,
+                    #[state_machine(transitions(low -> medium, medium -> high))]
+                    pub priority: String,
+                }
+            },
+        );
+        let generated = output.to_string();
+        assert!(
+            generated.contains("can_transition_status_to"),
+            "multi-sm model must emit `can_transition_status_to`: {generated}"
+        );
+        assert!(
+            generated.contains("can_transition_priority_to"),
+            "multi-sm model must emit `can_transition_priority_to`: {generated}"
+        );
+        assert!(
+            generated.contains("transition_status_to"),
+            "multi-sm model must emit `transition_status_to`: {generated}"
+        );
+        assert!(
+            generated.contains("transition_priority_to"),
+            "multi-sm model must emit `transition_priority_to`: {generated}"
         );
     }
 }

@@ -582,7 +582,16 @@ impl Mailer {
     ///
     /// Returns an error when SMTP or address configuration is invalid.
     pub fn from_config(config: &MailConfig) -> Result<Self, MailError> {
-        let mut builder = Self::builder().transport(config.transport);
+        Self::from_config_inner(config, None)
+    }
+
+    pub(crate) fn from_config_inner(
+        config: &MailConfig,
+        resilience: Option<Arc<crate::config::ResilienceConfig>>,
+    ) -> Result<Self, MailError> {
+        let mut builder = Self::builder()
+            .transport(config.transport)
+            .resilience_config(resilience);
         if let Some(from) = &config.from {
             builder = builder.from(from.clone());
         }
@@ -810,6 +819,7 @@ pub struct MailerBuilder {
     file_dir: PathBuf,
     smtp: Option<SmtpConfig>,
     delivery_queue: Option<Arc<dyn MailDeliveryQueue>>,
+    resilience_config: Option<Arc<crate::config::ResilienceConfig>>,
 }
 
 impl Default for MailerBuilder {
@@ -821,6 +831,7 @@ impl Default for MailerBuilder {
             file_dir: default_file_dir(),
             smtp: None,
             delivery_queue: None,
+            resilience_config: None,
         }
     }
 }
@@ -876,6 +887,12 @@ impl MailerBuilder {
         self
     }
 
+    #[must_use]
+    pub fn resilience_config(mut self, rc: Option<Arc<crate::config::ResilienceConfig>>) -> Self {
+        self.resilience_config = rc;
+        self
+    }
+
     /// Build the mailer.
     ///
     /// # Errors
@@ -893,7 +910,10 @@ impl MailerBuilder {
             Transport::Log => Arc::new(LogTransport),
             Transport::File => Arc::new(FileTransport { dir: self.file_dir }),
             Transport::Disabled => Arc::new(DisabledTransport),
-            Transport::Smtp => Arc::new(SmtpTransport::new(self.smtp.unwrap_or_default())?),
+            Transport::Smtp => Arc::new(SmtpTransport::new(
+                self.smtp.unwrap_or_default(),
+                self.resilience_config.clone(),
+            )?),
         };
 
         Ok(Mailer {
@@ -975,10 +995,14 @@ impl MailTransport for FileTransport {
 
 struct SmtpTransport {
     inner: AsyncSmtpTransport<Tokio1Executor>,
+    resilience_config: Option<Arc<crate::config::ResilienceConfig>>,
 }
 
 impl SmtpTransport {
-    fn new(config: SmtpConfig) -> Result<Self, MailError> {
+    fn new(
+        config: SmtpConfig,
+        resilience_config: Option<Arc<crate::config::ResilienceConfig>>,
+    ) -> Result<Self, MailError> {
         let host = config
             .host
             .filter(|host| !host.trim().is_empty())
@@ -1006,6 +1030,7 @@ impl SmtpTransport {
         }
         Ok(Self {
             inner: builder.build(),
+            resilience_config,
         })
     }
 }
@@ -1016,9 +1041,39 @@ impl MailTransport for SmtpTransport {
         mail: Mail,
     ) -> Pin<Box<dyn Future<Output = Result<(), MailError>> + Send + 'a>> {
         Box::pin(async move {
+            let breaker = self.resilience_config.as_ref().map_or_else(
+                || {
+                    crate::circuit_breaker::global_registry().get_or_create(
+                        "smtp_mailer",
+                        crate::circuit_breaker::CircuitBreakerPolicy::default(),
+                    )
+                },
+                |rc| {
+                    let policy = crate::circuit_breaker::CircuitBreakerPolicy::from_config(
+                        rc,
+                        "smtp_mailer",
+                    );
+                    crate::circuit_breaker::global_registry()
+                        .get_or_create_with_config("smtp_mailer", policy)
+                },
+            );
+
+            if breaker.before_call().is_err() {
+                return Err(MailError::RuntimeUnavailable(
+                    "smtp mailer circuit breaker is open".to_owned(),
+                ));
+            }
+            let guard = crate::circuit_breaker::CircuitBreakerGuard::new(breaker.clone());
+
             let message = lettre_message(&mail)?;
-            self.inner.send(message).await?;
-            Ok(())
+            let res = self.inner.send(message).await;
+            if res.is_ok() {
+                guard.success();
+            } else {
+                guard.failure();
+            }
+
+            res.map(|_| ()).map_err(Into::into)
         })
     }
 }
@@ -1641,7 +1696,11 @@ pub(crate) fn install_mailer(
     config: &MailConfig,
     enforce_durable_guard: bool,
 ) -> AutumnResult<()> {
-    let mut mailer = Mailer::from_config(config).map_err(AutumnError::service_unavailable)?;
+    let resilience = state
+        .extension::<crate::config::AutumnConfig>()
+        .map(|c| Arc::new(c.resilience.clone()));
+    let mut mailer =
+        Mailer::from_config_inner(config, resilience).map_err(AutumnError::service_unavailable)?;
 
     if let Some(interceptor) = state.extension::<Arc<dyn crate::interceptor::MailInterceptor>>() {
         mailer.transport = Arc::new(InterceptedMailTransport {
@@ -1814,13 +1873,16 @@ mod tests {
             std::process::id(),
             chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
         );
-        let Err(error) = SmtpTransport::new(SmtpConfig {
-            host: Some("smtp.example.com".to_owned()),
-            port: Some(587),
-            username: Some("mailer".to_owned()),
-            password_env: Some(missing_key.clone()),
-            tls: TlsMode::StartTls,
-        }) else {
+        let Err(error) = SmtpTransport::new(
+            SmtpConfig {
+                host: Some("smtp.example.com".to_owned()),
+                port: Some(587),
+                username: Some("mailer".to_owned()),
+                password_env: Some(missing_key.clone()),
+                tls: TlsMode::StartTls,
+            },
+            None,
+        ) else {
             panic!("missing password env should fail at startup");
         };
 
@@ -1829,13 +1891,16 @@ mod tests {
 
     #[test]
     fn smtp_transport_rejects_missing_password_env_key_when_username_is_set() {
-        let Err(error) = SmtpTransport::new(SmtpConfig {
-            host: Some("smtp.example.com".to_owned()),
-            port: Some(587),
-            username: Some("mailer".to_owned()),
-            password_env: None,
-            tls: TlsMode::StartTls,
-        }) else {
+        let Err(error) = SmtpTransport::new(
+            SmtpConfig {
+                host: Some("smtp.example.com".to_owned()),
+                port: Some(587),
+                username: Some("mailer".to_owned()),
+                password_env: None,
+                tls: TlsMode::StartTls,
+            },
+            None,
+        ) else {
             panic!("missing password_env setting should fail at startup");
         };
 
@@ -2659,5 +2724,68 @@ mod tests {
         let res = intercepted.send(mail).await;
         assert!(res.is_err());
         assert_eq!(TRANSPORT_CALLS.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_smtp_transport_circuit_breaker() {
+        let _lock = crate::circuit_breaker::TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::circuit_breaker::global_registry().clear();
+        let policy = crate::circuit_breaker::CircuitBreakerPolicy {
+            failure_ratio_threshold: 0.5,
+            sample_window: std::time::Duration::from_secs(10),
+            minimum_sample_count: 3,
+            open_duration: std::time::Duration::from_secs(60),
+            half_open_trial_count: 2,
+        };
+        let breaker =
+            crate::circuit_breaker::global_registry().get_or_create("smtp_mailer", policy);
+
+        // Ensure it is closed initially
+        assert_eq!(
+            breaker.state(),
+            crate::circuit_breaker::CircuitState::Closed
+        );
+
+        // Build an SMTP transport pointing to a bogus localhost port so it fails
+        let config = SmtpConfig {
+            host: Some("127.0.0.1".to_string()),
+            port: Some(9999), // Bogus port
+            tls: TlsMode::Disabled,
+            username: None,
+            password_env: None,
+        };
+        let transport = SmtpTransport::new(config, None).unwrap();
+
+        let mail = Mail::builder()
+            .from("sender@example.com")
+            .to("test@example.com")
+            .subject("test")
+            .text("body")
+            .build()
+            .unwrap();
+
+        // Send 3 times — all should fail and trip the breaker
+        for _ in 0..3 {
+            let res = transport.send(mail.clone()).await;
+            assert!(res.is_err());
+        }
+
+        assert_eq!(breaker.state(), crate::circuit_breaker::CircuitState::Open);
+
+        // 4th send should fail fast with a circuit breaker error
+        let res = transport.send(mail.clone()).await;
+        assert!(res.is_err());
+        let err_str = res.err().unwrap().to_string();
+        assert!(
+            err_str.contains("circuit breaker")
+                || err_str.contains("open")
+                || err_str.contains("Open")
+                || err_str.contains("runtime unavailable")
+        );
+
+        crate::circuit_breaker::global_registry().clear();
     }
 }

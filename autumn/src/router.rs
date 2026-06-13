@@ -753,7 +753,7 @@ fn build_openapi_router(
 /// end up either missing real collisions (the reviewer's case:
 /// `/api` + `/` recorded as `/api/` but axum routes it at `/api`) or
 /// generating a spec whose URLs don't match what axum serves.
-#[cfg(feature = "openapi")]
+#[allow(dead_code)]
 pub fn join_nested_path(prefix: &str, child: &str) -> String {
     let prefix_trimmed = prefix.trim_end_matches('/');
     if child == "/" || child.is_empty() {
@@ -1524,9 +1524,17 @@ where
     S: Clone + Send + Sync + 'static,
 {
     if config.bot_protection.enabled {
+        // Use the dedicated captcha_exempt_paths list — NOT csrf.exempt_paths —
+        // so that a route exempt from CSRF for non-cookie auth reasons does not
+        // automatically bypass bot-protection as well.
+        let mut exempt = config.security.captcha_exempt_paths.clone();
+        for endpoint in &config.security.webhooks.endpoints {
+            exempt.push(endpoint.path.clone());
+        }
         let layer =
             crate::security::captcha::BotProtectionLayer::from_config(&config.bot_protection)
-                .with_max_scan_bytes(config.security.upload.max_request_size_bytes);
+                .with_max_scan_bytes(config.security.upload.max_request_size_bytes)
+                .with_exempt_paths(exempt);
         tracing::info!(
             provider = ?config.bot_protection.provider,
             dev_bypass = config.bot_protection.dev_bypass,
@@ -1895,9 +1903,11 @@ fn apply_middleware(
     // layer is available when the timeout fires — see request_timeout_handler).
     //
     // Full ingress layer order (outermost → innermost):
-    //   TraceContext → Compression → Metrics → ExceptionFilter → ErrorPageContext → Session →
-    //   SecurityHeaders → RequestId → Timeout → [user layers] → Tenancy →
-    //   BodyLimit/UploadConfig → MethodOverride → RateLimit → CSRF → CORS → handler
+    //   TraceContext → AccessLog-fallback (applied in apply_startup_barrier) →
+    //   StartupBarrier → Compression → Metrics → ExceptionFilter → ErrorPageContext →
+    //   Session → SecurityHeaders → RequestId → LogContext → AccessLog-primary →
+    //   Timeout → [user layers] → Tenancy → BodyLimit/UploadConfig →
+    //   MethodOverride → RateLimit → CSRF → CORS → handler
     router = apply_request_timeout_middleware(router, config, state.metrics.clone());
 
     // Error-reporting + panic-catch layer. Placed inner to `RequestIdLayer`
@@ -1913,6 +1923,35 @@ fn apply_middleware(
             config.reporting.sample_rate,
         ));
     }
+
+    // Structured per-request access log (#999), primary emitter: one INFO
+    // event (target `autumn::access`) per served request at the response
+    // boundary. Inner to RequestId (so the request id is available) and to
+    // LogContext (so the event is emitted inside the request span); outer to
+    // the reporting and timeout layers so panics-turned-500s and timeout
+    // responses are logged with the status the client receives. Emitted
+    // responses are marked so the outermost fallback (apply_startup_barrier)
+    // does not double-log; that fallback covers requests that short-circuit
+    // before this layer runs.
+    if config.log.access_log {
+        router = router.layer(crate::middleware::AccessLogLayer::new(
+            config.log.access_log_exclude.clone(),
+        ));
+    }
+
+    // Request-scoped log context (#1169). Established for every request, inner
+    // to `RequestIdLayer` (so the request id is available to seed it) and outer
+    // to tenancy, user layers, and the handler (so all of them, and every
+    // `tracing` event they emit, inherit the same correlating context). The
+    // filter mirrors the error-page scrubber so sensitive custom fields never
+    // enter the context output.
+    let mut log_context_filter_parameters = config.log.filter_parameters.clone();
+    log_context_filter_parameters.extend(crate::encryption::registered_encrypted_column_names());
+    let log_context_filter = Arc::new(crate::log::filter::ParameterFilter::new(
+        &log_context_filter_parameters,
+        &config.log.unfilter_parameters,
+    ));
+    let router = router.layer(crate::middleware::LogContextLayer::new(log_context_filter));
 
     let router = router.layer(RequestIdLayer).layer(security_headers);
 
@@ -1970,8 +2009,10 @@ fn apply_middleware(
     //   [user layers, when SSG/ISG dist dir active] ->
     //   StaticFileMiddleware (when SSG/ISG enabled) ->
     //   Metrics -> ExceptionFilter -> ErrorPageContext -> Session ->
-    //   SecurityHeaders -> RequestId -> [user layers, non-static build] ->
+    //   SecurityHeaders -> RequestId -> LogContext -> AccessLog-primary ->
+    //   [user layers, non-static build] ->
     //   Tenancy -> RateLimit -> CSRF -> CORS -> handler
+    //   (An AccessLog fallback sits outermost, applied in apply_startup_barrier.)
     let router = router
         .layer(crate::middleware::error_page_filter::ErrorPageContextLayer { is_dev })
         .layer(ExceptionFilterLayer::new(all_filters))
@@ -2358,13 +2399,31 @@ fn apply_startup_barrier(
         barrier_state,
         startup_barrier,
     ));
+    // Access-log fallback (#999), applied OUTSIDE the startup barrier, the
+    // static-first (SSG/ISR) middleware, the session layer, and the
+    // exception-filter chain — every production build path funnels through
+    // this function, including after the late MCP endpoint merge. It emits
+    // only for responses the primary in-stack layer never saw (it checks the
+    // AccessLogEmitted response marker), giving startup 503s, pre-built
+    // static page hits, session-store outage 503s, and MCP endpoint requests
+    // an access line too. Those short-circuits never ran RequestIdLayer, so
+    // the fallback reads `x-request-id` from the response when present and
+    // logs without a request id otherwise.
+    let router = if config.log.access_log {
+        router.layer(crate::middleware::AccessLogLayer::fallback(
+            config.log.access_log_exclude.clone(),
+        ))
+    } else {
+        router
+    };
     // W3C Trace Context propagation wraps the startup barrier (and the
     // static-first middleware above it) so short-circuit responses —
     // startup 503s and pre-built static file hits — still extract the
     // incoming `traceparent` and inject the current context into the
     // outgoing response. Applied here rather than inside `apply_middleware`
     // because those outer wrappers can return without ever invoking the
-    // inner router.
+    // inner router. Outer to AccessLog so the access event is emitted while
+    // the trace context is current.
     #[cfg(feature = "telemetry-otlp")]
     let router = router.layer(crate::middleware::TraceContextLayer);
     router
@@ -2754,6 +2813,83 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(legacy.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// Pins the production access-log wiring (#999): the layer is applied in
+    /// `apply_startup_barrier`, outside the barrier itself, so even requests
+    /// rejected with 503 before the app router runs emit one access event
+    /// carrying the status the client receives.
+    #[test]
+    fn startup_barrier_503s_are_access_logged() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        #[derive(Clone, Default)]
+        struct Capture {
+            events: Arc<std::sync::Mutex<Vec<std::collections::BTreeMap<String, String>>>>,
+        }
+        struct Visitor<'a>(&'a mut std::collections::BTreeMap<String, String>);
+        impl tracing::field::Visit for Visitor<'_> {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                self.0.insert(field.name().to_owned(), format!("{value:?}"));
+            }
+            fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+                self.0.insert(field.name().to_owned(), value.to_string());
+            }
+        }
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Capture {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _ctx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                if event.metadata().target() != crate::middleware::ACCESS_LOG_TARGET {
+                    return;
+                }
+                let mut fields = std::collections::BTreeMap::new();
+                event.record(&mut Visitor(&mut fields));
+                self.events.lock().unwrap().push(fields);
+            }
+        }
+
+        let capture = Capture::default();
+        let events = Arc::clone(&capture.events);
+        let subscriber = tracing_subscriber::registry().with(capture);
+
+        tracing::subscriber::with_default(subscriber, || {
+            // With startup incomplete, the barrier rejects non-probe requests
+            // with 503 before the app router runs.
+            let state = AppState::for_test()
+                .with_profile("test")
+                .with_startup_complete(false);
+            let app = build_router(Vec::new(), &AutumnConfig::default(), state);
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let response = rt.block_on(async {
+                app.oneshot(
+                    Request::builder()
+                        .uri("/not-a-probe")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+            });
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        });
+
+        let events = events.lock().unwrap().clone();
+        assert_eq!(
+            events.len(),
+            1,
+            "a barrier-rejected request should emit one access event: {events:?}"
+        );
+        assert_eq!(events[0].get("status").map(String::as_str), Some("503"));
+        assert!(
+            !events[0].contains_key("request_id"),
+            "barrier short-circuits before RequestIdLayer, so no request id"
+        );
     }
 
     #[test]
@@ -3241,7 +3377,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "openapi")]
     #[test]
     fn join_nested_path_normalizes_like_axum() {
         // Reviewer's reported case: scope "/api" + child "/" must

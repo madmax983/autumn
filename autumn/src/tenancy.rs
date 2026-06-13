@@ -317,6 +317,10 @@ pub async fn tenancy_middleware(
         Err(e) => return e.into_response(),
     };
 
+    // Tag the request-scoped log context (#1169) so every subsequent event
+    // automatically carries the resolved tenant id.
+    crate::log::context::set_tenant_id(&tenant_id);
+
     let request = Request::from_parts(parts, body);
     let tenant_id_clone = tenant_id.clone();
     let response = CURRENT_TENANT
