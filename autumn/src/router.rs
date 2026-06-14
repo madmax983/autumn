@@ -4656,6 +4656,67 @@ mod trusted_host_tests {
 
         assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
     }
+
+}
+
+#[cfg(test)]
+mod api_versioning_tests {
+    #[tokio::test]
+    async fn api_versioning_sunset_auth_no_panic() {
+        use chrono::TimeZone;
+        use crate::router::{RouteVersionMetadata, api_versioning_middleware};
+        use crate::app::RegisteredApiVersions;
+        use crate::state::AppState;
+        use axum::extract::Extension;
+        use axum::extract::State;
+        use axum::http::Request;
+
+        let clock = crate::time::FixedClock::at(
+            chrono::Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap()
+        );
+
+        let version = crate::app::ApiVersion {
+            version: "v1".to_string(),
+            deprecated_at: None,
+            sunset_at: Some(chrono::Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap()),
+        };
+
+        let mut app_state = AppState::for_test();
+        app_state.clock = std::sync::Arc::new(clock);
+        app_state.insert_extension(RegisteredApiVersions(vec![version]));
+
+        let state = State(app_state.clone());
+
+        let meta = RouteVersionMetadata {
+            version: "v1".to_string(),
+            sunset_opt_out: false,
+            secured: true,
+            required_roles: &[],
+            has_policy: false,
+        };
+
+        let request = Request::builder()
+            .uri("/")
+            .body(axum::body::Body::empty())
+            .unwrap();
+
+        // Call the middleware function directly to verify it doesn't panic
+        let router = axum::Router::new()
+            .route("/", axum::routing::get(|| async { axum::response::IntoResponse::into_response("should not reach here") }))
+            .layer(axum::middleware::from_fn_with_state(
+                state.0.clone(),
+                |State(s): State<AppState>, ext: Option<Extension<RouteVersionMetadata>>, req, next| async move {
+                    api_versioning_middleware(State(s), ext, req, next).await
+                }
+            ))
+            .layer(axum::Extension(meta))
+            .with_state(state.0.clone());
+
+        use tower::ServiceExt;
+        let resp = router.oneshot(request).await.unwrap();
+
+        assert_eq!(resp.status(), axum::http::StatusCode::UNAUTHORIZED);
+    }
 }
 #[derive(Clone, Debug)]
 pub struct TrustedHostPolicy {
@@ -4791,7 +4852,13 @@ async fn api_versioning_middleware(
                 ));
             }
             if auth_failed {
-                return auth_error.unwrap().into_response();
+                if let Some(err) = auth_error {
+                    return err.into_response();
+                } else {
+                    return axum::response::IntoResponse::into_response(
+                        crate::error::AutumnError::unauthorized_msg("authentication required"),
+                    );
+                }
             }
         }
 
