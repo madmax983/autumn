@@ -480,8 +480,11 @@ pub fn plan_auth_with_providers(
     //   password_digest  String   → Text      NOT NULL
     //   reset_token_digest         Option<String>         → Nullable<Text>
     //   reset_token_expires_at     Option<NaiveDateTime>  → Nullable<Timestamp>
-    let mut user_field_tokens: Vec<&str> =
-        vec!["email:String", "time_zone:Option<String>", "password_digest:String"];
+    let mut user_field_tokens: Vec<&str> = vec![
+        "email:String",
+        "time_zone:Option<String>",
+        "password_digest:String",
+    ];
     if totp {
         user_field_tokens.push("totp_secret_encrypted:Option<String>");
         user_field_tokens.push("totp_enabled:bool");

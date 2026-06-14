@@ -32,8 +32,8 @@
 //! }
 //! ```
 
-use chrono::{DateTime, Utc};
 use chrono::TimeZone as _;
+use chrono::{DateTime, Utc};
 use chrono_tz::Tz;
 use serde::Deserialize;
 
@@ -197,15 +197,9 @@ impl axum::extract::FromRequestParts<crate::state::AppState> for TimeZone {
     }
 }
 
-async fn resolve_source(
-    parts: &axum::http::request::Parts,
-    source: &Source,
-) -> Option<Tz> {
+async fn resolve_source(parts: &axum::http::request::Parts, source: &Source) -> Option<Tz> {
     match source {
-        Source::User => parts
-            .extensions
-            .get::<UserTimeZone>()
-            .map(|utz| utz.0),
+        Source::User => parts.extensions.get::<UserTimeZone>().map(|utz| utz.0),
         Source::Session => {
             let session = parts.extensions.get::<crate::session::Session>().cloned()?;
             let value: String = session.get(TIME_ZONE_SESSION_KEY).await?;
@@ -442,9 +436,7 @@ pub fn datetime_local_input(
     dt: Option<DateTime<Utc>>,
     tz: Tz,
 ) -> maud::Markup {
-    let value = dt
-        .map(|d| to_local_input_value(d, tz))
-        .unwrap_or_default();
+    let value = dt.map(|d| to_local_input_value(d, tz)).unwrap_or_default();
     maud::html! {
         div.field {
             label for=(name) { (label) }
@@ -600,7 +592,10 @@ mod tests {
 
     #[test]
     fn cookie_ignores_other_cookies() {
-        let p = parts("/", &[("Cookie", "session=abc; autumn_time_zone=UTC; other=x")]);
+        let p = parts(
+            "/",
+            &[("Cookie", "session=abc; autumn_time_zone=UTC; other=x")],
+        );
         let result = resolve_from_cookie(&p);
         assert_eq!(result, Some(Tz::UTC));
     }
@@ -707,7 +702,10 @@ mod tests {
     fn to_local_input_value_formats_correctly() {
         use chrono::TimeZone as ChrTz;
         let utc = chrono::Utc.with_ymd_and_hms(2025, 6, 14, 6, 30, 0).unwrap();
-        assert_eq!(to_local_input_value(utc, Tz::Asia__Tokyo), "2025-06-14T15:30");
+        assert_eq!(
+            to_local_input_value(utc, Tz::Asia__Tokyo),
+            "2025-06-14T15:30"
+        );
         assert_eq!(to_local_input_value(utc, Tz::UTC), "2025-06-14T06:30");
     }
 
@@ -815,20 +813,15 @@ mod tests {
 
     #[tokio::test]
     async fn with_request_time_zone_sets_ambient() {
-        let result = with_request_time_zone(Tz::Asia__Tokyo, async {
-            ambient_time_zone()
-        })
-        .await;
+        let result = with_request_time_zone(Tz::Asia__Tokyo, async { ambient_time_zone() }).await;
         assert_eq!(result, Tz::Asia__Tokyo);
     }
 
     #[tokio::test]
     async fn ambient_returns_utc_outside_scope() {
         // Inside scope
-        let inside = with_request_time_zone(Tz::America__New_York, async {
-            ambient_time_zone()
-        })
-        .await;
+        let inside =
+            with_request_time_zone(Tz::America__New_York, async { ambient_time_zone() }).await;
         // Outside scope
         let outside = ambient_time_zone();
         assert_eq!(inside, Tz::America__New_York);
