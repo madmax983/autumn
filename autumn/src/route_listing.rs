@@ -78,6 +78,38 @@ pub struct RouteInfo {
 /// Helper type alias representing version name, status string, and sunset opt-out flag.
 type RouteVersionInfo = (Option<String>, Option<String>, Option<bool>);
 
+// ── export_markdown ────────────────────────────────────────────────────────
+
+/// Serialize the given route listing to Markdown format.
+///
+/// The Markdown contains a table with headers and includes the method, path, handler name,
+/// route source, and joined middleware labels.
+#[must_use]
+pub fn export_markdown(infos: &[RouteInfo]) -> String {
+    use std::fmt::Write as _;
+
+    let mut out = String::new();
+    out.push_str("| Method | Path | Handler | Source | Middleware |\n");
+    out.push_str("|---|---|---|---|---|\n");
+    for info in infos {
+        let middleware = info.middleware.join(", ");
+        // Ensure values do not contain unescaped '|' which breaks markdown tables.
+        writeln!(
+            out,
+            "| {} | {} | {} | {} | {} |",
+            info.method.replace('|', "\\|"),
+            info.path.replace('|', "\\|"),
+            info.handler.replace('|', "\\|"),
+            info.source.to_string().replace('|', "\\|"),
+            middleware.replace('|', "\\|")
+        )
+        .expect("writing to a String is infallible");
+    }
+    out
+}
+
+// ── collect_route_infos ────────────────────────────────────────────────────
+
 /// Collect [`RouteInfo`] entries from user routes and scoped groups.
 ///
 /// `route_sources` is a parallel slice to `routes`; each element is the
@@ -834,6 +866,34 @@ mod tests {
         assert_eq!(r.method, "GET");
         assert_eq!(r.handler, "static_files");
         assert_eq!(r.source, RouteSource::Framework);
+    }
+
+    // ── export_markdown ────────────────────────────────────────────────────
+
+    #[test]
+    fn route_info_exports_to_markdown() {
+        let infos = vec![RouteInfo {
+            method: "GET".to_owned(),
+            path: "/posts/{id}".to_owned(),
+            handler: "posts::show".to_owned(),
+            source: RouteSource::User,
+            middleware: vec!["secured".to_owned(), "cached".to_owned()],
+            api_version: None,
+            status: None,
+            sunset_opt_out: None,
+        }];
+        let md = export_markdown(&infos);
+        let lines: Vec<&str> = md.lines().collect();
+        assert_eq!(lines.len(), 3);
+        assert_eq!(
+            lines[0],
+            "| Method | Path | Handler | Source | Middleware |"
+        );
+        assert_eq!(lines[1], "|---|---|---|---|---|");
+        assert_eq!(
+            lines[2],
+            "| GET | /posts/{id} | posts::show | user | secured, cached |"
+        );
     }
 
     // ── append_dev_reload_routes ───────────────────────────────────────────
