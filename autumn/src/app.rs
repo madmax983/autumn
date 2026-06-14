@@ -182,6 +182,10 @@ pub struct ApiVersion {
 #[derive(Clone, Debug)]
 pub struct RegisteredApiVersions(pub Vec<ApiVersion>);
 
+/// A wrapper for registered routes in the app state.
+#[derive(Clone, Debug)]
+pub struct RegisteredRoutes(pub Vec<crate::route_listing::RouteInfo>);
+
 /// Builder for configuring and launching an Autumn application.
 ///
 /// Created by [`app()`]. Collect routes with [`.routes()`](Self::routes),
@@ -2495,7 +2499,29 @@ impl AppBuilder {
         } else {
             crate::cache::clear_global_cache();
         }
-        state.insert_extension(RegisteredApiVersions(api_versions));
+        state.insert_extension(RegisteredApiVersions(api_versions.clone()));
+
+        let mut infos = match crate::route_listing::collect_route_infos(
+            &all_routes,
+            &route_sources,
+            &scoped_groups,
+            &api_versions,
+        ) {
+            Ok(infos) => infos,
+            Err(e) => {
+                tracing::error!("Failed to collect route listing: {e}");
+                Vec::new()
+            }
+        };
+        infos.extend(declared_routes);
+        crate::route_listing::append_framework_routes(&mut infos, &config);
+        #[cfg(feature = "openapi")]
+        if let Some(ref oa) = openapi {
+            crate::route_listing::append_openapi_routes(&mut infos, oa);
+        }
+        crate::route_listing::append_dev_reload_routes(&mut infos);
+        crate::route_listing::sort_route_infos(&mut infos);
+        state.insert_extension(RegisteredRoutes(infos));
 
         // Install registered error reporters so the reporting layer (wired in
         // `apply_middleware`) can deliver panic + 5xx events. Empty is fine —

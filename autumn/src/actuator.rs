@@ -349,6 +349,14 @@ pub trait ProvideActuatorState {
         None
     }
 
+    /// Returns the registered routes if available.
+    ///
+    /// The default returns `None`. [`crate::AppState`] overrides this to return
+    /// the route listing built at application startup.
+    fn registered_routes(&self) -> Option<std::sync::Arc<crate::app::RegisteredRoutes>> {
+        None
+    }
+
     /// Returns the in-memory log capture buffer, if capture is enabled.
     ///
     /// The default returns `None` (capture disabled). [`crate::AppState`]
@@ -2313,6 +2321,18 @@ pub(crate) struct LoggersResponse {
     loggers: HashMap<String, String>,
 }
 
+/// `GET <actuator-prefix>/routes` -- view registered routes.
+pub(crate) async fn routes_endpoint<S: ProvideActuatorState + Send + Sync + 'static>(
+    State(state): State<S>,
+) -> impl IntoResponse {
+    let routes = state.registered_routes();
+    if let Some(r) = routes {
+        Json(r.0.clone()).into_response()
+    } else {
+        Json(Vec::<crate::route_listing::RouteInfo>::new()).into_response()
+    }
+}
+
 /// `GET <actuator-prefix>/loggers` -- view current log levels.
 pub(crate) async fn loggers_get<S: ProvideActuatorState + Send + Sync + 'static>(
     State(state): State<S>,
@@ -2904,6 +2924,10 @@ pub(crate) fn actuator_router_with_prefix<
             .route(
                 &actuator_route_path(prefix, "/configprops"),
                 axum::routing::get(configprops_endpoint::<S>),
+            )
+            .route(
+                &actuator_route_path(prefix, "/routes"),
+                axum::routing::get(routes_endpoint::<S>),
             )
             .route(
                 &actuator_route_path(prefix, "/loggers"),
@@ -4388,7 +4412,45 @@ mod tests {
         assert_eq!(job["total_failures"], 0);
     }
 
-    #[cfg(feature = "ws")]
+    #[tokio::test]
+    async fn actuator_routes_returns_json_list() {
+        let state = test_state();
+        state.insert_extension(crate::app::RegisteredRoutes(vec![
+            crate::route_listing::RouteInfo {
+                method: "GET".to_owned(),
+                path: "/api/test".to_owned(),
+                handler: "test_handler".to_owned(),
+                source: crate::route_listing::RouteSource::User,
+                middleware: vec![],
+                api_version: None,
+                status: None,
+                sunset_opt_out: None,
+            },
+        ]));
+
+        let app = actuator_router(true).with_state(state);
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/actuator/routes")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = http_body_util::BodyExt::collect(resp.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
+        let routes: Vec<crate::route_listing::RouteInfo> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].path, "/api/test");
+        assert_eq!(routes[0].handler, "test_handler");
+    }
+
     #[tokio::test]
     async fn actuator_channels_returns_metrics() {
         let state = test_state();
