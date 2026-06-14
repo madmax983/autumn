@@ -297,7 +297,10 @@ pub fn try_build_router_inner(
     state: AppState,
     ctx: RouterContext,
 ) -> Result<axum::Router, RouterBuildError> {
-    let router = build_router_pre_state(route_list, config, &state, ctx, None)?;
+    // Fully-dynamic path: no outer SecurityHeadersLayer is applied after this
+    // returns, so build_router_pre_state applies it (outermost, wrapping the
+    // gate).
+    let router = build_router_pre_state(route_list, config, &state, ctx, None, false)?;
     Ok(router.with_state(state))
 }
 
@@ -324,6 +327,13 @@ fn build_router_pre_state(
     // the caller pre-computes the flag so the idempotency selector still sees
     // the real layer list even though ctx.custom_layers is empty.
     opaque_app_layers_override: Option<bool>,
+    // When true (SSG/ISG path), the `SecurityHeadersLayer` is NOT applied here:
+    // `try_build_router_with_static_inner` applies a single one OUTSIDE the
+    // static-first middleware (wrapping cached pages, dynamic misses, and the
+    // gate), so applying it here too would double-apply it (which breaks CSP
+    // nonces). In the fully-dynamic path this is `false` and the layer is
+    // applied as the outermost framework layer below, wrapping the gate.
+    defer_security_headers: bool,
 ) -> Result<axum::Router<AppState>, RouterBuildError> {
     // Verify registered API versions
     let versions = state.extension::<crate::app::RegisteredApiVersions>();
@@ -489,6 +499,7 @@ fn build_router_pre_state(
         ctx.static_gate_layers,
         ctx.error_page_renderer,
         ctx.session_store,
+        defer_security_headers,
     )?;
 
     if dev_reload_enabled {
@@ -1837,6 +1848,10 @@ fn apply_middleware(
     static_gate_layers: Vec<crate::app::CustomLayerRegistration>,
     error_page_renderer: Option<SharedRenderer>,
     session_store: Option<Arc<dyn crate::session::BoxedSessionStore>>,
+    // When true (SSG/ISG path), `SecurityHeadersLayer` is NOT applied here — the
+    // caller applies a single one outside the static-first middleware. See
+    // `build_router_pre_state`'s `defer_security_headers` parameter.
+    defer_security_headers: bool,
 ) -> Result<axum::Router<AppState>, RouterBuildError> {
     // 404 fallback handler for unmatched routes must be registered BEFORE global middleware
     // so that unmatched routes are still protected by rate limiting, CSRF, CORS, etc.
@@ -1981,7 +1996,12 @@ fn apply_middleware(
     ));
     let router = router.layer(crate::middleware::LogContextLayer::new(log_context_filter));
 
-    let router = router.layer(RequestIdLayer).layer(security_headers);
+    // `security_headers` is applied LATER as the framework's outermost layer
+    // (after the gate, below) so that a gate short-circuit (redirect/401) still
+    // carries HSTS/CSP/nosniff — see the application point after the gate loop.
+    // RequestId stays here (inner to session) so the request id seeds the
+    // session, logs, and trace context.
+    let router = router.layer(RequestIdLayer);
 
     let router = crate::session::apply_session_layer(
         router,
@@ -2031,14 +2051,17 @@ fn apply_middleware(
     // Error page context layer must be inner to the exception filter so
     // WantsHtml is set on the response before the filter inspects it.
     // Full ingress layer order (outermost -> innermost):
-    //   [static_gate layers — outermost, outside session and the static cache] ->
+    //   SecurityHeaders (framework outermost, so gate short-circuits carry
+    //   HSTS/CSP/nosniff; in SSG/ISG mode applied by
+    //   try_build_router_with_static_inner instead) ->
+    //   [static_gate layers — outside session and the static cache] ->
     //   TraceContext (applied outside the startup barrier so short-circuit
     //   responses still carry traceparent) ->
     //   Compression (outer to ExceptionFilter — see note below) ->
     //   [user layers, when SSG/ISG dist dir active] ->
     //   StaticFileMiddleware (when SSG/ISG enabled) ->
     //   Metrics -> ExceptionFilter -> ErrorPageContext -> Session ->
-    //   SecurityHeaders -> RequestId -> LogContext -> AccessLog-primary ->
+    //   RequestId -> LogContext -> AccessLog-primary ->
     //   [user layers, non-static build] ->
     //   Tenancy -> RateLimit -> CSRF -> CORS -> handler
     //   (An AccessLog fallback sits outermost, applied in apply_startup_barrier.)
@@ -2057,13 +2080,26 @@ fn apply_middleware(
     // ETags are still computed on the uncompressed body before encoding occurs.
     let router = apply_compression_middleware(router, config);
 
-    // Pre-static gate layers (AppBuilder::static_gate) are applied OUTERMOST —
-    // outside session, request-id, compression, and everything else — so they
-    // run before any cached static page would be served and behave identically
-    // in fully-dynamic and SSG/ISG modes. In SSG/ISG mode these are drained by
-    // `try_build_router_with_static_inner` and applied outside the static-first
-    // middleware instead, so this loop sees an empty list there.
+    // Pre-static gate layers (AppBuilder::static_gate) are applied outside
+    // session, request-id, compression, and everything else — so they run
+    // before any cached static page would be served and behave identically in
+    // fully-dynamic and SSG/ISG modes. They are inner only to the framework's
+    // outermost `SecurityHeadersLayer` (applied just below), so a gate
+    // short-circuit still carries security headers. In SSG/ISG mode these are
+    // drained by `try_build_router_with_static_inner` and applied outside the
+    // static-first middleware instead, so this loop sees an empty list there.
     let router = apply_layers_in_registration_order(router, static_gate_layers, "Pre-static gate");
+
+    // Security headers are the framework's OUTERMOST layer so they wrap the gate
+    // (and everything else), ensuring redirect/401 short-circuits carry
+    // HSTS/CSP/nosniff. Applied as a single layer to keep CSP nonces consistent.
+    // In SSG/ISG mode `try_build_router_with_static_inner` applies the single
+    // outer layer instead (see `defer_security_headers`).
+    let router = if defer_security_headers {
+        router
+    } else {
+        router.layer(security_headers)
+    };
 
     Ok(router)
 }
@@ -2314,7 +2350,11 @@ pub fn try_build_router_with_static_inner(
     // and defeat the gate for cached hits).
     let static_gate_layers = std::mem::take(&mut ctx.static_gate_layers);
 
-    let inner_router = build_router_pre_state(route_list, config, &state, ctx, opaque_present)?;
+    // SSG/ISG path: a single SecurityHeadersLayer is applied OUTSIDE the
+    // static-first middleware below (wrapping cached pages, dynamic misses, and
+    // the gate), so the inner router must NOT apply its own — hence `true`.
+    let inner_router =
+        build_router_pre_state(route_list, config, &state, ctx, opaque_present, true)?;
 
     // Attach the inner router for ISR background regeneration. Because user
     // layers are excluded, re-renders produce raw HTML (no compression, etc.)
@@ -2407,7 +2447,10 @@ pub fn try_build_router_with_static_inner(
     );
 
     // Security headers are applied OUTERMOST so they wrap both cached pages and
-    // any gate short-circuit response.
+    // any gate short-circuit response. This is the SINGLE application for the
+    // SSG/ISG path: the inner router skips it (build_router_pre_state is called
+    // with `defer_security_headers = true`), so dynamic misses are not
+    // double-wrapped (which would break CSP nonces).
     let router = router.layer(crate::security::SecurityHeadersLayer::from_config(
         &config.security.headers,
     ));
@@ -4934,7 +4977,7 @@ mod trusted_host_tests {
     }
 
     #[tokio::test]
-    async fn static_gate_redirect_carries_security_headers() {
+    async fn static_gate_redirect_carries_security_headers_ssg() {
         // A gate short-circuit (302) must still carry the framework security
         // headers — SecurityHeadersLayer wraps the gate in the SSG path.
         let (_tmp, dist) = build_cached_dist("<h1>cached</h1>");
@@ -4962,6 +5005,57 @@ mod trusted_host_tests {
                 .headers()
                 .get("x-content-type-options")
                 .expect("gate redirect must carry security headers"),
+            "nosniff"
+        );
+    }
+
+    #[tokio::test]
+    async fn static_gate_redirect_carries_security_headers_dynamic() {
+        // Same contract in fully-dynamic mode (no dist): SecurityHeadersLayer is
+        // the framework's outermost layer, so a gate short-circuit still carries
+        // HSTS/CSP/nosniff. Guards against the dynamic/SSG inconsistency.
+        async fn dynamic_handler() -> &'static str {
+            "dynamic"
+        }
+        let route = Route {
+            method: http::Method::GET,
+            path: "/",
+            handler: axum::routing::get(dynamic_handler),
+            name: "root",
+            api_doc: crate::openapi::ApiDoc {
+                method: "GET",
+                path: "/",
+                operation_id: "root",
+                success_status: 200,
+                ..Default::default()
+            },
+            repository: None,
+            idempotency: crate::route::RouteIdempotency::Direct,
+            api_version: None,
+            sunset_opt_out: false,
+        };
+        let config = AutumnConfig::default();
+        let ctx = ctx_with_static_gate(redirect_gate_registration());
+
+        let app = super::try_build_router_with_static_inner(
+            vec![route],
+            &config,
+            crate::state::AppState::for_test(),
+            None,
+            ctx,
+        )
+        .expect("router builds");
+
+        let unauthed = app
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(unauthed.status(), StatusCode::FOUND);
+        assert_eq!(
+            unauthed
+                .headers()
+                .get("x-content-type-options")
+                .expect("dynamic gate redirect must carry security headers"),
             "nosniff"
         );
     }
