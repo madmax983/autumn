@@ -436,11 +436,17 @@ pub fn applied_user_migrations(
         .applied_migrations()
         .map_err(|e| MigrationError::Migration(e.to_string()))?;
 
-    Ok(all_applied
+    // `applied_migrations()` returns versions in descending order, so sort the
+    // filtered result ascending (versions are zero-padded timestamps, making a
+    // lexicographic sort equivalent to chronological). Callers rely on ascending
+    // order to compute "newest-first" rollback plans via `.rev()`.
+    let mut applied: Vec<String> = all_applied
         .iter()
-        .map(|v| v.to_string())
+        .map(ToString::to_string)
         .filter(|v| known_user_versions.contains(v))
-        .collect())
+        .collect();
+    applied.sort();
+    Ok(applied)
 }
 
 /// Revert the user migrations identified by `versions` (expected newest-first)
@@ -487,9 +493,12 @@ where
 
     let result: Result<(), MigrationError> = (|| {
         for version in versions {
+            // Build a borrowed `MigrationVersion` once per version (no heap
+            // allocation) instead of allocating a `String` for every migration.
+            let target = diesel::migration::MigrationVersion::from(version.as_str());
             let migration = all_migrations
                 .iter()
-                .find(|m| m.name().version().to_string() == *version)
+                .find(|m| m.name().version() == target)
                 .ok_or_else(|| {
                     MigrationError::Migration(format!(
                         "migration version {version} not found in migrations directory"

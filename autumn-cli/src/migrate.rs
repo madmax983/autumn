@@ -76,7 +76,7 @@ pub struct MigrationSafetyReport {
 }
 
 /// Run the migrate command.
-pub fn run(action: MigrateAction, with_maintenance: bool) {
+pub fn run(action: &MigrateAction, with_maintenance: bool) {
     eprintln!("\u{1F342} autumn migrate\n");
 
     match action {
@@ -85,7 +85,7 @@ pub fn run(action: MigrateAction, with_maintenance: bool) {
             run_safety_check(&migrations_dir);
             return;
         }
-        MigrateAction::Down(ref args) => {
+        MigrateAction::Down(args) => {
             run_down(args);
             return;
         }
@@ -102,7 +102,7 @@ pub fn run(action: MigrateAction, with_maintenance: bool) {
     check_diesel_cli();
 
     // 4. Enable maintenance mode if requested
-    if with_maintenance && action == MigrateAction::Run {
+    if with_maintenance && *action == MigrateAction::Run {
         enable_maintenance_for_migrate();
     }
 
@@ -230,6 +230,20 @@ fn run_migrations_with_maintenance(
     }
 }
 
+/// Print the safety findings for one migration direction (`up.sql`/`down.sql`).
+fn print_findings(label: &str, name: &str, findings: &[safety::SafetyFinding]) {
+    if safety::is_safe(findings) {
+        eprintln!("  \u{2713} {name}  [{label}]");
+    } else {
+        eprintln!("  \u{2717} {name}  [{label}]");
+        for f in findings {
+            eprintln!("      \u{2022} {} [{}]", f.operation, f.risk);
+            eprintln!("        Why:  {}", f.why);
+            eprintln!("        Next: {}", f.next_action);
+        }
+    }
+}
+
 /// Run the migration safety preflight check against all SQL files in `migrations_dir`.
 ///
 /// Prints a human-readable report to stderr and exits with code 1 if any
@@ -250,19 +264,6 @@ fn run_safety_check(migrations_dir: &str) {
 
     let total = reports.len();
     eprintln!("  Scanning {total} migration(s) in {migrations_dir}/...\n");
-
-    fn print_findings(label: &str, name: &str, findings: &[safety::SafetyFinding]) {
-        if safety::is_safe(findings) {
-            eprintln!("  \u{2713} {name}  [{label}]");
-        } else {
-            eprintln!("  \u{2717} {name}  [{label}]");
-            for f in findings {
-                eprintln!("      \u{2022} {} [{}]", f.operation, f.risk);
-                eprintln!("        Why:  {}", f.why);
-                eprintln!("        Next: {}", f.next_action);
-            }
-        }
-    }
 
     for report in &reports {
         print_findings("up.sql", &report.name, &report.up);
@@ -320,7 +321,13 @@ pub fn check_migrations_in_dir(dir: &Path) -> Result<Vec<MigrationSafetyReport>,
         let down_findings = if down_sql_path.exists() {
             let down_sql = std::fs::read_to_string(&down_sql_path)
                 .map_err(|e| format!("cannot read {}: {e}", down_sql_path.display()))?;
-            safety::classify_sql(&down_sql)
+            let mut down_findings = safety::classify_sql(&down_sql);
+            check_concurrent_index_transaction_opt_out(
+                &down_sql,
+                &entry.path(),
+                &mut down_findings,
+            );
+            down_findings
         } else {
             Vec::new()
         };
@@ -513,17 +520,45 @@ fn is_production_profile() -> bool {
         .or_else(|_| std::env::var("AUTUMN_PROFILE"))
         .unwrap_or_default();
     let normalized = profile.trim().to_lowercase();
-    matches!(normalized.as_str(), "prod" | "production")
+    normalized == "prod" || normalized == "production"
 }
 
 /// Find the migration directory that starts with `version` inside `migrations_dir`.
 fn find_migration_dir(migrations_dir: &Path, version: &str) -> Option<std::path::PathBuf> {
     std::fs::read_dir(migrations_dir)
         .ok()?
-        .filter_map(|e| e.ok())
+        .filter_map(std::result::Result::ok)
         .filter(|e| e.path().is_dir())
-        .find(|e| e.file_name().to_string_lossy().starts_with(version))
+        .find(|e| {
+            e.file_name()
+                .to_str()
+                .is_some_and(|s| s.starts_with(version))
+        })
         .map(|e| e.path())
+}
+
+/// Build the newest-first list of user-migration versions to revert.
+///
+/// With `--to VERSION`, every applied version strictly newer than `VERSION` is
+/// reverted (exiting non-zero if `VERSION` is not currently applied). Otherwise
+/// the most recently applied `--steps N` (default 1) versions are reverted.
+fn build_rollback_plan(args: &DownArgs, applied: &[String]) -> Vec<String> {
+    let Some(target_version) = args.to.as_deref() else {
+        let n = args.steps.unwrap_or(1);
+        return applied.iter().rev().take(n).cloned().collect();
+    };
+
+    if !applied.iter().any(|v| v == target_version) {
+        eprintln!("\u{2717} Version {target_version} is not currently applied.");
+        eprintln!("  Check `autumn migrate status` to see the applied user migrations.");
+        std::process::exit(1);
+    }
+    applied
+        .iter()
+        .filter(|v| v.as_str() > target_version)
+        .rev()
+        .cloned()
+        .collect()
 }
 
 /// Run `autumn migrate down`.
@@ -553,22 +588,7 @@ fn run_down(args: &DownArgs) {
     };
 
     // 4. Build plan (newest-first)
-    let plan: Vec<String> = if let Some(ref target_version) = args.to {
-        if !applied.contains(target_version) {
-            eprintln!("\u{2717} Version {target_version} is not currently applied.");
-            eprintln!("  Check `autumn migrate status` to see the applied user migrations.");
-            std::process::exit(1);
-        }
-        applied
-            .iter()
-            .filter(|v| v.as_str() > target_version.as_str())
-            .rev()
-            .cloned()
-            .collect()
-    } else {
-        let n = args.steps.unwrap_or(1);
-        applied.iter().rev().take(n).cloned().collect()
-    };
+    let plan = build_rollback_plan(args, &applied);
 
     if plan.is_empty() {
         eprintln!("  \u{2713} Nothing to roll back.");
@@ -578,22 +598,22 @@ fn run_down(args: &DownArgs) {
     // 5. Preflight: every planned migration must have an executable down.sql
     let mut missing: Vec<String> = Vec::new();
     for version in &plan {
-        let has_down = find_migration_dir(dir, version)
-            .map(|mdir| {
-                std::fs::read_to_string(mdir.join("down.sql"))
-                    .ok()
-                    .is_some_and(|sql| safety::has_executable_sql(&sql))
-            })
-            .unwrap_or(false);
+        let mdir = find_migration_dir(dir, version);
+        let has_down = mdir.as_ref().is_some_and(|d| {
+            std::fs::read_to_string(d.join("down.sql"))
+                .ok()
+                .is_some_and(|sql| safety::has_executable_sql(&sql))
+        });
         if !has_down {
-            let display = find_migration_dir(dir, version)
-                .map(|d| {
+            let display = mdir.as_ref().map_or_else(
+                || version.clone(),
+                |d| {
                     d.file_name()
                         .unwrap_or_default()
                         .to_string_lossy()
                         .into_owned()
-                })
-                .unwrap_or_else(|| version.clone());
+                },
+            );
             missing.push(display);
         }
     }
@@ -652,10 +672,10 @@ fn show_rollback_availability(database_url: &str, migrations_dir: &str) {
     }
 
     for version in &applied {
-        let migration_dir = find_migration_dir(dir, version);
-        let (label, has_down) = migration_dir
-            .as_ref()
-            .map(|d| {
+        let version_dir = find_migration_dir(dir, version);
+        let (label, has_down) = version_dir.as_ref().map_or_else(
+            || (version.clone(), false),
+            |d| {
                 let name = d
                     .file_name()
                     .unwrap_or_default()
@@ -665,8 +685,8 @@ fn show_rollback_availability(database_url: &str, migrations_dir: &str) {
                     .ok()
                     .is_some_and(|sql| safety::has_executable_sql(&sql));
                 (name, has_down)
-            })
-            .unwrap_or_else(|| (version.clone(), false));
+            },
+        );
 
         if has_down {
             eprintln!("  \u{2713} {label}");

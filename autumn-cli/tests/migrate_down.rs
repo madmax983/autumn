@@ -4,16 +4,16 @@
 //! so they only run when explicitly requested with `-- --ignored`.
 //!
 //! Run with:
-//!   cargo test -p autumn-cli --test migrate_down -- --ignored --nocapture
+//!   cargo test -p autumn-cli --test `migrate_down` -- --ignored --nocapture
 
 use std::path::Path;
 use std::process::Command;
 
-fn autumn_bin() -> &'static str {
+const fn autumn_bin() -> &'static str {
     env!("CARGO_BIN_EXE_autumn")
 }
 
-/// Run the autumn binary with `args` and env overrides; return (stdout, stderr, exit_code).
+/// Run the autumn binary with `args` and env overrides; return (stdout, stderr, `exit_code`).
 fn run_autumn(dir: &Path, args: &[&str], envs: &[(&str, &str)]) -> (String, String, Option<i32>) {
     let output = Command::new(autumn_bin())
         .args(args)
@@ -33,8 +33,7 @@ fn run_autumn_ok(dir: &Path, args: &[&str], envs: &[(&str, &str)]) -> (String, S
     assert_eq!(
         code,
         Some(0),
-        "autumn {:?} failed (exit={code:?})\nstdout: {stdout}\nstderr: {stderr}",
-        args,
+        "autumn {args:?} failed (exit={code:?})\nstdout: {stdout}\nstderr: {stderr}",
     );
     (stdout, stderr)
 }
@@ -44,8 +43,7 @@ fn run_autumn_fail(dir: &Path, args: &[&str], envs: &[(&str, &str)]) -> (String,
     assert_ne!(
         code,
         Some(0),
-        "autumn {:?} should have failed but exited 0\nstdout: {stdout}\nstderr: {stderr}",
-        args,
+        "autumn {args:?} should have failed but exited 0\nstdout: {stdout}\nstderr: {stderr}",
     );
     (stdout, stderr)
 }

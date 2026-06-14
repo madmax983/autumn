@@ -1331,7 +1331,7 @@ fn run_command(command: Commands) {
                 }),
                 None => migrate::MigrateAction::Run,
             };
-            migrate::run(action, with_maintenance);
+            migrate::run(&action, with_maintenance);
         }
         Commands::Maintenance(cmd) => match cmd {
             MaintenanceCommands::On {
