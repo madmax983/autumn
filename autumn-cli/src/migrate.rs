@@ -516,8 +516,11 @@ where
 /// Reads `AUTUMN_ENV` (preferred) then `AUTUMN_PROFILE` (legacy alias),
 /// normalising case and whitespace — same rules as `autumn_web::config`.
 fn is_production_profile() -> bool {
-    let profile = std::env::var("AUTUMN_ENV")
-        .or_else(|_| std::env::var("AUTUMN_PROFILE"))
+    // Treat an empty/whitespace `AUTUMN_ENV` as absent (matching
+    // `autumn_web::config`) so the legacy `AUTUMN_PROFILE` is still consulted.
+    let read = |key: &str| std::env::var(key).ok().filter(|v| !v.trim().is_empty());
+    let profile = read("AUTUMN_ENV")
+        .or_else(|| read("AUTUMN_PROFILE"))
         .unwrap_or_default();
     let normalized = profile.trim().to_lowercase();
     normalized == "prod" || normalized == "production"
@@ -1010,6 +1013,21 @@ mod tests {
     fn is_production_profile_reads_autumn_profile_legacy() {
         temp_env::with_vars(
             [("AUTUMN_ENV", None), ("AUTUMN_PROFILE", Some("production"))],
+            || {
+                assert!(is_production_profile());
+            },
+        );
+    }
+
+    #[test]
+    fn is_production_profile_empty_autumn_env_falls_back_to_legacy() {
+        // An empty/whitespace AUTUMN_ENV must be treated as absent so the
+        // legacy AUTUMN_PROFILE still triggers the production guard.
+        temp_env::with_vars(
+            [
+                ("AUTUMN_ENV", Some("   ")),
+                ("AUTUMN_PROFILE", Some("prod")),
+            ],
             || {
                 assert!(is_production_profile());
             },
