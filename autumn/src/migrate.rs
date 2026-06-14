@@ -477,10 +477,10 @@ fn resolve_applied_user_migrations(
 /// Return the applied **user** migrations (ascending by version), excluding any
 /// framework-owned migrations, each resolved to its local directory.
 ///
-/// Framework migrations are excluded by version (see
-/// [`framework_migration_versions`]). An applied user migration that is no
-/// longer present locally is still returned, with [`AppliedUserMigration::dir`]
-/// set to `None`, so callers can surface it rather than silently dropping it.
+/// Framework migrations are excluded by version (the embedded
+/// `FRAMEWORK_MIGRATIONS` set). An applied user migration that is no longer
+/// present locally is still returned, with [`AppliedUserMigration::dir`] set to
+/// `None`, so callers can surface it rather than silently dropping it.
 ///
 /// This is a read-only listing for status display; it does **not** take the
 /// migration advisory lock. Use [`revert_user_migrations_locked`] to plan and
