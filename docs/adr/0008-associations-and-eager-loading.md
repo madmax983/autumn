@@ -132,10 +132,13 @@ exactly.
 
 ## Consequences
 
-- **New public API → minor version bump** (0.5 → 0.6): `Preloaded`,
-  `NotLoaded`, `preload` module, `impl_preloadable_leaf!`, generated
-  `{Model}Preload` / `{Model}Associations` types, and the repository
-  `preload` method. No existing `autumn-web` surface changes.
+- **New public API → ships in the next minor**: `Preloaded`, `NotLoaded`, the
+  `preload` module, `impl_preloadable_leaf!`, generated `{Model}Preload` /
+  `{Model}Associations` types, and the repository `preload` method are all
+  additive. They are recorded under `## [Unreleased]` in `CHANGELOG.md`; per
+  repo convention the workspace version is bumped (to the next minor) only when
+  a release is cut, and the SemVer gate enforces a minor bump for these new
+  public items. No existing `autumn-web` surface changes.
 - **Manual models as targets**: a hand-written model (e.g. `reddit-clone`'s
   `User`, kept manual so `password_hash` is never auto-serialized) that is the
   *target* of an association must implement `Preloadable`. The

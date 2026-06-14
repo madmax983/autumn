@@ -7,8 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.6.0] - 2026-06-14
-
 ### Added
 
 - **db:** Declarative associations and eager loading for `#[model]` / `#[repository]` (#835)
