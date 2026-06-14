@@ -692,8 +692,11 @@ where
         // Require an exact match or a path-segment boundary (trailing `/`) so
         // that exempting `/inbound/mailgun` does not accidentally exempt
         // `/inbound/mailgun-settings` or other adjacent routes.
+        let raw_path = req.uri().path();
+        let clean = crate::security::path::clean_path(raw_path);
+
         if self.settings.exempt_paths.iter().any(|ep| {
-            let path = req.uri().path();
+            let path = clean.as_str();
             let e = ep.as_str();
             path == e
                 || path.starts_with(e)

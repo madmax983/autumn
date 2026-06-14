@@ -1,36 +1,25 @@
-use autumn_web::security::CsrfConfig;
-use autumn_web::security::CsrfLayer;
-use axum::{
-    Router,
-    body::Body,
-    http::{Request, StatusCode},
-    routing::post,
-};
+use autumn_web::security::{CsrfConfig, CsrfLayer};
+use axum::{Router, extract::Request, routing::post};
 use tower::ServiceExt;
 
 #[tokio::test]
-async fn eris_csrf_path_traversal_bypass() {
-    let config = CsrfConfig {
-        enabled: true,
-        exempt_paths: vec!["/api/".to_string()],
-        ..Default::default()
-    };
-
+async fn eris_csrf_path_traversal_poc() {
     let app = Router::new()
-        .route("/submit", post(|| async { "created" }))
-        .route("/api/items", post(|| async { "created" }))
-        .layer(CsrfLayer::from_config(&config));
+        .route("/protected", post(|| async { "changed" }))
+        .layer(CsrfLayer::from_config(&CsrfConfig {
+            enabled: true,
+            exempt_paths: vec!["/api/".to_string()],
+            ..Default::default()
+        }));
 
-    let malicious_req = Request::builder()
+    let req = Request::builder()
         .method("POST")
-        .uri("/api/../submit")
-        .body(Body::empty())
+        .uri("/api/../protected")
+        .body(axum::body::Body::empty())
         .unwrap();
 
-    let response = app.clone().oneshot(malicious_req).await.unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
 
-    // Axum routes strictly based on exact URI match and does not resolve '..'.
-    // Therefore, the request to /api/../submit safely falls through to a 404
-    // instead of executing the /submit handler, averting the CSRF bypass entirely.
-    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    // The clean_path fix prevents the CSRF bypass, so the request is rejected by CSRF
+    assert_eq!(res.status(), axum::http::StatusCode::FORBIDDEN);
 }
