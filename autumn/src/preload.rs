@@ -133,6 +133,20 @@ impl std::fmt::Debug for Associations {
 /// inherent methods are available directly (`post.title`, `post.id`).
 /// Generated association accessor traits — for example `PostAssociations` with
 /// `author()` and `comments()` — are implemented for `Preloaded<Post>`.
+///
+/// ```rust
+/// use autumn_web::preload::Preloaded;
+///
+/// #[derive(Debug)]
+/// struct Post { id: i64, title: String }
+///
+/// let post = Preloaded::new(Post { id: 1, title: "hi".into() });
+/// // Deref: the record's own fields are reachable.
+/// assert_eq!(post.id, 1);
+/// assert_eq!(post.title, "hi");
+/// // Nothing has been preloaded yet, so the association store is empty.
+/// assert!(post.associations().is_empty());
+/// ```
 #[derive(Debug)]
 pub struct Preloaded<T> {
     inner: T,

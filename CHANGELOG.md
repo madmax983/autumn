@@ -9,6 +9,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **db:** Declarative associations and eager loading for `#[model]` / `#[repository]` (#835)
+  - `#[model]` accepts struct-level `#[belongs_to(Target, fk = ...)]`,
+    `#[has_many(Target, fk = ...)]`, and `#[has_one(Target, fk = ...)]`.
+    Foreign keys are inferred by convention (`belongs_to` → `{target}_id` on
+    this model; `has_many`/`has_one` → `{source}_id` on the target) and
+    overridable with `fk = …`. The schema and association set live in one
+    place — no per-pair `Related` impl.
+  - Codegen emits a `{Model}Preload` spec builder (`Model::preload()`), a
+    `{Model}Associations` accessor trait implemented for `Preloaded<Model>`,
+    and a `Preloadable` impl that issues the batched queries.
+  - `#[repository]` gains `preload(records, spec)` returning
+    `Vec<Preloaded<Model>>`. It issues **at most one** `WHERE ... IN (...)`
+    statement per association per level (`belongs_to`/`has_one` keyed on the
+    parent/target id; `has_many` grouped client-side), with **no** per-row
+    fetches and **no** implicit lazy loading. Nested paths are supported, e.g.
+    `Post::preload().author().comments_with(Comment::preload().author())`.
+  - New `autumn_web::preload` module: `Preloaded<T>` (derefs to the record),
+    the type-erased `Associations` store, the typed `NotLoaded` accessor error
+    (accessing an un-preloaded association is an error, never SQL), the
+    `Preloadable` trait, and the `impl_preloadable_leaf!` macro for
+    hand-written association targets.
+  - Preload SQL runs on the **same read role** as the parent finder (the
+    repository's snapshotted `ReadRoute`); `on_primary()` pins the whole chain.
+    With `CursorPage`, preloads execute **after** the overfetch/truncate.
+  - `examples/reddit-clone` migrated: the front page and single-post view drop
+    their hand-written joins / per-row author lookups for `preload`. See
+    `docs/adr/0008-associations-and-eager-loading.md`.
 - **auth:** Active session management with device list and revocation in the auth starter (#819)
   - `autumn generate auth` now persists a `{user}_sessions` row per login
     (SHA-256 digest of the opaque session id — never the raw id — plus user id,
