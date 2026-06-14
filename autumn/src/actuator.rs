@@ -2326,11 +2326,10 @@ pub(crate) async fn routes_endpoint<S: ProvideActuatorState + Send + Sync + 'sta
     State(state): State<S>,
 ) -> impl IntoResponse {
     let routes = state.registered_routes();
-    if let Some(r) = routes {
-        Json(r.0.clone()).into_response()
-    } else {
-        Json(Vec::<crate::route_listing::RouteInfo>::new()).into_response()
-    }
+    routes.map_or_else(
+        || Json(Vec::<crate::route_listing::RouteInfo>::new()).into_response(),
+        |r| Json(r.0.clone()).into_response(),
+    )
 }
 
 /// `GET <actuator-prefix>/loggers` -- view current log levels.
@@ -3136,9 +3135,29 @@ mod tests {
         channels: crate::channels::Channels,
         #[cfg(feature = "ws")]
         shutdown: tokio_util::sync::CancellationToken,
+        extensions: axum::extract::Extension<axum::http::Extensions>,
+    }
+
+    impl TestActuatorState {
+        fn insert_extension<T: Clone + Send + Sync + 'static>(&mut self, val: T) {
+            self.extensions.0.insert(val);
+        }
     }
 
     impl ProvideActuatorState for TestActuatorState {
+        fn registered_routes(&self) -> Option<std::sync::Arc<crate::app::RegisteredRoutes>> {
+            self.extensions
+                .0
+                .get::<crate::app::RegisteredRoutes>()
+                .cloned()
+                .map(std::sync::Arc::new)
+        }
+
+        #[cfg(feature = "ws")]
+        fn channels(&self) -> &crate::channels::Channels {
+            &self.channels
+        }
+
         fn metrics(&self) -> &crate::middleware::MetricsCollector {
             &self.metrics
         }
@@ -3176,10 +3195,6 @@ mod tests {
         ) -> Option<&diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>>
         {
             self.pool.as_ref()
-        }
-        #[cfg(feature = "ws")]
-        fn channels(&self) -> &crate::channels::Channels {
-            &self.channels
         }
         #[cfg(feature = "ws")]
         fn shutdown_token(&self) -> tokio_util::sync::CancellationToken {
@@ -3221,6 +3236,7 @@ mod tests {
             channels: crate::channels::Channels::new(32),
             #[cfg(feature = "ws")]
             shutdown: tokio_util::sync::CancellationToken::new(),
+            extensions: axum::extract::Extension(axum::http::Extensions::new()),
         }
     }
 
@@ -4414,7 +4430,7 @@ mod tests {
 
     #[tokio::test]
     async fn actuator_routes_returns_json_list() {
-        let state = test_state();
+        let mut state = test_state();
         state.insert_extension(crate::app::RegisteredRoutes(vec![
             crate::route_listing::RouteInfo {
                 method: "GET".to_owned(),
@@ -4451,12 +4467,13 @@ mod tests {
         assert_eq!(routes[0].handler, "test_handler");
     }
 
+    #[cfg(feature = "ws")]
     #[tokio::test]
     async fn actuator_channels_returns_metrics() {
         let state = test_state();
-        let mut rx = state.channels().subscribe("feed");
+        let mut rx = state.channels.subscribe("feed");
         state
-            .channels()
+            .channels
             .broadcast()
             .publish("feed", "hello")
             .expect("publish should succeed");
