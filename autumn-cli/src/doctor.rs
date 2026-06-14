@@ -407,6 +407,62 @@ pub fn check_oauth2_provider_impl(
     }
 }
 
+/// Check that List-Unsubscribe is wired when any `#[mailer]` declares
+/// `list_unsubscribe` (pure, injectable for tests).
+///
+/// - No `list_unsubscribe` usage → pass (the feature is opt-in).
+/// - Usage with a base URL or mailto configured → pass.
+/// - Usage with neither configured → **fail** in production (Gmail/Yahoo will
+///   reject the bulk mail) and **warn** outside production so
+///   `autumn doctor --strict` still surfaces it before deploy.
+pub fn check_mail_unsubscribe_config_impl(
+    has_list_unsubscribe_usage: bool,
+    base_url: Option<&str>,
+    mailto: Option<&str>,
+    is_production: bool,
+) -> CheckResult {
+    let configured = base_url.is_some_and(|s| !s.trim().is_empty())
+        || mailto.is_some_and(|s| !s.trim().is_empty());
+
+    if !has_list_unsubscribe_usage {
+        return CheckResult {
+            name: "mail_unsubscribe",
+            status: CheckStatus::Pass,
+            detail: Some("no #[mailer] declares list_unsubscribe".into()),
+            hint: None,
+        };
+    }
+    if configured {
+        return CheckResult {
+            name: "mail_unsubscribe",
+            status: CheckStatus::Pass,
+            detail: Some("list_unsubscribe is wired (unsubscribe URL/mailto configured)".into()),
+            hint: None,
+        };
+    }
+    let detail = Some(
+        "a #[mailer] declares list_unsubscribe but neither mail.unsubscribe_base_url \
+         nor mail.unsubscribe_mailto is configured"
+            .into(),
+    );
+    let hint = Some("Set mail.unsubscribe_base_url (e.g. https://app.example.com) or mail.unsubscribe_mailto so RFC 8058 List-Unsubscribe headers can be emitted");
+    if is_production {
+        CheckResult {
+            name: "mail_unsubscribe",
+            status: CheckStatus::Fail,
+            detail,
+            hint,
+        }
+    } else {
+        CheckResult {
+            name: "mail_unsubscribe",
+            status: CheckStatus::Warn,
+            detail,
+            hint,
+        }
+    }
+}
+
 // ─── Pure helper functions (fully unit-testable) ──────────────────────────────
 
 pub const fn glyph(status: &CheckStatus) -> &'static str {
@@ -1418,6 +1474,46 @@ where
         .unwrap_or_default()
 }
 
+/// Detect whether any Rust source under `src/` declares
+/// `#[mailer(list_unsubscribe = "...")]`.
+fn detect_list_unsubscribe_usage() -> bool {
+    fn scan(dir: &std::path::Path) -> bool {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return false;
+        };
+        for entry in entries.filter_map(Result::ok) {
+            let path = entry.path();
+            if path.is_dir() {
+                if scan(&path) {
+                    return true;
+                }
+            } else if path.extension().and_then(|e| e.to_str()) == Some("rs")
+                && std::fs::read_to_string(&path)
+                    .is_ok_and(|content| content.contains("list_unsubscribe"))
+            {
+                return true;
+            }
+        }
+        false
+    }
+    scan(std::path::Path::new("src"))
+}
+
+/// Resolve `[mail]` unsubscribe destinations from the merged toml table.
+fn resolve_mail_unsubscribe(table: Option<&toml::Table>) -> (Option<String>, Option<String>) {
+    let mail = table
+        .and_then(|t| t.get("mail"))
+        .and_then(toml::Value::as_table);
+    let read = |key: &str| {
+        mail.and_then(|m| m.get(key))
+            .and_then(toml::Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(std::borrow::ToOwned::to_owned)
+    };
+    (read("unsubscribe_base_url"), read("unsubscribe_mailto"))
+}
+
 fn resolve_database_topology(table: Option<&toml::Table>) -> DoctorDatabaseTopology {
     resolve_database_topology_from_sources(
         |key| std::env::var(key).ok().filter(|value| !value.is_empty()),
@@ -1895,6 +1991,19 @@ pub fn run(opts: DoctorOptions) {
         }));
     }
 
+    // 9b. List-Unsubscribe wiring: fail closed in prod when a #[mailer] declares
+    // list_unsubscribe but no unsubscribe destination is configured.
+    let (unsub_base_url, unsub_mailto) = resolve_mail_unsubscribe(toml_table.as_ref());
+    let has_list_unsubscribe_usage = detect_list_unsubscribe_usage();
+    tasks.push(Box::new(move || {
+        check_mail_unsubscribe_config_impl(
+            has_list_unsubscribe_usage,
+            unsub_base_url.as_deref(),
+            unsub_mailto.as_deref(),
+            is_production,
+        )
+    }));
+
     // 10. Stale artifacts (warn only, never fail)
     tasks.push(Box::new(check_stale_artifacts));
 
@@ -2344,6 +2453,39 @@ pub fn check_gdpr_export_registration_impl(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── mail_unsubscribe check ─────────────────────────────────────────────────
+
+    #[test]
+    fn mail_unsubscribe_no_usage_passes() {
+        let r = check_mail_unsubscribe_config_impl(false, None, None, true);
+        assert_eq!(r.status, CheckStatus::Pass);
+    }
+
+    #[test]
+    fn mail_unsubscribe_usage_without_config_fails_in_prod() {
+        let r = check_mail_unsubscribe_config_impl(true, None, None, true);
+        assert_eq!(r.status, CheckStatus::Fail);
+        assert!(r.detail.unwrap().contains("list_unsubscribe"));
+    }
+
+    #[test]
+    fn mail_unsubscribe_usage_without_config_warns_outside_prod() {
+        let r = check_mail_unsubscribe_config_impl(true, None, Some("   "), false);
+        assert_eq!(r.status, CheckStatus::Warn);
+    }
+
+    #[test]
+    fn mail_unsubscribe_usage_with_base_url_passes() {
+        let r = check_mail_unsubscribe_config_impl(true, Some("https://app.example.com"), None, true);
+        assert_eq!(r.status, CheckStatus::Pass);
+    }
+
+    #[test]
+    fn mail_unsubscribe_usage_with_mailto_passes() {
+        let r = check_mail_unsubscribe_config_impl(true, None, Some("unsub@example.com"), true);
+        assert_eq!(r.status, CheckStatus::Pass);
+    }
 
     // ── glyph ────────────────────────────────────────────────────────────────
 

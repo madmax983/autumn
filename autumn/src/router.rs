@@ -419,6 +419,14 @@ fn build_router_pre_state(
     let idempotency_layers = build_idempotency_layers(config, state)?;
     let opaque_app_layers_present = opaque_app_layers_override
         .unwrap_or_else(|| custom_layers_require_fail_closed_idempotency(&ctx.custom_layers));
+    // Detect an app-provided override for the default unsubscribe endpoint before
+    // `route_list` is consumed by route mounting.
+    #[cfg(feature = "mail")]
+    let user_has_unsubscribe_route = route_list
+        .iter()
+        .any(|route| route.path == crate::mail::UNSUBSCRIBE_PATH);
+    #[cfg(not(feature = "mail"))]
+    let user_has_unsubscribe_route = false;
     let mut router = group_and_mount_routes(
         route_list,
         idempotency_layers.as_ref(),
@@ -428,7 +436,12 @@ fn build_router_pre_state(
 
     let dev_reload_enabled = dev::is_enabled_with_env(&crate::config::OsEnv);
 
-    router = mount_framework_routes(router, config, dev_reload_enabled);
+    router = mount_framework_routes(
+        router,
+        config,
+        dev_reload_enabled,
+        user_has_unsubscribe_route,
+    );
 
     let (mounted_probe_paths, router_with_probes) = mount_probe_endpoints(router, config);
     router = router_with_probes;
@@ -1205,6 +1218,7 @@ fn mount_framework_routes(
     mut router: axum::Router<AppState>,
     config: &AutumnConfig,
     dev_reload_enabled: bool,
+    #[cfg_attr(not(feature = "mail"), allow(unused_variables))] user_has_unsubscribe_route: bool,
 ) -> axum::Router<AppState> {
     #[cfg(not(feature = "mail"))]
     let _ = config;
@@ -1268,6 +1282,17 @@ fn mount_framework_routes(
         tracing::debug!(
             path = crate::mail::MAIL_PREVIEW_PATH,
             "Mounted dev mail preview endpoints"
+        );
+    }
+
+    // RFC 8058 one-click unsubscribe endpoint. Skipped when the app registers
+    // its own route at the path (the documented override hook).
+    #[cfg(feature = "mail")]
+    if config.mail.unsubscribe_endpoint_enabled() && !user_has_unsubscribe_route {
+        router = router.merge(crate::mail::unsubscribe_router());
+        tracing::debug!(
+            path = crate::mail::UNSUBSCRIBE_PATH,
+            "Mounted default unsubscribe endpoint"
         );
     }
 

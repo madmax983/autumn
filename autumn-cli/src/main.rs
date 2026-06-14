@@ -1028,6 +1028,14 @@ enum GenerateCommands {
     Mailer {
         /// Mailer name (`PascalCase` or `snake_case`, e.g. `Welcome`).
         name: String,
+        /// Opt into RFC 8058 one-click List-Unsubscribe for the given logical
+        /// list / suppression scope (e.g. `weekly_digest`). Scaffolds the
+        /// `#[mailer(list_unsubscribe = "...")]` attribute and a
+        /// `mail_unsubscribes` suppression migration. Use only for bulk mail
+        /// (newsletters, digests, drip campaigns) — never for password resets,
+        /// MFA codes, or security alerts.
+        #[arg(long, value_name = "SCOPE")]
+        list_unsubscribe: Option<String>,
         /// Print the file plan and exit without writing anything.
         #[arg(long)]
         dry_run: bool,
@@ -1796,9 +1804,14 @@ fn run_generate_command(cmd: GenerateCommands) {
         } => generate::task::run(&name, generate::Flags { dry_run, force }),
         GenerateCommands::Mailer {
             name,
+            list_unsubscribe,
             dry_run,
             force,
-        } => generate::mailer::run(&name, generate::Flags { dry_run, force }),
+        } => generate::mailer::run(
+            &name,
+            list_unsubscribe.as_deref(),
+            generate::Flags { dry_run, force },
+        ),
         GenerateCommands::InboundMail {
             name,
             dry_run,
@@ -3303,6 +3316,7 @@ mod tests {
             name,
             dry_run,
             force,
+            ..
         }) = cli.command
         else {
             panic!("expected generate mailer");

@@ -2,7 +2,10 @@
 
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
-use syn::{FnArg, GenericParam, ImplItem, ImplItemFn, ItemImpl, Pat, ReturnType, Type};
+use syn::{
+    Expr, ExprLit, FnArg, GenericParam, ImplItem, ImplItemFn, ItemImpl, Lit, MetaNameValue, Pat,
+    ReturnType, Type,
+};
 
 struct MailMethod {
     method: syn::Ident,
@@ -95,7 +98,54 @@ fn parse_mail_method(method: &ImplItemFn) -> syn::Result<Option<MailMethod>> {
     }))
 }
 
-pub fn mailer_macro(_attr: TokenStream, item: TokenStream) -> TokenStream {
+/// Parse the optional `list_unsubscribe = "scope"` attribute argument.
+fn parse_list_unsubscribe(attr: TokenStream) -> syn::Result<Option<String>> {
+    if attr.is_empty() {
+        return Ok(None);
+    }
+    let meta: MetaNameValue = syn::parse2(attr)?;
+    if !meta.path.is_ident("list_unsubscribe") {
+        return Err(syn::Error::new_spanned(
+            &meta.path,
+            "unknown #[mailer] argument; expected `list_unsubscribe = \"...\"`",
+        ));
+    }
+    let Expr::Lit(ExprLit {
+        lit: Lit::Str(value),
+        ..
+    }) = &meta.value
+    else {
+        return Err(syn::Error::new_spanned(
+            &meta.value,
+            "list_unsubscribe must be a string literal, e.g. list_unsubscribe = \"weekly_digest\"",
+        ));
+    };
+    let scope = value.value();
+    if scope.trim().is_empty() {
+        return Err(syn::Error::new_spanned(
+            value,
+            "list_unsubscribe scope must not be empty",
+        ));
+    }
+    Ok(Some(scope))
+}
+
+/// Best-effort label for a mailer `Self` type, used for inventory registration.
+fn self_ty_label(self_ty: &Type) -> String {
+    if let Type::Path(type_path) = self_ty {
+        if let Some(segment) = type_path.path.segments.last() {
+            return segment.ident.to_string();
+        }
+    }
+    quote!(#self_ty).to_string()
+}
+
+pub fn mailer_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let list_unsubscribe = match parse_list_unsubscribe(attr) {
+        Ok(scope) => scope,
+        Err(err) => return err.to_compile_error(),
+    };
+
     let input_impl: ItemImpl = match syn::parse2(item) {
         Ok(item) => item,
         Err(err) => return err.to_compile_error(),
@@ -160,6 +210,28 @@ pub fn mailer_macro(_attr: TokenStream, item: TokenStream) -> TokenStream {
         let arg_defs_later = method.args.iter().map(|(name, ty)| quote! { #name: #ty });
         let arg_names = method.args.iter().map(|(name, _)| quote! { #name });
         let arg_names_later = method.args.iter().map(|(name, _)| quote! { #name });
+        // When the mailer opts into list_unsubscribe, tag every built message
+        // with the scope so the runtime emits RFC 8058 headers and applies
+        // suppression at send time.
+        let (bind_send, bind_later) = if let Some(scope) = &list_unsubscribe {
+            (
+                quote! {
+                    let mut mail = self.#original #method_generic_call ( #( #arg_names, )* );
+                    mail.list_unsubscribe =
+                        ::core::option::Option::Some(::std::string::String::from(#scope));
+                },
+                quote! {
+                    let mut mail = self.#original #method_generic_call ( #( #arg_names_later, )* );
+                    mail.list_unsubscribe =
+                        ::core::option::Option::Some(::std::string::String::from(#scope));
+                },
+            )
+        } else {
+            (
+                quote! { let mail = self.#original #method_generic_call ( #( #arg_names, )* ); },
+                quote! { let mail = self.#original #method_generic_call ( #( #arg_names_later, )* ); },
+            )
+        };
         quote! {
             #( #cfg_attrs )*
             #vis async fn #send_method #method_generic_decl (
@@ -169,7 +241,7 @@ pub fn mailer_macro(_attr: TokenStream, item: TokenStream) -> TokenStream {
             ) -> ::autumn_web::AutumnResult<()>
             #method_where_clause
             {
-                let mail = self.#original #method_generic_call ( #( #arg_names, )* );
+                #bind_send
                 #helper_mailer_arg
                     .send(mail)
                     .await
@@ -184,11 +256,28 @@ pub fn mailer_macro(_attr: TokenStream, item: TokenStream) -> TokenStream {
             )
             #method_where_clause
             {
-                let mail = self.#original #method_generic_call ( #( #arg_names_later, )* );
+                #bind_later
                 #helper_mailer_arg.deliver_later(mail);
             }
         }
     });
+
+    // Register the list_unsubscribe declaration so production startup and
+    // `autumn doctor` can fail closed when no unsubscribe destination is set.
+    let registration = if let Some(scope) = &list_unsubscribe {
+        let mailer_label = self_ty_label(&self_ty);
+        quote! {
+            #( #impl_cfg_attrs )*
+            ::autumn_web::reexports::inventory::submit! {
+                ::autumn_web::mail::MailerListUnsubscribeDescriptor {
+                    mailer: #mailer_label,
+                    scope: #scope,
+                }
+            }
+        }
+    } else {
+        quote! {}
+    };
 
     quote! {
         #input_impl
@@ -197,6 +286,8 @@ pub fn mailer_macro(_attr: TokenStream, item: TokenStream) -> TokenStream {
         impl #impl_generics #self_ty #where_clause {
             #( #generated )*
         }
+
+        #registration
     }
 }
 
@@ -442,6 +533,69 @@ mod tests {
         );
         let rendered = out.to_string();
         assert!(rendered.contains("template methods must use an `&self` receiver"));
+    }
+
+    #[test]
+    fn list_unsubscribe_tags_messages_and_registers_descriptor() {
+        let out = mailer_macro(
+            quote! { list_unsubscribe = "weekly_digest" },
+            quote! {
+                impl DigestMailer {
+                    fn digest(&self, to: String) -> Mail {
+                        panic!("template body is irrelevant to macro rendering test")
+                    }
+                }
+            },
+        );
+        let rendered = out.to_string();
+        assert!(
+            rendered.contains("mail . list_unsubscribe ="),
+            "send/later helpers must tag the message with the list scope: {rendered}"
+        );
+        assert!(rendered.contains("\"weekly_digest\""));
+        assert!(
+            rendered.contains("MailerListUnsubscribeDescriptor"),
+            "must register an inventory descriptor: {rendered}"
+        );
+        assert!(rendered.contains("inventory :: submit"));
+        assert!(rendered.contains("mailer : \"DigestMailer\""));
+    }
+
+    #[test]
+    fn without_list_unsubscribe_emits_no_scope_or_registration() {
+        let out = mailer_macro(
+            TokenStream::new(),
+            quote! {
+                impl PlainMailer {
+                    fn ping(&self, to: String) -> Mail {
+                        panic!("template body is irrelevant to macro rendering test")
+                    }
+                }
+            },
+        );
+        let rendered = out.to_string();
+        assert!(
+            !rendered.contains("list_unsubscribe"),
+            "opt-out mailers must not reference list_unsubscribe at all: {rendered}"
+        );
+        assert!(!rendered.contains("MailerListUnsubscribeDescriptor"));
+        // Existing codegen unchanged: still binds an immutable `mail`.
+        assert!(rendered.contains("let mail = self . ping"));
+    }
+
+    #[test]
+    fn rejects_unknown_mailer_argument() {
+        let out = mailer_macro(
+            quote! { bogus = "x" },
+            quote! {
+                impl PlainMailer {
+                    fn ping(&self, to: String) -> Mail {
+                        panic!("template body is irrelevant to macro rendering test")
+                    }
+                }
+            },
+        );
+        assert!(out.to_string().contains("unknown #[mailer] argument"));
     }
 
     #[test]
