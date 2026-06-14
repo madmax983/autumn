@@ -525,6 +525,77 @@ fn validate_cookie_token_hmac(cookie_token: &str, settings: &CsrfSettings) -> bo
     keys.verify(uuid_part.as_bytes(), sig)
 }
 
+/// Extract the `boundary` parameter from a `multipart/form-data` Content-Type value.
+fn extract_multipart_boundary(content_type: &str) -> Option<&str> {
+    content_type.split(';').find_map(|part| {
+        part.trim()
+            .strip_prefix("boundary=")
+            .map(|b| b.trim_matches('"'))
+    })
+}
+
+/// Return the byte position of the first occurrence of `needle` in `haystack`.
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() {
+        return Some(0);
+    }
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+/// Scan a buffered `multipart/form-data` body for a named text field.
+///
+/// Returns the field value as a `&str` slice into `bytes`, or `None` when the
+/// field is absent or the body is malformed / truncated.  Callers pre-limit the
+/// buffer via `max_scan_bytes` so we never allocate more than that.
+fn scan_multipart_field<'a>(bytes: &'a [u8], boundary: &str, field_name: &str) -> Option<&'a str> {
+    let delimiter = format!("--{boundary}");
+    let delim = delimiter.as_bytes();
+    let end_marker = format!("\r\n{delimiter}");
+    let end_bytes = end_marker.as_bytes();
+    let mut pos = 0;
+
+    loop {
+        let rel = find_bytes(&bytes[pos..], delim)?;
+        pos += rel + delim.len();
+
+        // After the boundary: \r\n begins a part; anything else ends the multipart.
+        match bytes.get(pos..pos + 2) {
+            Some(b"\r\n") => pos += 2,
+            _ => break, // final boundary (--), truncated, or malformed
+        }
+
+        let header_end = find_bytes(&bytes[pos..], b"\r\n\r\n")?;
+        let headers = std::str::from_utf8(&bytes[pos..pos + header_end]).ok()?;
+        let value_start = pos + header_end + 4;
+
+        let is_match = headers.lines().any(|line| {
+            if !line
+                .to_ascii_lowercase()
+                .starts_with("content-disposition:")
+            {
+                return false;
+            }
+            line.split(';').skip(1).any(|attr| {
+                attr.trim()
+                    .strip_prefix("name=")
+                    .map(|v| v.trim_matches('"'))
+                    == Some(field_name)
+            })
+        });
+
+        if is_match {
+            let end = find_bytes(&bytes[value_start..], end_bytes)
+                .map_or(bytes.len(), |i| value_start + i);
+            return std::str::from_utf8(&bytes[value_start..end]).ok();
+        }
+
+        let next = find_bytes(&bytes[value_start..], end_bytes)?;
+        pos = value_start + next + end_bytes.len();
+    }
+
+    None
+}
+
 async fn verify_csrf_token(
     req: &mut Request<axum::body::Body>,
     settings: &CsrfSettings,
@@ -578,7 +649,15 @@ async fn verify_csrf_token(
         .and_then(|v| v.to_str().ok())
         .unwrap_or_default();
 
-    if !content_type.starts_with("application/x-www-form-urlencoded") {
+    let is_urlencoded = content_type.starts_with("application/x-www-form-urlencoded");
+    let multipart_boundary = if content_type.starts_with("multipart/form-data") {
+        extract_multipart_boundary(content_type).map(str::to_owned)
+    } else {
+        None
+    };
+    // NLL: content_type borrow ends here; req.body_mut() is safe to call below.
+
+    if !is_urlencoded && multipart_boundary.is_none() {
         return false;
     }
 
@@ -590,21 +669,35 @@ async fn verify_csrf_token(
         .await
         .unwrap_or_else(|_| axum::body::Bytes::new());
 
-    for (key, value) in url::form_urlencoded::parse(&bytes) {
-        if key == settings.form_field {
+    if is_urlencoded {
+        for (key, value) in url::form_urlencoded::parse(&bytes) {
+            if key == settings.form_field {
+                if let Some(c) = cookie_token
+                    && !c.is_empty()
+                    && !value.is_empty()
+                    && validate_cookie_token_hmac(c, settings)
+                    && constant_time_eq(c, value.as_ref())
+                {
+                    token_found = true;
+                }
+                break;
+            }
+        }
+    } else if let Some(ref boundary) = multipart_boundary {
+        #[allow(clippy::collapsible_if)]
+        if let Some(value) = scan_multipart_field(&bytes, boundary, &settings.form_field) {
             if let Some(c) = cookie_token
                 && !c.is_empty()
                 && !value.is_empty()
                 && validate_cookie_token_hmac(c, settings)
-                && constant_time_eq(c, value.as_ref())
+                && constant_time_eq(c, value)
             {
                 token_found = true;
             }
-            break;
         }
     }
 
-    // Restore request body
+    // Restore request body so downstream handlers (e.g. Multipart extractor) can read it.
     *req.body_mut() = axum::body::Body::from(bytes);
 
     token_found
@@ -1371,5 +1464,136 @@ mod tests {
             StatusCode::OK,
             "previous-key-signed CSRF token must pass during grace window"
         );
+    }
+
+    fn multipart_body(boundary: &str, fields: &[(&str, &str)]) -> String {
+        let mut body = String::new();
+        for (name, value) in fields {
+            body.push_str(&format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n"
+            ));
+        }
+        body.push_str(&format!("--{boundary}--\r\n"));
+        body
+    }
+
+    #[tokio::test]
+    async fn post_multipart_with_csrf_field_passes() {
+        let token = "test-csrf-token-uuid-1234";
+        let boundary = "----WebKitFormBoundaryABC123";
+        let body = multipart_body(boundary, &[("_csrf", token), ("name", "alice")]);
+        let app = Router::new()
+            .route("/upload", post(|| async { "ok" }))
+            .layer(CsrfLayer::from_config(&default_csrf_config()));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/upload")
+                    .header("Cookie", format!("autumn-csrf={token}"))
+                    .header(
+                        "Content-Type",
+                        format!("multipart/form-data; boundary={boundary}"),
+                    )
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn post_multipart_csrf_field_first_with_file_passes() {
+        let token = "test-csrf-token-uuid-5678";
+        let boundary = "----WebKitFormBoundaryDEF456";
+        // _csrf first, then binary file field
+        let mut body = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"_csrf\"\r\n\r\n{token}\r\n"
+        );
+        body.push_str(&format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"avatar\"; filename=\"photo.jpg\"\r\nContent-Type: image/jpeg\r\n\r\nFAKEJPEGDATA\r\n"
+        ));
+        body.push_str(&format!("--{boundary}--\r\n"));
+
+        let app = Router::new()
+            .route("/upload", post(|| async { "ok" }))
+            .layer(CsrfLayer::from_config(&default_csrf_config()));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/upload")
+                    .header("Cookie", format!("autumn-csrf={token}"))
+                    .header(
+                        "Content-Type",
+                        format!("multipart/form-data; boundary={boundary}"),
+                    )
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn post_multipart_without_csrf_field_rejected() {
+        let boundary = "----WebKitFormBoundaryGHI789";
+        let body = multipart_body(boundary, &[("file", "fakebytes")]);
+        let app = Router::new()
+            .route("/upload", post(|| async { "ok" }))
+            .layer(CsrfLayer::from_config(&default_csrf_config()));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/upload")
+                    .header("Cookie", "autumn-csrf=sometoken")
+                    .header(http::header::ACCEPT, "text/html")
+                    .header(
+                        "Content-Type",
+                        format!("multipart/form-data; boundary={boundary}"),
+                    )
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn post_multipart_with_wrong_csrf_token_rejected() {
+        let boundary = "----WebKitFormBoundaryJKL012";
+        let body = multipart_body(boundary, &[("_csrf", "wrong-token")]);
+        let app = Router::new()
+            .route("/upload", post(|| async { "ok" }))
+            .layer(CsrfLayer::from_config(&default_csrf_config()));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/upload")
+                    .header("Cookie", "autumn-csrf=correct-token")
+                    .header(http::header::ACCEPT, "text/html")
+                    .header(
+                        "Content-Type",
+                        format!("multipart/form-data; boundary={boundary}"),
+                    )
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
 }

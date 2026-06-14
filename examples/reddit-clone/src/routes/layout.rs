@@ -19,6 +19,66 @@ pub fn hx_redirect_to(url: &str) -> Response {
     response
 }
 
+/// Render the nav auth content — the final settled state, no htmx triggers.
+///
+/// Used by the `/_partials/nav-auth` endpoint so its response doesn't
+/// re-trigger another fetch (which would create an infinite loop).
+pub fn nav_auth_content(username: Option<&str>) -> Markup {
+    html! {
+        div class="flex items-center gap-3 text-sm" {
+            @if let Some(name) = username {
+                span class="text-gray-600" { "u/" (name) }
+                a href="/submit"
+                  class="px-3 py-1.5 bg-orange-500 text-white rounded hover:bg-orange-600" {
+                    "New Post"
+                }
+                // Logout uses the meta CSRF tag via the autumn-csrf.js script.
+                button
+                    hx-post="/logout"
+                    aria-label="Log out"
+                    class="text-gray-500 hover:text-orange-600 cursor-pointer" {
+                    "Log out"
+                }
+            } @else {
+                a href="/login" class="text-gray-600 hover:text-orange-600" { "Log in" }
+                a href="/register"
+                  class="px-3 py-1.5 bg-orange-500 text-white rounded hover:bg-orange-600" {
+                    "Sign up"
+                }
+            }
+        }
+    }
+}
+
+/// Render the nav auth slot for use inside a full page layout.
+///
+/// When `username` is `Some` (dynamic pages — session is known at render time),
+/// returns the content directly with no extra request.
+///
+/// When `None` (anonymous users on dynamic pages OR any static pre-rendered
+/// page), wraps the anonymous buttons in an htmx one-shot hydration shell.
+/// The shell fires a single `GET /_partials/nav-auth` on page load and swaps
+/// itself out with `nav_auth_content` — which has no htmx trigger, so the
+/// loop stops after one round-trip.
+pub fn nav_auth_markup(username: Option<&str>) -> Markup {
+    if username.is_some() {
+        nav_auth_content(username)
+    } else {
+        html! {
+            div class="flex items-center gap-3 text-sm"
+                hx-get="/_partials/nav-auth"
+                hx-trigger="load"
+                hx-swap="outerHTML" {
+                a href="/login" class="text-gray-600 hover:text-orange-600" { "Log in" }
+                a href="/register"
+                  class="px-3 py-1.5 bg-orange-500 text-white rounded hover:bg-orange-600" {
+                    "Sign up"
+                }
+            }
+        }
+    }
+}
+
 /// Base HTML layout wrapping page content.
 ///
 /// Accepts an optional `username` to show login/logout state in the nav.
@@ -75,27 +135,7 @@ pub fn layout(
                                     a href="/actuator/health" class="text-gray-500 hover:text-orange-600" { "Health" }
                                 }
                             }
-                            div class="flex items-center gap-3 text-sm" {
-                                @if let Some(name) = username {
-                                    span class="text-gray-600" { "u/" (name) }
-                                    a href="/submit"
-                                      class="px-3 py-1.5 bg-orange-500 text-white rounded hover:bg-orange-600" {
-                                        "New Post"
-                                    }
-                                    button
-                                        hx-post="/logout"
-                                        aria-label="Log out"
-                                        class="text-gray-500 hover:text-orange-600 cursor-pointer" {
-                                        "Log out"
-                                    }
-                                } @else {
-                                    a href="/login" class="text-gray-600 hover:text-orange-600" { "Log in" }
-                                    a href="/register"
-                                      class="px-3 py-1.5 bg-orange-500 text-white rounded hover:bg-orange-600" {
-                                        "Sign up"
-                                    }
-                                }
-                            }
+                            (nav_auth_markup(username))
                         }
                     }
                 }

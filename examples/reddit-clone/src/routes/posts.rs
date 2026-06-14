@@ -5,6 +5,7 @@
 //! Maud templates with Tailwind CSS, and feature-flag fragment gating
 //! via the `Flags` extractor.
 
+use autumn_web::experiments::Experiments;
 use autumn_web::extract::Path;
 use autumn_web::extract::State;
 use autumn_web::feature_flags::Flags;
@@ -49,8 +50,14 @@ pub async fn front_page(
     csrf: CsrfToken,
     mut db: Db,
     flags: Flags,
+    exps: Experiments,
 ) -> AutumnResult<Markup> {
     let current_user = session.get("username").await;
+
+    // A/B experiment: compact list (control) vs. card layout (treatment).
+    // The Experiments extractor resolves the actor from the session automatically
+    // (logged-in users → user_id; anonymous → stable per-session key).
+    let compact_layout = exps.assign("feed_layout").unwrap_or_default() == "compact";
 
     let hot_posts: Vec<PostSummary> = posts::table
         .inner_join(users::table.on(posts::author_id.eq(users::id)))
@@ -96,28 +103,31 @@ pub async fn front_page(
                 }
             }
 
-            // Post list
-            div class="space-y-2" {
-                @for (post_id, title, post_slug, score, comment_count, author, sub_name, sub_slug, created_at) in &hot_posts {
-                    div class="bg-white rounded-lg shadow-sm border border-gray-200 \
-                               hover:border-orange-300 transition-colors" {
-                        div class="flex items-start gap-3 p-4" {
-                            (vote_controls(*post_id, *score))
+            // Post list — layout variant determined by the feed_layout A/B experiment.
+            // compact (control): dense rows, no card shadow, more posts above the fold.
+            // card   (treatment): current card layout with borders and vote controls.
+            @if compact_layout {
+                div class="divide-y divide-gray-100" {
+                    @for (_post_id, title, post_slug, score, comment_count, author, sub_name, sub_slug, created_at) in &hot_posts {
+                        div class="flex items-center gap-3 py-2 px-2 hover:bg-gray-50 transition-colors" {
+                            span class="text-sm font-semibold text-gray-500 w-8 text-right shrink-0" {
+                                (score)
+                            }
                             div class="flex-1 min-w-0" {
                                 a href=(paths::show(sub_slug, post_slug))
-                                   class="text-lg font-medium text-gray-900 hover:text-orange-600 \
-                                          line-clamp-2" {
+                                   class="text-sm font-medium text-gray-900 hover:text-orange-600 \
+                                          line-clamp-1" {
                                     (title)
                                 }
-                                div class="text-xs text-gray-400 mt-1" {
+                                div class="text-xs text-gray-400" {
                                     a href=(super::subreddits::__autumn_path_show(sub_slug))
-                                       class="font-medium text-gray-600 hover:underline" {
+                                       class="text-gray-500 hover:underline" {
                                         "r/" (sub_name)
                                     }
-                                    " \u{2022} posted by "
+                                    " \u{2022} "
                                     a href=(super::auth::__autumn_path_profile(author))
                                        class="text-gray-500 hover:underline" { "u/" (author) }
-                                    " " (time_ago(created_at))
+                                    " \u{2022} " (time_ago(created_at))
                                     " \u{2022} "
                                     a href=(paths::show(sub_slug, post_slug))
                                        class="text-gray-500 hover:text-orange-600" {
@@ -127,16 +137,52 @@ pub async fn front_page(
                             }
                         }
                     }
+                    @if hot_posts.is_empty() {
+                        p class="text-gray-400 text-center py-8 text-sm" { "Nothing here yet!" }
+                    }
                 }
-                @if hot_posts.is_empty() {
-                    div class="text-center py-16" {
-                        p class="text-gray-400 text-lg mb-4" { "Nothing here yet!" }
-                        p class="text-gray-400 text-sm" {
-                            "Be the first to "
-                            a href="/r" class="text-orange-600 hover:underline" {
-                                "join a community"
+            } @else {
+                div class="space-y-2" {
+                    @for (post_id, title, post_slug, score, comment_count, author, sub_name, sub_slug, created_at) in &hot_posts {
+                        div class="bg-white rounded-lg shadow-sm border border-gray-200 \
+                                   hover:border-orange-300 transition-colors" {
+                            div class="flex items-start gap-3 p-4" {
+                                (vote_controls(*post_id, *score))
+                                div class="flex-1 min-w-0" {
+                                    a href=(paths::show(sub_slug, post_slug))
+                                       class="text-lg font-medium text-gray-900 hover:text-orange-600 \
+                                              line-clamp-2" {
+                                        (title)
+                                    }
+                                    div class="text-xs text-gray-400 mt-1" {
+                                        a href=(super::subreddits::__autumn_path_show(sub_slug))
+                                           class="font-medium text-gray-600 hover:underline" {
+                                            "r/" (sub_name)
+                                        }
+                                        " \u{2022} posted by "
+                                        a href=(super::auth::__autumn_path_profile(author))
+                                           class="text-gray-500 hover:underline" { "u/" (author) }
+                                        " " (time_ago(created_at))
+                                        " \u{2022} "
+                                        a href=(paths::show(sub_slug, post_slug))
+                                           class="text-gray-500 hover:text-orange-600" {
+                                            (comment_count) " comments"
+                                        }
+                                    }
+                                }
                             }
-                            " and post something."
+                        }
+                    }
+                    @if hot_posts.is_empty() {
+                        div class="text-center py-16" {
+                            p class="text-gray-400 text-lg mb-4" { "Nothing here yet!" }
+                            p class="text-gray-400 text-sm" {
+                                "Be the first to "
+                                a href="/r" class="text-orange-600 hover:underline" {
+                                    "join a community"
+                                }
+                                " and post something."
+                            }
                         }
                     }
                 }
