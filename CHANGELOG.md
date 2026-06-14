@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-06-14
+
 ### Added
 
 - **db:** Declarative associations and eager loading for `#[model]` / `#[repository]` (#835)
@@ -14,8 +16,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `#[has_many(Target, fk = ...)]`, and `#[has_one(Target, fk = ...)]`.
     Foreign keys are inferred by convention (`belongs_to` → `{target}_id` on
     this model; `has_many`/`has_one` → `{source}_id` on the target) and
-    overridable with `fk = …`. The schema and association set live in one
-    place — no per-pair `Related` impl.
+    overridable with `fk = …`. The accessor/store name is derived by
+    convention and overridable with `name = …`, so multiple associations can
+    target the same model (e.g. `authored` / `approved` both → `Post`) without
+    colliding. The schema and association set live in one place — no per-pair
+    `Related` impl.
   - Codegen emits a `{Model}Preload` spec builder (`Model::preload()`), a
     `{Model}Associations` accessor trait implemented for `Preloaded<Model>`,
     and a `Preloadable` impl that issues the batched queries.

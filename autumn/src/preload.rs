@@ -13,11 +13,13 @@
 //! * [`Preloaded<T>`] wraps a record and carries its loaded associations. It
 //!   derefs to `T`, so field access (`post.title`) keeps working; generated
 //!   accessor traits add `post.author()` / `post.comments()`.
-//! * [`Associations`] is the type-erased store behind a [`Preloaded`].
+//! * [`Associations`](crate::preload::Associations) is the type-erased store
+//!   behind a [`Preloaded`].
 //! * [`NotLoaded`] is returned by an accessor when its association was not part
 //!   of the preload set.
-//! * [`Preloadable`] (db-only) is implemented by `#[model]` for each record
-//!   type and drives the batched loading, including nested preload paths.
+//! * [`Preloadable`](crate::preload::Preloadable) (db-only) is implemented by
+//!   `#[model]` for each record type and drives the batched loading, including
+//!   nested preload paths.
 //!
 //! See `docs/adr/0008-associations-and-eager-loading.md` for the design
 //! rationale, including how preload interacts with the primary/replica

@@ -7965,21 +7965,38 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             ///     for comment in post.comments()? { /* ... */ }
             /// }
             /// ```
-            pub async fn preload(
+            // Generic over the record + spec types so the `Preloadable` bound
+            // rests on a *generic* parameter, not the concrete model. A bound
+            // on a concrete type that has no `Preloadable` impl is rejected
+            // eagerly; a bound on a generic type parameter is only checked at
+            // call sites. This keeps the method available on repositories whose
+            // model is hand-written (not via `#[model]`, e.g. zero-column test
+            // models) — they simply never call `preload`. In normal use the
+            // record type is inferred from the finder result, i.e. this
+            // repository's model.
+            pub async fn preload<__Model, __Spec>(
                 &self,
-                records: ::std::vec::Vec<#model_name>,
-                spec: <#model_name as ::autumn_web::preload::Preloadable>::Spec,
+                records: ::std::vec::Vec<__Model>,
+                spec: __Spec,
             ) -> ::autumn_web::AutumnResult<
-                ::std::vec::Vec<::autumn_web::preload::Preloaded<#model_name>>
-            > {
+                ::std::vec::Vec<::autumn_web::preload::Preloaded<__Model>>
+            >
+            where
+                __Model: ::autumn_web::preload::Preloadable<Spec = __Spec>,
+                __Spec: ::core::marker::Send,
+            {
+                // Nothing to preload: skip acquiring a connection entirely.
+                if records.is_empty() {
+                    return ::core::result::Result::Ok(::std::vec::Vec::new());
+                }
                 let mut conn = self.__autumn_acquire_read_conn().await?;
                 let mut wrapped: ::std::vec::Vec<
-                    ::autumn_web::preload::Preloaded<#model_name>
+                    ::autumn_web::preload::Preloaded<__Model>
                 > = records
                     .into_iter()
                     .map(::autumn_web::preload::Preloaded::new)
                     .collect();
-                <#model_name as ::autumn_web::preload::Preloadable>::load_associations(
+                <__Model as ::autumn_web::preload::Preloadable>::load_associations(
                     &mut wrapped, &spec, &mut *conn,
                 ).await?;
                 ::core::result::Result::Ok(wrapped)

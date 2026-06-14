@@ -103,7 +103,13 @@ fn resolve_fk_and_name(
     }
 }
 
-/// Parse a single association attribute body, e.g. `User, fk = author_id`.
+/// Parse a single association attribute body, e.g.
+/// `User, fk = author_id` or `Post, fk = author_id, name = authored_posts`.
+///
+/// `name = …` overrides the derived accessor/store name, so multiple
+/// associations can target the same model without colliding (e.g.
+/// `#[has_many(Post, fk = author_id, name = authored)]` plus
+/// `#[has_many(Post, fk = approver_id, name = approved)]`).
 fn parse_assoc_attr(
     attr: &syn::Attribute,
     kind: AssocKind,
@@ -111,33 +117,39 @@ fn parse_assoc_attr(
 ) -> syn::Result<Association> {
     use syn::parse::ParseStream;
 
-    let (target, explicit_fk) = attr.parse_args_with(|input: ParseStream| {
+    let (target, explicit_fk, explicit_name) = attr.parse_args_with(|input: ParseStream| {
         let target: syn::Ident = input.parse()?;
         let mut explicit_fk: Option<String> = None;
-        if input.peek(syn::Token![,]) {
+        let mut explicit_name: Option<String> = None;
+        // Zero or more trailing `, key = value` pairs (`fk`, `name`), any order.
+        while input.peek(syn::Token![,]) {
             input.parse::<syn::Token![,]>()?;
             let key: syn::Ident = input.parse()?;
-            if key != "fk" {
-                return Err(syn::Error::new_spanned(
-                    &key,
-                    "expected `fk = <column>` in association attribute",
-                ));
-            }
             input.parse::<syn::Token![=]>()?;
             // Accept either a bare identifier (`fk = author_id`) or a string
             // literal (`fk = "author_id"`).
-            if input.peek(LitStr) {
-                let lit: LitStr = input.parse()?;
-                explicit_fk = Some(lit.value());
+            let value = if input.peek(LitStr) {
+                input.parse::<LitStr>()?.value()
             } else {
-                let ident: syn::Ident = input.parse()?;
-                explicit_fk = Some(ident.to_string());
+                input.parse::<syn::Ident>()?.to_string()
+            };
+            if key == "fk" {
+                explicit_fk = Some(value);
+            } else if key == "name" {
+                explicit_name = Some(value);
+            } else {
+                return Err(syn::Error::new_spanned(
+                    &key,
+                    "expected `fk = <column>` or `name = <accessor>` in association attribute",
+                ));
             }
         }
-        Ok((target, explicit_fk))
+        Ok((target, explicit_fk, explicit_name))
     })?;
 
-    let (fk, name) = resolve_fk_and_name(kind, model_ident, &target, explicit_fk.as_deref());
+    let (fk, derived_name) =
+        resolve_fk_and_name(kind, model_ident, &target, explicit_fk.as_deref());
+    let name = explicit_name.unwrap_or(derived_name);
     Ok(Association {
         kind,
         target,
@@ -437,6 +449,11 @@ fn emit_association_items(
                     };
                     #[allow(unused_imports)]
                     use ::autumn_web::reexports::diesel_async::RunQueryDsl as _;
+                    // No parents => nothing to key any `WHERE ... IN (...)` on.
+                    // Return before issuing any (empty) association queries.
+                    if records.is_empty() {
+                        return ::core::result::Result::Ok(());
+                    }
                     let _ = (&records, &spec, &conn, #table_ident::table);
                     #(#loader_blocks)*
                     ::core::result::Result::Ok(())
@@ -2933,6 +2950,22 @@ mod tests {
         let attrs: Vec<syn::Attribute> =
             vec![syn::parse_quote!(#[belongs_to(User, bogus = author_id)])];
         assert!(resolve_associations(&model, &attrs).is_err());
+    }
+
+    #[test]
+    fn name_override_disambiguates_same_target() {
+        // Two has_many to the same target, distinguished by `name =`.
+        let model: syn::Ident = syn::parse_quote!(User);
+        let attrs: Vec<syn::Attribute> = vec![
+            syn::parse_quote!(#[has_many(Post, fk = author_id, name = authored)]),
+            syn::parse_quote!(#[has_many(Post, fk = approver_id, name = approved)]),
+        ];
+        let assocs = resolve_associations(&model, &attrs).expect("parse ok");
+        assert_eq!(assocs.len(), 2);
+        assert_eq!(assocs[0].fk, "author_id");
+        assert_eq!(assocs[0].name, "authored");
+        assert_eq!(assocs[1].fk, "approver_id");
+        assert_eq!(assocs[1].name, "approved");
     }
 
     #[test]

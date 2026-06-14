@@ -142,6 +142,19 @@ exactly.
   `autumn_web::impl_preloadable_leaf!(User)` macro provides a one-line leaf
   impl (loads nothing of its own, so it can be wrapped/preloaded but not
   nested into).
+- **Disambiguating associations**: multiple associations to the same target
+  are supported via `name = …` (e.g. `#[has_many(Post, fk = author_id, name =
+  authored)]` and `#[has_many(Post, fk = approver_id, name = approved)]`),
+  which overrides the derived accessor/store name.
+- **No per-association filtering / soft-delete awareness (follow-up)**: a
+  preload loads *all* matching rows of an association keyed only on the foreign
+  key. It does **not** apply the target's `#[repository(..., soft_delete)]`
+  `deleted_at IS NULL` predicate, because the source model's macro expansion
+  cannot see the target model's columns/config. So a `has_many` preload can
+  surface soft-deleted children that the target's own finders hide, and there
+  is no scoped/filtered preload (e.g. "only top-level comments"). Callers that
+  need either must filter client-side after preloading or keep a hand-written
+  scoped query. Soft-delete-aware and filtered preloads are a follow-up.
 - **Scope / limitations** (deliberately out of scope for this slice):
   polymorphic associations, `has_and_belongs_to_many` / join tables,
   write-side cascades, cross-database/shard preloading, and ORM-style implicit

@@ -51,6 +51,9 @@ pub async fn front_page(
         .select(Post::as_select())
         .load(&mut *db)
         .await?;
+    // Release the base-query connection before `preload` checks one out, so the
+    // two never contend on a single-connection pool.
+    drop(db);
     let hot_posts = repo
         .preload(hot_posts, Post::preload().author().subreddit())
         .await?;
@@ -423,6 +426,9 @@ pub async fn show(
         .await
         .map_err(|_| AutumnError::not_found_msg("Post not found"))?;
 
+    // Release the base-query connection before `preload` checks one out.
+    drop(db);
+
     // Eager-load the post's author and its comments (each with their author),
     // replacing the per-row author lookup + hand-written comment/author join.
     // For a post with N comments this is a fixed 2 extra queries (post.author,
@@ -444,7 +450,7 @@ pub async fn show(
         .iter()
         .filter(|c| c.parent_id.is_none())
         .collect();
-    post_comments.sort_by(|a, b| b.score.cmp(&a.score));
+    post_comments.sort_by_key(|c| std::cmp::Reverse(c.score));
 
     let is_author = current_user_id
         .as_ref()
