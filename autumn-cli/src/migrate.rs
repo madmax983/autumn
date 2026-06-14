@@ -1,17 +1,32 @@
-//! `autumn migrate` -- run or inspect Diesel database migrations.
+//! `autumn migrate` -- run, inspect, or roll back Diesel database migrations.
 //!
-//! Because the CLI cannot embed the user's application-specific migrations
-//! (they live in the user's crate via `embed_migrations!`), this module
-//! delegates to the `diesel` CLI tool. It reads the primary/write database URL
-//! from `autumn.toml` + environment variables, then shells out to
-//! `diesel migration run` or `diesel migration pending`.
+//! # Subcommands
 //!
-//! Framework-owned migrations that must be runnable in production are applied
-//! through Autumn's embedded migration harness.
+//! | Subcommand | Description |
+//! |---|---|
+//! | *(default)* | Apply all pending user + framework migrations |
+//! | `status` | Show applied/pending status per migration plus rollback availability |
+//! | `check` | Classify every `up.sql` and `down.sql` for rolling-deploy safety |
+//! | `down` | Revert the most recently applied user migration(s) via `down.sql` |
 //!
-//! The user's application binary is the canonical way to run embedded
-//! migrations (via `.migrations()` on `AppBuilder`). This CLI command
-//! is a convenience wrapper for explicit migration management.
+//! # User vs framework migrations
+//!
+//! **User migrations** live in `./migrations/` and are executed via the
+//! `diesel` CLI (`diesel migration run`) or the Rust harness (for `down`).
+//!
+//! **Framework migrations** are embedded in the `autumn` crate and applied
+//! through the Rust `MigrationHarness`. They are **forward-only**: `autumn
+//! migrate down` never reverts them. Their forward-only contract is preserved
+//! regardless of which user migrations are rolled back.
+//!
+//! # Database URL resolution
+//!
+//! Precedence (highest to lowest):
+//! 1. `AUTUMN_DATABASE__PRIMARY_URL` env var
+//! 2. `AUTUMN_DATABASE__URL` env var
+//! 3. `DATABASE_URL` env var
+//! 4. `database.primary_url` in `autumn.toml`
+//! 5. `database.url` in `autumn.toml`
 
 pub mod safety;
 
@@ -25,8 +40,19 @@ use autumn_web::migrate::{
 /// Default directory containing Diesel migration files.
 const DEFAULT_MIGRATIONS_DIR: &str = "migrations";
 
+/// Arguments for `autumn migrate down`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DownArgs {
+    /// Revert this many migrations (default: 1). Mutually exclusive with `to`.
+    pub steps: Option<usize>,
+    /// Revert until this version is the latest applied. Mutually exclusive with `steps`.
+    pub to: Option<String>,
+    /// Required when targeting the production profile.
+    pub yes_i_mean_prod: bool,
+}
+
 /// Subcommands for `autumn migrate`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MigrateAction {
     /// Run all pending migrations.
     Run,
@@ -35,16 +61,35 @@ pub enum MigrateAction {
     /// Preflight safety check — classifies all migration SQL files and returns
     /// a non-zero exit code if any unsafe or unclassified operations are found.
     Check,
+    /// Revert the most recently applied user migration(s).
+    Down(DownArgs),
+}
+
+/// Per-migration safety report returned by [`check_migrations_in_dir`].
+pub struct MigrationSafetyReport {
+    /// Migration directory name (e.g. `"20260101000000_create_posts"`).
+    pub name: String,
+    /// Findings for `up.sql`.
+    pub up: Vec<safety::SafetyFinding>,
+    /// Findings for `down.sql` (empty when `down.sql` is absent or empty).
+    pub down: Vec<safety::SafetyFinding>,
 }
 
 /// Run the migrate command.
 pub fn run(action: MigrateAction, with_maintenance: bool) {
     eprintln!("\u{1F342} autumn migrate\n");
 
-    if action == MigrateAction::Check {
-        let migrations_dir = resolve_migrations_dir();
-        run_safety_check(&migrations_dir);
-        return;
+    match action {
+        MigrateAction::Check => {
+            let migrations_dir = resolve_migrations_dir();
+            run_safety_check(&migrations_dir);
+            return;
+        }
+        MigrateAction::Down(ref args) => {
+            run_down(args);
+            return;
+        }
+        _ => {}
     }
 
     // 1. Resolve database URL from autumn.toml + env
@@ -68,9 +113,10 @@ pub fn run(action: MigrateAction, with_maintenance: bool) {
         }
         MigrateAction::Status => {
             show_status(&database_url, &migrations_dir);
+            show_rollback_availability(&database_url, &migrations_dir);
             show_framework_status(&database_url);
         }
-        MigrateAction::Check => unreachable!("handled above"),
+        MigrateAction::Check | MigrateAction::Down(_) => unreachable!("handled above"),
     }
 }
 
@@ -187,7 +233,7 @@ fn run_migrations_with_maintenance(
 /// Run the migration safety preflight check against all SQL files in `migrations_dir`.
 ///
 /// Prints a human-readable report to stderr and exits with code 1 if any
-/// unsafe or potentially-blocking operations are detected.
+/// unsafe or potentially-blocking operations are detected in either direction.
 fn run_safety_check(migrations_dir: &str) {
     let reports = match check_migrations_in_dir(Path::new(migrations_dir)) {
         Ok(r) => r,
@@ -205,11 +251,11 @@ fn run_safety_check(migrations_dir: &str) {
     let total = reports.len();
     eprintln!("  Scanning {total} migration(s) in {migrations_dir}/...\n");
 
-    for (name, findings) in &reports {
+    fn print_findings(label: &str, name: &str, findings: &[safety::SafetyFinding]) {
         if safety::is_safe(findings) {
-            eprintln!("  \u{2713} {name}  [safe]");
+            eprintln!("  \u{2713} {name}  [{label}]");
         } else {
-            eprintln!("  \u{2717} {name}");
+            eprintln!("  \u{2717} {name}  [{label}]");
             for f in findings {
                 eprintln!("      \u{2022} {} [{}]", f.operation, f.risk);
                 eprintln!("        Why:  {}", f.why);
@@ -218,9 +264,16 @@ fn run_safety_check(migrations_dir: &str) {
         }
     }
 
+    for report in &reports {
+        print_findings("up.sql", &report.name, &report.up);
+        if !report.down.is_empty() {
+            print_findings("down.sql", &report.name, &report.down);
+        }
+    }
+
     let any_unsafe = reports
         .iter()
-        .any(|(_, findings)| safety::has_unsafe_findings(findings));
+        .any(|r| safety::has_unsafe_findings(&r.up) || safety::has_unsafe_findings(&r.down));
 
     eprintln!();
     if any_unsafe {
@@ -236,13 +289,12 @@ fn run_safety_check(migrations_dir: &str) {
     }
 }
 
-/// Read every migration directory in `dir`, classify its `up.sql`, and return
-/// a sorted list of `(migration_name, findings)` pairs.
+/// Read every migration directory in `dir`, classify both `up.sql` and
+/// `down.sql`, and return a sorted list of [`MigrationSafetyReport`]s.
 ///
 /// Migration directories that have no `up.sql` are silently skipped.
-pub fn check_migrations_in_dir(
-    dir: &Path,
-) -> Result<Vec<(String, Vec<safety::SafetyFinding>)>, String> {
+/// `down.sql` is optional — its findings are empty when the file is absent.
+pub fn check_migrations_in_dir(dir: &Path) -> Result<Vec<MigrationSafetyReport>, String> {
     let mut entries: Vec<_> = std::fs::read_dir(dir)
         .map_err(|e| format!("cannot read {}: {e}", dir.display()))?
         .filter_map(std::result::Result::ok)
@@ -259,11 +311,25 @@ pub fn check_migrations_in_dir(
         if !up_sql_path.exists() {
             continue;
         }
-        let sql = std::fs::read_to_string(&up_sql_path)
+        let up_sql = std::fs::read_to_string(&up_sql_path)
             .map_err(|e| format!("cannot read {}: {e}", up_sql_path.display()))?;
-        let mut findings = safety::classify_sql(&sql);
-        check_concurrent_index_transaction_opt_out(&sql, &entry.path(), &mut findings);
-        results.push((migration_name, findings));
+        let mut up_findings = safety::classify_sql(&up_sql);
+        check_concurrent_index_transaction_opt_out(&up_sql, &entry.path(), &mut up_findings);
+
+        let down_sql_path = entry.path().join("down.sql");
+        let down_findings = if down_sql_path.exists() {
+            let down_sql = std::fs::read_to_string(&down_sql_path)
+                .map_err(|e| format!("cannot read {}: {e}", down_sql_path.display()))?;
+            safety::classify_sql(&down_sql)
+        } else {
+            Vec::new()
+        };
+
+        results.push(MigrationSafetyReport {
+            name: migration_name,
+            up: up_findings,
+            down: down_findings,
+        });
     }
 
     Ok(results)
@@ -438,6 +504,179 @@ where
     run_pending(database_url, FRAMEWORK_MIGRATIONS)
 }
 
+/// True iff the active profile is `prod` or `production`.
+///
+/// Reads `AUTUMN_ENV` (preferred) then `AUTUMN_PROFILE` (legacy alias),
+/// normalising case and whitespace — same rules as `autumn_web::config`.
+fn is_production_profile() -> bool {
+    let profile = std::env::var("AUTUMN_ENV")
+        .or_else(|_| std::env::var("AUTUMN_PROFILE"))
+        .unwrap_or_default();
+    let normalized = profile.trim().to_lowercase();
+    matches!(normalized.as_str(), "prod" | "production")
+}
+
+/// Find the migration directory that starts with `version` inside `migrations_dir`.
+fn find_migration_dir(migrations_dir: &Path, version: &str) -> Option<std::path::PathBuf> {
+    std::fs::read_dir(migrations_dir)
+        .ok()?
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().is_dir())
+        .find(|e| e.file_name().to_string_lossy().starts_with(version))
+        .map(|e| e.path())
+}
+
+/// Run `autumn migrate down`.
+fn run_down(args: &DownArgs) {
+    use autumn_web::migrate::{applied_user_migrations, revert_user_migrations};
+
+    // 1. Production guard
+    if is_production_profile() && !args.yes_i_mean_prod {
+        eprintln!("\u{2717} Production profile detected.");
+        eprintln!("  Rolling back migrations in production requires explicit confirmation.");
+        eprintln!("  Re-run with --yes-i-mean-prod to proceed.");
+        std::process::exit(1);
+    }
+
+    // 2. Resolve DB URL + migrations dir
+    let database_url = resolve_database_url();
+    let migrations_dir = resolve_migrations_dir();
+    let dir = Path::new(&migrations_dir);
+
+    // 3. Get applied user migrations (ascending order)
+    let applied = match applied_user_migrations(&database_url, dir) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("\u{2717} Failed to list applied user migrations: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    // 4. Build plan (newest-first)
+    let plan: Vec<String> = if let Some(ref target_version) = args.to {
+        if !applied.contains(target_version) {
+            eprintln!("\u{2717} Version {target_version} is not currently applied.");
+            eprintln!("  Check `autumn migrate status` to see the applied user migrations.");
+            std::process::exit(1);
+        }
+        applied
+            .iter()
+            .filter(|v| v.as_str() > target_version.as_str())
+            .rev()
+            .cloned()
+            .collect()
+    } else {
+        let n = args.steps.unwrap_or(1);
+        applied.iter().rev().take(n).cloned().collect()
+    };
+
+    if plan.is_empty() {
+        eprintln!("  \u{2713} Nothing to roll back.");
+        return;
+    }
+
+    // 5. Preflight: every planned migration must have an executable down.sql
+    let mut missing: Vec<String> = Vec::new();
+    for version in &plan {
+        let has_down = find_migration_dir(dir, version)
+            .map(|mdir| {
+                std::fs::read_to_string(mdir.join("down.sql"))
+                    .ok()
+                    .is_some_and(|sql| safety::has_executable_sql(&sql))
+            })
+            .unwrap_or(false);
+        if !has_down {
+            let display = find_migration_dir(dir, version)
+                .map(|d| {
+                    d.file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .into_owned()
+                })
+                .unwrap_or_else(|| version.clone());
+            missing.push(display);
+        }
+    }
+
+    if !missing.is_empty() {
+        eprintln!(
+            "\u{2717} The following migration(s) have no executable down.sql and cannot be reverted:"
+        );
+        for name in &missing {
+            eprintln!("    \u{2022} {name}");
+        }
+        eprintln!("  Add a down.sql to each migration before running `autumn migrate down`.");
+        std::process::exit(1);
+    }
+
+    // 6. Revert under advisory lock, streaming per-migration UX
+    eprintln!("  Rolling back {} migration(s)...\n", plan.len());
+
+    let result = revert_user_migrations(&database_url, dir, &plan, |r| {
+        eprintln!(
+            "  \u{2713} Rolled back {}  ({}ms)",
+            r.name,
+            r.duration.as_millis()
+        );
+    });
+
+    match result {
+        Ok(()) => {
+            eprintln!("\n\u{2713} {} migration(s) rolled back.", plan.len());
+        }
+        Err(e) => {
+            eprintln!("\n\u{2717} Rollback failed: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Show rollback availability for all applied user migrations.
+fn show_rollback_availability(database_url: &str, migrations_dir: &str) {
+    use autumn_web::migrate::applied_user_migrations;
+
+    let dir = Path::new(migrations_dir);
+    let applied = match applied_user_migrations(database_url, dir) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("  \u{26A0}\u{FE0F}  Could not check rollback availability: {e}");
+            return;
+        }
+    };
+
+    eprintln!("  Rollback availability (user migrations):\n");
+
+    if applied.is_empty() {
+        eprintln!("  No applied user migrations.");
+        return;
+    }
+
+    for version in &applied {
+        let migration_dir = find_migration_dir(dir, version);
+        let (label, has_down) = migration_dir
+            .as_ref()
+            .map(|d| {
+                let name = d
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned();
+                let has_down = std::fs::read_to_string(d.join("down.sql"))
+                    .ok()
+                    .is_some_and(|sql| safety::has_executable_sql(&sql));
+                (name, has_down)
+            })
+            .unwrap_or_else(|| (version.clone(), false));
+
+        if has_down {
+            eprintln!("  \u{2713} {label}");
+        } else {
+            eprintln!("  \u{2717} {label}  (no executable down.sql — not revertable)");
+        }
+    }
+    eprintln!();
+}
+
 /// Show migration status via `diesel migration pending`.
 fn show_status(database_url: &str, migrations_dir: &str) {
     eprintln!("  Checking migration status...\n");
@@ -556,6 +795,13 @@ mod tests {
         std::fs::write(migration_dir.join("down.sql"), "").unwrap();
     }
 
+    fn write_migration_with_down(dir: &std::path::Path, name: &str, up_sql: &str, down_sql: &str) {
+        let migration_dir = dir.join(name);
+        std::fs::create_dir_all(&migration_dir).unwrap();
+        std::fs::write(migration_dir.join("up.sql"), up_sql).unwrap();
+        std::fs::write(migration_dir.join("down.sql"), down_sql).unwrap();
+    }
+
     #[test]
     fn check_empty_migrations_dir_returns_empty() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -574,11 +820,54 @@ mod tests {
 
         let results = check_migrations_in_dir(tmp.path()).unwrap();
         assert_eq!(results.len(), 1);
-        let (name, findings) = &results[0];
-        assert_eq!(name, "20260101000000_create_posts");
+        assert_eq!(results[0].name, "20260101000000_create_posts");
         assert!(
-            findings.is_empty(),
-            "CREATE TABLE should produce no findings"
+            results[0].up.is_empty(),
+            "CREATE TABLE should produce no up findings"
+        );
+        assert!(
+            results[0].down.is_empty(),
+            "empty down.sql should produce no findings"
+        );
+    }
+
+    #[test]
+    fn check_down_sql_findings_are_included_in_report() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_migration_with_down(
+            tmp.path(),
+            "20260101000000_add_column",
+            "ALTER TABLE posts ADD COLUMN body TEXT;",
+            "ALTER TABLE posts DROP COLUMN body;",
+        );
+
+        let results = check_migrations_in_dir(tmp.path()).unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(results[0].up.is_empty(), "ADD COLUMN should be safe in up");
+        assert_eq!(
+            results[0].down.len(),
+            1,
+            "DROP COLUMN in down.sql should have 1 finding"
+        );
+        assert_eq!(results[0].down[0].risk, safety::RiskLevel::Destructive);
+    }
+
+    #[test]
+    fn check_down_sql_absent_produces_empty_findings() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let migration_dir = tmp.path().join("20260101000000_create_posts");
+        std::fs::create_dir_all(&migration_dir).unwrap();
+        std::fs::write(
+            migration_dir.join("up.sql"),
+            "CREATE TABLE posts (id BIGSERIAL);",
+        )
+        .unwrap();
+
+        let results = check_migrations_in_dir(tmp.path()).unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(
+            results[0].down.is_empty(),
+            "absent down.sql should produce empty findings"
         );
     }
 
@@ -593,9 +882,8 @@ mod tests {
 
         let results = check_migrations_in_dir(tmp.path()).unwrap();
         assert_eq!(results.len(), 1);
-        let (_, findings) = &results[0];
-        assert_eq!(findings.len(), 1);
-        assert_eq!(findings[0].risk, safety::RiskLevel::Destructive);
+        assert_eq!(results[0].up.len(), 1);
+        assert_eq!(results[0].up[0].risk, safety::RiskLevel::Destructive);
     }
 
     #[test]
@@ -606,7 +894,7 @@ mod tests {
         write_migration(tmp.path(), "20260102000000_second", "SELECT 1;");
 
         let results = check_migrations_in_dir(tmp.path()).unwrap();
-        let names: Vec<_> = results.iter().map(|(n, _)| n.as_str()).collect();
+        let names: Vec<_> = results.iter().map(|r| r.name.as_str()).collect();
         assert_eq!(
             names,
             vec![
@@ -625,7 +913,7 @@ mod tests {
 
         let results = check_migrations_in_dir(tmp.path()).unwrap();
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0].0, "20260101000000_valid");
+        assert_eq!(results[0].name, "20260101000000_valid");
     }
 
     #[test]
@@ -644,9 +932,9 @@ mod tests {
 
         let results = check_migrations_in_dir(tmp.path()).unwrap();
         assert_eq!(results.len(), 2);
-        assert!(results[0].1.is_empty(), "first migration should be safe");
+        assert!(results[0].up.is_empty(), "first migration should be safe");
         assert!(
-            !results[1].1.is_empty(),
+            !results[1].up.is_empty(),
             "second migration should have findings"
         );
     }
@@ -661,9 +949,51 @@ mod tests {
         );
 
         let results = check_migrations_in_dir(tmp.path()).unwrap();
-        let (_, findings) = &results[0];
-        assert_eq!(findings.len(), 1);
-        assert_eq!(findings[0].risk, safety::RiskLevel::PotentiallyBlocking);
+        assert_eq!(results[0].up.len(), 1);
+        assert_eq!(
+            results[0].up[0].risk,
+            safety::RiskLevel::PotentiallyBlocking
+        );
+    }
+
+    // ── is_production_profile ─────────────────────────────────────────────────
+
+    #[test]
+    fn is_production_profile_detects_prod() {
+        temp_env::with_var("AUTUMN_ENV", Some("prod"), || {
+            assert!(is_production_profile());
+        });
+    }
+
+    #[test]
+    fn is_production_profile_detects_production() {
+        temp_env::with_var("AUTUMN_ENV", Some("production"), || {
+            assert!(is_production_profile());
+        });
+    }
+
+    #[test]
+    fn is_production_profile_case_insensitive() {
+        temp_env::with_var("AUTUMN_ENV", Some("PROD"), || {
+            assert!(is_production_profile());
+        });
+    }
+
+    #[test]
+    fn is_production_profile_false_for_dev() {
+        temp_env::with_var("AUTUMN_ENV", Some("dev"), || {
+            assert!(!is_production_profile());
+        });
+    }
+
+    #[test]
+    fn is_production_profile_reads_autumn_profile_legacy() {
+        temp_env::with_vars(
+            [("AUTUMN_ENV", None), ("AUTUMN_PROFILE", Some("production"))],
+            || {
+                assert!(is_production_profile());
+            },
+        );
     }
 
     #[test]
@@ -999,9 +1329,9 @@ replica_url = "postgres://replica:5432/app"
 
         let results = check_migrations_in_dir(tmp.path()).unwrap();
         assert_eq!(results.len(), 1);
-        let (_, findings) = &results[0];
         assert!(
-            findings
+            results[0]
+                .up
                 .iter()
                 .any(|f| f.operation.contains("CONCURRENTLY")),
             "missing metadata.toml should produce a CONCURRENTLY finding"
@@ -1045,9 +1375,9 @@ replica_url = "postgres://replica:5432/app"
 
         let results = check_migrations_in_dir(tmp.path()).unwrap();
         assert_eq!(results.len(), 1);
-        let (_, findings) = &results[0];
         assert!(
-            !findings
+            !results[0]
+                .up
                 .iter()
                 .any(|f| f.operation.contains("CONCURRENTLY")),
             "opted-out CONCURRENTLY should not produce a transaction opt-out finding"

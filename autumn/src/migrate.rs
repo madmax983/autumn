@@ -25,9 +25,11 @@
 //! }
 //! ```
 
-use diesel::migration::Migration;
+use diesel::migration::{Migration, MigrationSource as _};
+use diesel::pg::Pg;
 use diesel::{Connection, RunQueryDsl};
-use diesel_migrations::{HarnessWithOutput, MigrationHarness};
+use diesel_migrations::{FileBasedMigrations, HarnessWithOutput, MigrationHarness};
+use std::path::Path;
 
 /// Re-export `EmbeddedMigrations` so users can reference it without adding
 /// `diesel_migrations` as a direct dependency.
@@ -383,6 +385,137 @@ impl Drop for MigrationLockGuard {
     }
 }
 
+/// A single user migration that was successfully reverted.
+///
+/// Emitted by the `on_reverted` callback in [`revert_user_migrations`] after
+/// each successful revert so callers can stream per-migration UX output.
+#[derive(Debug)]
+pub struct RevertedMigration {
+    /// Version string (e.g. `"20260101000000"`).
+    pub version: String,
+    /// Full migration name including version prefix (e.g. `"20260101000000_create_posts"`).
+    pub name: String,
+    /// Wall-clock time taken by the revert.
+    pub duration: std::time::Duration,
+}
+
+/// Return the applied **user** migrations (ascending by version), excluding any
+/// framework-owned migrations.
+///
+/// User migrations are those discovered in `migrations_dir` via
+/// [`FileBasedMigrations`]. Framework migrations are embedded in the autumn
+/// crate and are not present in the user's `migrations/` directory, so they
+/// are naturally excluded from the returned list.
+///
+/// # Errors
+///
+/// - [`MigrationError::Connection`] if the database is unreachable.
+/// - [`MigrationError::Migration`] if `migrations_dir` cannot be read or if
+///   querying applied versions from the database fails.
+pub fn applied_user_migrations(
+    database_url: &str,
+    migrations_dir: &Path,
+) -> Result<Vec<String>, MigrationError> {
+    let mut conn = diesel::PgConnection::establish(database_url)
+        .map_err(|e| MigrationError::Connection(e.to_string()))?;
+
+    let source = FileBasedMigrations::from_path(migrations_dir)
+        .map_err(|e| MigrationError::Migration(format!("failed to read migrations dir: {e}")))?;
+
+    let known_user_versions: std::collections::BTreeSet<String> = {
+        let migrations: Vec<Box<dyn Migration<Pg>>> = source
+            .migrations()
+            .map_err(|e| MigrationError::Migration(e.to_string()))?;
+        migrations
+            .iter()
+            .map(|m| m.name().version().to_string())
+            .collect()
+    };
+
+    let all_applied = conn
+        .applied_migrations()
+        .map_err(|e| MigrationError::Migration(e.to_string()))?;
+
+    Ok(all_applied
+        .iter()
+        .map(|v| v.to_string())
+        .filter(|v| known_user_versions.contains(v))
+        .collect())
+}
+
+/// Revert the user migrations identified by `versions` (expected newest-first)
+/// under a Postgres advisory lock.
+///
+/// Calls `on_reverted` after each successful revert so the caller can stream
+/// per-migration UX output. If a revert fails mid-way, the advisory lock is
+/// released and the error is returned; migrations reverted before the failure
+/// are already committed.
+///
+/// Passing an empty `versions` slice is a no-op (returns `Ok(())` immediately
+/// without connecting to the database).
+///
+/// # Errors
+///
+/// - [`MigrationError::Connection`] if the database is unreachable.
+/// - [`MigrationError::LockTimeout`] if the advisory lock cannot be acquired.
+/// - [`MigrationError::Migration`] if a revert fails or a version is not found
+///   in `migrations_dir`.
+pub fn revert_user_migrations<F>(
+    database_url: &str,
+    migrations_dir: &Path,
+    versions: &[String],
+    mut on_reverted: F,
+) -> Result<(), MigrationError>
+where
+    F: FnMut(&RevertedMigration),
+{
+    if versions.is_empty() {
+        return Ok(());
+    }
+
+    let mut conn = diesel::PgConnection::establish(database_url)
+        .map_err(|e| MigrationError::Connection(e.to_string()))?;
+
+    let source = FileBasedMigrations::from_path(migrations_dir)
+        .map_err(|e| MigrationError::Migration(format!("failed to read migrations dir: {e}")))?;
+
+    let all_migrations: Vec<Box<dyn Migration<Pg>>> = source
+        .migrations()
+        .map_err(|e| MigrationError::Migration(e.to_string()))?;
+
+    acquire_migration_lock(&mut conn, DEFAULT_LOCK_WAIT_TIMEOUT)?;
+
+    let result: Result<(), MigrationError> = (|| {
+        for version in versions {
+            let migration = all_migrations
+                .iter()
+                .find(|m| m.name().version().to_string() == *version)
+                .ok_or_else(|| {
+                    MigrationError::Migration(format!(
+                        "migration version {version} not found in migrations directory"
+                    ))
+                })?;
+
+            let started = std::time::Instant::now();
+            conn.revert_migration(migration.as_ref())
+                .map_err(|e| MigrationError::Migration(e.to_string()))?;
+            let duration = started.elapsed();
+
+            let full_name = migration.name().to_string();
+            on_reverted(&RevertedMigration {
+                version: version.clone(),
+                name: full_name,
+                duration,
+            });
+        }
+        Ok(())
+    })();
+
+    release_migration_lock(&mut conn);
+
+    result
+}
+
 /// Open a new Postgres connection and acquire the migration advisory lock,
 /// returning a [`MigrationLockGuard`] that releases it on drop.
 ///
@@ -656,6 +789,65 @@ mod tests {
     }
 
     // ── Existing tests ─────────────────────────────────────────────────────
+
+    // ── applied_user_migrations / revert_user_migrations ─────────────────────
+
+    #[test]
+    fn applied_user_migrations_fails_with_connection_error_on_bad_url() {
+        // Red-phase: function exists and returns Connection error on unreachable host.
+        let dir = std::path::Path::new("../examples/todo-app/migrations");
+        let result =
+            applied_user_migrations("postgres://invalid:invalid@0.0.0.0:1/invalid_db", dir);
+        assert!(result.is_err());
+        assert!(
+            matches!(result.unwrap_err(), MigrationError::Connection(_)),
+            "unreachable host must produce Connection error"
+        );
+    }
+
+    #[test]
+    fn revert_user_migrations_empty_versions_is_noop_without_connecting() {
+        // Passing an empty slice must not attempt a DB connection.
+        let dir = std::path::Path::new("../examples/todo-app/migrations");
+        let result = revert_user_migrations(
+            "postgres://invalid:invalid@0.0.0.0:1/invalid_db",
+            dir,
+            &[],
+            |_| {},
+        );
+        assert!(
+            result.is_ok(),
+            "empty version list must return Ok without connecting"
+        );
+    }
+
+    #[test]
+    fn revert_user_migrations_fails_with_connection_error_on_bad_url() {
+        let dir = std::path::Path::new("../examples/todo-app/migrations");
+        let result = revert_user_migrations(
+            "postgres://invalid:invalid@0.0.0.0:1/invalid_db",
+            dir,
+            &["20260101000000".to_string()],
+            |_| {},
+        );
+        assert!(result.is_err());
+        assert!(
+            matches!(result.unwrap_err(), MigrationError::Connection(_)),
+            "unreachable host must produce Connection error"
+        );
+    }
+
+    #[test]
+    fn reverted_migration_debug_includes_name() {
+        let r = RevertedMigration {
+            version: "20260101000000".to_string(),
+            name: "20260101000000_create_posts".to_string(),
+            duration: std::time::Duration::from_millis(42),
+        };
+        let s = format!("{r:?}");
+        assert!(s.contains("create_posts"));
+        assert!(s.contains("20260101000000"));
+    }
 
     #[test]
     fn migration_result_debug() {

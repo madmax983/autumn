@@ -192,6 +192,60 @@ safe to apply because no running code references `body` any longer.
 The same two-step pattern applies to column type changes and to removing columns
 with foreign-key references.
 
+## Rolling back with `autumn migrate down`
+
+Every `autumn generate migration` run creates a `down.sql` file alongside
+`up.sql`. `autumn migrate down` is the command that honours it.
+
+```bash
+# Revert the most recently applied user migration (default: --steps 1):
+autumn migrate down
+
+# Revert the last 3 user migrations in newest-first order:
+autumn migrate down --steps 3
+
+# Revert user migrations until 20260101000000 is the latest applied:
+autumn migrate down --to 20260101000000
+
+# Required when AUTUMN_ENV=prod:
+autumn migrate down --yes-i-mean-prod
+```
+
+### Framework migrations are forward-only
+
+Framework-owned migrations (the ones Autumn ships internally) are **never**
+rolled back by `autumn migrate down`. They are listed separately in
+`autumn migrate status` and have no `down.sql`. This design is intentional —
+rolling back framework schema changes would break the framework features that
+depend on them.
+
+### Safety guards
+
+Before touching the database, `autumn migrate down` checks:
+
+1. **Production guard** — If `AUTUMN_ENV` is `prod` or `production`, the command
+   refuses unless `--yes-i-mean-prod` is passed.
+2. **down.sql preflight** — Every migration in the plan must have a non-empty,
+   non-comment `down.sql`. If any are missing or blank, the command names them
+   and exits non-zero without touching the database.
+
+`autumn migrate check` also classifies `down.sql` files (in addition to
+`up.sql`), so you can catch unsafe rollback SQL — such as `DROP TABLE` — before
+an incident.
+
+### Observability
+
+`autumn migrate status` shows rollback availability for every applied user
+migration:
+
+```
+  ✓ 20260101000000_create_posts
+  ✗ 20260102000000_add_body_to_posts  (no executable down.sql — not revertable)
+```
+
+This makes the rollback path visible before an incident, so you know which
+migrations can be safely reverted.
+
 ## `autumn generate task`
 
 For operational scripts that should run through the full Autumn app context.

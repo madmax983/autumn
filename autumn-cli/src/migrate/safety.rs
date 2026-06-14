@@ -127,6 +127,21 @@ pub fn has_unsafe_findings(findings: &[SafetyFinding]) -> bool {
     findings.iter().any(|f| f.risk > RiskLevel::Safe)
 }
 
+/// True iff `sql` contains at least one non-empty, non-comment SQL statement.
+///
+/// Used to gate `autumn migrate down`: a `down.sql` that is blank or contains
+/// only comments is treated as absent — the command refuses to proceed and
+/// names the offending migration.
+pub fn has_executable_sql(sql: &str) -> bool {
+    let without_block_comments = strip_block_comments(sql);
+    split_statements(&without_block_comments)
+        .iter()
+        .any(|stmt| {
+            stmt.lines()
+                .any(|line| !line.trim().is_empty() && !line.trim().starts_with("--"))
+        })
+}
+
 // ── internals ────────────────────────────────────────────────────────────────
 
 /// Extract the table name from a normalized `CREATE TABLE name …` statement.
@@ -1695,5 +1710,44 @@ mod tests {
         let findings = classify_sql("DROP TYPE status CASCADE;");
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].risk, RiskLevel::ManualReview);
+    }
+
+    // ── has_executable_sql ────────────────────────────────────────────────────
+
+    #[test]
+    fn has_executable_sql_empty_string_is_false() {
+        assert!(!has_executable_sql(""));
+    }
+
+    #[test]
+    fn has_executable_sql_whitespace_only_is_false() {
+        assert!(!has_executable_sql("   \n\t\n  "));
+    }
+
+    #[test]
+    fn has_executable_sql_line_comment_only_is_false() {
+        assert!(!has_executable_sql("-- nothing here\n-- just comments"));
+    }
+
+    #[test]
+    fn has_executable_sql_block_comment_only_is_false() {
+        assert!(!has_executable_sql("/* block comment only */"));
+    }
+
+    #[test]
+    fn has_executable_sql_real_sql_is_true() {
+        assert!(has_executable_sql("DROP TABLE posts;"));
+    }
+
+    #[test]
+    fn has_executable_sql_comment_plus_sql_is_true() {
+        assert!(has_executable_sql(
+            "-- undo the migration\nDROP TABLE posts;"
+        ));
+    }
+
+    #[test]
+    fn has_executable_sql_no_trailing_semicolon_is_true() {
+        assert!(has_executable_sql("DROP TABLE posts"));
     }
 }
