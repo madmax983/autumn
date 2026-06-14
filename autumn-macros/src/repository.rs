@@ -7942,6 +7942,49 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 repo
             }
 
+            /// Eager-load associations for records returned by a finder.
+            ///
+            /// Wraps each record in [`Preloaded`](::autumn_web::preload::Preloaded)
+            /// and loads every association named in `spec` with at most one
+            /// batched `WHERE ... IN (...)` query per association level (plus
+            /// one per nested level). No per-row fetches, and no implicit lazy
+            /// loading — an un-preloaded association accessor returns
+            /// [`NotLoaded`](::autumn_web::preload::NotLoaded).
+            ///
+            /// Preload SQL runs on the same read role as the finder (the
+            /// repository's snapshotted [`ReadRoute`](::autumn_web::repository::ReadRoute)),
+            /// so a replica-routed list keeps its preloads on the replica.
+            ///
+            /// ```rust,ignore
+            /// let posts = repo.find_by_subreddit_id(id).await?;
+            /// let posts = repo
+            ///     .preload(posts, Post::preload().author().comments_with(Comment::preload().author()))
+            ///     .await?;
+            /// for post in &posts {
+            ///     let author = post.author()?;        // typed accessor
+            ///     for comment in post.comments()? { /* ... */ }
+            /// }
+            /// ```
+            pub async fn preload(
+                &self,
+                records: ::std::vec::Vec<#model_name>,
+                spec: <#model_name as ::autumn_web::preload::Preloadable>::Spec,
+            ) -> ::autumn_web::AutumnResult<
+                ::std::vec::Vec<::autumn_web::preload::Preloaded<#model_name>>
+            > {
+                let mut conn = self.__autumn_acquire_read_conn().await?;
+                let mut wrapped: ::std::vec::Vec<
+                    ::autumn_web::preload::Preloaded<#model_name>
+                > = records
+                    .into_iter()
+                    .map(::autumn_web::preload::Preloaded::new)
+                    .collect();
+                <#model_name as ::autumn_web::preload::Preloadable>::load_associations(
+                    &mut wrapped, &spec, &mut *conn,
+                ).await?;
+                ::core::result::Result::Ok(wrapped)
+            }
+
             /// The read route this repository snapshot uses for generated
             /// read-only methods. Exposed for tests; not a public API.
             #[doc(hidden)]

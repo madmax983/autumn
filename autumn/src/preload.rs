@@ -208,6 +208,38 @@ impl<T: serde::Serialize> serde::Serialize for Preloaded<T> {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct NoPreload;
 
+/// Implement [`Preloadable`] for a hand-written model as a leaf association
+/// target.
+///
+/// `#[model]` implements [`Preloadable`] automatically. Use this macro for
+/// manually-defined models (those not using `#[model]`) that need to appear as
+/// the *target* of a `#[belongs_to]` / `#[has_one]` / `#[has_many]` on another
+/// model. A leaf target loads no associations of its own (its `Spec` is
+/// [`NoPreload`]), so it can be preloaded and wrapped in [`Preloaded`] but not
+/// nested into.
+///
+/// The type must implement `diesel::Queryable`/`Selectable` for its table.
+///
+/// ```ignore
+/// autumn_web::impl_preloadable_leaf!(User);
+/// ```
+#[cfg(feature = "db")]
+#[macro_export]
+macro_rules! impl_preloadable_leaf {
+    ($ty:ty) => {
+        impl $crate::preload::Preloadable for $ty {
+            type Spec = $crate::preload::NoPreload;
+            fn load_associations<'__a>(
+                _records: &'__a mut [$crate::preload::Preloaded<Self>],
+                _spec: &'__a Self::Spec,
+                _conn: &'__a mut $crate::reexports::diesel_async::AsyncPgConnection,
+            ) -> $crate::preload::PreloadFuture<'__a> {
+                ::std::boxed::Box::pin(async move { ::core::result::Result::Ok(()) })
+            }
+        }
+    };
+}
+
 #[cfg(feature = "db")]
 pub use db_support::{PreloadFuture, Preloadable};
 

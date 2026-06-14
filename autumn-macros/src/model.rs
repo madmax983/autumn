@@ -43,6 +43,411 @@ fn has_attr(field: &Field, name: &str) -> bool {
     field.attrs.iter().any(|a| a.path().is_ident(name))
 }
 
+/// The three declarative association kinds supported on `#[model]`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum AssocKind {
+    /// `#[belongs_to(Target, fk = ...)]` — the foreign key lives on *this*
+    /// model and points at the target's primary key.
+    BelongsTo,
+    /// `#[has_many(Target, fk = ...)]` — the foreign key lives on the *target*
+    /// and points back at this model's primary key.
+    HasMany,
+    /// `#[has_one(Target, fk = ...)]` — like `has_many`, but at most one
+    /// related record.
+    HasOne,
+}
+
+/// A resolved association declaration: kind, target model, the (possibly
+/// inferred) foreign-key column, and the accessor/store name.
+struct Association {
+    kind: AssocKind,
+    target: syn::Ident,
+    /// The foreign-key column name. For `belongs_to` it is a column on this
+    /// model; for `has_many`/`has_one` it is a column on the target.
+    fk: String,
+    /// The accessor method name and association store key, e.g. `author`,
+    /// `comments`, `subreddit`.
+    name: String,
+}
+
+/// Resolve the foreign-key column and accessor name for an association,
+/// applying autumn's conventions when the `fk` is not given explicitly.
+///
+/// * `belongs_to(User)` on `Post` → fk `user_id`, name `user`.
+/// * `belongs_to(User, fk = author_id)` on `Post` → fk `author_id`, name `author`.
+/// * `has_many(Comment)` on `Post` → fk `post_id` (on `Comment`), name `comments`.
+/// * `has_one(Profile)` on `User` → fk `user_id` (on `Profile`), name `profile`.
+fn resolve_fk_and_name(
+    kind: AssocKind,
+    model_ident: &syn::Ident,
+    target_ident: &syn::Ident,
+    explicit_fk: Option<&str>,
+) -> (String, String) {
+    let snake_target = pascal_to_snake(&target_ident.to_string());
+    let snake_source = pascal_to_snake(&model_ident.to_string());
+    match kind {
+        AssocKind::BelongsTo => {
+            let fk = explicit_fk.map_or_else(|| format!("{snake_target}_id"), ToOwned::to_owned);
+            let name = fk.strip_suffix("_id").unwrap_or(&fk).to_owned();
+            (fk, name)
+        }
+        AssocKind::HasMany => {
+            let fk = explicit_fk.map_or_else(|| format!("{snake_source}_id"), ToOwned::to_owned);
+            let name = format!("{snake_target}s");
+            (fk, name)
+        }
+        AssocKind::HasOne => {
+            let fk = explicit_fk.map_or_else(|| format!("{snake_source}_id"), ToOwned::to_owned);
+            (fk, snake_target)
+        }
+    }
+}
+
+/// Parse a single association attribute body, e.g. `User, fk = author_id`.
+fn parse_assoc_attr(
+    attr: &syn::Attribute,
+    kind: AssocKind,
+    model_ident: &syn::Ident,
+) -> syn::Result<Association> {
+    use syn::parse::ParseStream;
+
+    let (target, explicit_fk) = attr.parse_args_with(|input: ParseStream| {
+        let target: syn::Ident = input.parse()?;
+        let mut explicit_fk: Option<String> = None;
+        if input.peek(syn::Token![,]) {
+            input.parse::<syn::Token![,]>()?;
+            let key: syn::Ident = input.parse()?;
+            if key != "fk" {
+                return Err(syn::Error::new_spanned(
+                    &key,
+                    "expected `fk = <column>` in association attribute",
+                ));
+            }
+            input.parse::<syn::Token![=]>()?;
+            // Accept either a bare identifier (`fk = author_id`) or a string
+            // literal (`fk = "author_id"`).
+            if input.peek(LitStr) {
+                let lit: LitStr = input.parse()?;
+                explicit_fk = Some(lit.value());
+            } else {
+                let ident: syn::Ident = input.parse()?;
+                explicit_fk = Some(ident.to_string());
+            }
+        }
+        Ok((target, explicit_fk))
+    })?;
+
+    let (fk, name) = resolve_fk_and_name(kind, model_ident, &target, explicit_fk.as_deref());
+    Ok(Association {
+        kind,
+        target,
+        fk,
+        name,
+    })
+}
+
+/// Collect all `#[belongs_to]` / `#[has_many]` / `#[has_one]` declarations from
+/// a model's outer attributes, in source order.
+fn resolve_associations(
+    model_ident: &syn::Ident,
+    attrs: &[syn::Attribute],
+) -> syn::Result<Vec<Association>> {
+    let mut out = Vec::new();
+    for attr in attrs {
+        let kind = if attr.path().is_ident("belongs_to") {
+            AssocKind::BelongsTo
+        } else if attr.path().is_ident("has_many") {
+            AssocKind::HasMany
+        } else if attr.path().is_ident("has_one") {
+            AssocKind::HasOne
+        } else {
+            continue;
+        };
+        out.push(parse_assoc_attr(attr, kind, model_ident)?);
+    }
+    Ok(out)
+}
+
+/// Whether an attribute is one of the association declarations consumed by
+/// `#[model]` (and therefore must not be re-emitted onto the Diesel struct).
+fn is_association_attr(attr: &syn::Attribute) -> bool {
+    attr.path().is_ident("belongs_to")
+        || attr.path().is_ident("has_many")
+        || attr.path().is_ident("has_one")
+}
+
+/// Generate everything needed to make a model's associations preloadable:
+///
+/// 1. A `{Model}Preload` spec builder (one optional nested spec per association).
+/// 2. A `{Model}Associations` accessor trait, implemented for
+///    `Preloaded<{Model}>`, returning typed `NotLoaded` on un-preloaded access.
+/// 3. An `impl Preloadable for {Model}` whose `load_associations` issues one
+///    batched `WHERE ... IN (...)` query per association and recurses into
+///    nested specs.
+///
+/// Always emits the `Preloadable`/spec/trait scaffolding even with no
+/// associations, so that a model is always a valid association *target* (its
+/// `Spec` is the empty [`NoPreload`]).
+fn emit_association_items(
+    model_ident: &syn::Ident,
+    table_ident: &syn::Ident,
+    vis: &syn::Visibility,
+    assocs: &[Association],
+) -> TokenStream {
+    let preload_spec_ident = format_ident!("{model_ident}Preload");
+    let assoc_trait_ident = format_ident!("{model_ident}Associations");
+    let model_str = model_ident.to_string();
+
+    // Spec struct fields + builder methods, one per association.
+    let mut spec_fields: Vec<TokenStream> = Vec::new();
+    let mut spec_builders: Vec<TokenStream> = Vec::new();
+    // Accessor trait method signatures + implementations.
+    let mut accessor_sigs: Vec<TokenStream> = Vec::new();
+    let mut accessor_impls: Vec<TokenStream> = Vec::new();
+    // Loader body statements (one block per association).
+    let mut loader_blocks: Vec<TokenStream> = Vec::new();
+
+    for assoc in assocs {
+        let name_ident = format_ident!("{}", assoc.name);
+        let with_ident = format_ident!("{}_with", assoc.name);
+        let target = &assoc.target;
+        let target_table = format_ident!("{}", infer_table_name(target));
+        let fk_ident = format_ident!("{}", assoc.fk);
+        let key = &assoc.name;
+        // Box the nested spec: associations can be mutually recursive
+        // (`Post` belongs_to `Subreddit`, `Subreddit` has_many `Post`), so an
+        // inline `Option<TargetSpec>` would be an infinitely-sized type.
+        let spec_ty = quote! {
+            ::core::option::Option<
+                ::std::boxed::Box<<#target as ::autumn_web::preload::Preloadable>::Spec>
+            >
+        };
+
+        spec_fields.push(quote! { #name_ident: #spec_ty });
+        spec_builders.push(quote! {
+            /// Preload this association (no nested associations).
+            #[must_use]
+            #vis fn #name_ident(mut self) -> Self {
+                self.#name_ident = ::core::option::Option::Some(
+                    ::std::boxed::Box::new(::core::default::Default::default())
+                );
+                self
+            }
+            /// Preload this association together with a nested preload spec.
+            #[must_use]
+            #vis fn #with_ident(
+                mut self,
+                spec: <#target as ::autumn_web::preload::Preloadable>::Spec,
+            ) -> Self {
+                self.#name_ident = ::core::option::Option::Some(::std::boxed::Box::new(spec));
+                self
+            }
+        });
+
+        match assoc.kind {
+            AssocKind::BelongsTo | AssocKind::HasOne => {
+                // Single related record, shared via Arc.
+                let stored_ty = quote! {
+                    ::core::option::Option<::std::sync::Arc<::autumn_web::preload::Preloaded<#target>>>
+                };
+                accessor_sigs.push(quote! {
+                    /// The preloaded related record, or `Ok(None)` when there is
+                    /// no matching row. `Err(NotLoaded)` if it was not preloaded.
+                    fn #name_ident(&self) -> ::core::result::Result<
+                        ::core::option::Option<&::autumn_web::preload::Preloaded<#target>>,
+                        ::autumn_web::preload::NotLoaded,
+                    >;
+                });
+                accessor_impls.push(quote! {
+                    fn #name_ident(&self) -> ::core::result::Result<
+                        ::core::option::Option<&::autumn_web::preload::Preloaded<#target>>,
+                        ::autumn_web::preload::NotLoaded,
+                    > {
+                        match self.associations().get::<#stored_ty>(#key) {
+                            ::core::option::Option::Some(v) => ::core::result::Result::Ok(v.as_deref()),
+                            ::core::option::Option::None => ::core::result::Result::Err(
+                                ::autumn_web::preload::NotLoaded::new(#model_str, #key),
+                            ),
+                        }
+                    }
+                });
+
+                let (key_expr, filter_col) = match assoc.kind {
+                    // belongs_to: fk is on *this* model, points at target's id.
+                    AssocKind::BelongsTo => (
+                        quote! { __r.#fk_ident },
+                        quote! { #target_table::id },
+                    ),
+                    // has_one: fk is on the *target*, points at this model's id.
+                    _ => (
+                        quote! { __r.id },
+                        quote! { #target_table::#fk_ident },
+                    ),
+                };
+                // For has_one the lookup map keys on the target's fk column; for
+                // belongs_to it keys on the target's id.
+                let map_key_expr = match assoc.kind {
+                    AssocKind::BelongsTo => quote! { __child.id },
+                    _ => quote! { __child.#fk_ident },
+                };
+
+                loader_blocks.push(quote! {
+                    if let ::core::option::Option::Some(__child_spec) = &spec.#name_ident {
+                        let mut __keys: ::std::vec::Vec<i64> =
+                            records.iter().map(|__r| #key_expr).collect();
+                        __keys.sort_unstable();
+                        __keys.dedup();
+                        let __rows: ::std::vec::Vec<#target> = #target_table::table
+                            .filter(#filter_col.eq_any(__keys))
+                            .select(<#target as ::autumn_web::reexports::diesel::SelectableHelper<::autumn_web::reexports::diesel::pg::Pg>>::as_select())
+                            .load::<#target>(&mut *conn)
+                            .await
+                            .map_err(::autumn_web::AutumnError::from)?;
+                        let mut __children: ::std::vec::Vec<
+                            ::autumn_web::preload::Preloaded<#target>
+                        > = __rows.into_iter().map(::autumn_web::preload::Preloaded::new).collect();
+                        <#target as ::autumn_web::preload::Preloadable>::load_associations(
+                            &mut __children, &**__child_spec, &mut *conn,
+                        ).await?;
+                        let mut __map: ::std::collections::HashMap<
+                            i64, ::std::sync::Arc<::autumn_web::preload::Preloaded<#target>>
+                        > = __children
+                            .into_iter()
+                            .map(|__child| (#map_key_expr, ::std::sync::Arc::new(__child)))
+                            .collect();
+                        for __r in records.iter_mut() {
+                            let __v: #stored_ty = __map.get(&(#key_expr)).map(::std::sync::Arc::clone);
+                            __r.associations_mut().insert::<#stored_ty>(#key, __v);
+                        }
+                    }
+                });
+            }
+            AssocKind::HasMany => {
+                // Many related records owned per-parent.
+                let stored_ty = quote! {
+                    ::std::vec::Vec<::autumn_web::preload::Preloaded<#target>>
+                };
+                accessor_sigs.push(quote! {
+                    /// The preloaded related records (possibly empty).
+                    /// `Err(NotLoaded)` if this association was not preloaded.
+                    fn #name_ident(&self) -> ::core::result::Result<
+                        &[::autumn_web::preload::Preloaded<#target>],
+                        ::autumn_web::preload::NotLoaded,
+                    >;
+                });
+                accessor_impls.push(quote! {
+                    fn #name_ident(&self) -> ::core::result::Result<
+                        &[::autumn_web::preload::Preloaded<#target>],
+                        ::autumn_web::preload::NotLoaded,
+                    > {
+                        match self.associations().get::<#stored_ty>(#key) {
+                            ::core::option::Option::Some(v) => ::core::result::Result::Ok(v.as_slice()),
+                            ::core::option::Option::None => ::core::result::Result::Err(
+                                ::autumn_web::preload::NotLoaded::new(#model_str, #key),
+                            ),
+                        }
+                    }
+                });
+                loader_blocks.push(quote! {
+                    if let ::core::option::Option::Some(__child_spec) = &spec.#name_ident {
+                        let mut __keys: ::std::vec::Vec<i64> =
+                            records.iter().map(|__r| __r.id).collect();
+                        __keys.sort_unstable();
+                        __keys.dedup();
+                        let __rows: ::std::vec::Vec<#target> = #target_table::table
+                            .filter(#target_table::#fk_ident.eq_any(__keys))
+                            .select(<#target as ::autumn_web::reexports::diesel::SelectableHelper<::autumn_web::reexports::diesel::pg::Pg>>::as_select())
+                            .load::<#target>(&mut *conn)
+                            .await
+                            .map_err(::autumn_web::AutumnError::from)?;
+                        let mut __children: ::std::vec::Vec<
+                            ::autumn_web::preload::Preloaded<#target>
+                        > = __rows.into_iter().map(::autumn_web::preload::Preloaded::new).collect();
+                        <#target as ::autumn_web::preload::Preloadable>::load_associations(
+                            &mut __children, &**__child_spec, &mut *conn,
+                        ).await?;
+                        let mut __groups: ::std::collections::HashMap<i64, #stored_ty> =
+                            ::std::collections::HashMap::new();
+                        for __child in __children {
+                            __groups.entry(__child.#fk_ident).or_default().push(__child);
+                        }
+                        for __r in records.iter_mut() {
+                            let __v: #stored_ty = __groups.remove(&__r.id).unwrap_or_default();
+                            __r.associations_mut().insert::<#stored_ty>(#key, __v);
+                        }
+                    }
+                });
+            }
+        }
+    }
+
+    quote! {
+        /// Eager-loading specification for this model's associations.
+        ///
+        /// Build it fluently and pass it to a `#[repository]` `preload(...)`
+        /// call. Each method enables one association; the `_with` variants take
+        /// a nested spec for the related model.
+        #[derive(::core::default::Default)]
+        #vis struct #preload_spec_ident {
+            #(#spec_fields,)*
+        }
+
+        impl #preload_spec_ident {
+            /// An empty preload set.
+            #[must_use]
+            #vis fn new() -> Self {
+                ::core::default::Default::default()
+            }
+            #(#spec_builders)*
+        }
+
+        impl #model_ident {
+            /// Start building an eager-loading spec for this model's
+            /// associations. Pass the result to a `#[repository]`
+            /// `preload(...)` call.
+            #[must_use]
+            #vis fn preload() -> #preload_spec_ident {
+                #preload_spec_ident::new()
+            }
+        }
+
+        /// Typed accessors for this model's preloaded associations.
+        ///
+        /// Accessing an association that was not preloaded returns
+        /// [`NotLoaded`](::autumn_web::preload::NotLoaded) rather than issuing
+        /// SQL — autumn never lazy-loads.
+        #vis trait #assoc_trait_ident {
+            #(#accessor_sigs)*
+        }
+
+        impl #assoc_trait_ident for ::autumn_web::preload::Preloaded<#model_ident> {
+            #(#accessor_impls)*
+        }
+
+        impl ::autumn_web::preload::Preloadable for #model_ident {
+            type Spec = #preload_spec_ident;
+
+            fn load_associations<'__a>(
+                records: &'__a mut [::autumn_web::preload::Preloaded<Self>],
+                spec: &'__a Self::Spec,
+                conn: &'__a mut ::autumn_web::reexports::diesel_async::AsyncPgConnection,
+            ) -> ::autumn_web::preload::PreloadFuture<'__a> {
+                ::std::boxed::Box::pin(async move {
+                    #[allow(unused_imports)]
+                    use ::autumn_web::reexports::diesel::{
+                        QueryDsl as _, ExpressionMethods as _,
+                    };
+                    #[allow(unused_imports)]
+                    use ::autumn_web::reexports::diesel_async::RunQueryDsl as _;
+                    let _ = (&records, &spec, &conn, #table_ident::table);
+                    #(#loader_blocks)*
+                    ::core::result::Result::Ok(())
+                })
+            }
+        }
+    }
+}
+
 /// Extract `#[validate(...)]` attributes from a field (verbatim pass-through).
 fn validate_attrs(field: &Field) -> Vec<&syn::Attribute> {
     field
@@ -869,9 +1274,16 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     };
     let is_searchable = searchable_lang.is_some();
     let search_language = searchable_lang.unwrap_or_else(|| "simple".to_string());
+
+    let associations = match resolve_associations(name, outer_attrs) {
+        Ok(assocs) => assocs,
+        Err(err) => return err.to_compile_error(),
+    };
+    let association_items = emit_association_items(name, &table_ident, vis, &associations);
+
     let filtered_outer_attrs: Vec<&syn::Attribute> = outer_attrs
         .iter()
-        .filter(|a| !a.path().is_ident("searchable"))
+        .filter(|a| !a.path().is_ident("searchable") && !is_association_attr(a))
         .collect();
 
     let new_name = format_ident!("New{name}");
@@ -2428,6 +2840,9 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
         // ── State machine impls (one per #[state_machine] field) ────────────
         #(#state_machine_impls)*
+
+        // ── Associations + eager loading (belongs_to / has_many / has_one) ──
+        #association_items
     }
 }
 
@@ -2456,6 +2871,72 @@ mod tests {
     // These tests cover the new `excluded_from_new` behaviour (must also
     // exclude `#[lock_version]` fields) and the helper that detects whether
     // a field carries the attribute.
+
+    // ── Association parsing / convention inference ───────────────────────
+
+    #[test]
+    fn belongs_to_explicit_fk_derives_name_from_fk() {
+        let post = syn::parse_quote!(Post);
+        let user = syn::parse_quote!(User);
+        let (fk, name) =
+            resolve_fk_and_name(AssocKind::BelongsTo, &post, &user, Some("author_id"));
+        assert_eq!(fk, "author_id");
+        assert_eq!(name, "author");
+    }
+
+    #[test]
+    fn belongs_to_infers_fk_and_name_from_target() {
+        let post = syn::parse_quote!(Post);
+        let subreddit = syn::parse_quote!(Subreddit);
+        let (fk, name) = resolve_fk_and_name(AssocKind::BelongsTo, &post, &subreddit, None);
+        assert_eq!(fk, "subreddit_id");
+        assert_eq!(name, "subreddit");
+    }
+
+    #[test]
+    fn has_many_infers_fk_from_source_and_pluralizes_name() {
+        let post = syn::parse_quote!(Post);
+        let comment = syn::parse_quote!(Comment);
+        let (fk, name) = resolve_fk_and_name(AssocKind::HasMany, &post, &comment, None);
+        assert_eq!(fk, "post_id");
+        assert_eq!(name, "comments");
+    }
+
+    #[test]
+    fn has_one_infers_fk_from_source_and_singular_name() {
+        let user = syn::parse_quote!(User);
+        let profile = syn::parse_quote!(Profile);
+        let (fk, name) = resolve_fk_and_name(AssocKind::HasOne, &user, &profile, None);
+        assert_eq!(fk, "user_id");
+        assert_eq!(name, "profile");
+    }
+
+    #[test]
+    fn resolve_associations_parses_all_kinds() {
+        let model: syn::Ident = syn::parse_quote!(Post);
+        let attrs: Vec<syn::Attribute> = vec![
+            syn::parse_quote!(#[belongs_to(User, fk = author_id)]),
+            syn::parse_quote!(#[has_many(Comment)]),
+            syn::parse_quote!(#[belongs_to(Subreddit)]),
+        ];
+        let assocs = resolve_associations(&model, &attrs).expect("parse ok");
+        assert_eq!(assocs.len(), 3);
+        assert_eq!(assocs[0].kind, AssocKind::BelongsTo);
+        assert_eq!(assocs[0].fk, "author_id");
+        assert_eq!(assocs[0].name, "author");
+        assert_eq!(assocs[1].kind, AssocKind::HasMany);
+        assert_eq!(assocs[1].fk, "post_id");
+        assert_eq!(assocs[1].name, "comments");
+        assert_eq!(assocs[2].name, "subreddit");
+    }
+
+    #[test]
+    fn resolve_associations_rejects_unknown_key() {
+        let model: syn::Ident = syn::parse_quote!(Post);
+        let attrs: Vec<syn::Attribute> =
+            vec![syn::parse_quote!(#[belongs_to(User, bogus = author_id)])];
+        assert!(resolve_associations(&model, &attrs).is_err());
+    }
 
     #[test]
     fn lock_version_attr_detected_by_has_attr() {
