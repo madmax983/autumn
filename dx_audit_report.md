@@ -116,3 +116,23 @@ To make the developer experience more robust ("idiot-proofing"):
 
 ## 4. 🧪 VERIFY - The "idiot proofing"
 - Confirmed that Axum's `IntoResponse` trait is not implemented for `i32`, `i64`, or other plain numbers out-of-the-box, meaning they cannot be returned directly from route handlers without manually converting them to strings or JSON first.
+
+# DX Audit Report: `README.md` Quickstart Compilation Failure
+
+## 1. 🔍 EXPERIENCE - The Walkthrough
+- Did the "README Run": Followed the Quickstart guide in `README.md`.
+- Created a new project, added the `autumn-web` dependency.
+- Copied the exact example code from `README.md` into `src/main.rs`.
+- Attempted to run the app using `cargo run`.
+
+## 2. 🚧 STUMBLE - The Friction Points
+- **Error Check**: The project fails to compile completely!
+- `cargo` outputs 36 massive errors from deep inside the dependency tree in a crate called `brotli`.
+- The errors look like: `the trait bound StandardAlloc: alloc::Allocator<u8> is not satisfied`.
+- The error hints mention multiple different versions of `alloc_no_stdlib` in the dependency graph.
+
+## 3. 📢 REPORT - The Complaint
+- "I literally just copy-pasted your Hello World from the README into a new project and hit run. It exploded with 36 compiler errors about `alloc::Allocator` in a `brotli` crate I've never even heard of. If I copy-paste the example and it doesn't compile, I am leaving!"
+
+## 4. 🧪 VERIFY - The "idiot proofing"
+- Confirmed that running `cargo new try_readme`, adding `autumn-web`, and pasting the exact code from the README produces `the trait bound StandardAlloc: alloc::Allocator<u8> is not satisfied` errors during `cargo build` because of conflicting `alloc-no-stdlib` versions brought in by `tower-http`'s `compression-br` feature.
