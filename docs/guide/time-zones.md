@@ -179,7 +179,9 @@ job::send_report(user.id, tz.iana()).enqueue(&state).await?;
 async fn send_report(user_id: i64, tz_name: String, state: AppState) {
     let tz = autumn_web::time_zone::parse_iana(&tz_name).unwrap_or(Tz::UTC);
     with_request_time_zone(tz, async move {
-        // local_datetime helpers automatically pick up the ambient zone
+        // Pass the captured zone to the view helpers explicitly; the ambient
+        // zone set above is available via `ambient_time_zone()` if you'd rather
+        // read it inside a deeply-nested renderer.
         let body = render_report(user_id, &state, tz).await;
         // ...
     }).await;

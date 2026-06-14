@@ -56,10 +56,18 @@ pub enum Source {
 /// Configuration for the time zone subsystem.
 ///
 /// Populated from the `[time_zone]` block in `autumn.toml`, or left at
-/// defaults (`UTC`, all sources). `time_zone = "America/New_York"` is also
-/// accepted as a shorthand for just the identifier.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
+/// defaults (`UTC`, all sources). Both the table form and the scalar
+/// shorthand are accepted:
+///
+/// ```toml
+/// # Scalar shorthand — sets `identifier`, keeps default sources:
+/// time_zone = "America/New_York"
+///
+/// # Table form — also lets you reorder the resolution sources:
+/// [time_zone]
+/// identifier = "America/New_York"
+/// ```
+#[derive(Debug, Clone)]
 pub struct TimeZoneConfig {
     /// IANA time zone identifier used when no source resolves.
     /// Defaults to `"UTC"`.
@@ -68,18 +76,63 @@ pub struct TimeZoneConfig {
     pub sources: Vec<Source>,
 }
 
+fn default_time_zone_identifier() -> String {
+    "UTC".to_owned()
+}
+
+fn default_time_zone_sources() -> Vec<Source> {
+    vec![Source::User, Source::Session, Source::Cookie, Source::Query]
+}
+
 impl Default for TimeZoneConfig {
     fn default() -> Self {
         Self {
-            identifier: "UTC".to_owned(),
-            sources: vec![Source::User, Source::Session, Source::Cookie, Source::Query],
+            identifier: default_time_zone_identifier(),
+            sources: default_time_zone_sources(),
         }
+    }
+}
+
+impl<'de> Deserialize<'de> for TimeZoneConfig {
+    /// Accept either a scalar identifier (`time_zone = "America/New_York"`) or
+    /// a full table (`[time_zone] identifier = "…"`), so the documented
+    /// shorthand in issue #836 loads correctly.
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Repr {
+            Scalar(String),
+            Table {
+                #[serde(default = "default_time_zone_identifier")]
+                identifier: String,
+                #[serde(default = "default_time_zone_sources")]
+                sources: Vec<Source>,
+            },
+        }
+
+        Ok(match Repr::deserialize(deserializer)? {
+            Repr::Scalar(identifier) => Self {
+                identifier,
+                sources: default_time_zone_sources(),
+            },
+            Repr::Table {
+                identifier,
+                sources,
+            } => Self {
+                identifier,
+                sources,
+            },
+        })
     }
 }
 
 impl TimeZoneConfig {
     /// Validate the config, returning an error if the identifier is not a
-    /// recognised IANA zone. Called by [`AutumnConfig::validate`] at startup.
+    /// recognised IANA zone. Called by
+    /// [`AutumnConfig::validate`](crate::config::AutumnConfig::validate) at startup.
     ///
     /// # Errors
     ///
@@ -214,7 +267,7 @@ fn resolve_from_query(parts: &axum::http::request::Parts) -> Option<Tz> {
     let query = parts.uri.query()?;
     for pair in query.split('&') {
         if let Some(value) = pair.strip_prefix("tz=")
-            && let Some(tz) = parse_iana(value)
+            && let Some(tz) = parse_iana(&percent_decode(value))
         {
             return Some(tz);
         }
@@ -230,12 +283,54 @@ fn resolve_from_cookie(parts: &axum::http::request::Parts) -> Option<Tz> {
     for cookie in cookie_header.split(';') {
         let cookie = cookie.trim();
         if let Some(value) = cookie.strip_prefix("autumn_time_zone=")
-            && let Some(tz) = parse_iana(value)
+            && let Some(tz) = parse_iana(&percent_decode(value))
         {
             return Some(tz);
         }
     }
     None
+}
+
+/// Resolve `%XX` percent-escapes in a query/cookie value so that
+/// pre-encoded IANA identifiers (e.g. `America%2FNew_York`,
+/// `Etc%2FGMT%2B5`) still parse.
+///
+/// `+` is left literal rather than decoded to a space: IANA identifiers can
+/// contain `+` (e.g. `Etc/GMT+5`) and never contain spaces, so treating `+`
+/// as a literal is the correct choice here.
+fn percent_decode(value: &str) -> std::borrow::Cow<'_, str> {
+    if !value.contains('%') {
+        return std::borrow::Cow::Borrowed(value);
+    }
+    let bytes = value.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let Some(byte) = decode_hex_pair(bytes[i + 1], bytes[i + 2])
+        {
+            out.push(byte);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    // Fall back to the original string if decoding produced invalid UTF-8.
+    String::from_utf8(out).map_or_else(
+        |_| std::borrow::Cow::Owned(value.to_owned()),
+        std::borrow::Cow::Owned,
+    )
+}
+
+/// Decode two ASCII hex digits into the byte they represent, or `None` if
+/// either character is not a hex digit.
+fn decode_hex_pair(hi: u8, lo: u8) -> Option<u8> {
+    let hi = (hi as char).to_digit(16)?;
+    let lo = (lo as char).to_digit(16)?;
+    // `hi` and `lo` are each in `0..16`, so the result is always `<= 255`.
+    u8::try_from(hi * 16 + lo).ok()
 }
 
 // ── IANA parsing ──────────────────────────────────────────────────────────────
@@ -348,7 +443,7 @@ pub fn time_ago(dt: DateTime<Utc>, now: DateTime<Utc>, tz: Tz) -> maud::Markup {
 fn format_relative(diff: chrono::Duration) -> String {
     let secs = diff.num_seconds();
     if secs < 0 {
-        let future = -secs;
+        let future = secs.unsigned_abs();
         return if future < 60 {
             format!("in {future} seconds")
         } else if future < 3600 {
@@ -560,6 +655,53 @@ mod tests {
         );
     }
 
+    #[derive(serde::Deserialize)]
+    struct Wrapper {
+        #[serde(default)]
+        time_zone: TimeZoneConfig,
+    }
+
+    #[test]
+    fn config_deserializes_scalar_shorthand() {
+        let w: Wrapper = toml::from_str(r#"time_zone = "America/New_York""#).unwrap();
+        assert_eq!(w.time_zone.identifier, "America/New_York");
+        // Scalar form keeps the default source chain.
+        assert_eq!(w.time_zone.sources, default_time_zone_sources());
+    }
+
+    #[test]
+    fn config_deserializes_table_form() {
+        let w: Wrapper = toml::from_str(
+            r#"
+            [time_zone]
+            identifier = "Asia/Tokyo"
+            sources = ["query", "cookie"]
+            "#,
+        )
+        .unwrap();
+        assert_eq!(w.time_zone.identifier, "Asia/Tokyo");
+        assert_eq!(w.time_zone.sources, vec![Source::Query, Source::Cookie]);
+    }
+
+    #[test]
+    fn config_table_form_defaults_missing_fields() {
+        let w: Wrapper = toml::from_str(
+            r#"
+            [time_zone]
+            identifier = "Europe/London"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(w.time_zone.identifier, "Europe/London");
+        assert_eq!(w.time_zone.sources, default_time_zone_sources());
+    }
+
+    #[test]
+    fn config_absent_uses_default() {
+        let w: Wrapper = toml::from_str("").unwrap();
+        assert_eq!(w.time_zone.identifier, "UTC");
+    }
+
     // ── Query resolution ──────────────────────────────────────────────────────
 
     #[test]
@@ -579,6 +721,46 @@ mod tests {
     fn query_param_absent_returns_none() {
         let p = parts("/", &[]);
         assert!(resolve_from_query(&p).is_none());
+    }
+
+    #[test]
+    fn query_param_percent_encoded_slash() {
+        let p = parts("/?tz=America%2FNew_York", &[]);
+        assert_eq!(resolve_from_query(&p), Some(Tz::America__New_York));
+    }
+
+    #[test]
+    fn query_param_percent_encoded_plus() {
+        // Etc/GMT+5 contains a literal '+'; fully percent-encoded form must parse.
+        let p = parts("/?tz=Etc%2FGMT%2B5", &[]);
+        assert_eq!(resolve_from_query(&p), Some(Tz::Etc__GMTPlus5));
+    }
+
+    #[test]
+    fn percent_decode_passthrough_when_no_escapes() {
+        assert_eq!(percent_decode("America/New_York"), "America/New_York");
+        assert!(matches!(
+            percent_decode("UTC"),
+            std::borrow::Cow::Borrowed("UTC")
+        ));
+    }
+
+    #[test]
+    fn percent_decode_resolves_escapes() {
+        assert_eq!(percent_decode("America%2FNew_York"), "America/New_York");
+        assert_eq!(percent_decode("Etc%2FGMT%2B5"), "Etc/GMT+5");
+    }
+
+    #[test]
+    fn percent_decode_leaves_plus_literal() {
+        assert_eq!(percent_decode("Etc/GMT+5"), "Etc/GMT+5");
+    }
+
+    #[test]
+    fn percent_decode_keeps_trailing_partial_escape_literal() {
+        // A stray '%' with too few hex digits is preserved verbatim.
+        assert_eq!(percent_decode("UTC%2"), "UTC%2");
+        assert_eq!(percent_decode("UTC%"), "UTC%");
     }
 
     // ── Cookie resolution ─────────────────────────────────────────────────────
@@ -610,6 +792,13 @@ mod tests {
     fn cookie_absent_returns_none() {
         let p = parts("/", &[]);
         assert!(resolve_from_cookie(&p).is_none());
+    }
+
+    #[test]
+    fn cookie_percent_encoded_value() {
+        // Frontend libraries often encodeURIComponent cookie values.
+        let p = parts("/", &[("Cookie", "autumn_time_zone=America%2FNew_York")]);
+        assert_eq!(resolve_from_cookie(&p), Some(Tz::America__New_York));
     }
 
     // ── Cookie helper ─────────────────────────────────────────────────────────

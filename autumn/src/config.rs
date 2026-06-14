@@ -125,6 +125,7 @@
 //! | `AUTUMN_AUTH__LOCKOUT__THRESHOLD` | `auth.lockout.threshold` | `i32` |
 //! | `AUTUMN_AUTH__LOCKOUT__WINDOW_SECS` | `auth.lockout.window_secs` | `u64` |
 //! | `AUTUMN_AUTH__LOCKOUT__COOLOFF_SECS` | `auth.lockout.cooloff_secs` | `u64` |
+//! | `AUTUMN_TIME_ZONE__IDENTIFIER` | `time_zone.identifier` | IANA id `String` |
 
 use std::path::{Path, PathBuf};
 
@@ -1932,6 +1933,15 @@ impl AutumnConfig {
         #[cfg(feature = "mail")]
         self.apply_mail_env_overrides_with_env(env);
         self.apply_resilience_env_overrides_with_env(env);
+        self.apply_time_zone_env_overrides_with_env(env);
+    }
+
+    fn apply_time_zone_env_overrides_with_env(&mut self, env: &dyn Env) {
+        parse_env_string(
+            env,
+            "AUTUMN_TIME_ZONE__IDENTIFIER",
+            &mut self.time_zone.identifier,
+        );
     }
 
     #[cfg(feature = "reporting")]
@@ -4269,6 +4279,18 @@ pool_size = 7
         };
         assert!(message.contains("database.replica_url"));
         assert!(message.contains("database.primary_url"));
+    }
+
+    #[test]
+    fn time_zone_identifier_env_override_applies() {
+        let env = MockEnv::new().with("AUTUMN_TIME_ZONE__IDENTIFIER", "America/New_York");
+        let mut config = AutumnConfig::default();
+        assert_eq!(config.time_zone.identifier, "UTC");
+
+        config.apply_env_overrides_with_env(&env);
+
+        assert_eq!(config.time_zone.identifier, "America/New_York");
+        assert!(config.time_zone.validate().is_ok());
     }
 
     #[test]

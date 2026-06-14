@@ -1488,6 +1488,7 @@ use crate::schema::{table};
 pub struct {pascal_name} {{
     pub id: i64,
     pub email: String,
+    #[default]
     pub time_zone: Option<String>,
     pub password_digest: String,
 {totp_fields}    #[default]
