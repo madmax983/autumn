@@ -714,9 +714,28 @@ fn render_layout(title: &str, _inspector_path: &str, body: &str) -> String {
     )
 }
 
-fn escape_html(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for ch in s.chars() {
+/// Escapes HTML special characters in the provided string.
+/// ⚡ Bolt optimization: Returns a `Cow<'_, str>` to avoid allocating a new
+/// `String` when the input does not contain any characters requiring escaping.
+/// This saves memory allocations in the hot path for request rendering,
+/// especially for inputs like simple paths, integers, or regular text.
+fn escape_html(s: &str) -> std::borrow::Cow<'_, str> {
+    let mut first_escape = None;
+    for (i, b) in s.bytes().enumerate() {
+        if matches!(b, b'&' | b'<' | b'>' | b'"' | b'\'') {
+            first_escape = Some(i);
+            break;
+        }
+    }
+
+    let Some(first) = first_escape else {
+        return std::borrow::Cow::Borrowed(s);
+    };
+
+    let mut out = String::with_capacity(s.len() + 8);
+    out.push_str(&s[..first]);
+
+    for ch in s[first..].chars() {
         match ch {
             '&' => out.push_str("&amp;"),
             '<' => out.push_str("&lt;"),
@@ -726,7 +745,7 @@ fn escape_html(s: &str) -> String {
             c => out.push(c),
         }
     }
-    out
+    std::borrow::Cow::Owned(out)
 }
 
 const INSPECTOR_CSS: &str = r"
