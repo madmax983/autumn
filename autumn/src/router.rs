@@ -156,6 +156,15 @@ pub struct RouterContext {
     /// that depend on extensions set by those framework layers — such as the
     /// request ID or session data — will not find them in SSG mode.
     pub custom_layers: Vec<crate::app::CustomLayerRegistration>,
+    /// Pre-static gate layers registered via
+    /// [`AppBuilder::static_gate`](crate::app::AppBuilder::static_gate).
+    /// Applied as the **outermost** middleware — outside the session layer and
+    /// ahead of the static-first middleware — so they can auth-gate / redirect
+    /// a request before a cached SSG/ISG page is served. Unlike
+    /// [`custom_layers`](Self::custom_layers), these always run in this
+    /// outermost position in both static and fully-dynamic modes, and never
+    /// see the session extension.
+    pub static_gate_layers: Vec<crate::app::CustomLayerRegistration>,
     pub error_page_renderer: Option<SharedRenderer>,
     /// Custom session store installed via
     /// [`AppBuilder::with_session_store`](crate::app::AppBuilder::with_session_store).
@@ -202,6 +211,7 @@ pub fn try_build_router(
             merge_routers: Vec::new(),
             nest_routers: Vec::new(),
             custom_layers: Vec::new(),
+            static_gate_layers: Vec::new(),
             error_page_renderer: None,
             session_store: None,
             #[cfg(feature = "openapi")]
@@ -265,6 +275,7 @@ pub fn try_build_router_merged(
             merge_routers,
             nest_routers,
             custom_layers: Vec::new(),
+            static_gate_layers: Vec::new(),
             error_page_renderer: None,
             session_store: None,
             #[cfg(feature = "openapi")]
@@ -469,6 +480,7 @@ fn build_router_pre_state(
         state,
         ctx.exception_filters,
         ctx.custom_layers,
+        ctx.static_gate_layers,
         ctx.error_page_renderer,
         ctx.session_store,
     )?;
@@ -1800,13 +1812,18 @@ fn build_idempotency_layers(
     }))
 }
 
-#[allow(clippy::cognitive_complexity, clippy::too_many_lines)]
+#[allow(
+    clippy::cognitive_complexity,
+    clippy::too_many_lines,
+    clippy::too_many_arguments
+)]
 fn apply_middleware(
     mut router: axum::Router<AppState>,
     config: &AutumnConfig,
     state: &AppState,
     exception_filters: Vec<Arc<dyn ExceptionFilter>>,
     custom_layers: Vec<crate::app::CustomLayerRegistration>,
+    static_gate_layers: Vec<crate::app::CustomLayerRegistration>,
     error_page_renderer: Option<SharedRenderer>,
     session_store: Option<Arc<dyn crate::session::BoxedSessionStore>>,
 ) -> Result<axum::Router<AppState>, RouterBuildError> {
@@ -2003,6 +2020,7 @@ fn apply_middleware(
     // Error page context layer must be inner to the exception filter so
     // WantsHtml is set on the response before the filter inspects it.
     // Full ingress layer order (outermost -> innermost):
+    //   [static_gate layers — outermost, outside session and the static cache] ->
     //   TraceContext (applied outside the startup barrier so short-circuit
     //   responses still carry traceparent) ->
     //   Compression (outer to ExceptionFilter — see note below) ->
@@ -2028,7 +2046,33 @@ fn apply_middleware(
     // ETags are still computed on the uncompressed body before encoding occurs.
     let router = apply_compression_middleware(router, config);
 
+    // Pre-static gate layers (AppBuilder::static_gate) are applied OUTERMOST —
+    // outside session, request-id, compression, and everything else — so they
+    // run before any cached static page would be served and behave identically
+    // in fully-dynamic and SSG/ISG modes. In SSG/ISG mode these are drained by
+    // `try_build_router_with_static_inner` and applied outside the static-first
+    // middleware instead, so this loop sees an empty list there.
+    let router = apply_layers_in_registration_order(router, static_gate_layers, "Pre-static gate");
+
     Ok(router)
+}
+
+/// Apply a set of user-registered layer registrations so that the
+/// first-registered layer ends up outermost on ingress — matching
+/// [`tower::ServiceBuilder`] ordering. Returns the wrapped router.
+fn apply_layers_in_registration_order(
+    mut router: axum::Router<AppState>,
+    layers: Vec<crate::app::CustomLayerRegistration>,
+    what: &str,
+) -> axum::Router<AppState> {
+    let count = layers.len();
+    for registered in layers.into_iter().rev() {
+        router = (registered.apply)(router);
+    }
+    if count > 0 {
+        tracing::debug!(count, "{what} Tower layers applied");
+    }
+    router
 }
 
 async fn trusted_host_middleware(
@@ -2177,6 +2221,7 @@ pub fn try_build_router_with_static(
             merge_routers: Vec::new(),
             nest_routers: Vec::new(),
             custom_layers: Vec::new(),
+            static_gate_layers: Vec::new(),
             error_page_renderer: None,
             session_store: None,
             #[cfg(feature = "openapi")]
@@ -2242,6 +2287,14 @@ pub fn try_build_router_with_static_inner(
         &ctx.custom_layers,
     ));
     let custom_layers = std::mem::take(&mut ctx.custom_layers);
+
+    // Pre-static gate layers (AppBuilder::static_gate) are likewise extracted
+    // and applied OUTSIDE the static-first middleware (the outermost layer of
+    // all), so they run before the static cache lookup serves a pre-rendered
+    // page. Draining them here keeps build_router_pre_state from applying them
+    // to the inner router (which would place them inside the static middleware
+    // and defeat the gate for cached hits).
+    let static_gate_layers = std::mem::take(&mut ctx.static_gate_layers);
 
     let inner_router = build_router_pre_state(route_list, config, &state, ctx, opaque_present)?;
 
@@ -2311,16 +2364,11 @@ pub fn try_build_router_with_static_inner(
     // process both static and dynamic responses (e.g. compress the HTML on
     // the way out). Iterate in reverse so the first registered layer ends up
     // outermost — matching tower::ServiceBuilder ordering.
-    let custom_layer_count = custom_layers.len();
-    for registered in custom_layers.into_iter().rev() {
-        router = (registered.apply)(router);
-    }
-    if custom_layer_count > 0 {
-        tracing::debug!(
-            count = custom_layer_count,
-            "Custom Tower layers applied outside static middleware"
-        );
-    }
+    router = apply_layers_in_registration_order(
+        router,
+        custom_layers,
+        "Custom (outside static middleware)",
+    );
 
     // Compression must also be applied OUTSIDE the static-first middleware so
     // that pre-rendered HTML pages (served directly by StaticFileLayer without
@@ -2328,9 +2376,20 @@ pub fn try_build_router_with_static_inner(
     // apply_middleware for the dynamic-only path.
     router = apply_compression_middleware(router, config);
 
-    let router = router.layer(crate::security::SecurityHeadersLayer::from_config(
+    let mut router = router.layer(crate::security::SecurityHeadersLayer::from_config(
         &config.security.headers,
     ));
+
+    // Pre-static gate layers are applied OUTERMOST — outside the static-first
+    // middleware, custom layers, compression, and security headers — so they
+    // run before the static cache lookup and can redirect / reject a request
+    // before a cached SSG/ISG page is served. This mirrors their outermost
+    // placement in `apply_middleware` for the dynamic-only path.
+    router = apply_layers_in_registration_order(
+        router,
+        static_gate_layers,
+        "Pre-static gate (outside static middleware)",
+    );
 
     Ok(apply_startup_barrier(
         router.with_state(state),
@@ -3437,6 +3496,7 @@ mod tests {
             merge_routers: Vec::new(),
             nest_routers: Vec::new(),
             custom_layers: Vec::new(),
+            static_gate_layers: Vec::new(),
             error_page_renderer: None,
             session_store: None,
             openapi: Some(openapi),
@@ -3743,6 +3803,7 @@ mod tests {
             merge_routers: Vec::new(),
             nest_routers: Vec::new(),
             custom_layers: Vec::new(),
+            static_gate_layers: Vec::new(),
             error_page_renderer: None,
             session_store: None,
             openapi: Some(openapi),
@@ -3769,6 +3830,7 @@ mod tests {
             merge_routers: Vec::new(),
             nest_routers: Vec::new(),
             custom_layers: Vec::new(),
+            static_gate_layers: Vec::new(),
             error_page_renderer: None,
             session_store: None,
             openapi: Some(openapi),
@@ -3816,6 +3878,7 @@ mod tests {
             merge_routers: Vec::new(),
             nest_routers: Vec::new(),
             custom_layers: Vec::new(),
+            static_gate_layers: Vec::new(),
             error_page_renderer: None,
             session_store: None,
             openapi: Some(openapi),
@@ -3845,6 +3908,7 @@ mod tests {
             merge_routers: Vec::new(),
             nest_routers: Vec::new(),
             custom_layers: Vec::new(),
+            static_gate_layers: Vec::new(),
             error_page_renderer: None,
             session_store: None,
             openapi: Some(openapi),
@@ -3880,6 +3944,7 @@ mod tests {
             merge_routers: Vec::new(),
             nest_routers: vec![("/api".to_owned(), nested)],
             custom_layers: Vec::new(),
+            static_gate_layers: Vec::new(),
             error_page_renderer: None,
             session_store: None,
             openapi: Some(openapi),
@@ -3915,6 +3980,7 @@ mod tests {
                     merge_routers: Vec::new(),
                     nest_routers: Vec::new(),
                     custom_layers: Vec::new(),
+                    static_gate_layers: Vec::new(),
                     error_page_renderer: None,
                     session_store: None,
                     openapi: Some(openapi),
@@ -4655,6 +4721,195 @@ mod trusted_host_tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+    }
+
+    // ----------------------------------------------------------------------
+    // static_gate: middleware that runs before the static cache lookup (#848)
+    // ----------------------------------------------------------------------
+
+    /// Build a `CustomLayerRegistration` wrapping a `from_fn` gate that
+    /// redirects (302 → /login) any request lacking an `x-authed` header.
+    fn redirect_gate_registration() -> crate::app::CustomLayerRegistration {
+        let gate = axum::middleware::from_fn(
+            |req: axum::extract::Request, next: axum::middleware::Next| async move {
+                if req.headers().contains_key("x-authed") {
+                    next.run(req).await
+                } else {
+                    http::Response::builder()
+                        .status(StatusCode::FOUND)
+                        .header(http::header::LOCATION, "/login")
+                        .body(Body::empty())
+                        .unwrap()
+                }
+            },
+        );
+        crate::app::CustomLayerRegistration {
+            type_id: std::any::TypeId::of::<()>(),
+            type_name: "redirect_gate",
+            apply: Box::new(move |router| router.layer(gate)),
+        }
+    }
+
+    /// Create a minimal dist dir with `manifest.json` mapping `/` → an
+    /// `index.html` containing the marker text, and return the temp handle
+    /// plus the dist path.
+    fn build_cached_dist(marker: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dist = tmp.path().join("dist");
+        std::fs::create_dir_all(&dist).expect("create dist");
+        std::fs::write(dist.join("index.html"), marker).expect("write index.html");
+        let mut routes = std::collections::HashMap::new();
+        routes.insert(
+            "/".to_owned(),
+            crate::static_gen::ManifestEntry {
+                file: "index.html".to_owned(),
+                revalidate: None,
+            },
+        );
+        let manifest = crate::static_gen::StaticManifest {
+            generated_at: "2026-06-14T00:00:00Z".to_owned(),
+            autumn_version: "0.3.0".to_owned(),
+            routes,
+        };
+        std::fs::write(
+            dist.join("manifest.json"),
+            serde_json::to_string(&manifest).expect("serialize manifest"),
+        )
+        .expect("write manifest");
+        (tmp, dist)
+    }
+
+    fn ctx_with_static_gate(gate: crate::app::CustomLayerRegistration) -> RouterContext {
+        RouterContext {
+            exception_filters: Vec::new(),
+            scoped_groups: Vec::new(),
+            merge_routers: Vec::new(),
+            nest_routers: Vec::new(),
+            custom_layers: Vec::new(),
+            static_gate_layers: vec![gate],
+            error_page_renderer: None,
+            session_store: None,
+            #[cfg(feature = "openapi")]
+            openapi: None,
+            #[cfg(feature = "mcp")]
+            mcp: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn static_gate_runs_before_cached_static_page() {
+        // A cached SSG page exists at "/". The static_gate must intercept the
+        // request BEFORE the static-first middleware serves the pre-rendered
+        // HTML, redirecting unauthenticated visitors.
+        let (_tmp, dist) = build_cached_dist("<h1>cached</h1>");
+        let config = AutumnConfig::default();
+        let ctx = ctx_with_static_gate(redirect_gate_registration());
+
+        let app = super::try_build_router_with_static_inner(
+            Vec::new(),
+            &config,
+            crate::state::AppState::for_test(),
+            Some(dist.as_path()),
+            ctx,
+        )
+        .expect("router builds");
+
+        // Unauthenticated: gate fires before the cached page is served.
+        let unauthed = app
+            .clone()
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            unauthed.status(),
+            StatusCode::FOUND,
+            "static_gate must redirect before the cached page is served"
+        );
+        assert_eq!(
+            unauthed.headers().get(http::header::LOCATION).unwrap(),
+            "/login"
+        );
+
+        // Authenticated: gate passes through and the cached HTML is served.
+        let authed = app
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .header("x-authed", "1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(authed.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(authed.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&body).contains("cached"),
+            "authenticated request should receive the cached page"
+        );
+    }
+
+    #[tokio::test]
+    async fn static_gate_runs_in_dynamic_mode() {
+        // With no dist dir, the same gate must still run as the outermost
+        // middleware so auth-gating code is portable across SSG and dynamic
+        // modes.
+        async fn dynamic_handler() -> &'static str {
+            "dynamic"
+        }
+        let route = Route {
+            method: http::Method::GET,
+            path: "/",
+            handler: axum::routing::get(dynamic_handler),
+            name: "root",
+            api_doc: crate::openapi::ApiDoc {
+                method: "GET",
+                path: "/",
+                operation_id: "root",
+                success_status: 200,
+                ..Default::default()
+            },
+            repository: None,
+            idempotency: crate::route::RouteIdempotency::Direct,
+            api_version: None,
+            sunset_opt_out: false,
+        };
+        let config = AutumnConfig::default();
+        let ctx = ctx_with_static_gate(redirect_gate_registration());
+
+        let app = super::try_build_router_with_static_inner(
+            vec![route],
+            &config,
+            crate::state::AppState::for_test(),
+            None,
+            ctx,
+        )
+        .expect("router builds");
+
+        let unauthed = app
+            .clone()
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(unauthed.status(), StatusCode::FOUND);
+
+        let authed = app
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .header("x-authed", "1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(authed.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(authed.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&body), "dynamic");
     }
 }
 #[derive(Clone, Debug)]

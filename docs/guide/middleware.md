@@ -134,6 +134,77 @@ present in `call(..)` — there's no race condition to worry about.
 
 ---
 
+## Gating cached pages with `static_gate`
+
+When you pre-render routes (SSG) or revalidate them on a schedule (ISG), the
+cached HTML is served by Autumn's static-first middleware **before** the inner
+router — session, auth, and your `.layer()` calls — is ever reached. That is
+what makes static hits fast and keeps them available even if the session
+backend is down, but it also means the framework's auth layers cannot gate a
+pre-rendered response: the same HTML is served to every visitor regardless of
+auth state.
+
+`AppBuilder::static_gate` is Autumn's answer to this, analogous to Next.js
+*Edge Middleware* (`middleware.ts`) running before the CDN cache lookup. A gate
+layer runs **outermost** — outside the session layer and ahead of the static
+cache — so it can redirect or reject a request before a cached page is served:
+
+```
+static_gate (auth check / redirect)
+  └─ static cache lookup
+       └─ pre-rendered page served (or regenerated for ISG)
+            └─ … session, your .layer() calls, route handler …
+```
+
+```rust,ignore
+use autumn_web::prelude::*;
+use axum::{
+    extract::Request,
+    http::{header, StatusCode},
+    middleware::Next,
+    response::Response,
+};
+
+async fn require_auth(req: Request, next: Next) -> Response {
+    // Verify a signed/JWT session cookie DIRECTLY — the session Extension is
+    // not available this far out in the stack.
+    if has_valid_session_cookie(req.headers()) {
+        next.run(req).await
+    } else {
+        Response::builder()
+            .status(StatusCode::FOUND)
+            .header(header::LOCATION, "/login")
+            .body(axum::body::Body::empty())
+            .unwrap()
+    }
+}
+
+autumn_web::app()
+    .routes(routes![dashboard])
+    .static_gate(axum::middleware::from_fn(require_auth))
+    .run()
+    .await;
+```
+
+Key properties and trade-offs:
+
+- **Runs before the static cache** in SSG/ISG mode, so cached pages can be
+  auth-gated without baking user-specific content into the pre-rendered HTML.
+- **Runs in the same outermost position in fully-dynamic mode** (no `dist/`
+  directory), so the same gate behaves identically whether or not static
+  generation is active — gating code is portable.
+- **No session `Extension`.** The session layer runs *inside* the gate, so you
+  cannot read session-populated extensions here. Verify a signed session cookie
+  or JWT directly, using the same signing key you configure for sessions.
+- **Personalised content still needs a dynamic route** (or client-side fetch).
+  `static_gate` decides *whether* to serve a cached page, not *what* it
+  contains.
+- Multiple `static_gate` calls stack in registration order (first =
+  outermost), like `.layer()`. Plugins can pre-flight with
+  `has_static_gate::<L>()` / `get_static_gate_types()`.
+
+---
+
 ## Limitations (for now)
 
 - **No per-route layers.** `.layer()` wraps the whole app. If you need a
