@@ -249,3 +249,50 @@ fn migrate_down_steps_and_to_are_mutually_exclusive() {
         .expect("failed to run autumn");
     assert!(!output.status.success(), "--steps and --to should conflict");
 }
+
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers); run with -- --ignored"]
+async fn migrate_down_with_maintenance_enables_then_disables() {
+    use testcontainers::runners::AsyncRunner as _;
+    use testcontainers_modules::postgres::Postgres;
+
+    let container = Postgres::default()
+        .start()
+        .await
+        .expect("failed to start Postgres testcontainer");
+
+    let host = container.get_host().await.unwrap();
+    let port = container.get_host_port_ipv4(5432).await.unwrap();
+    let db_url = format!("postgres://postgres:postgres@{host}:{port}/postgres");
+
+    let tmp = tempfile::tempdir().unwrap();
+    let migrations_dir = tmp.path().join("migrations");
+    std::fs::create_dir_all(&migrations_dir).unwrap();
+    write_migration(
+        &migrations_dir,
+        "20260101000000_create_posts",
+        "CREATE TABLE posts (id BIGSERIAL PRIMARY KEY);",
+        "DROP TABLE posts;",
+    );
+
+    let envs = [("AUTUMN_DATABASE__URL", db_url.as_str())];
+    let dir = tmp.path();
+
+    run_autumn_ok(dir, &["migrate"], &envs);
+
+    // `migrate --with-maintenance down` should enable maintenance, roll back,
+    // then disable it again (leaving no maintenance flag file behind).
+    let (_, stderr) = run_autumn_ok(dir, &["migrate", "--with-maintenance", "down"], &envs);
+    assert!(
+        stderr.contains("Maintenance mode ENABLED"),
+        "should enable maintenance: {stderr}"
+    );
+    assert!(
+        stderr.contains("Maintenance mode DISABLED"),
+        "should disable maintenance after success: {stderr}"
+    );
+    assert!(
+        stderr.contains("Rolled back"),
+        "should report rollback: {stderr}"
+    );
+}

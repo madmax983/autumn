@@ -34,7 +34,7 @@ use std::path::Path;
 use std::process::Command;
 
 use autumn_web::migrate::{
-    EmbeddedMigrations, FRAMEWORK_MIGRATIONS, MigrationError, MigrationResult,
+    AppliedUserMigration, EmbeddedMigrations, FRAMEWORK_MIGRATIONS, MigrationError, MigrationResult,
 };
 
 /// Default directory containing Diesel migration files.
@@ -86,7 +86,7 @@ pub fn run(action: &MigrateAction, with_maintenance: bool) {
             return;
         }
         MigrateAction::Down(args) => {
-            run_down(args);
+            run_down(args, with_maintenance);
             return;
         }
         _ => {}
@@ -526,18 +526,16 @@ fn is_production_profile() -> bool {
     normalized == "prod" || normalized == "production"
 }
 
-/// Find the migration directory that starts with `version` inside `migrations_dir`.
-fn find_migration_dir(migrations_dir: &Path, version: &str) -> Option<std::path::PathBuf> {
-    std::fs::read_dir(migrations_dir)
-        .ok()?
-        .filter_map(std::result::Result::ok)
-        .filter(|e| e.path().is_dir())
-        .find(|e| {
-            e.file_name()
-                .to_str()
-                .is_some_and(|s| s.starts_with(version))
-        })
-        .map(|e| e.path())
+/// Whether an applied user migration has a usable `down.sql` on disk.
+///
+/// Returns `false` when the migration is not present locally (`dir` is `None`)
+/// or its `down.sql` is missing/empty/comment-only.
+fn has_revertable_down_sql(m: &AppliedUserMigration) -> bool {
+    m.dir.as_ref().is_some_and(|d| {
+        std::fs::read_to_string(d.join("down.sql"))
+            .ok()
+            .is_some_and(|sql| safety::has_executable_sql(&sql))
+    })
 }
 
 /// Build the newest-first list of user-migration versions to revert.
@@ -545,28 +543,35 @@ fn find_migration_dir(migrations_dir: &Path, version: &str) -> Option<std::path:
 /// With `--to VERSION`, every applied version strictly newer than `VERSION` is
 /// reverted (exiting non-zero if `VERSION` is not currently applied). Otherwise
 /// the most recently applied `--steps N` (default 1) versions are reverted.
-fn build_rollback_plan(args: &DownArgs, applied: &[String]) -> Vec<String> {
+///
+/// `applied` is ascending by version, so the newest-first plan is its reverse.
+fn build_rollback_plan(args: &DownArgs, applied: &[AppliedUserMigration]) -> Vec<String> {
     let Some(target_version) = args.to.as_deref() else {
         let n = args.steps.unwrap_or(1);
-        return applied.iter().rev().take(n).cloned().collect();
+        return applied
+            .iter()
+            .rev()
+            .take(n)
+            .map(|m| m.version.clone())
+            .collect();
     };
 
-    if !applied.iter().any(|v| v == target_version) {
+    if !applied.iter().any(|m| m.version == target_version) {
         eprintln!("\u{2717} Version {target_version} is not currently applied.");
         eprintln!("  Check `autumn migrate status` to see the applied user migrations.");
         std::process::exit(1);
     }
     applied
         .iter()
-        .filter(|v| v.as_str() > target_version)
+        .filter(|m| m.version.as_str() > target_version)
         .rev()
-        .cloned()
+        .map(|m| m.version.clone())
         .collect()
 }
 
 /// Run `autumn migrate down`.
-fn run_down(args: &DownArgs) {
-    use autumn_web::migrate::{applied_user_migrations, revert_user_migrations};
+fn run_down(args: &DownArgs, with_maintenance: bool) {
+    use autumn_web::migrate::revert_user_migrations_locked;
 
     // 1. Production guard
     if is_production_profile() && !args.yes_i_mean_prod {
@@ -581,74 +586,77 @@ fn run_down(args: &DownArgs) {
     let migrations_dir = resolve_migrations_dir();
     let dir = Path::new(&migrations_dir);
 
-    // 3. Get applied user migrations (ascending order)
-    let applied = match applied_user_migrations(&database_url, dir) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("\u{2717} Failed to list applied user migrations: {e}");
-            std::process::exit(1);
-        }
-    };
+    // 3. Plan + revert atomically under the migration advisory lock. Listing the
+    //    applied migrations, building the plan, and preflighting down.sql all
+    //    happen inside `plan` (under the lock) so the plan cannot go stale
+    //    between read and execute (e.g. two concurrent `down` runs).
+    let result = revert_user_migrations_locked(
+        &database_url,
+        dir,
+        None,
+        |applied| {
+            let plan = build_rollback_plan(args, applied);
+            if plan.is_empty() {
+                eprintln!("  \u{2713} Nothing to roll back.");
+                return Ok(plan);
+            }
 
-    // 4. Build plan (newest-first)
-    let plan = build_rollback_plan(args, &applied);
+            // Preflight: every planned migration must have an executable
+            // down.sql. Applied-but-missing-locally migrations (dir = None) are
+            // surfaced here by name rather than silently skipped.
+            let missing: Vec<&str> = plan
+                .iter()
+                .filter_map(|version| {
+                    let m = applied.iter().find(|m| &m.version == version)?;
+                    (!has_revertable_down_sql(m)).then_some(m.name.as_str())
+                })
+                .collect();
+            if !missing.is_empty() {
+                eprintln!(
+                    "\u{2717} The following migration(s) have no executable down.sql and cannot be reverted:"
+                );
+                for name in &missing {
+                    eprintln!("    \u{2022} {name}");
+                }
+                eprintln!(
+                    "  Add a down.sql to each migration before running `autumn migrate down`."
+                );
+                std::process::exit(1);
+            }
 
-    if plan.is_empty() {
-        eprintln!("  \u{2713} Nothing to roll back.");
-        return;
-    }
-
-    // 5. Preflight: every planned migration must have an executable down.sql
-    let mut missing: Vec<String> = Vec::new();
-    for version in &plan {
-        let mdir = find_migration_dir(dir, version);
-        let has_down = mdir.as_ref().is_some_and(|d| {
-            std::fs::read_to_string(d.join("down.sql"))
-                .ok()
-                .is_some_and(|sql| safety::has_executable_sql(&sql))
-        });
-        if !has_down {
-            let display = mdir.as_ref().map_or_else(
-                || version.clone(),
-                |d| {
-                    d.file_name()
-                        .unwrap_or_default()
-                        .to_string_lossy()
-                        .into_owned()
-                },
+            // Preflight passed: enable maintenance mode (if requested) before we
+            // start mutating schema, then stream the rollback.
+            if with_maintenance {
+                enable_maintenance_for_migrate();
+            }
+            eprintln!("  Rolling back {} migration(s)...\n", plan.len());
+            Ok(plan)
+        },
+        |r| {
+            eprintln!(
+                "  \u{2713} Rolled back {}  ({}ms)",
+                r.name,
+                r.duration.as_millis()
             );
-            missing.push(display);
-        }
-    }
-
-    if !missing.is_empty() {
-        eprintln!(
-            "\u{2717} The following migration(s) have no executable down.sql and cannot be reverted:"
-        );
-        for name in &missing {
-            eprintln!("    \u{2022} {name}");
-        }
-        eprintln!("  Add a down.sql to each migration before running `autumn migrate down`.");
-        std::process::exit(1);
-    }
-
-    // 6. Revert under advisory lock, streaming per-migration UX
-    eprintln!("  Rolling back {} migration(s)...\n", plan.len());
-
-    let result = revert_user_migrations(&database_url, dir, &plan, |r| {
-        eprintln!(
-            "  \u{2713} Rolled back {}  ({}ms)",
-            r.name,
-            r.duration.as_millis()
-        );
-    });
+        },
+    );
 
     match result {
-        Ok(()) => {
-            eprintln!("\n\u{2713} {} migration(s) rolled back.", plan.len());
+        Ok(0) => {} // "Nothing to roll back." already printed; maintenance never enabled.
+        Ok(n) => {
+            eprintln!("\n\u{2713} {n} migration(s) rolled back.");
+            if with_maintenance {
+                disable_maintenance_after_migrate();
+            }
         }
         Err(e) => {
             eprintln!("\n\u{2717} Rollback failed: {e}");
+            if with_maintenance {
+                eprintln!(
+                    "  \u{26A0}\u{FE0F}  Maintenance mode left ON for safety. Investigate, then run \
+                     `autumn maintenance off` to re-open traffic."
+                );
+            }
             std::process::exit(1);
         }
     }
@@ -674,27 +682,19 @@ fn show_rollback_availability(database_url: &str, migrations_dir: &str) {
         return;
     }
 
-    for version in &applied {
-        let version_dir = find_migration_dir(dir, version);
-        let (label, has_down) = version_dir.as_ref().map_or_else(
-            || (version.clone(), false),
-            |d| {
-                let name = d
-                    .file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .into_owned();
-                let has_down = std::fs::read_to_string(d.join("down.sql"))
-                    .ok()
-                    .is_some_and(|sql| safety::has_executable_sql(&sql));
-                (name, has_down)
-            },
-        );
-
-        if has_down {
-            eprintln!("  \u{2713} {label}");
+    for m in &applied {
+        if m.dir.is_none() {
+            eprintln!(
+                "  \u{2717} {}  (applied but missing locally — not revertable)",
+                m.name
+            );
+        } else if has_revertable_down_sql(m) {
+            eprintln!("  \u{2713} {}", m.name);
         } else {
-            eprintln!("  \u{2717} {label}  (no executable down.sql — not revertable)");
+            eprintln!(
+                "  \u{2717} {}  (no executable down.sql — not revertable)",
+                m.name
+            );
         }
     }
     eprintln!();
@@ -1037,6 +1037,103 @@ mod tests {
     #[test]
     fn default_migrations_dir_is_migrations() {
         assert_eq!(DEFAULT_MIGRATIONS_DIR, "migrations");
+    }
+
+    // ── rollback planning ────────────────────────────────────────────────────
+
+    fn applied(version: &str) -> AppliedUserMigration {
+        AppliedUserMigration {
+            version: version.to_string(),
+            name: format!("{version}_m"),
+            dir: Some(std::path::PathBuf::from(format!("migrations/{version}_m"))),
+        }
+    }
+
+    #[test]
+    fn build_rollback_plan_default_reverts_single_newest() {
+        // `applied` is ascending; default plan reverts only the newest.
+        let applied = [applied("20260101000000"), applied("20260102000000")];
+        let args = DownArgs {
+            steps: None,
+            to: None,
+            yes_i_mean_prod: false,
+        };
+        assert_eq!(build_rollback_plan(&args, &applied), ["20260102000000"]);
+    }
+
+    #[test]
+    fn build_rollback_plan_steps_reverts_n_newest_first() {
+        let applied = [
+            applied("20260101000000"),
+            applied("20260102000000"),
+            applied("20260103000000"),
+        ];
+        let args = DownArgs {
+            steps: Some(2),
+            to: None,
+            yes_i_mean_prod: false,
+        };
+        // Newest-first so dependent migrations revert before their dependencies.
+        assert_eq!(
+            build_rollback_plan(&args, &applied),
+            ["20260103000000", "20260102000000"]
+        );
+    }
+
+    #[test]
+    fn build_rollback_plan_to_reverts_strictly_newer_newest_first() {
+        let applied = [
+            applied("20260101000000"),
+            applied("20260102000000"),
+            applied("20260103000000"),
+        ];
+        let args = DownArgs {
+            steps: None,
+            to: Some("20260101000000".to_string()),
+            yes_i_mean_prod: false,
+        };
+        assert_eq!(
+            build_rollback_plan(&args, &applied),
+            ["20260103000000", "20260102000000"]
+        );
+    }
+
+    #[test]
+    fn has_revertable_down_sql_false_when_missing_locally() {
+        let m = AppliedUserMigration {
+            version: "20260101000000".to_string(),
+            name: "20260101000000".to_string(),
+            dir: None,
+        };
+        assert!(!has_revertable_down_sql(&m));
+    }
+
+    #[test]
+    fn has_revertable_down_sql_true_for_executable_down() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("20260101000000_create_posts");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("down.sql"), "DROP TABLE posts;").unwrap();
+        let m = AppliedUserMigration {
+            version: "20260101000000".to_string(),
+            name: "20260101000000_create_posts".to_string(),
+            dir: Some(dir),
+        };
+        assert!(has_revertable_down_sql(&m));
+    }
+
+    #[test]
+    fn has_revertable_down_sql_false_for_comment_only_down() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("20260101000000_create_posts");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("down.sql"), "-- nothing to do\n").unwrap();
+        let m = AppliedUserMigration {
+            version: "20260101000000".to_string(),
+            name: "20260101000000_create_posts".to_string(),
+            dir: Some(dir),
+        };
+        assert!(!has_revertable_down_sql(&m));
     }
 
     #[test]

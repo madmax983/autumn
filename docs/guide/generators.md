@@ -209,6 +209,9 @@ autumn migrate down --to 20260101000000
 
 # Required when AUTUMN_ENV=prod:
 autumn migrate down --yes-i-mean-prod
+
+# Enable maintenance mode around the rollback, then disable it on success:
+autumn migrate --with-maintenance down
 ```
 
 ### Framework migrations are forward-only
@@ -224,14 +227,22 @@ depend on them.
 Before touching the database, `autumn migrate down` checks:
 
 1. **Production guard** — If `AUTUMN_ENV` is `prod` or `production`, the command
-   refuses unless `--yes-i-mean-prod` is passed.
+   refuses unless `--yes-i-mean-prod` is passed. (An empty `AUTUMN_ENV` falls
+   back to the legacy `AUTUMN_PROFILE`.)
 2. **down.sql preflight** — Every migration in the plan must have a non-empty,
    non-comment `down.sql`. If any are missing or blank, the command names them
-   and exits non-zero without touching the database.
+   and exits non-zero without touching the database. A migration recorded as
+   applied but no longer present locally is also surfaced as non-revertable
+   rather than silently skipped.
+
+Listing the applied migrations, building the plan, and reverting all happen
+while the migration advisory lock is held, so two concurrent `down` runs are
+serialized and neither double-reverts.
 
 `autumn migrate check` also classifies `down.sql` files (in addition to
-`up.sql`), so you can catch unsafe rollback SQL — such as `DROP TABLE` — before
-an incident.
+`up.sql`), so you can catch unsafe rollback SQL — such as `DROP TABLE` or a
+`DROP INDEX CONCURRENTLY` that is missing its `run_in_transaction = false`
+opt-out — before an incident.
 
 ### Observability
 
