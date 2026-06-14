@@ -223,10 +223,7 @@ async fn preload_routes_through_read_role_and_fails_fast_on_unavailable() {
         .mark_replica_unready("replica connection failed");
 
     let repo: PgReplicaNoteRepository = extract(&state).await;
-    assert!(matches!(
-        repo.__autumn_read_route(),
-        ReadRoute::Unavailable
-    ));
+    assert!(matches!(repo.__autumn_read_route(), ReadRoute::Unavailable));
 
     let err = repo
         .preload(

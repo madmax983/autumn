@@ -25,19 +25,18 @@
 //! ```
 
 use autumn_web::preload::{Preloadable, Preloaded};
+use diesel::prelude::*;
 use diesel::sql_types::BigInt;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::pooled_connection::deadpool::Pool;
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
-use diesel::prelude::*;
 
 use reddit_clone::models::{Comment, CommentAssociations, Post, PostAssociations};
 use reddit_clone::schema::posts;
 use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::postgres::Postgres;
 
-const CREATE_SCHEMA: &str =
-    include_str!("../migrations/20260419000000_create_reddit/up.sql");
+const CREATE_SCHEMA: &str = include_str!("../migrations/20260419000000_create_reddit/up.sql");
 
 #[derive(diesel::QueryableByName)]
 struct CountRow {
@@ -132,7 +131,10 @@ async fn preload_happy_path() {
     .expect("preload");
 
     let post = &loaded[0];
-    let author = post.author().expect("author preloaded").expect("author present");
+    let author = post
+        .author()
+        .expect("author preloaded")
+        .expect("author present");
     assert_eq!(author.username, "ada");
 
     let comments = post.comments().expect("comments preloaded");
@@ -190,7 +192,10 @@ async fn preload_missing_parent() {
         .expect("preload");
 
     let author = loaded[0].author().expect("author was preloaded");
-    assert!(author.is_none(), "missing parent => Ok(None), distinct from NotLoaded");
+    assert!(
+        author.is_none(),
+        "missing parent => Ok(None), distinct from NotLoaded"
+    );
 }
 
 #[tokio::test]
@@ -200,12 +205,10 @@ async fn preload_nested_path() {
     let mut conn = pool.get().await.expect("conn");
     setup_schema(&mut conn).await;
     seed_base(&mut conn).await;
-    diesel::sql_query(
-        "INSERT INTO comments (body, author_id, post_id) VALUES ('hi', 2, 1)",
-    )
-    .execute(&mut *conn)
-    .await
-    .unwrap();
+    diesel::sql_query("INSERT INTO comments (body, author_id, post_id) VALUES ('hi', 2, 1)")
+        .execute(&mut *conn)
+        .await
+        .unwrap();
 
     let mut loaded = all_posts(&mut conn).await;
     // posts.preload(comments.author)
@@ -303,7 +306,11 @@ async fn preload_is_batched_no_n_plus_one() {
         .count
     }
 
-    let spec = || Post::preload().author().comments_with(Comment::preload().author());
+    let spec = || {
+        Post::preload()
+            .author()
+            .comments_with(Comment::preload().author())
+    };
 
     // Small post.
     let mut small: Vec<Preloaded<Post>> = vec![Preloaded::new(

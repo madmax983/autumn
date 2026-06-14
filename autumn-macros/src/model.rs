@@ -275,15 +275,11 @@ fn emit_association_items(
 
                 let (key_expr, filter_col) = match assoc.kind {
                     // belongs_to: fk is on *this* model, points at target's id.
-                    AssocKind::BelongsTo => (
-                        quote! { __r.#fk_ident },
-                        quote! { #target_table::id },
-                    ),
+                    AssocKind::BelongsTo => {
+                        (quote! { __r.#fk_ident }, quote! { #target_table::id })
+                    }
                     // has_one: fk is on the *target*, points at this model's id.
-                    _ => (
-                        quote! { __r.id },
-                        quote! { #target_table::#fk_ident },
-                    ),
+                    _ => (quote! { __r.id }, quote! { #target_table::#fk_ident }),
                 };
                 // For has_one the lookup map keys on the target's fk column; for
                 // belongs_to it keys on the target's id.
@@ -2880,8 +2876,7 @@ mod tests {
     fn belongs_to_explicit_fk_derives_name_from_fk() {
         let post = syn::parse_quote!(Post);
         let user = syn::parse_quote!(User);
-        let (fk, name) =
-            resolve_fk_and_name(AssocKind::BelongsTo, &post, &user, Some("author_id"));
+        let (fk, name) = resolve_fk_and_name(AssocKind::BelongsTo, &post, &user, Some("author_id"));
         assert_eq!(fk, "author_id");
         assert_eq!(name, "author");
     }
