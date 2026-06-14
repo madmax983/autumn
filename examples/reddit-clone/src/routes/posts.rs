@@ -14,8 +14,9 @@ use diesel_async::RunQueryDsl;
 use scoped_futures::ScopedFutureExt;
 
 use crate::jobs::{PostPublicationArgs, PostPublicationJob};
-use crate::models::{Post, Subreddit, User};
-use crate::schema::{comments, posts, subreddits, users};
+use crate::models::{Comment, CommentAssociations, Post, PostAssociations, Subreddit};
+use crate::repositories::PgPostRepository;
+use crate::schema::{posts, subreddits};
 use crate::slugify::slugify;
 
 fn posts_per_page() -> i64 {
@@ -28,19 +29,6 @@ fn posts_per_page() -> i64 {
 
 use super::layout::{layout, time_ago, vote_controls};
 
-/// (`post_id`, title, `post_slug`, score, `comment_count`, author, `sub_name`, `sub_slug`, `created_at`)
-type PostSummary = (
-    i64,
-    String,
-    String,
-    i64,
-    i64,
-    String,
-    String,
-    String,
-    chrono::NaiveDateTime,
-);
-
 // ── Front page — hot posts across all subreddits ───────────────
 
 #[get("/")]
@@ -48,27 +36,23 @@ pub async fn front_page(
     session: Session,
     csrf: CsrfToken,
     mut db: Db,
+    repo: PgPostRepository,
     flags: Flags,
 ) -> AutumnResult<Markup> {
     let current_user = session.get("username").await;
 
-    let hot_posts: Vec<PostSummary> = posts::table
-        .inner_join(users::table.on(posts::author_id.eq(users::id)))
-        .inner_join(subreddits::table.on(posts::subreddit_id.eq(subreddits::id)))
+    // Hot posts across all subreddits. Instead of a hand-written two-way join,
+    // load the page of posts, then `preload` their author + subreddit. This is
+    // `1 + K` queries (here: posts, authors, subreddits = 3) regardless of how
+    // many posts are on the page — no N+1.
+    let hot_posts: Vec<Post> = posts::table
         .order(posts::hot_rank.desc())
         .limit(posts_per_page())
-        .select((
-            posts::id,
-            posts::title,
-            posts::slug,
-            posts::score,
-            posts::comment_count,
-            users::username,
-            subreddits::name,
-            subreddits::slug,
-            posts::created_at,
-        ))
+        .select(Post::as_select())
         .load(&mut *db)
+        .await?;
+    let hot_posts = repo
+        .preload(hot_posts, Post::preload().author().subreddit())
         .await?;
 
     Ok(layout(
@@ -98,30 +82,40 @@ pub async fn front_page(
 
             // Post list
             div class="space-y-2" {
-                @for (post_id, title, post_slug, score, comment_count, author, sub_name, sub_slug, created_at) in &hot_posts {
-                    div class="bg-white rounded-lg shadow-sm border border-gray-200 \
-                               hover:border-orange-300 transition-colors" {
-                        div class="flex items-start gap-3 p-4" {
-                            (vote_controls(*post_id, *score))
-                            div class="flex-1 min-w-0" {
-                                a href=(paths::show(sub_slug, post_slug))
-                                   class="text-lg font-medium text-gray-900 hover:text-orange-600 \
-                                          line-clamp-2" {
-                                    (title)
-                                }
-                                div class="text-xs text-gray-400 mt-1" {
-                                    a href=(super::subreddits::__autumn_path_show(sub_slug))
-                                       class="font-medium text-gray-600 hover:underline" {
-                                        "r/" (sub_name)
+                @for post in &hot_posts {
+                    // Typed accessors on the preloaded record. `?`-free in
+                    // templates: treat a missing preload as "absent".
+                    @let author = post.author().ok().flatten();
+                    @let sub = post.subreddit().ok().flatten();
+                    @if let Some(sub) = sub {
+                        div class="bg-white rounded-lg shadow-sm border border-gray-200 \
+                                   hover:border-orange-300 transition-colors" {
+                            div class="flex items-start gap-3 p-4" {
+                                (vote_controls(post.id, post.score))
+                                div class="flex-1 min-w-0" {
+                                    a href=(paths::show(&sub.slug, &post.slug))
+                                       class="text-lg font-medium text-gray-900 hover:text-orange-600 \
+                                              line-clamp-2" {
+                                        (post.title)
                                     }
-                                    " \u{2022} posted by "
-                                    a href=(super::auth::__autumn_path_profile(author))
-                                       class="text-gray-500 hover:underline" { "u/" (author) }
-                                    " " (time_ago(created_at))
-                                    " \u{2022} "
-                                    a href=(paths::show(sub_slug, post_slug))
-                                       class="text-gray-500 hover:text-orange-600" {
-                                        (comment_count) " comments"
+                                    div class="text-xs text-gray-400 mt-1" {
+                                        a href=(super::subreddits::__autumn_path_show(&sub.slug))
+                                           class="font-medium text-gray-600 hover:underline" {
+                                            "r/" (sub.name)
+                                        }
+                                        @if let Some(author) = author {
+                                            " \u{2022} posted by "
+                                            a href=(super::auth::__autumn_path_profile(&author.username))
+                                               class="text-gray-500 hover:underline" {
+                                                "u/" (author.username)
+                                            }
+                                        }
+                                        " " (time_ago(&post.created_at))
+                                        " \u{2022} "
+                                        a href=(paths::show(&sub.slug, &post.slug))
+                                           class="text-gray-500 hover:text-orange-600" {
+                                            (post.comment_count) " comments"
+                                        }
                                     }
                                 }
                             }
@@ -408,6 +402,7 @@ pub async fn show(
     session: Session,
     csrf: CsrfToken,
     mut db: Db,
+    repo: PgPostRepository,
     flags: Flags,
 ) -> AutumnResult<Markup> {
     let current_user = session.get("username").await;
@@ -428,21 +423,28 @@ pub async fn show(
         .await
         .map_err(|_| AutumnError::not_found_msg("Post not found"))?;
 
-    let author: User = users::table
-        .find(post.author_id)
-        .select(User::as_select())
-        .first(&mut *db)
+    // Eager-load the post's author and its comments (each with their author),
+    // replacing the per-row author lookup + hand-written comment/author join.
+    // For a post with N comments this is a fixed 2 extra queries (post.author,
+    // comments) + 1 (comments.author) = at most 3 here, never `2 + N`.
+    let mut loaded = repo
+        .preload(
+            vec![post],
+            Post::preload()
+                .author()
+                .comments_with(Comment::preload().author()),
+        )
         .await?;
+    let post = loaded.remove(0);
+    let author = post.author()?;
 
-    // Load top-level comments with authors
-    let post_comments: Vec<(crate::models::Comment, String)> = comments::table
-        .filter(comments::post_id.eq(post.id))
-        .filter(comments::parent_id.is_null())
-        .inner_join(users::table.on(comments::author_id.eq(users::id)))
-        .order(comments::score.desc())
-        .select((crate::models::Comment::as_select(), users::username))
-        .load(&mut *db)
-        .await?;
+    // Show top-level comments (parent_id IS NULL), highest score first.
+    let mut post_comments: Vec<&autumn_web::preload::Preloaded<Comment>> = post
+        .comments()?
+        .iter()
+        .filter(|c| c.parent_id.is_none())
+        .collect();
+    post_comments.sort_by(|a, b| b.score.cmp(&a.score));
 
     let is_author = current_user_id
         .as_ref()
@@ -469,10 +471,12 @@ pub async fn show(
                     div class="flex-1" {
                         h1 class="text-2xl font-bold text-gray-900 mb-2" { (post.title) }
                         div class="text-xs text-gray-400 mb-4" {
-                            "posted by "
-                            a href=(super::auth::__autumn_path_profile(&author.username))
-                               class="text-gray-500 hover:underline" {
-                                "u/" (author.username)
+                            @if let Some(author) = author {
+                                "posted by "
+                                a href=(super::auth::__autumn_path_profile(&author.username))
+                                   class="text-gray-500 hover:underline" {
+                                    "u/" (author.username)
+                                }
                             }
                             " " (time_ago(&post.created_at))
                         }
@@ -550,12 +554,15 @@ pub async fn show(
                 h2 class="font-semibold text-gray-700 mb-2" {
                     (post.comment_count) " Comments"
                 }
-                @for (comment, comment_author) in &post_comments {
+                @for comment in &post_comments {
+                    @let comment_author = comment.author().ok().flatten();
                     div class="bg-white rounded-lg shadow-sm border border-gray-200 p-4" {
                         div class="flex items-center gap-2 text-xs text-gray-400 mb-2" {
-                            a href=(super::auth::__autumn_path_profile(comment_author))
-                               class="font-medium text-gray-600 hover:underline" {
-                                "u/" (comment_author)
+                            @if let Some(comment_author) = comment_author {
+                                a href=(super::auth::__autumn_path_profile(&comment_author.username))
+                                   class="font-medium text-gray-600 hover:underline" {
+                                    "u/" (comment_author.username)
+                                }
                             }
                             "\u{2022} " (time_ago(&comment.created_at))
                             "\u{2022} " (comment.score) " points"
