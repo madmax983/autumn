@@ -839,6 +839,10 @@ fn generate_auth_in_fresh_project_creates_expected_files() {
     );
     assert!(up.contains("email"), "up.sql missing email column");
     assert!(
+        up.contains("time_zone TEXT NULL"),
+        "up.sql missing time_zone column"
+    );
+    assert!(
         up.contains("password_digest"),
         "up.sql missing password_digest"
     );
@@ -859,6 +863,10 @@ fn generate_auth_in_fresh_project_creates_expected_files() {
     assert!(
         model.contains("pub email: String"),
         "model missing email field"
+    );
+    assert!(
+        model.contains("pub time_zone: Option<String>"),
+        "model missing time_zone field"
     );
     assert!(
         model.contains("pub password_digest: String"),
@@ -885,6 +893,10 @@ fn generate_auth_in_fresh_project_creates_expected_files() {
     assert!(
         schema.contains("email -> Text"),
         "schema.rs missing email column"
+    );
+    assert!(
+        schema.contains("time_zone -> Nullable<Text>"),
+        "schema.rs missing time_zone column"
     );
     assert!(
         schema.contains("reset_token_digest -> Nullable<Text>"),

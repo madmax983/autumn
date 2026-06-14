@@ -480,7 +480,8 @@ pub fn plan_auth_with_providers(
     //   password_digest  String   → Text      NOT NULL
     //   reset_token_digest         Option<String>         → Nullable<Text>
     //   reset_token_expires_at     Option<NaiveDateTime>  → Nullable<Timestamp>
-    let mut user_field_tokens: Vec<&str> = vec!["email:String", "password_digest:String"];
+    let mut user_field_tokens: Vec<&str> =
+        vec!["email:String", "time_zone:Option<String>", "password_digest:String"];
     if totp {
         user_field_tokens.push("totp_secret_encrypted:Option<String>");
         user_field_tokens.push("totp_enabled:bool");
@@ -1384,6 +1385,7 @@ fn render_migration_up(snake_name: &str, table: &str, totp: bool) -> String {
         "CREATE TABLE {table} (\n\
          \x20   id BIGSERIAL PRIMARY KEY,\n\
          \x20   email TEXT NOT NULL UNIQUE,\n\
+         \x20   time_zone TEXT NULL,\n\
          \x20   password_digest TEXT NOT NULL,\n\
          {totp_columns}\
          \x20   failed_attempts INT NOT NULL DEFAULT 0,\n\
@@ -1483,6 +1485,7 @@ use crate::schema::{table};
 pub struct {pascal_name} {{
     pub id: i64,
     pub email: String,
+    pub time_zone: Option<String>,
     pub password_digest: String,
 {totp_fields}    #[default]
     pub failed_attempts: i32,

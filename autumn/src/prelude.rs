@@ -247,6 +247,27 @@ pub use crate::i18n::Locale;
 #[cfg(feature = "i18n")]
 pub use crate::i18n::t;
 
+// ── Time zones ────────────────────────────────────────────────────
+/// Request-scoped time zone extractor (resolves from user extension,
+/// session, cookie, and query parameter — see [`crate::time_zone`]).
+pub use crate::time_zone::TimeZone;
+/// Newtype for auth middleware to publish the authenticated user's zone
+/// into request extensions.
+pub use crate::time_zone::UserTimeZone;
+/// Render a UTC timestamp as a `<time>` element in the given zone.
+#[cfg(feature = "maud")]
+pub use crate::time_zone::local_datetime;
+/// Render only the date portion in the given zone.
+#[cfg(feature = "maud")]
+pub use crate::time_zone::local_date;
+/// Render a relative time string (e.g. "3 minutes ago") as a `<time>` element.
+#[cfg(feature = "maud")]
+pub use crate::time_zone::time_ago;
+/// Parse a browser `datetime-local` value as a local time in `tz` → UTC.
+pub use crate::time_zone::parse_local_datetime;
+/// Format a UTC timestamp as a `datetime-local` input value in `tz`.
+pub use crate::time_zone::to_local_input_value;
+
 #[cfg(test)]
 mod tests {
     use super::*;

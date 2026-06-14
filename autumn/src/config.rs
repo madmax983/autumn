@@ -732,6 +732,20 @@ pub struct AutumnConfig {
     #[cfg(feature = "i18n")]
     #[serde(default)]
     pub i18n: crate::i18n::I18nConfig,
+
+    /// Per-user time zone settings (`[time_zone]` block in `autumn.toml`).
+    ///
+    /// Controls the default IANA zone and the source resolution chain for the
+    /// [`TimeZone`](crate::time_zone::TimeZone) extractor.
+    ///
+    /// # Example
+    ///
+    /// ```toml
+    /// [time_zone]
+    /// identifier = "America/New_York"
+    /// ```
+    #[serde(default)]
+    pub time_zone: crate::time_zone::TimeZoneConfig,
     /// Pluggable file storage configuration. Honored only when the
     /// `storage` cargo feature is enabled.
     #[cfg(feature = "storage")]
@@ -1817,6 +1831,7 @@ impl AutumnConfig {
             .map_err(|error| ConfigError::Validation(error.to_string()))?;
         #[cfg(feature = "mail")]
         self.mail.validate(self.profile.as_deref())?;
+        self.time_zone.validate()?;
         // Session backend validation deliberately lives in
         // `crate::session::apply_session_layer`, not here. That function
         // short-circuits when a custom `SessionStore` was installed via
