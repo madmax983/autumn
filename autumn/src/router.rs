@@ -428,8 +428,14 @@ fn build_router_pre_state(
     };
 
     let idempotency_layers = build_idempotency_layers(config, state)?;
-    let opaque_app_layers_present = opaque_app_layers_override
-        .unwrap_or_else(|| custom_layers_require_fail_closed_idempotency(&ctx.custom_layers));
+    // Both `.layer(..)` custom layers and `.static_gate(..)` gate layers are
+    // opaque app layers for idempotency: an auth/tenant layer in either slot
+    // must force fail-closed replay so a cached mutation can't be served to a
+    // different principal carrying the same Idempotency-Key.
+    let opaque_app_layers_present = opaque_app_layers_override.unwrap_or_else(|| {
+        custom_layers_require_fail_closed_idempotency(&ctx.custom_layers)
+            || custom_layers_require_fail_closed_idempotency(&ctx.static_gate_layers)
+    });
     let mut router = group_and_mount_routes(
         route_list,
         idempotency_layers.as_ref(),
@@ -537,16 +543,21 @@ fn build_router_pre_state(
     //
     // KNOWN LIMITATION (static/ISR mode): when an app has a `dist` manifest,
     // `try_build_router_with_static_inner` drains the global custom layers
-    // (`AppBuilder::layer`) and applies them *outside* the static-first
+    // (`AppBuilder::layer`) and the pre-static gate layers
+    // (`AppBuilder::static_gate`) and applies them *outside* the static-first
     // middleware — i.e. after this builder returns. This dispatch clone is
     // built here, before that, so a `tools/call` replay does not pass through
-    // those outer custom layers (it would in the non-static path, where they
-    // are applied via `apply_middleware` before the clone is taken). Route-level
-    // guards and `#[secured]` dispatch through this clone and so still apply;
-    // only hand-rolled global `.layer(...)` middleware is skipped for MCP calls
-    // in static mode. Restoring full parity would require making custom-layer
-    // appliers re-usable (they are `FnOnce` today), so this is left documented
-    // rather than fixed for that narrow combination.
+    // those outer custom or gate layers (it would in the non-static path, where
+    // they are applied via `apply_middleware` before the clone is taken).
+    // Route-level guards and `#[secured]` dispatch through this clone and so
+    // still apply; only hand-rolled global `.layer(...)` middleware is skipped
+    // for MCP calls in static mode. `static_gate` is intentionally not applied
+    // to MCP dispatch: it is a page-cache gate whose only action is a browser
+    // redirect/reject, which is meaningless for a JSON-RPC `tools/call` — MCP
+    // and API auth belong in route guards / `#[secured]` / session, which DO
+    // traverse this clone. Restoring full parity for custom layers would require
+    // making the appliers re-usable (they are `FnOnce` today), so this is left
+    // documented rather than fixed for that narrow combination.
     #[cfg(feature = "mcp")]
     let router = if let Some((mount_path, tools, endpoint_layer)) = mcp_prepared {
         let dispatch = router.clone().with_state(state.clone());
@@ -2283,9 +2294,16 @@ pub fn try_build_router_with_static_inner(
     // then drain it. build_router_pre_state would otherwise see an empty list
     // and incorrectly treat opaque layers as absent when selecting idempotency
     // behaviour for each route.
-    let opaque_present = Some(custom_layers_require_fail_closed_idempotency(
-        &ctx.custom_layers,
-    ));
+    //
+    // Pre-static gate layers count here too: a `static_gate` used as a
+    // JWT/stateless auth layer is an opaque app layer for idempotency purposes
+    // (idempotency keys exclude `Authorization`, so without fail-closed replay a
+    // second principal with the same key+body could receive the first
+    // principal's cached mutation). Include them BEFORE either list is drained.
+    let opaque_present = Some(
+        custom_layers_require_fail_closed_idempotency(&ctx.custom_layers)
+            || custom_layers_require_fail_closed_idempotency(&ctx.static_gate_layers),
+    );
     let custom_layers = std::mem::take(&mut ctx.custom_layers);
 
     // Pre-static gate layers (AppBuilder::static_gate) are likewise extracted
@@ -2376,20 +2394,23 @@ pub fn try_build_router_with_static_inner(
     // apply_middleware for the dynamic-only path.
     router = apply_compression_middleware(router, config);
 
-    let mut router = router.layer(crate::security::SecurityHeadersLayer::from_config(
-        &config.security.headers,
-    ));
-
-    // Pre-static gate layers are applied OUTERMOST — outside the static-first
-    // middleware, custom layers, compression, and security headers — so they
-    // run before the static cache lookup and can redirect / reject a request
-    // before a cached SSG/ISG page is served. This mirrors their outermost
-    // placement in `apply_middleware` for the dynamic-only path.
+    // Pre-static gate layers run before the static cache lookup (they wrap the
+    // static-first middleware) so they can redirect / reject a request before a
+    // cached SSG/ISG page is served. They are applied INNER to the
+    // SecurityHeadersLayer below so that a gate's short-circuit response
+    // (redirect / 401) still carries the framework security headers (HSTS/CSP,
+    // etc.) — matching the headers a normal cached or dynamic response gets.
     router = apply_layers_in_registration_order(
         router,
         static_gate_layers,
         "Pre-static gate (outside static middleware)",
     );
+
+    // Security headers are applied OUTERMOST so they wrap both cached pages and
+    // any gate short-circuit response.
+    let router = router.layer(crate::security::SecurityHeadersLayer::from_config(
+        &config.security.headers,
+    ));
 
     Ok(apply_startup_barrier(
         router.with_state(state),
@@ -4910,6 +4931,50 @@ mod trusted_host_tests {
             .await
             .unwrap();
         assert_eq!(String::from_utf8_lossy(&body), "dynamic");
+    }
+
+    #[tokio::test]
+    async fn static_gate_redirect_carries_security_headers() {
+        // A gate short-circuit (302) must still carry the framework security
+        // headers — SecurityHeadersLayer wraps the gate in the SSG path.
+        let (_tmp, dist) = build_cached_dist("<h1>cached</h1>");
+        let config = AutumnConfig::default();
+        let ctx = ctx_with_static_gate(redirect_gate_registration());
+
+        let app = super::try_build_router_with_static_inner(
+            Vec::new(),
+            &config,
+            crate::state::AppState::for_test(),
+            Some(dist.as_path()),
+            ctx,
+        )
+        .expect("router builds");
+
+        let unauthed = app
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(unauthed.status(), StatusCode::FOUND);
+        // X-Content-Type-Options: nosniff is applied by SecurityHeadersLayer by
+        // default; its presence proves the layer wraps the gate's response.
+        assert_eq!(
+            unauthed
+                .headers()
+                .get("x-content-type-options")
+                .expect("gate redirect must carry security headers"),
+            "nosniff"
+        );
+    }
+
+    #[test]
+    fn static_gate_layer_requires_fail_closed_idempotency() {
+        // A static_gate (e.g. a JWT/auth layer) is an opaque app layer for
+        // idempotency: it must force fail-closed replay so a cached mutation
+        // can't be served to a different principal sharing an Idempotency-Key.
+        let gate = vec![redirect_gate_registration()];
+        assert!(super::custom_layers_require_fail_closed_idempotency(&gate));
+        // An empty set requires no fail-closed behaviour.
+        assert!(!super::custom_layers_require_fail_closed_idempotency(&[]));
     }
 }
 #[derive(Clone, Debug)]

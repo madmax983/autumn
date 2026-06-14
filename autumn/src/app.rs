@@ -1040,6 +1040,14 @@ impl AppBuilder {
     ///   signing key configured for the session) rather than relying on
     ///   session-populated extensions.
     /// * Like [`layer`](Self::layer), it applies globally to every route.
+    /// * **Page-cache gate, not API auth.** The gate guards GET/HEAD page
+    ///   serving and acts by issuing a browser redirect/reject. It is **not**
+    ///   applied to MCP `tools/call` dispatch (a JSON-RPC call, where a redirect
+    ///   is meaningless) and, in static builds, does not wrap the MCP dispatch
+    ///   clone. Gate MCP tools and JSON APIs with route-level guards /
+    ///   `#[secured]` / session auth, which always traverse the dispatch path.
+    /// * Short-circuit responses (the redirect/reject) are wrapped by the
+    ///   framework's security-header layer, so they still carry HSTS/CSP, etc.
     ///
     /// Layers are wrapped in registration order with the first-registered gate
     /// outermost, matching [`tower::ServiceBuilder`] semantics.
