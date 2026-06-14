@@ -188,6 +188,7 @@ fn is_association_attr(attr: &syn::Attribute) -> bool {
 /// Always emits the `Preloadable`/spec/trait scaffolding even with no
 /// associations, so that a model is always a valid association *target* (its
 /// `Spec` is the empty [`NoPreload`]).
+#[allow(clippy::too_many_lines)]
 fn emit_association_items(
     model_ident: &syn::Ident,
     table_ident: &syn::Ident,
@@ -286,9 +287,10 @@ fn emit_association_items(
                 };
                 // For has_one the lookup map keys on the target's fk column; for
                 // belongs_to it keys on the target's id.
-                let map_key_expr = match assoc.kind {
-                    AssocKind::BelongsTo => quote! { __child.id },
-                    _ => quote! { __child.#fk_ident },
+                let map_key_expr = if assoc.kind == AssocKind::BelongsTo {
+                    quote! { __child.id }
+                } else {
+                    quote! { __child.#fk_ident }
                 };
 
                 loader_blocks.push(quote! {

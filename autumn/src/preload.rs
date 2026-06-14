@@ -165,7 +165,7 @@ impl<T> Preloaded<T> {
 
     /// Borrow the wrapped record.
     #[must_use]
-    pub fn inner(&self) -> &T {
+    pub const fn inner(&self) -> &T {
         &self.inner
     }
 
@@ -177,13 +177,13 @@ impl<T> Preloaded<T> {
 
     /// Borrow the association store (read-only).
     #[must_use]
-    pub fn associations(&self) -> &Associations {
+    pub const fn associations(&self) -> &Associations {
         &self.associations
     }
 
     /// Mutably borrow the association store. Used by generated loaders to
     /// attach freshly loaded records.
-    pub fn associations_mut(&mut self) -> &mut Associations {
+    pub const fn associations_mut(&mut self) -> &mut Associations {
         &mut self.associations
     }
 }
