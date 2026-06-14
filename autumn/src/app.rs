@@ -112,6 +112,8 @@ pub fn app() -> AppBuilder {
         #[cfg(feature = "mail")]
         mail_delivery_queue_factory: None,
         #[cfg(feature = "mail")]
+        suppression_store: None,
+        #[cfg(feature = "mail")]
         mail_previews: Vec::new(),
         declared_routes: Vec::new(),
         idempotency_enabled: false,
@@ -313,6 +315,8 @@ pub struct AppBuilder {
     /// can capture framework-managed resources (DB pool, channels, etc.).
     #[cfg(feature = "mail")]
     mail_delivery_queue_factory: Option<MailDeliveryQueueFactory>,
+    #[cfg(feature = "mail")]
+    suppression_store: Option<crate::mail::SuppressionStoreHandle>,
     /// Mail template previews registered for the dev preview UI.
     #[cfg(feature = "mail")]
     mail_previews: Vec<crate::mail::MailPreview>,
@@ -1805,6 +1809,24 @@ impl AppBuilder {
         self
     }
 
+    /// Register a [`SuppressionStore`](crate::mail::SuppressionStore) used by
+    /// List-Unsubscribe sends to skip opted-out recipients and by the default
+    /// unsubscribe endpoint to record opt-outs.
+    ///
+    /// When the `db` feature is enabled and a connection pool is configured, a
+    /// Diesel-backed store is auto-wired, so most apps never call this — use it
+    /// to plug a custom backend. Mirrors
+    /// [`Self::with_mail_delivery_queue`].
+    #[cfg(feature = "mail")]
+    #[must_use]
+    pub fn with_suppression_store(
+        mut self,
+        store: impl crate::mail::SuppressionStore + 'static,
+    ) -> Self {
+        self.suppression_store = Some(crate::mail::SuppressionStoreHandle::new(store));
+        self
+    }
+
     /// Register an inbound mail router that creates webhook HTTP endpoints and
     /// dispatches parsed [`InboundEmail`](crate::inbound_mail::InboundEmail)
     /// values to registered handlers.
@@ -2212,6 +2234,8 @@ impl AppBuilder {
             #[cfg(feature = "mail")]
             mail_delivery_queue_factory,
             #[cfg(feature = "mail")]
+            suppression_store,
+            #[cfg(feature = "mail")]
             mail_previews,
             declared_routes: _,
             idempotency_enabled,
@@ -2517,6 +2541,10 @@ impl AppBuilder {
         // the "wired the macro arg, forgot the `.policy(...)`
         // builder call" footgun before any 500 lands.
         validate_repository_policies_registered(&all_routes, &scoped_groups, &state, &config);
+        #[cfg(feature = "mail")]
+        if let Some(handle) = suppression_store {
+            state.insert_extension(handle);
+        }
         #[cfg(feature = "mail")]
         crate::mail::install_mailer_with_factory(
             &state,
@@ -2984,6 +3012,8 @@ impl AppBuilder {
             #[cfg(feature = "mail")]
             mail_delivery_queue_factory,
             #[cfg(feature = "mail")]
+            suppression_store,
+            #[cfg(feature = "mail")]
             mail_previews,
             declared_routes: _,
             idempotency_enabled,
@@ -3175,6 +3205,10 @@ impl AppBuilder {
         // may open Redis/Harvest connections unavailable here), and the guard
         // itself is bypassed too — the Mailer is still installed so static
         // routes that extract `Mailer` for immediate `send` calls resolve.
+        #[cfg(feature = "mail")]
+        if let Some(handle) = suppression_store {
+            state.insert_extension(handle);
+        }
         #[cfg(feature = "mail")]
         crate::mail::install_mailer_with_factory(
             &state,
@@ -3494,6 +3528,8 @@ impl AppBuilder {
             #[cfg(feature = "mail")]
             mail_delivery_queue_factory,
             #[cfg(feature = "mail")]
+            suppression_store,
+            #[cfg(feature = "mail")]
             mail_interceptor,
             job_interceptor,
             #[cfg(feature = "db")]
@@ -3621,6 +3657,10 @@ impl AppBuilder {
             register(state.policy_registry());
         }
 
+        #[cfg(feature = "mail")]
+        if let Some(handle) = suppression_store {
+            state.insert_extension(handle);
+        }
         #[cfg(feature = "mail")]
         crate::mail::install_mailer_with_factory(
             &state,

@@ -132,14 +132,15 @@ fn parse_list_unsubscribe(attr: TokenStream) -> syn::Result<Option<String>> {
 
 /// Best-effort label for a mailer `Self` type, used for inventory registration.
 fn self_ty_label(self_ty: &Type) -> String {
-    if let Type::Path(type_path) = self_ty {
-        if let Some(segment) = type_path.path.segments.last() {
-            return segment.ident.to_string();
-        }
+    if let Type::Path(type_path) = self_ty
+        && let Some(segment) = type_path.path.segments.last()
+    {
+        return segment.ident.to_string();
     }
     quote!(#self_ty).to_string()
 }
 
+#[allow(clippy::too_many_lines, clippy::option_if_let_else)]
 pub fn mailer_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let list_unsubscribe = match parse_list_unsubscribe(attr) {
         Ok(scope) => scope,

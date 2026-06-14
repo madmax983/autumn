@@ -254,6 +254,8 @@ pub struct TestApp {
     state_initializers: Vec<Box<dyn FnOnce(&AppState) + Send>>,
     jobs: Vec<crate::job::JobInfo>,
     exception_filters: Vec<std::sync::Arc<dyn crate::middleware::ExceptionFilter>>,
+    #[cfg(feature = "mail")]
+    suppression_store: Option<crate::mail::SuppressionStoreHandle>,
     registered_plugins: std::collections::HashSet<String>,
     extensions: std::collections::HashMap<std::any::TypeId, Box<dyn std::any::Any + Send>>,
     /// Injected clock; `None` means use [`crate::time::SystemClock`].
@@ -321,6 +323,8 @@ impl TestApp {
             state_initializers: Vec::new(),
             jobs: Vec::new(),
             exception_filters: Vec::new(),
+            #[cfg(feature = "mail")]
+            suppression_store: None,
             registered_plugins: std::collections::HashSet::new(),
             extensions: std::collections::HashMap::new(),
             clock: None,
@@ -702,6 +706,20 @@ impl TestApp {
         self
     }
 
+    /// Register a [`SuppressionStore`](crate::mail::SuppressionStore) so
+    /// List-Unsubscribe sends skip suppressed recipients and the unsubscribe
+    /// endpoint records opt-outs. Mirrors
+    /// [`AppBuilder::with_suppression_store`](crate::app::AppBuilder::with_suppression_store).
+    #[cfg(feature = "mail")]
+    #[must_use]
+    pub fn with_suppression_store(
+        mut self,
+        store: impl crate::mail::SuppressionStore + 'static,
+    ) -> Self {
+        self.suppression_store = Some(crate::mail::SuppressionStoreHandle::new(store));
+        self
+    }
+
     #[must_use]
     pub fn with_job_interceptor(
         mut self,
@@ -1041,6 +1059,9 @@ impl TestApp {
 
         #[cfg(feature = "mail")]
         {
+            if let Some(handle) = self.suppression_store.clone() {
+                state.insert_extension(handle);
+            }
             crate::mail::install_mailer(&state, &self.config.mail, false)
                 .expect("Failed to configure test mailer");
         }
