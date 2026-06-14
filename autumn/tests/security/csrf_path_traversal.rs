@@ -1,5 +1,5 @@
 use autumn_web::security::{CsrfConfig, CsrfLayer};
-use axum::{Router, extract::Request, routing::post};
+use axum::{Router, http::Request, routing::post};
 use tower::ServiceExt;
 
 #[tokio::test]
