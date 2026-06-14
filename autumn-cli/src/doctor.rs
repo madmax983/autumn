@@ -1474,8 +1474,20 @@ where
         .unwrap_or_default()
 }
 
+/// Whether a Rust source file declares the `#[mailer(list_unsubscribe = ...)]`
+/// attribute (whitespace-insensitive), as opposed to merely calling the
+/// `.list_unsubscribe(...)` builder method or mentioning it in a comment.
+pub fn file_declares_list_unsubscribe(content: &str) -> bool {
+    let collapsed: String = content.chars().filter(|c| !c.is_whitespace()).collect();
+    collapsed.contains("mailer(list_unsubscribe")
+}
+
 /// Detect whether any Rust source under `src/` declares
 /// `#[mailer(list_unsubscribe = "...")]`.
+///
+/// Matches the attribute form specifically (whitespace-insensitive) so that
+/// builder calls like `.list_unsubscribe("x")` or comments do not trip a false
+/// positive.
 fn detect_list_unsubscribe_usage() -> bool {
     fn scan(dir: &std::path::Path) -> bool {
         let Ok(entries) = std::fs::read_dir(dir) else {
@@ -1489,7 +1501,7 @@ fn detect_list_unsubscribe_usage() -> bool {
                 }
             } else if path.extension().and_then(|e| e.to_str()) == Some("rs")
                 && std::fs::read_to_string(&path)
-                    .is_ok_and(|content| content.contains("list_unsubscribe"))
+                    .is_ok_and(|content| file_declares_list_unsubscribe(&content))
             {
                 return true;
             }
@@ -2485,6 +2497,25 @@ mod tests {
     fn mail_unsubscribe_usage_with_mailto_passes() {
         let r = check_mail_unsubscribe_config_impl(true, None, Some("unsub@example.com"), true);
         assert_eq!(r.status, CheckStatus::Pass);
+    }
+
+    #[test]
+    fn detects_mailer_attribute_but_not_builder_or_comment() {
+        assert!(file_declares_list_unsubscribe(
+            "#[mailer(list_unsubscribe = \"weekly_digest\")]"
+        ));
+        // whitespace / newlines inside the attribute still match
+        assert!(file_declares_list_unsubscribe(
+            "#[mailer(\n    list_unsubscribe = \"x\"\n)]"
+        ));
+        // builder call must NOT match
+        assert!(!file_declares_list_unsubscribe(
+            "Mail::builder().list_unsubscribe(\"x\").build()"
+        ));
+        // comment must NOT match
+        assert!(!file_declares_list_unsubscribe(
+            "// remember to set list_unsubscribe later"
+        ));
     }
 
     // ── glyph ────────────────────────────────────────────────────────────────

@@ -110,6 +110,14 @@ List mailers are delivered **one recipient per message** so each unsubscribe
 link is personalized. Recipients already in the suppression table are skipped
 with a structured log event (`target: "mail", outcome = "skipped_suppressed"`).
 
+> **Deferred delivery.** Suppression filtering and header signing happen inside
+> `Mailer::send`. The in-process `deliver_later` fallback re-enters `send`, so it
+> is covered automatically. If you register a durable
+> [`MailDeliveryQueue`](mail.md#deferred-delivery), make its worker deliver by
+> calling `Mailer::send` (the standard pattern) rather than invoking a transport
+> directly — otherwise queued list mail would bypass suppression and the
+> List-Unsubscribe headers.
+
 ## How tokens work
 
 Unsubscribe tokens are **stateless and short-lived**:

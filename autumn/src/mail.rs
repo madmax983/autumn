@@ -204,6 +204,12 @@ impl MailConfig {
             ));
         }
 
+        if self.unsubscribe_token_ttl_days <= 0 {
+            return Err(crate::config::ConfigError::Validation(
+                "mail.unsubscribe_token_ttl_days must be a positive number of days; a non-positive value would make every unsubscribe token immediately expired".to_owned(),
+            ));
+        }
+
         Ok(())
     }
 
@@ -916,7 +922,8 @@ impl UnsubscribeRuntime {
     pub fn list_unsubscribe_header(&self, subscriber: &str, list_id: &str) -> Option<String> {
         let mut entries: Vec<String> = Vec::new();
         if let Some(base) = self.base_url.as_deref().filter(|s| !s.trim().is_empty()) {
-            let expiry = current_unix_time() + self.ttl_days * 86_400;
+            let expiry = current_unix_time()
+                .saturating_add(self.ttl_days.saturating_mul(86_400));
             let token = unsubscribe::sign_token(&self.signing_keys, subscriber, list_id, expiry);
             entries.push(format!("<{}>", unsubscribe::unsubscribe_url(base, &token)));
         }
@@ -1724,6 +1731,14 @@ fn apply_preview_unsubscribe_headers(state: &AppState, mailer_label: &str, mut m
         return mail;
     };
     mail.list_unsubscribe = Some(scope.clone());
+    // Don't double-emit if the preview author already set the header by hand.
+    if mail
+        .extra_headers
+        .iter()
+        .any(|(name, _)| name.eq_ignore_ascii_case("List-Unsubscribe"))
+    {
+        return mail;
+    }
     let recipient = mail
         .to
         .first()
@@ -2292,7 +2307,7 @@ pub(crate) fn install_mailer(
         resolved
     };
 
-    if (unsubscribe_configured || suppression.is_some()) && transport_sends_mail {
+    if unsubscribe_configured || suppression.is_some() {
         let signing_keys = Arc::new(crate::security::config::resolve_signing_keys(
             &state
                 .extension::<crate::config::AutumnConfig>()
@@ -2307,10 +2322,14 @@ pub(crate) fn install_mailer(
             ttl_days,
             suppression: suppression.clone(),
         };
-        mailer.unsubscribe = Some(Arc::new(make_runtime()));
-        // Share the same wiring with the endpoint handler so signed links always
-        // verify within the process.
+        // Always share the wiring with the endpoint handler (mounted whenever an
+        // unsubscribe destination is configured, independent of transport) so a
+        // live unsubscribe link never 404s. Only the *sender* skips when the
+        // transport is intentionally a no-op.
         state.insert_extension(make_runtime());
+        if transport_sends_mail {
+            mailer.unsubscribe = Some(Arc::new(make_runtime()));
+        }
     }
 
     state.insert_extension(mailer);
@@ -2827,6 +2846,17 @@ mod tests {
         assert!(!unsubscribe_config_fail_closed(true, false, true, false));
         // not enforced (static build) → ok
         assert!(!unsubscribe_config_fail_closed(false, true, true, false));
+    }
+
+    #[test]
+    fn validate_rejects_non_positive_unsubscribe_ttl() {
+        let ttl = |days: i64| MailConfig {
+            unsubscribe_token_ttl_days: days,
+            ..MailConfig::default()
+        };
+        assert!(ttl(0).validate(Some("dev")).is_err());
+        assert!(ttl(-1).validate(Some("dev")).is_err());
+        assert!(ttl(30).validate(Some("dev")).is_ok());
     }
 
     #[test]
