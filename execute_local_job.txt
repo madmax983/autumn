@@ -1,0 +1,209 @@
+async fn execute_local_job(
+    job: QueuedJob,
+    jobs_by_name: &Arc<RwLock<HashMap<String, JobInfo>>>,
+    tx: &tokio::sync::mpsc::Sender<QueuedJob>,
+    state: &AppState,
+    job_admin: &JobAdminMemoryBackend,
+    coordination: &Arc<LocalJobCoordination>,
+) {
+    let maybe_info = jobs_by_name
+        .read()
+        .expect("job registry lock poisoned")
+        .get(&job.name)
+        .map(|info| {
+            (
+                info.handler,
+                info.max_attempts,
+                info.initial_backoff_ms,
+                info.uniqueness.clone(),
+                info.concurrency.clone(),
+            )
+        });
+    let Some((handler, info_max_attempts, info_backoff_ms, uniqueness, concurrency)) = maybe_info
+    else {
+        if job_admin.try_record_start(&job.id, job.attempt) == JobAdminStartDecision::Canceled {
+            state.job_registry.record_cancel(&job.name);
+            job_admin.record_cancelled(&job.id);
+            return;
+        }
+        state.job_registry.record_start(&job.name);
+        state
+            .job_registry
+            .record_failure(&job.name, format!("unknown job '{}'", job.name), true);
+        job_admin.record_failure(&job.id, format!("unknown job '{}'", job.name));
+        return;
+    };
+
+    // Concurrency gate: park the job when its group is saturated. Parked jobs
+    // keep their enqueued status and resume when release_slot pops them.
+    let job_name = job.name.clone();
+    let concurrency_group = concurrency.as_ref().map(|conc| {
+        let scope = job_concurrency_scope(conc, &job.payload);
+        (
+            local_concurrency_group(&job.name, scope.as_deref()),
+            conc.limit,
+        )
+    });
+    let job = if let Some((group, limit)) = &concurrency_group {
+        match coordination.acquire_slot_or_park(group, *limit, job) {
+            LocalSlotDecision::Acquired(job) => job,
+            LocalSlotDecision::Parked => {
+                state.job_registry.record_concurrency_blocked(&job_name);
+                return;
+            }
+        }
+    } else {
+        job
+    };
+
+    if job_admin.try_record_start(&job.id, job.attempt) == JobAdminStartDecision::Canceled {
+        state.job_registry.record_cancel(&job.name);
+        job_admin.record_cancelled(&job.id);
+        release_local_unique_hold(
+            coordination,
+            uniqueness.as_ref(),
+            &job.name,
+            &job.payload,
+            &job.id,
+        );
+        finish_local_slot(coordination, concurrency_group.as_ref(), tx, state);
+        return;
+    }
+    state.job_registry.record_start(&job.name);
+
+    // A pending-window unique key is held only until execution starts.
+    if let Some(unique) = &uniqueness
+        && unique.window == JobUniquenessWindow::Pending
+    {
+        let key = job_unique_key(unique, &job.payload);
+        coordination.release_unique(&job.name, &key, &job.id);
+    }
+
+    let max_attempts = if job.max_attempts != 0 {
+        job.max_attempts
+    } else if info_max_attempts != 0 {
+        info_max_attempts
+    } else {
+        5
+    };
+    let backoff_ms = if job.initial_backoff_ms != 0 {
+        job.initial_backoff_ms
+    } else if info_backoff_ms != 0 {
+        info_backoff_ms
+    } else {
+        250
+    };
+
+    let job_span = build_job_consumer_span(&job.name, job.attempt);
+    #[cfg(feature = "telemetry-otlp")]
+    if let Some(cx) =
+        restore_job_trace_context(job.traceparent.as_deref(), job.tracestate.as_deref())
+    {
+        use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+        let _ = job_span.set_parent(cx);
+    }
+    let f = run_job_handler(&job.name, handler, state.clone(), job.payload.clone());
+    let outcome = tracing::Instrument::instrument(f, job_span).await;
+    match outcome {
+        JobExecutionOutcome::Succeeded => {
+            state.job_registry.record_success(&job.name);
+            job_admin.record_success(&job.id);
+            release_local_unique_hold(
+                coordination,
+                uniqueness.as_ref(),
+                &job.name,
+                &job.payload,
+                &job.id,
+            );
+        }
+        JobExecutionOutcome::Failed(error) => {
+            if job.attempt < max_attempts {
+                // Running-window keys stay held across retries (the job is
+                // still in flight until it settles). A pending-window key was
+                // released when execution started, so re-acquire it now to
+                // keep duplicates coalescing while the retry waits out its
+                // backoff as a pending job again. If a duplicate was accepted
+                // while this job ran it now owns the key; in that case drop
+                // the retry (coalesce into the duplicate) rather than letting
+                // both run unprotected.
+                if let Some(unique) = &uniqueness
+                    && unique.window == JobUniquenessWindow::Pending
+                {
+                    let key = job_unique_key(unique, &job.payload);
+                    if !coordination.try_acquire_unique(&job.name, &key, &job.id, unique.window) {
+                        state.job_registry.record_deduplicated(&job.name);
+                        job_admin.record_deduplicated(&job.id);
+                        finish_local_slot(coordination, concurrency_group.as_ref(), tx, state);
+                        return;
+                    }
+                }
+                state
+                    .job_registry
+                    .record_retry(&job.name, &error, job.attempt);
+                job_admin.record_retrying(&job.id, &error);
+                let sender = tx.clone();
+                let registry = state.job_registry.clone();
+                let job_admin = job_admin.clone();
+                let id = job.id.clone();
+                let name = job.name.clone();
+                let payload = job.payload;
+                #[cfg(feature = "telemetry-otlp")]
+                let traceparent = job.traceparent;
+                #[cfg(feature = "telemetry-otlp")]
+                let tracestate = job.tracestate;
+                let delay = backoff_ms.saturating_mul(2_u64.saturating_pow(job.attempt - 1));
+                tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                    registry.record_enqueue(&name);
+                    job_admin.record_requeued(&id, job.attempt + 1);
+                    let _ = sender
+                        .send(QueuedJob {
+                            id,
+                            name,
+                            payload,
+                            attempt: job.attempt + 1,
+                            max_attempts,
+                            initial_backoff_ms: backoff_ms,
+                            #[cfg(feature = "telemetry-otlp")]
+                            traceparent,
+                            #[cfg(feature = "telemetry-otlp")]
+                            tracestate,
+                        })
+                        .await;
+                });
+            } else {
+                state
+                    .job_registry
+                    .record_failure(&job.name, error.clone(), true);
+                job_admin.record_failure(&job.id, error);
+                release_local_unique_hold(
+                    coordination,
+                    uniqueness.as_ref(),
+                    &job.name,
+                    &job.payload,
+                    &job.id,
+                );
+            }
+        }
+        JobExecutionOutcome::Panicked(error) => {
+            tracing::error!(job = %job.name, error = %error, "local job handler panicked");
+            state
+                .job_registry
+                .record_failure(&job.name, error.clone(), true);
+            job_admin.record_failure(&job.id, error);
+            release_local_unique_hold(
+                coordination,
+                uniqueness.as_ref(),
+                &job.name,
+                &job.payload,
+                &job.id,
+            );
+        }
+    }
+
+    // The concurrency slot frees as soon as the handler is no longer running,
+    // including while a retry waits out its backoff.
+    finish_local_slot(coordination, concurrency_group.as_ref(), tx, state);
+}
+
+/// Release a unique hold after a job settles. No-op for TTL-window holds
