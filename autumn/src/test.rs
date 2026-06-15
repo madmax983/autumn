@@ -658,6 +658,15 @@ impl TestApp {
             self.suppression_store = Some(handle);
         }
 
+        // Carry a plugin's `mount_unsubscribe_endpoint()` opt-in: production copies
+        // this builder flag into config.mail before router assembly, so a plugin
+        // that mounts the default unsubscribe endpoint must mount it under TestApp
+        // too (otherwise /_autumn/unsubscribe 404s in tests but works in prod).
+        #[cfg(feature = "mail")]
+        if app_builder.mount_unsubscribe_endpoint {
+            self.config.mail.mount_unsubscribe_endpoint = true;
+        }
+
         // Carry plugin-registered error reporters into the test app so
         // reporting-enabled plugins exercise the same behavior under `TestApp`
         // that they get from `AppBuilder::run`.
@@ -2332,21 +2341,27 @@ mod tests {
 
     #[cfg(feature = "mail")]
     #[test]
-    fn plugin_suppression_store_is_carried_into_test_app() {
+    fn plugin_suppression_store_and_endpoint_optin_carry_into_test_app() {
         struct SuppressionPlugin;
         impl crate::plugin::Plugin for SuppressionPlugin {
             fn build(self, app: crate::app::AppBuilder) -> crate::app::AppBuilder {
                 app.with_suppression_store(crate::mail::InMemorySuppressionStore::new())
+                    .mount_unsubscribe_endpoint()
             }
         }
 
-        // A plugin that wires List-Unsubscribe storage must propagate it into the
-        // TestApp, so unsubscribe POSTs / send-time suppression work without every
-        // test repeating `.with_suppression_store(...)`.
+        // A plugin that wires List-Unsubscribe storage and opts into the default
+        // endpoint must propagate both into the TestApp, so unsubscribe POSTs /
+        // send-time suppression behave under TestApp exactly as in production
+        // without every test repeating the setup manually.
         let app = TestApp::new().plugin(SuppressionPlugin);
         assert!(
             app.suppression_store.is_some(),
             "plugin-registered suppression store must be carried into TestApp"
+        );
+        assert!(
+            app.config.mail.mount_unsubscribe_endpoint,
+            "plugin endpoint opt-in must be carried into TestApp config"
         );
     }
 

@@ -320,7 +320,7 @@ pub struct AppBuilder {
     #[cfg(feature = "mail")]
     pub(crate) suppression_store: Option<crate::mail::SuppressionStoreHandle>,
     #[cfg(feature = "mail")]
-    mount_unsubscribe_endpoint: bool,
+    pub(crate) mount_unsubscribe_endpoint: bool,
     /// Mail template previews registered for the dev preview UI.
     #[cfg(feature = "mail")]
     mail_previews: Vec<crate::mail::MailPreview>,
