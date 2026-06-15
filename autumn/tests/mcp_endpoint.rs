@@ -72,6 +72,20 @@ async fn delete_todo(Path(id): Path<u32>) -> AutumnResult<Json<Todo>> {
     }))
 }
 
+// Requires the `CspNonce` extractor: it fails (500/tool error) unless the
+// dispatch pipeline injected a nonce into request extensions. Used to guard the
+// MCP-dispatch nonce regression — the framework's outermost `SecurityHeadersLayer`
+// (which injects the nonce) is applied after the dispatch clone is taken, so the
+// clone must re-attach it.
+#[get("/api/nonce-tool")]
+#[api_doc(mcp, summary = "Requires the CSP nonce")]
+async fn nonce_tool(_nonce: autumn_web::security::CspNonce) -> AutumnResult<Json<Todo>> {
+    Ok(Json(Todo {
+        id: 99,
+        title: "nonce-ok".into(),
+    }))
+}
+
 // A user route that already owns the `/mcp` path, used to exercise the
 // mount-path collision preflight.
 #[get("/mcp")]
@@ -304,6 +318,37 @@ async fn static_gate_is_excluded_from_mcp_dispatch_in_dynamic_mode() {
     let payload: serde_json::Value = serde_json::from_str(text).unwrap();
     assert_eq!(payload["id"], 7);
     assert_eq!(payload["title"], "todo 7");
+}
+
+#[tokio::test]
+async fn tools_call_dispatch_injects_csp_nonce_when_enabled() {
+    // Regression (round-four): the framework's outermost `SecurityHeadersLayer`
+    // — which injects `CspNonce` into request extensions — is applied AFTER the
+    // MCP dispatch clone is taken (so the page gate stays out of dispatch). The
+    // clone re-attaches that layer, so an MCP-exposed handler using the `CspNonce`
+    // extractor dispatches successfully instead of failing with a 500/tool error
+    // when `security.headers.csp_nonce` is enabled.
+    let mut config = AutumnConfig::default();
+    config.security.headers.csp_nonce.enabled = true;
+    let client = TestApp::new()
+        .routes(routes![nonce_tool])
+        .config(config)
+        .mount_mcp("/mcp")
+        .build();
+
+    let out = rpc(
+        &client,
+        serde_json::json!({
+            "jsonrpc":"2.0","id":1,"method":"tools/call",
+            "params": {"name":"nonce_tool","arguments":{}}
+        }),
+    )
+    .await;
+
+    assert_ne!(
+        out["result"]["isError"], true,
+        "tools/call dispatch must inject CspNonce: {out}"
+    );
 }
 
 #[tokio::test]
