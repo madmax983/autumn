@@ -80,8 +80,10 @@ fn collect_text(nodes: &[Node], out: &mut String) {
 /// Collapse runs of ASCII whitespace into single spaces and trim the ends, so
 /// text/`assert_text` comparisons survive indentation and line-wrapping
 /// changes in templates.
+///
+/// ⚡ Optimization: Uses `itertools::join` to eliminate intermediate `Vec` allocations during string concatenation.
 pub fn normalize_ws(s: &str) -> String {
-    s.split_whitespace().collect::<Vec<_>>().join(" ")
+    itertools::join(s.split_whitespace(), " ")
 }
 
 // ── Parser ───────────────────────────────────────────────────────────────────

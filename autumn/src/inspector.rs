@@ -223,11 +223,10 @@ pub fn detect_n_plus_one(queries: &[QueryRecord], threshold: usize) -> Option<NP
 }
 
 /// Collapse whitespace and lower-case a SQL string for comparison.
+///
+/// ⚡ Optimization: Uses `itertools::join` to eliminate intermediate `Vec` allocations during string concatenation.
 fn normalize_sql(sql: &str) -> String {
-    sql.split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .to_lowercase()
+    itertools::join(sql.split_whitespace(), " ").to_lowercase()
 }
 
 // ── Per-request query accumulator ─────────────────────────────────────────────
