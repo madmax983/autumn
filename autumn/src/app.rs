@@ -1043,11 +1043,20 @@ impl AppBuilder {
     /// * **Page-cache gate, not API auth.** The gate guards GET/HEAD page
     ///   serving and acts by issuing a browser redirect/reject. It is **not**
     ///   applied to MCP `tools/call` dispatch (a JSON-RPC call, where a redirect
-    ///   is meaningless) and, in static builds, does not wrap the MCP dispatch
-    ///   clone. Gate MCP tools and JSON APIs with route-level guards /
-    ///   `#[secured]` / session auth, which always traverse the dispatch path.
+    ///   is meaningless) in *either* mode: the gate is applied after the MCP
+    ///   dispatch clone is taken. Gate MCP tools and JSON APIs with route-level
+    ///   guards / `#[secured]` / session auth, which always traverse the
+    ///   dispatch path. A well-behaved gate should therefore no-op on non-GET
+    ///   requests (such as the `/mcp` JSON-RPC POST transport).
     /// * Short-circuit responses (the redirect/reject) are wrapped by the
     ///   framework's security-header layer, so they still carry HSTS/CSP, etc.
+    /// * Because the gate runs **outside** the request stack (it must run before
+    ///   session and the static cache), a gate short-circuit does **not** pass
+    ///   through trusted-host validation or the per-request timeout — same as any
+    ///   middleware registered with [`layer`](Self::layer) that runs before
+    ///   those framework layers. Keep gate work bounded (prefer local
+    ///   cookie/JWT checks over unbounded remote calls), and rely on the
+    ///   framework's trusted-host policy for the routes the gate forwards to.
     ///
     /// Layers are wrapped in registration order with the first-registered gate
     /// outermost, matching [`tower::ServiceBuilder`] semantics.

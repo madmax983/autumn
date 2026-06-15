@@ -490,16 +490,22 @@ fn build_router_pre_state(
         idempotency_layers.as_ref(),
     );
 
+    // Extract the pre-static gate layers (AppBuilder::static_gate) before
+    // applying the rest of the middleware. They are applied LAST — after the MCP
+    // dispatch clone is taken below — so a `tools/call` replay never traverses
+    // the page-cache gate. In the SSG/ISG path the caller already drained these
+    // into `try_build_router_with_static_inner`, so this take yields an empty
+    // list there.
+    let static_gate_layers = std::mem::take(&mut ctx.static_gate_layers);
+
     router = apply_middleware(
         router,
         config,
         state,
         ctx.exception_filters,
         ctx.custom_layers,
-        ctx.static_gate_layers,
         ctx.error_page_renderer,
         ctx.session_store,
-        defer_security_headers,
     )?;
 
     if dev_reload_enabled {
@@ -552,21 +558,21 @@ fn build_router_pre_state(
     // taken *before* the MCP route is added, so `tools/call` never recurses
     // into the MCP endpoint itself.
     //
+    // `static_gate` is intentionally NOT in this dispatch clone, in EITHER mode:
+    // the gate layers are applied after this clone is taken (below, after the MCP
+    // merge, in the fully-dynamic path; outside the static-first middleware in the
+    // SSG/ISG path). A `static_gate` is a page-cache gate whose only action is a
+    // browser redirect/reject, which is meaningless for a JSON-RPC `tools/call`.
+    // MCP/API auth belongs in route-level guards / `#[secured]` / session, which
+    // DO traverse this clone.
+    //
     // KNOWN LIMITATION (static/ISR mode): when an app has a `dist` manifest,
-    // `try_build_router_with_static_inner` drains the global custom layers
-    // (`AppBuilder::layer`) and the pre-static gate layers
-    // (`AppBuilder::static_gate`) and applies them *outside* the static-first
-    // middleware — i.e. after this builder returns. This dispatch clone is
-    // built here, before that, so a `tools/call` replay does not pass through
-    // those outer custom or gate layers (it would in the non-static path, where
-    // they are applied via `apply_middleware` before the clone is taken).
-    // Route-level guards and `#[secured]` dispatch through this clone and so
-    // still apply; only hand-rolled global `.layer(...)` middleware is skipped
-    // for MCP calls in static mode. `static_gate` is intentionally not applied
-    // to MCP dispatch: it is a page-cache gate whose only action is a browser
-    // redirect/reject, which is meaningless for a JSON-RPC `tools/call` — MCP
-    // and API auth belong in route guards / `#[secured]` / session, which DO
-    // traverse this clone. Restoring full parity for custom layers would require
+    // `try_build_router_with_static_inner` also drains the global custom layers
+    // (`AppBuilder::layer`) and applies them outside the static-first middleware,
+    // after this clone is taken. So in static mode a `tools/call` replay does not
+    // pass through hand-rolled global `.layer(...)` middleware (it would in the
+    // fully-dynamic path, where custom layers are applied via `apply_middleware`
+    // before the clone). Restoring full parity for custom layers would require
     // making the appliers re-usable (they are `FnOnce` today), so this is left
     // documented rather than fixed for that narrow combination.
     #[cfg(feature = "mcp")]
@@ -657,6 +663,29 @@ fn build_router_pre_state(
         router.merge(mcp_router)
     } else {
         router
+    };
+
+    // Apply the pre-static gate and the framework's outermost `SecurityHeadersLayer`
+    // LAST, after the MCP dispatch clone above was taken. This keeps the gate out
+    // of the `tools/call` dispatch path in fully-dynamic mode (matching the SSG/ISG
+    // path and the documented intent that a browser redirect/reject is meaningless
+    // for JSON-RPC dispatch), while still running the gate before session and the
+    // static cache for ordinary HTTP requests. `SecurityHeadersLayer` is applied
+    // outermost so a gate redirect/401 short-circuit still carries HSTS/CSP/nosniff;
+    // a single application keeps CSP nonces consistent.
+    //
+    // In the SSG/ISG path `defer_security_headers` is true and the gate layers were
+    // drained by `try_build_router_with_static_inner` (which applies both the gate
+    // and the single outer `SecurityHeadersLayer` outside the static-first
+    // middleware), so this block is a no-op there.
+    let router = if defer_security_headers {
+        router
+    } else {
+        let router =
+            apply_layers_in_registration_order(router, static_gate_layers, "Pre-static gate");
+        router.layer(crate::security::SecurityHeadersLayer::from_config(
+            &config.security.headers,
+        ))
     };
 
     Ok(router)
@@ -1845,13 +1874,8 @@ fn apply_middleware(
     state: &AppState,
     exception_filters: Vec<Arc<dyn ExceptionFilter>>,
     custom_layers: Vec<crate::app::CustomLayerRegistration>,
-    static_gate_layers: Vec<crate::app::CustomLayerRegistration>,
     error_page_renderer: Option<SharedRenderer>,
     session_store: Option<Arc<dyn crate::session::BoxedSessionStore>>,
-    // When true (SSG/ISG path), `SecurityHeadersLayer` is NOT applied here — the
-    // caller applies a single one outside the static-first middleware. See
-    // `build_router_pre_state`'s `defer_security_headers` parameter.
-    defer_security_headers: bool,
 ) -> Result<axum::Router<AppState>, RouterBuildError> {
     // 404 fallback handler for unmatched routes must be registered BEFORE global middleware
     // so that unmatched routes are still protected by rate limiting, CSRF, CORS, etc.
@@ -1904,11 +1928,6 @@ fn apply_middleware(
         crate::webhook::webhook_replay_cleanup_middleware,
     ));
     router = apply_upload_middleware(router, config);
-
-    // Security headers layer (always applied)
-    let security_headers =
-        crate::security::SecurityHeadersLayer::from_config(&config.security.headers);
-    tracing::debug!("Security headers enabled");
 
     // User-registered Tower layers (AppBuilder::layer). Outermost — applied
     // last so they wrap all framework middleware.  Iterate in reverse so the
@@ -2050,11 +2069,13 @@ fn apply_middleware(
 
     // Error page context layer must be inner to the exception filter so
     // WantsHtml is set on the response before the filter inspects it.
-    // Full ingress layer order (outermost -> innermost):
-    //   SecurityHeaders (framework outermost, so gate short-circuits carry
-    //   HSTS/CSP/nosniff; in SSG/ISG mode applied by
-    //   try_build_router_with_static_inner instead) ->
-    //   [static_gate layers — outside session and the static cache] ->
+    // Full ingress layer order (outermost -> innermost). NOTE: the framework's
+    // outermost `SecurityHeadersLayer` and the `static_gate` layers are applied
+    // by `build_router_pre_state` AFTER this function returns (and, crucially,
+    // after the MCP dispatch clone is taken), so they are NOT in this list:
+    //   SecurityHeaders (framework outermost — applied in build_router_pre_state) ->
+    //   [static_gate layers — applied in build_router_pre_state, after the MCP
+    //   dispatch clone, outside session and the static cache] ->
     //   TraceContext (applied outside the startup barrier so short-circuit
     //   responses still carry traceparent) ->
     //   Compression (outer to ExceptionFilter — see note below) ->
@@ -2080,27 +2101,11 @@ fn apply_middleware(
     // ETags are still computed on the uncompressed body before encoding occurs.
     let router = apply_compression_middleware(router, config);
 
-    // Pre-static gate layers (AppBuilder::static_gate) are applied outside
-    // session, request-id, compression, and everything else — so they run
-    // before any cached static page would be served and behave identically in
-    // fully-dynamic and SSG/ISG modes. They are inner only to the framework's
-    // outermost `SecurityHeadersLayer` (applied just below), so a gate
-    // short-circuit still carries security headers. In SSG/ISG mode these are
-    // drained by `try_build_router_with_static_inner` and applied outside the
-    // static-first middleware instead, so this loop sees an empty list there.
-    let router = apply_layers_in_registration_order(router, static_gate_layers, "Pre-static gate");
-
-    // Security headers are the framework's OUTERMOST layer so they wrap the gate
-    // (and everything else), ensuring redirect/401 short-circuits carry
-    // HSTS/CSP/nosniff. Applied as a single layer to keep CSP nonces consistent.
-    // In SSG/ISG mode `try_build_router_with_static_inner` applies the single
-    // outer layer instead (see `defer_security_headers`).
-    let router = if defer_security_headers {
-        router
-    } else {
-        router.layer(security_headers)
-    };
-
+    // NOTE: the `static_gate` layers and the framework's outermost
+    // `SecurityHeadersLayer` are intentionally NOT applied here. They are applied
+    // by `build_router_pre_state` after this function returns and after the MCP
+    // dispatch clone is taken, so a `tools/call` replay never traverses the
+    // page-cache gate (matching the SSG/ISG path and the documented intent).
     Ok(router)
 }
 
@@ -2279,6 +2284,7 @@ pub fn try_build_router_with_static(
     )
 }
 
+#[allow(clippy::too_many_lines)]
 pub fn try_build_router_with_static_inner(
     route_list: Vec<Route>,
     config: &AutumnConfig,
@@ -2366,7 +2372,23 @@ pub fn try_build_router_with_static_inner(
         .values()
         .any(|e| e.revalidate.is_some());
     let layer = if has_isr {
-        layer.with_router(inner_router.clone().with_state(state.clone()))
+        // The inner router defers `SecurityHeadersLayer` to the single outer
+        // application (see `defer_security_headers`), but ISR background
+        // regeneration drives this router directly and never reaches that outer
+        // layer. `SecurityHeadersLayer` is also what injects `CspNonce` into
+        // request extensions, so without it a handler using the `CspNonce`
+        // extractor would 500 during regeneration and the stale file would never
+        // refresh. Re-attach the layer here, on the regeneration router only.
+        // Its response headers are discarded (only the rendered HTML body is
+        // persisted), so this does not affect live-request headers and avoids the
+        // duplicate-header / nonce conflict that a second live layer would cause.
+        let regen_router = inner_router
+            .clone()
+            .layer(crate::security::SecurityHeadersLayer::from_config(
+                &config.security.headers,
+            ))
+            .with_state(state.clone());
+        layer.with_router(regen_router)
     } else {
         layer
     };
