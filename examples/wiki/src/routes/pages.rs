@@ -331,7 +331,10 @@ pub async fn update(
     let updated = repo.update(page.id, &update_page).await?;
 
     let summary = if updated.status != page.status {
-        Some(format!("Status changed: {} → {}", page.status, updated.status))
+        Some(format!(
+            "Status changed: {} → {}",
+            page.status, updated.status
+        ))
     } else if updated.title != page.title {
         Some(format!("Title changed: {} → {}", page.title, updated.title))
     } else {

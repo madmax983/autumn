@@ -68,12 +68,10 @@ pub fn run(debug: bool, package: Option<&str>) {
             cmd.current_dir(dir);
         }
     }
-    let status = cmd
-        .status()
-        .unwrap_or_else(|e| {
-            eprintln!("\u{2717} Failed to run {}: {e}", binary.display());
-            std::process::exit(1);
-        });
+    let status = cmd.status().unwrap_or_else(|e| {
+        eprintln!("\u{2717} Failed to run {}: {e}", binary.display());
+        std::process::exit(1);
+    });
 
     if !status.success() {
         eprintln!("\n\u{2717} Static build failed");
@@ -338,7 +336,11 @@ fn resolve_binary_from_metadata(
             } else {
                 pkg["targets"].as_array()?.iter().find_map(|t| {
                     let is_bin = t["kind"].as_array()?.iter().any(|k| k == "bin");
-                    if is_bin { t["name"].as_str().map(String::from) } else { None }
+                    if is_bin {
+                        t["name"].as_str().map(String::from)
+                    } else {
+                        None
+                    }
                 })?
             };
             let dir = pkg["manifest_path"]
@@ -459,13 +461,9 @@ mod tests {
                 ]
             }]
         });
-        let (bin, _) = resolve_binary_from_metadata(
-            &metadata,
-            true,
-            Some("todo-app"),
-            Path::new("/projects"),
-        )
-        .unwrap();
+        let (bin, _) =
+            resolve_binary_from_metadata(&metadata, true, Some("todo-app"), Path::new("/projects"))
+                .unwrap();
         assert_eq!(bin, expected_binary("/tmp/target/debug/todo-app"));
     }
 
@@ -487,7 +485,10 @@ mod tests {
             Path::new("/workspace"),
         )
         .unwrap();
-        assert_eq!(bin, expected_binary("/workspace/target/release/reddit-clone"));
+        assert_eq!(
+            bin,
+            expected_binary("/workspace/target/release/reddit-clone")
+        );
         assert_eq!(
             manifest_dir,
             Some(PathBuf::from("/workspace/examples/reddit-clone"))

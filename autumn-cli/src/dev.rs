@@ -1529,7 +1529,10 @@ mod tests {
         );
         assert!(result.is_ok());
         // Must return `todo-app`, not `seed` (which appears first in targets).
-        assert_eq!(result.unwrap(), expected_binary("/tmp/target/debug/todo-app"));
+        assert_eq!(
+            result.unwrap(),
+            expected_binary("/tmp/target/debug/todo-app")
+        );
     }
 
     #[test]
