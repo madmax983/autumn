@@ -147,7 +147,7 @@ pub fn mailer_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         Err(err) => return err.to_compile_error(),
     };
 
-    let input_impl: ItemImpl = match syn::parse2(item) {
+    let mut input_impl: ItemImpl = match syn::parse2(item) {
         Ok(item) => item,
         Err(err) => return err.to_compile_error(),
     };
@@ -168,6 +168,36 @@ pub fn mailer_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 Ok(Some(method)) => methods.push(method),
                 Ok(None) => {}
                 Err(err) => return err.to_compile_error(),
+            }
+        }
+    }
+
+    // When the mailer opts into list_unsubscribe, tag the `Mail` returned by the
+    // original template methods too — not just the generated send_*/deliver_later_*
+    // helpers. The template methods are public, so a direct call
+    // (`mailer.digest(to)`) whose result is passed to `Mailer::send` would
+    // otherwise send the bulk template with no List-Unsubscribe headers or
+    // suppression, even though the inventory descriptor already made startup/doctor
+    // report this mailer as compliant. The original body is wrapped in an
+    // immediately-invoked closure so an early `return` inside the template is
+    // tagged too.
+    if let Some(scope) = &list_unsubscribe {
+        for item in &mut input_impl.items {
+            if let ImplItem::Fn(method) = item
+                && returns_mail(method)
+                && method
+                    .sig
+                    .receiver()
+                    .is_some_and(|r| r.reference.is_some() && r.mutability.is_none())
+            {
+                let orig_block = method.block.clone();
+                method.block = syn::parse_quote!({
+                    #[allow(clippy::redundant_closure_call)]
+                    let mut __autumn_list_mail: ::autumn_web::mail::Mail = (|| #orig_block)();
+                    __autumn_list_mail.list_unsubscribe =
+                        ::core::option::Option::Some(::std::string::String::from(#scope));
+                    __autumn_list_mail
+                });
             }
         }
     }
@@ -570,6 +600,31 @@ mod tests {
         );
         assert!(rendered.contains("inventory :: submit"));
         assert!(rendered.contains("mailer : \"DigestMailer\""));
+        // The original template method body is rewritten to tag its returned Mail
+        // too, so direct calls (not just the helpers) are compliant.
+        assert!(
+            rendered.contains("__autumn_list_mail"),
+            "template method body must tag its returned Mail: {rendered}"
+        );
+    }
+
+    #[test]
+    fn without_list_unsubscribe_leaves_template_body_untouched() {
+        let out = mailer_macro(
+            TokenStream::new(),
+            quote! {
+                impl PlainMailer {
+                    fn ping(&self, to: String) -> Mail {
+                        panic!("template body is irrelevant to macro rendering test")
+                    }
+                }
+            },
+        );
+        let rendered = out.to_string();
+        assert!(
+            !rendered.contains("__autumn_list_mail"),
+            "opt-out mailers must not rewrite the template body: {rendered}"
+        );
     }
 
     #[test]

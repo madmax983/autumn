@@ -45,6 +45,19 @@ async fn send_digest(mailer: Mailer) -> AutumnResult<&'static str> {
     Ok("sent")
 }
 
+/// Calls the template method directly (not the generated `send_*` helper) and
+/// sends the returned `Mail`. The macro tags the template method body too, so
+/// this path must still emit RFC 8058 headers and apply suppression.
+#[get("/send-direct")]
+async fn send_digest_direct(mailer: Mailer) -> AutumnResult<&'static str> {
+    let mail = WeeklyDigestMailer.digest("ada@example.com".to_owned());
+    mailer
+        .send(mail)
+        .await
+        .map_err(AutumnError::internal_server_error)?;
+    Ok("sent")
+}
+
 fn dev_mail_config(dir: &std::path::Path) -> AutumnConfig {
     let mut config = AutumnConfig {
         profile: Some("dev".to_owned()),
@@ -241,6 +254,30 @@ async fn newsletter_unsubscribe_end_to_end_db_backed() {
         count_emls(dir.path()),
         1,
         "DB-suppressed recipient must not receive a second message"
+    );
+}
+
+/// A direct call to the template method (then `Mailer::send`) must still emit the
+/// RFC 8058 headers — the macro tags the template method body, not only helpers.
+#[tokio::test]
+async fn direct_template_call_still_emits_unsubscribe_headers() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let client = TestApp::new()
+        .config(dev_mail_config(dir.path()))
+        .mount_unsubscribe_endpoint()
+        .with_suppression_store(InMemorySuppressionStore::new())
+        .routes(routes![send_digest_direct])
+        .build();
+
+    client.get("/send-direct").send().await.assert_ok();
+    let eml = read_single_eml(dir.path());
+    assert!(
+        eml.contains("List-Unsubscribe: <https://app.example.com/_autumn/unsubscribe?token="),
+        "direct template call must still carry the one-click header:\n{eml}"
+    );
+    assert!(
+        eml.contains("List-Unsubscribe-Post: List-Unsubscribe=One-Click"),
+        "direct template call must still carry the post header:\n{eml}"
     );
 }
 

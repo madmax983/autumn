@@ -1186,21 +1186,21 @@ impl Mailer {
         list_id: String,
         runtime: &UnsubscribeRuntime,
     ) -> Result<(), MailError> {
-        // Validate every recipient up front so a syntactically invalid address
-        // fails before any message is delivered. The per-recipient loop below
-        // delivers one message at a time; without this pre-check it could deliver
-        // to earlier recipients and then fail on a later bad address, so a caller
-        // retrying the returned error would duplicate those earlier sends.
-        // Non-list mail builds the whole message first and fails atomically for
-        // the same invalid recipient list — match that.
+        // Resolve every recipient — address validity AND suppression decision —
+        // before delivering anything. The delivery loop below sends one message
+        // per recipient; if validation or a suppression-store lookup failed
+        // mid-loop it could deliver to earlier recipients and then return an
+        // error, so a caller retrying the send would duplicate those earlier
+        // deliveries. Non-list mail builds and validates the full message before
+        // any send — match that atomicity here.
+        //
+        // Each entry is `(recipient_display, canonical_subscriber)`. The canonical
+        // bare address is used for the suppression / token key so a formatted
+        // `Ada <ada@example.com>` recipient matches an opt-out recorded as
+        // `ada@example.com`; the display string is preserved for actual delivery.
+        let mut deliveries: Vec<(String, String)> = Vec::with_capacity(mail.to.len());
         for recipient in &mail.to {
             parse_mailbox(recipient)?;
-        }
-        for recipient in &mail.to {
-            // Suppression and token keys use the canonical bare address so a
-            // formatted `Ada <ada@example.com>` recipient matches an opt-out
-            // recorded as `ada@example.com`. The display string is preserved for
-            // actual delivery.
             let subscriber = canonical_subscriber(recipient);
             if let Some(store) = runtime.suppression.as_ref()
                 && store.is_suppressed(&subscriber, &list_id).await?
@@ -1213,8 +1213,12 @@ impl Mailer {
                 );
                 continue;
             }
+            deliveries.push((recipient.clone(), subscriber));
+        }
+
+        for (recipient, subscriber) in deliveries {
             let mut per_recipient = mail.clone();
-            per_recipient.to = vec![recipient.clone()];
+            per_recipient.to = vec![recipient];
             // Don't double-emit if the template already set the header by hand —
             // a migration to `#[mailer(list_unsubscribe)]` should replace, not
             // duplicate, an existing destination.
@@ -3073,6 +3077,68 @@ mod tests {
         assert!(
             sent.lock().unwrap().is_empty(),
             "no recipient may be delivered when the list contains an invalid address"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_list_mail_suppression_error_fails_before_any_delivery() {
+        // A suppression store that errors for one specific subscriber.
+        struct FailingStore {
+            fail_for: String,
+        }
+        impl SuppressionStore for FailingStore {
+            fn is_suppressed<'a>(
+                &'a self,
+                subscriber: &'a str,
+                _list_id: &'a str,
+            ) -> Pin<Box<dyn Future<Output = Result<bool, MailError>> + Send + 'a>> {
+                let fails = subscriber == self.fail_for;
+                Box::pin(async move {
+                    if fails {
+                        Err(MailError::RuntimeUnavailable(
+                            "store unavailable".to_owned(),
+                        ))
+                    } else {
+                        Ok(false)
+                    }
+                })
+            }
+            fn suppress<'a>(
+                &'a self,
+                _subscriber: &'a str,
+                _list_id: &'a str,
+            ) -> Pin<Box<dyn Future<Output = Result<(), MailError>> + Send + 'a>> {
+                Box::pin(async move { Ok(()) })
+            }
+        }
+
+        let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let transport = CapturingTransport { sent: sent.clone() };
+        let store: Arc<dyn SuppressionStore> = Arc::new(FailingStore {
+            fail_for: "second@example.com".to_owned(),
+        });
+        let mailer =
+            Mailer::with_transport(transport).with_unsubscribe(unsubscribe_runtime(Some(store)));
+        // The second recipient's suppression lookup errors. The whole send must
+        // fail before the first recipient is delivered, so a retry can't duplicate
+        // that delivery.
+        let mail = Mail::builder()
+            .from("from@example.com")
+            .to("first@example.com")
+            .to("second@example.com")
+            .subject("Digest")
+            .text("hello")
+            .list_unsubscribe("weekly_digest")
+            .build()
+            .unwrap();
+        let result = mailer.send(mail).await;
+        assert!(
+            result.is_err(),
+            "suppression-store error must fail the send"
+        );
+        assert!(
+            sent.lock().unwrap().is_empty(),
+            "no recipient may be delivered when a later suppression lookup fails"
         );
     }
 

@@ -1809,6 +1809,44 @@ fn resolve_unsubscribe_token_ttl_days_from_sources(
     toml_or_default
 }
 
+/// Mirror of `Transport::from_env_value` (mail module, feature-gated so not
+/// reachable from the CLI build): trim + lowercase and accept only a known
+/// transport, returning its canonical spelling, else `None`.
+fn parse_mail_transport(value: &str) -> Option<&'static str> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "log" => Some("log"),
+        "file" => Some("file"),
+        "smtp" => Some("smtp"),
+        "disabled" => Some("disabled"),
+        _ => None,
+    }
+}
+
+/// Resolve the effective mail transport the way the runtime does: a *valid* env
+/// override wins, then a valid `[mail].transport`, then the profile smart-default
+/// (`dev` → `log`, otherwise `disabled`). Invalid/whitespace values are ignored
+/// just as `Transport::from_env_value` ignores them, so doctor does not treat a
+/// malformed override as an active transport.
+fn resolve_effective_mail_transport(
+    env_value: Option<String>,
+    toml_transport: Option<&str>,
+    normalized_profile: &str,
+) -> String {
+    if let Some(raw) = env_value
+        && let Some(parsed) = parse_mail_transport(&raw)
+    {
+        return parsed.to_owned();
+    }
+    if let Some(parsed) = toml_transport.and_then(parse_mail_transport) {
+        return parsed.to_owned();
+    }
+    if normalized_profile == "dev" {
+        "log".to_owned()
+    } else {
+        "disabled".to_owned()
+    }
+}
+
 fn resolve_database_topology(table: Option<&toml::Table>) -> DoctorDatabaseTopology {
     resolve_database_topology_from_sources(
         |key| std::env::var(key).ok().filter(|value| !value.is_empty()),
@@ -2292,9 +2330,19 @@ pub fn run(opts: DoctorOptions) {
     // inline precedence with the canonical spelling winning, single override
     // file preferring the selected spelling), so doctor evaluates what the app
     // will actually boot with rather than a stale legacy spelling.
+    //
+    // Profile selection mirrors `resolve_profile_input`: a blank/whitespace
+    // AUTUMN_ENV is ignored before falling back to AUTUMN_PROFILE, so a blank
+    // preferred var does not silently downgrade a prod selection to dev.
     let raw_mail_profile = std::env::var("AUTUMN_ENV")
-        .or_else(|_| std::env::var("AUTUMN_PROFILE"))
-        .unwrap_or_else(|_| "dev".to_owned());
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .or_else(|| {
+            std::env::var("AUTUMN_PROFILE")
+                .ok()
+                .filter(|v| !v.trim().is_empty())
+        })
+        .unwrap_or_else(|| "dev".to_owned());
     let selected_input = raw_mail_profile.trim().to_owned();
     let normalized_profile = match selected_input.to_lowercase().as_str() {
         "prod" | "production" => "prod".to_owned(),
@@ -2303,28 +2351,21 @@ pub fn run(opts: DoctorOptions) {
     };
     let merged_mail_toml = get_merged_toml_table_runtime(&normalized_profile, &selected_input);
     let (unsub_base_url, unsub_mailto) = resolve_mail_unsubscribe(Some(&merged_mail_toml));
-    // Resolve the effective transport the same way the runtime does: env override
-    // wins, then explicit `[mail].transport`, then the profile smart-default
-    // (only `dev` defaults to `log`; every other profile defaults to `disabled`).
-    let effective_transport = std::env::var("AUTUMN_MAIL__TRANSPORT")
-        .ok()
-        .filter(|v| !v.trim().is_empty())
-        .or_else(|| {
-            merged_mail_toml
-                .get("mail")
-                .and_then(toml::Value::as_table)
-                .and_then(|m| m.get("transport"))
-                .and_then(toml::Value::as_str)
-                .map(str::to_owned)
-        })
-        .unwrap_or_else(|| {
-            if normalized_profile == "dev" {
-                "log".to_owned()
-            } else {
-                "disabled".to_owned()
-            }
-        });
-    let mail_transport_disabled = effective_transport.eq_ignore_ascii_case("disabled");
+    // Resolve the effective transport the same way the runtime does: a *valid* env
+    // override (trimmed, case-insensitive) wins, then explicit `[mail].transport`,
+    // then the profile smart-default (only `dev` defaults to `log`; every other
+    // profile defaults to `disabled`). An invalid/whitespace env value is ignored,
+    // matching `Transport::from_env_value`.
+    let effective_transport = resolve_effective_mail_transport(
+        std::env::var("AUTUMN_MAIL__TRANSPORT").ok(),
+        merged_mail_toml
+            .get("mail")
+            .and_then(toml::Value::as_table)
+            .and_then(|m| m.get("transport"))
+            .and_then(toml::Value::as_str),
+        &normalized_profile,
+    );
+    let mail_transport_disabled = effective_transport == "disabled";
     let unsub_token_ttl_days = resolve_unsubscribe_token_ttl_days(Some(&merged_mail_toml));
     let has_list_unsubscribe_usage = detect_list_unsubscribe_usage();
     tasks.push(Box::new(move || {
@@ -3008,6 +3049,36 @@ mod tests {
             30,
         );
         assert_eq!(r.status, CheckStatus::Pass);
+    }
+
+    #[test]
+    fn transport_resolver_trims_and_ignores_invalid_env() {
+        // Valid env override wins (trimmed + case-insensitive).
+        assert_eq!(
+            resolve_effective_mail_transport(Some(" SMTP ".to_owned()), Some("disabled"), "prod"),
+            "smtp"
+        );
+        // Whitespace-only "disabled" must resolve to disabled, not be treated raw.
+        assert_eq!(
+            resolve_effective_mail_transport(Some(" disabled ".to_owned()), None, "prod"),
+            "disabled"
+        );
+        // Invalid env override is ignored → falls back to TOML.
+        assert_eq!(
+            resolve_effective_mail_transport(Some("bogus".to_owned()), Some("disabled"), "prod"),
+            "disabled"
+        );
+        // No env, no TOML → profile smart-default.
+        assert_eq!(resolve_effective_mail_transport(None, None, "dev"), "log");
+        assert_eq!(
+            resolve_effective_mail_transport(None, None, "prod"),
+            "disabled"
+        );
+        // TOML value is parsed too (case-insensitive).
+        assert_eq!(
+            resolve_effective_mail_transport(None, Some("LOG"), "prod"),
+            "log"
+        );
     }
 
     #[test]
