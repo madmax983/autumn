@@ -1535,6 +1535,12 @@ where
         for endpoint in &config.security.webhooks.endpoints {
             csrf_layer = csrf_layer.with_exempt_path(&endpoint.path);
         }
+        // RFC 8058 one-click unsubscribe POSTs arrive from mailbox providers
+        // with no Autumn CSRF cookie/header; exempt the endpoint when mounted.
+        #[cfg(feature = "mail")]
+        if config.mail.unsubscribe_endpoint_enabled() {
+            csrf_layer = csrf_layer.with_exempt_path(crate::mail::UNSUBSCRIBE_PATH);
+        }
         tracing::info!("CSRF protection enabled");
         router = router.layer(csrf_layer);
     }

@@ -177,7 +177,11 @@ fn read_or_empty(path: &Path) -> String {
     std::fs::read_to_string(path).unwrap_or_default()
 }
 
-fn render_mailer_file(struct_name: &str, snake_name: &str, list_unsubscribe: Option<&str>) -> String {
+fn render_mailer_file(
+    struct_name: &str,
+    snake_name: &str,
+    list_unsubscribe: Option<&str>,
+) -> String {
     let mailer_attr = list_unsubscribe.map_or_else(
         || "#[mailer]".to_owned(),
         |scope| format!("#[mailer(list_unsubscribe = \"{scope}\")]"),

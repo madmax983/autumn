@@ -445,7 +445,9 @@ pub fn check_mail_unsubscribe_config_impl(
          nor mail.unsubscribe_mailto is configured"
             .into(),
     );
-    let hint = Some("Set mail.unsubscribe_base_url (e.g. https://app.example.com) or mail.unsubscribe_mailto so RFC 8058 List-Unsubscribe headers can be emitted");
+    let hint = Some(
+        "Set mail.unsubscribe_base_url (e.g. https://app.example.com) or mail.unsubscribe_mailto so RFC 8058 List-Unsubscribe headers can be emitted",
+    );
     if is_production {
         CheckResult {
             name: "mail_unsubscribe",
@@ -1478,7 +1480,17 @@ where
 /// attribute (whitespace-insensitive), as opposed to merely calling the
 /// `.list_unsubscribe(...)` builder method or mentioning it in a comment.
 pub fn file_declares_list_unsubscribe(content: &str) -> bool {
-    let collapsed: String = content.chars().filter(|c| !c.is_whitespace()).collect();
+    // Drop single-line comments so a commented-out attribute does not trip a
+    // false positive, while still preserving multi-line attribute bodies.
+    let without_comments: String = content
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let collapsed: String = without_comments
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
     collapsed.contains("mailer(list_unsubscribe")
 }
 
@@ -1511,19 +1523,26 @@ fn detect_list_unsubscribe_usage() -> bool {
     scan(std::path::Path::new("src"))
 }
 
-/// Resolve `[mail]` unsubscribe destinations from the merged toml table.
+/// Resolve `[mail]` unsubscribe destinations, preferring env overrides over the
+/// merged toml table (mirroring the runtime's `AUTUMN_MAIL__*` precedence).
 fn resolve_mail_unsubscribe(table: Option<&toml::Table>) -> (Option<String>, Option<String>) {
+    let env_var = |key: &str| std::env::var(key).ok().filter(|v| !v.is_empty());
     let mail = table
         .and_then(|t| t.get("mail"))
         .and_then(toml::Value::as_table);
-    let read = |key: &str| {
-        mail.and_then(|m| m.get(key))
-            .and_then(toml::Value::as_str)
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(std::borrow::ToOwned::to_owned)
+    let read = |env_key: &str, toml_key: &str| {
+        first_env(&env_var, &[env_key]).or_else(|| {
+            mail.and_then(|m| m.get(toml_key))
+                .and_then(toml::Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(std::borrow::ToOwned::to_owned)
+        })
     };
-    (read("unsubscribe_base_url"), read("unsubscribe_mailto"))
+    (
+        read("AUTUMN_MAIL__UNSUBSCRIBE_BASE_URL", "unsubscribe_base_url"),
+        read("AUTUMN_MAIL__UNSUBSCRIBE_MAILTO", "unsubscribe_mailto"),
+    )
 }
 
 fn resolve_database_topology(table: Option<&toml::Table>) -> DoctorDatabaseTopology {
@@ -2489,7 +2508,8 @@ mod tests {
 
     #[test]
     fn mail_unsubscribe_usage_with_base_url_passes() {
-        let r = check_mail_unsubscribe_config_impl(true, Some("https://app.example.com"), None, true);
+        let r =
+            check_mail_unsubscribe_config_impl(true, Some("https://app.example.com"), None, true);
         assert_eq!(r.status, CheckStatus::Pass);
     }
 

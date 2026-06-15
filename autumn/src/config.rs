@@ -2759,6 +2759,24 @@ impl AutumnConfig {
             &mut self.mail.allow_in_process_deliver_later_in_production,
         );
         parse_env_bool(env, "AUTUMN_MAIL__PREVIEW", &mut self.mail.preview);
+        parse_env_option_string(
+            env,
+            "AUTUMN_MAIL__UNSUBSCRIBE_BASE_URL",
+            &mut self.mail.unsubscribe_base_url,
+        );
+        parse_env_option_string(
+            env,
+            "AUTUMN_MAIL__UNSUBSCRIBE_MAILTO",
+            &mut self.mail.unsubscribe_mailto,
+        );
+        if let Ok(val) = env.var("AUTUMN_MAIL__UNSUBSCRIBE_TOKEN_TTL_DAYS") {
+            match val.parse::<i64>() {
+                Ok(days) => self.mail.unsubscribe_token_ttl_days = days,
+                Err(_) => eprintln!(
+                    "Warning: AUTUMN_MAIL__UNSUBSCRIBE_TOKEN_TTL_DAYS={val:?} is not a valid integer, ignoring"
+                ),
+            }
+        }
         if let Ok(val) = env.var("AUTUMN_MAIL__FILE_DIR") {
             self.mail.file_dir = PathBuf::from(val);
         }
