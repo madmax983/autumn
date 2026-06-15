@@ -2683,7 +2683,7 @@ mod tests {
     #[test]
     fn strip_rust_comments_removes_line_comments_and_preserves_code() {
         // Code before a comment is retained; everything after `//` is dropped.
-        let result = strip_rust_comments(r#"let x = 1; // this comment should disappear"#);
+        let result = strip_rust_comments("let x = 1; // this comment should disappear");
         assert!(
             result.contains("let x = 1;"),
             "code before comment preserved: {result}"
