@@ -174,6 +174,26 @@ fn is_valid_https_base_url(url: &str) -> bool {
     !host.is_empty() && !host.contains(char::is_whitespace)
 }
 
+/// Whether `value` is a usable unsubscribe mailbox — a bare `local@domain` or a
+/// `mailto:local@domain` URI, with non-empty parts and no whitespace.
+fn is_valid_mailto_address(value: &str) -> bool {
+    let address = value
+        .trim()
+        .strip_prefix("mailto:")
+        .unwrap_or_else(|| value.trim());
+    // Drop any `?subject=…` parameters before validating the address itself.
+    let address = address.split('?').next().unwrap_or("");
+    match address.split_once('@') {
+        Some((local, domain)) => {
+            !local.is_empty()
+                && !domain.is_empty()
+                && domain.contains('.')
+                && !address.contains(char::is_whitespace)
+        }
+        None => false,
+    }
+}
+
 const fn default_unsubscribe_ttl_days() -> i64 {
     crate::mail::unsubscribe::DEFAULT_TOKEN_TTL_DAYS
 }
@@ -241,6 +261,16 @@ impl MailConfig {
         {
             return Err(crate::config::ConfigError::Validation(
                 "mail.unsubscribe_base_url must be an absolute https:// URL with a host in prod; mailbox providers require HTTPS for RFC 8058 one-click unsubscribe".to_owned(),
+            ));
+        }
+
+        if matches!(profile, Some("prod" | "production"))
+            && let Some(mailto) = self.unsubscribe_mailto.as_deref().map(str::trim)
+            && !mailto.is_empty()
+            && !is_valid_mailto_address(mailto)
+        {
+            return Err(crate::config::ConfigError::Validation(
+                "mail.unsubscribe_mailto must be a bare mailbox address (or mailto: URI) like unsubscribe@example.com".to_owned(),
             ));
         }
 
@@ -3094,6 +3124,29 @@ mod tests {
         assert!(cfg(Some("https://x"), true).should_mount_unsubscribe_endpoint());
         // opt-in without a base URL does not mount.
         assert!(!cfg(None, true).should_mount_unsubscribe_endpoint());
+    }
+
+    #[test]
+    fn validate_rejects_malformed_mailto_in_prod() {
+        let cfg = |mailto: &str| MailConfig {
+            unsubscribe_mailto: Some(mailto.to_owned()),
+            ..MailConfig::default()
+        };
+        assert!(
+            cfg("unsubscribe example.com")
+                .validate(Some("prod"))
+                .is_err()
+        );
+        assert!(cfg("not-an-email").validate(Some("prod")).is_err());
+        assert!(cfg("unsub@example.com").validate(Some("prod")).is_ok());
+        // a full mailto: URI is accepted too.
+        assert!(
+            cfg("mailto:unsub@example.com")
+                .validate(Some("prod"))
+                .is_ok()
+        );
+        // dev is lenient.
+        assert!(cfg("whatever").validate(Some("dev")).is_ok());
     }
 
     #[test]

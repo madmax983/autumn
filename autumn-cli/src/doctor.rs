@@ -410,7 +410,8 @@ pub fn check_oauth2_provider_impl(
 /// Check that List-Unsubscribe is wired when any `#[mailer]` declares
 /// `list_unsubscribe` (pure, injectable for tests).
 ///
-/// - No `list_unsubscribe` usage → pass (the feature is opt-in).
+/// - No `list_unsubscribe` usage, or the transport is disabled (no mail is
+///   emitted) → pass.
 /// - Usage with a base URL or mailto configured → pass.
 /// - Usage with neither configured → **fail** in production (Gmail/Yahoo will
 ///   reject the bulk mail) and **warn** outside production so
@@ -419,6 +420,7 @@ pub fn check_mail_unsubscribe_config_impl(
     has_list_unsubscribe_usage: bool,
     base_url: Option<&str>,
     mailto: Option<&str>,
+    transport_disabled: bool,
     is_production: bool,
 ) -> CheckResult {
     let configured = base_url.is_some_and(|s| !s.trim().is_empty())
@@ -429,6 +431,16 @@ pub fn check_mail_unsubscribe_config_impl(
             name: "mail_unsubscribe",
             status: CheckStatus::Pass,
             detail: Some("no #[mailer] declares list_unsubscribe".into()),
+            hint: None,
+        };
+    }
+    if transport_disabled {
+        // Mirrors the runtime guard: a disabled transport emits no list mail, so
+        // unsubscribe destinations aren't required to boot.
+        return CheckResult {
+            name: "mail_unsubscribe",
+            status: CheckStatus::Pass,
+            detail: Some("mail.transport is disabled; no list mail is emitted".into()),
             hint: None,
         };
     }
@@ -2062,36 +2074,35 @@ pub fn run(opts: DoctorOptions) {
     }
 
     // 9b. List-Unsubscribe wiring: fail closed in prod when a #[mailer] declares
-    // list_unsubscribe but no unsubscribe destination is configured. Merge the
-    // canonical profile *and* its alias (prod/production, dev/development) so
-    // [profile.production.mail] / autumn-production.toml are seen, matching the
-    // runtime config loader.
+    // list_unsubscribe but no unsubscribe destination is configured. Merge BOTH
+    // spellings of the prod/dev pair (prod+production, dev+development) regardless
+    // of which the operator used, so [profile.production.mail] /
+    // autumn-production.toml are seen — matching the runtime config loader.
     let raw_mail_profile = std::env::var("AUTUMN_ENV")
         .or_else(|_| std::env::var("AUTUMN_PROFILE"))
         .unwrap_or_else(|_| "dev".to_owned())
         .trim()
         .to_lowercase();
-    let canonical_mail_profile = match raw_mail_profile.as_str() {
-        "production" => "prod",
-        "development" => "dev",
-        other => other,
+    let mail_profiles: Vec<&str> = match raw_mail_profile.as_str() {
+        "prod" | "production" => vec!["prod", "production"],
+        "dev" | "development" | "" => vec!["dev", "development"],
+        other => vec![other],
     };
-    let alias_mail_profile = match raw_mail_profile.as_str() {
-        "production" => Some("production"),
-        "development" => Some("development"),
-        _ => None,
-    };
-    let mail_profiles: Vec<&str> = std::iter::once(canonical_mail_profile)
-        .chain(alias_mail_profile)
-        .collect();
     let merged_mail_toml = get_merged_toml_table_profiles(&mail_profiles);
     let (unsub_base_url, unsub_mailto) = resolve_mail_unsubscribe(Some(&merged_mail_toml));
+    let mail_transport_disabled = merged_mail_toml
+        .get("mail")
+        .and_then(toml::Value::as_table)
+        .and_then(|m| m.get("transport"))
+        .and_then(toml::Value::as_str)
+        .is_some_and(|t| t.eq_ignore_ascii_case("disabled"));
     let has_list_unsubscribe_usage = detect_list_unsubscribe_usage();
     tasks.push(Box::new(move || {
         check_mail_unsubscribe_config_impl(
             has_list_unsubscribe_usage,
             unsub_base_url.as_deref(),
             unsub_mailto.as_deref(),
+            mail_transport_disabled,
             is_production,
         )
     }));
@@ -2550,33 +2561,46 @@ mod tests {
 
     #[test]
     fn mail_unsubscribe_no_usage_passes() {
-        let r = check_mail_unsubscribe_config_impl(false, None, None, true);
+        let r = check_mail_unsubscribe_config_impl(false, None, None, false, true);
         assert_eq!(r.status, CheckStatus::Pass);
     }
 
     #[test]
     fn mail_unsubscribe_usage_without_config_fails_in_prod() {
-        let r = check_mail_unsubscribe_config_impl(true, None, None, true);
+        let r = check_mail_unsubscribe_config_impl(true, None, None, false, true);
         assert_eq!(r.status, CheckStatus::Fail);
         assert!(r.detail.unwrap().contains("list_unsubscribe"));
     }
 
     #[test]
     fn mail_unsubscribe_usage_without_config_warns_outside_prod() {
-        let r = check_mail_unsubscribe_config_impl(true, None, Some("   "), false);
+        let r = check_mail_unsubscribe_config_impl(true, None, Some("   "), false, false);
         assert_eq!(r.status, CheckStatus::Warn);
     }
 
     #[test]
+    fn mail_unsubscribe_disabled_transport_passes() {
+        // Disabled transport emits no list mail, so config isn't required.
+        let r = check_mail_unsubscribe_config_impl(true, None, None, true, true);
+        assert_eq!(r.status, CheckStatus::Pass);
+    }
+
+    #[test]
     fn mail_unsubscribe_usage_with_base_url_passes() {
-        let r =
-            check_mail_unsubscribe_config_impl(true, Some("https://app.example.com"), None, true);
+        let r = check_mail_unsubscribe_config_impl(
+            true,
+            Some("https://app.example.com"),
+            None,
+            false,
+            true,
+        );
         assert_eq!(r.status, CheckStatus::Pass);
     }
 
     #[test]
     fn mail_unsubscribe_usage_with_mailto_passes() {
-        let r = check_mail_unsubscribe_config_impl(true, None, Some("unsub@example.com"), true);
+        let r =
+            check_mail_unsubscribe_config_impl(true, None, Some("unsub@example.com"), false, true);
         assert_eq!(r.status, CheckStatus::Pass);
     }
 
