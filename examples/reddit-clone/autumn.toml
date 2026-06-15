@@ -25,7 +25,7 @@ enabled = true
 name                    = "stripe"
 path                    = "/webhooks/stripe"
 provider                = "stripe"
-secret                  = "dev-stripe-webhook-secret-32-bytes"
+secret                  = "dev-only-override-in-prod"
 timestamp_tolerance_secs = 300
 replay_window_secs       = 86400
 
