@@ -137,10 +137,13 @@ pub fn run_sim(provider_str: &str, url: &str, secret: &str, payload: &str) {
         }
     }
 
-    match req.send() {
+    handle_sim_response(req.send());
+}
+
+fn handle_sim_response(result: Result<reqwest::blocking::Response, reqwest::Error>) {
+    match result {
         Ok(response) => {
             let status = response.status();
-
             match response.text() {
                 Ok(text) => {
                     if status.is_success() {
