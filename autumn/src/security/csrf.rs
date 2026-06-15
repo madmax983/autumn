@@ -753,6 +753,7 @@ mod tests {
     }
 
     use super::*;
+    use std::fmt::Write as _;
     use axum::Router;
     use axum::body::Body;
     use axum::routing::{get, post};
@@ -1469,11 +1470,12 @@ mod tests {
     fn multipart_body(boundary: &str, fields: &[(&str, &str)]) -> String {
         let mut body = String::new();
         for (name, value) in fields {
-            body.push_str(&format!(
+            let _ = write!(
+                body,
                 "--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n"
-            ));
+            );
         }
-        body.push_str(&format!("--{boundary}--\r\n"));
+        let _ = write!(body, "--{boundary}--\r\n");
         body
     }
 
@@ -1513,10 +1515,11 @@ mod tests {
         let mut body = format!(
             "--{boundary}\r\nContent-Disposition: form-data; name=\"_csrf\"\r\n\r\n{token}\r\n"
         );
-        body.push_str(&format!(
+        let _ = write!(
+            body,
             "--{boundary}\r\nContent-Disposition: form-data; name=\"avatar\"; filename=\"photo.jpg\"\r\nContent-Type: image/jpeg\r\n\r\nFAKEJPEGDATA\r\n"
-        ));
-        body.push_str(&format!("--{boundary}--\r\n"));
+        );
+        let _ = write!(body, "--{boundary}--\r\n");
 
         let app = Router::new()
             .route("/upload", post(|| async { "ok" }))
