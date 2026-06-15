@@ -510,6 +510,17 @@ async fn main() {
     }
 
     #[test]
+    fn rejects_unicode_and_special_chars_in_list_unsubscribe_scope() {
+        let tmp = project_with_main(default_main());
+        // Unicode characters are not allowed (alphanumeric ASCII + _ + - only).
+        assert!(plan_mailer(tmp.path(), "Welcome", Some("wöchentlich")).is_err());
+        assert!(plan_mailer(tmp.path(), "Welcome", Some("list.name")).is_err());
+        assert!(plan_mailer(tmp.path(), "Welcome", Some("list/name")).is_err());
+        // Dash and underscore are fine.
+        assert!(plan_mailer(tmp.path(), "Welcome", Some("a-b_c")).is_ok());
+    }
+
+    #[test]
     fn without_list_unsubscribe_no_migration_and_plain_attribute() {
         let tmp = project_with_main(default_main());
         let plan = plan_mailer(tmp.path(), "Welcome", None).unwrap();

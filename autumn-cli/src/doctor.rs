@@ -2660,6 +2660,40 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn mail_unsubscribe_usage_with_both_url_and_mailto_passes() {
+        let r = check_mail_unsubscribe_config_impl(
+            true,
+            Some("https://app.example.com"),
+            Some("unsub@example.com"),
+            false,
+            true,
+        );
+        assert_eq!(r.status, CheckStatus::Pass);
+    }
+
+    #[test]
+    fn strip_rust_comments_handles_unterminated_block_comment() {
+        // Should not panic; the remaining unclosed block is simply stripped.
+        let result = strip_rust_comments("code /* unclosed comment");
+        assert!(result.contains("code"));
+        assert!(!result.contains("unclosed"));
+    }
+
+    #[test]
+    fn strip_rust_comments_removes_line_comments_and_preserves_code() {
+        // Code before a comment is retained; everything after `//` is dropped.
+        let result = strip_rust_comments(r#"let x = 1; // this comment should disappear"#);
+        assert!(
+            result.contains("let x = 1;"),
+            "code before comment preserved: {result}"
+        );
+        assert!(
+            !result.contains("disappear"),
+            "line comment stripped: {result}"
+        );
+    }
+
     // ── glyph ────────────────────────────────────────────────────────────────
 
     #[test]

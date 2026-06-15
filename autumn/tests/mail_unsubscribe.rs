@@ -244,6 +244,98 @@ async fn newsletter_unsubscribe_end_to_end_db_backed() {
     );
 }
 
+/// POST with an invalid body (not `List-Unsubscribe=One-Click`) must return 400.
+#[tokio::test]
+async fn unsubscribe_post_rejects_bad_body() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let client = TestApp::new()
+        .config(dev_mail_config(dir.path()))
+        .mount_unsubscribe_endpoint()
+        .with_suppression_store(InMemorySuppressionStore::new())
+        .routes(routes![send_digest])
+        .build();
+
+    // Obtain a legitimately signed token.
+    client.get("/send").send().await.assert_ok();
+    let token = token_from_eml(&read_single_eml(dir.path()));
+
+    // Body does not match the RFC 8058 one-click requirement.
+    client
+        .post(&format!("/_autumn/unsubscribe?token={token}"))
+        .body("some-other-body")
+        .send()
+        .await
+        .assert_status(400);
+}
+
+/// POST with a valid token + correct body but no suppression backend configured
+/// must return 503 — the framework must never confirm an unsubscribe it cannot
+/// actually honor.
+#[tokio::test]
+async fn unsubscribe_post_without_suppression_store_returns_503() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    // Opt in to the endpoint but deliberately omit with_suppression_store().
+    let client = TestApp::new()
+        .config(dev_mail_config(dir.path()))
+        .mount_unsubscribe_endpoint()
+        .routes(routes![send_digest])
+        .build();
+
+    // Mail is still delivered (suppression check is skipped when no store).
+    client.get("/send").send().await.assert_ok();
+    let token = token_from_eml(&read_single_eml(dir.path()));
+
+    client
+        .post(&format!("/_autumn/unsubscribe?token={token}"))
+        .body("List-Unsubscribe=One-Click")
+        .send()
+        .await
+        .assert_status(503);
+}
+
+/// GET with a bad token must return 400 with an error HTML body.
+#[tokio::test]
+async fn unsubscribe_get_invalid_token_returns_400() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let client = TestApp::new()
+        .config(dev_mail_config(dir.path()))
+        .mount_unsubscribe_endpoint()
+        .with_suppression_store(InMemorySuppressionStore::new())
+        .routes(routes![send_digest])
+        .build();
+
+    client
+        .get("/_autumn/unsubscribe?token=not-a-valid-token")
+        .send()
+        .await
+        .assert_status(400);
+}
+
+/// Send with mailto-only config: the `List-Unsubscribe` header appears but
+/// `List-Unsubscribe-Post` (one-click) must NOT be emitted — RFC 2369 only.
+#[tokio::test]
+async fn send_list_mail_mailto_only_no_one_click_post_header() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut config = dev_mail_config(dir.path());
+    config.mail.unsubscribe_base_url = None; // mailto only, no HTTPS endpoint
+    let client = TestApp::new()
+        .config(config)
+        .with_suppression_store(InMemorySuppressionStore::new())
+        .routes(routes![send_digest])
+        .build();
+
+    client.get("/send").send().await.assert_ok();
+    let eml = read_single_eml(dir.path());
+    assert!(
+        eml.contains("List-Unsubscribe:"),
+        "List-Unsubscribe header should be present for mailto-only config:\n{eml}"
+    );
+    assert!(
+        !eml.contains("List-Unsubscribe-Post:"),
+        "List-Unsubscribe-Post must NOT be emitted without an HTTPS one-click URL:\n{eml}"
+    );
+}
+
 #[tokio::test]
 async fn dev_preview_shows_unsubscribe_headers_and_link() {
     let dir = tempfile::tempdir().expect("tempdir");

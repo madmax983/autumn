@@ -4224,4 +4224,89 @@ mod tests {
 
         crate::circuit_breaker::global_registry().clear();
     }
+
+    #[test]
+    fn validate_log_transport_in_prod_fails() {
+        let cfg = MailConfig {
+            transport: Transport::Log,
+            ..MailConfig::default()
+        };
+        assert!(cfg.validate(Some("prod")).is_err());
+        assert!(cfg.validate(Some("production")).is_err());
+        // allow flag lifts the restriction.
+        let allowed = MailConfig {
+            transport: Transport::Log,
+            allow_log_in_production: true,
+            ..MailConfig::default()
+        };
+        assert!(allowed.validate(Some("prod")).is_ok());
+    }
+
+    #[test]
+    fn validate_preview_outside_dev_fails() {
+        let cfg = MailConfig {
+            preview: true,
+            ..MailConfig::default()
+        };
+        assert!(cfg.validate(Some("prod")).is_err());
+        assert!(cfg.validate(Some("dev")).is_ok());
+        assert!(cfg.validate(Some("development")).is_ok());
+    }
+
+    #[test]
+    fn is_valid_https_base_url_edge_cases() {
+        assert!(is_valid_https_base_url("https://app.example.com"));
+        assert!(is_valid_https_base_url("https://app.example.com/base"));
+        assert!(!is_valid_https_base_url("http://app.example.com"));
+        assert!(!is_valid_https_base_url("https://"));
+        assert!(!is_valid_https_base_url("https:///path"));
+        assert!(!is_valid_https_base_url("https://app.example.com?q=1"));
+        assert!(!is_valid_https_base_url("https://app.example.com#frag"));
+        assert!(!is_valid_https_base_url("https://host name.com"));
+    }
+
+    #[test]
+    fn is_valid_mailto_address_edge_cases() {
+        assert!(is_valid_mailto_address("unsub@example.com"));
+        assert!(is_valid_mailto_address("mailto:unsub@example.com"));
+        assert!(is_valid_mailto_address(
+            "mailto:unsub@example.com?subject=hi"
+        ));
+        assert!(!is_valid_mailto_address("not-an-email"));
+        assert!(!is_valid_mailto_address("missing@dot"));
+        assert!(!is_valid_mailto_address("space @example.com"));
+        assert!(!is_valid_mailto_address(""));
+        assert!(!is_valid_mailto_address("@example.com")); // empty local
+        assert!(!is_valid_mailto_address("local@")); // empty domain
+    }
+
+    #[test]
+    fn unsubscribe_runtime_header_both_base_url_and_mailto() {
+        let runtime = UnsubscribeRuntime {
+            base_url: Some("https://app.example.com".to_owned()),
+            mailto: Some("u@example.com".to_owned()),
+            signing_keys: Arc::new(test_keys()),
+            ttl_days: 30,
+            suppression: None,
+        };
+        let header = runtime
+            .list_unsubscribe_header("a@x.com", "list")
+            .expect("header with both");
+        assert!(header.contains("https://app.example.com/_autumn/unsubscribe?token="));
+        assert!(header.contains("mailto:u@example.com?subject=unsubscribe"));
+        assert!(runtime.supports_one_click());
+    }
+
+    #[test]
+    fn unsubscribe_runtime_header_neither_configured_returns_none() {
+        let runtime = UnsubscribeRuntime {
+            base_url: None,
+            mailto: None,
+            signing_keys: Arc::new(test_keys()),
+            ttl_days: 30,
+            suppression: None,
+        };
+        assert!(runtime.list_unsubscribe_header("a@x.com", "list").is_none());
+        assert!(!runtime.supports_one_click());
+    }
 }
