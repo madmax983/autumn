@@ -272,13 +272,7 @@ fn run_safety_check(migrations_dir: &str) {
         }
     }
 
-    // The rolling-deploy safety gate keys off `up.sql` only: that is what runs
-    // during a forward deploy. `down.sql` findings are reported above for the
-    // rollback workflow (e.g. an inherently destructive `DROP TABLE` revert, or
-    // a `DROP INDEX CONCURRENTLY` that needs `run_in_transaction = false`), but
-    // they must not fail the forward check — otherwise every ordinary
-    // create-table migration would be rejected before deploy.
-    let any_unsafe = reports.iter().any(|r| safety::has_unsafe_findings(&r.up));
+    let any_unsafe = rolling_deploy_blocked(&reports);
     let any_down_unsafe = reports.iter().any(|r| safety::has_unsafe_findings(&r.down));
 
     eprintln!();
@@ -298,6 +292,15 @@ fn run_safety_check(migrations_dir: &str) {
              (reported above). These only run on `autumn migrate down`, not on deploy."
         );
     }
+}
+
+/// Whether any migration is unsafe for a forward rolling deploy.
+///
+/// Keys off `up.sql` only — `down.sql` runs on `autumn migrate down`, not during
+/// a forward deploy, so its (often inherently destructive) findings do not block
+/// the deploy gate.
+fn rolling_deploy_blocked(reports: &[MigrationSafetyReport]) -> bool {
+    reports.iter().any(|r| safety::has_unsafe_findings(&r.up))
 }
 
 /// Read every migration directory in `dir`, classify both `up.sql` and
@@ -901,6 +904,45 @@ mod tests {
         assert!(
             results[0].down.is_empty(),
             "absent down.sql should produce empty findings"
+        );
+    }
+
+    #[test]
+    fn rolling_deploy_gate_ignores_destructive_down_sql() {
+        // A forward-safe migration whose down.sql is inherently destructive
+        // (ADD COLUMN up / DROP COLUMN down) must NOT block the forward deploy.
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_migration_with_down(
+            tmp.path(),
+            "20260101000000_add_column",
+            "ALTER TABLE posts ADD COLUMN body TEXT;",
+            "ALTER TABLE posts DROP COLUMN body;",
+        );
+        let reports = check_migrations_in_dir(tmp.path()).unwrap();
+        assert!(
+            !reports[0].down.is_empty(),
+            "precondition: down.sql has a destructive finding"
+        );
+        assert!(
+            !rolling_deploy_blocked(&reports),
+            "destructive down.sql must not block a forward rolling deploy"
+        );
+    }
+
+    #[test]
+    fn rolling_deploy_gate_blocks_on_unsafe_up_sql() {
+        // An unsafe forward operation (DROP COLUMN in up.sql) must block.
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_migration_with_down(
+            tmp.path(),
+            "20260101000000_drop_column",
+            "ALTER TABLE posts DROP COLUMN body;",
+            "ALTER TABLE posts ADD COLUMN body TEXT;",
+        );
+        let reports = check_migrations_in_dir(tmp.path()).unwrap();
+        assert!(
+            rolling_deploy_blocked(&reports),
+            "unsafe up.sql must block the forward rolling deploy"
         );
     }
 

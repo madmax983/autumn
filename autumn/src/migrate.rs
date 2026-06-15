@@ -449,34 +449,61 @@ fn resolve_applied_user_migrations(
 
     let framework = framework_migration_versions()?;
 
-    let applied = conn
+    let applied: Vec<String> = conn
         .applied_migrations()
-        .map_err(|e| MigrationError::Migration(e.to_string()))?;
-
-    let mut user: Vec<AppliedUserMigration> = applied
+        .map_err(|e| MigrationError::Migration(e.to_string()))?
         .iter()
         .map(ToString::to_string)
+        .collect();
+
+    Ok(classify_applied_user_migrations(
+        &applied,
+        &by_version,
+        &framework,
+        migrations_dir,
+    ))
+}
+
+/// Pure classification of applied versions into user migrations (ascending by
+/// version), separated from DB/IO so it can be unit-tested.
+///
+/// `by_version` maps a normalised migration version to its local directory name
+/// (from the file-based source). `framework` is the embedded framework version
+/// set. A version is treated as a **user** migration when it is present locally
+/// (`by_version`) — local presence wins over a framework-version collision — or
+/// when it is neither local nor framework-owned (applied but missing locally,
+/// returned with `dir: None` so callers can surface it).
+fn classify_applied_user_migrations(
+    applied: &[String],
+    by_version: &std::collections::BTreeMap<String, String>,
+    framework: &std::collections::BTreeSet<String>,
+    migrations_dir: &Path,
+) -> Vec<AppliedUserMigration> {
+    let mut user: Vec<AppliedUserMigration> = applied
+        .iter()
         // Local presence wins: a version present in `migrations_dir` is a user
         // migration even if it collides with a framework shim version (e.g. the
         // placeholder `00000000000000` shared by `create_api_tokens` and some
         // apps' first migration). Only framework-owned versions that are absent
         // locally are excluded.
-        .filter(|v| by_version.contains_key(v) || !framework.contains(v))
-        .map(|version| match by_version.get(&version) {
-            Some(name) => AppliedUserMigration {
-                dir: Some(migrations_dir.join(name)),
-                name: name.clone(),
-                version,
-            },
-            None => AppliedUserMigration {
-                name: version.clone(),
-                dir: None,
-                version,
-            },
+        .filter(|v| by_version.contains_key(*v) || !framework.contains(*v))
+        .map(|version| {
+            by_version.get(version).map_or_else(
+                || AppliedUserMigration {
+                    name: version.clone(),
+                    dir: None,
+                    version: version.clone(),
+                },
+                |name| AppliedUserMigration {
+                    dir: Some(migrations_dir.join(name)),
+                    name: name.clone(),
+                    version: version.clone(),
+                },
+            )
         })
         .collect();
     user.sort_by(|a, b| a.version.cmp(&b.version));
-    Ok(user)
+    user
 }
 
 /// Return the applied **user** migrations (ascending by version), excluding any
@@ -931,6 +958,115 @@ mod tests {
         let s = format!("{m:?}");
         assert!(s.contains("create_posts"));
         assert!(m.dir.is_some());
+    }
+
+    fn version_map(pairs: &[(&str, &str)]) -> std::collections::BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(v, n)| ((*v).to_string(), (*n).to_string()))
+            .collect()
+    }
+
+    fn version_set(versions: &[&str]) -> std::collections::BTreeSet<String> {
+        versions.iter().map(|v| (*v).to_string()).collect()
+    }
+
+    #[test]
+    fn classify_excludes_framework_versions_absent_locally() {
+        let applied = vec!["00000000000000".to_string(), "20260101000000".to_string()];
+        let by_version = version_map(&[("20260101000000", "20260101000000_create_posts")]);
+        let framework = version_set(&["00000000000000"]);
+
+        let user = classify_applied_user_migrations(
+            &applied,
+            &by_version,
+            &framework,
+            Path::new("migrations"),
+        );
+
+        // The framework version (absent locally) is dropped; the user migration remains.
+        assert_eq!(user.len(), 1);
+        assert_eq!(user[0].version, "20260101000000");
+        assert_eq!(
+            user[0].dir,
+            Some(Path::new("migrations").join("20260101000000_create_posts"))
+        );
+    }
+
+    #[test]
+    fn classify_keeps_user_migration_colliding_with_framework_version() {
+        // A local user migration whose version equals a framework shim version
+        // (the placeholder `00000000000000`) must be kept — local presence wins.
+        let applied = vec!["00000000000000".to_string()];
+        let by_version = version_map(&[("00000000000000", "00000000000000_create_todos")]);
+        let framework = version_set(&["00000000000000"]);
+
+        let user = classify_applied_user_migrations(
+            &applied,
+            &by_version,
+            &framework,
+            Path::new("migrations"),
+        );
+
+        assert_eq!(
+            user.len(),
+            1,
+            "user migration sharing a framework version must not be dropped"
+        );
+        assert_eq!(user[0].name, "00000000000000_create_todos");
+        assert!(user[0].dir.is_some());
+    }
+
+    #[test]
+    fn classify_surfaces_applied_migration_missing_locally() {
+        // Applied, not framework-owned, but absent from the local dir: keep it
+        // with dir = None so callers can refuse rather than silently drop it.
+        let applied = vec!["20260101000000".to_string()];
+        let by_version = version_map(&[]);
+        let framework = version_set(&["00000000000000"]);
+
+        let user = classify_applied_user_migrations(
+            &applied,
+            &by_version,
+            &framework,
+            Path::new("migrations"),
+        );
+
+        assert_eq!(user.len(), 1);
+        assert_eq!(user[0].version, "20260101000000");
+        assert!(
+            user[0].dir.is_none(),
+            "missing-locally migration must have dir = None"
+        );
+    }
+
+    #[test]
+    fn classify_sorts_ascending_and_resolves_hyphenated_dirs() {
+        // `by_version` keys are Diesel-normalised (hyphens stripped); the dir
+        // name can be the raw hyphenated form, and it must still resolve.
+        let applied = vec!["20260102000000".to_string(), "20260101000000".to_string()];
+        let by_version = version_map(&[
+            ("20260101000000", "2026-01-01-000000_create_posts"),
+            ("20260102000000", "20260102000000_add_body"),
+        ]);
+        let framework = version_set(&[]);
+
+        let user = classify_applied_user_migrations(
+            &applied,
+            &by_version,
+            &framework,
+            Path::new("migrations"),
+        );
+
+        assert_eq!(user.len(), 2);
+        // Ascending by version regardless of input order.
+        assert_eq!(user[0].version, "20260101000000");
+        assert_eq!(user[1].version, "20260102000000");
+        // Hyphenated dir resolved via the normalised version key.
+        assert_eq!(
+            user[0].dir,
+            Some(Path::new("migrations").join("2026-01-01-000000_create_posts"))
+        );
     }
 
     #[test]
