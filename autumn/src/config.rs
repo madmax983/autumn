@@ -2777,6 +2777,11 @@ impl AutumnConfig {
                 ),
             }
         }
+        parse_env_bool(
+            env,
+            "AUTUMN_MAIL__MOUNT_UNSUBSCRIBE_ENDPOINT",
+            &mut self.mail.mount_unsubscribe_endpoint,
+        );
         if let Ok(val) = env.var("AUTUMN_MAIL__FILE_DIR") {
             self.mail.file_dir = PathBuf::from(val);
         }

@@ -265,19 +265,29 @@ pub fn mailer_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     // Register the list_unsubscribe declaration so production startup and
     // `autumn doctor` can fail closed when no unsubscribe destination is set.
-    let registration = if let Some(scope) = &list_unsubscribe {
+    // Emit one registration per mail method, carrying that method's `cfg`
+    // attributes, so a build that `#[cfg]`-removes every `Mail` method (and thus
+    // sends no list mail) registers nothing and does not force unsubscribe config.
+    let registrations: Vec<TokenStream> = if let Some(scope) = &list_unsubscribe {
         let mailer_label = self_ty_label(&self_ty);
-        quote! {
-            #( #impl_cfg_attrs )*
-            ::autumn_web::reexports::inventory::submit! {
-                ::autumn_web::mail::MailerListUnsubscribeDescriptor {
-                    mailer: #mailer_label,
-                    scope: #scope,
+        methods
+            .iter()
+            .map(|method| {
+                let cfg_attrs = &method.cfg_attrs;
+                quote! {
+                    #( #impl_cfg_attrs )*
+                    #( #cfg_attrs )*
+                    ::autumn_web::reexports::inventory::submit! {
+                        ::autumn_web::mail::MailerListUnsubscribeDescriptor {
+                            mailer: #mailer_label,
+                            scope: #scope,
+                        }
+                    }
                 }
-            }
-        }
+            })
+            .collect()
     } else {
-        quote! {}
+        Vec::new()
     };
 
     quote! {
@@ -288,7 +298,7 @@ pub fn mailer_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             #( #generated )*
         }
 
-        #registration
+        #( #registrations )*
     }
 }
 

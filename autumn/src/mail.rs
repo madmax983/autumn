@@ -158,13 +158,18 @@ pub struct MailConfig {
     pub smtp: SmtpConfig,
 }
 
-/// Whether `url` is an absolute `https://` URL with a non-empty host (no
-/// whitespace), e.g. `https://app.example.com` or `…/base`. Rejects bare
-/// `https://` and `https:///path`.
+/// Whether `url` is an absolute `https://` URL with a non-empty host and no
+/// query/fragment, e.g. `https://app.example.com` or `…/base`. Rejects bare
+/// `https://`, `https:///path`, and bases carrying `?`/`#` (the unsubscribe
+/// path/token is appended afterwards, so a query/fragment base would not route).
 fn is_valid_https_base_url(url: &str) -> bool {
     let Some(rest) = url.strip_prefix("https://") else {
         return false;
     };
+    // A query or fragment in the base would break the appended `?token=…`.
+    if url.contains('?') || url.contains('#') {
+        return false;
+    }
     let host = rest.split('/').next().unwrap_or("");
     !host.is_empty() && !host.contains(char::is_whitespace)
 }
@@ -968,7 +973,11 @@ impl UnsubscribeRuntime {
             entries.push(format!("<{}>", unsubscribe::unsubscribe_url(base, &token)));
         }
         if let Some(mailto) = self.mailto.as_deref().filter(|s| !s.trim().is_empty()) {
-            entries.push(format!("<mailto:{mailto}?subject=unsubscribe>"));
+            // Accept both a bare address and a full `mailto:` URI without
+            // double-prefixing the scheme.
+            let trimmed = mailto.trim();
+            let address = trimmed.strip_prefix("mailto:").unwrap_or(trimmed);
+            entries.push(format!("<mailto:{address}?subject=unsubscribe>"));
         }
         if entries.is_empty() {
             None
@@ -1148,7 +1157,17 @@ impl Mailer {
             }
             let mut per_recipient = mail.clone();
             per_recipient.to = vec![recipient.clone()];
-            if let Some(value) = runtime.list_unsubscribe_header(&subscriber, &list_id) {
+            // Don't double-emit if the template already set the header by hand —
+            // a migration to `#[mailer(list_unsubscribe)]` should replace, not
+            // duplicate, an existing destination.
+            let already_set = per_recipient
+                .extra_headers
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case("List-Unsubscribe"));
+            if let Some(value) = runtime
+                .list_unsubscribe_header(&subscriber, &list_id)
+                .filter(|_| !already_set)
+            {
                 per_recipient
                     .extra_headers
                     .push(("List-Unsubscribe".to_owned(), value));
@@ -2425,6 +2444,22 @@ pub(crate) fn install_mailer(
         ));
     }
 
+    // Warn (don't fail — a custom route is a valid choice) when one-click links
+    // will be advertised but the built-in endpoint is not opted in. We can't see
+    // app-registered routes here, so this is a heads-up, not a hard gate.
+    if in_production
+        && transport_sends_mail
+        && has_list_unsubscribe_mailers()
+        && base_url.is_some()
+        && !config.mount_unsubscribe_endpoint
+    {
+        tracing::warn!(
+            target: "mail",
+            path = UNSUBSCRIBE_PATH,
+            "list mail will advertise one-click unsubscribe URLs but the default endpoint is not mounted; call AppBuilder::mount_unsubscribe_endpoint() or serve the path yourself"
+        );
+    }
+
     if unsubscribe_configured || suppression.is_some() {
         let signing_keys = Arc::new(crate::security::config::resolve_signing_keys(
             &state
@@ -2611,15 +2646,16 @@ async fn unsubscribe_get_handler(
 }
 
 fn unsubscribe_form_html(list_id: &str, token: &str) -> String {
+    // Relative action (`?token=…`) posts back to the current URL, preserving any
+    // base-path prefix added by a reverse proxy.
     format!(
         "<!doctype html><html><head><meta charset=\"utf-8\"><title>Unsubscribe</title></head>\
          <body><h1>Unsubscribe</h1>\
          <p>Stop receiving <strong>{}</strong> emails?</p>\
-         <form method=\"post\" action=\"{}?token={}\">\
+         <form method=\"post\" action=\"?token={}\">\
          <input type=\"hidden\" name=\"List-Unsubscribe\" value=\"One-Click\">\
          <button type=\"submit\">Unsubscribe</button></form></body></html>",
         escape_html(list_id),
-        UNSUBSCRIBE_PATH,
         escape_html(token),
     )
 }
@@ -3081,6 +3117,17 @@ mod tests {
         // https prefix without a real host is rejected in prod.
         assert!(cfg("https://").validate(Some("prod")).is_err());
         assert!(cfg("https:///path").validate(Some("prod")).is_err());
+        // query/fragment bases would break the appended ?token=… link.
+        assert!(
+            cfg("https://app.example.com?t=acme")
+                .validate(Some("prod"))
+                .is_err()
+        );
+        assert!(
+            cfg("https://app.example.com#x")
+                .validate(Some("prod"))
+                .is_err()
+        );
         assert!(
             cfg("https://app.example.com/base")
                 .validate(Some("prod"))
@@ -3112,6 +3159,22 @@ mod tests {
             .expect("mailto header");
         assert!(header.contains("mailto:u@example.com"));
         assert!(!header.contains("token="));
+    }
+
+    #[test]
+    fn mailto_value_with_scheme_is_not_double_prefixed() {
+        let runtime = UnsubscribeRuntime {
+            base_url: None,
+            mailto: Some("mailto:u@example.com".to_owned()),
+            signing_keys: Arc::new(test_keys()),
+            ttl_days: 30,
+            suppression: None,
+        };
+        let header = runtime
+            .list_unsubscribe_header("a@x.com", "list")
+            .expect("mailto header");
+        assert!(header.contains("<mailto:u@example.com?subject=unsubscribe>"));
+        assert!(!header.contains("mailto:mailto:"));
     }
 
     #[test]
