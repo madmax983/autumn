@@ -1,0 +1,600 @@
+    Checking autumn-web v0.5.0 (/app/autumn)
+error: unnested or-patterns
+    --> autumn/src/inbound_mail.rs:1458:21
+     |
+1458 | ...   None | Some(b'\r') | Some(b'\n') | Some(b'-') | Some(b' ') | Some(b'\t')
+     |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#unnested_or_patterns
+     = note: `-D clippy::unnested-or-patterns` implied by `-D warnings`
+     = help: to override `-D warnings` add `#[allow(clippy::unnested_or_patterns)]`
+help: nest the patterns
+     |
+1458 -                     None | Some(b'\r') | Some(b'\n') | Some(b'-') | Some(b' ') | Some(b'\t')
+1458 +                     None | Some(b'\r' | b'\n' | b'-' | b' ' | b'\t')
+     |
+
+error: unnested or-patterns
+    --> autumn/src/inbound_mail.rs:1740:13
+     |
+1740 | ...   None | Some(b'\r') | Some(b'\n') | Some(b'-') | Some(b' ') | Some(b'\t')
+     |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#unnested_or_patterns
+help: nest the patterns
+     |
+1740 -             None | Some(b'\r') | Some(b'\n') | Some(b'-') | Some(b' ') | Some(b'\t')
+1740 +             None | Some(b'\r' | b'\n' | b'-' | b' ' | b'\t')
+     |
+
+error: unnested or-patterns
+    --> autumn/src/inbound_mail.rs:1752:13
+     |
+1752 | ...   None | Some(b'\r') | Some(b'\n') | Some(b'-') | Some(b' ') | Some(b'\t')
+     |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#unnested_or_patterns
+help: nest the patterns
+     |
+1752 -             None | Some(b'\r') | Some(b'\n') | Some(b'-') | Some(b' ') | Some(b'\t')
+1752 +             None | Some(b'\r' | b'\n' | b'-' | b' ' | b'\t')
+     |
+
+error: unnested or-patterns
+    --> autumn/src/inbound_mail.rs:1799:13
+     |
+1799 | ...   None | Some(b'\r') | Some(b'\n') | Some(b'-') | Some(b' ') | Some(b'\t')
+     |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#unnested_or_patterns
+help: nest the patterns
+     |
+1799 -             None | Some(b'\r') | Some(b'\n') | Some(b'-') | Some(b' ') | Some(b'\t')
+1799 +             None | Some(b'\r' | b'\n' | b'-' | b' ' | b'\t')
+     |
+
+error: item in documentation is missing backticks
+   --> autumn/src/inbound_mail.rs:154:33
+    |
+154 |     /// Extract the DER-encoded SubjectPublicKeyInfo from a DER X.509 c...
+    |                                 ^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#doc_markdown
+    = note: `-D clippy::doc-markdown` implied by `-D warnings`
+    = help: to override `-D warnings` add `#[allow(clippy::doc_markdown)]`
+help: try
+    |
+154 -     /// Extract the DER-encoded SubjectPublicKeyInfo from a DER X.509 certificate.
+154 +     /// Extract the DER-encoded `SubjectPublicKeyInfo` from a DER X.509 certificate.
+    |
+
+error: you seem to be trying to use `match` for an equality check. Consider using `if`
+   --> autumn/src/inbound_mail.rs:212:9
+    |
+212 | /         match sig_version {
+213 | |             "2" => {
+214 | |                 let hash = sha2::Sha256::digest(message);
+215 | |                 public_key
+...   |
+238 | |         }
+    | |_________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#single_match_else
+    = note: `-D clippy::single-match-else` implied by `-D warnings`
+    = help: to override `-D warnings` add `#[allow(clippy::single_match_else)]`
+help: try
+    |
+212 ~         if sig_version == "2" {
+213 +             let hash = sha2::Sha256::digest(message);
+214 +             public_key
+215 +                 .verify(Pkcs1v15Sign::new::<sha2::Sha256>(), &hash, sig)
+216 +                 .map_err(|_| ())
+217 +         } else {
+218 +             // SignatureVersion 1 uses SHA-1.
+219 +             // sha1 0.10 uses const-oid 0.10.x while rsa 0.9 uses const-oid 0.9.x,
+220 +             // so Pkcs1v15Sign::new::<sha1::Sha1>() fails to compile.  Work around
+221 +             // the version split by using new_unprefixed() and prepending the
+222 ~             // DigestInfo DER structure (RFC 3447 §9.2) manually.
+223 +             use sha1::Digest as _;
+224 +             let hash = sha1::Sha1::digest(message);
+225 +             // SHA-1 DigestInfo prefix: SEQUENCE { SEQUENCE { OID sha1, NULL }, OCTET STRING }
+226 +             const SHA1_DI_PREFIX: &[u8] = &[
+227 +                 0x30, 0x21, 0x30, 0x09, 0x06, 0x05, 0x2b, 0x0e, 0x03, 0x02, 0x1a, 0x05, 0x00,
+228 +                 0x04, 0x14,
+229 +             ];
+230 +             let mut digest_info = SHA1_DI_PREFIX.to_vec();
+231 +             digest_info.extend_from_slice(&hash);
+232 +             public_key
+233 +                 .verify(Pkcs1v15Sign::new_unprefixed(), &digest_info, sig)
+234 +                 .map_err(|_| ())
+235 +         }
+    |
+
+error: adding items after statements is confusing, since items exist from the start of the scope
+   --> autumn/src/inbound_mail.rs:228:17
+    |
+228 | / ...   const SHA1_DI_PREFIX: &[u8] = &[
+229 | | ...       0x30, 0x21, 0x30, 0x09, 0x06, 0x05, 0x2b, 0x0e, 0x03, 0x02,...
+230 | | ...       0x04, 0x14,
+231 | | ...   ];
+    | |________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#items_after_statements
+    = note: `-D clippy::items-after-statements` implied by `-D warnings`
+    = help: to override `-D warnings` add `#[allow(clippy::items_after_statements)]`
+
+error: item in documentation is missing backticks
+   --> autumn/src/inbound_mail.rs:241:60
+    |
+241 |     /// Verify the SNS notification signature and optional TopicArn bin...
+    |                                                            ^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#doc_markdown
+help: try
+    |
+241 -     /// Verify the SNS notification signature and optional TopicArn binding.
+241 +     /// Verify the SNS notification signature and optional `TopicArn` binding.
+    |
+
+error: matching over `()` is more explicit
+   --> autumn/src/inbound_mail.rs:311:14
+    |
+311 |             |_| {
+    |              ^ help: use `()` instead of `_`: `()`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#ignored_unit_patterns
+    = note: `-D clippy::ignored-unit-patterns` implied by `-D warnings`
+    = help: to override `-D warnings` add `#[allow(clippy::ignored_unit_patterns)]`
+
+error: this `map_or` can be simplified
+   --> autumn/src/inbound_mail.rs:782:12
+    |
+782 |           if email
+    |  ____________^
+783 | |             .spam_report
+784 | |             .as_ref()
+785 | |             .and_then(|r| r.verdict.as_deref())
+786 | |             .map_or(false, |v| v.eq_ignore_ascii_case("yes"))
+    | |_____________________________________________________________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#unnecessary_map_or
+    = note: `-D clippy::unnecessary-map-or` implied by `-D warnings`
+    = help: to override `-D warnings` add `#[allow(clippy::unnecessary_map_or)]`
+help: use is_some_and instead
+    |
+786 -             .map_or(false, |v| v.eq_ignore_ascii_case("yes"))
+786 +             .is_some_and(|v| v.eq_ignore_ascii_case("yes"))
+    |
+
+error: unnecessary boolean `not` operation
+   --> autumn/src/inbound_mail.rs:951:23
+    |
+951 |       let attachments = if !file_parts.is_empty() {
+    |  _______________________^
+952 | |         file_parts
+953 | |     } else {
+954 | |         let attachment_count: usize = form
+...   |
+969 | |         metadata
+970 | |     };
+    | |_____^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#if_not_else
+    = note: `-D clippy::if-not-else` implied by `-D warnings`
+    = help: to override `-D warnings` add `#[allow(clippy::if_not_else)]`
+help: try
+    |
+951 ~     let attachments = if file_parts.is_empty() {
+952 +         let attachment_count: usize = form
+953 +             .get("attachment-count")
+954 +             .and_then(|s| s.parse().ok())
+955 +             .unwrap_or(0)
+956 +             .min(100);
+957 +         let mut metadata = Vec::new();
+958 +         for i in 1..=attachment_count {
+959 +             if let Some(name) = form.get(&format!("attachment-{i}")) {
+960 +                 metadata.push(Attachment {
+961 +                     filename: Some(name.clone()),
+962 +                     content_type: "application/octet-stream".to_string(),
+963 +                     data: Bytes::new(),
+964 +                 });
+965 +             }
+966 +         }
+967 +         metadata
+968 +     } else {
+969 +         file_parts
+970 ~     };
+    |
+
+error: this function has too many lines (130/100)
+    --> autumn/src/inbound_mail.rs:1128:1
+     |
+1128 | fn parse_rfc5322(raw: Bytes) -> InboundEmail {
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#too_many_lines
+     = note: `-D clippy::too-many-lines` implied by `-D warnings`
+     = help: to override `-D warnings` add `#[allow(clippy::too_many_lines)]`
+
+error: function call inside of `unwrap_or`
+    --> autumn/src/inbound_mail.rs:1133:10
+     |
+1133 |         .unwrap_or((raw.as_ref(), &[]));
+     |          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: try: `unwrap_or_else(|| (raw.as_ref(), &[]))`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#or_fun_call
+     = note: `-D clippy::or-fun-call` implied by `-D warnings`
+     = help: to override `-D warnings` add `#[allow(clippy::or_fun_call)]`
+
+error: redundant closure
+    --> autumn/src/inbound_mail.rs:1189:72
+     |
+1189 | ...tes.iter().all(|b| b.is_ascii_whitespace())
+     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: replace the closure with the method itself: `u8::is_ascii_whitespace`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#redundant_closure_for_method_calls
+     = note: `-D clippy::redundant-closure-for-method-calls` implied by `-D warnings`
+     = help: to override `-D warnings` add `#[allow(clippy::redundant_closure_for_method_calls)]`
+
+error: called `map(<f>).unwrap_or(<a>)` on an `Option` value
+    --> autumn/src/inbound_mail.rs:1208:27
+     |
+1208 |               let ct_only = ct_lower
+     |  ___________________________^
+1209 | |                 .split(';')
+1210 | |                 .next()
+1211 | |                 .map(str::trim)
+1212 | |                 .unwrap_or("application/octet-stream")
+     | |______________________________________________________^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#map_unwrap_or
+     = note: `-D clippy::map-unwrap-or` implied by `-D warnings`
+     = help: to override `-D warnings` add `#[allow(clippy::map_unwrap_or)]`
+help: use `map_or(<a>, <f>)` instead
+     |
+1211 -                 .map(str::trim)
+1212 -                 .unwrap_or("application/octet-stream")
+1211 +                 .map_or("application/octet-stream", str::trim)
+     |
+
+error: called `map(<f>).unwrap_or_else(<g>)` on a `Result` value
+    --> autumn/src/inbound_mail.rs:1219:17
+     |
+1219 | / ...   base64::engine::general_purpose::STANDARD
+1220 | | ...       .decode(stripped.as_bytes())
+1221 | | ...       .map(Bytes::from)
+1222 | | ...       .unwrap_or_else(|_| Bytes::copy_from_slice(body_bytes))
+     | |_________________________________________________________________^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#map_unwrap_or
+help: try
+     |
+1219 ~                 base64::engine::general_purpose::STANDARD
+1220 +                     .decode(stripped.as_bytes()).map_or_else(|_| Bytes::copy_from_slice(body_bytes), Bytes::from)
+     |
+
+error: casting `u32` to `u8` may truncate the value
+    --> autumn/src/inbound_mail.rs:1311:26
+     |
+1311 | ... hi = (input[i + 1] as char).to_digit(16).unwrap_or(0) as u8;
+     |          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = help: if this is intentional allow the lint with `#[allow(clippy::cast_possible_truncation)]` ...
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#cast_possible_truncation
+     = note: `-D clippy::cast-possible-truncation` implied by `-D warnings`
+     = help: to override `-D warnings` add `#[allow(clippy::cast_possible_truncation)]`
+help: ... or use `try_from` and handle the error accordingly
+     |
+1311 -                 let hi = (input[i + 1] as char).to_digit(16).unwrap_or(0) as u8;
+1311 +                 let hi = u8::try_from((input[i + 1] as char).to_digit(16).unwrap_or(0));
+     |
+
+error: casting `u32` to `u8` may truncate the value
+    --> autumn/src/inbound_mail.rs:1312:26
+     |
+1312 | ... lo = (input[i + 2] as char).to_digit(16).unwrap_or(0) as u8;
+     |          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = help: if this is intentional allow the lint with `#[allow(clippy::cast_possible_truncation)]` ...
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#cast_possible_truncation
+help: ... or use `try_from` and handle the error accordingly
+     |
+1312 -                 let lo = (input[i + 2] as char).to_digit(16).unwrap_or(0) as u8;
+1312 +                 let lo = u8::try_from((input[i + 2] as char).to_digit(16).unwrap_or(0));
+     |
+
+error: this function has too many lines (130/100)
+    --> autumn/src/inbound_mail.rs:1415:1
+     |
+1415 | / fn extract_multipart_bodies(
+1416 | |     body: &[u8],
+1417 | |     content_type: &str,
+1418 | | ) -> (Option<String>, Option<String>, Vec<Attachment>) {
+     | |______________________________________________________^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#too_many_lines
+
+error: called `map(<f>).unwrap_or_else(<g>)` on an `Option` value
+    --> autumn/src/inbound_mail.rs:1496:29
+     |
+1496 |   ...   let part_ct_lower = part_headers
+     |  ___________________________^
+1497 | | ...       .lines()
+1498 | | ...       .find(|l| l.to_ascii_lowercase().starts_with("content-type...
+1499 | | ...       .map(|l| l[13..].trim().to_ascii_lowercase())
+1500 | | ...       .unwrap_or_else(|| "text/plain".to_string());
+     | |______________________________________________________^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#map_unwrap_or
+help: try
+     |
+1496 ~         let part_ct_lower = part_headers
+1497 +             .lines()
+1498 ~             .find(|l| l.to_ascii_lowercase().starts_with("content-type:")).map_or_else(|| "text/plain".to_string(), |l| l[13..].trim().to_ascii_lowercase());
+     |
+
+error: called `map(<f>).unwrap_or_else(<g>)` on an `Option` value
+    --> autumn/src/inbound_mail.rs:1501:28
+     |
+1501 |   ...   let part_ct_orig = part_headers
+     |  __________________________^
+1502 | | ...       .lines()
+1503 | | ...       .find(|l| l.to_ascii_lowercase().starts_with("content-type...
+1504 | | ...       .map(|l| l[13..].trim().to_string())
+1505 | | ...       .unwrap_or_else(|| "text/plain".to_string());
+     | |______________________________________________________^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#map_unwrap_or
+help: try
+     |
+1501 ~         let part_ct_orig = part_headers
+1502 +             .lines()
+1503 ~             .find(|l| l.to_ascii_lowercase().starts_with("content-type:")).map_or_else(|| "text/plain".to_string(), |l| l[13..].trim().to_string());
+     |
+
+error: called `map(<f>).unwrap_or(<a>)` on an `Option` value
+    --> autumn/src/inbound_mail.rs:1544:27
+     |
+1544 |               let ct_only = part_ct_lower
+     |  ___________________________^
+1545 | |                 .split(';')
+1546 | |                 .next()
+1547 | |                 .map(str::trim)
+1548 | |                 .unwrap_or("application/octet-stream")
+     | |______________________________________________________^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#map_unwrap_or
+help: use `map_or(<a>, <f>)` instead
+     |
+1547 -                 .map(str::trim)
+1548 -                 .unwrap_or("application/octet-stream")
+1547 +                 .map_or("application/octet-stream", str::trim)
+     |
+
+error: called `map(<f>).unwrap_or_else(<g>)` on a `Result` value
+    --> autumn/src/inbound_mail.rs:1555:17
+     |
+1555 | /                 base64::engine::general_purpose::STANDARD
+1556 | |                     .decode(stripped.as_bytes())
+1557 | |                     .map(Bytes::from)
+1558 | |                     .unwrap_or_else(|_| Bytes::copy_from_slice(part_body_bytes))
+     | |________________________________________________________________________________^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#map_unwrap_or
+help: try
+     |
+1555 ~                 base64::engine::general_purpose::STANDARD
+1556 +                     .decode(stripped.as_bytes()).map_or_else(|_| Bytes::copy_from_slice(part_body_bytes), Bytes::from)
+     |
+
+error: casting `u32` to `u8` may truncate the value
+    --> autumn/src/inbound_mail.rs:1659:22
+     |
+1659 | ... hi = (input[i + 1] as char).to_digit(16).unwrap_or(0) as u8;
+     |          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = help: if this is intentional allow the lint with `#[allow(clippy::cast_possible_truncation)]` ...
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#cast_possible_truncation
+help: ... or use `try_from` and handle the error accordingly
+     |
+1659 -             let hi = (input[i + 1] as char).to_digit(16).unwrap_or(0) as u8;
+1659 +             let hi = u8::try_from((input[i + 1] as char).to_digit(16).unwrap_or(0));
+     |
+
+error: casting `u32` to `u8` may truncate the value
+    --> autumn/src/inbound_mail.rs:1660:22
+     |
+1660 | ... lo = (input[i + 2] as char).to_digit(16).unwrap_or(0) as u8;
+     |          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = help: if this is intentional allow the lint with `#[allow(clippy::cast_possible_truncation)]` ...
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#cast_possible_truncation
+help: ... or use `try_from` and handle the error accordingly
+     |
+1660 -             let lo = (input[i + 2] as char).to_digit(16).unwrap_or(0) as u8;
+1660 +             let lo = u8::try_from((input[i + 2] as char).to_digit(16).unwrap_or(0));
+     |
+
+error: these match arms have identical bodies
+    --> autumn/src/inbound_mail.rs:1674:9
+     |
+1674 | ...   "utf-8" | "utf8" | "us-ascii" | "ascii" => String::from_utf8(bytes).ok(),
+     |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+1675 | ...   "iso-8859-1" | "latin-1" | "iso8859-1" => Some(bytes.iter().map(|&b| b as c...
+1676 | ...   _ => String::from_utf8(bytes).ok(),
+     |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the wildcard arm
+     |
+     = help: if this is unintentional make the arms return different values
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#match_same_arms
+     = note: `-D clippy::match-same-arms` implied by `-D warnings`
+     = help: to override `-D warnings` add `#[allow(clippy::match_same_arms)]`
+help: otherwise remove the non-wildcard arm
+     |
+1674 -         "utf-8" | "utf8" | "us-ascii" | "ascii" => String::from_utf8(bytes).ok(),
+     |
+
+error: this function has too many lines (104/100)
+    --> autumn/src/inbound_mail.rs:1764:1
+     |
+1764 | / fn parse_mailgun_form_data(
+1765 | |     body: &[u8],
+1766 | |     content_type: &str,
+1767 | | ) -> (HashMap<String, String>, Vec<Attachment>) {
+     | |_______________________________________________^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#too_many_lines
+
+error: called `map(<f>).unwrap_or(<a>)` on an `Option` value
+    --> autumn/src/inbound_mail.rs:1822:24
+     |
+1822 |   ...   let part_end = find_part_end(&body[part_start..], crlf_delim_b...
+     |  ______________________^
+1823 | | ...       .map(|p| part_start + p)
+1824 | | ...       .unwrap_or(body.len());
+     | |________________________________^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#map_unwrap_or
+help: use `map_or(<a>, <f>)` instead
+     |
+1823 -             .map(|p| part_start + p)
+1824 -             .unwrap_or(body.len());
+1823 +             .map_or(body.len(), |p| part_start + p);
+     |
+
+error: called `map(<f>).unwrap_or_else(<g>)` on an `Option` value
+    --> autumn/src/inbound_mail.rs:1860:27
+     |
+1860 |               let part_ct = headers_str
+     |  ___________________________^
+1861 | |                 .lines()
+1862 | |                 .find(|l| l.to_ascii_lowercase().starts_with("content-type:"))
+1863 | |                 .map(|l| {
+...    |
+1871 | |                 })
+1872 | |                 .unwrap_or_else(|| "application/octet-stream".to_string());
+     | |__________________________________________________________________________^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#map_unwrap_or
+help: try
+     |
+1860 ~             let part_ct = headers_str
+1861 +                 .lines()
+1862 +                 .find(|l| l.to_ascii_lowercase().starts_with("content-type:")).map_or_else(|| "application/octet-stream".to_string(), |l| {
+1863 +                     l[13..]
+1864 +                         .trim()
+1865 +                         .split(';')
+1866 +                         .next()
+1867 +                         .map(str::trim)
+1868 +                         .unwrap_or("application/octet-stream")
+1869 +                         .to_ascii_lowercase()
+1870 ~                 });
+     |
+
+error: called `map(<f>).unwrap_or(<a>)` on an `Option` value
+    --> autumn/src/inbound_mail.rs:1864:21
+     |
+1864 | /                     l[13..]
+1865 | |                         .trim()
+1866 | |                         .split(';')
+1867 | |                         .next()
+1868 | |                         .map(str::trim)
+1869 | |                         .unwrap_or("application/octet-stream")
+     | |______________________________________________________________^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#map_unwrap_or
+help: use `map_or(<a>, <f>)` instead
+     |
+1868 -                         .map(str::trim)
+1869 -                         .unwrap_or("application/octet-stream")
+1868 +                         .map_or("application/octet-stream", str::trim)
+     |
+
+error: called `map(<f>).unwrap_or_else(<g>)` on a `Result` value
+    --> autumn/src/inbound_mail.rs:1887:17
+     |
+1887 | / ...   base64::engine::general_purpose::STANDARD
+1888 | | ...       .decode(stripped.as_bytes())
+1889 | | ...       .map(Bytes::from)
+1890 | | ...       .unwrap_or_else(|_| Bytes::copy_from_slice(body_bytes))
+     | |_________________________________________________________________^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#map_unwrap_or
+help: try
+     |
+1887 ~                 base64::engine::general_purpose::STANDARD
+1888 +                     .decode(stripped.as_bytes()).map_or_else(|_| Bytes::copy_from_slice(body_bytes), Bytes::from)
+     |
+
+error: this `if` statement can be collapsed
+    --> autumn/src/inbound_mail.rs:2044:13
+     |
+2044 | / ...   if let Ok(json) = serde_json::from_slice::<serde_json::Value>(...
+2045 | | ...       if let Err(status) =
+2046 | | ...           sns_verify::verify(&json, &http_client, topic_arn.as_d...
+...    |
+2050 | | ...   }
+     | |_______^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#collapsible_if
+     = note: `-D clippy::collapsible-if` implied by `-D warnings`
+     = help: to override `-D warnings` add `#[allow(clippy::collapsible_if)]`
+help: collapse nested if block
+     |
+2044 ~             if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&body)
+2045 ~                 && let Err(status) =
+2046 |                     sns_verify::verify(&json, &http_client, topic_arn.as_deref()).await
+2047 |                 {
+2048 |                     return status;
+2049 ~                 }
+     |
+
+error: redundant closure
+    --> autumn/src/inbound_mail.rs:2059:35
+     |
+2059 |                         .and_then(|r| r.error_for_status())
+     |                                   ^^^^^^^^^^^^^^^^^^^^^^^^ help: replace the closure with the method itself: `reqwest::Response::error_for_status`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#redundant_closure_for_method_calls
+
+error: this could be a `const fn`
+   --> autumn/src/telemetry.rs:139:5
+    |
+139 | /     fn with_provider(provider: SdkTracerProvider) -> Self {
+140 | |         Self {
+141 | |             provider: Some(provider),
+142 | |             log_buffer: None,
+143 | |         }
+144 | |     }
+    | |_____^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#missing_const_for_fn
+    = note: `-D clippy::missing-const-for-fn` implied by `-D warnings`
+    = help: to override `-D warnings` add `#[allow(clippy::missing_const_for_fn)]`
+help: make the function `const`
+    |
+139 |     const fn with_provider(provider: SdkTracerProvider) -> Self {
+    |     +++++
+
+error: could not compile `autumn-web` (lib) due to 34 previous errors
+warning: build failed, waiting for other jobs to finish...
+error: this manual char comparison can be written more succinctly
+    --> autumn/src/inbound_mail.rs:3189:38
+     |
+3189 |             decoded.trim_end_matches(|c| c == '\r' || c == '\n'),
+     |                                      ^^^^^^^^^^^^^^^^^^^^^^^^^^ help: consider using an array of `char`: `['\r', '\n']`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#manual_pattern_char_comparison
+     = note: `-D clippy::manual-pattern-char-comparison` implied by `-D warnings`
+     = help: to override `-D warnings` add `#[allow(clippy::manual_pattern_char_comparison)]`
+
+error: wildcard matches only a single variant and will also match any future added variants
+    --> autumn/src/inbound_mail.rs:3235:13
+     |
+3235 |             other => panic!("expected Email, got {other:?}"),
+     |             ^^^^^ help: try: `other @ SnsParseResult::SubscriptionConfirmation { .. }`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#match_wildcard_for_single_variants
+     = note: `-D clippy::match-wildcard-for-single-variants` implied by `-D warnings`
+     = help: to override `-D warnings` add `#[allow(clippy::match_wildcard_for_single_variants)]`
+
+error: could not compile `autumn-web` (lib test) due to 36 previous errors
