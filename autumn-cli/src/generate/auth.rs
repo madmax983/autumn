@@ -1488,7 +1488,6 @@ use crate::schema::{table};
 pub struct {pascal_name} {{
     pub id: i64,
     pub email: String,
-    #[default]
     pub time_zone: Option<String>,
     pub password_digest: String,
 {totp_fields}    #[default]
@@ -2262,6 +2261,7 @@ pub async fn signup(
     let password_digest = hash_password(&form.password).await?;
     let new_{snake_name} = New{pascal_name} {{
         email: email.clone(),
+        time_zone: None,
         password_digest,
         reset_token_digest: None,
         reset_token_expires_at: None,
