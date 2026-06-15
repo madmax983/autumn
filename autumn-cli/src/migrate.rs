@@ -272,9 +272,14 @@ fn run_safety_check(migrations_dir: &str) {
         }
     }
 
-    let any_unsafe = reports
-        .iter()
-        .any(|r| safety::has_unsafe_findings(&r.up) || safety::has_unsafe_findings(&r.down));
+    // The rolling-deploy safety gate keys off `up.sql` only: that is what runs
+    // during a forward deploy. `down.sql` findings are reported above for the
+    // rollback workflow (e.g. an inherently destructive `DROP TABLE` revert, or
+    // a `DROP INDEX CONCURRENTLY` that needs `run_in_transaction = false`), but
+    // they must not fail the forward check — otherwise every ordinary
+    // create-table migration would be rejected before deploy.
+    let any_unsafe = reports.iter().any(|r| safety::has_unsafe_findings(&r.up));
+    let any_down_unsafe = reports.iter().any(|r| safety::has_unsafe_findings(&r.down));
 
     eprintln!();
     if any_unsafe {
@@ -285,8 +290,13 @@ fn run_safety_check(migrations_dir: &str) {
         eprintln!("  Review the findings above, apply the expand/contract pattern where needed,");
         eprintln!("  or coordinate a maintenance window before deploying these migrations.");
         std::process::exit(1);
-    } else {
-        eprintln!("\u{2713} All {total} migration(s) are safe for a rolling deploy.");
+    }
+    eprintln!("\u{2713} All {total} migration(s) are safe for a rolling deploy.");
+    if any_down_unsafe {
+        eprintln!(
+            "  Note: some down.sql reverts contain destructive or blocking operations \
+             (reported above). These only run on `autumn migrate down`, not on deploy."
+        );
     }
 }
 

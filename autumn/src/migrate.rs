@@ -456,7 +456,12 @@ fn resolve_applied_user_migrations(
     let mut user: Vec<AppliedUserMigration> = applied
         .iter()
         .map(ToString::to_string)
-        .filter(|v| !framework.contains(v))
+        // Local presence wins: a version present in `migrations_dir` is a user
+        // migration even if it collides with a framework shim version (e.g. the
+        // placeholder `00000000000000` shared by `create_api_tokens` and some
+        // apps' first migration). Only framework-owned versions that are absent
+        // locally are excluded.
+        .filter(|v| by_version.contains_key(v) || !framework.contains(v))
         .map(|version| match by_version.get(&version) {
             Some(name) => AppliedUserMigration {
                 dir: Some(migrations_dir.join(name)),
@@ -478,9 +483,12 @@ fn resolve_applied_user_migrations(
 /// framework-owned migrations, each resolved to its local directory.
 ///
 /// Framework migrations are excluded by version (the embedded
-/// `FRAMEWORK_MIGRATIONS` set). An applied user migration that is no longer
-/// present locally is still returned, with [`AppliedUserMigration::dir`] set to
-/// `None`, so callers can surface it rather than silently dropping it.
+/// `FRAMEWORK_MIGRATIONS` set), except where a version is also present in the
+/// local `migrations_dir` — local presence wins so a user migration that
+/// collides with a framework shim version is not dropped. An applied user
+/// migration that is no longer present locally is still returned, with
+/// [`AppliedUserMigration::dir`] set to `None`, so callers can surface it rather
+/// than silently dropping it.
 ///
 /// This is a read-only listing for status display; it does **not** take the
 /// migration advisory lock. Use [`revert_user_migrations_locked`] to plan and
