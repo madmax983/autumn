@@ -577,7 +577,22 @@ fn build_router_pre_state(
     // documented rather than fixed for that narrow combination.
     #[cfg(feature = "mcp")]
     let router = if let Some((mount_path, tools, endpoint_layer)) = mcp_prepared {
-        let dispatch = router.clone().with_state(state.clone());
+        // The framework's outermost `SecurityHeadersLayer` is applied AFTER this
+        // clone (below, with the gate), so the dispatch snapshot would otherwise
+        // miss it. That layer also injects `CspNonce` into request extensions, so
+        // without it a `tools/call` replay of a handler using the `CspNonce`
+        // extractor would 500 when `csp_nonce` is enabled. Re-attach it to the
+        // dispatch clone only: a direct HTTP request gets the same layer via the
+        // outer application, and the replay's response headers are discarded when
+        // `serve_mcp` rebuilds the JSON-RPC envelope, so there is no duplicate
+        // live header. (The gate is intentionally NOT re-attached here — a browser
+        // redirect/reject is meaningless for JSON-RPC dispatch.)
+        let dispatch = router
+            .clone()
+            .layer(crate::security::SecurityHeadersLayer::from_config(
+                &config.security.headers,
+            ))
+            .with_state(state.clone());
         // For header-based tenancy, forward the configured tenant header on
         // dispatch so tenant-scoped tools resolve the same tenant a direct HTTP
         // call would. Other sources key off already-forwarded headers/Host.
