@@ -49,13 +49,12 @@ pub fn run(debug: bool, package: Option<&str>) {
 
     let mut cmd = Command::new(&binary);
     cmd.env("AUTUMN_BUILD_STATIC", "1");
-    // Static pre-rendering is a build-time operation, not production serving.
-    // Force dev profile so autumn-dev.toml is loaded and production-only
-    // validation (signing secret, Redis webhook replay, etc.) doesn't block
-    // local `autumn build` runs. Only override if the caller hasn't already
-    // set AUTUMN_PROFILE themselves.
+    // Mirror cargo's profile selection: dev builds use the dev Autumn profile
+    // (skips production-only validation), release builds use prod so that
+    // prod config overrides (robots.txt, SEO settings, etc.) are applied.
+    // Users can override either by setting AUTUMN_PROFILE explicitly.
     if std::env::var("AUTUMN_PROFILE").is_err() {
-        cmd.env("AUTUMN_PROFILE", "dev");
+        cmd.env("AUTUMN_PROFILE", if debug { "dev" } else { "prod" });
     }
     // When -p <package> is given and the package lives in a subdirectory (e.g.
     // `autumn build -p reddit-clone` from the workspace root), the binary would
