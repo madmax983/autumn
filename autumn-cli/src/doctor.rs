@@ -570,6 +570,7 @@ fn is_valid_mailto_address_doctor(value: &str) -> bool {
                 && !domain.is_empty()
                 && domain.contains('.')
                 && !address.contains(char::is_whitespace)
+                && !address.contains([':', '/'])
         }
         None => false,
     }
@@ -2992,6 +2993,8 @@ mod tests {
         assert!(is_valid_mailto_address_doctor("mailto:unsub@example.com"));
         assert!(!is_valid_mailto_address_doctor("not-an-email"));
         assert!(!is_valid_mailto_address_doctor("unsubscribe example.com"));
+        assert!(!is_valid_mailto_address_doctor("https://unsub@example.com"));
+        assert!(!is_valid_mailto_address_doctor("unsub@https://example.com"));
     }
 
     #[test]

@@ -203,6 +203,10 @@ fn is_valid_mailto_address(value: &str) -> bool {
                 && !domain.is_empty()
                 && domain.contains('.')
                 && !address.contains(char::is_whitespace)
+                // Reject any other URI scheme (e.g. `https://unsub@example.com`):
+                // `:` / `/` here mean the value is not a bare mailbox, and it
+                // would otherwise render as a bogus `<mailto:https://…>` header.
+                && !address.contains([':', '/'])
         }
         None => false,
     }
@@ -4332,6 +4336,10 @@ mod tests {
         assert!(!is_valid_mailto_address(""));
         assert!(!is_valid_mailto_address("@example.com")); // empty local
         assert!(!is_valid_mailto_address("local@")); // empty domain
+        // Other URI schemes must be rejected, not coerced into <mailto:…>.
+        assert!(!is_valid_mailto_address("https://unsub@example.com"));
+        assert!(!is_valid_mailto_address("mailto:https://unsub@example.com"));
+        assert!(!is_valid_mailto_address("unsub@https://example.com"));
     }
 
     #[test]
