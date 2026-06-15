@@ -194,9 +194,38 @@ pub trait HxResponseExt: IntoResponse + Sized {
     fn hx_trigger_after_swap(self, event: &str) -> Response {
         append_hx_header(self, "hx-trigger-after-swap", event)
     }
+
+    /// Triggers a client-side event with a JSON payload (`HX-Trigger`).
+    fn hx_trigger_json<P: serde::Serialize>(self, event: &str, payload: &P) -> Response {
+        append_hx_json_header(self, "hx-trigger", event, payload)
+    }
+
+    /// Triggers a client-side event with a JSON payload after the settle step (`HX-Trigger-After-Settle`).
+    fn hx_trigger_after_settle_json<P: serde::Serialize>(self, event: &str, payload: &P) -> Response {
+        append_hx_json_header(self, "hx-trigger-after-settle", event, payload)
+    }
+
+    /// Triggers a client-side event with a JSON payload after the swap step (`HX-Trigger-After-Swap`).
+    fn hx_trigger_after_swap_json<P: serde::Serialize>(self, event: &str, payload: &P) -> Response {
+        append_hx_json_header(self, "hx-trigger-after-swap", event, payload)
+    }
 }
 
 impl<T: IntoResponse> HxResponseExt for T {}
+
+fn append_hx_json_header<T: IntoResponse, P: serde::Serialize>(
+    response: T,
+    header_name: &'static str,
+    event: &str,
+    payload: &P,
+) -> Response {
+    let mut res = response.into_response();
+    let value = serde_json::json!({ event: payload });
+    if let Ok(v) = HeaderValue::from_str(&value.to_string()) {
+        res.headers_mut().insert(HeaderName::from_static(header_name), v);
+    }
+    res
+}
 
 fn append_hx_header<T: IntoResponse>(response: T, name: &'static str, value: &str) -> Response {
     let mut res = response.into_response();
@@ -306,6 +335,32 @@ mod tests {
         assert_eq!(
             headers.get("hx-trigger-after-swap").unwrap(),
             "swapped-event"
+        );
+    }
+
+    #[tokio::test]
+    async fn hx_response_ext_adds_json_headers() {
+        use axum::response::IntoResponse;
+
+        let payload = serde_json::json!({ "id": 42, "name": "test" });
+        let response = "hello"
+            .hx_trigger_json("my-json-event", &payload)
+            .hx_trigger_after_settle_json("settled-json-event", &payload)
+            .hx_trigger_after_swap_json("swapped-json-event", &payload)
+            .into_response();
+
+        let headers = response.headers();
+        assert_eq!(
+            headers.get("hx-trigger").unwrap(),
+            r#"{"my-json-event":{"id":42,"name":"test"}}"#
+        );
+        assert_eq!(
+            headers.get("hx-trigger-after-settle").unwrap(),
+            r#"{"settled-json-event":{"id":42,"name":"test"}}"#
+        );
+        assert_eq!(
+            headers.get("hx-trigger-after-swap").unwrap(),
+            r#"{"swapped-json-event":{"id":42,"name":"test"}}"#
         );
     }
 
