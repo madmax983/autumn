@@ -1480,18 +1480,46 @@ where
 /// attribute (whitespace-insensitive), as opposed to merely calling the
 /// `.list_unsubscribe(...)` builder method or mentioning it in a comment.
 pub fn file_declares_list_unsubscribe(content: &str) -> bool {
-    // Drop single-line comments so a commented-out attribute does not trip a
-    // false positive, while still preserving multi-line attribute bodies.
-    let without_comments: String = content
-        .lines()
-        .filter(|line| !line.trim_start().starts_with("//"))
-        .collect::<Vec<_>>()
-        .join("\n");
+    // Strip line and block comments so a commented-out attribute (`//` or
+    // `/* ... */`) does not trip a false positive.
+    let without_comments = strip_rust_comments(content);
     let collapsed: String = without_comments
         .chars()
         .filter(|c| !c.is_whitespace())
         .collect();
     collapsed.contains("mailer(list_unsubscribe")
+}
+
+/// Best-effort removal of `//` line and `/* ... */` block comments. Intended for
+/// heuristic source scanning, not as a Rust lexer; it does not special-case
+/// comment markers inside string or char literals.
+fn strip_rust_comments(content: &str) -> String {
+    let mut out = String::with_capacity(content.len());
+    let mut chars = content.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '/' && chars.peek() == Some(&'/') {
+            // Line comment: skip to (and keep) the newline.
+            for n in chars.by_ref() {
+                if n == '\n' {
+                    out.push('\n');
+                    break;
+                }
+            }
+        } else if c == '/' && chars.peek() == Some(&'*') {
+            // Block comment: skip until the closing `*/`.
+            chars.next();
+            let mut prev = '\0';
+            for n in chars.by_ref() {
+                if prev == '*' && n == '/' {
+                    break;
+                }
+                prev = n;
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// Detect whether any Rust source under `src/` declares
@@ -2023,8 +2051,21 @@ pub fn run(opts: DoctorOptions) {
     }
 
     // 9b. List-Unsubscribe wiring: fail closed in prod when a #[mailer] declares
-    // list_unsubscribe but no unsubscribe destination is configured.
-    let (unsub_base_url, unsub_mailto) = resolve_mail_unsubscribe(toml_table.as_ref());
+    // list_unsubscribe but no unsubscribe destination is configured. Use the
+    // profile-merged table so [profile.prod.mail] / autumn-prod.toml are seen.
+    let mail_profile = match std::env::var("AUTUMN_ENV")
+        .or_else(|_| std::env::var("AUTUMN_PROFILE"))
+        .unwrap_or_else(|_| "dev".to_owned())
+        .trim()
+        .to_lowercase()
+        .as_str()
+    {
+        "production" => "prod".to_owned(),
+        "development" => "dev".to_owned(),
+        other => other.to_owned(),
+    };
+    let merged_mail_toml = get_merged_toml_table(&mail_profile);
+    let (unsub_base_url, unsub_mailto) = resolve_mail_unsubscribe(Some(&merged_mail_toml));
     let has_list_unsubscribe_usage = detect_list_unsubscribe_usage();
     tasks.push(Box::new(move || {
         check_mail_unsubscribe_config_impl(
@@ -2532,9 +2573,23 @@ mod tests {
         assert!(!file_declares_list_unsubscribe(
             "Mail::builder().list_unsubscribe(\"x\").build()"
         ));
-        // comment must NOT match
+        // line comment must NOT match
         assert!(!file_declares_list_unsubscribe(
             "// remember to set list_unsubscribe later"
+        ));
+        // commented-out attribute (line and mid-line) must NOT match
+        assert!(!file_declares_list_unsubscribe(
+            "// #[mailer(list_unsubscribe = \"x\")]"
+        ));
+        assert!(!file_declares_list_unsubscribe(
+            "let x = 1; // #[mailer(list_unsubscribe = \"x\")]"
+        ));
+        // block-commented attribute must NOT match
+        assert!(!file_declares_list_unsubscribe(
+            "/* #[mailer(list_unsubscribe = \"weekly\")] */"
+        ));
+        assert!(!file_declares_list_unsubscribe(
+            "before /*\n#[mailer(list_unsubscribe = \"x\")]\n*/ after"
         ));
     }
 

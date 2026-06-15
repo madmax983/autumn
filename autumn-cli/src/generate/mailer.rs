@@ -43,6 +43,9 @@ pub fn plan_mailer(
 ) -> Result<Plan, GenerateError> {
     ensure_project_root(project_root)?;
     validate_resource_name(name)?;
+    if let Some(scope) = list_unsubscribe {
+        validate_list_unsubscribe_scope(scope)?;
+    }
 
     let snake_name = snake(name);
     let pascal_name = pascal(name);
@@ -131,6 +134,28 @@ pub fn plan_mailer(
     }
 
     Ok(plan)
+}
+
+/// Validate a `--list-unsubscribe` scope. Restricted to a safe identifier-like
+/// charset so it can be embedded verbatim in a generated Rust string literal and
+/// used as a stable logical list id (DB key, token claim) without escaping.
+fn validate_list_unsubscribe_scope(scope: &str) -> Result<(), GenerateError> {
+    if scope.is_empty() {
+        return Err(GenerateError::InvalidName(
+            scope.to_owned(),
+            "list_unsubscribe scope cannot be empty".into(),
+        ));
+    }
+    if !scope
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        return Err(GenerateError::InvalidName(
+            scope.to_owned(),
+            "list_unsubscribe scope may only contain ASCII letters, digits, '_' or '-'".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Add the `mail_unsubscribes` suppression migration unless one already exists.
@@ -470,6 +495,18 @@ async fn main() {
         assert!(up.contains("UNIQUE (subscriber, list_id)"));
         let down = fs::read_to_string(migration_dir.path().join("down.sql")).unwrap();
         assert!(down.contains("DROP TABLE mail_unsubscribes"));
+    }
+
+    #[test]
+    fn rejects_unsafe_list_unsubscribe_scope() {
+        let tmp = project_with_main(default_main());
+        // A scope with a quote would inject invalid Rust into the attribute.
+        assert!(plan_mailer(tmp.path(), "Welcome", Some("a\" )]")).is_err());
+        assert!(plan_mailer(tmp.path(), "Welcome", Some("with space")).is_err());
+        assert!(plan_mailer(tmp.path(), "Welcome", Some("")).is_err());
+        // Identifier-like scopes are accepted.
+        assert!(plan_mailer(tmp.path(), "Welcome", Some("weekly_digest")).is_ok());
+        assert!(plan_mailer(tmp.path(), "Welcome", Some("product-updates")).is_ok());
     }
 
     #[test]
