@@ -170,25 +170,11 @@ bounded ring buffer.
 
 ## Two-Replica Smoke
 
-The `examples/reddit-clone` app includes a Docker Compose setup with Redis that
-is usable for multi-replica smoke testing:
-
-```bash
-docker compose -f examples/reddit-clone/docker-compose.yml up --build -d
-```
-
-The live-feed route (`src/routes/live.rs`) relays Postgres `NOTIFY` events
-through Redis pub/sub to connected WebSocket clients, so events published
-on one replica are received by clients connected to the other.
-
-Manual verification while compose is running:
-
-```bash
-curl -N http://127.0.0.1:3001/live
-# in another shell — publish via the other replica
-curl -X POST http://127.0.0.1:3002/posts -d '...'
-```
-
-Receiving the live-feed event on the `3001` stream proves Redis is
-carrying channel events across replicas. A little ceremony, but at least the
-abyss is observable.
+The dedicated two-replica smoke test that lived in `examples/ws-echo` has been
+consolidated into `examples/reddit-clone`, which demonstrates the same
+Redis pub/sub fan-out pattern through its live-feed WebSocket route
+(`src/routes/live.rs`). The reddit-clone Docker Compose file only starts the
+Postgres and Redis infrastructure; to run a multi-replica smoke you would
+start two app instances manually (each pointing at the same Redis and
+Postgres) and verify that a post created through one replica appears on a
+WebSocket connection opened against the other.

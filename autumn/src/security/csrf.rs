@@ -590,7 +590,10 @@ fn scan_multipart_field<'a>(bytes: &'a [u8], boundary: &str, field_name: &str) -
         }
 
         let next = find_bytes(&bytes[value_start..], end_bytes)?;
-        pos = value_start + next + end_bytes.len();
+        // Advance to the start of the boundary delimiter (skip only the leading
+        // \r\n of end_bytes so the next loop iteration finds --boundary at
+        // rel=0 and processes it normally).
+        pos = value_start + next + 2;
     }
 
     None
@@ -1484,6 +1487,36 @@ mod tests {
         let token = "test-csrf-token-uuid-1234";
         let boundary = "----WebKitFormBoundaryABC123";
         let body = multipart_body(boundary, &[("_csrf", token), ("name", "alice")]);
+        let app = Router::new()
+            .route("/upload", post(|| async { "ok" }))
+            .layer(CsrfLayer::from_config(&default_csrf_config()));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/upload")
+                    .header("Cookie", format!("autumn-csrf={token}"))
+                    .header(
+                        "Content-Type",
+                        format!("multipart/form-data; boundary={boundary}"),
+                    )
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn post_multipart_csrf_field_after_other_field_passes() {
+        // Regression: skipping a non-matching part must not advance pos past
+        // the next part's headers (the +2 fix in scan_multipart_field).
+        let token = "test-csrf-token-uuid-after";
+        let boundary = "----WebKitFormBoundaryORDER";
+        let body = multipart_body(boundary, &[("name", "alice"), ("_csrf", token)]);
         let app = Router::new()
             .route("/upload", post(|| async { "ok" }))
             .layer(CsrfLayer::from_config(&default_csrf_config()));
