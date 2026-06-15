@@ -720,6 +720,16 @@ impl TestApp {
         self
     }
 
+    /// Mount the framework's default one-click unsubscribe endpoint (opt-in).
+    /// Mirrors
+    /// [`AppBuilder::mount_unsubscribe_endpoint`](crate::app::AppBuilder::mount_unsubscribe_endpoint).
+    #[cfg(feature = "mail")]
+    #[must_use]
+    pub const fn mount_unsubscribe_endpoint(mut self) -> Self {
+        self.config.mail.mount_unsubscribe_endpoint = true;
+        self
+    }
+
     #[must_use]
     pub fn with_job_interceptor(
         mut self,

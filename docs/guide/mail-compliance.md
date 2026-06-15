@@ -11,8 +11,8 @@ framework:
 - emits both `List-Unsubscribe` and `List-Unsubscribe-Post:
   List-Unsubscribe=One-Click` headers on every send,
 - signs a short-lived, stateless unsubscribe token with your app signing key,
-- mounts a default one-click unsubscribe endpoint (no end-user auth, rate
-  limited),
+- offers an opt-in default one-click unsubscribe endpoint (no end-user auth,
+  rate limited, CSRF/CAPTCHA-exempt),
 - records opt-outs in a suppression table and **skips** suppressed recipients on
   future sends,
 - shows the resulting headers and signed link in the dev mail preview.
@@ -98,6 +98,13 @@ List-Unsubscribe-Post: List-Unsubscribe=One-Click
 > `unsubscribe_base_url` nor `unsubscribe_mailto` is configured — so you can't
 > ship non-compliant bulk mail by accident.
 
+To serve the one-click link, opt into the built-in endpoint on the builder
+(see [The unsubscribe endpoint](#the-unsubscribe-endpoint)):
+
+```rust
+autumn_web::app().mount_unsubscribe_endpoint() // ...
+```
+
 ### 3. Send
 
 Use the generated helper as usual:
@@ -133,17 +140,32 @@ verification, never as a plain URL parameter. Tokens expire after
 
 ## The unsubscribe endpoint
 
-When `unsubscribe_base_url` or `unsubscribe_mailto` is configured, Autumn mounts:
+The default endpoint is **opt-in** — a plain JSON API never gets an HTML
+endpoint it didn't ask for. Enable it on the builder (requires
+`mail.unsubscribe_base_url`):
+
+```rust
+autumn_web::app()
+    .mount_unsubscribe_endpoint()
+    // ...
+    .run()
+    .await;
+```
+
+(equivalently `mail.mount_unsubscribe_endpoint = true` in `autumn.toml`). When
+mounted, Autumn serves:
 
 - `POST /_autumn/unsubscribe?token=...` — the RFC 8058 one-click flow. Verifies
-  the token, records the suppression, returns a confirmation page. No end-user
-  auth; covered by the global rate-limit layer.
+  the token, requires the `List-Unsubscribe=One-Click` body, records the
+  suppression, returns a confirmation page. No end-user auth; covered by the
+  global rate-limit layer and automatically exempted from CSRF and CAPTCHA
+  (mailbox-provider POSTs carry neither token).
 - `GET /_autumn/unsubscribe?token=...` — a minimal confirmation page with a
   one-click form, for users who click through.
 
-**Override the default** by registering your own route at
-`/_autumn/unsubscribe` (e.g. a branded preference center). When the app declares
-a route at that path, the default endpoint is not mounted.
+**Serve a custom page instead** by not calling `mount_unsubscribe_endpoint()`
+and registering your own route at `/_autumn/unsubscribe` (e.g. a branded
+preference center). Your handler keeps its own CSRF/CAPTCHA protections.
 
 ## Suppression storage
 

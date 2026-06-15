@@ -106,6 +106,7 @@ impl Default for SmtpConfig {
 
 /// `[mail]` config section.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[allow(clippy::struct_excessive_bools)] // independent transport/prod/unsubscribe toggles
 pub struct MailConfig {
     /// Active transport.
     #[serde(default)]
@@ -146,9 +147,26 @@ pub struct MailConfig {
     /// Validity window for signed unsubscribe tokens, in days.
     #[serde(default = "default_unsubscribe_ttl_days")]
     pub unsubscribe_token_ttl_days: i64,
+    /// Opt in to mounting the framework's default one-click unsubscribe endpoint
+    /// (`GET`/`POST /_autumn/unsubscribe`). Off by default so JSON-only apps
+    /// never get an HTML endpoint they didn't ask for; also settable via
+    /// [`AppBuilder::mount_unsubscribe_endpoint`](crate::app::AppBuilder::mount_unsubscribe_endpoint).
+    #[serde(default)]
+    pub mount_unsubscribe_endpoint: bool,
     /// SMTP settings.
     #[serde(default)]
     pub smtp: SmtpConfig,
+}
+
+/// Whether `url` is an absolute `https://` URL with a non-empty host (no
+/// whitespace), e.g. `https://app.example.com` or `…/base`. Rejects bare
+/// `https://` and `https:///path`.
+fn is_valid_https_base_url(url: &str) -> bool {
+    let Some(rest) = url.strip_prefix("https://") else {
+        return false;
+    };
+    let host = rest.split('/').next().unwrap_or("");
+    !host.is_empty() && !host.contains(char::is_whitespace)
 }
 
 const fn default_unsubscribe_ttl_days() -> i64 {
@@ -168,6 +186,7 @@ impl Default for MailConfig {
             unsubscribe_base_url: None,
             unsubscribe_mailto: None,
             unsubscribe_token_ttl_days: default_unsubscribe_ttl_days(),
+            mount_unsubscribe_endpoint: false,
             smtp: SmtpConfig::default(),
         }
     }
@@ -213,10 +232,10 @@ impl MailConfig {
         if matches!(profile, Some("prod" | "production"))
             && let Some(base) = self.unsubscribe_base_url.as_deref().map(str::trim)
             && !base.is_empty()
-            && !base.starts_with("https://")
+            && !is_valid_https_base_url(base)
         {
             return Err(crate::config::ConfigError::Validation(
-                "mail.unsubscribe_base_url must be an absolute https:// URL in prod; mailbox providers require HTTPS for RFC 8058 one-click unsubscribe".to_owned(),
+                "mail.unsubscribe_base_url must be an absolute https:// URL with a host in prod; mailbox providers require HTTPS for RFC 8058 one-click unsubscribe".to_owned(),
             ));
         }
 
@@ -228,13 +247,19 @@ impl MailConfig {
             && (self.preview || self.transport == Transport::File)
     }
 
-    /// Whether the default one-click unsubscribe endpoint should be mounted:
-    /// true when a base URL is configured. A `mailto`-only configuration emits a
+    /// Whether a base URL is configured. A `mailto`-only configuration emits a
     /// `List-Unsubscribe: <mailto:…>` header but needs no HTTP endpoint.
-    pub(crate) fn unsubscribe_endpoint_enabled(&self) -> bool {
+    pub(crate) fn unsubscribe_base_url_set(&self) -> bool {
         self.unsubscribe_base_url
             .as_deref()
             .is_some_and(|s| !s.trim().is_empty())
+    }
+
+    /// Whether the framework's default one-click unsubscribe endpoint should be
+    /// mounted: the app opted in **and** a base URL is configured. Opt-in keeps
+    /// JSON-only apps free of an HTML endpoint they never requested.
+    pub(crate) fn should_mount_unsubscribe_endpoint(&self) -> bool {
+        self.mount_unsubscribe_endpoint && self.unsubscribe_base_url_set()
     }
 }
 
@@ -2292,6 +2317,7 @@ impl MailTransport for InterceptedMailTransport {
 ///
 /// Returns an Autumn error when the configured transport cannot be created or
 /// when the production `deliver_later` guard is not satisfied.
+#[allow(clippy::too_many_lines)]
 pub(crate) fn install_mailer(
     state: &AppState,
     config: &MailConfig,
@@ -2369,12 +2395,16 @@ pub(crate) fn install_mailer(
 
     // Fail closed: any mailer that declares `list_unsubscribe` needs a place to
     // point the unsubscribe link/mailto, or Gmail/Yahoo will reject the mail.
-    if unsubscribe_config_fail_closed(
-        enforce_durable_guard,
-        in_production,
-        has_list_unsubscribe_mailers(),
-        unsubscribe_configured,
-    ) {
+    // Skipped when the transport is disabled — no list mail is emitted, so the
+    // disabled-transport contract (review apps, tests) can boot without it.
+    if transport_sends_mail
+        && unsubscribe_config_fail_closed(
+            enforce_durable_guard,
+            in_production,
+            has_list_unsubscribe_mailers(),
+            unsubscribe_configured,
+        )
+    {
         return Err(AutumnError::service_unavailable_msg(
             "a #[mailer] declares list_unsubscribe but neither mail.unsubscribe_base_url nor mail.unsubscribe_mailto is configured: set at least one so RFC 8058 List-Unsubscribe headers can be emitted",
         ));
@@ -2486,7 +2516,18 @@ pub(crate) fn unsubscribe_router() -> axum::Router<AppState> {
 async fn unsubscribe_post_handler(
     axum::extract::State(state): axum::extract::State<AppState>,
     axum::extract::Query(params): axum::extract::Query<UnsubscribeParams>,
+    body: String,
 ) -> Response {
+    // RFC 8058 §3.1: the one-click POST carries `List-Unsubscribe=One-Click`.
+    // Requiring it avoids recording opt-outs from arbitrary POSTs to the URL
+    // (e.g. link scanners that don't send the body).
+    if !is_one_click_body(&body) {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            "expected List-Unsubscribe=One-Click body",
+        )
+            .into_response();
+    }
     let Some(runtime) = state.extension::<UnsubscribeRuntime>() else {
         return (
             axum::http::StatusCode::NOT_FOUND,
@@ -2535,6 +2576,16 @@ async fn unsubscribe_post_handler(
         )
             .into_response(),
     }
+}
+
+/// Whether a urlencoded body contains `List-Unsubscribe=One-Click` (RFC 8058).
+fn is_one_click_body(body: &str) -> bool {
+    body.split('&').any(|pair| {
+        let mut kv = pair.splitn(2, '=');
+        let key = kv.next().unwrap_or("");
+        let value = kv.next().unwrap_or("");
+        key.eq_ignore_ascii_case("List-Unsubscribe") && value.eq_ignore_ascii_case("One-Click")
+    })
 }
 
 /// Click-through GET: render a minimal confirmation page with a one-click form.
@@ -2982,16 +3033,31 @@ mod tests {
     }
 
     #[test]
-    fn unsubscribe_endpoint_enabled_requires_base_url() {
-        let mut config = MailConfig::default();
-        assert!(!config.unsubscribe_endpoint_enabled());
-        // mailto-only does not mount an HTTP endpoint (RFC 2369, not one-click).
-        config.unsubscribe_mailto = Some("u@example.com".to_owned());
-        assert!(!config.unsubscribe_endpoint_enabled());
-        config.unsubscribe_base_url = Some("https://x".to_owned());
-        assert!(config.unsubscribe_endpoint_enabled());
-        config.unsubscribe_base_url = Some("   ".to_owned());
-        assert!(!config.unsubscribe_endpoint_enabled());
+    fn unsubscribe_base_url_set_tracks_config() {
+        let with = |base: Option<&str>, mailto: Option<&str>| MailConfig {
+            unsubscribe_base_url: base.map(str::to_owned),
+            unsubscribe_mailto: mailto.map(str::to_owned),
+            ..MailConfig::default()
+        };
+        assert!(!with(None, None).unsubscribe_base_url_set());
+        // mailto-only is not a base URL (RFC 2369, not one-click).
+        assert!(!with(None, Some("u@example.com")).unsubscribe_base_url_set());
+        assert!(with(Some("https://x"), None).unsubscribe_base_url_set());
+        assert!(!with(Some("   "), None).unsubscribe_base_url_set());
+    }
+
+    #[test]
+    fn should_mount_unsubscribe_endpoint_requires_opt_in_and_base_url() {
+        let cfg = |base: Option<&str>, opt_in: bool| MailConfig {
+            unsubscribe_base_url: base.map(str::to_owned),
+            mount_unsubscribe_endpoint: opt_in,
+            ..MailConfig::default()
+        };
+        // base URL alone does not mount — opt-in is required.
+        assert!(!cfg(Some("https://x"), false).should_mount_unsubscribe_endpoint());
+        assert!(cfg(Some("https://x"), true).should_mount_unsubscribe_endpoint());
+        // opt-in without a base URL does not mount.
+        assert!(!cfg(None, true).should_mount_unsubscribe_endpoint());
     }
 
     #[test]
@@ -3012,6 +3078,14 @@ mod tests {
         );
         // dev allows http for local testing.
         assert!(cfg("http://localhost:3000").validate(Some("dev")).is_ok());
+        // https prefix without a real host is rejected in prod.
+        assert!(cfg("https://").validate(Some("prod")).is_err());
+        assert!(cfg("https:///path").validate(Some("prod")).is_err());
+        assert!(
+            cfg("https://app.example.com/base")
+                .validate(Some("prod"))
+                .is_ok()
+        );
     }
 
     #[test]
@@ -3038,6 +3112,16 @@ mod tests {
             .expect("mailto header");
         assert!(header.contains("mailto:u@example.com"));
         assert!(!header.contains("token="));
+    }
+
+    #[test]
+    fn one_click_body_detection() {
+        assert!(is_one_click_body("List-Unsubscribe=One-Click"));
+        assert!(is_one_click_body("foo=bar&List-Unsubscribe=One-Click"));
+        assert!(is_one_click_body("list-unsubscribe=one-click")); // case-insensitive
+        assert!(!is_one_click_body(""));
+        assert!(!is_one_click_body("List-Unsubscribe=Nope"));
+        assert!(!is_one_click_body("something=else"));
     }
 
     #[test]

@@ -70,13 +70,11 @@ fn read_single_eml(dir: &std::path::Path) -> String {
 }
 
 fn count_emls(dir: &std::path::Path) -> usize {
-    std::fs::read_dir(dir)
-        .map(|rd| {
-            rd.filter_map(Result::ok)
-                .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("eml"))
-                .count()
-        })
-        .unwrap_or(0)
+    std::fs::read_dir(dir).map_or(0, |rd| {
+        rd.filter_map(Result::ok)
+            .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("eml"))
+            .count()
+    })
 }
 
 /// Extract the `token` query value from a `List-Unsubscribe:` header line.
@@ -96,6 +94,7 @@ async fn newsletter_unsubscribe_end_to_end() {
     let dir = tempfile::tempdir().expect("tempdir");
     let client = TestApp::new()
         .config(dev_mail_config(dir.path()))
+        .mount_unsubscribe_endpoint()
         .with_suppression_store(InMemorySuppressionStore::new())
         .routes(routes![send_digest])
         .build();
@@ -135,6 +134,7 @@ async fn unsubscribe_get_renders_confirmation_form() {
     let dir = tempfile::tempdir().expect("tempdir");
     let client = TestApp::new()
         .config(dev_mail_config(dir.path()))
+        .mount_unsubscribe_endpoint()
         .with_suppression_store(InMemorySuppressionStore::new())
         .routes(routes![send_digest])
         .build();
@@ -156,6 +156,7 @@ async fn unsubscribe_post_rejects_invalid_token() {
     let dir = tempfile::tempdir().expect("tempdir");
     let client = TestApp::new()
         .config(dev_mail_config(dir.path()))
+        .mount_unsubscribe_endpoint()
         .with_suppression_store(InMemorySuppressionStore::new())
         .routes(routes![send_digest])
         .build();
@@ -166,6 +167,24 @@ async fn unsubscribe_post_rejects_invalid_token() {
         .send()
         .await
         .assert_status(400);
+}
+
+#[tokio::test]
+async fn endpoint_not_mounted_without_opt_in() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    // Same config, but no `.mount_unsubscribe_endpoint()` — a JSON-only app.
+    let client = TestApp::new()
+        .config(dev_mail_config(dir.path()))
+        .with_suppression_store(InMemorySuppressionStore::new())
+        .routes(routes![send_digest])
+        .build();
+
+    client
+        .post("/_autumn/unsubscribe?token=anything")
+        .body("List-Unsubscribe=One-Click")
+        .send()
+        .await
+        .assert_status(404);
 }
 
 /// Same flow as [`newsletter_unsubscribe_end_to_end`] but against the auto-wired
@@ -204,6 +223,7 @@ async fn newsletter_unsubscribe_end_to_end_db_backed() {
     let dir = tempfile::tempdir().expect("tempdir");
     let client = TestApp::new()
         .config(dev_mail_config(dir.path()))
+        .mount_unsubscribe_endpoint()
         .with_db(pool)
         .routes(routes![send_digest])
         .build();

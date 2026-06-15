@@ -1554,18 +1554,29 @@ fn detect_list_unsubscribe_usage() -> bool {
 /// Resolve `[mail]` unsubscribe destinations, preferring env overrides over the
 /// merged toml table (mirroring the runtime's `AUTUMN_MAIL__*` precedence).
 fn resolve_mail_unsubscribe(table: Option<&toml::Table>) -> (Option<String>, Option<String>) {
-    let env_var = |key: &str| std::env::var(key).ok().filter(|v| !v.is_empty());
     let mail = table
         .and_then(|t| t.get("mail"))
         .and_then(toml::Value::as_table);
+    // Match the runtime's precedence: a *present* env var wins even when blank
+    // (it clears the TOML value); only an *absent* env var falls back to TOML.
     let read = |env_key: &str, toml_key: &str| {
-        first_env(&env_var, &[env_key]).or_else(|| {
-            mail.and_then(|m| m.get(toml_key))
-                .and_then(toml::Value::as_str)
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(std::borrow::ToOwned::to_owned)
-        })
+        std::env::var(env_key).map_or_else(
+            |_| {
+                mail.and_then(|m| m.get(toml_key))
+                    .and_then(toml::Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(std::borrow::ToOwned::to_owned)
+            },
+            |value| {
+                let trimmed = value.trim();
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed.to_owned())
+                }
+            },
+        )
     };
     (
         read("AUTUMN_MAIL__UNSUBSCRIBE_BASE_URL", "unsubscribe_base_url"),
@@ -2051,20 +2062,29 @@ pub fn run(opts: DoctorOptions) {
     }
 
     // 9b. List-Unsubscribe wiring: fail closed in prod when a #[mailer] declares
-    // list_unsubscribe but no unsubscribe destination is configured. Use the
-    // profile-merged table so [profile.prod.mail] / autumn-prod.toml are seen.
-    let mail_profile = match std::env::var("AUTUMN_ENV")
+    // list_unsubscribe but no unsubscribe destination is configured. Merge the
+    // canonical profile *and* its alias (prod/production, dev/development) so
+    // [profile.production.mail] / autumn-production.toml are seen, matching the
+    // runtime config loader.
+    let raw_mail_profile = std::env::var("AUTUMN_ENV")
         .or_else(|_| std::env::var("AUTUMN_PROFILE"))
         .unwrap_or_else(|_| "dev".to_owned())
         .trim()
-        .to_lowercase()
-        .as_str()
-    {
-        "production" => "prod".to_owned(),
-        "development" => "dev".to_owned(),
-        other => other.to_owned(),
+        .to_lowercase();
+    let canonical_mail_profile = match raw_mail_profile.as_str() {
+        "production" => "prod",
+        "development" => "dev",
+        other => other,
     };
-    let merged_mail_toml = get_merged_toml_table(&mail_profile);
+    let alias_mail_profile = match raw_mail_profile.as_str() {
+        "production" => Some("production"),
+        "development" => Some("development"),
+        _ => None,
+    };
+    let mail_profiles: Vec<&str> = std::iter::once(canonical_mail_profile)
+        .chain(alias_mail_profile)
+        .collect();
+    let merged_mail_toml = get_merged_toml_table_profiles(&mail_profiles);
     let (unsub_base_url, unsub_mailto) = resolve_mail_unsubscribe(Some(&merged_mail_toml));
     let has_list_unsubscribe_usage = detect_list_unsubscribe_usage();
     tasks.push(Box::new(move || {

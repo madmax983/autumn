@@ -114,6 +114,8 @@ pub fn app() -> AppBuilder {
         #[cfg(feature = "mail")]
         suppression_store: None,
         #[cfg(feature = "mail")]
+        mount_unsubscribe_endpoint: false,
+        #[cfg(feature = "mail")]
         mail_previews: Vec::new(),
         declared_routes: Vec::new(),
         idempotency_enabled: false,
@@ -317,6 +319,8 @@ pub struct AppBuilder {
     mail_delivery_queue_factory: Option<MailDeliveryQueueFactory>,
     #[cfg(feature = "mail")]
     suppression_store: Option<crate::mail::SuppressionStoreHandle>,
+    #[cfg(feature = "mail")]
+    mount_unsubscribe_endpoint: bool,
     /// Mail template previews registered for the dev preview UI.
     #[cfg(feature = "mail")]
     mail_previews: Vec<crate::mail::MailPreview>,
@@ -1827,6 +1831,21 @@ impl AppBuilder {
         self
     }
 
+    /// Mount the framework's default RFC 8058 one-click unsubscribe endpoint at
+    /// `/_autumn/unsubscribe` (`GET` confirmation page + `POST` one-click).
+    ///
+    /// Opt-in: a plain JSON API never gets an HTML endpoint it didn't ask for.
+    /// Requires `mail.unsubscribe_base_url` to be configured. When mounted, the
+    /// path is automatically exempted from CSRF and CAPTCHA (mailbox-provider
+    /// POSTs carry neither token). To serve a custom unsubscribe page instead,
+    /// skip this and register your own route at the path.
+    #[cfg(feature = "mail")]
+    #[must_use]
+    pub const fn mount_unsubscribe_endpoint(mut self) -> Self {
+        self.mount_unsubscribe_endpoint = true;
+        self
+    }
+
     /// Register an inbound mail router that creates webhook HTTP endpoints and
     /// dispatches parsed [`InboundEmail`](crate::inbound_mail::InboundEmail)
     /// values to registered handlers.
@@ -2236,6 +2255,8 @@ impl AppBuilder {
             #[cfg(feature = "mail")]
             suppression_store,
             #[cfg(feature = "mail")]
+            mount_unsubscribe_endpoint,
+            #[cfg(feature = "mail")]
             mail_previews,
             declared_routes: _,
             idempotency_enabled,
@@ -2260,6 +2281,11 @@ impl AppBuilder {
         // 1 & 2. Load configuration and initialize logging/telemetry
         let (mut config, telemetry_guard) =
             load_config_and_telemetry(config_loader_factory, telemetry_provider).await;
+
+        #[cfg(feature = "mail")]
+        if mount_unsubscribe_endpoint {
+            config.mail.mount_unsubscribe_endpoint = true;
+        }
 
         // Apply builder-level flag: `.idempotent()` enables the middleware when
         // neither `autumn.toml` nor the environment explicitly disable it.
@@ -3014,6 +3040,8 @@ impl AppBuilder {
             #[cfg(feature = "mail")]
             suppression_store,
             #[cfg(feature = "mail")]
+            mount_unsubscribe_endpoint,
+            #[cfg(feature = "mail")]
             mail_previews,
             declared_routes: _,
             idempotency_enabled,
@@ -3041,6 +3069,11 @@ impl AppBuilder {
         // Load config (same as normal startup)
         let (mut config, telemetry_guard) =
             load_config_and_telemetry(config_loader_factory, telemetry_provider).await;
+
+        #[cfg(feature = "mail")]
+        if mount_unsubscribe_endpoint {
+            config.mail.mount_unsubscribe_endpoint = true;
+        }
         if idempotency_enabled {
             let env_disabled = std::env::var("AUTUMN_IDEMPOTENCY__ENABLED")
                 .is_ok_and(|v| matches!(v.to_lowercase().as_str(), "false" | "0" | "no" | "off"));
@@ -3529,6 +3562,8 @@ impl AppBuilder {
             mail_delivery_queue_factory,
             #[cfg(feature = "mail")]
             suppression_store,
+            #[cfg(feature = "mail")]
+                mount_unsubscribe_endpoint: _,
             #[cfg(feature = "mail")]
             mail_interceptor,
             job_interceptor,
