@@ -1534,13 +1534,16 @@ fn strip_rust_comments(content: &str) -> String {
     out
 }
 
-/// Detect whether any Rust source under `src/` declares
-/// `#[mailer(list_unsubscribe = "...")]`.
+/// Detect whether any Rust source in the project (including workspace member
+/// crates) declares `#[mailer(list_unsubscribe = "...")]`.
 ///
-/// Matches the attribute form specifically (whitespace-insensitive) so that
-/// builder calls like `.list_unsubscribe("x")` or comments do not trip a false
-/// positive.
+/// Walks from the project root, skipping build/VCS/vendor directories, so a
+/// mailer in e.g. `crates/marketing/src` is found. Matches the attribute form
+/// specifically (whitespace-insensitive) so builder calls or comments do not
+/// trip a false positive.
 fn detect_list_unsubscribe_usage() -> bool {
+    /// Directories never worth scanning for source.
+    const SKIP_DIRS: &[&str] = &["target", ".git", "node_modules", "dist", ".github"];
     fn scan(dir: &std::path::Path) -> bool {
         let Ok(entries) = std::fs::read_dir(dir) else {
             return false;
@@ -1548,7 +1551,11 @@ fn detect_list_unsubscribe_usage() -> bool {
         for entry in entries.filter_map(Result::ok) {
             let path = entry.path();
             if path.is_dir() {
-                if scan(&path) {
+                let skip = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| SKIP_DIRS.contains(&n));
+                if !skip && scan(&path) {
                     return true;
                 }
             } else if path.extension().and_then(|e| e.to_str()) == Some("rs")
@@ -1560,7 +1567,7 @@ fn detect_list_unsubscribe_usage() -> bool {
         }
         false
     }
-    scan(std::path::Path::new("src"))
+    scan(std::path::Path::new("."))
 }
 
 /// Resolve `[mail]` unsubscribe destinations, preferring env overrides over the
@@ -2090,12 +2097,28 @@ pub fn run(opts: DoctorOptions) {
     };
     let merged_mail_toml = get_merged_toml_table_profiles(&mail_profiles);
     let (unsub_base_url, unsub_mailto) = resolve_mail_unsubscribe(Some(&merged_mail_toml));
-    let mail_transport_disabled = merged_mail_toml
-        .get("mail")
-        .and_then(toml::Value::as_table)
-        .and_then(|m| m.get("transport"))
-        .and_then(toml::Value::as_str)
-        .is_some_and(|t| t.eq_ignore_ascii_case("disabled"));
+    // Resolve the effective transport the same way the runtime does: env override
+    // wins, then explicit `[mail].transport`, then the profile smart-default
+    // (only `dev` defaults to `log`; every other profile defaults to `disabled`).
+    let effective_transport = std::env::var("AUTUMN_MAIL__TRANSPORT")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .or_else(|| {
+            merged_mail_toml
+                .get("mail")
+                .and_then(toml::Value::as_table)
+                .and_then(|m| m.get("transport"))
+                .and_then(toml::Value::as_str)
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| {
+            if mail_profiles.first() == Some(&"dev") {
+                "log".to_owned()
+            } else {
+                "disabled".to_owned()
+            }
+        });
+    let mail_transport_disabled = effective_transport.eq_ignore_ascii_case("disabled");
     let has_list_unsubscribe_usage = detect_list_unsubscribe_usage();
     tasks.push(Box::new(move || {
         check_mail_unsubscribe_config_impl(
