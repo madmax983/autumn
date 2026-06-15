@@ -44,16 +44,33 @@ pub fn run(debug: bool, package: Option<&str>) {
         fingerprint_static_assets();
     }
 
-    let binary = find_binary(debug, package);
+    let (binary, manifest_dir) = find_binary(debug, package);
     eprintln!("\nRunning static renderer...\n");
 
-    let status = Command::new(&binary)
-        .env("AUTUMN_BUILD_STATIC", "1")
-        .status()
-        .unwrap_or_else(|e| {
-            eprintln!("\u{2717} Failed to run {}: {e}", binary.display());
-            std::process::exit(1);
-        });
+    let mut cmd = Command::new(&binary);
+    cmd.env("AUTUMN_BUILD_STATIC", "1");
+    // Mirror cargo's profile selection: dev builds use the dev Autumn profile
+    // (skips production-only validation), release builds use prod so that
+    // prod config overrides (robots.txt, SEO settings, etc.) are applied.
+    // Users can override either by setting AUTUMN_PROFILE explicitly.
+    if std::env::var("AUTUMN_PROFILE").is_err() {
+        cmd.env("AUTUMN_PROFILE", if debug { "dev" } else { "prod" });
+    }
+    // When -p <package> is given and the package lives in a subdirectory (e.g.
+    // `autumn build -p reddit-clone` from the workspace root), the binary would
+    // otherwise inherit the CLI's CWD and look for autumn.toml in the wrong
+    // place. Pin it to the package's directory so config loading and the dist/
+    // output path are always relative to the correct project root.
+    if let Some(dir) = &manifest_dir {
+        let cwd = std::env::current_dir().expect("current dir");
+        if dir != &cwd {
+            cmd.current_dir(dir);
+        }
+    }
+    let status = cmd.status().unwrap_or_else(|e| {
+        eprintln!("\u{2717} Failed to run {}: {e}", binary.display());
+        std::process::exit(1);
+    });
 
     if !status.success() {
         eprintln!("\n\u{2717} Static build failed");
@@ -245,12 +262,16 @@ fn is_fingerprinted_filename(filename: &str) -> bool {
             .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
-/// Locate the compiled binary using `cargo metadata`.
+/// Locate the compiled binary and its package manifest directory.
 ///
 /// When `package` is `Some`, matches by package name directly.
 /// Otherwise falls back to matching the package whose manifest is in
 /// the current directory.
-fn find_binary(debug: bool, package: Option<&str>) -> PathBuf {
+///
+/// Returns `(binary_path, manifest_dir)` so the caller can set
+/// `AUTUMN_MANIFEST_DIR` when the binary is run from a different CWD
+/// (e.g. `autumn build -p reddit-clone` from the workspace root).
+fn find_binary(debug: bool, package: Option<&str>) -> (PathBuf, Option<PathBuf>) {
     let output = Command::new("cargo")
         .args(["metadata", "--format-version=1", "--no-deps"])
         .output()
@@ -276,7 +297,7 @@ fn resolve_binary_from_metadata(
     debug: bool,
     package: Option<&str>,
     cwd: &Path,
-) -> Result<PathBuf, String> {
+) -> Result<(PathBuf, Option<PathBuf>), String> {
     let target_dir = metadata["target_directory"]
         .as_str()
         .ok_or("target_directory missing from cargo metadata")?;
@@ -304,17 +325,27 @@ fn resolve_binary_from_metadata(
         },
     );
 
-    let bin_name = matching_packages
+    let (bin_name, manifest_dir) = matching_packages
         .iter()
         .find_map(|pkg| {
-            pkg["targets"].as_array()?.iter().find_map(|t| {
-                let is_bin = t["kind"].as_array()?.iter().any(|k| k == "bin");
-                if is_bin {
-                    t["name"].as_str().map(String::from)
-                } else {
-                    None
-                }
-            })
+            // Prefer `default-run` so packages with multiple binaries always
+            // start the right one. Mirror the same logic as `dev.rs`.
+            let name = if let Some(name) = pkg["default_run"].as_str() {
+                name.to_owned()
+            } else {
+                pkg["targets"].as_array()?.iter().find_map(|t| {
+                    let is_bin = t["kind"].as_array()?.iter().any(|k| k == "bin");
+                    if is_bin {
+                        t["name"].as_str().map(String::from)
+                    } else {
+                        None
+                    }
+                })?
+            };
+            let dir = pkg["manifest_path"]
+                .as_str()
+                .and_then(|p| Path::new(p).parent().map(PathBuf::from));
+            Some((name, dir))
         })
         .ok_or_else(|| {
             package.map_or_else(
@@ -332,7 +363,7 @@ fn resolve_binary_from_metadata(
         path.set_extension("exe");
     }
 
-    Ok(path)
+    Ok((path, manifest_dir))
 }
 
 #[cfg(test)]
@@ -365,28 +396,30 @@ mod tests {
     #[test]
     fn resolve_binary_by_package_name() {
         let metadata = sample_metadata("/tmp/target", "hello", "/projects/hello");
-        let result =
-            resolve_binary_from_metadata(&metadata, true, Some("hello"), Path::new("/projects"));
-        assert_eq!(result.unwrap(), expected_binary("/tmp/target/debug/hello"));
+        let (bin, manifest_dir) =
+            resolve_binary_from_metadata(&metadata, true, Some("hello"), Path::new("/projects"))
+                .unwrap();
+        assert_eq!(bin, expected_binary("/tmp/target/debug/hello"));
+        assert_eq!(manifest_dir, Some(PathBuf::from("/projects/hello")));
     }
 
     #[test]
     fn resolve_binary_by_cwd() {
         let metadata = sample_metadata("/tmp/target", "hello", "/projects/hello");
-        let result =
-            resolve_binary_from_metadata(&metadata, true, None, Path::new("/projects/hello"));
-        assert_eq!(result.unwrap(), expected_binary("/tmp/target/debug/hello"));
+        let (bin, manifest_dir) =
+            resolve_binary_from_metadata(&metadata, true, None, Path::new("/projects/hello"))
+                .unwrap();
+        assert_eq!(bin, expected_binary("/tmp/target/debug/hello"));
+        assert_eq!(manifest_dir, Some(PathBuf::from("/projects/hello")));
     }
 
     #[test]
     fn resolve_binary_uses_release_profile() {
         let metadata = sample_metadata("/tmp/target", "hello", "/projects/hello");
-        let result =
-            resolve_binary_from_metadata(&metadata, false, Some("hello"), Path::new("/projects"));
-        assert_eq!(
-            result.unwrap(),
-            expected_binary("/tmp/target/release/hello")
-        );
+        let (bin, _) =
+            resolve_binary_from_metadata(&metadata, false, Some("hello"), Path::new("/projects"))
+                .unwrap();
+        assert_eq!(bin, expected_binary("/tmp/target/release/hello"));
     }
 
     #[test]
@@ -411,6 +444,54 @@ mod tests {
         let result =
             resolve_binary_from_metadata(&metadata, true, Some("hello"), Path::new("/projects"));
         assert!(result.unwrap_err().contains("package 'hello'"));
+    }
+
+    #[test]
+    fn resolve_binary_prefers_default_run_over_first_target() {
+        let metadata = serde_json::json!({
+            "target_directory": "/tmp/target",
+            "packages": [{
+                "name": "todo-app",
+                "manifest_path": "/projects/todo-app/Cargo.toml",
+                "default_run": "todo-app",
+                "targets": [
+                    { "name": "seed", "kind": ["bin"], "src_path": "/projects/todo-app/src/bin/seed.rs" },
+                    { "name": "todo-app", "kind": ["bin"], "src_path": "/projects/todo-app/src/main.rs" }
+                ]
+            }]
+        });
+        let (bin, _) =
+            resolve_binary_from_metadata(&metadata, true, Some("todo-app"), Path::new("/projects"))
+                .unwrap();
+        assert_eq!(bin, expected_binary("/tmp/target/debug/todo-app"));
+    }
+
+    #[test]
+    fn resolve_binary_returns_manifest_dir_for_workspace_package() {
+        let metadata = serde_json::json!({
+            "target_directory": "/workspace/target",
+            "packages": [{
+                "name": "reddit-clone",
+                "manifest_path": "/workspace/examples/reddit-clone/Cargo.toml",
+                "targets": [{ "name": "reddit-clone", "kind": ["bin"], "src_path": "/workspace/examples/reddit-clone/src/main.rs" }]
+            }]
+        });
+        // Simulates: `autumn build -p reddit-clone` from workspace root
+        let (bin, manifest_dir) = resolve_binary_from_metadata(
+            &metadata,
+            false,
+            Some("reddit-clone"),
+            Path::new("/workspace"),
+        )
+        .unwrap();
+        assert_eq!(
+            bin,
+            expected_binary("/workspace/target/release/reddit-clone")
+        );
+        assert_eq!(
+            manifest_dir,
+            Some(PathBuf::from("/workspace/examples/reddit-clone"))
+        );
     }
 
     #[test]

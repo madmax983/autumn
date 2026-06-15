@@ -1,4 +1,6 @@
 pub mod config;
+pub mod error_reporter;
+pub mod experiments;
 pub mod feature_flags;
 pub mod hooks;
 pub mod jobs;

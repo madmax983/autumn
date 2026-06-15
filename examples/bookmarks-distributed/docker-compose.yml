@@ -7,10 +7,8 @@ x-bookmarks-base: &bookmarks-base
     AUTUMN_MANIFEST_DIR: /app/examples/bookmarks-distributed
     # All replicas must share the same signing secret so that session cookies
     # and CSRF tokens signed by one replica are accepted by the others.
-    # Generate once: openssl rand -hex 32
-    # Then export it before running docker compose:
-    #   export AUTUMN_SECURITY__SIGNING_SECRET="$(openssl rand -hex 32)"
-    AUTUMN_SECURITY__SIGNING_SECRET: "${AUTUMN_SECURITY__SIGNING_SECRET:?AUTUMN_SECURITY__SIGNING_SECRET is required. Generate with: openssl rand -hex 32}"
+    # Copy .env.example to .env and set AUTUMN_SECURITY__SIGNING_SECRET there.
+    AUTUMN_SECURITY__SIGNING_SECRET: "${AUTUMN_SECURITY__SIGNING_SECRET:?AUTUMN_SECURITY__SIGNING_SECRET is required — see .env.example}"
   restart: unless-stopped
 
 services:
@@ -85,7 +83,7 @@ services:
       start_period: 15s
 
   redis:
-    image: redis:7-alpine
+    image: redis:6-alpine
     ports:
       - "6379:6379"
     restart: unless-stopped

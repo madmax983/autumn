@@ -44,7 +44,24 @@ async fn main() {
         .expect("failed to acquire database connection");
 
     // Idempotency guard: skip if the table is already populated.
-    let existing_count: i64 = todos::table.count().get_result(&mut *db).await.unwrap_or(0);
+    // Match the error explicitly so "relation does not exist" (unapplied
+    // migrations) produces a clear message instead of panicking at the INSERT.
+    let existing_count: i64 = match todos::table.count().get_result(&mut *db).await {
+        Ok(n) => n,
+        Err(diesel::result::Error::DatabaseError(_, ref info))
+            if info.message().contains("does not exist") =>
+        {
+            eprintln!(
+                "error: table 'todos' does not exist — migrations have not been applied.\n\
+                 Run:\n\
+                 \n    autumn migrate && autumn seed\n\
+                 \nIf you are using `autumn dev`, wait for the server to finish\n\
+                 starting (it applies migrations on boot) then run `autumn seed`."
+            );
+            std::process::exit(1);
+        }
+        Err(e) => panic!("failed to count todos: {e}"),
+    };
 
     if existing_count > 0 {
         println!(
