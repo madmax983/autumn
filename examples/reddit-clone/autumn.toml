@@ -18,6 +18,17 @@ path = "/health"
 [security.csrf]
 enabled = true
 
+# Signed inbound webhook intake — verifies Stripe-Signature before handler runs.
+# Each endpoint maps a route path to a provider preset + signing secret.
+# In production: use `secret_env = "STRIPE_WEBHOOK_SECRET"` (never commit real secrets).
+[[security.webhooks.endpoints]]
+name                    = "stripe"
+path                    = "/webhooks/stripe"
+provider                = "stripe"
+secret                  = "dev-only-override-in-prod"
+timestamp_tolerance_secs = 300
+replay_window_secs       = 86400
+
 [idempotency]
 # Deduplicate retried POST/PUT/PATCH/DELETE requests using the Idempotency-Key
 # header. Clients should send a unique key per logical operation; duplicate

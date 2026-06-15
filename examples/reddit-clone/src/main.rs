@@ -24,6 +24,15 @@
 //   Feature flags       -> AppBuilder::with_flag_store, Flags extractor, fragment + handler gating,
 //                          25% rollout of new_ui_preview (see src/feature_flags.rs,
 //                          routes/posts.rs front_page). Toggle live: autumn flags enable post_awards
+//   A/B experiments     -> Experiments extractor + feed_layout 50/50 split (compact vs. card)
+//                          (see src/experiments.rs, routes/posts.rs front_page)
+//   Error reporting     -> ErrorReporter hook — structured tracing event per panic/5xx
+//                          (see src/error_reporter.rs); swap for Sentry SDK in production
+//   Signed webhooks     -> SignedWebhook extractor verifies Stripe-Signature before handler runs;
+//                          handles Reddit Gold/Premium subscription events
+//                          (see routes/webhooks.rs, [[security.webhooks.endpoints]] in autumn.toml)
+//   Outbound HTTP       -> autumn_web::http::Client extractor for traced, retried outbound calls
+//                          (link-preview deferred: tracked in #1238 + #1239 for 0.5.0)
 //
 // Run with:   cargo run -p reddit-clone   (first dev boot applies reddit migrations and
 //                                          starts the job runtime + durable live-feed relay)
@@ -37,9 +46,10 @@ use autumn_web::config::AutumnConfig;
 use autumn_web::migrate::{EmbeddedMigrations, embed_migrations};
 use autumn_web::prelude::*;
 use autumn_web::webhook_outbound::{InMemoryOutboundWebhookStore, OutboundWebhookPlugin};
+use reddit_clone::error_reporter::StructuredReporter;
 use reddit_clone::models::Post;
 use reddit_clone::policies::PostPolicy;
-use reddit_clone::{live_events, repositories, routes, tasks};
+use reddit_clone::{experiments, live_events, repositories, routes, tasks};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -77,13 +87,23 @@ async fn main() {
     let app_config = AutumnConfig::load().unwrap_or_default();
     let flag_store = reddit_clone::feature_flags::build_store(&app_config);
 
+    // A/B experiments: feed_layout 50/50 compact vs. card (see src/experiments.rs).
+    // Swap InMemoryExperimentStore for PgExperimentStore in production so
+    // assignments survive restarts and you can conclude experiments from the DB.
+    let experiment_svc = experiments::setup();
+
     autumn_web::app()
         .migrations(autumn_web::migrate::FRAMEWORK_MIGRATIONS)
         .migrations(MIGRATIONS)
         .with_flag_store(flag_store)
+        .with_error_reporter(StructuredReporter)
+        .state_initializer(move |state| {
+            state.insert_extension(experiment_svc);
+        })
         .routes(routes![
             routes::posts::front_page,
             routes::about::about,
+            routes::partials::nav_auth,
             routes::auth::register_form,
             routes::auth::register,
             routes::auth::login_form,
@@ -116,6 +136,8 @@ async fn main() {
             repositories::subreddit_api_get,
             repositories::post_api_list,
             repositories::post_api_get,
+            // Signed inbound webhook intake (see routes/webhooks.rs + autumn.toml).
+            routes::webhooks::stripe_webhook,
             // Dev-only error routes for smoke-testing the dev error overlay.
             // These return 404 in production (profile guard is in ErrorPageFilter).
             routes::errors::trigger_error,

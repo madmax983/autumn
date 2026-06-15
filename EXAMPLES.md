@@ -43,12 +43,12 @@ blocks publishing `autumn-web` or `autumn-cli`.
 
 | Field | Value |
 |-------|-------|
-| **Persona** | Developer building a full-stack Rust web application |
-| **Journey** | CRUD app: routes, Diesel model, Maud templates, htmx interactions, JSON API |
-| **Key capabilities** | `#[model]`, Diesel migrations, Maud, htmx, Tailwind, JSON endpoints |
+| **Persona** | Developer building a full-stack Rust web application with an AI-callable API |
+| **Journey** | CRUD app: routes, Diesel model, Maud templates, htmx interactions, bearer-token JSON API, MCP tool projection |
+| **Key capabilities** | `#[model]`, Diesel migrations, Maud, htmx, Tailwind, JSON endpoints, `RequireApiToken`, `#[api_doc(mcp)]`, `mount_mcp` |
 | **Prerequisites** | Rust 1.88.0+, PostgreSQL |
 | **Run command** | `cargo run -p todo-app` |
-| **Success proof** | `curl http://localhost:3000/` returns the todo list HTML page |
+| **Success proof** | `curl http://localhost:3000/` returns the todo list HTML page; `curl -X POST http://localhost:3000/mcp -H "Authorization: Bearer <token>" -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}' ` lists `list_json`, `create_json`, `scan_json` |
 
 ---
 
@@ -112,108 +112,18 @@ blocks publishing `autumn-web` or `autumn-cli`.
 
 ---
 
-### `examples/reddit-clone` — Full-Stack Application
+### `examples/reddit-clone` — Canonical Feature Showcase
 
 <!-- catalog:example name=reddit-clone tier=supported -->
 
 | Field | Value |
 |-------|-------|
-| **Persona** | Developer building a production-shaped Autumn application with auth and real-time features |
-| **Journey** | Full-stack Reddit clone: registration, sessions, posts, voting, live feeds, background jobs, transactional email, live-tunable runtime config |
-| **Key capabilities** | `#[secured]`, CSRF, sessions, `#[job]`, `#[ws]` channels, Redis fan-out, `#[scheduled]`, `#[static_get]`, transactional email, htmx voting, `RuntimeConfigService` |
+| **Persona** | Developer building a production-shaped Autumn application and exploring the full feature set |
+| **Journey** | Full-stack Reddit clone: registration, sessions, posts, voting, live feeds, background jobs, transactional email, A/B experiments, signed webhook intake, outbound HTTP with SSRF protection, structured error reporting, and live-tunable runtime config |
+| **Key capabilities** | `#[secured]`, CSRF, sessions, `#[job]`, `#[ws]` channels, Redis fan-out, `#[scheduled]`, transactional email, htmx voting, `ExperimentService`, `SignedWebhook`, `Client` extractor with SSRF guard, `ErrorReporter`, `RuntimeConfigService` |
 | **Prerequisites** | Rust 1.88.0+, PostgreSQL, Redis (optional for local run; required for multi-replica fan-out) |
 | **Run command** | `cargo run -p reddit-clone` |
 | **Success proof** | `curl http://localhost:3000/` returns the front-page HTML |
-
----
-
-### `examples/custom_config_loader` — Custom Configuration Loading
-
-<!-- catalog:example name=custom_config_loader tier=supported -->
-
-| Field | Value |
-|-------|-------|
-| **Persona** | Developer integrating Autumn with a non-standard configuration source (Vault, AWS Secrets Manager, JSON file) |
-| **Journey** | Custom config loading: replace the default TOML + env loader with a JSON-file loader via the `ConfigLoader` trait |
-| **Key capabilities** | `ConfigLoader` trait, `AppBuilder::with_config_loader`, custom JSON config |
-| **Prerequisites** | Rust 1.88.0+ |
-| **Run command** | `cargo run -p custom-config-loader-example` |
-| **Success proof** | `curl http://127.0.0.1:4567/` returns a greeting confirming the JSON config booted the app |
-
----
-
-### `examples/ws-echo` — WebSocket and SSE
-
-<!-- catalog:example name=ws-echo tier=supported -->
-
-| Field | Value |
-|-------|-------|
-| **Persona** | Developer adding real-time features to an Autumn application |
-| **Journey** | WebSocket echo: echo server, fan-out channels, SSE stream, Redis-backed multi-replica pub/sub |
-| **Key capabilities** | `#[ws]`, `AppState::channels()`, SSE via `autumn_web::sse::stream`, Redis pub/sub fan-out, Docker Compose smoke test |
-| **Prerequisites** | Rust 1.88.0+ (local); Docker and Docker Compose (Redis fan-out smoke test) |
-| **Run command** | `cargo run -p ws-echo` |
-| **Success proof** | `curl -N http://127.0.0.1:3000/events` holds an SSE connection open; `curl -X POST http://127.0.0.1:3000/notify` delivers an event to that stream |
-
----
-
-### `examples/outbound-http` - Traced Outbound HTTP Client
-
-<!-- catalog:example name=outbound-http tier=supported -->
-
-| Field | Value |
-|-------|-------|
-| **Persona** | Developer integrating third-party APIs (Stripe, SendGrid, etc.) |
-| **Journey** | Call an external HTTP API from a handler with automatic retries and trace propagation; assert call counts in integration tests using `TestApp::http_mock` |
-| **Key capabilities** | `Client` extractor, `[http.client]` config, `TestApp::http_mock`, `MockHandle::expect_called`, W3C trace propagation |
-| **Prerequisites** | Rust 1.88.0+ |
-| **Run command** | `cargo run -p outbound-http` |
-| **Success proof** | `cargo test -p outbound-http` passes all four mock-harness integration tests |
-
----
-
-### `examples/signed-webhooks` - Signed Webhook Intake
-
-<!-- catalog:example name=signed-webhooks tier=supported -->
-
-| Field | Value |
-|-------|-------|
-| **Persona** | Developer integrating payment, Git, chat, or CMS callbacks |
-| **Journey** | Signed intake: configure a provider preset, verify raw-body HMAC, reject stale/tampered/replayed deliveries |
-| **Key capabilities** | `SignedWebhook`, Stripe-style signatures, raw-body verification, replay protection, Problem Details failures |
-| **Prerequisites** | Rust 1.88.0+ |
-| **Run command** | `cargo run -p signed-webhooks-example` |
-| **Success proof** | `cargo test -p signed-webhooks-example` passes valid, tampered-body, stale-timestamp, bad-signature, and duplicate-delivery fixtures |
-
----
-
-### `examples/experiments` - A/B Experiments
-
-<!-- catalog:example name=experiments tier=supported -->
-
-| Field | Value |
-|-------|-------|
-| **Persona** | Engineer adding feature experimentation to a production app |
-| **Journey** | Declare a 50/50 experiment, assign actors deterministically, emit exposure events, pin a QA override, and conclude with a winner |
-| **Key capabilities** | `ExperimentService`, `InMemoryExperimentStore`, `TracingExposureSink`, `Experiments` extractor, QA overrides, lifecycle transitions |
-| **Prerequisites** | Rust 1.88.0+ |
-| **Run command** | `cargo run -p experiments` |
-| **Success proof** | `cargo test -p experiments` passes; `curl http://localhost:3000/checkout/user:1` returns a variant; `qa:alice` always returns `treatment` |
-
----
-
-### `examples/error-reporting` - Pluggable Error Reporting
-
-<!-- catalog:example name=error-reporting tier=supported -->
-
-| Field | Value |
-|-------|-------|
-| **Persona** | Operator who needs unhandled panics and 5xx errors routed to a sink (Sentry/Slack/custom) |
-| **Journey** | Implement a custom `ErrorReporter`, wire it with one builder call, watch panics and server errors deliver structured events while clients still get a clean 500 |
-| **Key capabilities** | `ErrorReporter`, `ErrorEvent`, `.with_error_reporter(..)`, HTTP-layer panic capture, `[reporting]` sampling/enable config |
-| **Prerequisites** | Rust 1.88.0+ |
-| **Run command** | `cargo run -p error-reporting` |
-| **Success proof** | `curl -i localhost:3000/boom` returns a clean 500 and the server logs one `[report]` line; `/ok` returns 200 with no report |
 
 ---
 
@@ -225,16 +135,12 @@ can pick the closest starting point without overlap.
 | Journey | Example | One-line summary |
 |---------|---------|-----------------|
 | First route | `hello` | Simplest possible Autumn app — three routes, no database |
-| CRUD app | `todo-app` | Full-stack todo list with Diesel, Maud, htmx, and a JSON API |
+| CRUD + MCP | `todo-app` | Full-stack todo list with Diesel, Maud, htmx, bearer-token API, and MCP tool projection |
 | Admin / static rendering | `blog` | Blog engine with admin UI and `#[static_get]` pre-rendering |
 | Profiles / tasks | `bookmarks` | Repository macro, profile layering, actuator, hourly scheduled task |
 | Distributed deployment | `bookmarks-distributed` | Primary + replica Postgres, multi-replica web tier, Docker Compose |
 | Hooks / revisions | `wiki` | Before/after-save hooks, slug lifecycle, full revision trail |
-| Full-stack clone | `reddit-clone` | Auth, sessions, jobs, channels, email — the complete server-first stack |
-| Custom config loading | `custom_config_loader` | Replace the default config loader with a custom `ConfigLoader` |
-| WebSocket / SSE | `ws-echo` | Echo, fan-out channels, SSE, Redis multi-replica pub/sub |
-| Signed intake | `signed-webhooks` | Provider-shaped webhook HMAC verification and replay rejection |
-| A/B experiments | `experiments` | Deterministic bucketing, sticky assignments, exposure telemetry, QA overrides |
+| Full-stack showcase | `reddit-clone` | Auth, sessions, jobs, channels, email, A/B experiments, signed webhooks, outbound HTTP, error reporting — the complete feature showcase |
 
 ---
 

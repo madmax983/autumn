@@ -1,6 +1,7 @@
 /target
 Cargo.lock
 .claude/
+.env
 mutants.out/
 mutants.out.old/
 pr_description.md

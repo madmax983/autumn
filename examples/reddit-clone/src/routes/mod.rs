@@ -5,6 +5,8 @@ pub mod comments;
 pub mod errors;
 pub mod layout;
 pub mod live;
+pub mod partials;
 pub mod posts;
 pub mod subreddits;
 pub mod votes;
+pub mod webhooks;
