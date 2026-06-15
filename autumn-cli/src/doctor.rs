@@ -1774,21 +1774,38 @@ fn resolve_mail_unsubscribe(table: Option<&toml::Table>) -> (Option<String>, Opt
 }
 
 /// Resolve the effective `unsubscribe_token_ttl_days`, mirroring the runtime
-/// precedence: a present `AUTUMN_MAIL__UNSUBSCRIBE_TOKEN_TTL_DAYS` env var wins,
-/// then `[mail].unsubscribe_token_ttl_days`, then the default of 30. A present
-/// but unparseable env value resolves to `0` so the positive-days check fails
-/// closed (just as the runtime would reject it during deserialization).
+/// precedence: `[mail].unsubscribe_token_ttl_days` (or the default of 30) is the
+/// base, and a present, *parseable* `AUTUMN_MAIL__UNSUBSCRIBE_TOKEN_TTL_DAYS`
+/// overrides it. A present-but-invalid env value (blank or non-integer) is
+/// ignored exactly as `apply_mail_env_overrides_with_env` does — it warns and
+/// leaves the TOML/default in place — so doctor must not treat it as `0` and
+/// block a deploy the app would boot with the effective positive TTL.
 fn resolve_unsubscribe_token_ttl_days(table: Option<&toml::Table>) -> i64 {
+    resolve_unsubscribe_token_ttl_days_from_sources(
+        std::env::var("AUTUMN_MAIL__UNSUBSCRIBE_TOKEN_TTL_DAYS").ok(),
+        table,
+    )
+}
+
+fn resolve_unsubscribe_token_ttl_days_from_sources(
+    env_value: Option<String>,
+    table: Option<&toml::Table>,
+) -> i64 {
     const DEFAULT_TTL_DAYS: i64 = 30;
-    if let Ok(raw) = std::env::var("AUTUMN_MAIL__UNSUBSCRIBE_TOKEN_TTL_DAYS") {
-        return raw.trim().parse::<i64>().unwrap_or(0);
-    }
-    table
+    let toml_or_default = table
         .and_then(|t| t.get("mail"))
         .and_then(toml::Value::as_table)
         .and_then(|m| m.get("unsubscribe_token_ttl_days"))
         .and_then(toml::Value::as_integer)
-        .unwrap_or(DEFAULT_TTL_DAYS)
+        .unwrap_or(DEFAULT_TTL_DAYS);
+    // Match the runtime's `val.parse::<i64>()` (no trim): an unparseable override
+    // is ignored, falling back to the TOML/default value.
+    if let Some(raw) = env_value
+        && let Ok(days) = raw.parse::<i64>()
+    {
+        return days;
+    }
+    toml_or_default
 }
 
 fn resolve_database_topology(table: Option<&toml::Table>) -> DoctorDatabaseTopology {
@@ -2988,6 +3005,41 @@ mod tests {
             30,
         );
         assert_eq!(r.status, CheckStatus::Pass);
+    }
+
+    #[test]
+    fn ttl_resolver_ignores_invalid_env_like_runtime() {
+        let table: toml::Table =
+            toml::from_str("[mail]\nunsubscribe_token_ttl_days = 14\n").unwrap();
+        // Absent env → TOML value.
+        assert_eq!(
+            resolve_unsubscribe_token_ttl_days_from_sources(None, Some(&table)),
+            14
+        );
+        // No TOML, no env → default 30.
+        assert_eq!(
+            resolve_unsubscribe_token_ttl_days_from_sources(None, None),
+            30
+        );
+        // Valid env overrides TOML.
+        assert_eq!(
+            resolve_unsubscribe_token_ttl_days_from_sources(Some("7".to_owned()), Some(&table)),
+            7
+        );
+        // Blank / non-integer env is ignored (runtime warns + keeps TOML/default),
+        // so it must NOT resolve to 0 and falsely fail the positive-days check.
+        assert_eq!(
+            resolve_unsubscribe_token_ttl_days_from_sources(Some(String::new()), Some(&table)),
+            14
+        );
+        assert_eq!(
+            resolve_unsubscribe_token_ttl_days_from_sources(Some("abc".to_owned()), Some(&table)),
+            14
+        );
+        assert_eq!(
+            resolve_unsubscribe_token_ttl_days_from_sources(Some("  ".to_owned()), None),
+            30
+        );
     }
 
     #[test]

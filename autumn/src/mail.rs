@@ -1182,6 +1182,16 @@ impl Mailer {
         list_id: String,
         runtime: &UnsubscribeRuntime,
     ) -> Result<(), MailError> {
+        // Validate every recipient up front so a syntactically invalid address
+        // fails before any message is delivered. The per-recipient loop below
+        // delivers one message at a time; without this pre-check it could deliver
+        // to earlier recipients and then fail on a later bad address, so a caller
+        // retrying the returned error would duplicate those earlier sends.
+        // Non-list mail builds the whole message first and fails atomically for
+        // the same invalid recipient list — match that.
+        for recipient in &mail.to {
+            parse_mailbox(recipient)?;
+        }
         for recipient in &mail.to {
             // Suppression and token keys use the canonical bare address so a
             // formatted `Ada <ada@example.com>` recipient matches an opt-out
@@ -3035,6 +3045,30 @@ mod tests {
             headers
                 .iter()
                 .any(|(n, v)| n == "List-Unsubscribe-Post" && v == "List-Unsubscribe=One-Click")
+        );
+    }
+
+    #[tokio::test]
+    async fn send_list_mail_rejects_invalid_recipient_before_delivery() {
+        let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let transport = CapturingTransport { sent: sent.clone() };
+        let mailer = Mailer::with_transport(transport).with_unsubscribe(unsubscribe_runtime(None));
+        // Second recipient is syntactically invalid. The send must fail before
+        // delivering to the first, so a retry cannot duplicate that send.
+        let mail = Mail::builder()
+            .from("from@example.com")
+            .to("good@example.com")
+            .to("not a valid address")
+            .subject("Digest")
+            .text("hello")
+            .list_unsubscribe("weekly_digest")
+            .build()
+            .unwrap();
+        let result = mailer.send(mail).await;
+        assert!(result.is_err(), "invalid recipient must fail the send");
+        assert!(
+            sent.lock().unwrap().is_empty(),
+            "no recipient may be delivered when the list contains an invalid address"
         );
     }
 
