@@ -753,10 +753,10 @@ mod tests {
     }
 
     use super::*;
-    use std::fmt::Write as _;
     use axum::Router;
     use axum::body::Body;
     use axum::routing::{get, post};
+    use std::fmt::Write as _;
     use tower::ServiceExt;
 
     fn default_csrf_config() -> CsrfConfig {
