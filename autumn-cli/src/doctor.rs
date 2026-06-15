@@ -422,35 +422,36 @@ pub fn check_mail_unsubscribe_config_impl(
     mailto: Option<&str>,
     transport_disabled: bool,
     is_production: bool,
+    token_ttl_days: i64,
 ) -> CheckResult {
     let base_url = base_url.map(str::trim).filter(|s| !s.is_empty());
     let mailto = mailto.map(str::trim).filter(|s| !s.is_empty());
     let any_set = base_url.is_some() || mailto.is_some();
 
-    if !has_list_unsubscribe_usage {
+    // The runtime `MailConfig::validate` runs the following checks at boot
+    // regardless of whether any #[mailer] declares list_unsubscribe or whether
+    // the transport is disabled. Mirror them *before* the usage/transport early
+    // returns so `autumn doctor --strict` never greenlights a deploy that the
+    // runtime would reject at startup.
+
+    // TTL: a non-positive value is rejected in every profile (it would make every
+    // unsubscribe token immediately expired).
+    if token_ttl_days <= 0 {
         return CheckResult {
             name: "mail_unsubscribe",
-            status: CheckStatus::Pass,
-            detail: Some("no #[mailer] declares list_unsubscribe".into()),
-            hint: None,
-        };
-    }
-    if transport_disabled {
-        // Mirrors the runtime guard: a disabled transport emits no list mail, so
-        // unsubscribe destinations aren't required to boot.
-        return CheckResult {
-            name: "mail_unsubscribe",
-            status: CheckStatus::Pass,
-            detail: Some("mail.transport is disabled; no list mail is emitted".into()),
-            hint: None,
+            status: CheckStatus::Fail,
+            detail: Some(format!(
+                "mail.unsubscribe_token_ttl_days must be a positive number of days (got {token_ttl_days})"
+            )),
+            hint: Some(
+                "Set mail.unsubscribe_token_ttl_days to a positive value (default 30); a non-positive value would make every unsubscribe token immediately expired",
+            ),
         };
     }
 
-    // A non-empty but malformed destination is worse than a missing one: the
-    // runtime `MailConfig::validate` rejects it in prod, so the app won't boot.
-    // Surface that here instead of returning Pass on an invalid value. The
-    // HTTPS/mailbox rules are validated in prod only, matching the runtime.
-    if is_production && any_set {
+    // Destination format: a non-empty but malformed base_url / mailto is rejected
+    // in prod (mailbox providers require HTTPS one-click / a real mailbox).
+    if is_production {
         if let Some(url) = base_url
             && !is_valid_https_base_url_doctor(url)
         {
@@ -481,6 +482,25 @@ pub fn check_mail_unsubscribe_config_impl(
                 ),
             };
         }
+    }
+
+    if !has_list_unsubscribe_usage {
+        return CheckResult {
+            name: "mail_unsubscribe",
+            status: CheckStatus::Pass,
+            detail: Some("no #[mailer] declares list_unsubscribe".into()),
+            hint: None,
+        };
+    }
+    if transport_disabled {
+        // Mirrors the runtime guard: a disabled transport emits no list mail, so
+        // unsubscribe destinations aren't required to boot.
+        return CheckResult {
+            name: "mail_unsubscribe",
+            status: CheckStatus::Pass,
+            detail: Some("mail.transport is disabled; no list mail is emitted".into()),
+            hint: None,
+        };
     }
 
     if any_set {
@@ -1753,6 +1773,24 @@ fn resolve_mail_unsubscribe(table: Option<&toml::Table>) -> (Option<String>, Opt
     )
 }
 
+/// Resolve the effective `unsubscribe_token_ttl_days`, mirroring the runtime
+/// precedence: a present `AUTUMN_MAIL__UNSUBSCRIBE_TOKEN_TTL_DAYS` env var wins,
+/// then `[mail].unsubscribe_token_ttl_days`, then the default of 30. A present
+/// but unparseable env value resolves to `0` so the positive-days check fails
+/// closed (just as the runtime would reject it during deserialization).
+fn resolve_unsubscribe_token_ttl_days(table: Option<&toml::Table>) -> i64 {
+    const DEFAULT_TTL_DAYS: i64 = 30;
+    if let Ok(raw) = std::env::var("AUTUMN_MAIL__UNSUBSCRIBE_TOKEN_TTL_DAYS") {
+        return raw.trim().parse::<i64>().unwrap_or(0);
+    }
+    table
+        .and_then(|t| t.get("mail"))
+        .and_then(toml::Value::as_table)
+        .and_then(|m| m.get("unsubscribe_token_ttl_days"))
+        .and_then(toml::Value::as_integer)
+        .unwrap_or(DEFAULT_TTL_DAYS)
+}
+
 fn resolve_database_topology(table: Option<&toml::Table>) -> DoctorDatabaseTopology {
     resolve_database_topology_from_sources(
         |key| std::env::var(key).ok().filter(|value| !value.is_empty()),
@@ -2269,6 +2307,7 @@ pub fn run(opts: DoctorOptions) {
             }
         });
     let mail_transport_disabled = effective_transport.eq_ignore_ascii_case("disabled");
+    let unsub_token_ttl_days = resolve_unsubscribe_token_ttl_days(Some(&merged_mail_toml));
     let has_list_unsubscribe_usage = detect_list_unsubscribe_usage();
     tasks.push(Box::new(move || {
         check_mail_unsubscribe_config_impl(
@@ -2277,6 +2316,7 @@ pub fn run(opts: DoctorOptions) {
             unsub_mailto.as_deref(),
             mail_transport_disabled,
             is_production,
+            unsub_token_ttl_days,
         )
     }));
 
@@ -2734,27 +2774,27 @@ mod tests {
 
     #[test]
     fn mail_unsubscribe_no_usage_passes() {
-        let r = check_mail_unsubscribe_config_impl(false, None, None, false, true);
+        let r = check_mail_unsubscribe_config_impl(false, None, None, false, true, 30);
         assert_eq!(r.status, CheckStatus::Pass);
     }
 
     #[test]
     fn mail_unsubscribe_usage_without_config_fails_in_prod() {
-        let r = check_mail_unsubscribe_config_impl(true, None, None, false, true);
+        let r = check_mail_unsubscribe_config_impl(true, None, None, false, true, 30);
         assert_eq!(r.status, CheckStatus::Fail);
         assert!(r.detail.unwrap().contains("list_unsubscribe"));
     }
 
     #[test]
     fn mail_unsubscribe_usage_without_config_warns_outside_prod() {
-        let r = check_mail_unsubscribe_config_impl(true, None, Some("   "), false, false);
+        let r = check_mail_unsubscribe_config_impl(true, None, Some("   "), false, false, 30);
         assert_eq!(r.status, CheckStatus::Warn);
     }
 
     #[test]
     fn mail_unsubscribe_disabled_transport_passes() {
         // Disabled transport emits no list mail, so config isn't required.
-        let r = check_mail_unsubscribe_config_impl(true, None, None, true, true);
+        let r = check_mail_unsubscribe_config_impl(true, None, None, true, true, 30);
         assert_eq!(r.status, CheckStatus::Pass);
     }
 
@@ -2766,14 +2806,21 @@ mod tests {
             None,
             false,
             true,
+            30,
         );
         assert_eq!(r.status, CheckStatus::Pass);
     }
 
     #[test]
     fn mail_unsubscribe_usage_with_mailto_passes() {
-        let r =
-            check_mail_unsubscribe_config_impl(true, None, Some("unsub@example.com"), false, true);
+        let r = check_mail_unsubscribe_config_impl(
+            true,
+            None,
+            Some("unsub@example.com"),
+            false,
+            true,
+            30,
+        );
         assert_eq!(r.status, CheckStatus::Pass);
     }
 
@@ -2861,6 +2908,7 @@ mod tests {
             None,
             false,
             true,
+            30,
         );
         assert_eq!(r.status, CheckStatus::Fail);
         let r = check_mail_unsubscribe_config_impl(
@@ -2869,6 +2917,7 @@ mod tests {
             None,
             false,
             true,
+            30,
         );
         assert_eq!(r.status, CheckStatus::Fail);
     }
@@ -2881,6 +2930,7 @@ mod tests {
             Some("unsubscribe example.com"),
             false,
             true,
+            30,
         );
         assert_eq!(r.status, CheckStatus::Fail);
     }
@@ -2894,6 +2944,7 @@ mod tests {
             None,
             false,
             false,
+            30,
         );
         assert_eq!(r.status, CheckStatus::Pass);
     }
@@ -2934,8 +2985,46 @@ mod tests {
             Some("unsub@example.com"),
             false,
             true,
+            30,
         );
         assert_eq!(r.status, CheckStatus::Pass);
+    }
+
+    #[test]
+    fn mail_unsubscribe_non_positive_ttl_fails_in_any_profile() {
+        // Runtime validate() rejects a non-positive TTL in every profile, even
+        // with no list usage or a disabled transport, so the app won't boot.
+        for is_prod in [true, false] {
+            let r = check_mail_unsubscribe_config_impl(false, None, None, true, is_prod, 0);
+            assert_eq!(r.status, CheckStatus::Fail, "ttl=0 prod={is_prod}");
+            let r = check_mail_unsubscribe_config_impl(false, None, None, true, is_prod, -5);
+            assert_eq!(r.status, CheckStatus::Fail, "ttl=-5 prod={is_prod}");
+        }
+    }
+
+    #[test]
+    fn mail_unsubscribe_invalid_destination_fails_even_without_usage() {
+        // Runtime validate() rejects a malformed destination in prod regardless of
+        // whether any #[mailer] declares list_unsubscribe, so doctor must not Pass
+        // before validating it.
+        let r = check_mail_unsubscribe_config_impl(
+            false,
+            Some("http://app.example.com"),
+            None,
+            true,
+            true,
+            30,
+        );
+        assert_eq!(r.status, CheckStatus::Fail);
+        let r = check_mail_unsubscribe_config_impl(
+            false,
+            None,
+            Some("unsubscribe example.com"),
+            true,
+            true,
+            30,
+        );
+        assert_eq!(r.status, CheckStatus::Fail);
     }
 
     #[test]

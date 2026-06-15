@@ -650,6 +650,14 @@ impl TestApp {
             self.inbound_mail_router = Some(router);
         }
 
+        // Carry a plugin-registered suppression store (List-Unsubscribe storage)
+        // into the test app so unsubscribe POSTs and send-time suppression behave
+        // under TestApp exactly as they do under AppBuilder::run.
+        #[cfg(feature = "mail")]
+        if let Some(handle) = app_builder.suppression_store {
+            self.suppression_store = Some(handle);
+        }
+
         // Carry plugin-registered error reporters into the test app so
         // reporting-enabled plugins exercise the same behavior under `TestApp`
         // that they get from `AppBuilder::run`.
@@ -2320,6 +2328,26 @@ mod tests {
         );
 
         crate::job::clear_global_job_client();
+    }
+
+    #[cfg(feature = "mail")]
+    #[test]
+    fn plugin_suppression_store_is_carried_into_test_app() {
+        struct SuppressionPlugin;
+        impl crate::plugin::Plugin for SuppressionPlugin {
+            fn build(self, app: crate::app::AppBuilder) -> crate::app::AppBuilder {
+                app.with_suppression_store(crate::mail::InMemorySuppressionStore::new())
+            }
+        }
+
+        // A plugin that wires List-Unsubscribe storage must propagate it into the
+        // TestApp, so unsubscribe POSTs / send-time suppression work without every
+        // test repeating `.with_suppression_store(...)`.
+        let app = TestApp::new().plugin(SuppressionPlugin);
+        assert!(
+            app.suppression_store.is_some(),
+            "plugin-registered suppression store must be carried into TestApp"
+        );
     }
 
     /// End-to-end acceptance for issue #605: a plain `<form method="post">`

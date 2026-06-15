@@ -318,7 +318,7 @@ pub struct AppBuilder {
     #[cfg(feature = "mail")]
     mail_delivery_queue_factory: Option<MailDeliveryQueueFactory>,
     #[cfg(feature = "mail")]
-    suppression_store: Option<crate::mail::SuppressionStoreHandle>,
+    pub(crate) suppression_store: Option<crate::mail::SuppressionStoreHandle>,
     #[cfg(feature = "mail")]
     mount_unsubscribe_endpoint: bool,
     /// Mail template previews registered for the dev preview UI.
