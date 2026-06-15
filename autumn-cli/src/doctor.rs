@@ -1378,6 +1378,78 @@ fn get_merged_toml_table_profiles(profiles: &[&str]) -> toml::Table {
     merged
 }
 
+/// Inline `[profile.{name}]` lookup order, mirroring the runtime config loader's
+/// `profile_lookup_names`: the canonical spelling is applied **last** so it wins
+/// (`production` then `prod`; `development` then `dev`).
+fn inline_profile_lookup_names(profile: &str) -> Vec<&str> {
+    match profile {
+        "prod" => vec!["production", "prod"],
+        "dev" => vec!["development", "dev"],
+        other => vec![other],
+    }
+}
+
+/// Ordered `autumn-{name}.toml` override-file lookup, mirroring the runtime's
+/// `profile_override_file_lookup_names`: only the **first existing** file is
+/// loaded, preferring the spelling the operator actually selected.
+fn override_file_lookup_names(profile: &str, selected_input: &str) -> Vec<String> {
+    match profile {
+        "prod" if selected_input.eq_ignore_ascii_case("production") => {
+            vec!["production".to_owned(), "prod".to_owned()]
+        }
+        "prod" => vec!["prod".to_owned(), "production".to_owned()],
+        "dev" if selected_input.eq_ignore_ascii_case("development") => {
+            vec!["development".to_owned(), "dev".to_owned()]
+        }
+        "dev" => vec!["dev".to_owned(), "development".to_owned()],
+        other => vec![other.to_owned()],
+    }
+}
+
+/// Build the merged TOML the same way the runtime config loader layers profile
+/// sources, so doctor evaluates exactly what the app will boot with. Mirrors
+/// `autumn_web::config`: inline `[profile.{name}]` sections are applied in alias
+/// order (canonical spelling wins), and exactly one `autumn-{name}.toml` file is
+/// loaded — the first that exists, preferring the selected spelling.
+fn get_merged_toml_table_runtime(normalized_profile: &str, selected_input: &str) -> toml::Table {
+    let mut merged = toml::Table::new();
+
+    let base_toml = std::fs::read_to_string("autumn.toml")
+        .ok()
+        .and_then(|c| toml::from_str::<toml::Table>(&c).ok());
+
+    // 1. Base autumn.toml top-level.
+    if let Some(ref table) = base_toml {
+        deep_merge(&mut merged, table);
+    }
+
+    // 2. Inline [profile.{name}] sections, canonical spelling applied last (wins).
+    for profile_name in inline_profile_lookup_names(normalized_profile) {
+        if let Some(prof) = base_toml
+            .as_ref()
+            .and_then(|t| t.get("profile"))
+            .and_then(toml::Value::as_table)
+            .and_then(|p| p.get(profile_name))
+            .and_then(toml::Value::as_table)
+        {
+            deep_merge(&mut merged, prof);
+        }
+    }
+
+    // 3. Exactly one autumn-{name}.toml override file (first existing).
+    for profile_name in override_file_lookup_names(normalized_profile, selected_input) {
+        if let Some(table) = std::fs::read_to_string(format!("autumn-{profile_name}.toml"))
+            .ok()
+            .and_then(|c| toml::from_str::<toml::Table>(&c).ok())
+        {
+            deep_merge(&mut merged, &table);
+            break;
+        }
+    }
+
+    merged
+}
+
 pub struct DoctorOAuth2Provider {
     pub name: String,
     pub client_id: String,
@@ -2081,21 +2153,21 @@ pub fn run(opts: DoctorOptions) {
     }
 
     // 9b. List-Unsubscribe wiring: fail closed in prod when a #[mailer] declares
-    // list_unsubscribe but no unsubscribe destination is configured. Merge BOTH
-    // spellings of the prod/dev pair (prod+production, dev+development) regardless
-    // of which the operator used, so [profile.production.mail] /
-    // autumn-production.toml are seen — matching the runtime config loader.
+    // list_unsubscribe but no unsubscribe destination is configured. Layer the
+    // profile sources exactly as the runtime config loader does (alias-aware
+    // inline precedence with the canonical spelling winning, single override
+    // file preferring the selected spelling), so doctor evaluates what the app
+    // will actually boot with rather than a stale legacy spelling.
     let raw_mail_profile = std::env::var("AUTUMN_ENV")
         .or_else(|_| std::env::var("AUTUMN_PROFILE"))
-        .unwrap_or_else(|_| "dev".to_owned())
-        .trim()
-        .to_lowercase();
-    let mail_profiles: Vec<&str> = match raw_mail_profile.as_str() {
-        "prod" | "production" => vec!["prod", "production"],
-        "dev" | "development" | "" => vec!["dev", "development"],
-        other => vec![other],
+        .unwrap_or_else(|_| "dev".to_owned());
+    let selected_input = raw_mail_profile.trim().to_owned();
+    let normalized_profile = match selected_input.to_lowercase().as_str() {
+        "prod" | "production" => "prod".to_owned(),
+        "dev" | "development" | "" => "dev".to_owned(),
+        other => other.to_owned(),
     };
-    let merged_mail_toml = get_merged_toml_table_profiles(&mail_profiles);
+    let merged_mail_toml = get_merged_toml_table_runtime(&normalized_profile, &selected_input);
     let (unsub_base_url, unsub_mailto) = resolve_mail_unsubscribe(Some(&merged_mail_toml));
     // Resolve the effective transport the same way the runtime does: env override
     // wins, then explicit `[mail].transport`, then the profile smart-default
@@ -2112,7 +2184,7 @@ pub fn run(opts: DoctorOptions) {
                 .map(str::to_owned)
         })
         .unwrap_or_else(|| {
-            if mail_profiles.first() == Some(&"dev") {
+            if normalized_profile == "dev" {
                 "log".to_owned()
             } else {
                 "disabled".to_owned()
@@ -2658,6 +2730,47 @@ mod tests {
         assert!(!file_declares_list_unsubscribe(
             "before /*\n#[mailer(list_unsubscribe = \"x\")]\n*/ after"
         ));
+    }
+
+    #[test]
+    fn inline_profile_lookup_order_matches_runtime() {
+        // Canonical spelling applied last so it wins over the legacy alias —
+        // matching autumn_web::config::profile_lookup_names.
+        assert_eq!(
+            inline_profile_lookup_names("prod"),
+            vec!["production", "prod"]
+        );
+        assert_eq!(
+            inline_profile_lookup_names("dev"),
+            vec!["development", "dev"]
+        );
+        assert_eq!(inline_profile_lookup_names("staging"), vec!["staging"]);
+    }
+
+    #[test]
+    fn override_file_lookup_order_prefers_selected_spelling() {
+        // Default canonical selection prefers the canonical file.
+        assert_eq!(
+            override_file_lookup_names("prod", "prod"),
+            vec!["prod".to_owned(), "production".to_owned()]
+        );
+        // When the operator selected the legacy spelling, that file is preferred.
+        assert_eq!(
+            override_file_lookup_names("prod", "production"),
+            vec!["production".to_owned(), "prod".to_owned()]
+        );
+        assert_eq!(
+            override_file_lookup_names("dev", "dev"),
+            vec!["dev".to_owned(), "development".to_owned()]
+        );
+        assert_eq!(
+            override_file_lookup_names("dev", "development"),
+            vec!["development".to_owned(), "dev".to_owned()]
+        );
+        assert_eq!(
+            override_file_lookup_names("staging", "staging"),
+            vec!["staging".to_owned()]
+        );
     }
 
     #[test]
