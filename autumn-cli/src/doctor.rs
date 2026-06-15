@@ -423,8 +423,9 @@ pub fn check_mail_unsubscribe_config_impl(
     transport_disabled: bool,
     is_production: bool,
 ) -> CheckResult {
-    let configured = base_url.is_some_and(|s| !s.trim().is_empty())
-        || mailto.is_some_and(|s| !s.trim().is_empty());
+    let base_url = base_url.map(str::trim).filter(|s| !s.is_empty());
+    let mailto = mailto.map(str::trim).filter(|s| !s.is_empty());
+    let any_set = base_url.is_some() || mailto.is_some();
 
     if !has_list_unsubscribe_usage {
         return CheckResult {
@@ -444,7 +445,45 @@ pub fn check_mail_unsubscribe_config_impl(
             hint: None,
         };
     }
-    if configured {
+
+    // A non-empty but malformed destination is worse than a missing one: the
+    // runtime `MailConfig::validate` rejects it in prod, so the app won't boot.
+    // Surface that here instead of returning Pass on an invalid value. The
+    // HTTPS/mailbox rules are validated in prod only, matching the runtime.
+    if is_production && any_set {
+        if let Some(url) = base_url
+            && !is_valid_https_base_url_doctor(url)
+        {
+            return CheckResult {
+                name: "mail_unsubscribe",
+                status: CheckStatus::Fail,
+                detail: Some(format!(
+                    "mail.unsubscribe_base_url is set to an invalid value ({url:?}): \
+                     the runtime requires an absolute https:// URL with a real host"
+                )),
+                hint: Some(
+                    "Use an absolute https:// URL with a host and no query/fragment, e.g. https://app.example.com",
+                ),
+            };
+        }
+        if let Some(addr) = mailto
+            && !is_valid_mailto_address_doctor(addr)
+        {
+            return CheckResult {
+                name: "mail_unsubscribe",
+                status: CheckStatus::Fail,
+                detail: Some(format!(
+                    "mail.unsubscribe_mailto is set to an invalid value ({addr:?}): \
+                     the runtime requires a bare mailbox address or mailto: URI"
+                )),
+                hint: Some(
+                    "Use a mailbox like unsubscribe@example.com (or mailto:unsubscribe@example.com)",
+                ),
+            };
+        }
+    }
+
+    if any_set {
         return CheckResult {
             name: "mail_unsubscribe",
             status: CheckStatus::Pass,
@@ -474,6 +513,45 @@ pub fn check_mail_unsubscribe_config_impl(
             detail,
             hint,
         }
+    }
+}
+
+/// Mirror of `autumn_web`'s `is_valid_https_base_url` (mail module, feature-gated
+/// so not reachable from the CLI build). Kept byte-for-byte in sync so
+/// `autumn doctor --strict` rejects exactly what the runtime rejects at boot.
+fn is_valid_https_base_url_doctor(url: &str) -> bool {
+    if url
+        .strip_prefix("https://")
+        .is_some_and(|rest| rest.starts_with('/'))
+    {
+        return false;
+    }
+    let Ok(parsed) = ::url::Url::parse(url) else {
+        return false;
+    };
+    parsed.scheme() == "https"
+        && parsed.host_str().is_some_and(|h| !h.is_empty())
+        && parsed.username().is_empty()
+        && parsed.password().is_none()
+        && parsed.query().is_none()
+        && parsed.fragment().is_none()
+}
+
+/// Mirror of `autumn_web`'s `is_valid_mailto_address` (see above).
+fn is_valid_mailto_address_doctor(value: &str) -> bool {
+    let address = value
+        .trim()
+        .strip_prefix("mailto:")
+        .unwrap_or_else(|| value.trim());
+    let address = address.split('?').next().unwrap_or("");
+    match address.split_once('@') {
+        Some((local, domain)) => {
+            !local.is_empty()
+                && !domain.is_empty()
+                && domain.contains('.')
+                && !address.contains(char::is_whitespace)
+        }
+        None => false,
     }
 }
 
@@ -2771,6 +2849,81 @@ mod tests {
             override_file_lookup_names("staging", "staging"),
             vec!["staging".to_owned()]
         );
+    }
+
+    #[test]
+    fn mail_unsubscribe_invalid_base_url_fails_in_prod() {
+        // Non-empty but malformed: runtime validate() would reject this, so doctor
+        // must not return Pass on it.
+        let r = check_mail_unsubscribe_config_impl(
+            true,
+            Some("http://app.example.com"),
+            None,
+            false,
+            true,
+        );
+        assert_eq!(r.status, CheckStatus::Fail);
+        let r = check_mail_unsubscribe_config_impl(
+            true,
+            Some("https://app.example.com:abc"),
+            None,
+            false,
+            true,
+        );
+        assert_eq!(r.status, CheckStatus::Fail);
+    }
+
+    #[test]
+    fn mail_unsubscribe_invalid_mailto_fails_in_prod() {
+        let r = check_mail_unsubscribe_config_impl(
+            true,
+            None,
+            Some("unsubscribe example.com"),
+            false,
+            true,
+        );
+        assert_eq!(r.status, CheckStatus::Fail);
+    }
+
+    #[test]
+    fn mail_unsubscribe_invalid_value_is_lenient_outside_prod() {
+        // Dev mirrors the runtime: malformed values are not a hard gate.
+        let r = check_mail_unsubscribe_config_impl(
+            true,
+            Some("http://app.example.com"),
+            None,
+            false,
+            false,
+        );
+        assert_eq!(r.status, CheckStatus::Pass);
+    }
+
+    #[test]
+    fn doctor_url_validation_matches_runtime_cases() {
+        assert!(is_valid_https_base_url_doctor("https://app.example.com"));
+        assert!(is_valid_https_base_url_doctor(
+            "https://app.example.com:8443"
+        ));
+        assert!(is_valid_https_base_url_doctor(
+            "https://app.example.com/base"
+        ));
+        assert!(!is_valid_https_base_url_doctor("http://app.example.com"));
+        assert!(!is_valid_https_base_url_doctor(
+            "https://app.example.com:abc"
+        ));
+        assert!(!is_valid_https_base_url_doctor("https://@/base"));
+        assert!(!is_valid_https_base_url_doctor("https:///path"));
+        assert!(!is_valid_https_base_url_doctor(
+            "https://user@app.example.com"
+        ));
+        assert!(!is_valid_https_base_url_doctor(
+            "https://app.example.com?q=1"
+        ));
+
+        assert!(is_valid_mailto_address_doctor("unsub@example.com"));
+        assert!(is_valid_mailto_address_doctor("mailto:unsub@example.com"));
+        assert!(!is_valid_mailto_address_doctor("not-an-email"));
+        assert!(!is_valid_mailto_address_doctor("unsubscribe example.com"));
     }
 
     #[test]

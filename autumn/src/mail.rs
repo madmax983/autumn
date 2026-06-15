@@ -163,15 +163,29 @@ pub struct MailConfig {
 /// `https://`, `https:///path`, and bases carrying `?`/`#` (the unsubscribe
 /// path/token is appended afterwards, so a query/fragment base would not route).
 fn is_valid_https_base_url(url: &str) -> bool {
-    let Some(rest) = url.strip_prefix("https://") else {
-        return false;
-    };
-    // A query or fragment in the base would break the appended `?token=…`.
-    if url.contains('?') || url.contains('#') {
+    // Reject an empty authority (`https:///path`): the WHATWG parser would
+    // otherwise collapse it into a bogus host, but an author who wrote this meant
+    // a real host followed by a path.
+    if url
+        .strip_prefix("https://")
+        .is_some_and(|rest| rest.starts_with('/'))
+    {
         return false;
     }
-    let host = rest.split('/').next().unwrap_or("");
-    !host.is_empty() && !host.contains(char::is_whitespace)
+    let Ok(parsed) = ::url::Url::parse(url) else {
+        return false;
+    };
+    // Require an absolute https:// URL with a real host and a valid authority.
+    // Parsing (rather than splitting on `/`) rejects malformed authorities like
+    // `https://app.example.com:abc` (bad port) or `https://@/base` (empty host).
+    // No credentials in the link, and no query/fragment — either would break the
+    // appended `?token=…`.
+    parsed.scheme() == "https"
+        && parsed.host_str().is_some_and(|h| !h.is_empty())
+        && parsed.username().is_empty()
+        && parsed.password().is_none()
+        && parsed.query().is_none()
+        && parsed.fragment().is_none()
 }
 
 /// Whether `value` is a usable unsubscribe mailbox — a bare `local@domain` or a
@@ -4263,6 +4277,12 @@ mod tests {
         assert!(!is_valid_https_base_url("https://app.example.com?q=1"));
         assert!(!is_valid_https_base_url("https://app.example.com#frag"));
         assert!(!is_valid_https_base_url("https://host name.com"));
+        // Malformed authorities that a naive `/`-split would wrongly accept.
+        assert!(!is_valid_https_base_url("https://app.example.com:abc"));
+        assert!(!is_valid_https_base_url("https://@/base"));
+        assert!(!is_valid_https_base_url("https://user@app.example.com"));
+        // A valid explicit port is fine.
+        assert!(is_valid_https_base_url("https://app.example.com:8443"));
     }
 
     #[test]
