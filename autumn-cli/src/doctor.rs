@@ -1713,32 +1713,39 @@ fn strip_rust_comments(content: &str) -> String {
 /// specifically (whitespace-insensitive) so builder calls or comments do not
 /// trip a false positive.
 fn detect_list_unsubscribe_usage() -> bool {
+    scan_dir_for_list_unsubscribe(std::path::Path::new("."))
+}
+
+/// Recursively scan `root` for a source file declaring
+/// `#[mailer(list_unsubscribe = "...")]`.
+///
+/// Skips build/VCS/vendor directories so a `cargo vendor` copy of the framework
+/// (whose own tests declare a real list mailer) can't trip a false positive for
+/// an application binary that registers none.
+fn scan_dir_for_list_unsubscribe(root: &std::path::Path) -> bool {
     /// Directories never worth scanning for source.
-    const SKIP_DIRS: &[&str] = &["target", ".git", "node_modules", "dist", ".github"];
-    fn scan(dir: &std::path::Path) -> bool {
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            return false;
-        };
-        for entry in entries.filter_map(Result::ok) {
-            let path = entry.path();
-            if path.is_dir() {
-                let skip = path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .is_some_and(|n| SKIP_DIRS.contains(&n));
-                if !skip && scan(&path) {
-                    return true;
-                }
-            } else if path.extension().and_then(|e| e.to_str()) == Some("rs")
-                && std::fs::read_to_string(&path)
-                    .is_ok_and(|content| file_declares_list_unsubscribe(&content))
-            {
+    const SKIP_DIRS: &[&str] = &["target", ".git", "node_modules", "dist", ".github", "vendor"];
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return false;
+    };
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        if path.is_dir() {
+            let skip = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| SKIP_DIRS.contains(&n));
+            if !skip && scan_dir_for_list_unsubscribe(&path) {
                 return true;
             }
+        } else if path.extension().and_then(|e| e.to_str()) == Some("rs")
+            && std::fs::read_to_string(&path)
+                .is_ok_and(|content| file_declares_list_unsubscribe(&content))
+        {
+            return true;
         }
-        false
     }
-    scan(std::path::Path::new("."))
+    false
 }
 
 /// Resolve `[mail]` unsubscribe destinations, preferring env overrides over the
@@ -2914,6 +2921,37 @@ mod tests {
         assert!(!file_declares_list_unsubscribe(
             "before /*\n#[mailer(list_unsubscribe = \"x\")]\n*/ after"
         ));
+    }
+
+    #[test]
+    fn scan_finds_workspace_mailer_but_skips_vendored_copy() {
+        let root = tempfile::tempdir().expect("temp dir");
+        // A vendored dependency copy (e.g. `cargo vendor`) carries the framework's
+        // own list mailer in its tests — this must NOT count as app usage.
+        let vendored = root.path().join("vendor/autumn-web/tests");
+        std::fs::create_dir_all(&vendored).expect("create vendor dir");
+        std::fs::write(
+            vendored.join("mail_unsubscribe.rs"),
+            "#[mailer(list_unsubscribe = \"weekly_digest\")]\nfn x() {}",
+        )
+        .expect("write vendored source");
+        assert!(
+            !scan_dir_for_list_unsubscribe(root.path()),
+            "vendored dependency sources must be skipped"
+        );
+
+        // A real workspace member that declares one is still detected.
+        let app = root.path().join("crates/marketing/src");
+        std::fs::create_dir_all(&app).expect("create app dir");
+        std::fs::write(
+            app.join("mailers.rs"),
+            "#[mailer(list_unsubscribe = \"weekly_digest\")]\nfn y() {}",
+        )
+        .expect("write app source");
+        assert!(
+            scan_dir_for_list_unsubscribe(root.path()),
+            "workspace member mailer must still be detected"
+        );
     }
 
     #[test]
