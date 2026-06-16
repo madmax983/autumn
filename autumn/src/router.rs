@@ -2786,6 +2786,269 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn should_allow_request_without_version_metadata() {
+        let state = test_state();
+        let app = axum::Router::new()
+            .route("/", axum::routing::get(|| async { "OK" }))
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                api_versioning_middleware,
+            ))
+            .with_state(state);
+
+        let req = Request::builder().uri("/").body(Body::empty()).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn should_allow_request_for_active_version() {
+        let state = test_state();
+        let active_version = crate::app::ApiVersion {
+            version: "v1".to_string(),
+            deprecated_at: None,
+            sunset_at: None,
+        };
+        state.insert_extension(crate::app::RegisteredApiVersions(vec![active_version]));
+
+        let meta = RouteVersionMetadata {
+            version: "v1".to_string(),
+            sunset_opt_out: false,
+            secured: false,
+            required_roles: &[],
+        };
+
+        let app = axum::Router::new()
+            .route("/", axum::routing::get(|| async { "OK" }))
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                api_versioning_middleware,
+            ))
+            .layer(axum::extract::Extension(meta))
+            .with_state(state);
+
+        let req = Request::builder().uri("/").body(Body::empty()).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn should_add_deprecation_header_for_deprecated_version() {
+        let state = test_state();
+        let now = chrono::Utc::now();
+        let past = now - chrono::TimeDelta::try_days(1).unwrap();
+
+        let deprecated_version = crate::app::ApiVersion {
+            version: "v1".to_string(),
+            deprecated_at: Some(past),
+            sunset_at: None,
+        };
+        state.insert_extension(crate::app::RegisteredApiVersions(vec![deprecated_version]));
+
+        let meta = RouteVersionMetadata {
+            version: "v1".to_string(),
+            sunset_opt_out: false,
+            secured: false,
+            required_roles: &[],
+        };
+
+        let app = axum::Router::new()
+            .route("/", axum::routing::get(|| async { "OK" }))
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                api_versioning_middleware,
+            ))
+            .layer(axum::extract::Extension(meta))
+            .with_state(state);
+
+        let req = Request::builder().uri("/").body(Body::empty()).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let expected_date = format!("@{}", past.timestamp());
+        assert_eq!(
+            resp.headers().get("Deprecation").unwrap(),
+            expected_date.as_str()
+        );
+        assert!(resp.headers().get("Sunset").is_none());
+    }
+
+    #[tokio::test]
+    async fn should_add_sunset_header_for_soon_to_be_sunset_version() {
+        let state = test_state();
+        let now = chrono::Utc::now();
+        let past = now - chrono::TimeDelta::try_days(1).unwrap();
+        let future = now + chrono::TimeDelta::try_days(30).unwrap();
+
+        let soon_sunset_version = crate::app::ApiVersion {
+            version: "v1".to_string(),
+            deprecated_at: Some(past),
+            sunset_at: Some(future),
+        };
+        state.insert_extension(crate::app::RegisteredApiVersions(vec![soon_sunset_version]));
+
+        let meta = RouteVersionMetadata {
+            version: "v1".to_string(),
+            sunset_opt_out: false,
+            secured: false,
+            required_roles: &[],
+        };
+
+        let app = axum::Router::new()
+            .route("/", axum::routing::get(|| async { "OK" }))
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                api_versioning_middleware,
+            ))
+            .layer(axum::extract::Extension(meta))
+            .with_state(state);
+
+        let req = Request::builder().uri("/").body(Body::empty()).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let expected_dep_date = format!("@{}", past.timestamp());
+        let expected_sun_date = future.format("%a, %d %b %Y %H:%M:%S GMT").to_string();
+        assert_eq!(
+            resp.headers().get("Deprecation").unwrap(),
+            expected_dep_date.as_str()
+        );
+        assert_eq!(
+            resp.headers().get("Sunset").unwrap(),
+            expected_sun_date.as_str()
+        );
+    }
+
+    #[tokio::test]
+    async fn should_return_410_gone_for_sunset_version() {
+        let state = test_state();
+        let now = chrono::Utc::now();
+        let past = now - chrono::TimeDelta::try_days(30).unwrap();
+
+        let sunset_version = crate::app::ApiVersion {
+            version: "v1".to_string(),
+            deprecated_at: Some(past - chrono::TimeDelta::try_days(30).unwrap()),
+            sunset_at: Some(past),
+        };
+        state.insert_extension(crate::app::RegisteredApiVersions(vec![sunset_version]));
+
+        let meta = RouteVersionMetadata {
+            version: "v1".to_string(),
+            sunset_opt_out: false,
+            secured: false,
+            required_roles: &[],
+        };
+
+        let app = axum::Router::new()
+            .route("/", axum::routing::get(|| async { "OK" }))
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                api_versioning_middleware,
+            ))
+            .layer(axum::extract::Extension(meta))
+            .with_state(state);
+
+        let req = Request::builder().uri("/").body(Body::empty()).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+
+        assert_eq!(resp.status(), StatusCode::GONE);
+
+        let expected_sun_date = past.format("%a, %d %b %Y %H:%M:%S GMT").to_string();
+        assert_eq!(
+            resp.headers().get("Sunset").unwrap(),
+            expected_sun_date.as_str()
+        );
+    }
+
+    #[tokio::test]
+    async fn should_bypass_sunset_if_opted_out() {
+        let state = test_state();
+        let now = chrono::Utc::now();
+        let past = now - chrono::TimeDelta::try_days(30).unwrap();
+
+        let sunset_version = crate::app::ApiVersion {
+            version: "v1".to_string(),
+            deprecated_at: Some(past - chrono::TimeDelta::try_days(30).unwrap()),
+            sunset_at: Some(past),
+        };
+        state.insert_extension(crate::app::RegisteredApiVersions(vec![sunset_version]));
+
+        let meta = RouteVersionMetadata {
+            version: "v1".to_string(),
+            sunset_opt_out: true,
+            secured: false,
+            required_roles: &[],
+        };
+
+        let app = axum::Router::new()
+            .route("/", axum::routing::get(|| async { "OK" }))
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                api_versioning_middleware,
+            ))
+            .layer(axum::extract::Extension(meta))
+            .with_state(state);
+
+        let req = Request::builder().uri("/").body(Body::empty()).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let expected_dep_date = format!(
+            "@{}",
+            (past - chrono::TimeDelta::try_days(30).unwrap()).timestamp()
+        );
+        let expected_sun_date = past.format("%a, %d %b %Y %H:%M:%S GMT").to_string();
+        assert_eq!(
+            resp.headers().get("Deprecation").unwrap(),
+            expected_dep_date.as_str()
+        );
+        assert_eq!(
+            resp.headers().get("Sunset").unwrap(),
+            expected_sun_date.as_str()
+        );
+    }
+
+    #[tokio::test]
+    async fn should_return_401_for_unauthorized_sunset_request() {
+        let state = test_state();
+        let now = chrono::Utc::now();
+        let past = now - chrono::TimeDelta::try_days(30).unwrap();
+
+        let sunset_version = crate::app::ApiVersion {
+            version: "v1".to_string(),
+            deprecated_at: Some(past - chrono::TimeDelta::try_days(30).unwrap()),
+            sunset_at: Some(past),
+        };
+        state.insert_extension(crate::app::RegisteredApiVersions(vec![sunset_version]));
+
+        let meta = RouteVersionMetadata {
+            version: "v1".to_string(),
+            sunset_opt_out: false,
+            secured: true,
+            required_roles: &[],
+        };
+
+        let app = axum::Router::new()
+            .route("/", axum::routing::get(|| async { "OK" }))
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                api_versioning_middleware,
+            ))
+            .layer(axum::extract::Extension(meta))
+            .with_state(state);
+
+        let req = Request::builder().uri("/").body(Body::empty()).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
     async fn build_router_mounts_actuator_at_configured_prefix() {
         let mut config = AutumnConfig::default();
         config.actuator.prefix = "/ops".to_owned();
