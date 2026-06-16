@@ -251,20 +251,7 @@ pub(crate) fn compare_replica_migration_versions(
     }
 }
 
-/// List every applied migration version recorded in `__diesel_schema_migrations`
-/// (both framework- and user-owned), ascending by version.
-///
-/// Unlike [`applied_user_migrations`], this does not filter to user migrations —
-/// it is the raw applied set. `autumn migrate down --to <VERSION>` uses it to
-/// accept an applied *framework* version as a rollback boundary (reverting only
-/// the newer user migrations above it) while framework migrations themselves
-/// stay forward-only.
-///
-/// # Errors
-///
-/// - [`MigrationError::Connection`] if the database is unreachable.
-/// - [`MigrationError::Migration`] if querying applied versions fails.
-pub fn applied_migration_versions(database_url: &str) -> Result<Vec<String>, MigrationError> {
+fn applied_migration_versions(database_url: &str) -> Result<Vec<String>, MigrationError> {
     let mut conn = diesel::PgConnection::establish(database_url)
         .map_err(|e| MigrationError::Connection(e.to_string()))?;
 

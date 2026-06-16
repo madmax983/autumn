@@ -205,8 +205,8 @@ autumn migrate down
 autumn migrate down --steps 3
 
 # Revert user migrations until 20260101000000 is the latest applied.
-# VERSION may be a framework migration: framework stays forward-only, so only
-# the newer user migrations above the boundary are reverted.
+# VERSION must be a currently applied user migration; framework migrations are
+# forward-only and cannot be used as a boundary.
 autumn migrate down --to 20260101000000
 
 # Required when AUTUMN_ENV=prod:
