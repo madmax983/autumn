@@ -174,14 +174,15 @@ fn is_valid_https_base_url(url: &str) -> bool {
     {
         return false;
     }
-    // Reject an empty authority (`https:///path`): the WHATWG parser would
-    // otherwise collapse it into a bogus host, but an author who wrote this meant
-    // a real host followed by a path.
-    if url
-        .strip_prefix("https://")
-        .is_some_and(|rest| rest.starts_with('/'))
-    {
-        return false;
+    // Require the raw input to be literally `https://<authority>…`. `url::Url`
+    // normalizes a missing/short authority (`https:`, `https:app.example.com`,
+    // `https:/app.example.com`, `https:///path`) into a valid HTTPS URL with a
+    // host, but the *original* malformed string is what gets rendered into the
+    // header — so reject anything that isn't `https://` followed by a non-`/`
+    // authority character.
+    match url.strip_prefix("https://") {
+        Some(rest) if !rest.is_empty() && !rest.starts_with('/') => {}
+        _ => return false,
     }
     let Ok(parsed) = ::url::Url::parse(url) else {
         return false;
@@ -4531,6 +4532,10 @@ mod tests {
         assert!(!is_valid_https_base_url("https://example.com/<x>"));
         assert!(!is_valid_https_base_url("https://example.com/a b"));
         assert!(!is_valid_https_base_url("https://example.com/a\r\nb"));
+        // Missing/short authority that `Url::parse` would normalize to a valid
+        // host — rejected so prod can't advertise an unusable one-click URL.
+        assert!(!is_valid_https_base_url("https:/app.example.com"));
+        assert!(!is_valid_https_base_url("https:app.example.com"));
     }
 
     #[test]

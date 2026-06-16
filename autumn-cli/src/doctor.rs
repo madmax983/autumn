@@ -579,11 +579,9 @@ fn is_valid_https_base_url_doctor(url: &str) -> bool {
     {
         return false;
     }
-    if url
-        .strip_prefix("https://")
-        .is_some_and(|rest| rest.starts_with('/'))
-    {
-        return false;
+    match url.strip_prefix("https://") {
+        Some(rest) if !rest.is_empty() && !rest.starts_with('/') => {}
+        _ => return false,
     }
     let Ok(parsed) = ::url::Url::parse(url) else {
         return false;
@@ -3225,6 +3223,8 @@ mod tests {
         ));
         assert!(!is_valid_https_base_url_doctor("https://@/base"));
         assert!(!is_valid_https_base_url_doctor("https:///path"));
+        assert!(!is_valid_https_base_url_doctor("https:/app.example.com"));
+        assert!(!is_valid_https_base_url_doctor("https:app.example.com"));
         assert!(!is_valid_https_base_url_doctor(
             "https://user@app.example.com"
         ));
