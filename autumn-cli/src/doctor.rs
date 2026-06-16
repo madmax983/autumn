@@ -416,7 +416,6 @@ pub fn check_oauth2_provider_impl(
 /// - Usage with neither configured → **fail** in production (Gmail/Yahoo will
 ///   reject the bulk mail) and **warn** outside production so
 ///   `autumn doctor --strict` still surfaces it before deploy.
-#[allow(clippy::fn_params_excessive_bools)] // independent usage/transport/prod/db signals
 pub fn check_mail_unsubscribe_config_impl(
     has_list_unsubscribe_usage: bool,
     base_url: Option<&str>,
@@ -424,7 +423,6 @@ pub fn check_mail_unsubscribe_config_impl(
     transport_disabled: bool,
     is_production: bool,
     token_ttl_days: i64,
-    database_configured: bool,
 ) -> CheckResult {
     let base_url = base_url.map(str::trim).filter(|s| !s.is_empty());
     let mailto = mailto.map(str::trim).filter(|s| !s.is_empty());
@@ -508,11 +506,7 @@ pub fn check_mail_unsubscribe_config_impl(
     if any_set {
         // Reached only when a #[mailer] uses list_unsubscribe and the transport is
         // active (the no-usage / disabled-transport cases returned above).
-        return mail_unsubscribe_configured_result(
-            base_url.is_some(),
-            is_production,
-            database_configured,
-        );
+        return mail_unsubscribe_configured_result(base_url.is_some(), is_production);
     }
     let detail = Some(
         "a #[mailer] declares list_unsubscribe but neither mail.unsubscribe_base_url \
@@ -549,27 +543,17 @@ pub fn check_mail_unsubscribe_config_impl(
 /// can't see a programmatically registered store, so it warns rather than
 /// greenlight a config the app may reject at startup — under `--strict` this
 /// surfaces as an error. A mailto-only destination needs no store, so it passes.
-fn mail_unsubscribe_configured_result(
-    base_url_set: bool,
-    is_production: bool,
-    database_configured: bool,
-) -> CheckResult {
-    // A production base_url drives the one-click endpoint, which the runtime
-    // fails closed without a suppression backend. When a database pool is
-    // configured the runtime auto-wires `DbSuppressionStore`, so the deploy is
-    // compliant and we pass. Only warn when no backend can be inferred — there
-    // may still be a programmatic `with_suppression_store`, which doctor cannot
-    // see statically, so this stays a warning rather than a hard failure.
-    if is_production && base_url_set && !database_configured {
+fn mail_unsubscribe_configured_result(base_url_set: bool, is_production: bool) -> CheckResult {
+    if is_production && base_url_set {
         return CheckResult {
             name: "mail_unsubscribe",
             status: CheckStatus::Warn,
             detail: Some(
                 "mail.unsubscribe_base_url is set, so the one-click endpoint must persist \
-                 opt-outs, but no database is configured for doctor to infer a suppression \
-                 backend; the runtime fails closed in production unless a database pool or a \
-                 SuppressionStore registered via AppBuilder::with_suppression_store is available \
-                 — the latter doctor cannot verify statically"
+                 opt-outs; the runtime fails closed in production unless a suppression backend \
+                 (a database pool, or a SuppressionStore registered via \
+                 AppBuilder::with_suppression_store) is available — which doctor cannot verify \
+                 statically"
                     .into(),
             ),
             hint: Some(
@@ -577,15 +561,10 @@ fn mail_unsubscribe_configured_result(
             ),
         };
     }
-    let detail = if is_production && base_url_set {
-        "list_unsubscribe is wired (unsubscribe URL configured); a database pool is configured, so the runtime auto-wires a suppression backend"
-    } else {
-        "list_unsubscribe is wired (unsubscribe URL/mailto configured)"
-    };
     CheckResult {
         name: "mail_unsubscribe",
         status: CheckStatus::Pass,
-        detail: Some(detail.into()),
+        detail: Some("list_unsubscribe is wired (unsubscribe URL/mailto configured)".into()),
         hint: None,
     }
 }
@@ -2484,11 +2463,6 @@ pub fn run(opts: DoctorOptions) {
     let unsub_token_ttl_days = resolve_unsubscribe_token_ttl_days(Some(&merged_mail_toml));
     let unsub_ttl_toml_type_invalid = unsubscribe_ttl_toml_type_invalid(Some(&merged_mail_toml));
     let unsub_dest_toml_type_invalid = unsubscribe_dest_toml_type_invalid(Some(&merged_mail_toml));
-    // A configured primary database means the runtime auto-wires DbSuppressionStore,
-    // so a production base_url is compliant without a custom store.
-    let mail_database_configured = resolve_database_topology(Some(&merged_mail_toml))
-        .primary_url
-        .is_some();
     let has_list_unsubscribe_usage = detect_list_unsubscribe_usage();
     tasks.push(Box::new(move || {
         // A present-but-non-string destination fails the runtime's typed config
@@ -2534,7 +2508,6 @@ pub fn run(opts: DoctorOptions) {
             mail_transport_disabled,
             is_production,
             unsub_token_ttl_days,
-            mail_database_configured,
         )
     }));
 
@@ -2992,36 +2965,34 @@ mod tests {
 
     #[test]
     fn mail_unsubscribe_no_usage_passes() {
-        let r = check_mail_unsubscribe_config_impl(false, None, None, false, true, 30, false);
+        let r = check_mail_unsubscribe_config_impl(false, None, None, false, true, 30);
         assert_eq!(r.status, CheckStatus::Pass);
     }
 
     #[test]
     fn mail_unsubscribe_usage_without_config_fails_in_prod() {
-        let r = check_mail_unsubscribe_config_impl(true, None, None, false, true, 30, false);
+        let r = check_mail_unsubscribe_config_impl(true, None, None, false, true, 30);
         assert_eq!(r.status, CheckStatus::Fail);
         assert!(r.detail.unwrap().contains("list_unsubscribe"));
     }
 
     #[test]
     fn mail_unsubscribe_usage_without_config_warns_outside_prod() {
-        let r =
-            check_mail_unsubscribe_config_impl(true, None, Some("   "), false, false, 30, false);
+        let r = check_mail_unsubscribe_config_impl(true, None, Some("   "), false, false, 30);
         assert_eq!(r.status, CheckStatus::Warn);
     }
 
     #[test]
     fn mail_unsubscribe_disabled_transport_passes() {
         // Disabled transport emits no list mail, so config isn't required.
-        let r = check_mail_unsubscribe_config_impl(true, None, None, true, true, 30, false);
+        let r = check_mail_unsubscribe_config_impl(true, None, None, true, true, 30);
         assert_eq!(r.status, CheckStatus::Pass);
     }
 
     #[test]
     fn mail_unsubscribe_base_url_warns_in_prod_but_passes_outside() {
         // In production a base_url additionally requires a suppression backend the
-        // runtime fails closed without; with no database configured doctor can't
-        // infer one (a custom store can't be seen statically), so it warns.
+        // runtime fails closed without; doctor can't verify it, so it warns.
         let r = check_mail_unsubscribe_config_impl(
             true,
             Some("https://app.example.com"),
@@ -3029,21 +3000,9 @@ mod tests {
             false,
             true,
             30,
-            false,
         );
         assert_eq!(r.status, CheckStatus::Warn);
         assert!(r.detail.unwrap().contains("suppression backend"));
-        // A configured database pool auto-wires DbSuppressionStore, so it passes.
-        let r = check_mail_unsubscribe_config_impl(
-            true,
-            Some("https://app.example.com"),
-            None,
-            false,
-            true,
-            30,
-            true,
-        );
-        assert_eq!(r.status, CheckStatus::Pass);
         // Outside production the runtime does not gate on the backend, so it passes.
         let r = check_mail_unsubscribe_config_impl(
             true,
@@ -3052,7 +3011,6 @@ mod tests {
             false,
             false,
             30,
-            false,
         );
         assert_eq!(r.status, CheckStatus::Pass);
     }
@@ -3066,7 +3024,6 @@ mod tests {
             false,
             true,
             30,
-            false,
         );
         assert_eq!(r.status, CheckStatus::Pass);
     }
@@ -3204,7 +3161,6 @@ mod tests {
             false,
             true,
             30,
-            false,
         );
         assert_eq!(r.status, CheckStatus::Fail);
         let r = check_mail_unsubscribe_config_impl(
@@ -3214,7 +3170,6 @@ mod tests {
             false,
             true,
             30,
-            false,
         );
         assert_eq!(r.status, CheckStatus::Fail);
     }
@@ -3228,7 +3183,6 @@ mod tests {
             false,
             true,
             30,
-            false,
         );
         assert_eq!(r.status, CheckStatus::Fail);
     }
@@ -3243,7 +3197,6 @@ mod tests {
             false,
             false,
             30,
-            false,
         );
         assert_eq!(r.status, CheckStatus::Pass);
     }
@@ -3289,7 +3242,6 @@ mod tests {
             false,
             true,
             30,
-            false,
         );
         assert_eq!(r.status, CheckStatus::Warn);
     }
@@ -3403,9 +3355,9 @@ mod tests {
         // Runtime validate() rejects a non-positive TTL in every profile, even
         // with no list usage or a disabled transport, so the app won't boot.
         for is_prod in [true, false] {
-            let r = check_mail_unsubscribe_config_impl(false, None, None, true, is_prod, 0, false);
+            let r = check_mail_unsubscribe_config_impl(false, None, None, true, is_prod, 0);
             assert_eq!(r.status, CheckStatus::Fail, "ttl=0 prod={is_prod}");
-            let r = check_mail_unsubscribe_config_impl(false, None, None, true, is_prod, -5, false);
+            let r = check_mail_unsubscribe_config_impl(false, None, None, true, is_prod, -5);
             assert_eq!(r.status, CheckStatus::Fail, "ttl=-5 prod={is_prod}");
         }
     }
@@ -3422,7 +3374,6 @@ mod tests {
             true,
             true,
             30,
-            false,
         );
         assert_eq!(r.status, CheckStatus::Fail);
         let r = check_mail_unsubscribe_config_impl(
@@ -3432,7 +3383,6 @@ mod tests {
             true,
             true,
             30,
-            false,
         );
         assert_eq!(r.status, CheckStatus::Fail);
     }
