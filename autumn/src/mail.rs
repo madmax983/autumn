@@ -784,17 +784,23 @@ pub(crate) const fn unsubscribe_config_fail_closed(
     enforce && in_production && has_list_mailers && !unsubscribe_configured
 }
 
-/// Signed, short-lived, stateless unsubscribe tokens.
+/// Encrypted, short-lived, stateless unsubscribe tokens.
 ///
-/// A token is `base64url(subscriber).base64url(list_id).expiry.HMAC` where the
-/// HMAC-SHA256 is computed over the leading `subscriber.list_id.expiry` payload
-/// with the app signing key (`ResolvedSigningKeys`). The signature makes the
-/// token tamper-proof and single-purpose; the subscriber is base64-encoded (not
-/// encrypted), so it is the recipient's own address — the same value already
-/// present in the message `To`/envelope that any intermediary handling the mail
-/// can see. It is never exposed as a separate plaintext URL parameter.
+/// A token is `base64url(version ‖ nonce ‖ AES-256-GCM(payload))`, where the
+/// inner payload is `base64url(subscriber).base64url(list_id).expiry`. The cipher
+/// key is derived from the app signing key (`ResolvedSigningKeys`) via HMAC-SHA256
+/// with a domain-separation label. AES-256-GCM provides both confidentiality and
+/// authenticity: unlike a plain signed token the recipient address is **not**
+/// recoverable from the URL (so it can't leak from proxy/browser/link-scanner
+/// logs), and the GCM tag makes the token tamper-proof. Verification tries the
+/// current key, then any rotation-grace `previous` keys. Stateless — no
+/// server-side token storage.
 pub mod unsubscribe {
+    use aes_gcm::aead::{Aead, KeyInit};
+    use aes_gcm::{Aes256Gcm, Nonce};
     use base64::Engine as _;
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
 
     use crate::security::config::ResolvedSigningKeys;
 
@@ -802,6 +808,13 @@ pub mod unsubscribe {
     pub const DEFAULT_TOKEN_TTL_DAYS: i64 = 30;
 
     const ENGINE: base64::engine::GeneralPurpose = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    /// Token format version (first byte of the encrypted blob).
+    const TOKEN_VERSION: u8 = 1;
+    /// AES-GCM nonce length in bytes.
+    const NONCE_LEN: usize = 12;
+    /// Domain-separation label for deriving the token cipher key from a signing
+    /// key, so it is independent of other uses of the signing secret.
+    const KEY_CONTEXT: &[u8] = b"autumn:unsubscribe-token:v1";
 
     /// A verified unsubscribe request decoded from a signed token.
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -826,7 +839,20 @@ pub mod unsubscribe {
         Expired,
     }
 
-    fn payload(subscriber: &str, list_id: &str, expiry_unix: i64) -> String {
+    /// Derive a 32-byte AES-256 key from a signing key via HMAC-SHA256 with a
+    /// domain-separation label.
+    fn derive_key(signing_key: &[u8]) -> [u8; 32] {
+        let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(signing_key)
+            .expect("HMAC accepts any key length");
+        mac.update(KEY_CONTEXT);
+        let bytes = mac.finalize().into_bytes();
+        let mut key = [0u8; 32];
+        key.copy_from_slice(&bytes);
+        key
+    }
+
+    /// The inner authenticated plaintext: `b64(subscriber).b64(list_id).expiry`.
+    fn plaintext(subscriber: &str, list_id: &str, expiry_unix: i64) -> String {
         format!(
             "{}.{}.{expiry_unix}",
             ENGINE.encode(subscriber.as_bytes()),
@@ -834,7 +860,14 @@ pub mod unsubscribe {
         )
     }
 
-    /// Sign an unsubscribe token valid until `expiry_unix` (seconds since epoch).
+    /// Mint an encrypted unsubscribe token valid until `expiry_unix`.
+    ///
+    /// The subscriber/list/expiry (seconds since epoch) are encrypted and
+    /// authenticated with AES-256-GCM, so they are not recoverable from the URL.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the OS RNG is unavailable.
     #[must_use]
     pub fn sign_token(
         keys: &ResolvedSigningKeys,
@@ -842,9 +875,21 @@ pub mod unsubscribe {
         list_id: &str,
         expiry_unix: i64,
     ) -> String {
-        let payload = payload(subscriber, list_id, expiry_unix);
-        let sig = keys.sign(payload.as_bytes());
-        format!("{payload}.{sig}")
+        let key = derive_key(&keys.current);
+        let cipher = Aes256Gcm::new_from_slice(&key).expect("derived key is always 32 bytes");
+        let mut nonce_bytes = [0u8; NONCE_LEN];
+        getrandom::getrandom(&mut nonce_bytes).expect("OS RNG failed");
+        let ciphertext = cipher
+            .encrypt(
+                Nonce::from_slice(&nonce_bytes),
+                plaintext(subscriber, list_id, expiry_unix).as_bytes(),
+            )
+            .expect("AES-GCM encryption cannot fail for valid inputs");
+        let mut blob = Vec::with_capacity(1 + NONCE_LEN + ciphertext.len());
+        blob.push(TOKEN_VERSION);
+        blob.extend_from_slice(&nonce_bytes);
+        blob.extend_from_slice(&ciphertext);
+        ENGINE.encode(blob)
     }
 
     /// Verify a token and decode its subscriber/list, rejecting bad signatures
@@ -859,10 +904,28 @@ pub mod unsubscribe {
         token: &str,
         now_unix: i64,
     ) -> Result<Unsubscribed, TokenError> {
-        let (payload, sig) = token.rsplit_once('.').ok_or(TokenError::Malformed)?;
-        if !keys.verify(payload.as_bytes(), sig) {
-            return Err(TokenError::BadSignature);
+        let blob = ENGINE.decode(token).map_err(|_| TokenError::Malformed)?;
+        if blob.len() < 1 + NONCE_LEN {
+            return Err(TokenError::Malformed);
         }
+        if blob[0] != TOKEN_VERSION {
+            return Err(TokenError::Malformed);
+        }
+        let nonce = Nonce::from_slice(&blob[1..=NONCE_LEN]);
+        let ciphertext = &blob[1 + NONCE_LEN..];
+        // Try the current key first, then any rotation-grace `previous` keys. A
+        // wrong key (or any tampering) fails AES-GCM authentication.
+        let payload = std::iter::once(&keys.current)
+            .chain(keys.previous.iter())
+            .find_map(|signing_key| {
+                let key = derive_key(signing_key);
+                // The derived key is always 32 bytes, so construction never fails;
+                // `.ok()?` keeps this panic-free regardless.
+                let cipher = Aes256Gcm::new_from_slice(&key).ok()?;
+                cipher.decrypt(nonce, ciphertext).ok()
+            })
+            .ok_or(TokenError::BadSignature)?;
+        let payload = String::from_utf8(payload).map_err(|_| TokenError::Malformed)?;
         let mut parts = payload.split('.');
         let subscriber_b64 = parts.next().ok_or(TokenError::Malformed)?;
         let list_b64 = parts.next().ok_or(TokenError::Malformed)?;
@@ -2929,12 +2992,20 @@ mod tests {
 
     #[test]
     fn token_roundtrips_and_hides_subscriber() {
+        use base64::Engine as _;
+        let engine = base64::engine::general_purpose::URL_SAFE_NO_PAD;
         let keys = test_keys();
         let token =
             unsubscribe::sign_token(&keys, "ada@example.com", "weekly_digest", 4_000_000_000);
         assert!(
             !token.contains("ada@example.com"),
             "raw subscriber must not appear in the token: {token}"
+        );
+        // The address is encrypted, not merely base64-encoded: its base64url form
+        // (which the old signed-token format embedded) must not appear either.
+        assert!(
+            !token.contains(&engine.encode("ada@example.com")),
+            "base64 of subscriber must not appear — the payload must be encrypted: {token}"
         );
         let decoded = unsubscribe::verify_token(&keys, &token, 1_000).expect("token should verify");
         assert_eq!(decoded.subscriber, "ada@example.com");
@@ -2943,10 +3014,16 @@ mod tests {
 
     #[test]
     fn token_rejects_tamper_and_expiry() {
+        use base64::Engine as _;
+        let engine = base64::engine::general_purpose::URL_SAFE_NO_PAD;
         let keys = test_keys();
         let token =
             unsubscribe::sign_token(&keys, "ada@example.com", "weekly_digest", 4_000_000_000);
-        let tampered = format!("{token}x");
+        // Flip a bit in the trailing GCM tag: AES-GCM authentication must reject it.
+        let mut blob = engine.decode(&token).expect("token is base64");
+        let last = blob.len() - 1;
+        blob[last] ^= 0x01;
+        let tampered = engine.encode(&blob);
         assert_eq!(
             unsubscribe::verify_token(&keys, &tampered, 1_000),
             Err(unsubscribe::TokenError::BadSignature)
