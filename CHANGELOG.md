@@ -5,244 +5,67 @@ All notable changes to the Autumn framework will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.5.0] - 2026-06-16
 
 ### Added
 
-- **auth:** Active session management with device list and revocation in the auth starter (#819)
-  - `autumn generate auth` now persists a `{user}_sessions` row per login
-    (SHA-256 digest of the opaque session id — never the raw id — plus user id,
-    IP at login, raw + parsed User-Agent, optional device label, `created_at`,
-    `last_seen_at`), created on password login, email confirmation, TOTP verify,
-    and passkey login, and removed on logout.
-  - Generated handler APIs on the user model: `sessions()`, `revoke_session(id)`,
-    `revoke_other_sessions(current_digest)`, and `revoke_all_sessions()`, plus a
-    `require_tracked_session` gate used by every generated authenticated route.
-    The row is the source of truth: revoking it makes the device's **next**
-    request 401 (the cookie session is destroyed too), with no reliance on
-    cookie expiry. `last_seen_at` writes are throttled to at most one per
-    `[auth.sessions].last_seen_update_secs` (default 60 s) per session.
-  - New `/account/sessions` Maud + htmx page: per-session revoke buttons,
-    device labels, and a one-click "Sign out everywhere else".
-  - Credential-changing events — password reset, TOTP enrollment/disable, and
-    passkey add/remove — revoke all *other* sessions by default, configurable
-    via the new `[auth.sessions] revoke_on_credential_change` flag (default on).
-  - New `autumn_web::user_agent` module: a dependency-free heuristic
-    `parse_user_agent` (browser family / OS / device class) with a documented
-    one-line swap point for custom parsers.
-  - Generated `tests/auth_sessions.rs` covers the two-client flow (log in twice,
-    revoke from one client, the other's replayed cookie 401s) and generated
-    `docs/guide/session-management.md` documents the APIs, the privacy posture
-    for stored IP/UA (purpose limitation, retention scrubbing SQL, IP
-    truncation), and the migration path for existing auth-starter apps.
-  - Additive only: one new table in the auth-starter migration; no public API
-    removed.
-- **jobs:** Job uniqueness keys and concurrency limits for `#[job]` (#829)
-  - `#[job(unique)]` dedupes enqueues on a stable hash of the full args;
-    `unique_by = "field, …"` derives the key from selected args fields. The
-    uniqueness window is configurable: `unique_window = "running"` (default:
-    held while pending or running), `"pending"` (released when execution
-    starts), or `unique_for_ms = N` (TTL debounce from enqueue time). A
-    coalesced enqueue is a no-op `Ok(())` — N identical enqueues in a burst
-    execute exactly once.
-  - `#[job(concurrency = N)]` caps simultaneously-executing jobs of the type;
-    `concurrency_key = "field"` scopes the cap per distinct args value
-    (e.g. at most one `recalculate_account` per account). Excess jobs wait
-    for a slot rather than running or being dropped.
-  - Enforced consistently on all three backends and distributed-safe on the
-    durable ones: Postgres uses an additive schema (nullable columns + a
-    partial unique index with `ON CONFLICT DO NOTHING`) and concurrency-aware
-    claims serialized by a transaction-scoped advisory lock only when a
-    limited job is registered; Redis uses `SET NX PX` unique locks and atomic
-    Lua claim/settle scripts with a parked-jobs zset.
-  - Keys and slots are released on success, terminal failure, and worker
-    crash (visibility-timeout recovery / TTL backstop), so a dead worker
-    cannot deadlock a unique key or leak a concurrency slot. Retries keep
-    the key held but free the slot during backoff.
-  - Observability: `/actuator/jobs` adds `total_deduplicated` and
-    `blocked_on_concurrency` per job, and the job admin model gains the
-    `deduplicated` status.
-  - Additive and non-breaking: jobs without the new attributes behave
-    exactly as before; the `autumn_jobs` schema change is additive; minor
-    version bump.
-
-- **log:** Structured per-request access log, on by default (#999)
-  - Every served HTTP request now emits **exactly one** structured access-log
-    event (`tracing` target `autumn::access`, level `INFO`) at the response
-    boundary, carrying `method`, `route` (the matched low-cardinality template,
-    e.g. `/users/{id}` — never the raw path), `status`, `duration_ms`, and the
-    `request_id` that matches the `x-request-id` header and error pages.
-  - Dual placement: the **primary** layer emits inside the request
-    span/log context (correlated, request id from the request extension) and
-    marks the response; an **outermost fallback** at the router assembly
-    boundary logs only responses the primary never saw — startup 503s,
-    pre-built static (SSG/ISR) page hits, session-store outage 503s, and
-    requests to the late-mounted MCP endpoint — with the wire status and no
-    request id (those paths never run `RequestIdLayer`).
-  - Rendered by the standard subscriber, so it honors `log.format`: a readable
-    line under `pretty`, a single JSON object per line under `json`. Works with
-    **no** `telemetry-otlp` feature and no OTLP collector — operators on
-    `docker logs` / platform log drains get request-level visibility for free.
-  - Steady-state probe/asset noise is excluded by default (`/health`,
-    `/live`, `/ready`, `/startup`, `/actuator/*`, `/static/*`); the set is
-    configurable via `log.access_log_exclude` (whole-segment prefix matching)
-    or `AUTUMN_LOG__ACCESS_LOG_EXCLUDE` (comma-separated). Unmatched requests
-    log the low-cardinality `_unmatched` route label.
-  - On by default; turn off with `log.access_log = false` in `autumn.toml`
-    or `AUTUMN_LOG__ACCESS_LOG=false` — no recompile needed.
-  - The line never includes query strings, headers, or bodies, preserving the
-    log-scrubbing posture established for logs (#697) by construction.
-  - Additive `LogConfig` fields only (`access_log`, `access_log_exclude`);
-    non-breaking, minor version bump.
-
-- **log:** Request-scoped log context that auto-tags every log line (#1169)
-  - An always-on `LogContextLayer` establishes a fresh `tokio::task_local`
-    `log::context::LogContext` for **every** HTTP request, seeded with the same
-    `request_id` used by the `x-request-id` header and error pages. It is not
-    gated behind `telemetry-otlp` and is applied inner to `RequestIdLayer` so the
-    request id is always available.
-  - The request is driven inside a `tracing` span carrying
-    `request_id`/`user_id`/`tenant_id`, so every `tracing` event emitted during
-    the request automatically correlates back to it — no manual field threading.
-  - When the request authenticates, `user_id` is added to the context
-    automatically (from both the `#[secured]` session check and the `RequireAuth`
-    middleware); when multi-tenancy resolves a tenant, `tenant_id` is added
-    automatically (from the tenancy middleware).
-  - Handler/service code can attach custom fields with
-    `autumn_web::log::context::with_log_field("order_id", id)` (re-exported from
-    the prelude). The well-known ids (`request_id`/`user_id`/`tenant_id`) ride the
-    request span and render in ordinary `tracing` output; custom fields are
-    carried in the context for **structured** consumers — the actuator log buffer
-    (#1168), the access line (#999), or any context-aware layer — rather than the
-    default stdout formatter. Reserved keys cannot be shadowed by custom fields.
-  - The context stays active while a streaming/SSE response body is produced (the
-    body is re-scoped per frame, mirroring tenancy), and synchronous work in a
-    downstream layer's `Service::call` is correlated too.
-  - Context is isolated per request (nothing leaks across requests) and a
-    `tokio::spawn`'d task does **not** inherit it unless explicitly propagated via
-    `log::context::in_current_context(..)`, which re-enters the request span too.
-  - Sensitive custom-field values are scrubbed through the existing
-    `log/filter.rs` key filter (#697), so secrets never enter the context output.
-  - Additive, non-breaking surface (minor version bump). Establishes the
-    correlating primitive consumed by the per-request access line (#999) and the
-    actuator log-view buffer (#1168).
-- **mcp:** Expose typed endpoints as Model Context Protocol (MCP) tools so AI agents can call your API (#1117)
-  - New `mcp` Cargo feature (implies `openapi`). `AppBuilder::mount_mcp("/mcp")` serves a spec-compliant MCP endpoint over Streamable HTTP, handling `initialize`, `tools/list`, and `tools/call`.
-  - Endpoints opt in per-route via `#[api_doc(mcp)]`; nothing is exposed implicitly. `#[api_doc(mcp = false)]` force-excludes a route.
-  - A whole-API hatch, `AppBuilder::expose_all_as_mcp()`, auto-includes every eligible `GET`, but mutating verbs (`POST`/`PUT`/`PATCH`/`DELETE`) still require an explicit `#[api_doc(mcp)]` opt-in, and per-endpoint exclusions are always honored.
-  - Each tool's `name`, `description`, and `inputSchema` are derived from the existing `ApiDoc` (operation id, summary/description, merged request-body + `Query` + path-param schemas) — there is no second, hand-maintained schema, so the tool catalog cannot drift from the handler's typed contract.
-  - `tools/call` dispatches through the **real handler pipeline** (the same in-process path the test client uses), so `#[secured]`, authorization, tenancy, rate limits, and validation apply identically to an agent call and an HTTP call.
-  - Agent authentication reuses the existing bearer-token surface (`RequireApiToken` / `ApiTokenStore`): the `Authorization`, `Cookie`, and `X-CSRF-Token` headers presented to `/mcp` are forwarded into the dispatched call, so bearer, session (`#[secured]`), and CSRF-protected routes behave identically to a direct request.
-  - `Origin` validation (MCP Streamable-HTTP spec requirement) is enforced against the app's CORS `allowed_origins`: a browser `Origin` not in the allowlist gets `403`, while requests without an `Origin` (non-browser agents) pass — defending against DNS-rebinding without breaking agent clients.
-  - `AppBuilder::secure_mcp(layer)` gates the entire `/mcp` endpoint (catalog included) behind any tower layer, e.g. `RequireApiToken`.
-  - JSON-RPC robustness: rejects requests missing `jsonrpc: "2.0"`, empty/malformed batches, and non-object `arguments` with `-32600`/`-32602`; negotiates only supported protocol versions; enforces required `body` arguments; serializes array query fields with form/explode semantics; and reuses the framework path-segment encoder. Tool-result bodies are capped at 10 MiB. Duplicate tool names (same `operation_id`) keep the first registration with a build-time warning.
-  - HTTP method maps to MCP safety annotations: `GET` → `readOnlyHint`; `DELETE` → `destructiveHint`.
-  - Only JSON-in/JSON-out endpoints are eligible; HTML/Maud routes (no response schema) are auto-excluded with a build-time log note.
-  - `examples/todo-app` gains an `/mcp` endpoint exposing `list_json` (read) and `create_json` (explicitly-opted-in write) behind `RequireApiToken`.
-
-- **actuator:** Decouple the Prometheus scrape endpoint from sensitive mode (#857)
-  - New `actuator.prometheus` config flag (default `true`) controls
-    `/actuator/prometheus` **independently of** `actuator.sensitive`. Production
-    apps can expose Prometheus metrics for platform scraping (e.g. Fly.io
-    `[metrics]`) while keeping `sensitive = false`, so `/actuator/env`,
-    `/actuator/configprops`, `/actuator/loggers`, `/actuator/tasks`,
-    `/actuator/jobs`, and the actuator task UI stay off the public surface.
-  - Set `actuator.prometheus = false` (or `AUTUMN_ACTUATOR__PROMETHEUS=false`)
-    to remove the scrape endpoint entirely (it then returns `404`). The flag is
-    surfaced in `/actuator/configprops`.
-  - The `[actuator]` section now honors environment overrides
-    (`AUTUMN_ACTUATOR__PREFIX`, `AUTUMN_ACTUATOR__SENSITIVE`,
-    `AUTUMN_ACTUATOR__PROMETHEUS`), matching the documented
-    `AUTUMN_SECTION__FIELD` convention. Previously the actuator section was only
-    configurable via TOML.
-  - Docs: `docs/guide/deployment.md` now describes the safe Fly.io deployment
-    shape, including scraping a private/non-public metrics port, and clarifies
-    that OTLP tracing and the Prometheus scrape endpoint are separate telemetry
-    paths — enabling OTLP does not add OpenTelemetry metrics to
-    `/actuator/prometheus` without an explicit bridge/exporter.
-- **testing:** CSS-selector HTML assertions on `TestResponse` (#1147)
-  - Autumn renders server-side HTML (Maud + htmx), so the in-process test client can now assert on page *structure* by CSS selector instead of brittle substrings. New chainable methods on `TestResponse`: `assert_selector(css)`, `assert_no_selector(css)`, `assert_selector_count(css, n)`, `assert_text(css, expected)`, `assert_text_contains(css, sub)`, and `assert_attr(css, attr, expected)`.
-  - Non-asserting accessors for custom assertions: `selector_count(css) -> usize`, `selector_text(css) -> Vec<String>`, and `selector_attr(css, attr) -> Vec<Option<String>>` — each returns matches in document order.
-  - Backed by a dependency-free HTML parser and CSS-selector matcher (`tag`, `.class`, `#id`, `[attr]`/`[attr=v]`/`[attr^=v]`/`[attr$=v]`/`[attr*=v]`, compound selectors, selector lists, and descendant/child combinators). Parses fragments literally, so bare `<tr>` htmx swaps are selectable — a spec HTML5 tree builder would foster-parent and drop them.
-  - Assertions survive cosmetic template changes (whitespace, attribute order, wrapping markup) that break the equivalent `assert_body_contains` test. Failure messages print the selector, expected-vs-actual value, and a truncated outline of the parsed HTML.
-  - Purely additive: no breaking change to existing assertions; no new published dependency. See the `autumn::test` module docs and `docs/guide/testing.md` for a worked example.
-
-## [0.5.0] - 2026-06-04
-
-### Added
-
-- **dev inspector:** Built-in request inspector with N+1 query detection (#701)
-  - In `dev` profile, `autumn-web` automatically mounts a request inspector UI at `/_autumn/inspect` (configurable via `[dev] inspector_path`). The route does not exist in `prod` or `test` profiles.
-  - The inspector records the last N requests (default `N = 100`, configurable via `[dev] inspector_capacity`) in a bounded in-memory ring buffer. Each record includes HTTP method, path, status code, wall time, response Content-Type and Content-Length.
-  - An N+1 detector flags any request that issued ≥ M structurally identical SQL statements (default `M = 5`, configurable via `[dev] inspector_n_plus_one_threshold`). The flag includes the offending SQL template and the repetition count.
-  - A `RequestInspector` Axum extractor is available to handlers in `dev` profile to append SQL query records (with SQL text, bound parameters, elapsed time, and `file:line` call site). Integration tests can use the extractor to assert "this request issued exactly K queries."
-  - The inspector UI (server-rendered HTML, no client-side framework) lists requests newest-first with method, path, status, duration, query count, and an N+1 warning badge. Clicking a request opens a detail view with a per-query timing table and a `curl` snippet to reproduce the request.
-  - The inspector excludes its own requests from the ring buffer to avoid feedback loops.
-  - New `[dev]` config section: `inspector_path`, `inspector_capacity`, `inspector_n_plus_one_threshold`.
-  - Existing apps require zero changes — the inspector is purely additive.
-  - See `docs/guide/dev-inspector.md` for the full guide.
-
-- **pagination:** Wire first-class pagination into `#[repository]` and scaffold (#681)
-  - `#[repository]` now generates a `page(req: &PageRequest) -> AutumnResult<Page<Model>>` method on every repository struct, enabling offset pagination without hand-written SQL.  Results are ordered by `id DESC` for deterministic page boundaries.
-  - `#[repository(Model, cursor_key = field)]` additionally generates `cursor_page(req: &CursorRequest) -> AutumnResult<CursorPage<Model>>` — keyset pagination sorted by `(field DESC, id DESC)`.  The cursor payload encodes both the sort-key value and `id` so the keyset filter is always correct: `WHERE (field < after_k) OR (field = after_k AND id < after_id)`.
-  - `autumn generate scaffold` index actions use the `PageRequest` extractor directly.  Out-of-range values are clamped silently (consistent with the framework rule that list endpoints never 400 for bad paging params).
-  - Scaffold-generated routes include a `pagination_nav` Maud helper with htmx-friendly Previous / Next links.
-  - `examples/todo-app` updated: `Todo::page` added; HTML list view uses `PageRequest` and renders pagination controls.
-  - `docs/guide/pagination.md` added, covering: offset vs cursor decision guide, macro entry points, overriding page size, declaring a cursor key, htmx wiring.
-
-To opt out of the generated `page` method: implement your own list handler using `repo.find_all()` or a custom Diesel query.  The `find_all` method is unchanged.
-
-- **security:** Centralize trusted-proxies policy across forwarded-header middleware (#812)
-  - **New `[security.trusted_proxies]` config block** at the top level of `[security]`.
-    Configure once; every framework middleware (rate limiter, method-override origin check,
-    CSRF, HSTS detection, tracing fields) honours the same trust boundary automatically.
-    Fields: `ranges` (CIDR list), `trusted_hops` (peel-N-from-right strategy), and
-    `trust_forwarded_headers` (global on/off switch). Profile-aware defaults: `dev` trusts
-    loopback only; `prod` defaults to no forwarding trust until configured.
-  - **New extractors** in `autumn_web::extract`: `ClientAddr` (resolved client IP),
-    `ClientHost` (resolved external hostname), `ClientScheme` (`"http"` / `"https"` after
-    `X-Forwarded-Proto` evaluation). These are the only blessed way to read client identity
-    from handlers and middleware — direct `X-Forwarded-*` reads are now rejected by the
-    new CI `grep` guard.
-  - **Deprecation:** `security.rate_limit.trusted_proxies` and
-    `security.rate_limit.trust_forwarded_headers` continue to work for one minor release
-    with a deprecation warning at startup pointing at the new top-level config.
-    `autumn doctor --strict` fails when both old and new are set with conflicting values.
-  - **Regression fixes:** Closes three related CVEs — PR #753 (`X-Forwarded-For`
-    rate-limit bypass), PR #785 and PR #791 (`X-Forwarded-Host` CSRF/method-override
-    spoofing bypass in `MethodOverrideLayer`). The PoC from PR #791 is now covered by
-    a regression test that validates the override is rejected when the
-    `ResolvedClientIdentity` host does not match the `Origin` header.
-  - **Plugin author guide** added to `docs/guide/middleware.md` and
-    `docs/guide/extensibility.md`: "Never read `X-Forwarded-*` directly. Use
-    `ClientAddr` / `ClientHost` / `ClientScheme` extractors."
-- **configuration:** Add TOML config file support to generated scaffolds and a runtime configuration system for live-tunable operational knobs (#773, #931).
-- **data and repositories:** Add soft delete, high-performance bulk CRUD, Postgres full-text search, automatic version history, CSV import/export, and per-query statement timeout/slow-query telemetry support (#858, #881, #905, #922, #1075, #865).
-- **development loop:** Add the dev-mode error overlay, generator conformance CI gate, dev-loop latency budgets, and framework runtime benchmarks (#1080, #1079, #920, #756).
-- **HTTP and routing:** Add safe HTML method override handling, ETag conditional GET helpers, per-request timeout and body-size middleware, first-class response compression, and API versioning with deprecation and sunset lifecycles (#605, #853, #996, #1083, #1077).
-- **operations:** Add rolling-deploy shutdown contracts, maintenance mode middleware and CLI commands, W3C trace-context propagation across jobs/mailers, traced outbound HTTP client retries/mocks, outbound signed webhooks with retries/DLQ/actuator endpoints, and pluggable error reporting for panics and 5xx responses (#843, #917, #854, #863, #923, #1047).
-- **security:** Add encrypted credentials, at-rest attribute encryption, direct browser-to-storage uploads, trusted-host validation, CSP nonces, log parameter scrubbing, per-principal/API-token rate limits, TOTP auth scaffolding, and WebAuthn passkey scaffolding (#849, #1058, #860, #885, #915, #903, #1001, #1057, #1070).
-- **state and collaboration:** Add after-commit callbacks, HTTP idempotency-key middleware, row-level multi-tenancy, Redis-backed global rate limiting, first-class feature flags, A/B experiments, distributed presence, active search/autocomplete widgets, inline field validation, and an injectable `Clock` extractor for deterministic tests (#778, #779, #876, #764, #1000, #1016, #973, #989, #991, #1014).
-- **content and tooling:** Add Markdown rendering with frontmatter/SSG support, `autumn generate mailer`, migration safety preflight checks, and plugin hooks at framework-owned dependency boundaries (#921, #866, #762, #862).
+- **0.5.0-cleanup:** CSRF multipart fix, reddit-clone feature expansi… (#1250)([12bbb7f](https://github.com/madmax983/autumn/commit/12bbb7f15b4a1b84ad7092efe42581ad1319f6f7))
+- Expose recent structured logs via GET /actuator/logfile (#1168) (#1184)([f6dabc0](https://github.com/madmax983/autumn/commit/f6dabc07cc3072dfe321a0dc6828857826c778cb))
+- **cli:** Add --api flag for json-only scaffold generation (#1153)([c9b96d1](https://github.com/madmax983/autumn/commit/c9b96d12be11e047ec33dc5e6c2c1f6f6d999028))
+- First-class API versioning with deprecation & sunset lifecycles (#1077)([490022b](https://github.com/madmax983/autumn/commit/490022b97991b87d83baf400d5bd8834b50509f5))
+- Add transactional test isolation for database tests (#1055)([bb42459](https://github.com/madmax983/autumn/commit/bb42459ba4429d80f1fd10c580478c152f9fe558))
+- **cli:** Write autumn.toml stubs, generate OAuth login buttons, and require PKCE verifiers([b922a05](https://github.com/madmax983/autumn/commit/b922a050e9c014f8d7913f5d92e973070a195ee3))
+- Implement outbound signed webhooks with retries, DLQ, and actuator endpoints (#792) (#923)([e6e535c](https://github.com/madmax983/autumn/commit/e6e535c5f32010ce9277729a320e6307a9f44df6))
+- Postgres full-text search (FTS) with dynamic migrations and repository macros (#842) (#905)([fbc2bf5](https://github.com/madmax983/autumn/commit/fbc2bf50e68a0e5c76071f8e30479dbecf5399fa))
+- High-performance bulk repository CRUD operations (issue #841) (#881)([45e39f6](https://github.com/madmax983/autumn/commit/45e39f6ba3e2f2263782ab7d8649ef4b05e482a7))
+- **tenancy:** Implement first-class opt-in row-level multi-tenancy (#876)([15029e7](https://github.com/madmax983/autumn/commit/15029e724a620ce9ca04aca585be29f7dbc210b2))
+- **db:** Per-query statement timeouts and slow-query telemetry (#826) (#865)([37bfed2](https://github.com/madmax983/autumn/commit/37bfed2b77b2291c2438c92451d43e2e9fb3b12e))
+- Expose plugin hooks at framework-owned dependency boundaries (#690) (#862)([ca1b6ce](https://github.com/madmax983/autumn/commit/ca1b6cea0b9b793e3af5ab963fec601638199dfd))
 
 ### Fixed
 
-- **tenancy:** Normalize hostnames to lowercase in subdomain mode for DNS case-insensitivity
-- **tenancy:** Add `jwt_audience` config field; enable audience validation when configured
-- Keep the release gate from mutating the changelog during validation (#763).
-- Fix rate-limit `X-Forwarded-For` spoofing bypasses and add targeted mutant-killing coverage for proxy handling (#753, #787, #789).
-- Fix benchmark and CI lint/doc-build regressions across the 0.5.0 line (#783, #800, #801, #1041).
-
-### Changed
-
-- Move the static file layer inside the user middleware stack so custom middleware observes static responses consistently (#845).
-- Revert the OAuth2/OIDC social-login scaffold from this release line after review; the TOTP and WebAuthn scaffolds remain in scope for 0.5.0 (#1046).
+- **ui:** Add semantic CSS classes to all framework widgets + fix wizard stepper connector([fae4746](https://github.com/madmax983/autumn/commit/fae474607207a4ec1d90771a87da0f2ad9ed67f0))
+- Skip E0119 time 0.3.48 coherence regression in semver check([0abf525](https://github.com/madmax983/autumn/commit/0abf525f3e0112c903942c1b2d3435457d30b08b))
+- Update chromiumoxide 0.7→0.9 to drop removed byteorder dep([dcc7826](https://github.com/madmax983/autumn/commit/dcc782689deca46665d56ba0961db3431c8cfd11))
+- Pin time <0.3.48 to avoid E0119 coherence regression([dba2a30](https://github.com/madmax983/autumn/commit/dba2a30fe5cb02df74fee2d07738769486d6f7af))
+- Hoist outer out.push('\n') after if/else chain to fully satisfy branches_sharing_code([7b1045e](https://github.com/madmax983/autumn/commit/7b1045ec5975a07c656f01258f6fefbeff95dadf))
+- Hoist shared out.push('\n') after if-else to satisfy clippy::branches_sharing_code([60bab65](https://github.com/madmax983/autumn/commit/60bab6548c2f76b4b6a9072d905528f38ffca7e4))
+- SEO collision guard covers scoped groups; TOML comma placed before inline comment([41affeb](https://github.com/madmax983/autumn/commit/41affebd1e1862c2283a94abcff287a06c9f225e))
+- Skip autumn-storage-s3 semver check on aws-runtime E0282 upstream regression([2d76f05](https://github.com/madmax983/autumn/commit/2d76f05c015aace413f542609891b7fbae4c9904))
+- Widen aws-runtime exclusion to all of <1.7 (1.7.3 same E0282 bug)([013ff76](https://github.com/madmax983/autumn/commit/013ff76062a403e272cbfbb6908ec556c7bd30d3))
+- Coalesce local pending-window retry when duplicate owns key; pin aws-runtime([d18cb55](https://github.com/madmax983/autumn/commit/d18cb553d19132b15134c7df8ca4758047e4d4d5))
+- Multiline TOML comma and scoped path collision normalization([a91c37c](https://github.com/madmax983/autumn/commit/a91c37c5f9c1122a1fd75be7c5a8557209a4e433))
+- **tests:** Update seo test to match truncation-not-sitemapindex behavior([4b9e3ec](https://github.com/madmax983/autumn/commit/4b9e3ec6aaee504c723171a9c6dffb5f4a1fe87f))
+- Eliminate stale-recovery race window for pending-window unique keys([ee08e56](https://github.com/madmax983/autumn/commit/ee08e56001c052d003b70f819355d08cd77cedcc))
+- Inbound-mail build and Redis pending-window retry dedup([29d5296](https://github.com/madmax983/autumn/commit/29d5296e9ec997c96ffa3a80eddc39356ae37fc2))
+- TTL-unique dedup and retry unique_key regression([204a578](https://github.com/madmax983/autumn/commit/204a578641041f908ad5deda8aa62a22b012c4e6))
+- Security hardening and atomic dedup for retry([645cd63](https://github.com/madmax983/autumn/commit/645cd63ce1268418df0ccc82ab82f4f26541536b))
+- **cli:** Generate schema for oauth_identities and fix oauth test syntax([f8a227e](https://github.com/madmax983/autumn/commit/f8a227e4819ac3abae6d802aa6f2737361451add))
+- Replace useless format! with concat!.to_owned() in render_oauth_docs_file([b2693c4](https://github.com/madmax983/autumn/commit/b2693c48c8847d884797fc566d3545c18f5cc53f))
+- Address Codex P2 review comments on OAuth2 configuration([363c37f](https://github.com/madmax983/autumn/commit/363c37f84e5c1474f1da98750298eba09e8c7198))
+- Silence --all-targets clippy warnings in test code([29ad0e0](https://github.com/madmax983/autumn/commit/29ad0e08dd822001e7654c956320622f02b411f6))
+- Use batch_execute for multi-statement migration in feature_flags_pg_integration test (#1041)([ca23e85](https://github.com/madmax983/autumn/commit/ca23e851c6488a47bd4e6343739bcd9020fcac15))
+- Keep release gate from mutating changelog (#763)([516c663](https://github.com/madmax983/autumn/commit/516c663c0f804c79f00377bc84639bd3aa7864e2))
 
 ### Documentation
 
-- Add and refresh guides for pagination, hooks and transactions, dev inspector, runtime configuration, CSV/admin data flows, API versioning, compression, and first-run release smoke coverage.
+- Agent plugin (#1164)([cda6e78](https://github.com/madmax983/autumn/commit/cda6e78fccc8387169fb040d12c56dd485e4c31c))
 
+### Styling
 
+- Rustfmt — wrap long tracing macro string literals([5f35362](https://github.com/madmax983/autumn/commit/5f353624ffe4f6059f3ade1954148ecaeffa7b37))
+- Apply cargo fmt to all workspace files([e77ce4b](https://github.com/madmax983/autumn/commit/e77ce4ba61d2c1c2e802d0f9f3d6beca53b3ba1d))
+
+### Miscellaneous
+
+- **deps:** Bump actions/upload-artifact from 4 to 7 (#1067)([b88a095](https://github.com/madmax983/autumn/commit/b88a095e8e32a1ec6c3d5bde0c30dc762acde57c))
+- **deps:** Update pulldown-cmark requirement from 0.12 to 0.13 (#1068)([d60694d](https://github.com/madmax983/autumn/commit/d60694d5f6de66a59f5353c95c812ed464ab90a5))
+- Clippy([1d2ab8c](https://github.com/madmax983/autumn/commit/1d2ab8c6fa8ddf8970e51172ad9787596c7029db))
+- Clippy([38417bb](https://github.com/madmax983/autumn/commit/38417bb7cc8928374568803fb7ab455311fe72ab))
+- **deps:** Bump django (#760)([ef1af3a](https://github.com/madmax983/autumn/commit/ef1af3a1cc48d348d1213a03d0fe1c0a0595e465))
+- **deps:** Bump actions/download-artifact from 4 to 8 (#745)([afee5bf](https://github.com/madmax983/autumn/commit/afee5bfa616c4ef24ba485bb85d5453ffd14e0e4))
+- **deps:** Bump actions/upload-artifact from 4 to 7 (#744)([b6b028c](https://github.com/madmax983/autumn/commit/b6b028cf71a7efee75d1437d2edc1b91f7b5313a))
+- Changelog and release notes([367bcd3](https://github.com/madmax983/autumn/commit/367bcd365df380f974f9cb6d943467e8d9c672a6))
 ## [0.4.0] - 2026-05-12
 
 ### Added
