@@ -160,15 +160,19 @@ static_gate (auth check / redirect)
 use autumn_web::prelude::*;
 use axum::{
     extract::Request,
-    http::{header, StatusCode},
+    http::{header, Method, StatusCode},
     middleware::Next,
     response::Response,
 };
 
 async fn require_auth(req: Request, next: Next) -> Response {
+    // Only gate page navigation: let non-GET/HEAD requests (JSON APIs, form
+    // POSTs, the `/mcp` JSON-RPC transport, CORS preflights) pass through so a
+    // browser redirect never turns them into a 302.
+    let is_page = matches!(req.method(), &Method::GET | &Method::HEAD);
     // Verify a signed/JWT session cookie DIRECTLY — the session Extension is
     // not available this far out in the stack.
-    if has_valid_session_cookie(req.headers()) {
+    if !is_page || has_valid_session_cookie(req.headers()) {
         next.run(req).await
     } else {
         Response::builder()
@@ -199,6 +203,12 @@ Key properties and trade-offs:
 - **Personalised content still needs a dynamic route** (or client-side fetch).
   `static_gate` decides *whether* to serve a cached page, not *what* it
   contains.
+- **Page-cache gate, not API auth.** The gate is global, so a well-behaved gate
+  should no-op on non-GET/HEAD requests (note the `is_page` check above) — a
+  browser redirect is meaningless for a JSON API or the `/mcp` JSON-RPC POST
+  transport, and the gate is never applied to MCP `tools/call` dispatch anyway.
+  Authenticate JSON APIs and MCP tools with route-level guards / `#[secured]` /
+  session auth.
 - Multiple `static_gate` calls stack in registration order (first =
   outermost), like `.layer()`. Plugins can pre-flight with
   `has_static_gate::<L>()` / `get_static_gate_types()`.

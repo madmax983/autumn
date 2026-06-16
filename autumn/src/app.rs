@@ -1093,15 +1093,19 @@ impl AppBuilder {
     /// use autumn_web::prelude::*;
     /// use axum::{
     ///     extract::Request,
-    ///     http::{header, StatusCode},
+    ///     http::{header, Method, StatusCode},
     ///     middleware::Next,
     ///     response::Response,
     /// };
     ///
     /// async fn require_auth(req: Request, next: Next) -> Response {
+    ///     // Only gate page navigation. Pass non-GET/HEAD requests (JSON APIs,
+    ///     // form POSTs, the `/mcp` JSON-RPC transport, CORS preflights) straight
+    ///     // through so a browser redirect never turns them into a 302.
+    ///     let is_page = matches!(req.method(), &Method::GET | &Method::HEAD);
     ///     // Inspect a signed session cookie directly — no session Extension
     ///     // is available this far out in the stack.
-    ///     if req.headers().contains_key("x-authed") {
+    ///     if !is_page || req.headers().contains_key("x-authed") {
     ///         next.run(req).await
     ///     } else {
     ///         Response::builder()
