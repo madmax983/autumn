@@ -77,6 +77,9 @@ pub use crate::mail::{
     Mail, MailConfig, MailDeliveryQueue, MailDeliveryQueueHandle, MailError, MailPreview,
     MailPreviewError, MailPreviewRegistry, MailTransport, Mailer, SmtpConfig, TlsMode, Transport,
 };
+/// Shard routing extractors and types for `[[database.shards]]` apps.
+#[cfg(feature = "db")]
+pub use crate::sharding::{ShardKey, ShardKeyOverride, ShardedDb, Shards};
 /// Server-Sent Events (SSE) support.
 pub use crate::sse::{Event, Sse};
 /// Structured CLI argument extractor for one-off `#[task]` handlers.
@@ -247,6 +250,27 @@ pub use crate::i18n::Locale;
 #[cfg(feature = "i18n")]
 pub use crate::i18n::t;
 
+// ── Time zones ────────────────────────────────────────────────────
+/// Request-scoped time zone extractor (resolves from user extension,
+/// session, cookie, and query parameter — see [`crate::time_zone`]).
+pub use crate::time_zone::TimeZone;
+/// Newtype for auth middleware to publish the authenticated user's zone
+/// into request extensions.
+pub use crate::time_zone::UserTimeZone;
+/// Render only the date portion in the given zone.
+#[cfg(feature = "maud")]
+pub use crate::time_zone::local_date;
+/// Render a UTC timestamp as a `<time>` element in the given zone.
+#[cfg(feature = "maud")]
+pub use crate::time_zone::local_datetime;
+/// Parse a browser `datetime-local` value as a local time in `tz` → UTC.
+pub use crate::time_zone::parse_local_datetime;
+/// Render a relative time string (e.g. "3 minutes ago") as a `<time>` element.
+#[cfg(feature = "maud")]
+pub use crate::time_zone::time_ago;
+/// Format a UTC timestamp as a `datetime-local` input value in `tz`.
+pub use crate::time_zone::to_local_input_value;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -260,6 +284,7 @@ mod tests {
             )),
             pool: None,
             replica_pool: None,
+            shards: None,
             profile: None,
             started_at: std::time::Instant::now(),
             health_detailed: false,

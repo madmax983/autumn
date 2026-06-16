@@ -173,18 +173,13 @@ See [EXAMPLES.md](EXAMPLES.md) for the full catalog with personas, journeys, pre
 | Example | Description |
 |---------|-------------|
 | [`examples/hello`](examples/hello) | Minimal hello-world app with route macros and no database |
-| [`examples/todo-app`](examples/todo-app) | Classic full-stack CRUD app with Diesel, Maud, htmx, Tailwind, and JSON endpoints |
+| [`examples/todo-app`](examples/todo-app) | Full-stack CRUD app with Diesel, Maud, htmx, Tailwind, JSON API, bearer-token auth, and MCP tool projection |
 | [`examples/blog`](examples/blog) | Blog engine with admin UI, validation, and pre-rendering pages to static HTML via `#[static_get]` |
 | [`examples/bookmarks`](examples/bookmarks) | Repository macro, generated CRUD API, profiles, scheduled tasks, and actuator endpoints |
 | [`examples/bookmarks-distributed`](examples/bookmarks-distributed) | Primary/replica Postgres, multi-replica web tier behind nginx, advisory-lock scheduling, and Docker Compose deployment |
+| [`examples/bookmarks-sharded`](examples/bookmarks-sharded) | Framework-native horizontal sharding: tenant → slot → shard routing, control database, cross-shard fan-out, and Docker Compose deployment |
 | [`examples/wiki`](examples/wiki) | Mutation hooks, revision history, generated REST API, and slug lifecycle management |
-| [`examples/reddit-clone`](examples/reddit-clone) | Full-featured Reddit clone: auth, sessions, CSRF, `#[secured]`, transactional email, `#[job]`, `#[ws]` channels, Redis fan-out, htmx voting, profiles, and live-tunable runtime config |
-| [`examples/custom_config_loader`](examples/custom_config_loader) | Replace the default TOML + env config loader with a custom `ConfigLoader` (JSON file, Vault, Secrets Manager, etc.) |
-| [`examples/ws-echo`](examples/ws-echo) | WebSocket echo server, SSE fan-out, htmx live list, and Redis-backed multi-replica pub/sub |
-| [`examples/signed-webhooks`](examples/signed-webhooks) | Signed webhook intake with provider-shaped HMAC verification, replay protection, and fixture tests |
-| [`examples/outbound-http`](examples/outbound-http) | Traced outbound HTTP client with automatic retries, `TestApp::http_mock` test harness, and Stripe-style charge endpoint |
-| [`examples/experiments`](examples/experiments) | A/B experiment system: deterministic 50/50 bucketing, sticky assignments, exposure telemetry, QA overrides, and lifecycle transitions |
-| [`examples/error-reporting`](examples/error-reporting) | Catch handler panics at the HTTP layer and route panics + 5xx errors to a custom pluggable `ErrorReporter` |
+| [`examples/reddit-clone`](examples/reddit-clone) | Canonical feature showcase: auth, sessions, CSRF, `#[secured]`, transactional email, `#[job]`, `#[ws]` channels, Redis fan-out, htmx voting, A/B experiments, signed webhook intake, outbound HTTP with SSRF protection, structured error reporting, and live-tunable config |
 
 ## Documentation
 
@@ -196,6 +191,7 @@ See [EXAMPLES.md](EXAMPLES.md) for the full catalog with personas, journeys, pre
 - [Code Generators](docs/guide/generators.md) — `autumn generate model | migration | scaffold`
 - [One-Off Tasks](docs/guide/tasks.md) - `#[task]`, `one_off_tasks![]`, and `autumn task`
 - [Multi-Replica Scheduled Tasks](docs/guide/scheduled-multi-replica.md) - `#[scheduled]` with Postgres advisory-lock coordination
+- [Horizontal Sharding](docs/guide/sharding.md) — `[[database.shards]]`, slot-based routing, `ShardedDb`/`Shards` extractors, per-shard health and migrations
 - [Operating Background Jobs](docs/guide/operating-background-jobs.md) - admin dashboard and recovery actions for `#[job]`
 - [Exposing Your API as MCP Tools](docs/guide/mcp.md) — project typed endpoints into a Model Context Protocol server with `#[api_doc(mcp)]` + `mount_mcp`
 - [Mail Guide](docs/guide/mail.md)

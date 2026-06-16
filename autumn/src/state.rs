@@ -71,6 +71,12 @@ pub struct AppState {
     pub(crate) replica_pool:
         Option<diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>>,
 
+    /// Configured shard set, or `None` when no `[[database.shards]]`
+    /// entries exist. The `pool`/`replica_pool` roles above are the
+    /// control topology; tenant data routes across these shards.
+    #[cfg(feature = "db")]
+    pub(crate) shards: Option<crate::sharding::ShardSet>,
+
     /// Active profile name (e.g., "dev", "prod", "staging").
     pub(crate) profile: Option<String>,
 
@@ -226,6 +232,17 @@ impl AppState {
         self.replica_pool.as_ref()
     }
 
+    /// Returns the configured shard set, when `[[database.shards]]`
+    /// entries exist.
+    ///
+    /// The control roles ([`pool`](Self::pool)/[`replica_pool`](Self::replica_pool))
+    /// are unaffected by sharding; framework state lives there.
+    #[cfg(feature = "db")]
+    #[must_use]
+    pub const fn shards(&self) -> Option<&crate::sharding::ShardSet> {
+        self.shards.as_ref()
+    }
+
     /// Returns the pool used for read-only work.
     #[cfg(feature = "db")]
     #[must_use]
@@ -331,6 +348,14 @@ impl AppState {
         pool: diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>,
     ) -> Self {
         self.replica_pool = Some(pool);
+        self
+    }
+
+    /// Sets the shard set.
+    #[cfg(feature = "db")]
+    #[must_use]
+    pub fn with_shards(mut self, shards: crate::sharding::ShardSet) -> Self {
+        self.shards = Some(shards);
         self
     }
 
@@ -563,6 +588,8 @@ impl AppState {
             pool: None,
             #[cfg(feature = "db")]
             replica_pool: None,
+            #[cfg(feature = "db")]
+            shards: None,
             profile: None,
             started_at: std::time::Instant::now(),
             health_detailed: true,
@@ -622,6 +649,10 @@ impl DbState for AppState {
     ) -> Option<&diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>>
     {
         Self::read_pool(self)
+    }
+
+    fn shards(&self) -> Option<&crate::sharding::ShardSet> {
+        self.shards.as_ref()
     }
 
     fn db_interceptors(
@@ -746,6 +777,11 @@ impl crate::actuator::ProvideActuatorState for AppState {
     ) -> Option<&diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>>
     {
         self.pool.as_ref()
+    }
+
+    #[cfg(feature = "db")]
+    fn shards(&self) -> Option<&crate::sharding::ShardSet> {
+        self.shards.as_ref()
     }
     // a11y_posture() uses the trait default (all-false) intentionally: AppState
     // cannot know whether the application's layout is accessible.  Override this

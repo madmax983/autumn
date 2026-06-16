@@ -9,6 +9,72 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **db:** Declarative associations and eager loading for `#[model]` / `#[repository]` (#835)
+  - `#[model]` accepts struct-level `#[belongs_to(Target, fk = ...)]`,
+    `#[has_many(Target, fk = ...)]`, and `#[has_one(Target, fk = ...)]`.
+    Foreign keys are inferred by convention (`belongs_to` → `{target}_id` on
+    this model; `has_many`/`has_one` → `{source}_id` on the target) and
+    overridable with `fk = …`. The accessor/store name is derived by
+    convention and overridable with `name = …`, so multiple associations can
+    target the same model (e.g. `authored` / `approved` both → `Post`) without
+    colliding. The schema and association set live in one place — no per-pair
+    `Related` impl.
+  - Codegen emits a `{Model}Preload` spec builder (`Model::preload()`), a
+    `{Model}Associations` accessor trait implemented for `Preloaded<Model>`,
+    and a `Preloadable` impl that issues the batched queries.
+  - `#[repository]` gains `preload(records, spec)` returning
+    `Vec<Preloaded<Model>>`. It issues **at most one** `WHERE ... IN (...)`
+    statement per association per level (`belongs_to`/`has_one` keyed on the
+    parent/target id; `has_many` grouped client-side), with **no** per-row
+    fetches and **no** implicit lazy loading. Nested paths are supported, e.g.
+    `Post::preload().author().comments_with(Comment::preload().author())`.
+  - New `autumn_web::preload` module: `Preloaded<T>` (derefs to the record),
+    the type-erased `Associations` store, the typed `NotLoaded` accessor error
+    (accessing an un-preloaded association is an error, never SQL), the
+    `Preloadable` trait, and the `impl_preloadable_leaf!` macro for
+    hand-written association targets.
+  - Preload SQL runs on the **same read role** as the parent finder (the
+    repository's snapshotted `ReadRoute`); `on_primary()` pins the whole chain.
+    With `CursorPage`, preloads execute **after** the overfetch/truncate.
+  - Preloaded associations honor the target's **read scoping**, keyed off the
+    target's `#[repository]` config (not field presence): when the target
+    repository is `soft_delete`, soft-deleted rows (`deleted_at IS NOT NULL`)
+    are hidden; when it is `tenant_scoped`, rows outside the ambient
+    `CURRENT_TENANT` are hidden — mirroring the target's finders. A
+    `deleted_at`/`tenant_id` column on a model whose repository does *not* opt
+    in is left unfiltered. `repo.across_tenants().preload(...)` skips the
+    tenant predicate at every level, matching `across_tenants()` finders.
+  - `examples/reddit-clone` migrated: the front page and single-post view drop
+    their hand-written joins / per-row author lookups for `preload`. See
+    `docs/adr/0008-associations-and-eager-loading.md`.
+- **db:** Framework-native horizontal sharding (`[[database.shards]]`)
+  - Tenant data routes key → logical slot (fixed at 16384 slots, matching
+    Redis Cluster/Valkey — nothing to choose or outgrow; deterministic
+    FNV-1a/splitmix64 hash pinned by golden-vector tests) → physical shard
+    per an explicit `slots` map, so resharding moves whole slots in config
+    instead of rehashing keys. Each shard is a full primary/replica
+    `DatabaseTopology` with per-shard `replica_fallback`.
+  - New `autumn_web::sharding` module and prelude extractors: `ShardedDb`
+    (tenant-routed via `ShardKeyOverride` → tenancy task-local → tenant
+    extraction; derefs like `Db` with the same `tx` semantics) and `Shards`
+    (`db_for`/`read_for`/`db_on` plus a bounded concurrent `each_shard`
+    fan-out that collects per-shard results — there are no cross-shard
+    transactions). Pluggable `ShardRouter` via
+    `AppBuilder::with_shard_router`; per-shard pool decoration via
+    `DatabasePoolProvider::create_shard_topology`. `#[repository]` gains a
+    `with_pool` constructor for shard-scoped repositories.
+  - Startup auto-migrate and `autumn migrate` apply migrations control-first
+    then per shard, fail-fast with target labels; new `--shard <name>` /
+    `--control-only` flags and per-target `status`. Per-shard replica
+    migration parity gates each shard's replica reads.
+  - `/ready` and `/actuator/health` gain `db:shard:<name>` components;
+    `/actuator/metrics` gains a `database_shards` block; shard-routed
+    checkouts tag spans (`db.shard`) and route metrics (`shard=<name>`).
+  - Framework state (jobs, scheduler locks, sessions, flags) stays on the
+    unsharded control role — enforced at config validation. New
+    `examples/bookmarks-sharded` Docker Compose stack and
+    `docs/guide/sharding.md`.
+
 - **auth:** Active session management with device list and revocation in the auth starter (#819)
   - `autumn generate auth` now persists a `{user}_sessions` row per login
     (SHA-256 digest of the opaque session id — never the raw id — plus user id,

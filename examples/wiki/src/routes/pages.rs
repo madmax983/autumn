@@ -3,7 +3,7 @@ use autumn_web::prelude::*;
 use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
 
-use crate::models::{NewPage, Page, Revision};
+use crate::models::{NewPage, NewRevision, Page, Revision};
 use crate::repositories::{PageRepository, PgPageRepository};
 use crate::schema::revisions;
 
@@ -223,9 +223,27 @@ pub async fn new_form() -> Markup {
 }
 
 #[post("/pages")]
-pub async fn create(repo: PgPageRepository, form: Form<PageForm>) -> AutumnResult<Redirect> {
+pub async fn create(
+    repo: PgPageRepository,
+    mut db: Db,
+    form: Form<PageForm>,
+) -> AutumnResult<Redirect> {
     let new_page = form.0.into_new();
     let page = repo.save(&new_page).await?;
+
+    diesel::insert_into(revisions::table)
+        .values(&NewRevision {
+            page_id: page.id,
+            op: "create".into(),
+            title: page.title.clone(),
+            body: page.body.clone(),
+            status: page.status.clone(),
+            changed_by: None,
+            summary: None,
+        })
+        .execute(&mut *db)
+        .await?;
+
     Ok(Redirect::to(&paths::show(page.slug)))
 }
 
@@ -305,11 +323,37 @@ impl PageForm {
 pub async fn update(
     Path(slug): Path<String>,
     repo: PgPageRepository,
+    mut db: Db,
     form: Form<PageForm>,
 ) -> AutumnResult<Redirect> {
     let page = find_page_by_slug(&repo, &slug).await?;
     let update_page = form.0.into_update();
     let updated = repo.update(page.id, &update_page).await?;
+
+    let summary = if updated.status != page.status {
+        Some(format!(
+            "Status changed: {} → {}",
+            page.status, updated.status
+        ))
+    } else if updated.title != page.title {
+        Some(format!("Title changed: {} → {}", page.title, updated.title))
+    } else {
+        None
+    };
+
+    diesel::insert_into(revisions::table)
+        .values(&NewRevision {
+            page_id: updated.id,
+            op: "update".into(),
+            title: updated.title.clone(),
+            body: updated.body.clone(),
+            status: updated.status.clone(),
+            changed_by: None,
+            summary,
+        })
+        .execute(&mut *db)
+        .await?;
+
     Ok(Redirect::to(&paths::show(updated.slug)))
 }
 

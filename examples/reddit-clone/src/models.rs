@@ -21,6 +21,11 @@ pub struct User {
     pub avatar: Option<Blob>,
 }
 
+// `User` is a hand-written model (so `password_hash` is never auto-exposed),
+// but it is the target of `#[belongs_to(User, ...)]` on `Post`/`Comment`/
+// `Subreddit`. Make it a leaf preload target so `post.author()` works.
+autumn_web::impl_preloadable_leaf!(User);
+
 #[derive(Debug, Clone, diesel::Insertable, serde::Deserialize)]
 #[diesel(table_name = users)]
 pub struct NewUser {
@@ -29,6 +34,8 @@ pub struct NewUser {
 }
 
 #[autumn_web::model]
+#[belongs_to(User, fk = creator_id)]
+#[has_many(Post)]
 pub struct Subreddit {
     #[id]
     pub id: i64,
@@ -46,6 +53,9 @@ pub struct Subreddit {
 }
 
 #[autumn_web::model]
+#[belongs_to(User, fk = author_id)]
+#[belongs_to(Subreddit)]
+#[has_many(Comment)]
 pub struct Post {
     #[id]
     pub id: i64,
@@ -72,6 +82,8 @@ pub struct Post {
 }
 
 #[autumn_web::model]
+#[belongs_to(User, fk = author_id)]
+#[belongs_to(Post)]
 pub struct Comment {
     #[id]
     pub id: i64,

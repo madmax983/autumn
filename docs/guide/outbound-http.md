@@ -197,6 +197,6 @@ let client = Client::from_config(&config.http.client);
 
 ## Complete example
 
-See [`examples/outbound-http`](../../examples/outbound-http/src/main.rs) for a
-full working example with a Stripe-style charge endpoint and four integration
-tests covering mocked calls, call-count assertions, and error handling.
+See [`examples/reddit-clone/src/routes/auth.rs`](../../examples/reddit-clone/src/routes/auth.rs)
+for a working example with outbound HTTP calls and integration tests covering
+mocked calls, call-count assertions, and error handling.
