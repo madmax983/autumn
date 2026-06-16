@@ -122,6 +122,9 @@ pub use plugin::{Plugin, Plugins};
 pub mod route_listing;
 
 #[cfg(feature = "db")]
+pub mod sharding;
+
+#[cfg(feature = "db")]
 pub mod repository;
 #[cfg(feature = "db")]
 pub(crate) mod repository_commit_hooks;

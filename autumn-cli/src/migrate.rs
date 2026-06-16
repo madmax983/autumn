@@ -37,8 +37,21 @@ pub enum MigrateAction {
     Check,
 }
 
+/// Which databases `autumn migrate` operates on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MigrateTarget {
+    /// The control database plus every `[[database.shards]]` entry
+    /// (control first, shards in declaration order). The default.
+    All,
+    /// Only the control database (`database.primary_url`/`url`) —
+    /// pre-shards behavior.
+    ControlOnly,
+    /// A single shard, addressed by its configured `name`.
+    Shard(String),
+}
+
 /// Run the migrate command.
-pub fn run(action: MigrateAction, with_maintenance: bool) {
+pub fn run(action: MigrateAction, with_maintenance: bool, target: &MigrateTarget) {
     eprintln!("\u{1F342} autumn migrate\n");
 
     if action == MigrateAction::Check {
@@ -47,8 +60,8 @@ pub fn run(action: MigrateAction, with_maintenance: bool) {
         return;
     }
 
-    // 1. Resolve database URL from autumn.toml + env
-    let database_url = resolve_database_url();
+    // 1. Resolve migration target databases from autumn.toml + env
+    let targets = resolve_targets(target);
 
     // 2. Resolve migrations directory
     let migrations_dir = resolve_migrations_dir();
@@ -61,16 +74,122 @@ pub fn run(action: MigrateAction, with_maintenance: bool) {
         enable_maintenance_for_migrate();
     }
 
-    // 5. Execute the appropriate diesel command
+    // 5. Execute the appropriate diesel command per target
     match action {
         MigrateAction::Run => {
-            run_migrations_with_maintenance(&database_url, &migrations_dir, with_maintenance);
+            run_all_targets(&targets, &migrations_dir, with_maintenance);
         }
         MigrateAction::Status => {
-            show_status(&database_url, &migrations_dir);
-            show_framework_status(&database_url);
+            for (label, url) in &targets {
+                eprintln!("\u{2500}\u{2500} {label} \u{2500}\u{2500}");
+                show_status(url, &migrations_dir);
+                show_framework_status(url);
+                eprintln!();
+            }
         }
         MigrateAction::Check => unreachable!("handled above"),
+    }
+}
+
+/// Resolve the `(label, database_url)` pairs the command operates on,
+/// in apply order (control first, then shards in declaration order).
+fn resolve_targets(target: &MigrateTarget) -> Vec<(String, String)> {
+    let control = try_resolve_database_url();
+    let shards = resolve_shard_database_urls();
+    match build_targets(control, shards, target) {
+        Ok(targets) => targets,
+        Err(message) => {
+            eprintln!("{message}");
+            if matches!(target, MigrateTarget::All | MigrateTarget::ControlOnly) {
+                // Reuse the standard missing-URL guidance (prints and exits).
+                resolve_database_url();
+            }
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Pure target-selection logic behind [`resolve_targets`], separated so
+/// every branch is unit-testable without touching the environment.
+fn build_targets(
+    control: Option<String>,
+    shards: Vec<(String, String)>,
+    target: &MigrateTarget,
+) -> Result<Vec<(String, String)>, String> {
+    match target {
+        MigrateTarget::ControlOnly => control
+            .map(|url| vec![("control".to_owned(), url)])
+            .ok_or_else(|| "\u{2717} No control database URL found.".to_owned()),
+        MigrateTarget::Shard(name) => {
+            let Some((_, url)) = shards.iter().find(|(shard, _)| shard == name) else {
+                let detail = if shards.is_empty() {
+                    "No [[database.shards]] entries found in autumn.toml or environment.".to_owned()
+                } else {
+                    let known: Vec<&str> = shards.iter().map(|(n, _)| n.as_str()).collect();
+                    format!("Known shards: {}", known.join(", "))
+                };
+                return Err(format!("\u{2717} Unknown shard {name:?}.\n  {detail}"));
+            };
+            Ok(vec![(format!("shard:{name}"), url.clone())])
+        }
+        MigrateTarget::All => {
+            // Shard-only deployments (no control role) are a valid shape:
+            // include the control target only when a control URL resolves.
+            let mut targets = Vec::new();
+            if let Some(control_url) = control {
+                targets.push(("control".to_owned(), control_url));
+            } else if shards.is_empty() {
+                return Err("\u{2717} No database URL found.".to_owned());
+            }
+            for (name, url) in shards {
+                targets.push((format!("shard:{name}"), url));
+            }
+            Ok(targets)
+        }
+    }
+}
+
+/// Apply migrations to every target in order, failing fast with a
+/// per-target summary.
+fn run_all_targets(targets: &[(String, String)], migrations_dir: &str, with_maintenance: bool) {
+    let mut completed: Vec<&str> = Vec::new();
+    for (label, url) in targets {
+        eprintln!("\u{2500}\u{2500} Migrating {label} \u{2500}\u{2500}");
+        if run_single_target(url, migrations_dir) {
+            completed.push(label);
+            eprintln!();
+        } else {
+            eprintln!();
+            eprintln!("  Summary:");
+            for done in &completed {
+                eprintln!("    \u{2713} {done}");
+            }
+            eprintln!("    \u{2717} {label} \u{2014} FAILED (see output above)");
+            for (pending, _) in targets.iter().skip(completed.len() + 1) {
+                eprintln!("    \u{2022} {pending} \u{2014} not attempted");
+            }
+            eprintln!();
+            eprintln!(
+                "  Migrations already applied to earlier targets are skipped \
+                 idempotently when you rerun `autumn migrate`."
+            );
+            if with_maintenance {
+                eprintln!(
+                    "  \u{26A0}\u{FE0F}  Migration failed — maintenance mode left ON for safety."
+                );
+                eprintln!("      Fix the migration then run `autumn migrate` to retry.");
+                eprintln!("      Run `autumn maintenance off` to re-open traffic manually.");
+            }
+            std::process::exit(1);
+        }
+    }
+
+    eprintln!("  Summary:");
+    for done in completed {
+        eprintln!("    \u{2713} {done}");
+    }
+    if with_maintenance {
+        disable_maintenance_after_migrate();
     }
 }
 
@@ -101,20 +220,19 @@ fn disable_maintenance_after_migrate() {
     }
 }
 
-fn run_migrations_with_maintenance(
-    database_url: &str,
-    migrations_dir: &str,
-    with_maintenance: bool,
-) {
+/// Apply app + framework migrations to one database. Returns whether
+/// everything succeeded; the caller decides how to fail.
+fn run_single_target(database_url: &str, migrations_dir: &str) -> bool {
     use autumn_web::migrate::{DEFAULT_LOCK_WAIT_TIMEOUT, hold_migration_lock};
 
-    // Acquire the Postgres advisory lock before reading the pending-migration
-    // list.  This serializes concurrent callers (rolling-deploy replicas or
-    // parallel `autumn migrate run` invocations): only one process runs
-    // migrations at a time; the rest wait and then find no pending work.
-    // The lock is released when `_lock_guard` drops (end of this function or
-    // process exit — both are safe because PostgreSQL releases session-level
-    // advisory locks on connection close).
+    // Acquire this target database's Postgres advisory lock before reading
+    // the pending-migration list. This serializes concurrent callers
+    // (rolling-deploy replicas or parallel `autumn migrate run`
+    // invocations): only one process runs migrations against a given
+    // database at a time; the rest wait and then find no pending work.
+    // The lock is released when `_lock_guard` drops (end of this function
+    // or process exit — both are safe because PostgreSQL releases
+    // session-level advisory locks on connection close).
     //
     // Known limitation: the advisory lock lives on the parent process's
     // connection, not inside the child `diesel` subprocess. If the parent is
@@ -125,19 +243,13 @@ fn run_migrations_with_maintenance(
     // could abort an in-progress transaction. In practice most orchestrators
     // kill the whole cgroup, and Postgres's transaction isolation prevents
     // concurrent dirty writes either way.
-    let _lock_guard =
-        hold_migration_lock(database_url, DEFAULT_LOCK_WAIT_TIMEOUT).unwrap_or_else(|e| {
+    let _lock_guard = match hold_migration_lock(database_url, DEFAULT_LOCK_WAIT_TIMEOUT) {
+        Ok(guard) => guard,
+        Err(e) => {
             eprintln!("\u{274C} Failed to acquire migration lock: {e}");
-            if with_maintenance {
-                eprintln!();
-                eprintln!(
-                    "  \u{26A0}\u{FE0F}  Lock acquisition failed — maintenance mode left ON for safety."
-                );
-                eprintln!("      Fix the blocking migration then run `autumn migrate` to retry.");
-                eprintln!("      Run `autumn maintenance off` to re-open traffic manually.");
-            }
-            std::process::exit(1);
-        });
+            return false;
+        }
+    };
 
     eprintln!("  Running pending migrations...\n");
     let dir = std::path::Path::new(migrations_dir);
@@ -147,41 +259,24 @@ fn run_migrations_with_maintenance(
         .env("DATABASE_URL", database_url)
         .status();
 
-    let success = match status {
+    match status {
         Ok(s) if s.success() => {
             eprintln!("\n\u{2713} Migrations applied successfully.");
-            true
         }
         Ok(_) => {
             eprintln!(
                 "\n\u{274C} Migration failed in {}. Check the error output above.",
                 dir.display()
             );
-            false
+            return false;
         }
         Err(e) => {
             eprintln!("\u{274C} Failed to run diesel migration run: {e}");
-            false
+            return false;
         }
-    };
-
-    if success {
-        run_framework_migrations(database_url);
-        if with_maintenance {
-            // Only disable maintenance when everything succeeded
-            disable_maintenance_after_migrate();
-        }
-    } else {
-        if with_maintenance {
-            eprintln!();
-            eprintln!(
-                "  \u{26A0}\u{FE0F}  Migration failed — maintenance mode left ON for safety."
-            );
-            eprintln!("      Fix the migration then run `autumn migrate` to retry.");
-            eprintln!("      Run `autumn maintenance off` to re-open traffic manually.");
-        }
-        std::process::exit(1);
     }
+
+    run_framework_migrations(database_url)
 }
 
 /// Run the migration safety preflight check against all SQL files in `migrations_dir`.
@@ -322,6 +417,13 @@ fn resolve_database_url() -> String {
     resolve_database_url_with_env(|key| std::env::var(key))
 }
 
+/// Like [`resolve_database_url`], but returns `None` instead of exiting
+/// when no control URL is configured (valid for shard-only deployments).
+fn try_resolve_database_url() -> Option<String> {
+    let config_table = read_autumn_toml_table();
+    resolve_primary_database_url_from_sources(|key| std::env::var(key), config_table.as_ref())
+}
+
 fn resolve_database_url_with_env<F>(env_var: F) -> String
 where
     F: Fn(&str) -> Result<String, std::env::VarError>,
@@ -380,6 +482,73 @@ where
     None
 }
 
+/// Resolve `(name, primary_url)` for every `[[database.shards]]` entry,
+/// in declaration order.
+///
+/// Mirrors the framework's positional environment override scheme:
+/// `AUTUMN_DATABASE__SHARDS__{i}__NAME` / `__PRIMARY_URL` override entry
+/// `i` of the TOML declaration (or append a new entry when both are set
+/// for the next free index); probing stops at the first absent index.
+fn resolve_shard_database_urls() -> Vec<(String, String)> {
+    resolve_shard_database_urls_with_env(|key| std::env::var(key))
+}
+
+fn resolve_shard_database_urls_with_env<F>(env_var: F) -> Vec<(String, String)>
+where
+    F: Fn(&str) -> Result<String, std::env::VarError>,
+{
+    let config_table = read_autumn_toml_table();
+    resolve_shard_database_urls_from_sources(env_var, config_table.as_ref())
+}
+
+fn resolve_shard_database_urls_from_sources<F>(
+    env_var: F,
+    table: Option<&toml::Table>,
+) -> Vec<(String, String)>
+where
+    F: Fn(&str) -> Result<String, std::env::VarError>,
+{
+    const MAX_ENV_SHARDS: usize = 64;
+
+    let mut shards: Vec<(String, String)> = table
+        .and_then(|table| table.get("database"))
+        .and_then(toml::Value::as_table)
+        .and_then(|database| database.get("shards"))
+        .and_then(toml::Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(toml::Value::as_table)
+                .filter_map(|shard| {
+                    let name = shard.get("name").and_then(toml::Value::as_str)?;
+                    let url = shard.get("primary_url").and_then(toml::Value::as_str)?;
+                    Some((name.to_owned(), url.to_owned()))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    for i in 0..MAX_ENV_SHARDS {
+        let name_var = format!("AUTUMN_DATABASE__SHARDS__{i}__NAME");
+        let url_var = format!("AUTUMN_DATABASE__SHARDS__{i}__PRIMARY_URL");
+        if i >= shards.len() {
+            let (Ok(name), Ok(url)) = (env_var(&name_var), env_var(&url_var)) else {
+                break;
+            };
+            shards.push((name, url));
+            continue;
+        }
+        if let Ok(name) = env_var(&name_var) {
+            shards[i].0 = name;
+        }
+        if let Ok(url) = env_var(&url_var) {
+            shards[i].1 = url;
+        }
+    }
+
+    shards
+}
+
 /// Resolve the migrations directory (default: `./migrations/`).
 fn resolve_migrations_dir() -> String {
     let dir = Path::new(DEFAULT_MIGRATIONS_DIR);
@@ -408,22 +577,24 @@ fn check_diesel_cli() {
     }
 }
 
-fn run_framework_migrations(database_url: &str) {
+fn run_framework_migrations(database_url: &str) -> bool {
     eprintln!("  Running pending Autumn framework migrations...\n");
 
     match run_framework_migrations_inner(database_url, autumn_web::migrate::run_pending) {
         Ok(result) if result.applied.is_empty() => {
             eprintln!("\n\u{2713} Framework migrations are up to date.");
+            true
         }
         Ok(result) => {
             for migration in &result.applied {
                 eprintln!("  Applied {migration}");
             }
             eprintln!("\n\u{2713} Framework migrations applied successfully.");
+            true
         }
         Err(e) => {
             eprintln!("\n\u{2717} Framework migration failed: {e}");
-            std::process::exit(1);
+            false
         }
     }
 }
@@ -806,6 +977,159 @@ replica_url = "postgres://replica:5432/app"
         let url = resolve_primary_database_url_from_sources(env_var, Some(&table)).unwrap();
 
         assert_eq!(url, "postgres://primary:5432/app");
+    }
+
+    // ── build_targets ──────────────────────────────────────────────────────
+
+    fn two_shards() -> Vec<(String, String)> {
+        vec![
+            ("shard0".to_owned(), "postgres://s0/app".to_owned()),
+            ("shard1".to_owned(), "postgres://s1/app".to_owned()),
+        ]
+    }
+
+    #[test]
+    fn build_targets_all_orders_control_first_then_shards() {
+        let targets = build_targets(
+            Some("postgres://control/app".to_owned()),
+            two_shards(),
+            &MigrateTarget::All,
+        )
+        .unwrap();
+
+        let labels: Vec<&str> = targets.iter().map(|(label, _)| label.as_str()).collect();
+        assert_eq!(labels, ["control", "shard:shard0", "shard:shard1"]);
+        assert_eq!(targets[0].1, "postgres://control/app");
+    }
+
+    #[test]
+    fn build_targets_all_supports_shard_only_deployments() {
+        let targets = build_targets(None, two_shards(), &MigrateTarget::All).unwrap();
+        let labels: Vec<&str> = targets.iter().map(|(label, _)| label.as_str()).collect();
+        assert_eq!(labels, ["shard:shard0", "shard:shard1"]);
+    }
+
+    #[test]
+    fn build_targets_all_errors_with_no_databases_at_all() {
+        let error = build_targets(None, Vec::new(), &MigrateTarget::All).unwrap_err();
+        assert!(error.contains("No database URL"));
+    }
+
+    #[test]
+    fn build_targets_control_only_requires_control() {
+        let targets = build_targets(
+            Some("postgres://control/app".to_owned()),
+            two_shards(),
+            &MigrateTarget::ControlOnly,
+        )
+        .unwrap();
+        assert_eq!(
+            targets,
+            vec![("control".to_owned(), "postgres://control/app".to_owned())]
+        );
+
+        let error = build_targets(None, two_shards(), &MigrateTarget::ControlOnly).unwrap_err();
+        assert!(error.contains("control database"));
+    }
+
+    #[test]
+    fn build_targets_selects_single_shard_by_name() {
+        let targets = build_targets(
+            None,
+            two_shards(),
+            &MigrateTarget::Shard("shard1".to_owned()),
+        )
+        .unwrap();
+        assert_eq!(
+            targets,
+            vec![("shard:shard1".to_owned(), "postgres://s1/app".to_owned())]
+        );
+    }
+
+    #[test]
+    fn build_targets_unknown_shard_lists_known_names() {
+        let error = build_targets(None, two_shards(), &MigrateTarget::Shard("nope".to_owned()))
+            .unwrap_err();
+        assert!(error.contains("Unknown shard"));
+        assert!(error.contains("shard0, shard1"));
+
+        let error =
+            build_targets(None, Vec::new(), &MigrateTarget::Shard("nope".to_owned())).unwrap_err();
+        assert!(error.contains("No [[database.shards]] entries"));
+    }
+
+    // ── resolve_shard_database_urls ────────────────────────────────────────
+
+    fn no_env(_key: &str) -> Result<String, std::env::VarError> {
+        Err(std::env::VarError::NotPresent)
+    }
+
+    #[test]
+    fn shard_urls_resolve_from_toml_in_declaration_order() {
+        let table = toml::from_str::<toml::Table>(
+            r#"
+[database]
+primary_url = "postgres://control:5432/app"
+
+[[database.shards]]
+name = "shard0"
+primary_url = "postgres://shard0:5432/app"
+
+[[database.shards]]
+name = "shard1"
+primary_url = "postgres://shard1:5432/app"
+"#,
+        )
+        .unwrap();
+
+        let shards = resolve_shard_database_urls_from_sources(no_env, Some(&table));
+
+        assert_eq!(
+            shards,
+            vec![
+                ("shard0".to_owned(), "postgres://shard0:5432/app".to_owned()),
+                ("shard1".to_owned(), "postgres://shard1:5432/app".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn shard_urls_env_overrides_and_appends() {
+        let table = toml::from_str::<toml::Table>(
+            r#"
+[[database.shards]]
+name = "shard0"
+primary_url = "postgres://toml:5432/app"
+"#,
+        )
+        .unwrap();
+        let env_var = |key: &str| -> Result<String, std::env::VarError> {
+            match key {
+                "AUTUMN_DATABASE__SHARDS__0__PRIMARY_URL" => {
+                    Ok("postgres://env:5432/app".to_owned())
+                }
+                "AUTUMN_DATABASE__SHARDS__1__NAME" => Ok("shard1".to_owned()),
+                "AUTUMN_DATABASE__SHARDS__1__PRIMARY_URL" => {
+                    Ok("postgres://env1:5432/app".to_owned())
+                }
+                _ => Err(std::env::VarError::NotPresent),
+            }
+        };
+
+        let shards = resolve_shard_database_urls_from_sources(env_var, Some(&table));
+
+        assert_eq!(
+            shards,
+            vec![
+                ("shard0".to_owned(), "postgres://env:5432/app".to_owned()),
+                ("shard1".to_owned(), "postgres://env1:5432/app".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn shard_urls_empty_without_shards() {
+        assert!(resolve_shard_database_urls_from_sources(no_env, None).is_empty());
     }
 
     // ── check_concurrent_index_transaction_opt_out ────────────────────────

@@ -2758,6 +2758,8 @@ mod tests {
             pool: None,
             #[cfg(feature = "db")]
             replica_pool: None,
+            #[cfg(feature = "db")]
+            shards: None,
             profile: Some("test".to_owned()),
             started_at: std::time::Instant::now(),
             health_detailed: false,
