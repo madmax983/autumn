@@ -136,9 +136,9 @@ multi-replica fan-out, and channel actuator metrics, see
 
 ## Testing
 
-See `examples/ws-echo` for a runnable minimal server and
-`autumn/tests/ws_integration.rs` for end-to-end tests that drive real
-WebSocket traffic against an Autumn app using `tokio-tungstenite`.
+See `examples/reddit-clone/src/routes/live.rs` for a runnable WebSocket live-feed
+implementation and `autumn/tests/ws_integration.rs` for end-to-end tests that
+drive real WebSocket traffic against an Autumn app using `tokio-tungstenite`.
 
 ## Out of scope
 

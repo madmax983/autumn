@@ -730,19 +730,20 @@ pub fn text_input<T: Serialize>(
     let wrapper_id = format!("{field}-field");
 
     maud::html! {
-        div id=(wrapper_id) {
-            label for=(field) { (label) }
+        div id=(wrapper_id) class="autumn-field" {
+            label for=(field) class="autumn-field__label" { (label) }
             input
                 type="text"
                 id=(field)
                 name=(field)
                 value=(value)
+                class=(if has_errors { "autumn-field__input autumn-field__input--invalid" } else { "autumn-field__input" })
                 aria-invalid=(if has_errors { "true" } else { "false" })
                 aria-describedby=(if has_errors { error_id.as_str() } else { "" });
             @if has_errors {
-                div id=(error_id) role="alert" {
+                div id=(error_id) role="alert" class="autumn-field__errors" {
                     @for error in errors {
-                        p { (error) }
+                        p class="autumn-field__error" { (error) }
                     }
                 }
             }
@@ -789,13 +790,14 @@ pub fn text_input_htmx<T: Serialize>(
     let target = "closest [data-autumn-field-wrapper]";
 
     maud::html! {
-        div id=(wrapper_id) data-autumn-field-wrapper=(field) {
-            label for=(field) { (label) }
+        div id=(wrapper_id) class="autumn-field" data-autumn-field-wrapper=(field) {
+            label for=(field) class="autumn-field__label" { (label) }
             input
                 type="text"
                 id=(field)
                 name=(field)
                 value=(value)
+                class=(if has_errors { "autumn-field__input autumn-field__input--invalid" } else { "autumn-field__input" })
                 aria-invalid=(if has_errors { "true" } else { "false" })
                 aria-describedby=(if has_errors { error_id.as_str() } else { "" })
                 hx-post=(validate_url)
@@ -804,9 +806,9 @@ pub fn text_input_htmx<T: Serialize>(
                 hx-swap="outerHTML"
                 hx-include="closest form";
             @if has_errors {
-                div id=(error_id) role="alert" {
+                div id=(error_id) role="alert" class="autumn-field__errors" {
                     @for error in errors {
-                        p { (error) }
+                        p class="autumn-field__error" { (error) }
                     }
                 }
             }
@@ -819,7 +821,7 @@ pub fn text_input_htmx<T: Serialize>(
 #[must_use]
 pub fn submit_button(label: &str) -> maud::Markup {
     maud::html! {
-        button type="submit" { (label) }
+        button type="submit" class="autumn-submit" { (label) }
     }
 }
 
@@ -845,18 +847,19 @@ pub fn password_input<T: Serialize>(
     let wrapper_id = format!("{field}-field");
 
     maud::html! {
-        div id=(wrapper_id) {
-            label for=(field) { (label) }
+        div id=(wrapper_id) class="autumn-field" {
+            label for=(field) class="autumn-field__label" { (label) }
             input
                 type="password"
                 id=(field)
                 name=(field)
+                class=(if has_errors { "autumn-field__input autumn-field__input--invalid" } else { "autumn-field__input" })
                 aria-invalid=(if has_errors { "true" } else { "false" })
                 aria-describedby=(if has_errors { error_id.as_str() } else { "" });
             @if has_errors {
-                div id=(error_id) role="alert" {
+                div id=(error_id) role="alert" class="autumn-field__errors" {
                     @for error in errors {
-                        p { (error) }
+                        p class="autumn-field__error" { (error) }
                     }
                 }
             }
@@ -883,18 +886,19 @@ pub fn textarea_input<T: Serialize>(
     let wrapper_id = format!("{field}-field");
 
     maud::html! {
-        div id=(wrapper_id) {
-            label for=(field) { (label) }
+        div id=(wrapper_id) class="autumn-field" {
+            label for=(field) class="autumn-field__label" { (label) }
             textarea
                 id=(field)
                 name=(field)
+                class=(if has_errors { "autumn-field__input autumn-field__input--invalid" } else { "autumn-field__input" })
                 aria-invalid=(if has_errors { "true" } else { "false" })
                 aria-describedby=(if has_errors { error_id.as_str() } else { "" })
                 { (value) }
             @if has_errors {
-                div id=(error_id) role="alert" {
+                div id=(error_id) role="alert" class="autumn-field__errors" {
                     @for error in errors {
-                        p { (error) }
+                        p class="autumn-field__error" { (error) }
                     }
                 }
             }

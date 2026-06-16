@@ -157,5 +157,5 @@ projection, enqueue a `#[job]` after verification and return promptly. Jobs are
 recommended for follow-up processing, but they are not required to accept a
 signed webhook.
 
-See `examples/signed-webhooks/` for runnable fixture tests covering valid,
+See `examples/reddit-clone/src/routes/webhooks.rs` for runnable fixture tests covering valid,
 tampered-body, stale-timestamp, bad-signature, and duplicate-delivery cases.

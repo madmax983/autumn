@@ -946,6 +946,11 @@ fn resolve_binary_from_metadata(
     let bin_name = matching_packages
         .iter()
         .find_map(|pkg| {
+            // Prefer `default-run` so packages with multiple binaries (e.g. a
+            // `seed` binary alongside the main server) always start the right one.
+            if let Some(name) = pkg["default_run"].as_str() {
+                return Some(name.to_owned());
+            }
             pkg["targets"].as_array()?.iter().find_map(|t| {
                 let is_bin = t["kind"].as_array()?.iter().any(|k| k == "bin");
                 if is_bin {
@@ -1498,6 +1503,36 @@ mod tests {
             resolve_binary_from_metadata(&metadata, Some("multi"), Path::new("/projects/multi"));
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), expected_binary("/tmp/target/debug/server"));
+    }
+
+    // Regression: packages with multiple binaries (e.g. `seed` + main server)
+    // must start the `default-run` binary, not whichever happens to be listed
+    // first in `cargo metadata` targets.
+    #[test]
+    fn resolve_binary_prefers_default_run_over_first_target() {
+        let metadata = serde_json::json!({
+            "target_directory": "/tmp/target",
+            "packages": [{
+                "name": "todo-app",
+                "manifest_path": "/projects/todo-app/Cargo.toml",
+                "default_run": "todo-app",
+                "targets": [
+                    {"name": "seed",     "kind": ["bin"]},
+                    {"name": "todo-app", "kind": ["bin"]}
+                ]
+            }]
+        });
+        let result = resolve_binary_from_metadata(
+            &metadata,
+            Some("todo-app"),
+            Path::new("/projects/todo-app"),
+        );
+        assert!(result.is_ok());
+        // Must return `todo-app`, not `seed` (which appears first in targets).
+        assert_eq!(
+            result.unwrap(),
+            expected_binary("/tmp/target/debug/todo-app")
+        );
     }
 
     #[test]

@@ -337,8 +337,8 @@ pub fn active_search_input(id: &str, label: &str, config: &ActiveSearchConfig<'_
     };
 
     maud::html! {
-        div {
-            label for=(id) { (label) }
+        div class="autumn-search" {
+            label for=(id) class="autumn-search__label" { (label) }
             input
                 type="search"
                 id=(id)
@@ -346,6 +346,7 @@ pub fn active_search_input(id: &str, label: &str, config: &ActiveSearchConfig<'_
                 autocomplete="off"
                 aria-controls=(aria_controls)
                 placeholder=[config.placeholder]
+                class="autumn-search__input"
                 data-ac-min-length=(config.min_length)
                 hx-get=[hx_get]
                 hx-post=[hx_post]
@@ -498,10 +499,11 @@ pub fn autocomplete_input(id: &str, label: &str, config: &AutocompleteConfig<'_>
     maud::html! {
         div
             id=(format!("{id}-wrapper"))
+            class="autumn-autocomplete"
             data-ac-value-id=(value_id)
             data-ac-value-name=(config.value_name)
             data-ac-free-text[config.free_text] {
-            label for=(query_id) { (label) }
+            label for=(query_id) class="autumn-autocomplete__label" { (label) }
             input
                 type="search"
                 id=(query_id)
@@ -512,6 +514,7 @@ pub fn autocomplete_input(id: &str, label: &str, config: &AutocompleteConfig<'_>
                 aria-autocomplete="list"
                 aria-controls=(options_id)
                 placeholder=[config.placeholder]
+                class="autumn-autocomplete__input"
                 data-ac-query
                 data-ac-min-length=(config.min_length)
                 hx-get=(config.action)
@@ -526,7 +529,8 @@ pub fn autocomplete_input(id: &str, label: &str, config: &AutocompleteConfig<'_>
                 id=(options_id)
                 role="listbox"
                 aria-label=(label)
-                aria-live="polite" {}
+                aria-live="polite"
+                class="autumn-autocomplete__options" {}
             noscript {
                 select name=(config.value_name) aria-label=(label) {
                     option value="" { "— select —" }
@@ -565,6 +569,7 @@ pub fn autocomplete_option(value: &str, label: &str) -> maud::Markup {
         div
             role="option"
             tabindex="0"
+            class="autumn-autocomplete__option"
             data-value=(value) {
             (label)
         }
