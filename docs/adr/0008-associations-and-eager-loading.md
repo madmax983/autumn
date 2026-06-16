@@ -149,21 +149,34 @@ exactly.
   are supported via `name = …` (e.g. `#[has_many(Post, fk = author_id, name =
   authored)]` and `#[has_many(Post, fk = approver_id, name = approved)]`),
   which overrides the derived accessor/store name.
-- **Target read scoping (tenant isolation + soft-delete) is enforced**: a
-  preload applies the association target's own read scoping so it hides the
-  same rows the target's repository finders do. Because the *loading* model's
-  macro cannot see the *target's* columns, each `#[model]` generates a
-  `__autumn_preload_retain` helper from its **own** field set, and the loader
-  calls it on freshly loaded target rows: a `deleted_at` field drops
-  soft-deleted rows (`deleted_at IS NOT NULL`), and a `tenant_id` field keeps
-  only rows matching the ambient `CURRENT_TENANT` task-local when a tenant is
-  set. This filtering is applied **in-memory** after the batched `IN` load
-  (the source can't add a typed `.filter()` on columns it can't name), so a
-  cross-tenant `belongs_to` parent reads back as `Ok(None)` and cross-tenant /
-  soft-deleted `has_many` children are excluded from the group. Hand-written
-  models that are association targets get an identity retain via
-  `impl_preloadable_leaf!` (no auto-scoping). Models with no `tenant_id` /
-  `deleted_at` field are unaffected (identity).
+- **Target read scoping (tenant isolation + soft-delete) is enforced, keyed
+  off the target's *repository* config**: a preload hides the same rows the
+  target's repository finders do. Each `#[model]` generates a
+  `__autumn_preload_retain` helper that the loader calls on freshly loaded
+  target rows; filtering is **in-memory** after the batched `IN` load (the
+  loading model can't add a typed `.filter()` on columns it can't name). The
+  decision to scope is **not** inferred from field presence — a model may have
+  a `deleted_at` (audit/history) or `tenant_id` column without its repository
+  opting into `soft_delete` / `tenant_scoped`, and in that case finders don't
+  filter, so neither does preload. Instead:
+  - The retain is generated behind a *compile-time* column guard (it only
+    references `deleted_at` / `tenant_id` when the field exists) but gated at
+    *runtime* on the target repository's config, surfaced via the default-
+    `false` `AutumnPreloadScopeExt` trait whose
+    `__autumn_repo_soft_delete_scope` / `__autumn_repo_tenant_scope` the
+    `#[repository(..., soft_delete, tenant_scoped)]` macro overrides with
+    inherent fns (inherent wins over the blanket default).
+  - Tenant scoping additionally honors `across_tenants()`: a repository's
+    `preload` publishes its cross-tenant choice as the ambient
+    `PRELOAD_ACROSS_TENANTS` task-local, which the retain reads (and which
+    propagates through nested levels), so `repo.across_tenants().preload(...)`
+    skips the tenant predicate on every level — matching finders for
+    admin/reporting.
+  Net effect: a cross-tenant `belongs_to` parent reads back as `Ok(None)` and
+  cross-tenant / soft-deleted `has_many` children are excluded — but only when
+  the target's repository actually scopes that way. Hand-written models that
+  are association targets get an identity retain via `impl_preloadable_leaf!`
+  (no auto-scoping); models with no scoping config are unaffected.
 - **No per-association *custom* filtering (follow-up)**: beyond the target's
   own tenant/soft-delete scoping, preload loads *all* matching rows of an
   association keyed on the foreign key — there is no scoped/filtered preload

@@ -1744,12 +1744,26 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         .iter()
         .find(|f| f.ident.as_ref().is_some_and(|id| id == "deleted_at"))
         .copied();
+    // Soft-delete retain. Gated at *runtime* on the model's repository being
+    // declared `soft_delete` (via the inherent override of
+    // `AutumnPreloadScopeExt::__autumn_repo_soft_delete_scope`), so a model that
+    // merely *has* a `deleted_at` column (e.g. audit/history) but whose
+    // repository is not `soft_delete` is left unfiltered — matching its
+    // finders. The field check below is only the compile-time column guard.
     let soft_delete_retain = match deleted_at_field {
         Some(f) if is_option_type(&f.ty) => quote! {
-            rows.retain(|__r| ::core::option::Option::is_none(&__r.deleted_at));
+            if <Self>::__autumn_repo_soft_delete_scope() {
+                rows.retain(|__r| ::core::option::Option::is_none(&__r.deleted_at));
+            }
         },
         _ => quote! {},
     };
+    // Tenant retain. Gated at runtime on the repository being `tenant_scoped`
+    // (inherent override of `__autumn_repo_tenant_scope`) AND not running under
+    // `across_tenants()` (the ambient `preload_across_tenants()` flag a
+    // repository's `preload` publishes). Field presence is only the column
+    // guard; a `tenant_id` column without a `tenant_scoped` repository stays
+    // unfiltered, matching finders.
     let tenant_retain = tenant_id_field.as_ref().map_or_else(
         || quote! {},
         |f| {
@@ -1759,17 +1773,29 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 quote! { __r.tenant_id == __t }
             };
             quote! {
-                if let ::core::option::Option::Some(__t) =
-                    ::autumn_web::tenancy::CURRENT_TENANT
-                        .try_with(|__c| __c.clone())
-                        .ok()
-                        .flatten()
+                if <Self>::__autumn_repo_tenant_scope()
+                    && !::autumn_web::preload::preload_across_tenants()
                 {
-                    rows.retain(|__r| #cmp);
+                    if let ::core::option::Option::Some(__t) =
+                        ::autumn_web::tenancy::CURRENT_TENANT
+                            .try_with(|__c| __c.clone())
+                            .ok()
+                            .flatten()
+                    {
+                        rows.retain(|__r| #cmp);
+                    }
                 }
             }
         },
     );
+    let preload_scope_in_scope = if deleted_at_field.is_some() || tenant_id_field.is_some() {
+        // Bring the default-`false` trait into scope so `Self::…scope()`
+        // resolves to the blanket default when the repository macro emitted no
+        // inherent override (inherent wins when it exists).
+        quote! { use ::autumn_web::preload::AutumnPreloadScopeExt as _; }
+    } else {
+        quote! {}
+    };
     let preload_retain_rows = if deleted_at_field.is_some() || tenant_id_field.is_some() {
         quote! { mut rows }
     } else {
@@ -1786,6 +1812,7 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             pub fn __autumn_preload_retain(
                 #preload_retain_rows: ::std::vec::Vec<Self>,
             ) -> ::std::vec::Vec<Self> {
+                #preload_scope_in_scope
                 #soft_delete_retain
                 #tenant_retain
                 rows

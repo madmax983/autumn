@@ -36,11 +36,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Preload SQL runs on the **same read role** as the parent finder (the
     repository's snapshotted `ReadRoute`); `on_primary()` pins the whole chain.
     With `CursorPage`, preloads execute **after** the overfetch/truncate.
-  - Preloaded associations honor the target's **read scoping**: soft-deleted
-    rows (`deleted_at`) and rows outside the ambient `CURRENT_TENANT`
-    (`tenant_id`) are hidden, mirroring the target's repository finders. Each
-    `#[model]` generates the scoping from its own field set and the loader
-    applies it to loaded target rows.
+  - Preloaded associations honor the target's **read scoping**, keyed off the
+    target's `#[repository]` config (not field presence): when the target
+    repository is `soft_delete`, soft-deleted rows (`deleted_at IS NOT NULL`)
+    are hidden; when it is `tenant_scoped`, rows outside the ambient
+    `CURRENT_TENANT` are hidden — mirroring the target's finders. A
+    `deleted_at`/`tenant_id` column on a model whose repository does *not* opt
+    in is left unfiltered. `repo.across_tenants().preload(...)` skips the
+    tenant predicate at every level, matching `across_tenants()` finders.
   - `examples/reddit-clone` migrated: the front page and single-post view drop
     their hand-written joins / per-row author lookups for `preload`. See
     `docs/adr/0008-associations-and-eager-loading.md`.

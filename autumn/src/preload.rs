@@ -224,6 +224,54 @@ impl<T: serde::Serialize> serde::Serialize for Preloaded<T> {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct NoPreload;
 
+/// Reports a model's *repository* read-scoping so that `preload`'s in-memory
+/// retain can match what generated finders do.
+///
+/// The decision to apply tenant isolation or soft-delete filtering lives on
+/// `#[repository(..., tenant_scoped, soft_delete)]`, which the `#[model]` macro
+/// (the one that generates the retain) cannot see. So the `#[repository]` macro
+/// overrides these — as *inherent* associated fns on the model, which take
+/// priority over this blanket default — for the flags it enables. Models with
+/// no repository (or a non-scoped one) keep the `false` defaults, so preload
+/// applies no scoping they wouldn't get from a finder.
+///
+/// This is framework plumbing, not a public API.
+#[doc(hidden)]
+pub trait AutumnPreloadScopeExt {
+    /// Whether the model's repository is `soft_delete`.
+    #[must_use]
+    fn __autumn_repo_soft_delete_scope() -> bool {
+        false
+    }
+    /// Whether the model's repository is `tenant_scoped`.
+    #[must_use]
+    fn __autumn_repo_tenant_scope() -> bool {
+        false
+    }
+}
+
+impl<T: ?Sized> AutumnPreloadScopeExt for T {}
+
+#[cfg(feature = "db")]
+tokio::task_local! {
+    /// Set by a repository's `preload` to the repository's `across_tenants`
+    /// choice, so the (recursive) target tenant-retain can skip the tenant
+    /// predicate for cross-tenant admin/reporting loads — the same way
+    /// `across_tenants()` makes finders skip it. Defaults to `false` (scoped).
+    #[doc(hidden)]
+    pub static PRELOAD_ACROSS_TENANTS: bool;
+}
+
+/// Whether the current preload should bypass tenant scoping (i.e. it was
+/// started from a repository pinned with `across_tenants()`). `false` outside a
+/// preload or when not pinned. Framework plumbing, not a public API.
+#[cfg(feature = "db")]
+#[doc(hidden)]
+#[must_use]
+pub fn preload_across_tenants() -> bool {
+    PRELOAD_ACROSS_TENANTS.try_with(|v| *v).unwrap_or(false)
+}
+
 /// Implement [`Preloadable`] for a hand-written model as a leaf association
 /// target.
 ///
