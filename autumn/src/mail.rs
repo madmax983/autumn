@@ -163,6 +163,17 @@ pub struct MailConfig {
 /// `https://`, `https:///path`, and bases carrying `?`/`#` (the unsubscribe
 /// path/token is appended afterwards, so a query/fragment base would not route).
 fn is_valid_https_base_url(url: &str) -> bool {
+    // Reject characters that are unsafe inside an RFC 2369 angle-bracket URI or
+    // would survive into the raw header: `Url::parse` percent-encodes a space or
+    // `<`/`>` in the path, but the *original* string is what gets rendered as
+    // `<…?token=…>`, so a raw `<`/`>`/whitespace/control char would close or
+    // corrupt the `List-Unsubscribe` value.
+    if url
+        .chars()
+        .any(|c| c.is_control() || c.is_whitespace() || matches!(c, '<' | '>'))
+    {
+        return false;
+    }
     // Reject an empty authority (`https:///path`): the WHATWG parser would
     // otherwise collapse it into a bogus host, but an author who wrote this meant
     // a real host followed by a path.
@@ -191,10 +202,15 @@ fn is_valid_https_base_url(url: &str) -> bool {
 /// Whether `value` is a usable unsubscribe mailbox — a bare `local@domain` or a
 /// `mailto:local@domain` URI, with non-empty parts and no whitespace.
 fn is_valid_mailto_address(value: &str) -> bool {
-    // Reject control characters anywhere in the value (including inside a
-    // `?subject=…` query): they would otherwise survive into the raw
-    // `List-Unsubscribe` header as a CRLF injection (e.g. an extra `Bcc:`).
-    if value.chars().any(char::is_control) {
+    // Reject control characters and RFC 2369 delimiters anywhere in the value
+    // (including inside a `?subject=…` query): the value is rendered verbatim
+    // inside `<mailto:…>`, so a control char (CRLF injection, e.g. an extra
+    // `Bcc:`) or a `<`/`>`/`,` (which would close the entry and inject an extra
+    // `List-Unsubscribe` target) must not pass.
+    if value
+        .chars()
+        .any(|c| c.is_control() || matches!(c, '<' | '>' | ','))
+    {
         return false;
     }
     let address = value
@@ -4433,6 +4449,11 @@ mod tests {
         assert!(!is_valid_https_base_url("https://user@app.example.com"));
         // A valid explicit port is fine.
         assert!(is_valid_https_base_url("https://app.example.com:8443"));
+        // Characters unsafe inside an RFC 2369 angle-bracket URI are rejected,
+        // even though `Url::parse` would percent-encode them.
+        assert!(!is_valid_https_base_url("https://example.com/<x>"));
+        assert!(!is_valid_https_base_url("https://example.com/a b"));
+        assert!(!is_valid_https_base_url("https://example.com/a\r\nb"));
     }
 
     #[test]
@@ -4458,6 +4479,12 @@ mod tests {
             "mailto:unsub@example.com?subject=x\r\nBcc: victim@example.com"
         ));
         assert!(!is_valid_mailto_address("unsub@example.com\nBcc: v@x.com"));
+        // RFC 2369 delimiters (`<`/`>`/`,`) would close the angle-bracket entry
+        // and inject an extra List-Unsubscribe target.
+        assert!(!is_valid_mailto_address(
+            "unsub@example.com>,<bogus@example.com"
+        ));
+        assert!(!is_valid_mailto_address("a@x.com,b@x.com"));
     }
 
     #[test]

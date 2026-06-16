@@ -574,6 +574,12 @@ fn mail_unsubscribe_configured_result(base_url_set: bool, is_production: bool) -
 /// `autumn doctor --strict` rejects exactly what the runtime rejects at boot.
 fn is_valid_https_base_url_doctor(url: &str) -> bool {
     if url
+        .chars()
+        .any(|c| c.is_control() || c.is_whitespace() || matches!(c, '<' | '>'))
+    {
+        return false;
+    }
+    if url
         .strip_prefix("https://")
         .is_some_and(|rest| rest.starts_with('/'))
     {
@@ -592,9 +598,12 @@ fn is_valid_https_base_url_doctor(url: &str) -> bool {
 
 /// Mirror of `autumn_web`'s `is_valid_mailto_address` (see above).
 fn is_valid_mailto_address_doctor(value: &str) -> bool {
-    // Reject control characters anywhere in the value (CRLF injection guard);
-    // mirrors autumn_web's is_valid_mailto_address.
-    if value.chars().any(char::is_control) {
+    // Reject control characters and RFC 2369 delimiters (`<`/`>`/`,`) anywhere in
+    // the value; mirrors autumn_web's is_valid_mailto_address.
+    if value
+        .chars()
+        .any(|c| c.is_control() || matches!(c, '<' | '>' | ','))
+    {
         return false;
     }
     let address = value
