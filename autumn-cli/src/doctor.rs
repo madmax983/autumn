@@ -533,8 +533,8 @@ pub fn check_mail_unsubscribe_config_impl(
     }
 }
 
-/// Result for a configured unsubscribe destination (a valid base_url and/or
-/// mailto is set, a list mailer is in use, and the transport is active).
+/// Result for a configured unsubscribe destination (a valid `base_url` and/or
+/// `mailto` is set, a list mailer is in use, and the transport is active).
 ///
 /// A `base_url` drives the framework's one-click HTTP endpoint, which must
 /// persist opt-outs. The runtime fails closed in production when a base URL is
