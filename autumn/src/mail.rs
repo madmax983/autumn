@@ -1229,17 +1229,16 @@ impl Mailer {
         for (recipient, subscriber) in deliveries {
             let mut per_recipient = mail.clone();
             per_recipient.to = vec![recipient];
-            // Don't double-emit if the template already set the header by hand —
-            // a migration to `#[mailer(list_unsubscribe)]` should replace, not
-            // duplicate, an existing destination.
-            let already_set = per_recipient
-                .extra_headers
-                .iter()
-                .any(|(name, _)| name.eq_ignore_ascii_case("List-Unsubscribe"));
-            if let Some(value) = runtime
-                .list_unsubscribe_header(&subscriber, &list_id)
-                .filter(|_| !already_set)
-            {
+            if let Some(value) = runtime.list_unsubscribe_header(&subscriber, &list_id) {
+                // A migration to `#[mailer(list_unsubscribe)]` replaces, not
+                // duplicates, any header the template set by hand: drop an existing
+                // List-Unsubscribe / List-Unsubscribe-Post first so the generated
+                // per-recipient one-click header is authoritative (otherwise a
+                // stale manual header would suppress RFC 8058 compliance).
+                per_recipient.extra_headers.retain(|(name, _)| {
+                    !name.eq_ignore_ascii_case("List-Unsubscribe")
+                        && !name.eq_ignore_ascii_case("List-Unsubscribe-Post")
+                });
                 per_recipient
                     .extra_headers
                     .push(("List-Unsubscribe".to_owned(), value));
@@ -1887,14 +1886,6 @@ fn apply_preview_unsubscribe_headers(state: &AppState, mailer_label: &str, mut m
         return mail;
     };
     mail.list_unsubscribe = Some(scope.clone());
-    // Don't double-emit if the preview author already set the header by hand.
-    if mail
-        .extra_headers
-        .iter()
-        .any(|(name, _)| name.eq_ignore_ascii_case("List-Unsubscribe"))
-    {
-        return mail;
-    }
     let recipient = mail.to.first().map_or_else(
         || "subscriber@example.com".to_owned(),
         |to| canonical_subscriber(to),
@@ -1926,6 +1917,12 @@ fn apply_preview_unsubscribe_headers(state: &AppState, mailer_label: &str, mut m
         },
     );
     if let Some(value) = header {
+        // Mirror send: the generated header replaces, not duplicates, any header
+        // the preview author set by hand, so the preview reflects what is sent.
+        mail.extra_headers.retain(|(name, _)| {
+            !name.eq_ignore_ascii_case("List-Unsubscribe")
+                && !name.eq_ignore_ascii_case("List-Unsubscribe-Post")
+        });
         mail.extra_headers
             .push(("List-Unsubscribe".to_owned(), value));
         if one_click {
@@ -3059,6 +3056,45 @@ mod tests {
         assert!(headers.iter().any(|(n, v)| n == "List-Unsubscribe"
             && v.contains("/_autumn/unsubscribe?token=")
             && v.contains("mailto:unsub@example.com")));
+        assert!(
+            headers
+                .iter()
+                .any(|(n, v)| n == "List-Unsubscribe-Post" && v == "List-Unsubscribe=One-Click")
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::significant_drop_tightening)]
+    async fn send_replaces_manual_list_unsubscribe_with_generated_one_click() {
+        // A template that opts into list_unsubscribe but also set a hand-rolled
+        // List-Unsubscribe must end up with the generated per-recipient one-click
+        // header (replace, not suppress), so RFC 8058 compliance isn't lost.
+        let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let transport = CapturingTransport { sent: sent.clone() };
+        let mailer = Mailer::with_transport(transport).with_unsubscribe(unsubscribe_runtime(None));
+        let mail = Mail::builder()
+            .from("from@example.com")
+            .to("user@example.com")
+            .subject("Digest")
+            .text("hello")
+            .header("List-Unsubscribe", "<mailto:old@example.com>")
+            .list_unsubscribe("weekly_digest")
+            .build()
+            .unwrap();
+        mailer.send(mail).await.unwrap();
+        let captured = sent.lock().unwrap();
+        assert_eq!(captured.len(), 1);
+        let headers = &captured[0].extra_headers;
+        // Exactly one List-Unsubscribe, and it's the generated one-click (not the
+        // stale manual value).
+        let unsub: Vec<&String> = headers
+            .iter()
+            .filter(|(n, _)| n == "List-Unsubscribe")
+            .map(|(_, v)| v)
+            .collect();
+        assert_eq!(unsub.len(), 1);
+        assert!(unsub[0].contains("/_autumn/unsubscribe?token="));
+        assert!(!unsub[0].contains("old@example.com"));
         assert!(
             headers
                 .iter()

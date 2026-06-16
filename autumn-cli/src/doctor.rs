@@ -1780,7 +1780,10 @@ fn detect_list_unsubscribe_usage() -> bool {
 ///
 /// Skips build/VCS/vendor directories so a `cargo vendor` copy of the framework
 /// (whose own tests declare a real list mailer) can't trip a false positive for
-/// an application binary that registers none.
+/// an application binary that registers none. Also skips `tests/` and `examples/`
+/// trees: the runtime inventory only registers mailers compiled into the
+/// application binary, so an integration-test or example fixture must not make
+/// `autumn doctor --strict` require unsubscribe config for mail that can't be sent.
 fn scan_dir_for_list_unsubscribe(root: &std::path::Path) -> bool {
     /// Directories never worth scanning for source.
     const SKIP_DIRS: &[&str] = &[
@@ -1790,6 +1793,8 @@ fn scan_dir_for_list_unsubscribe(root: &std::path::Path) -> bool {
         "dist",
         ".github",
         "vendor",
+        "tests",
+        "examples",
     ];
     let Ok(entries) = std::fs::read_dir(root) else {
         return false;
@@ -3114,6 +3119,23 @@ mod tests {
         assert!(
             !scan_dir_for_list_unsubscribe(root.path()),
             "vendored dependency sources must be skipped"
+        );
+
+        // Integration-test and example fixtures are not compiled into the app
+        // binary, so the runtime inventory never registers them — they must be
+        // skipped too.
+        for tree in ["tests", "examples"] {
+            let dir = root.path().join(tree);
+            std::fs::create_dir_all(&dir).expect("create test/example dir");
+            std::fs::write(
+                dir.join("fixture.rs"),
+                "#[mailer(list_unsubscribe = \"weekly_digest\")]\nfn f() {}",
+            )
+            .expect("write fixture source");
+        }
+        assert!(
+            !scan_dir_for_list_unsubscribe(root.path()),
+            "tests/ and examples/ fixtures must be skipped"
         );
 
         // A real workspace member that declares one is still detected.
