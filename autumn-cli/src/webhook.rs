@@ -98,6 +98,23 @@ pub fn run_sim(provider_str: &str, url: &str, secret: &str, payload: &str) {
             req = req.header("X-GitHub-Event", "sim.event");
         }
         WebhookProvider::Stripe => {
+            // Warn if the payload has no top-level "id" field. The Stripe
+            // provider derives its replay-protection delivery ID from
+            // json_body["id"]; without it the endpoint returns 400.
+            // Real Stripe events always include "id": "evt_...".
+            if serde_json::from_str::<serde_json::Value>(payload)
+                .ok()
+                .and_then(|v| v.get("id").cloned())
+                .is_none()
+            {
+                eprintln!(
+                    "⚠️  Warning: Stripe payload has no top-level \"id\" field.\n   \
+                     The endpoint uses it as the replay-protection delivery ID and \
+                     will return 400 MissingDeliveryId.\n   \
+                     Add e.g. \"id\": \"evt_sim_001\" to your payload."
+                );
+            }
+
             let signed_payload = format!("{now}.{payload}");
             let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes())
                 .expect("HMAC can take key of any size");
@@ -120,10 +137,13 @@ pub fn run_sim(provider_str: &str, url: &str, secret: &str, payload: &str) {
         }
     }
 
-    match req.send() {
+    handle_sim_response(req.send());
+}
+
+fn handle_sim_response(result: Result<reqwest::blocking::Response, reqwest::Error>) {
+    match result {
         Ok(response) => {
             let status = response.status();
-
             match response.text() {
                 Ok(text) => {
                     if status.is_success() {

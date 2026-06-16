@@ -755,6 +755,60 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         quote! {}
     };
 
+    let with_pool_method = {
+        let hooks_field = config.hooks_type.as_ref().map_or_else(
+            || quote! {},
+            |hooks_ident| {
+                quote! {
+                    hooks: <#hooks_ident as ::autumn_web::hooks::RepositoryHooksDefault>::autumn_default(),
+                }
+            },
+        );
+        let idempotency_field = if commit_hooks_enabled {
+            quote! { idempotency: ::core::option::Option::None, }
+        } else {
+            quote! {}
+        };
+        let register_hooks = if commit_hooks_enabled {
+            quote! { Self::__autumn_register_repository_commit_hooks(); }
+        } else {
+            quote! {}
+        };
+        quote! {
+            /// Construct this repository over an explicit pool instead of
+            /// the request-extracted control pool — e.g. a shard's primary
+            /// pool from the `Shards` extractor or `state.shards()`:
+            ///
+            /// ```rust,ignore
+            /// let shard = shards.set().route(&tenant_id).await?;
+            /// let repo = Self::with_pool(shard.primary_pool().clone());
+            /// ```
+            ///
+            /// Framework defaults apply: no statement timeout, 500ms
+            /// slow-query threshold, no route-level metrics label (those
+            /// come from the request when the repository is used as an
+            /// extractor), and reads run on the supplied pool.
+            #[must_use]
+            pub fn with_pool(
+                pool: ::autumn_web::reexports::diesel_async::pooled_connection::deadpool::Pool<
+                    ::autumn_web::reexports::diesel_async::AsyncPgConnection,
+                >,
+            ) -> Self {
+                #register_hooks
+                Self {
+                    pool,
+                    #hooks_field
+                    #idempotency_field
+                    #tenant_init_field
+                    __autumn_read_route: ::autumn_web::repository::ReadRoute::Primary,
+                    __autumn_statement_timeout_ms: 0,
+                    __autumn_slow_threshold: ::std::time::Duration::from_millis(500),
+                    __autumn_route: ::core::option::Option::None,
+                }
+            }
+        }
+    };
+
     // #971: snapshot the read-routing decision once per extraction. The
     // `primary_reads` attribute pins read-after-write-sensitive aggregates
     // to the primary at compile time; otherwise the route follows
@@ -7919,6 +7973,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
         impl #pg_name {
             #across_tenants_method
+            #with_pool_method
             #hook_support_methods
 
             /// Returns a clone of this repository whose generated read

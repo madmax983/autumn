@@ -10,7 +10,7 @@ services:
     volumes:
       - pgdata:/var/lib/postgresql/data
   redis:
-    image: redis:7
+    image: redis:6
     ports:
       - "6379:6379"
 

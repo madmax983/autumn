@@ -5,6 +5,7 @@
 //! Maud templates with Tailwind CSS, and feature-flag fragment gating
 //! via the `Flags` extractor.
 
+use autumn_web::experiments::Experiments;
 use autumn_web::extract::Path;
 use autumn_web::extract::State;
 use autumn_web::feature_flags::Flags;
@@ -38,8 +39,14 @@ pub async fn front_page(
     mut db: Db,
     repo: PgPostRepository,
     flags: Flags,
+    exps: Experiments,
 ) -> AutumnResult<Markup> {
     let current_user = session.get("username").await;
+
+    // A/B experiment: compact list (control) vs. card layout (treatment).
+    // The Experiments extractor resolves the actor from the session automatically
+    // (logged-in users → user_id; anonymous → stable per-session key).
+    let compact_layout = exps.assign("feed_layout").unwrap_or_default() == "compact";
 
     // Hot posts across all subreddits. Instead of a hand-written two-way join,
     // load the page of posts, then `preload` their author + subreddit. This is
@@ -83,37 +90,38 @@ pub async fn front_page(
                 }
             }
 
-            // Post list
-            div class="space-y-2" {
-                @for post in &hot_posts {
-                    // Typed accessors on the preloaded record. `?`-free in
-                    // templates: treat a missing preload as "absent".
-                    @let author = post.author().ok().flatten();
-                    @let sub = post.subreddit().ok().flatten();
-                    @if let Some(sub) = sub {
-                        div class="bg-white rounded-lg shadow-sm border border-gray-200 \
-                                   hover:border-orange-300 transition-colors" {
-                            div class="flex items-start gap-3 p-4" {
-                                (vote_controls(post.id, post.score))
+            // Post list — layout variant determined by the feed_layout A/B
+            // experiment. compact (control): dense rows; card (treatment):
+            // bordered cards with vote controls. Author + subreddit come from
+            // the preloaded record's typed accessors (`?`-free in templates:
+            // treat a missing preload as "absent").
+            @if compact_layout {
+                div class="divide-y divide-gray-100" {
+                    @for post in &hot_posts {
+                        @let author = post.author().ok().flatten();
+                        @let sub = post.subreddit().ok().flatten();
+                        @if let Some(sub) = sub {
+                            div class="flex items-center gap-3 py-2 px-2 hover:bg-gray-50 transition-colors" {
+                                span class="text-sm font-semibold text-gray-500 w-8 text-right shrink-0" {
+                                    (post.score)
+                                }
                                 div class="flex-1 min-w-0" {
                                     a href=(paths::show(&sub.slug, &post.slug))
-                                       class="text-lg font-medium text-gray-900 hover:text-orange-600 \
-                                              line-clamp-2" {
+                                       class="text-sm font-medium text-gray-900 hover:text-orange-600 \
+                                              line-clamp-1" {
                                         (post.title)
                                     }
-                                    div class="text-xs text-gray-400 mt-1" {
+                                    div class="text-xs text-gray-400" {
                                         a href=(super::subreddits::__autumn_path_show(&sub.slug))
-                                           class="font-medium text-gray-600 hover:underline" {
+                                           class="text-gray-500 hover:underline" {
                                             "r/" (sub.name)
                                         }
                                         @if let Some(author) = author {
-                                            " \u{2022} posted by "
+                                            " \u{2022} "
                                             a href=(super::auth::__autumn_path_profile(&author.username))
-                                               class="text-gray-500 hover:underline" {
-                                                "u/" (author.username)
-                                            }
+                                               class="text-gray-500 hover:underline" { "u/" (author.username) }
                                         }
-                                        " " (time_ago(&post.created_at))
+                                        " \u{2022} " (time_ago(&post.created_at))
                                         " \u{2022} "
                                         a href=(paths::show(&sub.slug, &post.slug))
                                            class="text-gray-500 hover:text-orange-600" {
@@ -124,16 +132,60 @@ pub async fn front_page(
                             }
                         }
                     }
+                    @if hot_posts.is_empty() {
+                        p class="text-gray-400 text-center py-8 text-sm" { "Nothing here yet!" }
+                    }
                 }
-                @if hot_posts.is_empty() {
-                    div class="text-center py-16" {
-                        p class="text-gray-400 text-lg mb-4" { "Nothing here yet!" }
-                        p class="text-gray-400 text-sm" {
-                            "Be the first to "
-                            a href="/r" class="text-orange-600 hover:underline" {
-                                "join a community"
+            } @else {
+                div class="space-y-2" {
+                    @for post in &hot_posts {
+                        @let author = post.author().ok().flatten();
+                        @let sub = post.subreddit().ok().flatten();
+                        @if let Some(sub) = sub {
+                            div class="bg-white rounded-lg shadow-sm border border-gray-200 \
+                                       hover:border-orange-300 transition-colors" {
+                                div class="flex items-start gap-3 p-4" {
+                                    (vote_controls(post.id, post.score))
+                                    div class="flex-1 min-w-0" {
+                                        a href=(paths::show(&sub.slug, &post.slug))
+                                           class="text-lg font-medium text-gray-900 hover:text-orange-600 \
+                                                  line-clamp-2" {
+                                            (post.title)
+                                        }
+                                        div class="text-xs text-gray-400 mt-1" {
+                                            a href=(super::subreddits::__autumn_path_show(&sub.slug))
+                                               class="font-medium text-gray-600 hover:underline" {
+                                                "r/" (sub.name)
+                                            }
+                                            @if let Some(author) = author {
+                                                " \u{2022} posted by "
+                                                a href=(super::auth::__autumn_path_profile(&author.username))
+                                                   class="text-gray-500 hover:underline" {
+                                                    "u/" (author.username)
+                                                }
+                                            }
+                                            " " (time_ago(&post.created_at))
+                                            " \u{2022} "
+                                            a href=(paths::show(&sub.slug, &post.slug))
+                                               class="text-gray-500 hover:text-orange-600" {
+                                                (post.comment_count) " comments"
+                                            }
+                                        }
+                                    }
+                                }
                             }
-                            " and post something."
+                        }
+                    }
+                    @if hot_posts.is_empty() {
+                        div class="text-center py-16" {
+                            p class="text-gray-400 text-lg mb-4" { "Nothing here yet!" }
+                            p class="text-gray-400 text-sm" {
+                                "Be the first to "
+                                a href="/r" class="text-orange-600 hover:underline" {
+                                    "join a community"
+                                }
+                                " and post something."
+                            }
                         }
                     }
                 }

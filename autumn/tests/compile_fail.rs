@@ -81,6 +81,10 @@ fn compile_pass_tests() {
     #[cfg(feature = "db")]
     t.pass("tests/compile-pass/repository_encrypted.rs");
 
+    // Sharding extractors + repository with_pool over a shard (requires db feature)
+    #[cfg(feature = "db")]
+    t.pass("tests/compile-pass/sharded_handlers.rs");
+
     // Model factory composition (#[factory_assoc]) — requires db feature
     #[cfg(feature = "db")]
     t.pass("tests/compile-pass/model_factory_composition.rs");
