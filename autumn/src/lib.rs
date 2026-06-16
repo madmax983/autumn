@@ -176,6 +176,11 @@ pub mod middleware;
 pub mod openapi;
 pub mod pagination;
 pub mod paths;
+/// Eager-loading (preload) runtime for `#[model]` associations.
+///
+/// See [`preload`] for [`preload::Preloaded`], [`preload::NotLoaded`], and the
+/// [`preload::Preloadable`] trait that generated code implements.
+pub mod preload;
 pub mod prelude;
 pub use paths::PathExt;
 #[cfg(feature = "presence")]
@@ -333,6 +338,13 @@ pub use pagination::PageRequest;
 /// See the [`pagination`] module for the full query contract and usage
 /// patterns.
 pub use pagination::CursorPage;
+
+/// Eager-loaded record wrapper and the typed `NotLoaded` accessor error.
+///
+/// See the [`preload`] module for declaring `#[belongs_to]` / `#[has_many]` /
+/// `#[has_one]` associations and loading them with a `#[repository]`
+/// `preload(...)` call.
+pub use preload::{NotLoaded, Preloaded};
 
 /// Cursor pagination parameters extracted from the query string.
 ///
