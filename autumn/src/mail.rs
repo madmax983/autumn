@@ -191,6 +191,12 @@ fn is_valid_https_base_url(url: &str) -> bool {
 /// Whether `value` is a usable unsubscribe mailbox — a bare `local@domain` or a
 /// `mailto:local@domain` URI, with non-empty parts and no whitespace.
 fn is_valid_mailto_address(value: &str) -> bool {
+    // Reject control characters anywhere in the value (including inside a
+    // `?subject=…` query): they would otherwise survive into the raw
+    // `List-Unsubscribe` header as a CRLF injection (e.g. an extra `Bcc:`).
+    if value.chars().any(char::is_control) {
+        return false;
+    }
     let address = value
         .trim()
         .strip_prefix("mailto:")
@@ -1022,9 +1028,13 @@ impl UnsubscribeRuntime {
         }
         if let Some(mailto) = self.mailto.as_deref().filter(|s| !s.trim().is_empty()) {
             // Accept both a bare address and a full `mailto:` URI without
-            // double-prefixing the scheme.
+            // double-prefixing the scheme. Render only the bare mailbox (drop any
+            // configured `?query`) before appending the canonical subject, so a
+            // value like `mailto:u@x?subject=a\r\nBcc: v@x` can't inject extra
+            // headers into the raw `List-Unsubscribe` value.
             let trimmed = mailto.trim();
             let address = trimmed.strip_prefix("mailto:").unwrap_or(trimmed);
+            let address = address.split('?').next().unwrap_or(address);
             entries.push(format!("<mailto:{address}?subject=unsubscribe>"));
         }
         if entries.is_empty() {
@@ -4406,6 +4416,32 @@ mod tests {
         assert!(!is_valid_mailto_address("https://unsub@example.com"));
         assert!(!is_valid_mailto_address("mailto:https://unsub@example.com"));
         assert!(!is_valid_mailto_address("unsub@https://example.com"));
+        // CRLF / control characters (header-injection attempt) are rejected even
+        // when hidden behind a `?query` the address check would otherwise drop.
+        assert!(!is_valid_mailto_address(
+            "mailto:unsub@example.com?subject=x\r\nBcc: victim@example.com"
+        ));
+        assert!(!is_valid_mailto_address("unsub@example.com\nBcc: v@x.com"));
+    }
+
+    #[test]
+    fn unsubscribe_header_mailto_drops_configured_query_no_injection() {
+        // Even if a malformed value slipped past validation (e.g. set outside
+        // prod), the rendered header must carry only the bare mailbox plus the
+        // canonical subject — never an injected CRLF/Bcc.
+        let runtime = UnsubscribeRuntime {
+            base_url: None,
+            mailto: Some("mailto:u@example.com?subject=x\r\nBcc: v@x.com".to_owned()),
+            signing_keys: Arc::new(test_keys()),
+            ttl_days: 30,
+            suppression: None,
+        };
+        let header = runtime
+            .list_unsubscribe_header("a@x.com", "list")
+            .expect("mailto header");
+        assert_eq!(header, "<mailto:u@example.com?subject=unsubscribe>");
+        assert!(!header.contains('\r') && !header.contains('\n'));
+        assert!(!header.contains("Bcc"));
     }
 
     #[test]

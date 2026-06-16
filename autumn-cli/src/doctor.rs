@@ -592,6 +592,11 @@ fn is_valid_https_base_url_doctor(url: &str) -> bool {
 
 /// Mirror of `autumn_web`'s `is_valid_mailto_address` (see above).
 fn is_valid_mailto_address_doctor(value: &str) -> bool {
+    // Reject control characters anywhere in the value (CRLF injection guard);
+    // mirrors autumn_web's is_valid_mailto_address.
+    if value.chars().any(char::is_control) {
+        return false;
+    }
     let address = value
         .trim()
         .strip_prefix("mailto:")
@@ -1852,6 +1857,26 @@ fn unsubscribe_ttl_toml_type_invalid(table: Option<&toml::Table>) -> bool {
         .is_some_and(|v| v.as_integer().is_none())
 }
 
+/// True when `[mail].unsubscribe_base_url` or `[mail].unsubscribe_mailto` is
+/// present in the merged TOML but is not a string (e.g. an integer or array).
+///
+/// The runtime deserializes these as `Option<String>`, so a present non-string
+/// value fails config loading before boot. `resolve_mail_unsubscribe` only reads
+/// `as_str()` and would otherwise treat such a value as absent, letting doctor
+/// report `Pass` for a config the app can't start with — so flag it explicitly,
+/// like the TTL type guard.
+fn unsubscribe_dest_toml_type_invalid(table: Option<&toml::Table>) -> bool {
+    let mail = table
+        .and_then(|t| t.get("mail"))
+        .and_then(toml::Value::as_table);
+    ["unsubscribe_base_url", "unsubscribe_mailto"]
+        .iter()
+        .any(|key| {
+            mail.and_then(|m| m.get(*key))
+                .is_some_and(|v| v.as_str().is_none())
+        })
+}
+
 fn resolve_unsubscribe_token_ttl_days_from_sources(
     env_value: Option<String>,
     table: Option<&toml::Table>,
@@ -2432,8 +2457,27 @@ pub fn run(opts: DoctorOptions) {
     let mail_transport_disabled = effective_transport == "disabled";
     let unsub_token_ttl_days = resolve_unsubscribe_token_ttl_days(Some(&merged_mail_toml));
     let unsub_ttl_toml_type_invalid = unsubscribe_ttl_toml_type_invalid(Some(&merged_mail_toml));
+    let unsub_dest_toml_type_invalid = unsubscribe_dest_toml_type_invalid(Some(&merged_mail_toml));
     let has_list_unsubscribe_usage = detect_list_unsubscribe_usage();
     tasks.push(Box::new(move || {
+        // A present-but-non-string destination fails the runtime's typed config
+        // load (Option<String>) before boot; doctor reads an untyped table, so a
+        // non-string value would otherwise look absent. Flag it like the TTL guard.
+        if unsub_dest_toml_type_invalid {
+            return CheckResult {
+                name: "mail_unsubscribe",
+                status: CheckStatus::Fail,
+                detail: Some(
+                    "mail.unsubscribe_base_url and mail.unsubscribe_mailto must be strings; a \
+                     non-string TOML value (e.g. an integer or array) fails configuration loading \
+                     before the app can boot"
+                        .into(),
+                ),
+                hint: Some(
+                    "Set mail.unsubscribe_base_url / mail.unsubscribe_mailto to quoted string values",
+                ),
+            };
+        }
         // A present-but-non-integer TOML TTL fails the runtime's typed config load
         // before boot; doctor reads an untyped table, so flag it here rather than
         // letting it silently default in `resolve_unsubscribe_token_ttl_days`.
@@ -3262,6 +3306,27 @@ mod tests {
         let float: toml::Table =
             toml::from_str("[mail]\nunsubscribe_token_ttl_days = 30.0\n").unwrap();
         assert!(unsubscribe_ttl_toml_type_invalid(Some(&float)));
+    }
+
+    #[test]
+    fn dest_toml_type_invalid_flags_non_string_values() {
+        assert!(!unsubscribe_dest_toml_type_invalid(None));
+        let empty: toml::Table = toml::from_str("[mail]\n").unwrap();
+        assert!(!unsubscribe_dest_toml_type_invalid(Some(&empty)));
+        // String values are valid.
+        let strings: toml::Table = toml::from_str(
+            "[mail]\nunsubscribe_base_url = \"https://x\"\nunsubscribe_mailto = \"u@x.com\"\n",
+        )
+        .unwrap();
+        assert!(!unsubscribe_dest_toml_type_invalid(Some(&strings)));
+        // A present non-string (integer/array) is the wrong type — the runtime's
+        // Option<String> deserialize rejects it before boot, so doctor must flag it.
+        let int_url: toml::Table =
+            toml::from_str("[mail]\nunsubscribe_base_url = 42\n").unwrap();
+        assert!(unsubscribe_dest_toml_type_invalid(Some(&int_url)));
+        let arr_mailto: toml::Table =
+            toml::from_str("[mail]\nunsubscribe_mailto = [\"u@x.com\"]\n").unwrap();
+        assert!(unsubscribe_dest_toml_type_invalid(Some(&arr_mailto)));
     }
 
     #[test]
