@@ -504,12 +504,9 @@ pub fn check_mail_unsubscribe_config_impl(
     }
 
     if any_set {
-        return CheckResult {
-            name: "mail_unsubscribe",
-            status: CheckStatus::Pass,
-            detail: Some("list_unsubscribe is wired (unsubscribe URL/mailto configured)".into()),
-            hint: None,
-        };
+        // Reached only when a #[mailer] uses list_unsubscribe and the transport is
+        // active (the no-usage / disabled-transport cases returned above).
+        return mail_unsubscribe_configured_result(base_url.is_some(), is_production);
     }
     let detail = Some(
         "a #[mailer] declares list_unsubscribe but neither mail.unsubscribe_base_url \
@@ -533,6 +530,42 @@ pub fn check_mail_unsubscribe_config_impl(
             detail,
             hint,
         }
+    }
+}
+
+/// Result for a configured unsubscribe destination (a valid base_url and/or
+/// mailto is set, a list mailer is in use, and the transport is active).
+///
+/// A `base_url` drives the framework's one-click HTTP endpoint, which must
+/// persist opt-outs. The runtime fails closed in production when a base URL is
+/// set but no suppression backend (a database pool, or a `SuppressionStore`
+/// registered via `AppBuilder::with_suppression_store`) is available. doctor
+/// can't see a programmatically registered store, so it warns rather than
+/// greenlight a config the app may reject at startup — under `--strict` this
+/// surfaces as an error. A mailto-only destination needs no store, so it passes.
+fn mail_unsubscribe_configured_result(base_url_set: bool, is_production: bool) -> CheckResult {
+    if is_production && base_url_set {
+        return CheckResult {
+            name: "mail_unsubscribe",
+            status: CheckStatus::Warn,
+            detail: Some(
+                "mail.unsubscribe_base_url is set, so the one-click endpoint must persist \
+                 opt-outs; the runtime fails closed in production unless a suppression backend \
+                 (a database pool, or a SuppressionStore registered via \
+                 AppBuilder::with_suppression_store) is available — which doctor cannot verify \
+                 statically"
+                    .into(),
+            ),
+            hint: Some(
+                "Configure a database pool (db feature) or register a SuppressionStore before deploying so one-click unsubscribes are recorded",
+            ),
+        };
+    }
+    CheckResult {
+        name: "mail_unsubscribe",
+        status: CheckStatus::Pass,
+        detail: Some("list_unsubscribe is wired (unsubscribe URL/mailto configured)".into()),
+        hint: None,
     }
 }
 
@@ -1724,7 +1757,14 @@ fn detect_list_unsubscribe_usage() -> bool {
 /// an application binary that registers none.
 fn scan_dir_for_list_unsubscribe(root: &std::path::Path) -> bool {
     /// Directories never worth scanning for source.
-    const SKIP_DIRS: &[&str] = &["target", ".git", "node_modules", "dist", ".github", "vendor"];
+    const SKIP_DIRS: &[&str] = &[
+        "target",
+        ".git",
+        "node_modules",
+        "dist",
+        ".github",
+        "vendor",
+    ];
     let Ok(entries) = std::fs::read_dir(root) else {
         return false;
     };
@@ -1793,6 +1833,23 @@ fn resolve_unsubscribe_token_ttl_days(table: Option<&toml::Table>) -> i64 {
         std::env::var("AUTUMN_MAIL__UNSUBSCRIBE_TOKEN_TTL_DAYS").ok(),
         table,
     )
+}
+
+/// True when `[mail].unsubscribe_token_ttl_days` is present in the merged TOML
+/// but is not an integer (e.g. a quoted string or a float).
+///
+/// The runtime deserializes this field as `i64` from the TOML *before* any
+/// `AUTUMN_MAIL__UNSUBSCRIBE_TOKEN_TTL_DAYS` override is applied (the override
+/// mutates the already-typed value), so a non-integer TOML value fails config
+/// loading at boot regardless of the env var. doctor reads the merged config as
+/// an untyped table, so it must check the type explicitly instead of silently
+/// defaulting (which would greenlight a deploy the app can't start).
+fn unsubscribe_ttl_toml_type_invalid(table: Option<&toml::Table>) -> bool {
+    table
+        .and_then(|t| t.get("mail"))
+        .and_then(toml::Value::as_table)
+        .and_then(|m| m.get("unsubscribe_token_ttl_days"))
+        .is_some_and(|v| v.as_integer().is_none())
 }
 
 fn resolve_unsubscribe_token_ttl_days_from_sources(
@@ -2374,8 +2431,27 @@ pub fn run(opts: DoctorOptions) {
     );
     let mail_transport_disabled = effective_transport == "disabled";
     let unsub_token_ttl_days = resolve_unsubscribe_token_ttl_days(Some(&merged_mail_toml));
+    let unsub_ttl_toml_type_invalid = unsubscribe_ttl_toml_type_invalid(Some(&merged_mail_toml));
     let has_list_unsubscribe_usage = detect_list_unsubscribe_usage();
     tasks.push(Box::new(move || {
+        // A present-but-non-integer TOML TTL fails the runtime's typed config load
+        // before boot; doctor reads an untyped table, so flag it here rather than
+        // letting it silently default in `resolve_unsubscribe_token_ttl_days`.
+        if unsub_ttl_toml_type_invalid {
+            return CheckResult {
+                name: "mail_unsubscribe",
+                status: CheckStatus::Fail,
+                detail: Some(
+                    "mail.unsubscribe_token_ttl_days must be an integer number of days; a \
+                     non-integer TOML value (e.g. a quoted string or a float) fails configuration \
+                     loading before the app can boot"
+                        .into(),
+                ),
+                hint: Some(
+                    "Set mail.unsubscribe_token_ttl_days to a bare integer, e.g. unsubscribe_token_ttl_days = 30",
+                ),
+            };
+        }
         check_mail_unsubscribe_config_impl(
             has_list_unsubscribe_usage,
             unsub_base_url.as_deref(),
@@ -2865,13 +2941,26 @@ mod tests {
     }
 
     #[test]
-    fn mail_unsubscribe_usage_with_base_url_passes() {
+    fn mail_unsubscribe_base_url_warns_in_prod_but_passes_outside() {
+        // In production a base_url additionally requires a suppression backend the
+        // runtime fails closed without; doctor can't verify it, so it warns.
         let r = check_mail_unsubscribe_config_impl(
             true,
             Some("https://app.example.com"),
             None,
             false,
             true,
+            30,
+        );
+        assert_eq!(r.status, CheckStatus::Warn);
+        assert!(r.detail.unwrap().contains("suppression backend"));
+        // Outside production the runtime does not gate on the backend, so it passes.
+        let r = check_mail_unsubscribe_config_impl(
+            true,
+            Some("https://app.example.com"),
+            None,
+            false,
+            false,
             30,
         );
         assert_eq!(r.status, CheckStatus::Pass);
@@ -3077,7 +3166,9 @@ mod tests {
     }
 
     #[test]
-    fn mail_unsubscribe_usage_with_both_url_and_mailto_passes() {
+    fn mail_unsubscribe_usage_with_both_url_and_mailto_warns_in_prod() {
+        // base_url presence drives the suppression-backend warning even when a
+        // mailto fallback is also configured.
         let r = check_mail_unsubscribe_config_impl(
             true,
             Some("https://app.example.com"),
@@ -3086,7 +3177,7 @@ mod tests {
             true,
             30,
         );
-        assert_eq!(r.status, CheckStatus::Pass);
+        assert_eq!(r.status, CheckStatus::Warn);
     }
 
     #[test]
@@ -3152,6 +3243,25 @@ mod tests {
             resolve_unsubscribe_token_ttl_days_from_sources(Some("  ".to_owned()), None),
             30
         );
+    }
+
+    #[test]
+    fn ttl_toml_type_invalid_flags_non_integer_values() {
+        // Absent key → not invalid (the default applies).
+        assert!(!unsubscribe_ttl_toml_type_invalid(None));
+        let empty: toml::Table = toml::from_str("[mail]\n").unwrap();
+        assert!(!unsubscribe_ttl_toml_type_invalid(Some(&empty)));
+        // A bare integer is valid.
+        let int: toml::Table = toml::from_str("[mail]\nunsubscribe_token_ttl_days = 30\n").unwrap();
+        assert!(!unsubscribe_ttl_toml_type_invalid(Some(&int)));
+        // A quoted string or a float is the wrong type — the runtime's typed i64
+        // deserialize rejects it before boot, so doctor must flag it.
+        let string: toml::Table =
+            toml::from_str("[mail]\nunsubscribe_token_ttl_days = \"30\"\n").unwrap();
+        assert!(unsubscribe_ttl_toml_type_invalid(Some(&string)));
+        let float: toml::Table =
+            toml::from_str("[mail]\nunsubscribe_token_ttl_days = 30.0\n").unwrap();
+        assert!(unsubscribe_ttl_toml_type_invalid(Some(&float)));
     }
 
     #[test]
