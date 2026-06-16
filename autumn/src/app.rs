@@ -91,6 +91,10 @@ pub fn app() -> AppBuilder {
         config_loader_factory: None,
         #[cfg(feature = "db")]
         pool_provider_factory: None,
+        #[cfg(feature = "db")]
+        shard_provider_factory: None,
+        #[cfg(feature = "db")]
+        shard_router: None,
         telemetry_provider: None,
         session_store: None,
         #[cfg(feature = "ws")]
@@ -160,6 +164,19 @@ type PoolProviderFactory = Box<
                 dyn Future<
                         Output = Result<Option<crate::db::DatabaseTopology>, crate::db::PoolError>,
                     > + Send,
+            >,
+        > + Send,
+>;
+/// Captured [`DatabasePoolProvider::create_shard_topology`] calls: builds
+/// one topology per configured shard, in declaration order.
+#[cfg(feature = "db")]
+type ShardProviderFactory = Box<
+    dyn FnOnce(
+            crate::config::DatabaseConfig,
+        ) -> Pin<
+            Box<
+                dyn Future<Output = Result<Vec<crate::db::DatabaseTopology>, crate::db::PoolError>>
+                    + Send,
             >,
         > + Send,
 >;
@@ -254,6 +271,15 @@ pub struct AppBuilder {
     /// the default [`DieselDeadpoolPoolProvider`](crate::db::DieselDeadpoolPoolProvider) runs.
     #[cfg(feature = "db")]
     pool_provider_factory: Option<PoolProviderFactory>,
+    /// Companion to `pool_provider_factory` for `[[database.shards]]`
+    /// topologies; captured from the same provider in `with_pool_provider`.
+    #[cfg(feature = "db")]
+    shard_provider_factory: Option<ShardProviderFactory>,
+    /// Custom shard routing strategy. When `None` and shards are
+    /// configured, the default [`HashShardRouter`](crate::sharding::HashShardRouter)
+    /// is used.
+    #[cfg(feature = "db")]
+    shard_router: Option<Arc<dyn crate::sharding::ShardRouter>>,
     /// Custom telemetry provider (tier-1 subsystem replacement). When `None`,
     /// the default [`TracingOtlpTelemetryProvider`](crate::telemetry::TracingOtlpTelemetryProvider) runs.
     telemetry_provider: Option<Box<dyn crate::telemetry::TelemetryProvider>>,
@@ -1526,10 +1552,50 @@ impl AppBuilder {
                 "database pool provider replaced; the previously-installed provider was overwritten"
             );
         }
+        // The provider serves both the control topology and any configured
+        // shard topologies; share it between the two captured closures.
+        let provider = Arc::new(provider);
+        let shard_provider = Arc::clone(&provider);
         self.pool_provider_factory =
             Some(Box::new(move |config: crate::config::DatabaseConfig| {
                 Box::pin(async move { provider.create_topology(&config).await })
             }));
+        self.shard_provider_factory =
+            Some(Box::new(move |config: crate::config::DatabaseConfig| {
+                Box::pin(async move {
+                    let mut topologies = Vec::with_capacity(config.shards.len());
+                    for shard in &config.shards {
+                        topologies
+                            .push(shard_provider.create_shard_topology(shard, &config).await?);
+                    }
+                    Ok(topologies)
+                })
+            }));
+        self
+    }
+
+    /// Install a custom [`ShardRouter`](crate::sharding::ShardRouter),
+    /// replacing the default slot-hash router for `[[database.shards]]`
+    /// routing.
+    ///
+    /// Useful for directory/lookup routing — e.g. a control-plane table
+    /// that pins hot tenants to dedicated shards. Custom routers can
+    /// still compose with the deterministic hash via
+    /// [`ShardSet::slot_for_key`](crate::sharding::ShardSet::slot_for_key)
+    /// and
+    /// [`ShardSet::shard_for_slot`](crate::sharding::ShardSet::shard_for_slot).
+    #[cfg(feature = "db")]
+    #[must_use]
+    pub fn with_shard_router<R>(mut self, router: R) -> Self
+    where
+        R: crate::sharding::ShardRouter,
+    {
+        if self.shard_router.is_some() {
+            tracing::warn!(
+                "shard router replaced; the previously-installed router was overwritten"
+            );
+        }
+        self.shard_router = Some(Arc::new(router));
         self
     }
 
@@ -2184,13 +2250,14 @@ impl AppBuilder {
         // "db" is a reserved built-in component name. Allowing a custom indicator
         // under this name would produce an inconsistent response: the custom result
         // would still gate the aggregate status while the built-in pool check owns
-        // the components.db / checks.database display.
+        // the components.db / checks.database display. The "db:shard:" prefix is
+        // reserved for the framework's per-shard indicators for the same reason.
         #[cfg(feature = "db")]
-        if name == "db" {
+        if name == "db" || name.starts_with("db:shard:") {
             tracing::warn!(
                 indicator_name = %name,
-                "\"db\" is a reserved built-in health indicator name; registration skipped. \
-                 Use a different name for your custom indicator."
+                "\"db\" and \"db:shard:*\" are reserved built-in health indicator names; \
+                 registration skipped. Use a different name for your custom indicator."
             );
             return self;
         }
@@ -2315,6 +2382,10 @@ impl AppBuilder {
             config_loader_factory,
             #[cfg(feature = "db")]
             pool_provider_factory,
+            #[cfg(feature = "db")]
+            shard_provider_factory,
+            #[cfg(feature = "db")]
+            shard_router,
             telemetry_provider,
             session_store,
             #[cfg(feature = "ws")]
@@ -2445,6 +2516,8 @@ impl AppBuilder {
             &config,
             migrations,
             pool_provider_factory,
+            shard_provider_factory,
+            shard_router,
             RepositoryCommitHookQueueMigrationMode::Runtime,
         )
         .await
@@ -2455,16 +2528,29 @@ impl AppBuilder {
         #[cfg(feature = "db")]
         let pool = database.topology;
         #[cfg(feature = "db")]
+        let shards = database.shards;
+        #[cfg(feature = "db")]
         let replica_readiness = database.replica_readiness;
         #[cfg(feature = "db")]
         let replica_migration_check = database.replica_migration_check;
 
         #[cfg(feature = "db")]
-        if pool.is_some() {
+        if pool.is_some() || shards.is_some() {
+            // Pool sizes multiply across shards: surface the total so
+            // N-shard deployments notice the aggregate connection count.
+            let shard_max_connections = shards
+                .as_ref()
+                .map_or(0, crate::sharding::ShardSet::total_max_connections);
+            let control_max_connections = pool.as_ref().map_or(0, |topology| {
+                topology.primary().status().max_size
+                    + topology.replica().map_or(0, |p| p.status().max_size)
+            });
             tracing::info!(
                 primary_max_connections = config.database.effective_primary_pool_size(),
                 replica_configured = config.database.replica_url.is_some(),
                 replica_max_connections = config.database.effective_replica_pool_size(),
+                shard_count = shards.as_ref().map_or(0, crate::sharding::ShardSet::len),
+                total_max_connections = control_max_connections + shard_max_connections,
                 "Database topology configured"
             );
         } else {
@@ -2485,6 +2571,8 @@ impl AppBuilder {
             &config,
             #[cfg(feature = "db")]
             pool.as_ref(),
+            #[cfg(feature = "db")]
+            shards,
             #[cfg(feature = "ws")]
             channels_backend,
         );
@@ -2830,6 +2918,17 @@ impl AppBuilder {
                 server_shutdown.child_token(),
             );
         }
+        // Repositories built over a shard pool (`with_pool`) enqueue durable
+        // commit hooks into that shard's queue table; drain each one too.
+        #[cfg(feature = "db")]
+        if let Some(shards) = state.shards() {
+            for shard in shards.iter() {
+                crate::repository_commit_hooks::start_repository_commit_hook_worker(
+                    shard.primary_pool().clone(),
+                    server_shutdown.child_token(),
+                );
+            }
+        }
 
         #[cfg(feature = "presence")]
         {
@@ -3089,6 +3188,10 @@ impl AppBuilder {
             config_loader_factory,
             #[cfg(feature = "db")]
             pool_provider_factory,
+            #[cfg(feature = "db")]
+            shard_provider_factory,
+            #[cfg(feature = "db")]
+            shard_router,
             telemetry_provider,
             session_store,
             #[cfg(feature = "ws")]
@@ -3228,6 +3331,8 @@ impl AppBuilder {
             &config,
             vec![],
             pool_provider_factory,
+            shard_provider_factory,
+            shard_router,
             RepositoryCommitHookQueueMigrationMode::StaticBuild,
         )
         .await
@@ -3238,6 +3343,8 @@ impl AppBuilder {
         #[cfg(feature = "db")]
         let pool = database.topology;
         #[cfg(feature = "db")]
+        let shards = database.shards;
+        #[cfg(feature = "db")]
         let replica_readiness = database.replica_readiness;
         #[cfg(feature = "db")]
         let replica_migration_check = database.replica_migration_check;
@@ -3246,6 +3353,8 @@ impl AppBuilder {
             &config,
             #[cfg(feature = "db")]
             pool.as_ref(),
+            #[cfg(feature = "db")]
+            shards,
             #[cfg(feature = "ws")]
             channels_backend,
         );
@@ -3606,6 +3715,10 @@ impl AppBuilder {
             migrations,
             #[cfg(feature = "db")]
             pool_provider_factory,
+            #[cfg(feature = "db")]
+            shard_provider_factory,
+            #[cfg(feature = "db")]
+            shard_router,
             telemetry_provider,
             session_store,
             #[cfg(feature = "ws")]
@@ -3681,6 +3794,8 @@ impl AppBuilder {
             &config,
             migrations,
             pool_provider_factory,
+            shard_provider_factory,
+            shard_router,
             RepositoryCommitHookQueueMigrationMode::Runtime,
         )
         .await
@@ -3691,6 +3806,8 @@ impl AppBuilder {
         #[cfg(feature = "db")]
         let pool = database.topology;
         #[cfg(feature = "db")]
+        let shards = database.shards;
+        #[cfg(feature = "db")]
         let replica_readiness = database.replica_readiness;
         #[cfg(feature = "db")]
         let replica_migration_check = database.replica_migration_check;
@@ -3699,6 +3816,8 @@ impl AppBuilder {
             &config,
             #[cfg(feature = "db")]
             pool.as_ref(),
+            #[cfg(feature = "db")]
+            shards,
             #[cfg(feature = "ws")]
             channels_backend,
         );
@@ -3784,6 +3903,17 @@ impl AppBuilder {
                 pool,
                 task_shutdown.child_token(),
             );
+        }
+        // Repositories built over a shard pool (`with_pool`) enqueue durable
+        // commit hooks into that shard's queue table; drain each one too.
+        #[cfg(feature = "db")]
+        if let Some(shards) = state.shards() {
+            for shard in shards.iter() {
+                crate::repository_commit_hooks::start_repository_commit_hook_worker(
+                    shard.primary_pool().clone(),
+                    task_shutdown.child_token(),
+                );
+            }
         }
 
         if let Err(error) = run_startup_hooks(&startup_hooks, state.clone()).await {
@@ -4924,6 +5054,7 @@ fn install_i18n_bundle_layer(
 #[cfg(feature = "db")]
 struct DatabaseBootstrap {
     topology: Option<crate::db::DatabaseTopology>,
+    shards: Option<crate::sharding::ShardSet>,
     replica_readiness: Option<crate::migrate::ReplicaMigrationReadiness>,
     replica_migration_check: Option<(String, String)>,
 }
@@ -4933,6 +5064,8 @@ async fn setup_database(
     config: &AutumnConfig,
     migrations: Vec<crate::migrate::EmbeddedMigrations>,
     pool_provider: Option<PoolProviderFactory>,
+    shard_provider: Option<ShardProviderFactory>,
+    shard_router: Option<Arc<dyn crate::sharding::ShardRouter>>,
     hook_queue_migration_mode: RepositoryCommitHookQueueMigrationMode,
 ) -> Result<DatabaseBootstrap, String> {
     let migrations = migrations_with_repository_framework_migrations(
@@ -4948,31 +5081,29 @@ async fn setup_database(
     }
     .map_err(|e| format!("Failed to create database pool: {e}"))?;
 
+    let router = shard_router.unwrap_or_else(|| Arc::new(crate::sharding::HashShardRouter));
+    let shards = if config.database.has_shards() {
+        let set = match shard_provider {
+            Some(factory) => {
+                let topologies = factory(config.database.clone())
+                    .await
+                    .map_err(|e| format!("Failed to create shard pools: {e}"))?;
+                crate::sharding::build_shard_set(&config.database, topologies, router)
+            }
+            None => crate::sharding::create_shard_set(&config.database, router)
+                .map(|set| set.expect("has_shards() checked above")),
+        }
+        .map_err(|e| format!("Failed to configure shards: {e}"))?;
+        Some(set)
+    } else {
+        None
+    };
+
     // Skip migrations when the provider opted out of a database (returned
     // `Ok(None)`) — even if `database.url` is configured. Custom providers
     // signal "this app runs without a DB" by returning None; running
     // migrations against the URL anyway would defeat the opt-out.
-    if topology.is_some()
-        && let Some(url) = config.database.effective_primary_url()
-    {
-        let url = url.to_owned();
-        let profile = config.profile.clone();
-        let auto_in_prod = config.database.auto_migrate_in_production;
-        for mig in migrations {
-            let url = url.clone();
-            let profile = profile.clone();
-            // run_pending_locked polls with std::thread::sleep (up to 60 s under
-            // contention), so we must not call auto_migrate on a Tokio worker thread.
-            tokio::task::spawn_blocking(move || {
-                crate::migrate::auto_migrate(&url, profile.as_deref(), auto_in_prod, mig);
-            })
-            .await
-            .unwrap_or_else(|e| {
-                tracing::error!(error = %e, "Migration task panicked");
-                std::process::exit(1);
-            });
-        }
-    }
+    run_startup_migrations(config, topology.is_some(), shards.is_some(), migrations).await;
 
     let (replica_readiness, replica_migration_check) = if topology
         .as_ref()
@@ -4998,11 +5129,110 @@ async fn setup_database(
         (None, None)
     };
 
+    if check_replica_migrations && let Some(set) = &shards {
+        check_shard_replica_migration_parity(config, set).await;
+    }
+
     Ok(DatabaseBootstrap {
         topology,
+        shards,
         replica_readiness,
         replica_migration_check,
     })
+}
+
+/// Apply the embedded migration sets control-first, then to each shard in
+/// declaration order, failing fast on the first apply error: a
+/// half-migrated fleet that boots is worse than a crashed deploy, and
+/// already-migrated targets are idempotently skipped on retry.
+///
+/// `run_pending_locked` polls with `std::thread::sleep` (up to 60 s under
+/// contention), so the whole sequence runs off the Tokio worker threads in
+/// one blocking task that owns the embedded migration sets.
+#[cfg(feature = "db")]
+async fn run_startup_migrations(
+    config: &AutumnConfig,
+    control_configured: bool,
+    shards_configured: bool,
+    migrations: Vec<crate::migrate::EmbeddedMigrations>,
+) {
+    let control_url = if control_configured {
+        config.database.effective_primary_url().map(str::to_owned)
+    } else {
+        None
+    };
+    let shard_targets: Vec<(String, String)> = if shards_configured {
+        config
+            .database
+            .shards
+            .iter()
+            .map(|shard| (format!("shard:{}", shard.name), shard.primary_url.clone()))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let profile = config.profile.clone();
+    let auto_in_prod = config.database.auto_migrate_in_production;
+    tokio::task::spawn_blocking(move || {
+        if let Some(url) = control_url {
+            for mig in &migrations {
+                crate::migrate::auto_migrate(
+                    &url,
+                    profile.as_deref(),
+                    auto_in_prod,
+                    mig,
+                    "control",
+                );
+            }
+        }
+        for (target, url) in &shard_targets {
+            for mig in &migrations {
+                crate::migrate::auto_migrate(url, profile.as_deref(), auto_in_prod, mig, target);
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|e| {
+        tracing::error!(error = %e, "Migration task panicked");
+        std::process::exit(1);
+    });
+}
+
+/// Per-shard replica migration parity feeds each shard's runtime state
+/// (the analogue of `ProbeState`'s control-replica dependency), which
+/// gates that shard's replica reads per its `replica_fallback`.
+#[cfg(feature = "db")]
+async fn check_shard_replica_migration_parity(
+    config: &AutumnConfig,
+    set: &crate::sharding::ShardSet,
+) {
+    for (shard_config, shard) in config.database.shards.iter().zip(set.iter()) {
+        let Some(replica_url) = shard_config.replica_url.as_deref() else {
+            continue;
+        };
+        // Remember the URLs so the per-shard health indicator can re-run
+        // the parity comparison on later readiness probes, and claim the
+        // recheck throttle slot for the check that runs right here.
+        shard
+            .runtime()
+            .configure_migration_check(shard_config.primary_url.clone(), replica_url.to_owned());
+        let _ = shard.runtime().parity_check_due();
+        let readiness = crate::migrate::check_replica_migration_readiness_blocking(
+            shard_config.primary_url.clone(),
+            replica_url.to_owned(),
+        )
+        .await;
+        if readiness.is_ready() {
+            shard.runtime().mark_replica_migrations_ready();
+        } else if let Some(detail) = readiness.detail() {
+            tracing::warn!(
+                shard = %shard.name(),
+                detail = %detail,
+                "shard replica migrations are not ready"
+            );
+            shard.runtime().mark_replica_migrations_unready(detail);
+        }
+    }
 }
 
 #[cfg(feature = "db")]
@@ -5739,6 +5969,7 @@ mod validate_repository_api_policies_tests {
 fn build_state(
     config: &AutumnConfig,
     #[cfg(feature = "db")] database_topology: Option<&crate::db::DatabaseTopology>,
+    #[cfg(feature = "db")] shards: Option<crate::sharding::ShardSet>,
     #[cfg(feature = "ws")] channels_backend: Option<Arc<dyn crate::channels::ChannelsBackend>>,
 ) -> AppState {
     #[cfg(feature = "ws")]
@@ -5761,6 +5992,8 @@ fn build_state(
         pool: database_topology.map(|topology| topology.primary().clone()),
         #[cfg(feature = "db")]
         replica_pool: database_topology.and_then(|topology| topology.replica().cloned()),
+        #[cfg(feature = "db")]
+        shards,
         profile: config.profile.clone(),
         started_at: std::time::Instant::now(),
         health_detailed: config.health.detailed,
@@ -5789,6 +6022,12 @@ fn build_state(
         state
             .probes()
             .configure_replica_dependency(config.database.replica_fallback);
+    }
+    // Surface every shard in /ready and /actuator/health as a
+    // `db:shard:<name>` component (replica readiness refresh + pool stats).
+    #[cfg(feature = "db")]
+    if let Some(set) = state.shards() {
+        crate::sharding::register_shard_health_indicators(set, &state.health_indicator_registry);
     }
     state.insert_extension(config.clone());
     state.insert_extension(crate::step_up::StepUpGlobalConfig {
@@ -6072,6 +6311,8 @@ mod tests {
             pool: None,
             #[cfg(feature = "db")]
             replica_pool: None,
+            #[cfg(feature = "db")]
+            shards: None,
             profile: None,
             started_at: std::time::Instant::now(),
             health_detailed: true,
@@ -6162,6 +6403,7 @@ mod tests {
         let state = build_state(
             &config,
             Some(&topology),
+            None,
             #[cfg(feature = "ws")]
             None,
         );
@@ -6208,6 +6450,8 @@ mod tests {
             &config,
             Vec::new(),
             pool_provider_factory,
+            None,
+            None,
             RepositoryCommitHookQueueMigrationMode::Runtime,
         )
         .await
@@ -6227,6 +6471,7 @@ mod tests {
         let state = build_state(
             &config,
             Some(&topology),
+            None,
             #[cfg(feature = "ws")]
             None,
         );
@@ -6237,6 +6482,139 @@ mod tests {
         assert!(state.read_pool().is_none());
         let (status, _) = crate::probe::readiness_response(&state).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[cfg(feature = "db")]
+    fn sharded_test_config() -> AutumnConfig {
+        let mut config = AutumnConfig::default();
+        config.database.primary_url = Some("postgres://localhost/control".to_owned());
+        config.database.shards = vec![
+            crate::config::ShardConfig {
+                name: "shard0".to_owned(),
+                primary_url: "postgres://localhost/shard0".to_owned(),
+                slots: None,
+                replica_url: None,
+                primary_pool_size: Some(3),
+                replica_pool_size: None,
+                replica_fallback: None,
+            },
+            crate::config::ShardConfig {
+                name: "shard1".to_owned(),
+                primary_url: "postgres://localhost/shard1".to_owned(),
+                slots: None,
+                replica_url: Some("postgres://localhost/shard1_ro".to_owned()),
+                primary_pool_size: None,
+                replica_pool_size: Some(2),
+                replica_fallback: None,
+            },
+        ];
+        config
+    }
+
+    #[cfg(feature = "db")]
+    #[tokio::test]
+    async fn setup_database_builds_shard_set_from_config() {
+        let config = sharded_test_config();
+
+        let database = setup_database(
+            &config,
+            Vec::new(),
+            None,
+            None,
+            None,
+            RepositoryCommitHookQueueMigrationMode::Runtime,
+        )
+        .await
+        .expect("sharded config should bootstrap");
+
+        assert!(database.topology.is_some(), "control role configured");
+        let shards = database.shards.expect("shards configured");
+        assert_eq!(shards.len(), 2);
+        assert_eq!(
+            shards
+                .by_name("shard0")
+                .expect("shard0")
+                .primary_pool()
+                .status()
+                .max_size,
+            3
+        );
+        assert_eq!(
+            shards
+                .by_name("shard1")
+                .expect("shard1")
+                .replica_pool()
+                .expect("shard1 replica")
+                .status()
+                .max_size,
+            2
+        );
+
+        let state = build_state(
+            &config,
+            database.topology.as_ref(),
+            Some(shards),
+            #[cfg(feature = "ws")]
+            None,
+        );
+        let state_shards = state.shards().expect("state should expose shards");
+        assert_eq!(state_shards.len(), 2);
+        // Routing works end-to-end through state-held shards.
+        let routed = state_shards.route("tenant-1").await.expect("route");
+        assert!(["shard0", "shard1"].contains(&routed.name()));
+    }
+
+    #[cfg(feature = "db")]
+    #[tokio::test]
+    async fn custom_pool_provider_builds_shard_topologies() {
+        struct CountingProvider(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+        impl crate::db::DatabasePoolProvider for CountingProvider {
+            async fn create_pool(
+                &self,
+                config: &crate::config::DatabaseConfig,
+            ) -> Result<
+                Option<
+                    diesel_async::pooled_connection::deadpool::Pool<
+                        diesel_async::AsyncPgConnection,
+                    >,
+                >,
+                crate::db::PoolError,
+            > {
+                crate::db::create_pool(config)
+            }
+
+            async fn create_shard_topology(
+                &self,
+                shard: &crate::config::ShardConfig,
+                defaults: &crate::config::DatabaseConfig,
+            ) -> Result<crate::db::DatabaseTopology, crate::db::PoolError> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                crate::db::create_shard_topology(shard, defaults)
+            }
+        }
+
+        let config = sharded_test_config();
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let AppBuilder {
+            pool_provider_factory,
+            shard_provider_factory,
+            ..
+        } = app().with_pool_provider(CountingProvider(calls.clone()));
+
+        let database = setup_database(
+            &config,
+            Vec::new(),
+            pool_provider_factory,
+            shard_provider_factory,
+            None,
+            RepositoryCommitHookQueueMigrationMode::Runtime,
+        )
+        .await
+        .expect("provider should build shard topologies");
+
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(database.shards.expect("shards").len(), 2);
     }
 
     #[cfg(feature = "db")]
@@ -6472,6 +6850,7 @@ mod tests {
         let state = build_state(
             &config,
             Some(&topology),
+            None,
             #[cfg(feature = "ws")]
             None,
         );
@@ -6513,6 +6892,7 @@ mod tests {
         let state = build_state(
             &config,
             Some(&topology),
+            None,
             #[cfg(feature = "ws")]
             None,
         );
@@ -6560,6 +6940,8 @@ mod tests {
 
         let state = build_state(
             &config,
+            #[cfg(feature = "db")]
+            None,
             #[cfg(feature = "db")]
             None,
             #[cfg(feature = "ws")]
@@ -7054,6 +7436,8 @@ mod tests {
             pool: None,
             #[cfg(feature = "db")]
             replica_pool: None,
+            #[cfg(feature = "db")]
+            shards: None,
             profile: None,
             started_at: std::time::Instant::now(),
             health_detailed: true,
@@ -7163,6 +7547,8 @@ mod tests {
             pool: None,
             #[cfg(feature = "db")]
             replica_pool: None,
+            #[cfg(feature = "db")]
+            shards: None,
             profile: None,
             started_at: std::time::Instant::now(),
             health_detailed: true,
@@ -7241,38 +7627,7 @@ mod tests {
             },
         ];
         let config = AutumnConfig::default();
-        let state = AppState {
-            extensions: std::sync::Arc::new(std::sync::RwLock::new(
-                std::collections::HashMap::new(),
-            )),
-            #[cfg(feature = "db")]
-            pool: None,
-            #[cfg(feature = "db")]
-            replica_pool: None,
-            profile: None,
-            started_at: std::time::Instant::now(),
-            health_detailed: true,
-            probes: crate::probe::ProbeState::ready_for_test(),
-            metrics: crate::middleware::MetricsCollector::new(),
-            log_levels: crate::actuator::LogLevels::new("info"),
-            task_registry: crate::actuator::TaskRegistry::new(),
-            job_registry: crate::actuator::JobRegistry::new(),
-            config_props: crate::actuator::ConfigProperties::default(),
-            metrics_source_registry: crate::actuator::MetricsSourceRegistry::new(),
-            health_indicator_registry: crate::actuator::HealthIndicatorRegistry::new(),
-            #[cfg(feature = "ws")]
-            channels: crate::channels::Channels::new(32),
-            #[cfg(feature = "presence")]
-            presence: crate::presence::Presence::new(crate::channels::Channels::new(32)),
-            #[cfg(feature = "ws")]
-            shutdown: tokio_util::sync::CancellationToken::new(),
-            policy_registry: crate::authorization::PolicyRegistry::default(),
-            forbidden_response: crate::authorization::ForbiddenResponse::default(),
-            auth_session_key: "user_id".to_owned(),
-            shared_cache: None,
-            clock: std::sync::Arc::new(crate::time::SystemClock),
-        };
-        let router = crate::router::build_router(route_list, &config, state);
+        let router = crate::router::build_router(route_list, &config, AppState::for_test());
 
         // GET /admin should return "list"
         let resp = router
@@ -7542,6 +7897,8 @@ mod tests {
             pool: None,
             #[cfg(feature = "db")]
             replica_pool: None,
+            #[cfg(feature = "db")]
+            shards: None,
             profile: None,
             started_at: std::time::Instant::now(),
             health_detailed: true,
@@ -7855,6 +8212,8 @@ mod tests {
             pool: None,
             #[cfg(feature = "db")]
             replica_pool: None,
+            #[cfg(feature = "db")]
+            shards: None,
             profile: None,
             started_at: std::time::Instant::now(),
             health_detailed: true,
@@ -8006,6 +8365,8 @@ mod tests {
             pool: None,
             #[cfg(feature = "db")]
             replica_pool: None,
+            #[cfg(feature = "db")]
+            shards: None,
             profile: None,
             started_at: std::time::Instant::now(),
             health_detailed: true,
@@ -8055,6 +8416,8 @@ mod tests {
             pool: None,
             #[cfg(feature = "db")]
             replica_pool: None,
+            #[cfg(feature = "db")]
+            shards: None,
             profile: None,
             started_at: std::time::Instant::now(),
             health_detailed: true,
@@ -8314,6 +8677,8 @@ mod tests {
             pool: None,
             #[cfg(feature = "db")]
             replica_pool: None,
+            #[cfg(feature = "db")]
+            shards: None,
             profile: None,
             started_at: std::time::Instant::now(),
             health_detailed: true,
@@ -8387,6 +8752,8 @@ mod tests {
             pool: None,
             #[cfg(feature = "db")]
             replica_pool: None,
+            #[cfg(feature = "db")]
+            shards: None,
             profile: None,
             started_at: std::time::Instant::now(),
             health_detailed: true,

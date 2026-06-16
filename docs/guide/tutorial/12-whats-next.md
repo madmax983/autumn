@@ -26,7 +26,7 @@ tutorial omitted. Then branch out into the newer example apps:
 - `examples/blog/` for hybrid rendering and a richer admin UI
 - `examples/bookmarks/` for repository macros, generated CRUD APIs, and scheduled tasks
 - `examples/wiki/` for mutation hooks and revision history
-- `examples/signed-webhooks/` for signed third-party callback intake and replay fixtures
+- `examples/reddit-clone/src/routes/webhooks.rs` for signed third-party callback intake and replay fixtures
 
 ### Ideas for Extending the App
 

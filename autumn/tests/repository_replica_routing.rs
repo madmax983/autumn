@@ -206,3 +206,38 @@ async fn reads_error_when_replica_unready_and_fallback_forbidden() {
         "error should explain the replica is unavailable, got: {err}"
     );
 }
+
+/// Issue #835: `preload` runs against the same read role as the parent finder.
+/// It acquires its connection through the repository's `ReadRoute`, so under a
+/// `FailReadiness` policy with an unready replica it fails fast with the same
+/// "replica unavailable" error a finder would — before touching any pool, and
+/// without ever falling back to the primary. (Runs without a live database.)
+#[tokio::test]
+async fn preload_routes_through_read_role_and_fails_fast_on_unavailable() {
+    let state = two_pool_state();
+    state
+        .probes()
+        .configure_replica_dependency(ReplicaFallback::FailReadiness);
+    state
+        .probes()
+        .mark_replica_unready("replica connection failed");
+
+    let repo: PgReplicaNoteRepository = extract(&state).await;
+    assert!(matches!(repo.__autumn_read_route(), ReadRoute::Unavailable));
+
+    let err = repo
+        .preload(
+            vec![ReplicaNote {
+                id: 1,
+                content: "x".into(),
+            }],
+            ReplicaNote::preload(),
+        )
+        .await
+        .expect_err("preload must honor the unavailable read route");
+    assert!(
+        err.to_string().to_lowercase().contains("replica"),
+        "preload should route through the read role and report the replica is \
+         unavailable, got: {err}"
+    );
+}

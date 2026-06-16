@@ -220,6 +220,13 @@ pub trait DbState {
         self.replica_pool().or_else(|| self.pool())
     }
 
+    /// Returns the configured shard set, when `[[database.shards]]`
+    /// entries exist. Defaults to `None` so unsharded states need no
+    /// changes.
+    fn shards(&self) -> Option<&crate::sharding::ShardSet> {
+        None
+    }
+
     /// Returns any registered database connection checkout interceptors.
     fn db_interceptors(
         &self,
@@ -692,6 +699,36 @@ pub fn create_topology(config: &DatabaseConfig) -> Result<Option<DatabaseTopolog
     Ok(Some(DatabaseTopology { primary, replica }))
 }
 
+/// Create one shard's primary and optional replica pools, applying the
+/// shard's pool-size and timeout fallbacks to the `[database]` defaults.
+///
+/// # Errors
+///
+/// Returns [`PoolError`] if either configured role cannot be built.
+pub fn create_shard_topology(
+    shard: &crate::config::ShardConfig,
+    defaults: &DatabaseConfig,
+) -> Result<DatabaseTopology, PoolError> {
+    let primary = build_pool(
+        &shard.primary_url,
+        shard.effective_primary_pool_size(defaults),
+        defaults.connect_timeout_secs,
+    )?;
+    let replica = shard
+        .replica_url
+        .as_deref()
+        .map(|url| {
+            build_pool(
+                url,
+                shard.effective_replica_pool_size(defaults),
+                defaults.connect_timeout_secs,
+            )
+        })
+        .transpose()?;
+
+    Ok(DatabaseTopology { primary, replica })
+}
+
 // ── Db extractor ─────────────────────────────────────────────
 
 /// Connection type managed by the deadpool pool.
@@ -890,22 +927,39 @@ impl std::ops::DerefMut for Db {
     }
 }
 
-impl<S> FromRequestParts<S> for Db
-where
-    S: DbState + Send + Sync,
-{
-    type Rejection = AutumnError;
+/// Everything required to check out and instrument a pooled connection.
+///
+/// Shared by the plain [`Db`] extractor and shard-routed checkouts so that
+/// every connection — regardless of which pool it came from — gets the same
+/// span, interceptor, statement-timeout, and slow-query treatment.
+pub(crate) struct DbCheckoutParams<'a> {
+    /// Pool to check the connection out of.
+    pub pool: &'a Pool<AsyncPgConnection>,
+    /// Role label surfaced to [`DbConnectionInterceptor`]s, e.g. `"primary"`
+    /// or `"shard:<name>:primary"`.
+    pub pool_name: &'a str,
+    /// Shard name recorded on the `db.connection` span, when routed.
+    pub shard: Option<&'a str>,
+    /// Resolved statement timeout (route override already merged with the
+    /// global config). `None` disables the timeout (`SET statement_timeout = 0`).
+    pub statement_timeout: Option<std::time::Duration>,
+    /// `"METHOD /matched/path"` key used for per-route DB metrics.
+    pub route_key: Option<String>,
+    pub metrics: Option<crate::middleware::MetricsCollector>,
+    pub slow_query_threshold: std::time::Duration,
+    pub interceptors: Vec<std::sync::Arc<dyn crate::interceptor::DbConnectionInterceptor>>,
+}
 
-    async fn from_request_parts(
-        parts: &mut axum::http::request::Parts,
-        state: &S,
-    ) -> Result<Self, Self::Rejection> {
+impl Db {
+    /// Check a connection out of `params.pool` with full instrumentation.
+    ///
+    /// This is the single code path behind the [`Db`] extractor and all
+    /// shard-routed checkouts: span creation, checkout interceptors,
+    /// `SET statement_timeout`, and the metrics captured for the
+    /// slow-query warning on `Drop`.
+    pub(crate) async fn checkout(params: DbCheckoutParams<'_>) -> Result<Self, AutumnError> {
         const PG_TIMEOUT_MAX_MS: u64 = i32::MAX as u64;
         use diesel_async::RunQueryDsl as _;
-
-        let pool = state
-            .pool()
-            .ok_or_else(|| AutumnError::service_unavailable_msg("Database not configured"))?;
 
         // Span covers the full time the connection is held — from
         // checkout through the end of the request — rather than just
@@ -917,39 +971,39 @@ where
             "db.connection",
             otel.kind = "client",
             db.system = "postgresql",
+            db.shard = tracing::field::Empty,
         );
-        let interceptors = state.db_interceptors();
+        if let Some(shard) = params.shard {
+            span.record("db.shard", shard);
+        }
 
+        let pool = params.pool;
         let mut checkout_future: std::pin::Pin<
             Box<
                 dyn std::future::Future<Output = Result<PooledConnection, AutumnError>> + Send + '_,
             >,
-        > = Box::pin(async {
+        > = Box::pin(async move {
             pool.get().await.map_err(|e| {
                 tracing::error!("Failed to acquire database connection: {e}");
                 AutumnError::service_unavailable_msg(e.to_string())
             })
         });
-        for interceptor in &interceptors {
+        for interceptor in &params.interceptors {
             let ctx = crate::interceptor::DbCheckoutContext {
-                pool_name: "primary".to_string(),
+                pool_name: params.pool_name.to_string(),
             };
             checkout_future = interceptor.intercept_checkout(ctx, checkout_future);
         }
 
         let mut conn = checkout_future.instrument(span.clone()).await?;
 
-        let timeout_override = parts.extensions.get::<StatementTimeout>().copied();
         // Postgres statement_timeout is a signed 32-bit integer (milliseconds).
         // Cap at i32::MAX to avoid a confusing 503 for very large configured values.
-        let timeout_ms = timeout_override
-            .map(|t| t.0)
-            .or_else(|| state.statement_timeout())
-            .map_or(0u64, |d| {
-                u64::try_from(d.as_millis())
-                    .unwrap_or(PG_TIMEOUT_MAX_MS)
-                    .min(PG_TIMEOUT_MAX_MS)
-            });
+        let timeout_ms = params.statement_timeout.map_or(0u64, |d| {
+            u64::try_from(d.as_millis())
+                .unwrap_or(PG_TIMEOUT_MAX_MS)
+                .min(PG_TIMEOUT_MAX_MS)
+        });
 
         diesel::sql_query(format!("SET statement_timeout = {timeout_ms}"))
             .execute(&mut conn)
@@ -959,27 +1013,85 @@ where
                 AutumnError::service_unavailable_msg(format!("Database initialization error: {e}"))
             })?;
 
-        let matched_path = parts
-            .extensions
-            .get::<axum::extract::MatchedPath>()
-            .map_or_else(|| parts.uri.path(), axum::extract::MatchedPath::as_str);
-        let route_key = format!("{} {}", parts.method, matched_path);
-        let metrics = state.metrics();
-        let slow_query_threshold = state.slow_query_threshold();
         let start_time = std::time::Instant::now();
-        let is_test_tx = interceptors.iter().any(|i| i.is_transactional_test());
+        let is_test_tx = params
+            .interceptors
+            .iter()
+            .any(|i| i.is_transactional_test());
 
         Ok(Self {
             conn,
             span,
             tx_depth: 0,
             tx_poisoned: false,
-            route_key: Some(route_key),
-            metrics: metrics.cloned(),
-            slow_query_threshold,
+            route_key: params.route_key,
+            metrics: params.metrics,
+            slow_query_threshold: params.slow_query_threshold,
             start_time,
             is_test_tx,
         })
+    }
+}
+
+/// Request-derived context shared by every `Db`-producing extractor.
+///
+/// Captures the route-override statement timeout, the matched-path metrics
+/// key, and the state-held instrumentation handles so shard-routed
+/// checkouts behave identically to the plain [`Db`] extractor.
+#[derive(Clone)]
+pub(crate) struct RequestDbContext {
+    pub statement_timeout: Option<std::time::Duration>,
+    pub route_key: Option<String>,
+    pub metrics: Option<crate::middleware::MetricsCollector>,
+    pub slow_query_threshold: std::time::Duration,
+    pub interceptors: Vec<std::sync::Arc<dyn crate::interceptor::DbConnectionInterceptor>>,
+}
+
+impl RequestDbContext {
+    pub(crate) fn from_parts<S: DbState>(parts: &axum::http::request::Parts, state: &S) -> Self {
+        let timeout_override = parts.extensions.get::<StatementTimeout>().copied();
+        let matched_path = parts
+            .extensions
+            .get::<axum::extract::MatchedPath>()
+            .map_or_else(|| parts.uri.path(), axum::extract::MatchedPath::as_str);
+        Self {
+            statement_timeout: timeout_override
+                .map(|t| t.0)
+                .or_else(|| state.statement_timeout()),
+            route_key: Some(format!("{} {}", parts.method, matched_path)),
+            metrics: state.metrics().cloned(),
+            slow_query_threshold: state.slow_query_threshold(),
+            interceptors: state.db_interceptors(),
+        }
+    }
+}
+
+impl<S> FromRequestParts<S> for Db
+where
+    S: DbState + Send + Sync,
+{
+    type Rejection = AutumnError;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        let pool = state
+            .pool()
+            .ok_or_else(|| AutumnError::service_unavailable_msg("Database not configured"))?;
+        let ctx = RequestDbContext::from_parts(parts, state);
+
+        Self::checkout(DbCheckoutParams {
+            pool,
+            pool_name: "primary",
+            shard: None,
+            statement_timeout: ctx.statement_timeout,
+            route_key: ctx.route_key,
+            metrics: ctx.metrics,
+            slow_query_threshold: ctx.slow_query_threshold,
+            interceptors: ctx.interceptors,
+        })
+        .await
     }
 }
 
@@ -1091,6 +1203,25 @@ pub trait DatabasePoolProvider: Send + Sync + 'static {
 
             Ok(Some(DatabaseTopology::from_pools(primary, replica)))
         }
+    }
+
+    /// Create one shard's [`DatabaseTopology`] from its
+    /// `[[database.shards]]` entry.
+    ///
+    /// The default implementation uses Autumn's deadpool factory for both
+    /// roles. Override to decorate per-shard pools (metrics wrappers,
+    /// circuit breakers) the same way `create_pool` decorates the control
+    /// role.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PoolError`] if either configured role cannot be built.
+    fn create_shard_topology(
+        &self,
+        shard: &crate::config::ShardConfig,
+        defaults: &DatabaseConfig,
+    ) -> impl std::future::Future<Output = Result<DatabaseTopology, PoolError>> + Send {
+        async move { create_shard_topology(shard, defaults) }
     }
 }
 
