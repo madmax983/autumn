@@ -99,7 +99,7 @@ pub fn run(action: &MigrateAction, with_maintenance: bool, target: &MigrateTarge
             return;
         }
         MigrateAction::Down(args) => {
-            run_down(args, with_maintenance);
+            run_down(args, with_maintenance, target);
             return;
         }
         _ => {}
@@ -754,9 +754,7 @@ fn build_rollback_plan(args: &DownArgs, applied: &[AppliedUserMigration]) -> Vec
 }
 
 /// Run `autumn migrate down`.
-fn run_down(args: &DownArgs, with_maintenance: bool) {
-    use autumn_web::migrate::revert_user_migrations_locked;
-
+fn run_down(args: &DownArgs, with_maintenance: bool, target: &MigrateTarget) {
     // 1. Production guard
     if is_production_profile() && !args.yes_i_mean_prod {
         eprintln!("\u{2717} Production profile detected.");
@@ -765,17 +763,71 @@ fn run_down(args: &DownArgs, with_maintenance: bool) {
         std::process::exit(1);
     }
 
-    // 2. Resolve DB URL + migrations dir
-    let database_url = resolve_database_url();
+    // 2. Resolve target databases (control + shards / a single shard /
+    //    control-only) and the migrations dir. `down` honors --shard /
+    //    --control-only exactly like `migrate run`.
+    let targets = resolve_targets(target);
     let migrations_dir = resolve_migrations_dir();
     let dir = Path::new(&migrations_dir);
 
-    // 3. Plan + revert atomically under the migration advisory lock. Listing the
-    //    applied migrations, building the plan, and preflighting down.sql all
-    //    happen inside `plan` (under the lock) so the plan cannot go stale
-    //    between read and execute (e.g. two concurrent `down` runs).
-    let result = revert_user_migrations_locked(
-        &database_url,
+    // Maintenance mode is a global flag, so enable it at most once (the first
+    // time any target actually has work) and disable it after all targets
+    // complete. Tracked across targets so an empty plan never toggles it.
+    let mut maintenance_enabled = false;
+    let mut total_reverted = 0usize;
+    let multi = targets.len() > 1;
+
+    for (label, url) in &targets {
+        if multi {
+            eprintln!("\u{2500}\u{2500} Rolling back {label} \u{2500}\u{2500}");
+        }
+        match run_down_target(args, url, dir, with_maintenance, &mut maintenance_enabled) {
+            Ok(n) => {
+                total_reverted += n;
+                if multi {
+                    eprintln!();
+                }
+            }
+            Err(e) => {
+                eprintln!("\n\u{2717} Rollback failed for {label}: {e}");
+                if maintenance_enabled {
+                    eprintln!(
+                        "  \u{26A0}\u{FE0F}  Maintenance mode left ON for safety. Investigate, then run \
+                         `autumn maintenance off` to re-open traffic."
+                    );
+                }
+                std::process::exit(1);
+            }
+        }
+    }
+
+    if total_reverted > 0 {
+        eprintln!("\n\u{2713} {total_reverted} migration(s) rolled back.");
+    }
+    if maintenance_enabled {
+        disable_maintenance_after_migrate();
+    }
+}
+
+/// Roll back the planned user migrations on a single target database, under the
+/// migration advisory lock. Returns the number of migrations reverted.
+///
+/// Listing applied migrations, building the plan, and preflighting `down.sql`
+/// all happen inside the `plan` closure (under the lock) so the plan cannot go
+/// stale between read and execute (e.g. two concurrent `down` runs).
+/// `maintenance_enabled` is shared across targets so maintenance mode is
+/// enabled at most once, the first time any target has work to do.
+fn run_down_target(
+    args: &DownArgs,
+    database_url: &str,
+    dir: &Path,
+    with_maintenance: bool,
+    maintenance_enabled: &mut bool,
+) -> Result<usize, autumn_web::migrate::MigrationError> {
+    use autumn_web::migrate::revert_user_migrations_locked;
+
+    revert_user_migrations_locked(
+        database_url,
         dir,
         None,
         |applied| {
@@ -808,10 +860,12 @@ fn run_down(args: &DownArgs, with_maintenance: bool) {
                 std::process::exit(1);
             }
 
-            // Preflight passed: enable maintenance mode (if requested) before we
-            // start mutating schema, then stream the rollback.
-            if with_maintenance {
+            // Preflight passed: enable maintenance mode (if requested and not
+            // already enabled for an earlier target) before we mutate schema,
+            // then stream the rollback.
+            if with_maintenance && !*maintenance_enabled {
                 enable_maintenance_for_migrate();
+                *maintenance_enabled = true;
             }
             eprintln!("  Rolling back {} migration(s)...\n", plan.len());
             Ok(plan)
@@ -823,27 +877,7 @@ fn run_down(args: &DownArgs, with_maintenance: bool) {
                 r.duration.as_millis()
             );
         },
-    );
-
-    match result {
-        Ok(0) => {} // "Nothing to roll back." already printed; maintenance never enabled.
-        Ok(n) => {
-            eprintln!("\n\u{2713} {n} migration(s) rolled back.");
-            if with_maintenance {
-                disable_maintenance_after_migrate();
-            }
-        }
-        Err(e) => {
-            eprintln!("\n\u{2717} Rollback failed: {e}");
-            if with_maintenance {
-                eprintln!(
-                    "  \u{26A0}\u{FE0F}  Maintenance mode left ON for safety. Investigate, then run \
-                     `autumn maintenance off` to re-open traffic."
-                );
-            }
-            std::process::exit(1);
-        }
-    }
+    )
 }
 
 /// Show rollback availability for all applied user migrations.
