@@ -724,12 +724,23 @@ fn has_revertable_down_sql(m: &AppliedUserMigration) -> bool {
 
 /// Build the newest-first list of user-migration versions to revert.
 ///
-/// With `--to VERSION`, every applied version strictly newer than `VERSION` is
-/// reverted (exiting non-zero if `VERSION` is not currently applied). Otherwise
-/// the most recently applied `--steps N` (default 1) versions are reverted.
+/// With `--to VERSION`, every applied *user* migration strictly newer than
+/// `VERSION` is reverted (exiting non-zero if `VERSION` is not currently applied
+/// at all). `VERSION` may be either a user or a framework migration: a framework
+/// version is a valid boundary — the newer user migrations above it are reverted
+/// while the framework migration stays in place (framework migrations are
+/// forward-only). Otherwise the most recently applied `--steps N` (default 1)
+/// user migrations are reverted.
 ///
-/// `applied` is ascending by version, so the newest-first plan is its reverse.
-fn build_rollback_plan(args: &DownArgs, applied: &[AppliedUserMigration]) -> Vec<String> {
+/// `applied` is the ascending-by-version list of applied *user* migrations;
+/// `applied_all` is the ascending set of *all* applied versions (framework +
+/// user) used only to validate the `--to` boundary. The newest-first plan is
+/// the matching user migrations reversed.
+fn build_rollback_plan(
+    args: &DownArgs,
+    applied: &[AppliedUserMigration],
+    applied_all: &[String],
+) -> Vec<String> {
     let Some(target_version) = args.to.as_deref() else {
         let n = args.steps.unwrap_or(1);
         return applied
@@ -740,9 +751,9 @@ fn build_rollback_plan(args: &DownArgs, applied: &[AppliedUserMigration]) -> Vec
             .collect();
     };
 
-    if !applied.iter().any(|m| m.version == target_version) {
+    if !applied_all.iter().any(|v| v == target_version) {
         eprintln!("\u{2717} Version {target_version} is not currently applied.");
-        eprintln!("  Check `autumn migrate status` to see the applied user migrations.");
+        eprintln!("  Check `autumn migrate status` to see the applied migrations.");
         std::process::exit(1);
     }
     applied
@@ -770,6 +781,15 @@ fn run_down(args: &DownArgs, with_maintenance: bool, target: &MigrateTarget) {
     let migrations_dir = resolve_migrations_dir();
     let dir = Path::new(&migrations_dir);
 
+    // Multi-target rollbacks are fail-fast and applied in order, matching the
+    // forward `migrate run`: each target is reverted before the next is
+    // planned. If a later target fails (a runtime down.sql error, or shards at
+    // divergent migration states), earlier targets are already rolled back —
+    // re-running `down` then plans from each target's current state. To roll a
+    // single database back in isolation, scope the command with --shard /
+    // --control-only. (Missing/empty down.sql is caught by preflight before any
+    // mutation, since all targets share one migrations dir.)
+    //
     // Maintenance mode is a global flag, so enable it at most once (the first
     // time any target actually has work) and disable it after all targets
     // complete. Tracked across targets so an empty plan never toggles it.
@@ -824,14 +844,25 @@ fn run_down_target(
     with_maintenance: bool,
     maintenance_enabled: &mut bool,
 ) -> Result<usize, autumn_web::migrate::MigrationError> {
-    use autumn_web::migrate::revert_user_migrations_locked;
+    use autumn_web::migrate::{applied_migration_versions, revert_user_migrations_locked};
+
+    // The full applied set (framework + user) is needed only to validate a
+    // `--to` boundary that may name a framework migration. Framework migrations
+    // are forward-only, so reading this before the lock is safe: a concurrent
+    // `migrate run` can only add *newer* framework versions, never remove an
+    // older boundary. Skip the query entirely when `--to` is not in play.
+    let applied_all = if args.to.is_some() {
+        applied_migration_versions(database_url)?
+    } else {
+        Vec::new()
+    };
 
     revert_user_migrations_locked(
         database_url,
         dir,
         None,
         |applied| {
-            let plan = build_rollback_plan(args, applied);
+            let plan = build_rollback_plan(args, applied, &applied_all);
             if plan.is_empty() {
                 eprintln!("  \u{2713} Nothing to roll back.");
                 return Ok(plan);
@@ -1315,7 +1346,8 @@ mod tests {
             to: None,
             yes_i_mean_prod: false,
         };
-        assert_eq!(build_rollback_plan(&args, &applied), ["20260102000000"]);
+        // `applied_all` is unused on the default/steps path.
+        assert_eq!(build_rollback_plan(&args, &applied, &[]), ["20260102000000"]);
     }
 
     #[test]
@@ -1332,7 +1364,7 @@ mod tests {
         };
         // Newest-first so dependent migrations revert before their dependencies.
         assert_eq!(
-            build_rollback_plan(&args, &applied),
+            build_rollback_plan(&args, &applied, &[]),
             ["20260103000000", "20260102000000"]
         );
     }
@@ -1344,14 +1376,37 @@ mod tests {
             applied("20260102000000"),
             applied("20260103000000"),
         ];
+        let applied_all: Vec<String> =
+            applied.iter().map(|m| m.version.clone()).collect();
         let args = DownArgs {
             steps: None,
             to: Some("20260101000000".to_string()),
             yes_i_mean_prod: false,
         };
         assert_eq!(
-            build_rollback_plan(&args, &applied),
+            build_rollback_plan(&args, &applied, &applied_all),
             ["20260103000000", "20260102000000"]
+        );
+    }
+
+    #[test]
+    fn build_rollback_plan_to_accepts_framework_version_boundary() {
+        // A framework migration (forward-only, so absent from the user list) is
+        // a valid `--to` boundary: the newer user migrations above it revert
+        // while the framework migration itself stays applied.
+        let framework = "20260512000000";
+        let applied = [applied("20260601000000"), applied("20260602000000")];
+        let applied_all: Vec<String> = std::iter::once(framework.to_string())
+            .chain(applied.iter().map(|m| m.version.clone()))
+            .collect();
+        let args = DownArgs {
+            steps: None,
+            to: Some(framework.to_string()),
+            yes_i_mean_prod: false,
+        };
+        assert_eq!(
+            build_rollback_plan(&args, &applied, &applied_all),
+            ["20260602000000", "20260601000000"]
         );
     }
 

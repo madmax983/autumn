@@ -204,7 +204,9 @@ autumn migrate down
 # Revert the last 3 user migrations in newest-first order:
 autumn migrate down --steps 3
 
-# Revert user migrations until 20260101000000 is the latest applied:
+# Revert user migrations until 20260101000000 is the latest applied.
+# VERSION may be a framework migration: framework stays forward-only, so only
+# the newer user migrations above the boundary are reverted.
 autumn migrate down --to 20260101000000
 
 # Required when AUTUMN_ENV=prod:
@@ -238,6 +240,19 @@ Before touching the database, `autumn migrate down` checks:
 Listing the applied migrations, building the plan, and reverting all happen
 while the migration advisory lock is held, so two concurrent `down` runs are
 serialized and neither double-reverts.
+
+### Sharded deployments
+
+Like `autumn migrate run`, `autumn migrate down` operates on the control
+database plus every configured shard by default, and honours `--shard <name>`
+and `--control-only` to scope to a single target. Targets are rolled back in
+order and the command is **fail-fast**: if a later target fails (for example a
+runtime `down.sql` error, or shards sitting at divergent migration states), the
+earlier targets have already been rolled back. Re-running `down` then plans
+from each target's current state, so scope the command with `--shard` /
+`--control-only` when you need to roll a single database back in isolation. (A
+missing or empty `down.sql` is caught by preflight before any target is
+mutated, since all targets share one `migrations/` directory.)
 
 `autumn migrate check` also classifies `down.sql` files (in addition to
 `up.sql`), so you can catch unsafe rollback SQL — such as `DROP TABLE` or a

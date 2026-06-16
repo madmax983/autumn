@@ -630,7 +630,9 @@ enum MigrateCommands {
         steps: Option<usize>,
         /// Revert user migrations until VERSION is the latest applied.
         ///
-        /// VERSION must currently be applied. Fails cleanly otherwise.
+        /// VERSION must currently be applied (fails cleanly otherwise) and may
+        /// name a framework migration: framework migrations stay forward-only,
+        /// so only the newer user migrations above the boundary are reverted.
         /// Mutually exclusive with --steps.
         #[arg(long, value_name = "VERSION", conflicts_with = "steps")]
         to: Option<String>,
