@@ -313,6 +313,12 @@ fn emit_association_items(
                             .load::<#target>(&mut *conn)
                             .await
                             .map_err(::autumn_web::AutumnError::from)?;
+                        // Apply the target's own read scoping (tenant isolation +
+                        // soft-delete) to the freshly loaded rows, mirroring what
+                        // the target's repository finders would hide. The source
+                        // macro can't see the target's columns, so the target
+                        // generates this helper from its own field set.
+                        let __rows = #target::__autumn_preload_retain(__rows);
                         let mut __children: ::std::vec::Vec<
                             ::autumn_web::preload::Preloaded<#target>
                         > = __rows.into_iter().map(::autumn_web::preload::Preloaded::new).collect();
@@ -370,6 +376,12 @@ fn emit_association_items(
                             .load::<#target>(&mut *conn)
                             .await
                             .map_err(::autumn_web::AutumnError::from)?;
+                        // Apply the target's own read scoping (tenant isolation +
+                        // soft-delete) to the freshly loaded rows, mirroring what
+                        // the target's repository finders would hide. The source
+                        // macro can't see the target's columns, so the target
+                        // generates this helper from its own field set.
+                        let __rows = #target::__autumn_preload_retain(__rows);
                         let mut __children: ::std::vec::Vec<
                             ::autumn_web::preload::Preloaded<#target>
                         > = __rows.into_iter().map(::autumn_web::preload::Preloaded::new).collect();
@@ -1722,6 +1734,65 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         .find(|f| f.ident.as_ref().is_some_and(|id| id == "tenant_id"))
         .copied();
 
+    // `__autumn_preload_retain`: applies this model's read scoping to rows
+    // loaded by another model's `preload`, in-memory, so eager-loaded
+    // associations hide the same rows the model's repository finders do.
+    // Built from the model's own field set (the loading model can't see these
+    // columns): soft-delete drops `deleted_at IS NOT NULL`; tenant scoping
+    // keeps only rows matching the ambient `CURRENT_TENANT` when one is set.
+    let deleted_at_field = all_fields
+        .iter()
+        .find(|f| f.ident.as_ref().is_some_and(|id| id == "deleted_at"))
+        .copied();
+    let soft_delete_retain = match deleted_at_field {
+        Some(f) if is_option_type(&f.ty) => quote! {
+            rows.retain(|__r| ::core::option::Option::is_none(&__r.deleted_at));
+        },
+        _ => quote! {},
+    };
+    let tenant_retain = tenant_id_field.as_ref().map_or_else(
+        || quote! {},
+        |f| {
+            let cmp = if is_option_type(&f.ty) {
+                quote! { __r.tenant_id.as_deref() == ::core::option::Option::Some(__t.as_str()) }
+            } else {
+                quote! { __r.tenant_id == __t }
+            };
+            quote! {
+                if let ::core::option::Option::Some(__t) =
+                    ::autumn_web::tenancy::CURRENT_TENANT
+                        .try_with(|__c| __c.clone())
+                        .ok()
+                        .flatten()
+                {
+                    rows.retain(|__r| #cmp);
+                }
+            }
+        },
+    );
+    let preload_retain_rows = if deleted_at_field.is_some() || tenant_id_field.is_some() {
+        quote! { mut rows }
+    } else {
+        quote! { rows }
+    };
+    let preload_retain_impl = quote! {
+        impl #name {
+            /// Apply this model's read scoping (tenant isolation + soft-delete)
+            /// to rows loaded by another model's `preload`. Generated from the
+            /// model's field set; identity for models without `tenant_id` /
+            /// `deleted_at`.
+            #[doc(hidden)]
+            #[must_use]
+            pub fn __autumn_preload_retain(
+                #preload_retain_rows: ::std::vec::Vec<Self>,
+            ) -> ::std::vec::Vec<Self> {
+                #soft_delete_retain
+                #tenant_retain
+                rows
+            }
+        }
+    };
+
     let new_has_tenant_id = fields_for_new
         .iter()
         .any(|f| f.ident.as_ref().is_some_and(|id| id == "tenant_id"));
@@ -2857,6 +2928,7 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         #(#state_machine_impls)*
 
         // ── Associations + eager loading (belongs_to / has_many / has_one) ──
+        #preload_retain_impl
         #association_items
     }
 }

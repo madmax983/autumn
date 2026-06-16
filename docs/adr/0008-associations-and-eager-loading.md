@@ -149,15 +149,26 @@ exactly.
   are supported via `name = …` (e.g. `#[has_many(Post, fk = author_id, name =
   authored)]` and `#[has_many(Post, fk = approver_id, name = approved)]`),
   which overrides the derived accessor/store name.
-- **No per-association filtering / soft-delete awareness (follow-up)**: a
-  preload loads *all* matching rows of an association keyed only on the foreign
-  key. It does **not** apply the target's `#[repository(..., soft_delete)]`
-  `deleted_at IS NULL` predicate, because the source model's macro expansion
-  cannot see the target model's columns/config. So a `has_many` preload can
-  surface soft-deleted children that the target's own finders hide, and there
-  is no scoped/filtered preload (e.g. "only top-level comments"). Callers that
-  need either must filter client-side after preloading or keep a hand-written
-  scoped query. Soft-delete-aware and filtered preloads are a follow-up.
+- **Target read scoping (tenant isolation + soft-delete) is enforced**: a
+  preload applies the association target's own read scoping so it hides the
+  same rows the target's repository finders do. Because the *loading* model's
+  macro cannot see the *target's* columns, each `#[model]` generates a
+  `__autumn_preload_retain` helper from its **own** field set, and the loader
+  calls it on freshly loaded target rows: a `deleted_at` field drops
+  soft-deleted rows (`deleted_at IS NOT NULL`), and a `tenant_id` field keeps
+  only rows matching the ambient `CURRENT_TENANT` task-local when a tenant is
+  set. This filtering is applied **in-memory** after the batched `IN` load
+  (the source can't add a typed `.filter()` on columns it can't name), so a
+  cross-tenant `belongs_to` parent reads back as `Ok(None)` and cross-tenant /
+  soft-deleted `has_many` children are excluded from the group. Hand-written
+  models that are association targets get an identity retain via
+  `impl_preloadable_leaf!` (no auto-scoping). Models with no `tenant_id` /
+  `deleted_at` field are unaffected (identity).
+- **No per-association *custom* filtering (follow-up)**: beyond the target's
+  own tenant/soft-delete scoping, preload loads *all* matching rows of an
+  association keyed on the foreign key — there is no scoped/filtered preload
+  for arbitrary predicates (e.g. "only top-level comments"). Callers needing
+  that filter client-side after preloading or keep a hand-written scoped query.
 - **Scope / limitations** (deliberately out of scope for this slice):
   polymorphic associations, `has_and_belongs_to_many` / join tables,
   write-side cascades, cross-database/shard preloading, and ORM-style implicit

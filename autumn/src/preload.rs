@@ -243,6 +243,17 @@ pub struct NoPreload;
 #[macro_export]
 macro_rules! impl_preloadable_leaf {
     ($ty:ty) => {
+        impl $ty {
+            /// Identity scoping for a hand-written preload target: rows are
+            /// returned unchanged (no tenant/soft-delete filtering is applied
+            /// for manually-defined models). See [`Preloaded`].
+            #[doc(hidden)]
+            #[must_use]
+            pub fn __autumn_preload_retain(rows: ::std::vec::Vec<Self>) -> ::std::vec::Vec<Self> {
+                rows
+            }
+        }
+
         impl $crate::preload::Preloadable for $ty {
             type Spec = $crate::preload::NoPreload;
             fn load_associations<'__a>(

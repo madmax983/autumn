@@ -29,7 +29,7 @@ use diesel::prelude::*;
 use diesel::sql_types::BigInt;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::pooled_connection::deadpool::Pool;
-use diesel_async::{AsyncPgConnection, RunQueryDsl};
+use diesel_async::{AsyncPgConnection, RunQueryDsl, SimpleAsyncConnection};
 
 use reddit_clone::models::{Comment, CommentAssociations, Post, PostAssociations};
 use reddit_clone::schema::posts;
@@ -37,6 +37,9 @@ use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::postgres::Postgres;
 
 const CREATE_SCHEMA: &str = include_str!("../migrations/20260419000000_create_reddit/up.sql");
+// `User::as_select()` (used by `author` preloads) includes the `avatar`
+// column added by this later migration, so apply it too.
+const ADD_AVATAR: &str = include_str!("../migrations/20260427000000_add_user_avatar/up.sql");
 
 #[derive(diesel::QueryableByName)]
 struct CountRow {
@@ -63,10 +66,16 @@ async fn start_postgres() -> (impl std::any::Any, Pool<AsyncPgConnection>) {
 }
 
 async fn setup_schema(conn: &mut AsyncPgConnection) {
-    diesel::sql_query(CREATE_SCHEMA)
-        .execute(conn)
+    // The migration files contain many semicolon-separated statements; Postgres
+    // rejects multiple commands in a prepared statement, so use the simple
+    // (unprepared) batch protocol — the same way the other PG integration
+    // tests apply full migration files.
+    conn.batch_execute(CREATE_SCHEMA)
         .await
         .expect("create reddit schema");
+    conn.batch_execute(ADD_AVATAR)
+        .await
+        .expect("add users.avatar column");
 }
 
 /// Seed two users, one subreddit, and one post by `author_id = 1`.
@@ -167,6 +176,13 @@ async fn preload_missing_parent() {
     let (_c, pool) = start_postgres().await;
     let mut conn = pool.get().await.expect("conn");
     setup_schema(&mut conn).await;
+    // `posts.author_id` is `NOT NULL REFERENCES users(id)`, so an orphan row
+    // can't exist under the strict FK. Drop just that constraint for this case
+    // to exercise the "preloaded but parent missing" → `Ok(None)` path.
+    diesel::sql_query("ALTER TABLE posts DROP CONSTRAINT IF EXISTS posts_author_id_fkey")
+        .execute(&mut *conn)
+        .await
+        .expect("drop posts.author_id fk");
     // A post whose author_id points at a user that does not exist.
     diesel::sql_query("INSERT INTO users (username, password_hash) VALUES ('ada', 'h')")
         .execute(&mut *conn)

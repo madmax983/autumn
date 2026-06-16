@@ -36,6 +36,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Preload SQL runs on the **same read role** as the parent finder (the
     repository's snapshotted `ReadRoute`); `on_primary()` pins the whole chain.
     With `CursorPage`, preloads execute **after** the overfetch/truncate.
+  - Preloaded associations honor the target's **read scoping**: soft-deleted
+    rows (`deleted_at`) and rows outside the ambient `CURRENT_TENANT`
+    (`tenant_id`) are hidden, mirroring the target's repository finders. Each
+    `#[model]` generates the scoping from its own field set and the loader
+    applies it to loaded target rows.
   - `examples/reddit-clone` migrated: the front page and single-post view drop
     their hand-written joins / per-row author lookups for `preload`. See
     `docs/adr/0008-associations-and-eager-loading.md`.
