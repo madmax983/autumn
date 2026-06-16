@@ -9,7 +9,8 @@
 //! pattern), **not** off field presence: a model may carry a `deleted_at` /
 //! `tenant_id` column (audit history, denormalized tenant) without its
 //! repository scoping on it, and then finders — and preload — leave it
-//! unfiltered. `across_tenants()` is honored via the ambient
+//! unfiltered. A tenant-scoped target with no tenant context **fails closed**
+//! exactly like its finders. `across_tenants()` is honored via the ambient
 //! `PRELOAD_ACROSS_TENANTS` task-local that a repository's `preload` publishes.
 //!
 //! These tests exercise the retain in-memory — no database required — by
@@ -42,6 +43,16 @@ mod schema {
     }
 
     autumn_web::reexports::diesel::table! {
+        // Soft-delete only (no tenant scoping): soft-delete applies regardless
+        // of tenant context, and never fails closed.
+        soft_items (id) {
+            id -> Int8,
+            name -> Text,
+            deleted_at -> Nullable<Timestamp>,
+        }
+    }
+
+    autumn_web::reexports::diesel::table! {
         plain_items (id) {
             id -> Int8,
             name -> Text,
@@ -49,7 +60,7 @@ mod schema {
     }
 }
 
-use schema::{audit_items, plain_items, scoped_items};
+use schema::{audit_items, plain_items, scoped_items, soft_items};
 
 #[autumn_web::model(table = "scoped_items")]
 pub struct ScopedItem {
@@ -80,6 +91,18 @@ pub struct AuditItem {
 // neither should preload.
 #[autumn_web::repository(AuditItem, table = "audit_items")]
 pub trait AuditItemRepository {}
+
+#[autumn_web::model(table = "soft_items")]
+pub struct SoftItem {
+    #[id]
+    pub id: i64,
+    pub name: String,
+    #[default]
+    pub deleted_at: Option<chrono::NaiveDateTime>,
+}
+
+#[autumn_web::repository(SoftItem, table = "soft_items", soft_delete)]
+pub trait SoftItemRepository {}
 
 #[autumn_web::model(table = "plain_items")]
 pub struct PlainItem {
@@ -123,23 +146,23 @@ async fn retain_keeps_only_current_tenant_and_drops_soft_deleted() {
         .scope(Some("acme".to_string()), async move {
             ScopedItem::__autumn_preload_retain(rows)
         })
-        .await;
+        .await
+        .expect("tenant context present");
 
     assert_eq!(ids(&kept), vec![1, 4]);
 }
 
 #[tokio::test]
-async fn retain_without_tenant_context_still_drops_soft_deleted() {
-    // No CURRENT_TENANT set: tenant filtering is skipped (single-tenant / admin
-    // context), but soft-deleted rows are always hidden (repo is soft_delete).
-    let rows = vec![
-        item(1, "acme", false),
-        item(2, "globex", true), // soft-deleted → dropped regardless of tenant
-        item(3, "globex", false),
-    ];
-
-    let kept = ScopedItem::__autumn_preload_retain(rows);
-    assert_eq!(ids(&kept), vec![1, 3]);
+async fn retain_fails_closed_when_tenant_scoped_without_context() {
+    // Tenant-scoped target, no CURRENT_TENANT, not across_tenants: must error
+    // rather than attach cross-tenant rows — same as a tenant-scoped finder.
+    let rows = vec![item(1, "acme", false), item(2, "globex", false)];
+    let result = ScopedItem::__autumn_preload_retain(rows);
+    let err = result.expect_err("must fail closed without tenant context");
+    assert!(
+        err.to_string().to_lowercase().contains("tenant"),
+        "error should mention tenant context, got: {err}"
+    );
 }
 
 #[tokio::test]
@@ -156,14 +179,16 @@ async fn retain_isolates_each_tenant() {
         .scope(Some("acme".to_string()), async {
             ScopedItem::__autumn_preload_retain(make())
         })
-        .await;
+        .await
+        .expect("tenant context present");
     assert_eq!(ids(&acme), vec![1, 3]);
 
     let globex = CURRENT_TENANT
         .scope(Some("globex".to_string()), async {
             ScopedItem::__autumn_preload_retain(make())
         })
-        .await;
+        .await
+        .expect("tenant context present");
     assert_eq!(ids(&globex), vec![2]);
 }
 
@@ -184,9 +209,35 @@ async fn across_tenants_skips_tenant_filter_but_keeps_soft_delete() {
                 .scope(true, async { ScopedItem::__autumn_preload_retain(rows) })
                 .await
         })
-        .await;
+        .await
+        .expect("across_tenants never fails closed");
 
     assert_eq!(ids(&kept), vec![1, 2]);
+}
+
+#[test]
+fn soft_delete_only_drops_deleted_without_tenant_context() {
+    // `soft_delete` (not `tenant_scoped`): soft-deleted rows are hidden with no
+    // tenant context, and there is no fail-closed.
+    let rows = vec![
+        SoftItem {
+            id: 1,
+            name: "a".into(),
+            deleted_at: None,
+        },
+        SoftItem {
+            id: 2,
+            name: "b".into(),
+            deleted_at: Some(chrono::NaiveDateTime::default()),
+        },
+        SoftItem {
+            id: 3,
+            name: "c".into(),
+            deleted_at: None,
+        },
+    ];
+    let kept = SoftItem::__autumn_preload_retain(rows).expect("soft-only never fails closed");
+    assert_eq!(kept.iter().map(|r| r.id).collect::<Vec<_>>(), vec![1, 3]);
 }
 
 #[tokio::test]
@@ -194,7 +245,8 @@ async fn retain_does_not_scope_when_repository_opts_out() {
     // `AuditItem` has `deleted_at` + `tenant_id` columns, but its repository is
     // not `soft_delete` / `tenant_scoped`. Finders leave these rows unfiltered,
     // so preload must too — even with a tenant in context and soft-deleted rows
-    // present. (Regression test for the field-presence bug.)
+    // present, and it must not fail closed. (Regression for the field-presence
+    // bug.)
     let rows = vec![
         audit(1, "acme", false),
         audit(2, "globex", false), // other tenant → still kept
@@ -205,7 +257,8 @@ async fn retain_does_not_scope_when_repository_opts_out() {
         .scope(Some("acme".to_string()), async {
             AuditItem::__autumn_preload_retain(rows)
         })
-        .await;
+        .await
+        .expect("opted-out target never fails closed");
 
     assert_eq!(kept.iter().map(|r| r.id).collect::<Vec<_>>(), vec![1, 2, 3]);
 }
@@ -222,6 +275,6 @@ fn retain_is_identity_for_models_without_scoping_columns() {
             name: "b".into(),
         },
     ];
-    let kept = PlainItem::__autumn_preload_retain(rows);
+    let kept = PlainItem::__autumn_preload_retain(rows).expect("identity");
     assert_eq!(kept.iter().map(|r| r.id).collect::<Vec<_>>(), vec![1, 2]);
 }

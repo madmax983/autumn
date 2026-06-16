@@ -318,7 +318,7 @@ fn emit_association_items(
                         // the target's repository finders would hide. The source
                         // macro can't see the target's columns, so the target
                         // generates this helper from its own field set.
-                        let __rows = #target::__autumn_preload_retain(__rows);
+                        let __rows = #target::__autumn_preload_retain(__rows)?;
                         let mut __children: ::std::vec::Vec<
                             ::autumn_web::preload::Preloaded<#target>
                         > = __rows.into_iter().map(::autumn_web::preload::Preloaded::new).collect();
@@ -381,7 +381,7 @@ fn emit_association_items(
                         // the target's repository finders would hide. The source
                         // macro can't see the target's columns, so the target
                         // generates this helper from its own field set.
-                        let __rows = #target::__autumn_preload_retain(__rows);
+                        let __rows = #target::__autumn_preload_retain(__rows)?;
                         let mut __children: ::std::vec::Vec<
                             ::autumn_web::preload::Preloaded<#target>
                         > = __rows.into_iter().map(::autumn_web::preload::Preloaded::new).collect();
@@ -1776,13 +1776,24 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 if <Self>::__autumn_repo_tenant_scope()
                     && !::autumn_web::preload::preload_across_tenants()
                 {
-                    if let ::core::option::Option::Some(__t) =
-                        ::autumn_web::tenancy::CURRENT_TENANT
-                            .try_with(|__c| __c.clone())
-                            .ok()
-                            .flatten()
+                    match ::autumn_web::tenancy::CURRENT_TENANT
+                        .try_with(|__c| __c.clone())
+                        .ok()
+                        .flatten()
                     {
-                        rows.retain(|__r| #cmp);
+                        ::core::option::Option::Some(__t) => {
+                            rows.retain(|__r| #cmp);
+                        }
+                        // Fail closed, exactly like a tenant-scoped finder:
+                        // never attach cross-tenant rows when tenant context is
+                        // missing (job/admin path that lost the tenant, etc.).
+                        ::core::option::Option::None => {
+                            return ::core::result::Result::Err(
+                                ::autumn_web::AutumnError::internal_server_error_msg(
+                                    "Query scoped to tenant, but no tenant context was established"
+                                )
+                            );
+                        }
                     }
                 }
             }
@@ -1803,19 +1814,22 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     };
     let preload_retain_impl = quote! {
         impl #name {
-            /// Apply this model's read scoping (tenant isolation + soft-delete)
-            /// to rows loaded by another model's `preload`. Generated from the
-            /// model's field set; identity for models without `tenant_id` /
-            /// `deleted_at`.
+            /// Apply this model's repository read scoping (tenant isolation +
+            /// soft-delete) to rows loaded by another model's `preload`, so
+            /// preloaded associations hide the same rows the model's finders
+            /// do. Gated on the repository's `tenant_scoped`/`soft_delete`
+            /// config (see `AutumnPreloadScopeExt`); identity for models whose
+            /// repository opts out (or has no `tenant_id`/`deleted_at`). Fails
+            /// closed — like a tenant-scoped finder — when the target is
+            /// tenant-scoped but no tenant context is set.
             #[doc(hidden)]
-            #[must_use]
             pub fn __autumn_preload_retain(
                 #preload_retain_rows: ::std::vec::Vec<Self>,
-            ) -> ::std::vec::Vec<Self> {
+            ) -> ::autumn_web::AutumnResult<::std::vec::Vec<Self>> {
                 #preload_scope_in_scope
                 #soft_delete_retain
                 #tenant_retain
-                rows
+                ::core::result::Result::Ok(rows)
             }
         }
     };
