@@ -59,9 +59,13 @@ pub async fn front_page(
         .load(&mut *db)
         .await?;
     // Release the base-query connection before `preload` checks one out, so the
-    // two never contend on a single-connection pool.
+    // two never contend on a single-connection pool. The base rows were read
+    // from the primary via `Db`, so pin the preload to the primary too
+    // (`on_primary`) — otherwise, under replica lag, an author/subreddit just
+    // written may be missing on the replica and the post would be skipped.
     drop(db);
     let hot_posts = repo
+        .on_primary()
         .preload(hot_posts, Post::preload().author().subreddit())
         .await?;
 
@@ -478,7 +482,9 @@ pub async fn show(
         .await
         .map_err(|_| AutumnError::not_found_msg("Post not found"))?;
 
-    // Release the base-query connection before `preload` checks one out.
+    // Release the base-query connection before `preload` checks one out. The
+    // base rows came from the primary via `Db`, so pin the preload to the
+    // primary too (`on_primary`) to keep both reads on one consistent role.
     drop(db);
 
     // Eager-load the post's author and its comments (each with their author),
@@ -486,6 +492,7 @@ pub async fn show(
     // For a post with N comments this is a fixed 2 extra queries (post.author,
     // comments) + 1 (comments.author) = at most 3 here, never `2 + N`.
     let mut loaded = repo
+        .on_primary()
         .preload(
             vec![post],
             Post::preload()
