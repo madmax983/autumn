@@ -307,10 +307,15 @@ fn consume_dollar_quoted_body(chars: &mut std::iter::Peekable<std::str::Chars<'_
                 break; // Found the closing delimiter.
             }
         } else {
+            let mut failed_match = closing[0..match_count].to_vec();
+            failed_match.push(sc);
+
             match_count = 0;
-            // The current char may start a new partial match.
-            if sc == closing[0] {
-                match_count = 1;
+            for i in (1..=failed_match.len()).rev() {
+                if failed_match[failed_match.len() - i..] == closing[0..i] {
+                    match_count = i;
+                    break;
+                }
             }
         }
     }
