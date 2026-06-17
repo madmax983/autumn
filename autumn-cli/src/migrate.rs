@@ -699,19 +699,29 @@ where
     run_pending(database_url, FRAMEWORK_MIGRATIONS)
 }
 
-/// True iff the active profile is `prod` or `production`.
+/// True iff the active profile resolves to `prod`/`production`.
 ///
-/// Reads `AUTUMN_ENV` (preferred) then `AUTUMN_PROFILE` (legacy alias),
-/// normalising case and whitespace — same rules as `autumn_web::config`.
+/// Mirrors `autumn_web::config::resolve_profile`'s precedence: `AUTUMN_ENV`
+/// (preferred) then `AUTUMN_PROFILE` (legacy alias), normalising case and
+/// whitespace. When neither is set, fall back to the build-mode signal —
+/// `AUTUMN_IS_DEBUG=0` (set by `#[autumn_web::main]` in release builds) resolves
+/// to prod — so a release deployment that relies on that signal still trips the
+/// rollback guard. (The `--profile` CLI flag that `resolve_profile` also honours
+/// is not a recognised `migrate down` argument, so it cannot reach here.)
 fn is_production_profile() -> bool {
-    // Treat an empty/whitespace `AUTUMN_ENV` as absent (matching
-    // `autumn_web::config`) so the legacy `AUTUMN_PROFILE` is still consulted.
+    // Treat an empty/whitespace value as absent (matching `autumn_web::config`)
+    // so the next signal in the precedence chain is still consulted.
     let read = |key: &str| std::env::var(key).ok().filter(|v| !v.trim().is_empty());
-    let profile = read("AUTUMN_ENV")
+    read("AUTUMN_ENV")
         .or_else(|| read("AUTUMN_PROFILE"))
-        .unwrap_or_default();
-    let normalized = profile.trim().to_lowercase();
-    normalized == "prod" || normalized == "production"
+        .map_or_else(
+            // No explicit profile: fall back to the build-mode signal.
+            || std::env::var("AUTUMN_IS_DEBUG").ok().as_deref() == Some("0"),
+            |profile| {
+                let normalized = profile.trim().to_lowercase();
+                normalized == "prod" || normalized == "production"
+            },
+        )
 }
 
 /// Whether an applied user migration has a usable `down.sql` on disk.
@@ -969,13 +979,21 @@ fn show_rollback_availability(database_url: &str, migrations_dir: &str) {
                 "  \u{2717} {}  (applied but missing locally — not revertable)",
                 m.name
             );
-        } else if has_revertable_down_sql(m) {
-            eprintln!("  \u{2713} {}", m.name);
-        } else {
+        } else if !has_revertable_down_sql(m) {
             eprintln!(
                 "  \u{2717} {}  (no executable down.sql — not revertable)",
                 m.name
             );
+        } else if down_sql_concurrent_without_opt_out(m) {
+            // `migrate down` refuses these (the CONCURRENTLY revert would fail
+            // inside Diesel's transaction), so don't advertise them as available.
+            eprintln!(
+                "  \u{2717} {}  (down.sql uses CONCURRENTLY without `run_in_transaction = false` — \
+                 not revertable as-is)",
+                m.name
+            );
+        } else {
+            eprintln!("  \u{2713} {}", m.name);
         }
     }
     eprintln!();
@@ -1350,6 +1368,51 @@ mod tests {
             ],
             || {
                 assert!(is_production_profile());
+            },
+        );
+    }
+
+    #[test]
+    fn is_production_profile_debug_zero_without_env_is_prod() {
+        // No explicit profile: `AUTUMN_IS_DEBUG=0` (release build signal) must
+        // resolve to prod so the rollback guard still trips.
+        temp_env::with_vars(
+            [
+                ("AUTUMN_ENV", None),
+                ("AUTUMN_PROFILE", None),
+                ("AUTUMN_IS_DEBUG", Some("0")),
+            ],
+            || {
+                assert!(is_production_profile());
+            },
+        );
+    }
+
+    #[test]
+    fn is_production_profile_debug_one_without_env_is_not_prod() {
+        temp_env::with_vars(
+            [
+                ("AUTUMN_ENV", None),
+                ("AUTUMN_PROFILE", None),
+                ("AUTUMN_IS_DEBUG", Some("1")),
+            ],
+            || {
+                assert!(!is_production_profile());
+            },
+        );
+    }
+
+    #[test]
+    fn is_production_profile_explicit_env_overrides_debug_signal() {
+        // An explicit dev profile wins over `AUTUMN_IS_DEBUG=0`.
+        temp_env::with_vars(
+            [
+                ("AUTUMN_ENV", Some("dev")),
+                ("AUTUMN_PROFILE", None),
+                ("AUTUMN_IS_DEBUG", Some("0")),
+            ],
+            || {
+                assert!(!is_production_profile());
             },
         );
     }
