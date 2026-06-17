@@ -1460,4 +1460,47 @@ mod tests {
         // New ETag must differ from old one.
         assert_ne!(new_etag, &old_etag.header_value());
     }
+
+    #[tokio::test]
+    async fn rebuild_oversized_body_preserves_content() {
+        let prefix = bytes::Bytes::from("hello");
+        let overflow = http_body::Frame::data(bytes::Bytes::from(" world"));
+        let remaining_body = Body::from("!");
+
+        let mut reconstructed = rebuild_oversized_body(prefix, overflow, remaining_body);
+        let mut result = Vec::new();
+        while let Some(Ok(frame)) = BodyExt::frame(&mut reconstructed).await {
+            if let Ok(data) = frame.into_data() {
+                result.extend_from_slice(&data);
+            }
+        }
+
+        assert_eq!(result, b"hello world!");
+    }
+
+    #[tokio::test]
+    async fn etag_layer_processes_exact_max_body_bytes() {
+        let exact_size = EtagLayer::MAX_BODY_BYTES;
+
+        let svc = tower::ServiceBuilder::new()
+            .layer(EtagLayer)
+            .service_fn(move |_req: Request<Body>| async move {
+                Ok::<_, axum::Error>(Response::new(Body::from(vec![b'a'; exact_size])))
+            });
+
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/")
+            .body(Body::empty())
+            .unwrap();
+
+        let res = svc.oneshot(req).await.unwrap();
+
+        assert_eq!(res.status(), StatusCode::OK);
+        // Ensure ETag header exists and is calculated for exact max bounds!
+        assert!(res.headers().contains_key(ETAG));
+
+        let full_body = http_body_util::BodyExt::collect(res.into_body()).await.unwrap().to_bytes();
+        assert_eq!(full_body.len(), exact_size);
+    }
 }
