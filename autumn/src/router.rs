@@ -4117,6 +4117,7 @@ mod tests {
             merge_routers: Vec::new(),
             nest_routers: Vec::new(),
             custom_layers: Vec::new(),
+            static_gate_layers: Vec::new(),
             error_page_renderer: None,
             session_store: None,
             openapi: Some(openapi),
