@@ -1057,11 +1057,13 @@ impl ShardRepositorySeed {
         ctx: &crate::db::RequestDbContext,
         shard_name: &str,
     ) -> Self {
+        // Postgres `statement_timeout` is a signed 32-bit integer (ms); cap
+        // to `i32::MAX` so the cast back to a `u64` field is always lossless.
         const PG_TIMEOUT_MAX_MS: u64 = i32::MAX as u64;
-        let statement_timeout_ms = ctx
-            .statement_timeout
-            .map(|d| d.as_millis().min(PG_TIMEOUT_MAX_MS as u128) as u64)
-            .unwrap_or(0);
+        let statement_timeout_ms = ctx.statement_timeout.map_or(0, |d| {
+            u64::try_from(d.as_millis().min(u128::from(PG_TIMEOUT_MAX_MS)))
+                .unwrap_or(PG_TIMEOUT_MAX_MS)
+        });
         Self {
             pool: pool.clone(),
             statement_timeout_ms,
@@ -1158,7 +1160,7 @@ impl ShardedDb {
     /// Internal ABI; not a stable public API.
     #[doc(hidden)]
     #[must_use]
-    pub fn __autumn_repository_seed(&self) -> &ShardRepositorySeed {
+    pub const fn __autumn_repository_seed(&self) -> &ShardRepositorySeed {
         &self.repo_seed
     }
 }
