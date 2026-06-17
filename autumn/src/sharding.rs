@@ -1060,11 +1060,7 @@ impl ShardRepositorySeed {
         const PG_TIMEOUT_MAX_MS: u64 = i32::MAX as u64;
         let statement_timeout_ms = ctx
             .statement_timeout
-            .map(|d| {
-                u64::try_from(d.as_millis())
-                    .unwrap_or(u64::MAX)
-                    .min(PG_TIMEOUT_MAX_MS)
-            })
+            .map(|d| d.as_millis().min(PG_TIMEOUT_MAX_MS as u128) as u64)
             .unwrap_or(0);
         Self {
             pool: pool.clone(),

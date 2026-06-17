@@ -55,7 +55,11 @@ fn make_pool(database: &str) -> Pool<AsyncPgConnection> {
 }
 
 async fn extract_repo(state: &AppState) -> PgShardNoteRepository {
-    let (mut parts, ()) = Request::builder().uri("/notes").body(()).unwrap().into_parts();
+    let (mut parts, ()) = Request::builder()
+        .uri("/notes")
+        .body(())
+        .unwrap()
+        .into_parts();
     PgShardNoteRepository::from_request_parts(&mut parts, state)
         .await
         .expect("extraction succeeds")
