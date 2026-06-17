@@ -407,6 +407,220 @@ pub fn check_oauth2_provider_impl(
     }
 }
 
+/// Check that List-Unsubscribe is wired when any `#[mailer]` declares
+/// `list_unsubscribe` (pure, injectable for tests).
+///
+/// - No `list_unsubscribe` usage, or the transport is disabled (no mail is
+///   emitted) → pass.
+/// - Usage with a base URL or mailto configured → pass.
+/// - Usage with neither configured → **fail** in production (Gmail/Yahoo will
+///   reject the bulk mail) and **warn** outside production so
+///   `autumn doctor --strict` still surfaces it before deploy.
+pub fn check_mail_unsubscribe_config_impl(
+    has_list_unsubscribe_usage: bool,
+    base_url: Option<&str>,
+    mailto: Option<&str>,
+    transport_disabled: bool,
+    is_production: bool,
+    token_ttl_days: i64,
+) -> CheckResult {
+    let base_url = base_url.map(str::trim).filter(|s| !s.is_empty());
+    let mailto = mailto.map(str::trim).filter(|s| !s.is_empty());
+    let any_set = base_url.is_some() || mailto.is_some();
+
+    // The runtime `MailConfig::validate` runs the following checks at boot
+    // regardless of whether any #[mailer] declares list_unsubscribe or whether
+    // the transport is disabled. Mirror them *before* the usage/transport early
+    // returns so `autumn doctor --strict` never greenlights a deploy that the
+    // runtime would reject at startup.
+
+    // TTL: a non-positive value is rejected in every profile (it would make every
+    // unsubscribe token immediately expired).
+    if token_ttl_days <= 0 {
+        return CheckResult {
+            name: "mail_unsubscribe",
+            status: CheckStatus::Fail,
+            detail: Some(format!(
+                "mail.unsubscribe_token_ttl_days must be a positive number of days (got {token_ttl_days})"
+            )),
+            hint: Some(
+                "Set mail.unsubscribe_token_ttl_days to a positive value (default 30); a non-positive value would make every unsubscribe token immediately expired",
+            ),
+        };
+    }
+
+    // Destination format: a non-empty but malformed base_url / mailto is rejected
+    // in prod (mailbox providers require HTTPS one-click / a real mailbox).
+    if is_production {
+        if let Some(url) = base_url
+            && !is_valid_https_base_url_doctor(url)
+        {
+            return CheckResult {
+                name: "mail_unsubscribe",
+                status: CheckStatus::Fail,
+                detail: Some(format!(
+                    "mail.unsubscribe_base_url is set to an invalid value ({url:?}): \
+                     the runtime requires an absolute https:// URL with a real host"
+                )),
+                hint: Some(
+                    "Use an absolute https:// URL with a host and no query/fragment, e.g. https://app.example.com",
+                ),
+            };
+        }
+        if let Some(addr) = mailto
+            && !is_valid_mailto_address_doctor(addr)
+        {
+            return CheckResult {
+                name: "mail_unsubscribe",
+                status: CheckStatus::Fail,
+                detail: Some(format!(
+                    "mail.unsubscribe_mailto is set to an invalid value ({addr:?}): \
+                     the runtime requires a bare mailbox address or mailto: URI"
+                )),
+                hint: Some(
+                    "Use a mailbox like unsubscribe@example.com (or mailto:unsubscribe@example.com)",
+                ),
+            };
+        }
+    }
+
+    if !has_list_unsubscribe_usage {
+        return CheckResult {
+            name: "mail_unsubscribe",
+            status: CheckStatus::Pass,
+            detail: Some("no #[mailer] declares list_unsubscribe".into()),
+            hint: None,
+        };
+    }
+    if transport_disabled {
+        // Mirrors the runtime guard: a disabled transport emits no list mail, so
+        // unsubscribe destinations aren't required to boot.
+        return CheckResult {
+            name: "mail_unsubscribe",
+            status: CheckStatus::Pass,
+            detail: Some("mail.transport is disabled; no list mail is emitted".into()),
+            hint: None,
+        };
+    }
+
+    if any_set {
+        // Reached only when a #[mailer] uses list_unsubscribe and the transport is
+        // active (the no-usage / disabled-transport cases returned above).
+        return mail_unsubscribe_configured_result(base_url.is_some(), is_production);
+    }
+    let detail = Some(
+        "a #[mailer] declares list_unsubscribe but neither mail.unsubscribe_base_url \
+         nor mail.unsubscribe_mailto is configured"
+            .into(),
+    );
+    let hint = Some(
+        "Set mail.unsubscribe_base_url (e.g. https://app.example.com) or mail.unsubscribe_mailto so RFC 8058 List-Unsubscribe headers can be emitted",
+    );
+    if is_production {
+        CheckResult {
+            name: "mail_unsubscribe",
+            status: CheckStatus::Fail,
+            detail,
+            hint,
+        }
+    } else {
+        CheckResult {
+            name: "mail_unsubscribe",
+            status: CheckStatus::Warn,
+            detail,
+            hint,
+        }
+    }
+}
+
+/// Result for a configured unsubscribe destination (a valid `base_url` and/or
+/// `mailto` is set, a list mailer is in use, and the transport is active).
+///
+/// A `base_url` drives the framework's one-click HTTP endpoint, which must
+/// persist opt-outs. The runtime fails closed in production when a base URL is
+/// set but no suppression backend (a database pool, or a `SuppressionStore`
+/// registered via `AppBuilder::with_suppression_store`) is available. doctor
+/// can't see a programmatically registered store, so it warns rather than
+/// greenlight a config the app may reject at startup — under `--strict` this
+/// surfaces as an error. A mailto-only destination needs no store, so it passes.
+fn mail_unsubscribe_configured_result(base_url_set: bool, is_production: bool) -> CheckResult {
+    if is_production && base_url_set {
+        return CheckResult {
+            name: "mail_unsubscribe",
+            status: CheckStatus::Warn,
+            detail: Some(
+                "mail.unsubscribe_base_url is set, so the one-click endpoint must persist \
+                 opt-outs; the runtime fails closed in production unless a suppression backend \
+                 (a database pool, or a SuppressionStore registered via \
+                 AppBuilder::with_suppression_store) is available — which doctor cannot verify \
+                 statically"
+                    .into(),
+            ),
+            hint: Some(
+                "Configure a database pool (db feature) or register a SuppressionStore before deploying so one-click unsubscribes are recorded",
+            ),
+        };
+    }
+    CheckResult {
+        name: "mail_unsubscribe",
+        status: CheckStatus::Pass,
+        detail: Some("list_unsubscribe is wired (unsubscribe URL/mailto configured)".into()),
+        hint: None,
+    }
+}
+
+/// Mirror of `autumn_web`'s `is_valid_https_base_url` (mail module, feature-gated
+/// so not reachable from the CLI build). Kept byte-for-byte in sync so
+/// `autumn doctor --strict` rejects exactly what the runtime rejects at boot.
+fn is_valid_https_base_url_doctor(url: &str) -> bool {
+    if url
+        .chars()
+        .any(|c| c.is_control() || c.is_whitespace() || matches!(c, '<' | '>'))
+    {
+        return false;
+    }
+    match url.strip_prefix("https://") {
+        Some(rest) if !rest.is_empty() && !rest.starts_with('/') => {}
+        _ => return false,
+    }
+    let Ok(parsed) = ::url::Url::parse(url) else {
+        return false;
+    };
+    parsed.scheme() == "https"
+        && parsed.host_str().is_some_and(|h| !h.is_empty())
+        && parsed.username().is_empty()
+        && parsed.password().is_none()
+        && parsed.query().is_none()
+        && parsed.fragment().is_none()
+}
+
+/// Mirror of `autumn_web`'s `is_valid_mailto_address` (see above).
+fn is_valid_mailto_address_doctor(value: &str) -> bool {
+    // Reject control characters and RFC 2369 delimiters (`<`/`>`/`,`) anywhere in
+    // the value; mirrors autumn_web's is_valid_mailto_address.
+    if value
+        .chars()
+        .any(|c| c.is_control() || matches!(c, '<' | '>' | ','))
+    {
+        return false;
+    }
+    let address = value
+        .trim()
+        .strip_prefix("mailto:")
+        .unwrap_or_else(|| value.trim());
+    let address = address.split('?').next().unwrap_or("");
+    match address.split_once('@') {
+        Some((local, domain)) => {
+            !local.is_empty()
+                && !domain.is_empty()
+                && domain.contains('.')
+                && !address.contains(char::is_whitespace)
+                && !address.contains([':', '/'])
+        }
+        None => false,
+    }
+}
+
 // ─── Pure helper functions (fully unit-testable) ──────────────────────────────
 
 pub const fn glyph(status: &CheckStatus) -> &'static str {
@@ -1308,6 +1522,78 @@ fn get_merged_toml_table_profiles(profiles: &[&str]) -> toml::Table {
     merged
 }
 
+/// Inline `[profile.{name}]` lookup order, mirroring the runtime config loader's
+/// `profile_lookup_names`: the canonical spelling is applied **last** so it wins
+/// (`production` then `prod`; `development` then `dev`).
+fn inline_profile_lookup_names(profile: &str) -> Vec<&str> {
+    match profile {
+        "prod" => vec!["production", "prod"],
+        "dev" => vec!["development", "dev"],
+        other => vec![other],
+    }
+}
+
+/// Ordered `autumn-{name}.toml` override-file lookup, mirroring the runtime's
+/// `profile_override_file_lookup_names`: only the **first existing** file is
+/// loaded, preferring the spelling the operator actually selected.
+fn override_file_lookup_names(profile: &str, selected_input: &str) -> Vec<String> {
+    match profile {
+        "prod" if selected_input.eq_ignore_ascii_case("production") => {
+            vec!["production".to_owned(), "prod".to_owned()]
+        }
+        "prod" => vec!["prod".to_owned(), "production".to_owned()],
+        "dev" if selected_input.eq_ignore_ascii_case("development") => {
+            vec!["development".to_owned(), "dev".to_owned()]
+        }
+        "dev" => vec!["dev".to_owned(), "development".to_owned()],
+        other => vec![other.to_owned()],
+    }
+}
+
+/// Build the merged TOML the same way the runtime config loader layers profile
+/// sources, so doctor evaluates exactly what the app will boot with. Mirrors
+/// `autumn_web::config`: inline `[profile.{name}]` sections are applied in alias
+/// order (canonical spelling wins), and exactly one `autumn-{name}.toml` file is
+/// loaded — the first that exists, preferring the selected spelling.
+fn get_merged_toml_table_runtime(normalized_profile: &str, selected_input: &str) -> toml::Table {
+    let mut merged = toml::Table::new();
+
+    let base_toml = std::fs::read_to_string("autumn.toml")
+        .ok()
+        .and_then(|c| toml::from_str::<toml::Table>(&c).ok());
+
+    // 1. Base autumn.toml top-level.
+    if let Some(ref table) = base_toml {
+        deep_merge(&mut merged, table);
+    }
+
+    // 2. Inline [profile.{name}] sections, canonical spelling applied last (wins).
+    for profile_name in inline_profile_lookup_names(normalized_profile) {
+        if let Some(prof) = base_toml
+            .as_ref()
+            .and_then(|t| t.get("profile"))
+            .and_then(toml::Value::as_table)
+            .and_then(|p| p.get(profile_name))
+            .and_then(toml::Value::as_table)
+        {
+            deep_merge(&mut merged, prof);
+        }
+    }
+
+    // 3. Exactly one autumn-{name}.toml override file (first existing).
+    for profile_name in override_file_lookup_names(normalized_profile, selected_input) {
+        if let Some(table) = std::fs::read_to_string(format!("autumn-{profile_name}.toml"))
+            .ok()
+            .and_then(|c| toml::from_str::<toml::Table>(&c).ok())
+        {
+            deep_merge(&mut merged, &table);
+            break;
+        }
+    }
+
+    merged
+}
+
 pub struct DoctorOAuth2Provider {
     pub name: String,
     pub client_id: String,
@@ -1416,6 +1702,250 @@ where
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// Whether a Rust source file declares the `#[mailer(list_unsubscribe = ...)]`
+/// attribute (whitespace-insensitive), as opposed to merely calling the
+/// `.list_unsubscribe(...)` builder method or mentioning it in a comment.
+pub fn file_declares_list_unsubscribe(content: &str) -> bool {
+    // Strip line and block comments so a commented-out attribute (`//` or
+    // `/* ... */`) does not trip a false positive.
+    let without_comments = strip_rust_comments(content);
+    let collapsed: String = without_comments
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    collapsed.contains("mailer(list_unsubscribe")
+}
+
+/// Best-effort removal of `//` line and `/* ... */` block comments. Intended for
+/// heuristic source scanning, not as a Rust lexer; it does not special-case
+/// comment markers inside string or char literals.
+fn strip_rust_comments(content: &str) -> String {
+    let mut out = String::with_capacity(content.len());
+    let mut chars = content.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '/' && chars.peek() == Some(&'/') {
+            // Line comment: skip to (and keep) the newline.
+            for n in chars.by_ref() {
+                if n == '\n' {
+                    out.push('\n');
+                    break;
+                }
+            }
+        } else if c == '/' && chars.peek() == Some(&'*') {
+            // Block comment: skip until the closing `*/`.
+            chars.next();
+            let mut prev = '\0';
+            for n in chars.by_ref() {
+                if prev == '*' && n == '/' {
+                    break;
+                }
+                prev = n;
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Detect whether any Rust source in the project (including workspace member
+/// crates) declares `#[mailer(list_unsubscribe = "...")]`.
+///
+/// Walks from the project root, skipping build/VCS/vendor directories, so a
+/// mailer in e.g. `crates/marketing/src` is found. Matches the attribute form
+/// specifically (whitespace-insensitive) so builder calls or comments do not
+/// trip a false positive.
+fn detect_list_unsubscribe_usage() -> bool {
+    scan_dir_for_list_unsubscribe(std::path::Path::new("."))
+}
+
+/// Recursively scan `root` for a source file declaring
+/// `#[mailer(list_unsubscribe = "...")]`.
+///
+/// Skips build/VCS/vendor directories so a `cargo vendor` copy of the framework
+/// (whose own tests declare a real list mailer) can't trip a false positive for
+/// an application binary that registers none. Also skips `tests/` and `examples/`
+/// trees: the runtime inventory only registers mailers compiled into the
+/// application binary, so an integration-test or example fixture must not make
+/// `autumn doctor --strict` require unsubscribe config for mail that can't be sent.
+fn scan_dir_for_list_unsubscribe(root: &std::path::Path) -> bool {
+    /// Directories never worth scanning for source.
+    const SKIP_DIRS: &[&str] = &[
+        "target",
+        ".git",
+        "node_modules",
+        "dist",
+        ".github",
+        "vendor",
+        "tests",
+        "examples",
+    ];
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return false;
+    };
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        if path.is_dir() {
+            let skip = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| SKIP_DIRS.contains(&n));
+            if !skip && scan_dir_for_list_unsubscribe(&path) {
+                return true;
+            }
+        } else if path.extension().and_then(|e| e.to_str()) == Some("rs")
+            && std::fs::read_to_string(&path)
+                .is_ok_and(|content| file_declares_list_unsubscribe(&content))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Resolve `[mail]` unsubscribe destinations, preferring env overrides over the
+/// merged toml table (mirroring the runtime's `AUTUMN_MAIL__*` precedence).
+fn resolve_mail_unsubscribe(table: Option<&toml::Table>) -> (Option<String>, Option<String>) {
+    let mail = table
+        .and_then(|t| t.get("mail"))
+        .and_then(toml::Value::as_table);
+    // Match the runtime's precedence: a *present* env var wins even when blank
+    // (it clears the TOML value); only an *absent* env var falls back to TOML.
+    let read = |env_key: &str, toml_key: &str| {
+        std::env::var(env_key).map_or_else(
+            |_| {
+                mail.and_then(|m| m.get(toml_key))
+                    .and_then(toml::Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(std::borrow::ToOwned::to_owned)
+            },
+            |value| {
+                let trimmed = value.trim();
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed.to_owned())
+                }
+            },
+        )
+    };
+    (
+        read("AUTUMN_MAIL__UNSUBSCRIBE_BASE_URL", "unsubscribe_base_url"),
+        read("AUTUMN_MAIL__UNSUBSCRIBE_MAILTO", "unsubscribe_mailto"),
+    )
+}
+
+/// Resolve the effective `unsubscribe_token_ttl_days`, mirroring the runtime
+/// precedence: `[mail].unsubscribe_token_ttl_days` (or the default of 30) is the
+/// base, and a present, *parseable* `AUTUMN_MAIL__UNSUBSCRIBE_TOKEN_TTL_DAYS`
+/// overrides it. A present-but-invalid env value (blank or non-integer) is
+/// ignored exactly as `apply_mail_env_overrides_with_env` does — it warns and
+/// leaves the TOML/default in place — so doctor must not treat it as `0` and
+/// block a deploy the app would boot with the effective positive TTL.
+fn resolve_unsubscribe_token_ttl_days(table: Option<&toml::Table>) -> i64 {
+    resolve_unsubscribe_token_ttl_days_from_sources(
+        std::env::var("AUTUMN_MAIL__UNSUBSCRIBE_TOKEN_TTL_DAYS").ok(),
+        table,
+    )
+}
+
+/// True when `[mail].unsubscribe_token_ttl_days` is present in the merged TOML
+/// but is not an integer (e.g. a quoted string or a float).
+///
+/// The runtime deserializes this field as `i64` from the TOML *before* any
+/// `AUTUMN_MAIL__UNSUBSCRIBE_TOKEN_TTL_DAYS` override is applied (the override
+/// mutates the already-typed value), so a non-integer TOML value fails config
+/// loading at boot regardless of the env var. doctor reads the merged config as
+/// an untyped table, so it must check the type explicitly instead of silently
+/// defaulting (which would greenlight a deploy the app can't start).
+fn unsubscribe_ttl_toml_type_invalid(table: Option<&toml::Table>) -> bool {
+    table
+        .and_then(|t| t.get("mail"))
+        .and_then(toml::Value::as_table)
+        .and_then(|m| m.get("unsubscribe_token_ttl_days"))
+        .is_some_and(|v| v.as_integer().is_none())
+}
+
+/// True when `[mail].unsubscribe_base_url` or `[mail].unsubscribe_mailto` is
+/// present in the merged TOML but is not a string (e.g. an integer or array).
+///
+/// The runtime deserializes these as `Option<String>`, so a present non-string
+/// value fails config loading before boot. `resolve_mail_unsubscribe` only reads
+/// `as_str()` and would otherwise treat such a value as absent, letting doctor
+/// report `Pass` for a config the app can't start with — so flag it explicitly,
+/// like the TTL type guard.
+fn unsubscribe_dest_toml_type_invalid(table: Option<&toml::Table>) -> bool {
+    let mail = table
+        .and_then(|t| t.get("mail"))
+        .and_then(toml::Value::as_table);
+    ["unsubscribe_base_url", "unsubscribe_mailto"]
+        .iter()
+        .any(|key| {
+            mail.and_then(|m| m.get(*key))
+                .is_some_and(|v| v.as_str().is_none())
+        })
+}
+
+fn resolve_unsubscribe_token_ttl_days_from_sources(
+    env_value: Option<String>,
+    table: Option<&toml::Table>,
+) -> i64 {
+    const DEFAULT_TTL_DAYS: i64 = 30;
+    let toml_or_default = table
+        .and_then(|t| t.get("mail"))
+        .and_then(toml::Value::as_table)
+        .and_then(|m| m.get("unsubscribe_token_ttl_days"))
+        .and_then(toml::Value::as_integer)
+        .unwrap_or(DEFAULT_TTL_DAYS);
+    // Match the runtime's `val.parse::<i64>()` (no trim): an unparseable override
+    // is ignored, falling back to the TOML/default value.
+    if let Some(raw) = env_value
+        && let Ok(days) = raw.parse::<i64>()
+    {
+        return days;
+    }
+    toml_or_default
+}
+
+/// Mirror of `Transport::from_env_value` (mail module, feature-gated so not
+/// reachable from the CLI build): trim + lowercase and accept only a known
+/// transport, returning its canonical spelling, else `None`.
+fn parse_mail_transport(value: &str) -> Option<&'static str> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "log" => Some("log"),
+        "file" => Some("file"),
+        "smtp" => Some("smtp"),
+        "disabled" => Some("disabled"),
+        _ => None,
+    }
+}
+
+/// Resolve the effective mail transport the way the runtime does: a *valid* env
+/// override wins, then a valid `[mail].transport`, then the profile smart-default
+/// (`dev` → `log`, otherwise `disabled`). Invalid/whitespace values are ignored
+/// just as `Transport::from_env_value` ignores them, so doctor does not treat a
+/// malformed override as an active transport.
+fn resolve_effective_mail_transport(
+    env_value: Option<String>,
+    toml_transport: Option<&str>,
+    normalized_profile: &str,
+) -> String {
+    if let Some(raw) = env_value
+        && let Some(parsed) = parse_mail_transport(&raw)
+    {
+        return parsed.to_owned();
+    }
+    if let Some(parsed) = toml_transport.and_then(parse_mail_transport) {
+        return parsed.to_owned();
+    }
+    if normalized_profile == "dev" {
+        "log".to_owned()
+    } else {
+        "disabled".to_owned()
+    }
 }
 
 fn resolve_database_topology(table: Option<&toml::Table>) -> DoctorDatabaseTopology {
@@ -1895,6 +2425,99 @@ pub fn run(opts: DoctorOptions) {
         }));
     }
 
+    // 9b. List-Unsubscribe wiring: fail closed in prod when a #[mailer] declares
+    // list_unsubscribe but no unsubscribe destination is configured. Layer the
+    // profile sources exactly as the runtime config loader does (alias-aware
+    // inline precedence with the canonical spelling winning, single override
+    // file preferring the selected spelling), so doctor evaluates what the app
+    // will actually boot with rather than a stale legacy spelling.
+    //
+    // Profile selection mirrors `resolve_profile_input`: a blank/whitespace
+    // AUTUMN_ENV is ignored before falling back to AUTUMN_PROFILE, so a blank
+    // preferred var does not silently downgrade a prod selection to dev.
+    let raw_mail_profile = std::env::var("AUTUMN_ENV")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .or_else(|| {
+            std::env::var("AUTUMN_PROFILE")
+                .ok()
+                .filter(|v| !v.trim().is_empty())
+        })
+        .unwrap_or_else(|| "dev".to_owned());
+    let selected_input = raw_mail_profile.trim().to_owned();
+    let normalized_profile = match selected_input.to_lowercase().as_str() {
+        "prod" | "production" => "prod".to_owned(),
+        "dev" | "development" | "" => "dev".to_owned(),
+        other => other.to_owned(),
+    };
+    let merged_mail_toml = get_merged_toml_table_runtime(&normalized_profile, &selected_input);
+    let (unsub_base_url, unsub_mailto) = resolve_mail_unsubscribe(Some(&merged_mail_toml));
+    // Resolve the effective transport the same way the runtime does: a *valid* env
+    // override (trimmed, case-insensitive) wins, then explicit `[mail].transport`,
+    // then the profile smart-default (only `dev` defaults to `log`; every other
+    // profile defaults to `disabled`). An invalid/whitespace env value is ignored,
+    // matching `Transport::from_env_value`.
+    let effective_transport = resolve_effective_mail_transport(
+        std::env::var("AUTUMN_MAIL__TRANSPORT").ok(),
+        merged_mail_toml
+            .get("mail")
+            .and_then(toml::Value::as_table)
+            .and_then(|m| m.get("transport"))
+            .and_then(toml::Value::as_str),
+        &normalized_profile,
+    );
+    let mail_transport_disabled = effective_transport == "disabled";
+    let unsub_token_ttl_days = resolve_unsubscribe_token_ttl_days(Some(&merged_mail_toml));
+    let unsub_ttl_toml_type_invalid = unsubscribe_ttl_toml_type_invalid(Some(&merged_mail_toml));
+    let unsub_dest_toml_type_invalid = unsubscribe_dest_toml_type_invalid(Some(&merged_mail_toml));
+    let has_list_unsubscribe_usage = detect_list_unsubscribe_usage();
+    tasks.push(Box::new(move || {
+        // A present-but-non-string destination fails the runtime's typed config
+        // load (Option<String>) before boot; doctor reads an untyped table, so a
+        // non-string value would otherwise look absent. Flag it like the TTL guard.
+        if unsub_dest_toml_type_invalid {
+            return CheckResult {
+                name: "mail_unsubscribe",
+                status: CheckStatus::Fail,
+                detail: Some(
+                    "mail.unsubscribe_base_url and mail.unsubscribe_mailto must be strings; a \
+                     non-string TOML value (e.g. an integer or array) fails configuration loading \
+                     before the app can boot"
+                        .into(),
+                ),
+                hint: Some(
+                    "Set mail.unsubscribe_base_url / mail.unsubscribe_mailto to quoted string values",
+                ),
+            };
+        }
+        // A present-but-non-integer TOML TTL fails the runtime's typed config load
+        // before boot; doctor reads an untyped table, so flag it here rather than
+        // letting it silently default in `resolve_unsubscribe_token_ttl_days`.
+        if unsub_ttl_toml_type_invalid {
+            return CheckResult {
+                name: "mail_unsubscribe",
+                status: CheckStatus::Fail,
+                detail: Some(
+                    "mail.unsubscribe_token_ttl_days must be an integer number of days; a \
+                     non-integer TOML value (e.g. a quoted string or a float) fails configuration \
+                     loading before the app can boot"
+                        .into(),
+                ),
+                hint: Some(
+                    "Set mail.unsubscribe_token_ttl_days to a bare integer, e.g. unsubscribe_token_ttl_days = 30",
+                ),
+            };
+        }
+        check_mail_unsubscribe_config_impl(
+            has_list_unsubscribe_usage,
+            unsub_base_url.as_deref(),
+            unsub_mailto.as_deref(),
+            mail_transport_disabled,
+            is_production,
+            unsub_token_ttl_days,
+        )
+    }));
+
     // 10. Stale artifacts (warn only, never fail)
     tasks.push(Box::new(check_stale_artifacts));
 
@@ -2344,6 +2967,456 @@ pub fn check_gdpr_export_registration_impl(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── mail_unsubscribe check ─────────────────────────────────────────────────
+
+    #[test]
+    fn mail_unsubscribe_no_usage_passes() {
+        let r = check_mail_unsubscribe_config_impl(false, None, None, false, true, 30);
+        assert_eq!(r.status, CheckStatus::Pass);
+    }
+
+    #[test]
+    fn mail_unsubscribe_usage_without_config_fails_in_prod() {
+        let r = check_mail_unsubscribe_config_impl(true, None, None, false, true, 30);
+        assert_eq!(r.status, CheckStatus::Fail);
+        assert!(r.detail.unwrap().contains("list_unsubscribe"));
+    }
+
+    #[test]
+    fn mail_unsubscribe_usage_without_config_warns_outside_prod() {
+        let r = check_mail_unsubscribe_config_impl(true, None, Some("   "), false, false, 30);
+        assert_eq!(r.status, CheckStatus::Warn);
+    }
+
+    #[test]
+    fn mail_unsubscribe_disabled_transport_passes() {
+        // Disabled transport emits no list mail, so config isn't required.
+        let r = check_mail_unsubscribe_config_impl(true, None, None, true, true, 30);
+        assert_eq!(r.status, CheckStatus::Pass);
+    }
+
+    #[test]
+    fn mail_unsubscribe_base_url_warns_in_prod_but_passes_outside() {
+        // In production a base_url additionally requires a suppression backend the
+        // runtime fails closed without; doctor can't verify it, so it warns.
+        let r = check_mail_unsubscribe_config_impl(
+            true,
+            Some("https://app.example.com"),
+            None,
+            false,
+            true,
+            30,
+        );
+        assert_eq!(r.status, CheckStatus::Warn);
+        assert!(r.detail.unwrap().contains("suppression backend"));
+        // Outside production the runtime does not gate on the backend, so it passes.
+        let r = check_mail_unsubscribe_config_impl(
+            true,
+            Some("https://app.example.com"),
+            None,
+            false,
+            false,
+            30,
+        );
+        assert_eq!(r.status, CheckStatus::Pass);
+    }
+
+    #[test]
+    fn mail_unsubscribe_usage_with_mailto_passes() {
+        let r = check_mail_unsubscribe_config_impl(
+            true,
+            None,
+            Some("unsub@example.com"),
+            false,
+            true,
+            30,
+        );
+        assert_eq!(r.status, CheckStatus::Pass);
+    }
+
+    #[test]
+    fn detects_mailer_attribute_but_not_builder_or_comment() {
+        assert!(file_declares_list_unsubscribe(
+            "#[mailer(list_unsubscribe = \"weekly_digest\")]"
+        ));
+        // whitespace / newlines inside the attribute still match
+        assert!(file_declares_list_unsubscribe(
+            "#[mailer(\n    list_unsubscribe = \"x\"\n)]"
+        ));
+        // builder call must NOT match
+        assert!(!file_declares_list_unsubscribe(
+            "Mail::builder().list_unsubscribe(\"x\").build()"
+        ));
+        // line comment must NOT match
+        assert!(!file_declares_list_unsubscribe(
+            "// remember to set list_unsubscribe later"
+        ));
+        // commented-out attribute (line and mid-line) must NOT match
+        assert!(!file_declares_list_unsubscribe(
+            "// #[mailer(list_unsubscribe = \"x\")]"
+        ));
+        assert!(!file_declares_list_unsubscribe(
+            "let x = 1; // #[mailer(list_unsubscribe = \"x\")]"
+        ));
+        // block-commented attribute must NOT match
+        assert!(!file_declares_list_unsubscribe(
+            "/* #[mailer(list_unsubscribe = \"weekly\")] */"
+        ));
+        assert!(!file_declares_list_unsubscribe(
+            "before /*\n#[mailer(list_unsubscribe = \"x\")]\n*/ after"
+        ));
+    }
+
+    #[test]
+    fn scan_finds_workspace_mailer_but_skips_vendored_copy() {
+        let root = tempfile::tempdir().expect("temp dir");
+        // A vendored dependency copy (e.g. `cargo vendor`) carries the framework's
+        // own list mailer in its tests — this must NOT count as app usage.
+        let vendored = root.path().join("vendor/autumn-web/tests");
+        std::fs::create_dir_all(&vendored).expect("create vendor dir");
+        std::fs::write(
+            vendored.join("mail_unsubscribe.rs"),
+            "#[mailer(list_unsubscribe = \"weekly_digest\")]\nfn x() {}",
+        )
+        .expect("write vendored source");
+        assert!(
+            !scan_dir_for_list_unsubscribe(root.path()),
+            "vendored dependency sources must be skipped"
+        );
+
+        // Integration-test and example fixtures are not compiled into the app
+        // binary, so the runtime inventory never registers them — they must be
+        // skipped too.
+        for tree in ["tests", "examples"] {
+            let dir = root.path().join(tree);
+            std::fs::create_dir_all(&dir).expect("create test/example dir");
+            std::fs::write(
+                dir.join("fixture.rs"),
+                "#[mailer(list_unsubscribe = \"weekly_digest\")]\nfn f() {}",
+            )
+            .expect("write fixture source");
+        }
+        assert!(
+            !scan_dir_for_list_unsubscribe(root.path()),
+            "tests/ and examples/ fixtures must be skipped"
+        );
+
+        // A real workspace member that declares one is still detected.
+        let app = root.path().join("crates/marketing/src");
+        std::fs::create_dir_all(&app).expect("create app dir");
+        std::fs::write(
+            app.join("mailers.rs"),
+            "#[mailer(list_unsubscribe = \"weekly_digest\")]\nfn y() {}",
+        )
+        .expect("write app source");
+        assert!(
+            scan_dir_for_list_unsubscribe(root.path()),
+            "workspace member mailer must still be detected"
+        );
+    }
+
+    #[test]
+    fn inline_profile_lookup_order_matches_runtime() {
+        // Canonical spelling applied last so it wins over the legacy alias —
+        // matching autumn_web::config::profile_lookup_names.
+        assert_eq!(
+            inline_profile_lookup_names("prod"),
+            vec!["production", "prod"]
+        );
+        assert_eq!(
+            inline_profile_lookup_names("dev"),
+            vec!["development", "dev"]
+        );
+        assert_eq!(inline_profile_lookup_names("staging"), vec!["staging"]);
+    }
+
+    #[test]
+    fn override_file_lookup_order_prefers_selected_spelling() {
+        // Default canonical selection prefers the canonical file.
+        assert_eq!(
+            override_file_lookup_names("prod", "prod"),
+            vec!["prod".to_owned(), "production".to_owned()]
+        );
+        // When the operator selected the legacy spelling, that file is preferred.
+        assert_eq!(
+            override_file_lookup_names("prod", "production"),
+            vec!["production".to_owned(), "prod".to_owned()]
+        );
+        assert_eq!(
+            override_file_lookup_names("dev", "dev"),
+            vec!["dev".to_owned(), "development".to_owned()]
+        );
+        assert_eq!(
+            override_file_lookup_names("dev", "development"),
+            vec!["development".to_owned(), "dev".to_owned()]
+        );
+        assert_eq!(
+            override_file_lookup_names("staging", "staging"),
+            vec!["staging".to_owned()]
+        );
+    }
+
+    #[test]
+    fn mail_unsubscribe_invalid_base_url_fails_in_prod() {
+        // Non-empty but malformed: runtime validate() would reject this, so doctor
+        // must not return Pass on it.
+        let r = check_mail_unsubscribe_config_impl(
+            true,
+            Some("http://app.example.com"),
+            None,
+            false,
+            true,
+            30,
+        );
+        assert_eq!(r.status, CheckStatus::Fail);
+        let r = check_mail_unsubscribe_config_impl(
+            true,
+            Some("https://app.example.com:abc"),
+            None,
+            false,
+            true,
+            30,
+        );
+        assert_eq!(r.status, CheckStatus::Fail);
+    }
+
+    #[test]
+    fn mail_unsubscribe_invalid_mailto_fails_in_prod() {
+        let r = check_mail_unsubscribe_config_impl(
+            true,
+            None,
+            Some("unsubscribe example.com"),
+            false,
+            true,
+            30,
+        );
+        assert_eq!(r.status, CheckStatus::Fail);
+    }
+
+    #[test]
+    fn mail_unsubscribe_invalid_value_is_lenient_outside_prod() {
+        // Dev mirrors the runtime: malformed values are not a hard gate.
+        let r = check_mail_unsubscribe_config_impl(
+            true,
+            Some("http://app.example.com"),
+            None,
+            false,
+            false,
+            30,
+        );
+        assert_eq!(r.status, CheckStatus::Pass);
+    }
+
+    #[test]
+    fn doctor_url_validation_matches_runtime_cases() {
+        assert!(is_valid_https_base_url_doctor("https://app.example.com"));
+        assert!(is_valid_https_base_url_doctor(
+            "https://app.example.com:8443"
+        ));
+        assert!(is_valid_https_base_url_doctor(
+            "https://app.example.com/base"
+        ));
+        assert!(!is_valid_https_base_url_doctor("http://app.example.com"));
+        assert!(!is_valid_https_base_url_doctor(
+            "https://app.example.com:abc"
+        ));
+        assert!(!is_valid_https_base_url_doctor("https://@/base"));
+        assert!(!is_valid_https_base_url_doctor("https:///path"));
+        assert!(!is_valid_https_base_url_doctor("https:/app.example.com"));
+        assert!(!is_valid_https_base_url_doctor("https:app.example.com"));
+        assert!(!is_valid_https_base_url_doctor(
+            "https://user@app.example.com"
+        ));
+        assert!(!is_valid_https_base_url_doctor(
+            "https://app.example.com?q=1"
+        ));
+
+        assert!(is_valid_mailto_address_doctor("unsub@example.com"));
+        assert!(is_valid_mailto_address_doctor("mailto:unsub@example.com"));
+        assert!(!is_valid_mailto_address_doctor("not-an-email"));
+        assert!(!is_valid_mailto_address_doctor("unsubscribe example.com"));
+        assert!(!is_valid_mailto_address_doctor("https://unsub@example.com"));
+        assert!(!is_valid_mailto_address_doctor("unsub@https://example.com"));
+    }
+
+    #[test]
+    fn mail_unsubscribe_usage_with_both_url_and_mailto_warns_in_prod() {
+        // base_url presence drives the suppression-backend warning even when a
+        // mailto fallback is also configured.
+        let r = check_mail_unsubscribe_config_impl(
+            true,
+            Some("https://app.example.com"),
+            Some("unsub@example.com"),
+            false,
+            true,
+            30,
+        );
+        assert_eq!(r.status, CheckStatus::Warn);
+    }
+
+    #[test]
+    fn transport_resolver_trims_and_ignores_invalid_env() {
+        // Valid env override wins (trimmed + case-insensitive).
+        assert_eq!(
+            resolve_effective_mail_transport(Some(" SMTP ".to_owned()), Some("disabled"), "prod"),
+            "smtp"
+        );
+        // Whitespace-only "disabled" must resolve to disabled, not be treated raw.
+        assert_eq!(
+            resolve_effective_mail_transport(Some(" disabled ".to_owned()), None, "prod"),
+            "disabled"
+        );
+        // Invalid env override is ignored → falls back to TOML.
+        assert_eq!(
+            resolve_effective_mail_transport(Some("bogus".to_owned()), Some("disabled"), "prod"),
+            "disabled"
+        );
+        // No env, no TOML → profile smart-default.
+        assert_eq!(resolve_effective_mail_transport(None, None, "dev"), "log");
+        assert_eq!(
+            resolve_effective_mail_transport(None, None, "prod"),
+            "disabled"
+        );
+        // TOML value is parsed too (case-insensitive).
+        assert_eq!(
+            resolve_effective_mail_transport(None, Some("LOG"), "prod"),
+            "log"
+        );
+    }
+
+    #[test]
+    fn ttl_resolver_ignores_invalid_env_like_runtime() {
+        let table: toml::Table =
+            toml::from_str("[mail]\nunsubscribe_token_ttl_days = 14\n").unwrap();
+        // Absent env → TOML value.
+        assert_eq!(
+            resolve_unsubscribe_token_ttl_days_from_sources(None, Some(&table)),
+            14
+        );
+        // No TOML, no env → default 30.
+        assert_eq!(
+            resolve_unsubscribe_token_ttl_days_from_sources(None, None),
+            30
+        );
+        // Valid env overrides TOML.
+        assert_eq!(
+            resolve_unsubscribe_token_ttl_days_from_sources(Some("7".to_owned()), Some(&table)),
+            7
+        );
+        // Blank / non-integer env is ignored (runtime warns + keeps TOML/default),
+        // so it must NOT resolve to 0 and falsely fail the positive-days check.
+        assert_eq!(
+            resolve_unsubscribe_token_ttl_days_from_sources(Some(String::new()), Some(&table)),
+            14
+        );
+        assert_eq!(
+            resolve_unsubscribe_token_ttl_days_from_sources(Some("abc".to_owned()), Some(&table)),
+            14
+        );
+        assert_eq!(
+            resolve_unsubscribe_token_ttl_days_from_sources(Some("  ".to_owned()), None),
+            30
+        );
+    }
+
+    #[test]
+    fn ttl_toml_type_invalid_flags_non_integer_values() {
+        // Absent key → not invalid (the default applies).
+        assert!(!unsubscribe_ttl_toml_type_invalid(None));
+        let empty: toml::Table = toml::from_str("[mail]\n").unwrap();
+        assert!(!unsubscribe_ttl_toml_type_invalid(Some(&empty)));
+        // A bare integer is valid.
+        let int: toml::Table = toml::from_str("[mail]\nunsubscribe_token_ttl_days = 30\n").unwrap();
+        assert!(!unsubscribe_ttl_toml_type_invalid(Some(&int)));
+        // A quoted string or a float is the wrong type — the runtime's typed i64
+        // deserialize rejects it before boot, so doctor must flag it.
+        let string: toml::Table =
+            toml::from_str("[mail]\nunsubscribe_token_ttl_days = \"30\"\n").unwrap();
+        assert!(unsubscribe_ttl_toml_type_invalid(Some(&string)));
+        let float: toml::Table =
+            toml::from_str("[mail]\nunsubscribe_token_ttl_days = 30.0\n").unwrap();
+        assert!(unsubscribe_ttl_toml_type_invalid(Some(&float)));
+    }
+
+    #[test]
+    fn dest_toml_type_invalid_flags_non_string_values() {
+        assert!(!unsubscribe_dest_toml_type_invalid(None));
+        let empty: toml::Table = toml::from_str("[mail]\n").unwrap();
+        assert!(!unsubscribe_dest_toml_type_invalid(Some(&empty)));
+        // String values are valid.
+        let strings: toml::Table = toml::from_str(
+            "[mail]\nunsubscribe_base_url = \"https://x\"\nunsubscribe_mailto = \"u@x.com\"\n",
+        )
+        .unwrap();
+        assert!(!unsubscribe_dest_toml_type_invalid(Some(&strings)));
+        // A present non-string (integer/array) is the wrong type — the runtime's
+        // Option<String> deserialize rejects it before boot, so doctor must flag it.
+        let int_url: toml::Table = toml::from_str("[mail]\nunsubscribe_base_url = 42\n").unwrap();
+        assert!(unsubscribe_dest_toml_type_invalid(Some(&int_url)));
+        let arr_mailto: toml::Table =
+            toml::from_str("[mail]\nunsubscribe_mailto = [\"u@x.com\"]\n").unwrap();
+        assert!(unsubscribe_dest_toml_type_invalid(Some(&arr_mailto)));
+    }
+
+    #[test]
+    fn mail_unsubscribe_non_positive_ttl_fails_in_any_profile() {
+        // Runtime validate() rejects a non-positive TTL in every profile, even
+        // with no list usage or a disabled transport, so the app won't boot.
+        for is_prod in [true, false] {
+            let r = check_mail_unsubscribe_config_impl(false, None, None, true, is_prod, 0);
+            assert_eq!(r.status, CheckStatus::Fail, "ttl=0 prod={is_prod}");
+            let r = check_mail_unsubscribe_config_impl(false, None, None, true, is_prod, -5);
+            assert_eq!(r.status, CheckStatus::Fail, "ttl=-5 prod={is_prod}");
+        }
+    }
+
+    #[test]
+    fn mail_unsubscribe_invalid_destination_fails_even_without_usage() {
+        // Runtime validate() rejects a malformed destination in prod regardless of
+        // whether any #[mailer] declares list_unsubscribe, so doctor must not Pass
+        // before validating it.
+        let r = check_mail_unsubscribe_config_impl(
+            false,
+            Some("http://app.example.com"),
+            None,
+            true,
+            true,
+            30,
+        );
+        assert_eq!(r.status, CheckStatus::Fail);
+        let r = check_mail_unsubscribe_config_impl(
+            false,
+            None,
+            Some("unsubscribe example.com"),
+            true,
+            true,
+            30,
+        );
+        assert_eq!(r.status, CheckStatus::Fail);
+    }
+
+    #[test]
+    fn strip_rust_comments_handles_unterminated_block_comment() {
+        // Should not panic; the remaining unclosed block is simply stripped.
+        let result = strip_rust_comments("code /* unclosed comment");
+        assert!(result.contains("code"));
+        assert!(!result.contains("unclosed"));
+    }
+
+    #[test]
+    fn strip_rust_comments_removes_line_comments_and_preserves_code() {
+        // Code before a comment is retained; everything after `//` is dropped.
+        let result = strip_rust_comments("let x = 1; // this comment should disappear");
+        assert!(
+            result.contains("let x = 1;"),
+            "code before comment preserved: {result}"
+        );
+        assert!(
+            !result.contains("disappear"),
+            "line comment stripped: {result}"
+        );
+    }
 
     // ── glyph ────────────────────────────────────────────────────────────────
 

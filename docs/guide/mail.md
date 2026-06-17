@@ -288,3 +288,6 @@ build a `Mailer::with_transport(...)`.
   case Autumn falls back to an in-process Tokio task and logs failures.
 - For DB-write + mail-orchestration flows, use the [Transactions
   Guide](transactions.md) for the canonical atomic write pattern.
+- Shipping newsletters, digests, or other bulk mail? See
+  [Mail compliance: List-Unsubscribe](mail-compliance.md) to meet Gmail/Yahoo
+  bulk-sender requirements with one attribute and one config key.

@@ -895,6 +895,14 @@ fn collect_claimed_get_paths(
         claimed.insert("/_autumn/mail/messages/{message_id}".to_owned());
         claimed.insert("/_autumn/mail/previews/{mailer}/{method}".to_owned());
     }
+    // The default unsubscribe endpoint merges a GET (+POST) at `UNSUBSCRIBE_PATH`
+    // before the late-merged OpenAPI/MCP routers, so reserve it too — otherwise an
+    // OpenAPI/MCP mount configured at `/_autumn/unsubscribe` passes this preflight
+    // and then panics in `router.merge` instead of surfacing the typed collision.
+    #[cfg(feature = "mail")]
+    if config.mail.should_mount_unsubscribe_endpoint() {
+        claimed.insert(crate::mail::UNSUBSCRIBE_PATH.to_owned());
+    }
     claimed
 }
 
@@ -1271,6 +1279,18 @@ fn mount_framework_routes(
         );
     }
 
+    // RFC 8058 one-click unsubscribe endpoint — opt-in via
+    // `mail.mount_unsubscribe_endpoint` / `AppBuilder::mount_unsubscribe_endpoint`
+    // so JSON-only apps never get an HTML endpoint they didn't request.
+    #[cfg(feature = "mail")]
+    if config.mail.should_mount_unsubscribe_endpoint() {
+        router = router.merge(crate::mail::unsubscribe_router());
+        tracing::debug!(
+            path = crate::mail::UNSUBSCRIBE_PATH,
+            "Mounted default unsubscribe endpoint"
+        );
+    }
+
     router
 }
 
@@ -1510,6 +1530,13 @@ where
         for endpoint in &config.security.webhooks.endpoints {
             csrf_layer = csrf_layer.with_exempt_path(&endpoint.path);
         }
+        // RFC 8058 one-click unsubscribe POSTs arrive from mailbox providers
+        // with no Autumn CSRF cookie/header; exempt the endpoint only when the
+        // framework owns it (opt-in), so a custom override keeps its own CSRF.
+        #[cfg(feature = "mail")]
+        if config.mail.should_mount_unsubscribe_endpoint() {
+            csrf_layer = csrf_layer.with_exempt_path(crate::mail::UNSUBSCRIBE_PATH);
+        }
         tracing::info!("CSRF protection enabled");
         router = router.layer(csrf_layer);
     }
@@ -1530,6 +1557,12 @@ where
         let mut exempt = config.security.captcha_exempt_paths.clone();
         for endpoint in &config.security.webhooks.endpoints {
             exempt.push(endpoint.path.clone());
+        }
+        // One-click unsubscribe POSTs carry no CAPTCHA token; exempt the
+        // framework-owned endpoint when mounted.
+        #[cfg(feature = "mail")]
+        if config.mail.should_mount_unsubscribe_endpoint() {
+            exempt.push(crate::mail::UNSUBSCRIBE_PATH.to_owned());
         }
         let layer =
             crate::security::captcha::BotProtectionLayer::from_config(&config.bot_protection)
@@ -3896,6 +3929,42 @@ mod tests {
                 field: "openapi_json_path",
                 ref path,
             } if path == "/api/docs"
+        ));
+    }
+
+    #[cfg(all(feature = "openapi", feature = "mail"))]
+    #[tokio::test]
+    async fn try_build_router_rejects_openapi_path_on_unsubscribe_endpoint() {
+        // The default one-click unsubscribe endpoint merges a GET at
+        // `/_autumn/unsubscribe` before the late-merged OpenAPI router, so the
+        // collision preflight must reserve it — otherwise mounting OpenAPI there
+        // panics in `router.merge` instead of surfacing the typed collision.
+        let mut config = AutumnConfig::default();
+        config.mail.mount_unsubscribe_endpoint = true;
+        config.mail.unsubscribe_base_url = Some("https://app.example.com".to_owned());
+        assert!(config.mail.should_mount_unsubscribe_endpoint());
+        let openapi = crate::openapi::OpenApiConfig::new("Demo", "1.0.0")
+            .openapi_json_path(crate::mail::UNSUBSCRIBE_PATH);
+        let ctx = RouterContext {
+            exception_filters: Vec::new(),
+            scoped_groups: Vec::new(),
+            merge_routers: Vec::new(),
+            nest_routers: Vec::new(),
+            custom_layers: Vec::new(),
+            error_page_renderer: None,
+            session_store: None,
+            openapi: Some(openapi),
+            #[cfg(feature = "mcp")]
+            mcp: None,
+        };
+        let err = super::try_build_router_inner(Vec::new(), &config, test_state(), ctx)
+            .expect_err("unsubscribe endpoint path should be reserved");
+        assert!(matches!(
+            err,
+            RouterBuildError::OpenApiPathCollision {
+                field: "openapi_json_path",
+                ref path,
+            } if path == crate::mail::UNSUBSCRIBE_PATH
         ));
     }
 

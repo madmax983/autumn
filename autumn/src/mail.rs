@@ -106,6 +106,7 @@ impl Default for SmtpConfig {
 
 /// `[mail]` config section.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[allow(clippy::struct_excessive_bools)] // independent transport/prod/unsubscribe toggles
 pub struct MailConfig {
     /// Active transport.
     #[serde(default)]
@@ -133,9 +134,109 @@ pub struct MailConfig {
     /// Setting this flag outside `dev` is rejected at startup.
     #[serde(default)]
     pub preview: bool,
+    /// Base URL for RFC 8058 one-click `List-Unsubscribe` links, e.g.
+    /// `https://app.example.com`. Required (alongside or instead of
+    /// [`unsubscribe_mailto`](Self::unsubscribe_mailto)) for any `#[mailer]`
+    /// that declares `list_unsubscribe`.
+    #[serde(default)]
+    pub unsubscribe_base_url: Option<String>,
+    /// `mailto:` fallback address for the `List-Unsubscribe` header, e.g.
+    /// `unsubscribe@example.com`.
+    #[serde(default)]
+    pub unsubscribe_mailto: Option<String>,
+    /// Validity window for signed unsubscribe tokens, in days.
+    #[serde(default = "default_unsubscribe_ttl_days")]
+    pub unsubscribe_token_ttl_days: i64,
+    /// Opt in to mounting the framework's default one-click unsubscribe endpoint
+    /// (`GET`/`POST /_autumn/unsubscribe`). Off by default so JSON-only apps
+    /// never get an HTML endpoint they didn't ask for; also settable via
+    /// [`AppBuilder::mount_unsubscribe_endpoint`](crate::app::AppBuilder::mount_unsubscribe_endpoint).
+    #[serde(default)]
+    pub mount_unsubscribe_endpoint: bool,
     /// SMTP settings.
     #[serde(default)]
     pub smtp: SmtpConfig,
+}
+
+/// Whether `url` is an absolute `https://` URL with a non-empty host and no
+/// query/fragment, e.g. `https://app.example.com` or `…/base`. Rejects bare
+/// `https://`, `https:///path`, and bases carrying `?`/`#` (the unsubscribe
+/// path/token is appended afterwards, so a query/fragment base would not route).
+fn is_valid_https_base_url(url: &str) -> bool {
+    // Reject characters that are unsafe inside an RFC 2369 angle-bracket URI or
+    // would survive into the raw header: `Url::parse` percent-encodes a space or
+    // `<`/`>` in the path, but the *original* string is what gets rendered as
+    // `<…?token=…>`, so a raw `<`/`>`/whitespace/control char would close or
+    // corrupt the `List-Unsubscribe` value.
+    if url
+        .chars()
+        .any(|c| c.is_control() || c.is_whitespace() || matches!(c, '<' | '>'))
+    {
+        return false;
+    }
+    // Require the raw input to be literally `https://<authority>…`. `url::Url`
+    // normalizes a missing/short authority (`https:`, `https:app.example.com`,
+    // `https:/app.example.com`, `https:///path`) into a valid HTTPS URL with a
+    // host, but the *original* malformed string is what gets rendered into the
+    // header — so reject anything that isn't `https://` followed by a non-`/`
+    // authority character.
+    match url.strip_prefix("https://") {
+        Some(rest) if !rest.is_empty() && !rest.starts_with('/') => {}
+        _ => return false,
+    }
+    let Ok(parsed) = ::url::Url::parse(url) else {
+        return false;
+    };
+    // Require an absolute https:// URL with a real host and a valid authority.
+    // Parsing (rather than splitting on `/`) rejects malformed authorities like
+    // `https://app.example.com:abc` (bad port) or `https://@/base` (empty host).
+    // No credentials in the link, and no query/fragment — either would break the
+    // appended `?token=…`.
+    parsed.scheme() == "https"
+        && parsed.host_str().is_some_and(|h| !h.is_empty())
+        && parsed.username().is_empty()
+        && parsed.password().is_none()
+        && parsed.query().is_none()
+        && parsed.fragment().is_none()
+}
+
+/// Whether `value` is a usable unsubscribe mailbox — a bare `local@domain` or a
+/// `mailto:local@domain` URI, with non-empty parts and no whitespace.
+fn is_valid_mailto_address(value: &str) -> bool {
+    // Reject control characters and RFC 2369 delimiters anywhere in the value
+    // (including inside a `?subject=…` query): the value is rendered verbatim
+    // inside `<mailto:…>`, so a control char (CRLF injection, e.g. an extra
+    // `Bcc:`) or a `<`/`>`/`,` (which would close the entry and inject an extra
+    // `List-Unsubscribe` target) must not pass.
+    if value
+        .chars()
+        .any(|c| c.is_control() || matches!(c, '<' | '>' | ','))
+    {
+        return false;
+    }
+    let address = value
+        .trim()
+        .strip_prefix("mailto:")
+        .unwrap_or_else(|| value.trim());
+    // Drop any `?subject=…` parameters before validating the address itself.
+    let address = address.split('?').next().unwrap_or("");
+    match address.split_once('@') {
+        Some((local, domain)) => {
+            !local.is_empty()
+                && !domain.is_empty()
+                && domain.contains('.')
+                && !address.contains(char::is_whitespace)
+                // Reject any other URI scheme (e.g. `https://unsub@example.com`):
+                // `:` / `/` here mean the value is not a bare mailbox, and it
+                // would otherwise render as a bogus `<mailto:https://…>` header.
+                && !address.contains([':', '/'])
+        }
+        None => false,
+    }
+}
+
+const fn default_unsubscribe_ttl_days() -> i64 {
+    crate::mail::unsubscribe::DEFAULT_TOKEN_TTL_DAYS
 }
 
 impl Default for MailConfig {
@@ -148,6 +249,10 @@ impl Default for MailConfig {
             allow_in_process_deliver_later_in_production: false,
             file_dir: default_file_dir(),
             preview: false,
+            unsubscribe_base_url: None,
+            unsubscribe_mailto: None,
+            unsubscribe_token_ttl_days: default_unsubscribe_ttl_days(),
+            mount_unsubscribe_endpoint: false,
             smtp: SmtpConfig::default(),
         }
     }
@@ -184,12 +289,53 @@ impl MailConfig {
             ));
         }
 
+        if self.unsubscribe_token_ttl_days <= 0 {
+            return Err(crate::config::ConfigError::Validation(
+                "mail.unsubscribe_token_ttl_days must be a positive number of days; a non-positive value would make every unsubscribe token immediately expired".to_owned(),
+            ));
+        }
+
+        if matches!(profile, Some("prod" | "production"))
+            && let Some(base) = self.unsubscribe_base_url.as_deref().map(str::trim)
+            && !base.is_empty()
+            && !is_valid_https_base_url(base)
+        {
+            return Err(crate::config::ConfigError::Validation(
+                "mail.unsubscribe_base_url must be an absolute https:// URL with a host in prod; mailbox providers require HTTPS for RFC 8058 one-click unsubscribe".to_owned(),
+            ));
+        }
+
+        if matches!(profile, Some("prod" | "production"))
+            && let Some(mailto) = self.unsubscribe_mailto.as_deref().map(str::trim)
+            && !mailto.is_empty()
+            && !is_valid_mailto_address(mailto)
+        {
+            return Err(crate::config::ConfigError::Validation(
+                "mail.unsubscribe_mailto must be a bare mailbox address (or mailto: URI) like unsubscribe@example.com".to_owned(),
+            ));
+        }
+
         Ok(())
     }
 
     pub(crate) fn preview_routes_enabled(&self, profile: Option<&str>) -> bool {
         matches!(profile, Some("dev" | "development"))
             && (self.preview || self.transport == Transport::File)
+    }
+
+    /// Whether a base URL is configured. A `mailto`-only configuration emits a
+    /// `List-Unsubscribe: <mailto:…>` header but needs no HTTP endpoint.
+    pub(crate) fn unsubscribe_base_url_set(&self) -> bool {
+        self.unsubscribe_base_url
+            .as_deref()
+            .is_some_and(|s| !s.trim().is_empty())
+    }
+
+    /// Whether the framework's default one-click unsubscribe endpoint should be
+    /// mounted: the app opted in **and** a base URL is configured. Opt-in keeps
+    /// JSON-only apps free of an HTML endpoint they never requested.
+    pub(crate) fn should_mount_unsubscribe_endpoint(&self) -> bool {
+        self.mount_unsubscribe_endpoint && self.unsubscribe_base_url_set()
     }
 }
 
@@ -236,6 +382,16 @@ pub struct Mail {
     pub html: Option<String>,
     /// Plain-text body.
     pub text: Option<String>,
+    /// Logical list / suppression scope for RFC 8058 one-click
+    /// `List-Unsubscribe` (e.g. `"weekly_digest"`). Set by the
+    /// `#[mailer(list_unsubscribe = "...")]` macro. `None` for transactional
+    /// mail that must never carry unsubscribe headers (password resets, MFA
+    /// codes, security alerts). See [`crate::mail::unsubscribe`].
+    pub list_unsubscribe: Option<String>,
+    /// Additional raw headers emitted on the wire by every transport. Used to
+    /// carry the computed `List-Unsubscribe` / `List-Unsubscribe-Post` headers,
+    /// but available for any custom header.
+    pub extra_headers: Vec<(String, String)>,
 }
 
 /// Stable root path for the dev mail preview UI.
@@ -378,6 +534,8 @@ pub struct MailBuilder {
     subject: Option<String>,
     html: Option<String>,
     text: Option<String>,
+    list_unsubscribe: Option<String>,
+    extra_headers: Vec<(String, String)>,
 }
 
 impl MailBuilder {
@@ -423,6 +581,25 @@ impl MailBuilder {
         self
     }
 
+    /// Tag this message with a logical list / suppression scope, opting it into
+    /// RFC 8058 one-click `List-Unsubscribe` handling at send time.
+    ///
+    /// Authors normally set this declaratively via
+    /// `#[mailer(list_unsubscribe = "...")]`; this builder method exists for
+    /// hand-rolled mail and previews.
+    #[must_use]
+    pub fn list_unsubscribe(mut self, scope: impl Into<String>) -> Self {
+        self.list_unsubscribe = Some(scope.into());
+        self
+    }
+
+    /// Add a raw header emitted by every transport.
+    #[must_use]
+    pub fn header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.extra_headers.push((name.into(), value.into()));
+        self
+    }
+
     /// Build the mail.
     ///
     /// # Errors
@@ -450,6 +627,8 @@ impl MailBuilder {
             subject,
             html: self.html,
             text: self.text,
+            list_unsubscribe: self.list_unsubscribe,
+            extra_headers: self.extra_headers,
         })
     }
 }
@@ -555,6 +734,413 @@ impl std::fmt::Debug for MailDeliveryQueueHandle {
     }
 }
 
+// ── RFC 8058 List-Unsubscribe ────────────────────────────────────────────────
+
+/// Stable root path for the framework's default one-click unsubscribe endpoint.
+pub const UNSUBSCRIBE_PATH: &str = "/_autumn/unsubscribe";
+
+/// Compile-time registration of a `#[mailer(list_unsubscribe = "...")]`.
+///
+/// Emitted by the `#[mailer]` macro. Lets production startup and `autumn doctor`
+/// enumerate which logical lists exist so they can fail closed when the app has
+/// no unsubscribe destination configured.
+#[derive(Debug)]
+pub struct MailerListUnsubscribeDescriptor {
+    /// Mailer type name (e.g. `WeeklyDigestMailer`).
+    pub mailer: &'static str,
+    /// Logical list / suppression scope (e.g. `weekly_digest`).
+    pub scope: &'static str,
+}
+
+inventory::collect!(MailerListUnsubscribeDescriptor);
+
+/// Every `list_unsubscribe` declaration registered across the binary.
+#[must_use]
+pub fn registered_list_unsubscribe_scopes() -> Vec<&'static MailerListUnsubscribeDescriptor> {
+    inventory::iter::<MailerListUnsubscribeDescriptor>
+        .into_iter()
+        .collect()
+}
+
+/// Returns `true` when any `#[mailer]` in this binary opted into
+/// `list_unsubscribe`.
+#[must_use]
+pub fn has_list_unsubscribe_mailers() -> bool {
+    inventory::iter::<MailerListUnsubscribeDescriptor>
+        .into_iter()
+        .next()
+        .is_some()
+}
+
+/// Whether production startup must fail closed: a `#[mailer]` declares
+/// `list_unsubscribe` but the app configured no unsubscribe destination.
+#[must_use]
+#[allow(clippy::fn_params_excessive_bools)]
+pub(crate) const fn unsubscribe_config_fail_closed(
+    enforce: bool,
+    in_production: bool,
+    has_list_mailers: bool,
+    unsubscribe_configured: bool,
+) -> bool {
+    enforce && in_production && has_list_mailers && !unsubscribe_configured
+}
+
+/// Encrypted, short-lived, stateless unsubscribe tokens.
+///
+/// A token is `base64url(version ‖ nonce ‖ AES-256-GCM(payload))`, where the
+/// inner payload is `base64url(subscriber).base64url(list_id).expiry`. The cipher
+/// key is derived from the app signing key (`ResolvedSigningKeys`) via HMAC-SHA256
+/// with a domain-separation label. AES-256-GCM provides both confidentiality and
+/// authenticity: unlike a plain signed token the recipient address is **not**
+/// recoverable from the URL (so it can't leak from proxy/browser/link-scanner
+/// logs), and the GCM tag makes the token tamper-proof. Verification tries the
+/// current key, then any rotation-grace `previous` keys. Stateless — no
+/// server-side token storage.
+pub mod unsubscribe {
+    use aes_gcm::aead::{Aead, KeyInit};
+    use aes_gcm::{Aes256Gcm, Nonce};
+    use base64::Engine as _;
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+
+    use crate::security::config::ResolvedSigningKeys;
+
+    /// Default validity window for unsubscribe tokens, in days.
+    pub const DEFAULT_TOKEN_TTL_DAYS: i64 = 30;
+
+    const ENGINE: base64::engine::GeneralPurpose = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    /// Token format version (first byte of the encrypted blob).
+    const TOKEN_VERSION: u8 = 1;
+    /// AES-GCM nonce length in bytes.
+    const NONCE_LEN: usize = 12;
+    /// Domain-separation label for deriving the token cipher key from a signing
+    /// key, so it is independent of other uses of the signing secret.
+    const KEY_CONTEXT: &[u8] = b"autumn:unsubscribe-token:v1";
+
+    /// A verified unsubscribe request decoded from a signed token.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct Unsubscribed {
+        /// Opaque subscriber identifier (email address by default).
+        pub subscriber: String,
+        /// Logical list / suppression scope.
+        pub list_id: String,
+    }
+
+    /// Reasons an unsubscribe token fails to verify.
+    #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+    pub enum TokenError {
+        /// Structure or encoding is invalid.
+        #[error("unsubscribe token is malformed")]
+        Malformed,
+        /// Signature did not match any current or previous signing key.
+        #[error("unsubscribe token signature is invalid")]
+        BadSignature,
+        /// Token is past its expiry.
+        #[error("unsubscribe token has expired")]
+        Expired,
+    }
+
+    /// Derive a 32-byte AES-256 key from a signing key via HMAC-SHA256 with a
+    /// domain-separation label.
+    fn derive_key(signing_key: &[u8]) -> [u8; 32] {
+        let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(signing_key)
+            .expect("HMAC accepts any key length");
+        mac.update(KEY_CONTEXT);
+        let bytes = mac.finalize().into_bytes();
+        let mut key = [0u8; 32];
+        key.copy_from_slice(&bytes);
+        key
+    }
+
+    /// The inner authenticated plaintext: `b64(subscriber).b64(list_id).expiry`.
+    fn plaintext(subscriber: &str, list_id: &str, expiry_unix: i64) -> String {
+        format!(
+            "{}.{}.{expiry_unix}",
+            ENGINE.encode(subscriber.as_bytes()),
+            ENGINE.encode(list_id.as_bytes()),
+        )
+    }
+
+    /// Mint an encrypted unsubscribe token valid until `expiry_unix`.
+    ///
+    /// The subscriber/list/expiry (seconds since epoch) are encrypted and
+    /// authenticated with AES-256-GCM, so they are not recoverable from the URL.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the OS RNG is unavailable.
+    #[must_use]
+    pub fn sign_token(
+        keys: &ResolvedSigningKeys,
+        subscriber: &str,
+        list_id: &str,
+        expiry_unix: i64,
+    ) -> String {
+        let key = derive_key(&keys.current);
+        let cipher = Aes256Gcm::new_from_slice(&key).expect("derived key is always 32 bytes");
+        let mut nonce_bytes = [0u8; NONCE_LEN];
+        getrandom::getrandom(&mut nonce_bytes).expect("OS RNG failed");
+        let ciphertext = cipher
+            .encrypt(
+                Nonce::from_slice(&nonce_bytes),
+                plaintext(subscriber, list_id, expiry_unix).as_bytes(),
+            )
+            .expect("AES-GCM encryption cannot fail for valid inputs");
+        let mut blob = Vec::with_capacity(1 + NONCE_LEN + ciphertext.len());
+        blob.push(TOKEN_VERSION);
+        blob.extend_from_slice(&nonce_bytes);
+        blob.extend_from_slice(&ciphertext);
+        ENGINE.encode(blob)
+    }
+
+    /// Verify a token and decode its subscriber/list, rejecting bad signatures
+    /// and expired tokens.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TokenError`] when the token is malformed, its signature is
+    /// invalid, or it has expired relative to `now_unix`.
+    pub fn verify_token(
+        keys: &ResolvedSigningKeys,
+        token: &str,
+        now_unix: i64,
+    ) -> Result<Unsubscribed, TokenError> {
+        let blob = ENGINE.decode(token).map_err(|_| TokenError::Malformed)?;
+        if blob.len() < 1 + NONCE_LEN {
+            return Err(TokenError::Malformed);
+        }
+        if blob[0] != TOKEN_VERSION {
+            return Err(TokenError::Malformed);
+        }
+        let nonce = Nonce::from_slice(&blob[1..=NONCE_LEN]);
+        let ciphertext = &blob[1 + NONCE_LEN..];
+        // Try the current key first, then any rotation-grace `previous` keys. A
+        // wrong key (or any tampering) fails AES-GCM authentication.
+        let payload = std::iter::once(&keys.current)
+            .chain(keys.previous.iter())
+            .find_map(|signing_key| {
+                let key = derive_key(signing_key);
+                // The derived key is always 32 bytes, so construction never fails;
+                // `.ok()?` keeps this panic-free regardless.
+                let cipher = Aes256Gcm::new_from_slice(&key).ok()?;
+                cipher.decrypt(nonce, ciphertext).ok()
+            })
+            .ok_or(TokenError::BadSignature)?;
+        let payload = String::from_utf8(payload).map_err(|_| TokenError::Malformed)?;
+        let mut parts = payload.split('.');
+        let subscriber_b64 = parts.next().ok_or(TokenError::Malformed)?;
+        let list_b64 = parts.next().ok_or(TokenError::Malformed)?;
+        let expiry_s = parts.next().ok_or(TokenError::Malformed)?;
+        if parts.next().is_some() {
+            return Err(TokenError::Malformed);
+        }
+        let expiry: i64 = expiry_s.parse().map_err(|_| TokenError::Malformed)?;
+        if now_unix > expiry {
+            return Err(TokenError::Expired);
+        }
+        let subscriber = decode_field(subscriber_b64)?;
+        let list_id = decode_field(list_b64)?;
+        Ok(Unsubscribed {
+            subscriber,
+            list_id,
+        })
+    }
+
+    fn decode_field(encoded: &str) -> Result<String, TokenError> {
+        let bytes = ENGINE.decode(encoded).map_err(|_| TokenError::Malformed)?;
+        String::from_utf8(bytes).map_err(|_| TokenError::Malformed)
+    }
+
+    /// Build the one-click unsubscribe URL for `token` rooted at `base_url`.
+    #[must_use]
+    pub fn unsubscribe_url(base_url: &str, token: &str) -> String {
+        format!(
+            "{}{}?token={token}",
+            base_url.trim_end_matches('/'),
+            super::UNSUBSCRIBE_PATH,
+        )
+    }
+}
+
+/// Persistent record of recipients who unsubscribed from a logical list.
+///
+/// Implementors store one row per `(subscriber, list_id)` and answer
+/// suppression queries at send time. Mirrors [`MailDeliveryQueue`]: register a
+/// [`SuppressionStoreHandle`] on [`AppState`] (or let the framework auto-wire a
+/// `db`-feature `DbSuppressionStore` backend) before `install_mailer` runs.
+pub trait SuppressionStore: Send + Sync {
+    /// Returns `true` when `subscriber` has unsubscribed from `list_id`.
+    fn is_suppressed<'a>(
+        &'a self,
+        subscriber: &'a str,
+        list_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, MailError>> + Send + 'a>>;
+
+    /// Record that `subscriber` unsubscribed from `list_id` (idempotent).
+    fn suppress<'a>(
+        &'a self,
+        subscriber: &'a str,
+        list_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), MailError>> + Send + 'a>>;
+}
+
+/// Cloneable handle to a [`SuppressionStore`] for storage on [`AppState`].
+#[derive(Clone)]
+pub struct SuppressionStoreHandle(Arc<dyn SuppressionStore>);
+
+impl SuppressionStoreHandle {
+    /// Wrap a store implementation.
+    #[must_use]
+    pub fn new(store: impl SuppressionStore + 'static) -> Self {
+        Self(Arc::new(store))
+    }
+
+    /// Wrap an already-shared store implementation.
+    #[must_use]
+    pub fn from_arc(store: Arc<dyn SuppressionStore>) -> Self {
+        Self(store)
+    }
+
+    /// Borrow the inner store.
+    #[must_use]
+    pub fn inner(&self) -> &Arc<dyn SuppressionStore> {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for SuppressionStoreHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SuppressionStoreHandle").finish()
+    }
+}
+
+/// In-memory [`SuppressionStore`] for tests, review apps, and single-process dev.
+///
+/// State is process-local and lost on restart; use `DbSuppressionStore` in
+/// production.
+#[derive(Debug, Default, Clone)]
+pub struct InMemorySuppressionStore {
+    suppressed: Arc<std::sync::Mutex<std::collections::HashSet<(String, String)>>>,
+}
+
+impl InMemorySuppressionStore {
+    /// Create an empty in-memory store.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl SuppressionStore for InMemorySuppressionStore {
+    fn is_suppressed<'a>(
+        &'a self,
+        subscriber: &'a str,
+        list_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, MailError>> + Send + 'a>> {
+        Box::pin(async move {
+            let key = (subscriber.to_owned(), list_id.to_owned());
+            let suppressed = self
+                .suppressed
+                .lock()
+                .expect("suppression lock")
+                .contains(&key);
+            Ok(suppressed)
+        })
+    }
+
+    fn suppress<'a>(
+        &'a self,
+        subscriber: &'a str,
+        list_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), MailError>> + Send + 'a>> {
+        Box::pin(async move {
+            let key = (subscriber.to_owned(), list_id.to_owned());
+            self.suppressed
+                .lock()
+                .expect("suppression lock")
+                .insert(key);
+            Ok(())
+        })
+    }
+}
+
+/// Runtime wiring for List-Unsubscribe.
+///
+/// Holds where to point unsubscribe links, how to sign tokens, and where
+/// suppression lives. Shared (via `Arc`) between the [`Mailer`] that signs
+/// links and the endpoint that verifies them so tokens always validate within a
+/// process.
+pub struct UnsubscribeRuntime {
+    /// Base URL for unsubscribe links (e.g. `https://app.example.com`).
+    pub base_url: Option<String>,
+    /// `mailto:` fallback address for the `List-Unsubscribe` header.
+    pub mailto: Option<String>,
+    /// Signing keys used for token HMACs.
+    pub signing_keys: Arc<crate::security::config::ResolvedSigningKeys>,
+    /// Token validity window, in days.
+    pub ttl_days: i64,
+    /// Suppression backend (absent in pure-header configurations).
+    pub suppression: Option<Arc<dyn SuppressionStore>>,
+}
+
+impl std::fmt::Debug for UnsubscribeRuntime {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UnsubscribeRuntime")
+            .field("base_url", &self.base_url)
+            .field("mailto", &self.mailto)
+            .field("ttl_days", &self.ttl_days)
+            .field("has_suppression", &self.suppression.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl UnsubscribeRuntime {
+    /// Build the `List-Unsubscribe` header value for `subscriber` on `list_id`:
+    /// `<https://…?token=…>, <mailto:…>` per RFC 8058 §2. Returns `None` when
+    /// neither a base URL nor a mailto is configured.
+    #[must_use]
+    pub fn list_unsubscribe_header(&self, subscriber: &str, list_id: &str) -> Option<String> {
+        let mut entries: Vec<String> = Vec::new();
+        if let Some(base) = self.base_url.as_deref().filter(|s| !s.trim().is_empty()) {
+            let expiry = current_unix_time().saturating_add(self.ttl_days.saturating_mul(86_400));
+            let token = unsubscribe::sign_token(&self.signing_keys, subscriber, list_id, expiry);
+            entries.push(format!("<{}>", unsubscribe::unsubscribe_url(base, &token)));
+        }
+        if let Some(mailto) = self.mailto.as_deref().filter(|s| !s.trim().is_empty()) {
+            // Accept both a bare address and a full `mailto:` URI without
+            // double-prefixing the scheme. Render only the bare mailbox (drop any
+            // configured `?query`) before appending the canonical subject, so a
+            // value like `mailto:u@x?subject=a\r\nBcc: v@x` can't inject extra
+            // headers into the raw `List-Unsubscribe` value.
+            let trimmed = mailto.trim();
+            let address = trimmed.strip_prefix("mailto:").unwrap_or(trimmed);
+            let address = address.split('?').next().unwrap_or(address);
+            entries.push(format!("<mailto:{address}?subject=unsubscribe>"));
+        }
+        if entries.is_empty() {
+            None
+        } else {
+            Some(entries.join(", "))
+        }
+    }
+
+    /// Whether RFC 8058 one-click is available — i.e. an HTTPS unsubscribe URL is
+    /// configured. `List-Unsubscribe-Post` is only valid alongside such a URL; a
+    /// `mailto`-only configuration is a plain RFC 2369 unsubscribe, not one-click.
+    #[must_use]
+    pub fn supports_one_click(&self) -> bool {
+        self.base_url
+            .as_deref()
+            .is_some_and(|s| !s.trim().is_empty())
+    }
+}
+
+fn current_unix_time() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
+}
+
 #[derive(Debug, Clone, Default)]
 struct MailerDefaults {
     from: Option<String>,
@@ -567,6 +1153,7 @@ pub struct Mailer {
     defaults: Arc<MailerDefaults>,
     transport: Arc<dyn MailTransport>,
     delivery_queue: Option<Arc<dyn MailDeliveryQueue>>,
+    unsubscribe: Option<Arc<UnsubscribeRuntime>>,
 }
 
 impl Mailer {
@@ -614,6 +1201,7 @@ impl Mailer {
             defaults: Arc::new(MailerDefaults::default()),
             transport: Arc::new(transport),
             delivery_queue: None,
+            unsubscribe: None,
         }
     }
 
@@ -621,6 +1209,14 @@ impl Mailer {
     #[must_use]
     pub fn with_delivery_queue(mut self, queue: impl MailDeliveryQueue + 'static) -> Self {
         self.delivery_queue = Some(Arc::new(queue));
+        self
+    }
+
+    /// Attach the List-Unsubscribe runtime used to sign links, emit RFC 8058
+    /// headers, and skip suppressed recipients.
+    #[must_use]
+    pub fn with_unsubscribe(mut self, runtime: Arc<UnsubscribeRuntime>) -> Self {
+        self.unsubscribe = Some(runtime);
         self
     }
 
@@ -642,13 +1238,102 @@ impl Mailer {
 
     /// Send mail immediately.
     ///
+    /// When the message carries a [`list_unsubscribe`](Mail::list_unsubscribe)
+    /// scope and a [`UnsubscribeRuntime`] is attached, recipients with a
+    /// matching suppression row are skipped (with a structured log event) and
+    /// every delivered message gains RFC 8058 `List-Unsubscribe` /
+    /// `List-Unsubscribe-Post` headers scoped to the recipient. Such messages
+    /// are delivered one recipient at a time so each unsubscribe link is
+    /// personalized.
+    ///
     /// # Errors
     ///
-    /// Returns an error from the selected transport.
+    /// Returns an error from the selected transport, or from the suppression
+    /// store when a suppression check fails.
     pub async fn send(&self, mail: Mail) -> Result<(), MailError> {
-        self.transport
-            .send(mail.with_defaults(&self.defaults))
-            .await
+        let mail = mail.with_defaults(&self.defaults);
+        if let Some(list_id) = mail.list_unsubscribe.clone() {
+            if let Some(runtime) = self.unsubscribe.clone() {
+                return self.send_list_mail(mail, list_id, &runtime).await;
+            }
+            // Opted into a list (e.g. via MailBuilder::list_unsubscribe) but no
+            // unsubscribe runtime is wired — send without headers/suppression,
+            // but make the compliance gap loud rather than silent.
+            tracing::warn!(
+                target: "mail",
+                list_id = %list_id,
+                "sending list mail without an unsubscribe runtime: no List-Unsubscribe headers or suppression applied (set mail.unsubscribe_base_url / mail.unsubscribe_mailto)"
+            );
+        }
+        self.transport.send(mail).await
+    }
+
+    /// Deliver a list mail recipient-by-recipient, applying suppression and
+    /// per-recipient RFC 8058 headers.
+    async fn send_list_mail(
+        &self,
+        mail: Mail,
+        list_id: String,
+        runtime: &UnsubscribeRuntime,
+    ) -> Result<(), MailError> {
+        // Resolve every recipient — address validity AND suppression decision —
+        // before delivering anything. The delivery loop below sends one message
+        // per recipient; if validation or a suppression-store lookup failed
+        // mid-loop it could deliver to earlier recipients and then return an
+        // error, so a caller retrying the send would duplicate those earlier
+        // deliveries. Non-list mail builds and validates the full message before
+        // any send — match that atomicity here.
+        //
+        // Each entry is `(recipient_display, canonical_subscriber)`. The canonical
+        // bare address is used for the suppression / token key so a formatted
+        // `Ada <ada@example.com>` recipient matches an opt-out recorded as
+        // `ada@example.com`; the display string is preserved for actual delivery.
+        let mut deliveries: Vec<(String, String)> = Vec::with_capacity(mail.to.len());
+        for recipient in &mail.to {
+            parse_mailbox(recipient)?;
+            let subscriber = canonical_subscriber(recipient);
+            if let Some(store) = runtime.suppression.as_ref()
+                && store.is_suppressed(&subscriber, &list_id).await?
+            {
+                tracing::info!(
+                    target: "mail",
+                    list_id = %list_id,
+                    outcome = "skipped_suppressed",
+                    "skipping suppressed list-unsubscribe recipient"
+                );
+                continue;
+            }
+            deliveries.push((recipient.clone(), subscriber));
+        }
+
+        for (recipient, subscriber) in deliveries {
+            let mut per_recipient = mail.clone();
+            per_recipient.to = vec![recipient];
+            if let Some(value) = runtime.list_unsubscribe_header(&subscriber, &list_id) {
+                // A migration to `#[mailer(list_unsubscribe)]` replaces, not
+                // duplicates, any header the template set by hand: drop an existing
+                // List-Unsubscribe / List-Unsubscribe-Post first so the generated
+                // per-recipient one-click header is authoritative (otherwise a
+                // stale manual header would suppress RFC 8058 compliance).
+                per_recipient.extra_headers.retain(|(name, _)| {
+                    !name.eq_ignore_ascii_case("List-Unsubscribe")
+                        && !name.eq_ignore_ascii_case("List-Unsubscribe-Post")
+                });
+                per_recipient
+                    .extra_headers
+                    .push(("List-Unsubscribe".to_owned(), value));
+                // `List-Unsubscribe-Post` is only valid with an HTTPS one-click
+                // URL; a mailto-only header is plain RFC 2369.
+                if runtime.supports_one_click() {
+                    per_recipient.extra_headers.push((
+                        "List-Unsubscribe-Post".to_owned(),
+                        "List-Unsubscribe=One-Click".to_owned(),
+                    ));
+                }
+            }
+            self.transport.send(per_recipient).await?;
+        }
+        Ok(())
     }
 
     /// Queue mail for later delivery.
@@ -923,6 +1608,7 @@ impl MailerBuilder {
             }),
             transport,
             delivery_queue: self.delivery_queue,
+            unsubscribe: None,
         })
     }
 }
@@ -1127,7 +1813,14 @@ fn render_eml(mail: &Mail) -> String {
     out.push_str("@autumn.local>\n");
     out.push_str("Subject: ");
     out.push_str(&mail.subject);
-    out.push_str("\nMIME-Version: 1.0\n");
+    out.push('\n');
+    for (name, value) in &mail.extra_headers {
+        out.push_str(name);
+        out.push_str(": ");
+        out.push_str(value);
+        out.push('\n');
+    }
+    out.push_str("MIME-Version: 1.0\n");
     if mail.html.is_some() && mail.text.is_some() {
         out.push_str("Content-Type: multipart/alternative; boundary=\"autumn-mail\"\n\n");
         if let Some(text) = &mail.text {
@@ -1250,12 +1943,76 @@ fn show_template_preview(state: &AppState, mailer: &str, method: &str) -> Respon
 
     match preview.render() {
         Ok(mail) => {
+            let mail = apply_preview_unsubscribe_headers(state, mailer, mail);
             let raw = render_eml(&mail);
             let parsed = parse_eml(&raw);
             html_response(render_mail_detail(&parsed, "Template preview"))
         }
         Err(error) => preview_error_response(&error),
     }
+}
+
+/// Inject sample RFC 8058 headers into a preview so authors can confirm wiring
+/// without sending. Uses the configured [`UnsubscribeRuntime`] when present,
+/// otherwise a sample base URL with an ephemeral key purely for display.
+fn apply_preview_unsubscribe_headers(state: &AppState, mailer_label: &str, mut mail: Mail) -> Mail {
+    let scope = mail.list_unsubscribe.clone().or_else(|| {
+        registered_list_unsubscribe_scopes()
+            .into_iter()
+            .find(|descriptor| descriptor.mailer == mailer_label)
+            .map(|descriptor| descriptor.scope.to_owned())
+    });
+    let Some(scope) = scope else {
+        return mail;
+    };
+    mail.list_unsubscribe = Some(scope.clone());
+    let recipient = mail.to.first().map_or_else(
+        || "subscriber@example.com".to_owned(),
+        |to| canonical_subscriber(to),
+    );
+    // Use the configured runtime when present, otherwise a sample with an
+    // ephemeral key purely for display. Compute the header inside each branch so
+    // the sample need not outlive this expression.
+    let (header, one_click) = state.extension::<UnsubscribeRuntime>().map_or_else(
+        || {
+            let sample = UnsubscribeRuntime {
+                base_url: Some("https://example.com".to_owned()),
+                mailto: None,
+                signing_keys: Arc::new(crate::security::config::resolve_signing_keys(
+                    &crate::security::config::SigningSecretConfig::default(),
+                )),
+                ttl_days: unsubscribe::DEFAULT_TOKEN_TTL_DAYS,
+                suppression: None,
+            };
+            (
+                sample.list_unsubscribe_header(&recipient, &scope),
+                sample.supports_one_click(),
+            )
+        },
+        |runtime| {
+            (
+                runtime.list_unsubscribe_header(&recipient, &scope),
+                runtime.supports_one_click(),
+            )
+        },
+    );
+    if let Some(value) = header {
+        // Mirror send: the generated header replaces, not duplicates, any header
+        // the preview author set by hand, so the preview reflects what is sent.
+        mail.extra_headers.retain(|(name, _)| {
+            !name.eq_ignore_ascii_case("List-Unsubscribe")
+                && !name.eq_ignore_ascii_case("List-Unsubscribe-Post")
+        });
+        mail.extra_headers
+            .push(("List-Unsubscribe".to_owned(), value));
+        if one_click {
+            mail.extra_headers.push((
+                "List-Unsubscribe-Post".to_owned(),
+                "List-Unsubscribe=One-Click".to_owned(),
+            ));
+        }
+    }
+    mail
 }
 
 async fn captured_messages(dir: &Path) -> Result<Vec<CapturedMailSummary>, MailPreviewError> {
@@ -1532,7 +2289,16 @@ fn render_mail_detail(parsed: &ParsedMail, label: &str) -> String {
     body.push_str("</pre></details>");
 
     body.push_str("<details><summary>Headers</summary><dl>");
-    for header in ["From", "To", "Reply-To", "Subject", "Date", "Message-Id"] {
+    for header in [
+        "From",
+        "To",
+        "Reply-To",
+        "Subject",
+        "Date",
+        "Message-Id",
+        "List-Unsubscribe",
+        "List-Unsubscribe-Post",
+    ] {
         if let Some(value) = parsed.header_value(header) {
             body.push_str("<dt>");
             body.push_str(header);
@@ -1626,6 +2392,18 @@ fn parse_mailbox(address: &str) -> Result<Mailbox, MailError> {
     })
 }
 
+/// Canonical, case-insensitive bare address used as the suppression / token key.
+///
+/// Strips any display name (`Ada <ada@example.com>` → `ada@example.com`) and
+/// lowercases, so an opt-out matches future sends regardless of formatting.
+/// Falls back to the trimmed, lowercased input when the address cannot be parsed.
+fn canonical_subscriber(recipient: &str) -> String {
+    parse_mailbox(recipient).map_or_else(
+        |_| recipient.trim().to_ascii_lowercase(),
+        |mailbox| mailbox.email.to_string().to_ascii_lowercase(),
+    )
+}
+
 fn lettre_message(mail: &Mail) -> Result<Message, MailError> {
     let from = mail
         .from
@@ -1639,6 +2417,22 @@ fn lettre_message(mail: &Mail) -> Result<Message, MailError> {
         builder = builder.reply_to(parse_mailbox(reply_to)?);
     }
     builder = builder.subject(mail.subject.clone());
+
+    for (name, value) in &mail.extra_headers {
+        use lettre::message::header::{HeaderName, HeaderValue};
+        match HeaderName::new_from_ascii(name.clone()) {
+            Ok(header_name) => {
+                builder = builder.raw_header(HeaderValue::new(header_name, value.clone()));
+            }
+            Err(error) => {
+                tracing::warn!(
+                    header_name = %name,
+                    error = %error,
+                    "skipping mail header with invalid name"
+                );
+            }
+        }
+    }
 
     match (&mail.text, &mail.html) {
         (Some(text), Some(html)) => Ok(builder.multipart(
@@ -1691,6 +2485,7 @@ impl MailTransport for InterceptedMailTransport {
 ///
 /// Returns an Autumn error when the configured transport cannot be created or
 /// when the production `deliver_later` guard is not satisfied.
+#[allow(clippy::too_many_lines)]
 pub(crate) fn install_mailer(
     state: &AppState,
     config: &MailConfig,
@@ -1736,6 +2531,109 @@ pub(crate) fn install_mailer(
         }
     }
 
+    // ── List-Unsubscribe wiring ──────────────────────────────────────────────
+    let base_url = config
+        .unsubscribe_base_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let mailto = config
+        .unsubscribe_mailto
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let unsubscribe_configured = base_url.is_some() || mailto.is_some();
+
+    // Resolve the suppression backend: an explicitly registered handle wins;
+    // otherwise auto-wire a Diesel-backed store when a DB pool is available.
+    let suppression: Option<Arc<dyn SuppressionStore>> = {
+        let explicit = state
+            .extension::<SuppressionStoreHandle>()
+            .map(|handle| Arc::clone(handle.inner()));
+        #[cfg(feature = "db")]
+        let resolved = explicit.or_else(|| {
+            state
+                .pool()
+                .map(|pool| Arc::new(db_suppression::DbSuppressionStore::new(pool.clone())) as _)
+        });
+        #[cfg(not(feature = "db"))]
+        let resolved = explicit;
+        resolved
+    };
+
+    // Fail closed: any mailer that declares `list_unsubscribe` needs a place to
+    // point the unsubscribe link/mailto, or Gmail/Yahoo will reject the mail.
+    // Skipped when the transport is disabled — no list mail is emitted, so the
+    // disabled-transport contract (review apps, tests) can boot without it.
+    if transport_sends_mail
+        && unsubscribe_config_fail_closed(
+            enforce_durable_guard,
+            in_production,
+            has_list_unsubscribe_mailers(),
+            unsubscribe_configured,
+        )
+    {
+        return Err(AutumnError::service_unavailable_msg(
+            "a #[mailer] declares list_unsubscribe but neither mail.unsubscribe_base_url nor mail.unsubscribe_mailto is configured: set at least one so RFC 8058 List-Unsubscribe headers can be emitted",
+        ));
+    }
+
+    // Fail closed: when we will actually emit one-click links (active transport,
+    // a list mailer, and a base URL), the endpoint must be able to record
+    // opt-outs — otherwise a successful unsubscribe POST is a silent no-op.
+    if enforce_durable_guard
+        && in_production
+        && transport_sends_mail
+        && has_list_unsubscribe_mailers()
+        && base_url.is_some()
+        && suppression.is_none()
+    {
+        return Err(AutumnError::service_unavailable_msg(
+            "mail.unsubscribe_base_url is set but no suppression backend is available: configure a database pool or register a SuppressionStore so one-click unsubscribes can be persisted",
+        ));
+    }
+
+    // Warn (don't fail — a custom route is a valid choice) when one-click links
+    // will be advertised but the built-in endpoint is not opted in. We can't see
+    // app-registered routes here, so this is a heads-up, not a hard gate.
+    if in_production
+        && transport_sends_mail
+        && has_list_unsubscribe_mailers()
+        && base_url.is_some()
+        && !config.mount_unsubscribe_endpoint
+    {
+        tracing::warn!(
+            target: "mail",
+            path = UNSUBSCRIBE_PATH,
+            "list mail will advertise one-click unsubscribe URLs but the default endpoint is not mounted; call AppBuilder::mount_unsubscribe_endpoint() or serve the path yourself"
+        );
+    }
+
+    if unsubscribe_configured || suppression.is_some() {
+        let signing_keys = Arc::new(crate::security::config::resolve_signing_keys(
+            &state
+                .extension::<crate::config::AutumnConfig>()
+                .map(|c| c.security.signing_secret.clone())
+                .unwrap_or_default(),
+        ));
+        let ttl_days = config.unsubscribe_token_ttl_days;
+        let make_runtime = || UnsubscribeRuntime {
+            base_url: base_url.map(str::to_owned),
+            mailto: mailto.map(str::to_owned),
+            signing_keys: Arc::clone(&signing_keys),
+            ttl_days,
+            suppression: suppression.clone(),
+        };
+        // Always share the wiring with the endpoint handler (mounted whenever an
+        // unsubscribe destination is configured, independent of transport) so a
+        // live unsubscribe link never 404s. Only the *sender* skips when the
+        // transport is intentionally a no-op.
+        state.insert_extension(make_runtime());
+        if transport_sends_mail {
+            mailer.unsubscribe = Some(Arc::new(make_runtime()));
+        }
+    }
+
     state.insert_extension(mailer);
     Ok(())
 }
@@ -1777,6 +2675,255 @@ where
     install_mailer(state, config, enforce_durable_guard)
 }
 
+// ── Default one-click unsubscribe endpoint ───────────────────────────────────
+
+#[derive(Deserialize)]
+struct UnsubscribeParams {
+    #[serde(default)]
+    token: String,
+}
+
+/// Router for the framework's default unsubscribe endpoint.
+///
+/// Mounted automatically when `mail.unsubscribe_base_url` or
+/// `mail.unsubscribe_mailto` is configured, unless the app registers its own
+/// route at [`UNSUBSCRIBE_PATH`] (the documented override hook). Requires no
+/// end-user auth; the global rate-limit layer applies.
+pub(crate) fn unsubscribe_router() -> axum::Router<AppState> {
+    axum::Router::new().route(
+        UNSUBSCRIBE_PATH,
+        axum::routing::get(unsubscribe_get_handler).post(unsubscribe_post_handler),
+    )
+}
+
+/// RFC 8058 one-click POST: verify the token and record the suppression.
+async fn unsubscribe_post_handler(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    axum::extract::Query(params): axum::extract::Query<UnsubscribeParams>,
+    body: String,
+) -> Response {
+    // RFC 8058 §3.1: the one-click POST carries `List-Unsubscribe=One-Click`.
+    // Requiring it avoids recording opt-outs from arbitrary POSTs to the URL
+    // (e.g. link scanners that don't send the body).
+    if !is_one_click_body(&body) {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            "expected List-Unsubscribe=One-Click body",
+        )
+            .into_response();
+    }
+    let Some(runtime) = state.extension::<UnsubscribeRuntime>() else {
+        return (
+            axum::http::StatusCode::NOT_FOUND,
+            "unsubscribe is not configured",
+        )
+            .into_response();
+    };
+    match unsubscribe::verify_token(&runtime.signing_keys, &params.token, current_unix_time()) {
+        Ok(decoded) => {
+            let Some(store) = runtime.suppression.as_ref() else {
+                // No backend to record the opt-out — never confirm an unsubscribe
+                // we cannot actually honor.
+                tracing::error!(
+                    target: "mail",
+                    "unsubscribe POST received but no suppression backend is configured"
+                );
+                return (
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                    "unsubscribe storage is not configured",
+                )
+                    .into_response();
+            };
+            if let Err(error) = store.suppress(&decoded.subscriber, &decoded.list_id).await {
+                tracing::error!(error = %error, "failed to record unsubscribe suppression");
+                return (
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    "could not process unsubscribe",
+                )
+                    .into_response();
+            }
+            tracing::info!(
+                target: "mail",
+                list_id = %decoded.list_id,
+                outcome = "unsubscribed",
+                "recorded one-click unsubscribe"
+            );
+            (
+                axum::http::StatusCode::OK,
+                Html(unsubscribe_confirmation_html(&decoded.list_id)),
+            )
+                .into_response()
+        }
+        Err(error) => (
+            axum::http::StatusCode::BAD_REQUEST,
+            Html(unsubscribe_error_html(&error.to_string())),
+        )
+            .into_response(),
+    }
+}
+
+/// Whether a urlencoded body contains `List-Unsubscribe=One-Click` (RFC 8058).
+fn is_one_click_body(body: &str) -> bool {
+    body.split('&').any(|pair| {
+        let mut kv = pair.splitn(2, '=');
+        let key = kv.next().unwrap_or("");
+        let value = kv.next().unwrap_or("");
+        key.eq_ignore_ascii_case("List-Unsubscribe") && value.eq_ignore_ascii_case("One-Click")
+    })
+}
+
+/// Click-through GET: render a minimal confirmation page with a one-click form.
+async fn unsubscribe_get_handler(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    axum::extract::Query(params): axum::extract::Query<UnsubscribeParams>,
+) -> Response {
+    let Some(runtime) = state.extension::<UnsubscribeRuntime>() else {
+        return (
+            axum::http::StatusCode::NOT_FOUND,
+            "unsubscribe is not configured",
+        )
+            .into_response();
+    };
+    match unsubscribe::verify_token(&runtime.signing_keys, &params.token, current_unix_time()) {
+        Ok(decoded) => Html(unsubscribe_form_html(&decoded.list_id, &params.token)).into_response(),
+        Err(error) => (
+            axum::http::StatusCode::BAD_REQUEST,
+            Html(unsubscribe_error_html(&error.to_string())),
+        )
+            .into_response(),
+    }
+}
+
+fn unsubscribe_form_html(list_id: &str, token: &str) -> String {
+    // Relative action (`?token=…`) posts back to the current URL, preserving any
+    // base-path prefix added by a reverse proxy.
+    format!(
+        "<!doctype html><html><head><meta charset=\"utf-8\"><title>Unsubscribe</title></head>\
+         <body><h1>Unsubscribe</h1>\
+         <p>Stop receiving <strong>{}</strong> emails?</p>\
+         <form method=\"post\" action=\"?token={}\">\
+         <input type=\"hidden\" name=\"List-Unsubscribe\" value=\"One-Click\">\
+         <button type=\"submit\">Unsubscribe</button></form></body></html>",
+        escape_html(list_id),
+        escape_html(token),
+    )
+}
+
+fn unsubscribe_confirmation_html(list_id: &str) -> String {
+    format!(
+        "<!doctype html><html><head><meta charset=\"utf-8\"><title>Unsubscribed</title></head>\
+         <body><h1>You're unsubscribed</h1>\
+         <p>You will no longer receive <strong>{}</strong> emails.</p></body></html>",
+        escape_html(list_id),
+    )
+}
+
+fn unsubscribe_error_html(detail: &str) -> String {
+    format!(
+        "<!doctype html><html><head><meta charset=\"utf-8\"><title>Unsubscribe</title></head>\
+         <body><h1>Unsubscribe link is not valid</h1><p>{}</p></body></html>",
+        escape_html(detail),
+    )
+}
+
+/// Diesel-backed [`SuppressionStore`].
+#[cfg(feature = "db")]
+pub mod db_suppression {
+    use std::future::Future;
+    use std::pin::Pin;
+
+    use diesel::prelude::*;
+    use diesel_async::AsyncPgConnection;
+    use diesel_async::RunQueryDsl;
+    use diesel_async::pooled_connection::deadpool::Pool;
+
+    use super::{MailError, SuppressionStore};
+
+    diesel::table! {
+        mail_unsubscribes (id) {
+            id -> Int8,
+            subscriber -> Text,
+            list_id -> Text,
+            unsubscribed_at -> Timestamptz,
+        }
+    }
+
+    #[derive(Insertable)]
+    #[diesel(table_name = mail_unsubscribes)]
+    struct NewUnsubscribe<'a> {
+        subscriber: &'a str,
+        list_id: &'a str,
+    }
+
+    /// Postgres-backed suppression list keyed by `(subscriber, list_id)`.
+    ///
+    /// Backed by the `mail_unsubscribes` table provisioned by the migration that
+    /// `autumn generate mailer --list-unsubscribe` writes into the app.
+    #[derive(Clone)]
+    pub struct DbSuppressionStore {
+        pool: Pool<AsyncPgConnection>,
+    }
+
+    impl DbSuppressionStore {
+        /// Create a store backed by `pool`.
+        #[must_use]
+        pub const fn new(pool: Pool<AsyncPgConnection>) -> Self {
+            Self { pool }
+        }
+    }
+
+    impl SuppressionStore for DbSuppressionStore {
+        fn is_suppressed<'a>(
+            &'a self,
+            subscriber: &'a str,
+            list_id: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<bool, MailError>> + Send + 'a>> {
+            Box::pin(async move {
+                let mut conn =
+                    self.pool.get().await.map_err(|e| {
+                        MailError::RuntimeUnavailable(format!("suppression pool: {e}"))
+                    })?;
+                let count: i64 = mail_unsubscribes::table
+                    .filter(mail_unsubscribes::subscriber.eq(subscriber))
+                    .filter(mail_unsubscribes::list_id.eq(list_id))
+                    .count()
+                    .get_result(&mut conn)
+                    .await
+                    .map_err(|e| {
+                        MailError::RuntimeUnavailable(format!("suppression query: {e}"))
+                    })?;
+                Ok(count > 0)
+            })
+        }
+
+        fn suppress<'a>(
+            &'a self,
+            subscriber: &'a str,
+            list_id: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<(), MailError>> + Send + 'a>> {
+            Box::pin(async move {
+                let mut conn =
+                    self.pool.get().await.map_err(|e| {
+                        MailError::RuntimeUnavailable(format!("suppression pool: {e}"))
+                    })?;
+                diesel::insert_into(mail_unsubscribes::table)
+                    .values(NewUnsubscribe {
+                        subscriber,
+                        list_id,
+                    })
+                    .on_conflict((mail_unsubscribes::subscriber, mail_unsubscribes::list_id))
+                    .do_nothing()
+                    .execute(&mut conn)
+                    .await
+                    .map_err(|e| {
+                        MailError::RuntimeUnavailable(format!("suppression insert: {e}"))
+                    })?;
+                Ok(())
+            })
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1802,6 +2949,553 @@ mod tests {
     #[test]
     fn transport_default_is_disabled() {
         assert_eq!(Transport::default(), Transport::Disabled);
+    }
+
+    // ── List-Unsubscribe: Mail surface (Component 1) ─────────────────────────
+
+    #[test]
+    fn mail_defaults_have_no_unsubscribe_or_extra_headers() {
+        let mail = Mail::builder()
+            .to("user@example.com")
+            .subject("Hi")
+            .text("hello")
+            .build()
+            .expect("mail should build");
+        assert_eq!(mail.list_unsubscribe, None);
+        assert!(mail.extra_headers.is_empty());
+    }
+
+    #[test]
+    fn mail_builder_sets_list_unsubscribe_and_headers() {
+        let mail = Mail::builder()
+            .to("user@example.com")
+            .subject("Hi")
+            .text("hello")
+            .list_unsubscribe("weekly_digest")
+            .header("X-Custom", "1")
+            .build()
+            .expect("mail should build");
+        assert_eq!(mail.list_unsubscribe.as_deref(), Some("weekly_digest"));
+        assert_eq!(
+            mail.extra_headers,
+            vec![("X-Custom".to_owned(), "1".to_owned())]
+        );
+    }
+
+    // ── List-Unsubscribe: token signing (Component 2) ────────────────────────
+
+    fn test_keys() -> crate::security::config::ResolvedSigningKeys {
+        crate::security::config::ResolvedSigningKeys::new(
+            b"unit-test-signing-key-0123456789".to_vec(),
+            vec![],
+        )
+    }
+
+    #[test]
+    fn token_roundtrips_and_hides_subscriber() {
+        use base64::Engine as _;
+        let engine = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        let keys = test_keys();
+        let token =
+            unsubscribe::sign_token(&keys, "ada@example.com", "weekly_digest", 4_000_000_000);
+        assert!(
+            !token.contains("ada@example.com"),
+            "raw subscriber must not appear in the token: {token}"
+        );
+        // The address is encrypted, not merely base64-encoded: its base64url form
+        // (which the old signed-token format embedded) must not appear either.
+        assert!(
+            !token.contains(&engine.encode("ada@example.com")),
+            "base64 of subscriber must not appear — the payload must be encrypted: {token}"
+        );
+        let decoded = unsubscribe::verify_token(&keys, &token, 1_000).expect("token should verify");
+        assert_eq!(decoded.subscriber, "ada@example.com");
+        assert_eq!(decoded.list_id, "weekly_digest");
+    }
+
+    #[test]
+    fn token_rejects_tamper_and_expiry() {
+        use base64::Engine as _;
+        let engine = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        let keys = test_keys();
+        let token =
+            unsubscribe::sign_token(&keys, "ada@example.com", "weekly_digest", 4_000_000_000);
+        // Flip a bit in the trailing GCM tag: AES-GCM authentication must reject it.
+        let mut blob = engine.decode(&token).expect("token is base64");
+        let last = blob.len() - 1;
+        blob[last] ^= 0x01;
+        let tampered = engine.encode(&blob);
+        assert_eq!(
+            unsubscribe::verify_token(&keys, &tampered, 1_000),
+            Err(unsubscribe::TokenError::BadSignature)
+        );
+        // Expired (now > expiry).
+        let short = unsubscribe::sign_token(&keys, "ada@example.com", "weekly_digest", 100);
+        assert_eq!(
+            unsubscribe::verify_token(&keys, &short, 200),
+            Err(unsubscribe::TokenError::Expired)
+        );
+    }
+
+    #[test]
+    fn token_verifies_under_rotated_previous_key() {
+        let signer = crate::security::config::ResolvedSigningKeys::new(
+            b"old-key-old-key-old-key-old-key!".to_vec(),
+            vec![],
+        );
+        let token = unsubscribe::sign_token(&signer, "ada@example.com", "list", 4_000_000_000);
+        let rotated = crate::security::config::ResolvedSigningKeys::new(
+            b"new-key-new-key-new-key-new-key!".to_vec(),
+            vec![b"old-key-old-key-old-key-old-key!".to_vec()],
+        );
+        assert!(unsubscribe::verify_token(&rotated, &token, 1_000).is_ok());
+    }
+
+    #[test]
+    fn unsubscribe_url_includes_token_and_path() {
+        let url = unsubscribe::unsubscribe_url("https://app.example.com/", "TOK");
+        assert_eq!(url, "https://app.example.com/_autumn/unsubscribe?token=TOK");
+    }
+
+    // ── List-Unsubscribe: suppression store (Component 3) ────────────────────
+
+    #[tokio::test]
+    async fn in_memory_suppression_transitions() {
+        let store = InMemorySuppressionStore::new();
+        assert!(!store.is_suppressed("a@x.com", "list").await.unwrap());
+        store.suppress("a@x.com", "list").await.unwrap();
+        assert!(store.is_suppressed("a@x.com", "list").await.unwrap());
+        // Scoped to (subscriber, list).
+        assert!(!store.is_suppressed("a@x.com", "other").await.unwrap());
+        assert!(!store.is_suppressed("b@x.com", "list").await.unwrap());
+    }
+
+    // ── List-Unsubscribe: header emission + send (Component 4) ───────────────
+
+    #[test]
+    fn render_eml_emits_extra_headers() {
+        let mail = Mail::builder()
+            .from("from@example.com")
+            .to("user@example.com")
+            .subject("Hi")
+            .text("hello")
+            .header("List-Unsubscribe", "<https://x/u?token=t>, <mailto:u@x>")
+            .header("List-Unsubscribe-Post", "List-Unsubscribe=One-Click")
+            .build()
+            .expect("mail should build");
+        let eml = render_eml(&mail);
+        assert!(eml.contains("List-Unsubscribe: <https://x/u?token=t>, <mailto:u@x>"));
+        assert!(eml.contains("List-Unsubscribe-Post: List-Unsubscribe=One-Click"));
+    }
+
+    #[test]
+    fn render_eml_without_headers_has_no_unsubscribe() {
+        let mail = Mail::builder()
+            .from("from@example.com")
+            .to("user@example.com")
+            .subject("Hi")
+            .text("hello")
+            .build()
+            .expect("mail should build");
+        assert!(!render_eml(&mail).contains("List-Unsubscribe"));
+    }
+
+    #[derive(Clone)]
+    struct CapturingTransport {
+        sent: Arc<std::sync::Mutex<Vec<Mail>>>,
+    }
+
+    impl MailTransport for CapturingTransport {
+        fn send<'a>(
+            &'a self,
+            mail: Mail,
+        ) -> Pin<Box<dyn Future<Output = Result<(), MailError>> + Send + 'a>> {
+            Box::pin(async move {
+                self.sent.lock().expect("sent lock").push(mail);
+                Ok(())
+            })
+        }
+    }
+
+    fn unsubscribe_runtime(
+        suppression: Option<Arc<dyn SuppressionStore>>,
+    ) -> Arc<UnsubscribeRuntime> {
+        Arc::new(UnsubscribeRuntime {
+            base_url: Some("https://app.example.com".to_owned()),
+            mailto: Some("unsub@example.com".to_owned()),
+            signing_keys: Arc::new(test_keys()),
+            ttl_days: 30,
+            suppression,
+        })
+    }
+
+    #[tokio::test]
+    #[allow(clippy::significant_drop_tightening)]
+    async fn send_adds_headers_for_list_mail() {
+        let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let transport = CapturingTransport { sent: sent.clone() };
+        let mailer = Mailer::with_transport(transport).with_unsubscribe(unsubscribe_runtime(None));
+        let mail = Mail::builder()
+            .from("from@example.com")
+            .to("user@example.com")
+            .subject("Digest")
+            .text("hello")
+            .list_unsubscribe("weekly_digest")
+            .build()
+            .unwrap();
+        mailer.send(mail).await.unwrap();
+        let captured = sent.lock().unwrap();
+        assert_eq!(captured.len(), 1);
+        let headers = &captured[0].extra_headers;
+        assert!(headers.iter().any(|(n, v)| n == "List-Unsubscribe"
+            && v.contains("/_autumn/unsubscribe?token=")
+            && v.contains("mailto:unsub@example.com")));
+        assert!(
+            headers
+                .iter()
+                .any(|(n, v)| n == "List-Unsubscribe-Post" && v == "List-Unsubscribe=One-Click")
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::significant_drop_tightening)]
+    async fn send_replaces_manual_list_unsubscribe_with_generated_one_click() {
+        // A template that opts into list_unsubscribe but also set a hand-rolled
+        // List-Unsubscribe must end up with the generated per-recipient one-click
+        // header (replace, not suppress), so RFC 8058 compliance isn't lost.
+        let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let transport = CapturingTransport { sent: sent.clone() };
+        let mailer = Mailer::with_transport(transport).with_unsubscribe(unsubscribe_runtime(None));
+        let mail = Mail::builder()
+            .from("from@example.com")
+            .to("user@example.com")
+            .subject("Digest")
+            .text("hello")
+            .header("List-Unsubscribe", "<mailto:old@example.com>")
+            .list_unsubscribe("weekly_digest")
+            .build()
+            .unwrap();
+        mailer.send(mail).await.unwrap();
+        let captured = sent.lock().unwrap();
+        assert_eq!(captured.len(), 1);
+        let headers = &captured[0].extra_headers;
+        // Exactly one List-Unsubscribe, and it's the generated one-click (not the
+        // stale manual value).
+        let unsub: Vec<&String> = headers
+            .iter()
+            .filter(|(n, _)| n == "List-Unsubscribe")
+            .map(|(_, v)| v)
+            .collect();
+        assert_eq!(unsub.len(), 1);
+        assert!(unsub[0].contains("/_autumn/unsubscribe?token="));
+        assert!(!unsub[0].contains("old@example.com"));
+        assert!(
+            headers
+                .iter()
+                .any(|(n, v)| n == "List-Unsubscribe-Post" && v == "List-Unsubscribe=One-Click")
+        );
+    }
+
+    #[tokio::test]
+    async fn send_list_mail_rejects_invalid_recipient_before_delivery() {
+        let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let transport = CapturingTransport { sent: sent.clone() };
+        let mailer = Mailer::with_transport(transport).with_unsubscribe(unsubscribe_runtime(None));
+        // Second recipient is syntactically invalid. The send must fail before
+        // delivering to the first, so a retry cannot duplicate that send.
+        let mail = Mail::builder()
+            .from("from@example.com")
+            .to("good@example.com")
+            .to("not a valid address")
+            .subject("Digest")
+            .text("hello")
+            .list_unsubscribe("weekly_digest")
+            .build()
+            .unwrap();
+        let result = mailer.send(mail).await;
+        assert!(result.is_err(), "invalid recipient must fail the send");
+        assert!(
+            sent.lock().unwrap().is_empty(),
+            "no recipient may be delivered when the list contains an invalid address"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_list_mail_suppression_error_fails_before_any_delivery() {
+        // A suppression store that errors for one specific subscriber.
+        struct FailingStore {
+            fail_for: String,
+        }
+        impl SuppressionStore for FailingStore {
+            fn is_suppressed<'a>(
+                &'a self,
+                subscriber: &'a str,
+                _list_id: &'a str,
+            ) -> Pin<Box<dyn Future<Output = Result<bool, MailError>> + Send + 'a>> {
+                let fails = subscriber == self.fail_for;
+                Box::pin(async move {
+                    if fails {
+                        Err(MailError::RuntimeUnavailable(
+                            "store unavailable".to_owned(),
+                        ))
+                    } else {
+                        Ok(false)
+                    }
+                })
+            }
+            fn suppress<'a>(
+                &'a self,
+                _subscriber: &'a str,
+                _list_id: &'a str,
+            ) -> Pin<Box<dyn Future<Output = Result<(), MailError>> + Send + 'a>> {
+                Box::pin(async move { Ok(()) })
+            }
+        }
+
+        let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let transport = CapturingTransport { sent: sent.clone() };
+        let store: Arc<dyn SuppressionStore> = Arc::new(FailingStore {
+            fail_for: "second@example.com".to_owned(),
+        });
+        let mailer =
+            Mailer::with_transport(transport).with_unsubscribe(unsubscribe_runtime(Some(store)));
+        // The second recipient's suppression lookup errors. The whole send must
+        // fail before the first recipient is delivered, so a retry can't duplicate
+        // that delivery.
+        let mail = Mail::builder()
+            .from("from@example.com")
+            .to("first@example.com")
+            .to("second@example.com")
+            .subject("Digest")
+            .text("hello")
+            .list_unsubscribe("weekly_digest")
+            .build()
+            .unwrap();
+        let result = mailer.send(mail).await;
+        assert!(
+            result.is_err(),
+            "suppression-store error must fail the send"
+        );
+        assert!(
+            sent.lock().unwrap().is_empty(),
+            "no recipient may be delivered when a later suppression lookup fails"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_skips_suppressed_recipient() {
+        let store = Arc::new(InMemorySuppressionStore::new());
+        store
+            .suppress("user@example.com", "weekly_digest")
+            .await
+            .unwrap();
+        let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let transport = CapturingTransport { sent: sent.clone() };
+        let mailer =
+            Mailer::with_transport(transport).with_unsubscribe(unsubscribe_runtime(Some(store)));
+        let mail = Mail::builder()
+            .from("from@example.com")
+            .to("user@example.com")
+            .subject("Digest")
+            .text("hello")
+            .list_unsubscribe("weekly_digest")
+            .build()
+            .unwrap();
+        mailer.send(mail).await.unwrap();
+        assert!(
+            sent.lock().unwrap().is_empty(),
+            "suppressed recipient must be skipped"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::significant_drop_tightening)]
+    async fn send_without_scope_is_unchanged() {
+        let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let transport = CapturingTransport { sent: sent.clone() };
+        let mailer = Mailer::with_transport(transport).with_unsubscribe(unsubscribe_runtime(None));
+        let mail = Mail::builder()
+            .from("from@example.com")
+            .to("user@example.com")
+            .subject("Reset")
+            .text("hello")
+            .build()
+            .unwrap();
+        mailer.send(mail).await.unwrap();
+        let captured = sent.lock().unwrap();
+        assert_eq!(captured.len(), 1);
+        assert!(
+            captured[0].extra_headers.is_empty(),
+            "non-list mail must not gain headers"
+        );
+    }
+
+    // ── List-Unsubscribe: startup fail-closed (Component 6) ──────────────────
+
+    #[test]
+    fn fail_closed_only_in_prod_with_mailers_and_no_config() {
+        assert!(unsubscribe_config_fail_closed(true, true, true, false));
+        // configured → ok
+        assert!(!unsubscribe_config_fail_closed(true, true, true, true));
+        // no list mailers → ok
+        assert!(!unsubscribe_config_fail_closed(true, true, false, false));
+        // not production → ok
+        assert!(!unsubscribe_config_fail_closed(true, false, true, false));
+        // not enforced (static build) → ok
+        assert!(!unsubscribe_config_fail_closed(false, true, true, false));
+    }
+
+    #[test]
+    fn validate_rejects_non_positive_unsubscribe_ttl() {
+        let ttl = |days: i64| MailConfig {
+            unsubscribe_token_ttl_days: days,
+            ..MailConfig::default()
+        };
+        assert!(ttl(0).validate(Some("dev")).is_err());
+        assert!(ttl(-1).validate(Some("dev")).is_err());
+        assert!(ttl(30).validate(Some("dev")).is_ok());
+    }
+
+    #[test]
+    fn unsubscribe_base_url_set_tracks_config() {
+        let with = |base: Option<&str>, mailto: Option<&str>| MailConfig {
+            unsubscribe_base_url: base.map(str::to_owned),
+            unsubscribe_mailto: mailto.map(str::to_owned),
+            ..MailConfig::default()
+        };
+        assert!(!with(None, None).unsubscribe_base_url_set());
+        // mailto-only is not a base URL (RFC 2369, not one-click).
+        assert!(!with(None, Some("u@example.com")).unsubscribe_base_url_set());
+        assert!(with(Some("https://x"), None).unsubscribe_base_url_set());
+        assert!(!with(Some("   "), None).unsubscribe_base_url_set());
+    }
+
+    #[test]
+    fn should_mount_unsubscribe_endpoint_requires_opt_in_and_base_url() {
+        let cfg = |base: Option<&str>, opt_in: bool| MailConfig {
+            unsubscribe_base_url: base.map(str::to_owned),
+            mount_unsubscribe_endpoint: opt_in,
+            ..MailConfig::default()
+        };
+        // base URL alone does not mount — opt-in is required.
+        assert!(!cfg(Some("https://x"), false).should_mount_unsubscribe_endpoint());
+        assert!(cfg(Some("https://x"), true).should_mount_unsubscribe_endpoint());
+        // opt-in without a base URL does not mount.
+        assert!(!cfg(None, true).should_mount_unsubscribe_endpoint());
+    }
+
+    #[test]
+    fn validate_rejects_malformed_mailto_in_prod() {
+        let cfg = |mailto: &str| MailConfig {
+            unsubscribe_mailto: Some(mailto.to_owned()),
+            ..MailConfig::default()
+        };
+        assert!(
+            cfg("unsubscribe example.com")
+                .validate(Some("prod"))
+                .is_err()
+        );
+        assert!(cfg("not-an-email").validate(Some("prod")).is_err());
+        assert!(cfg("unsub@example.com").validate(Some("prod")).is_ok());
+        // a full mailto: URI is accepted too.
+        assert!(
+            cfg("mailto:unsub@example.com")
+                .validate(Some("prod"))
+                .is_ok()
+        );
+        // dev is lenient.
+        assert!(cfg("whatever").validate(Some("dev")).is_ok());
+    }
+
+    #[test]
+    fn validate_requires_https_base_url_in_prod() {
+        let cfg = |url: &str| MailConfig {
+            unsubscribe_base_url: Some(url.to_owned()),
+            ..MailConfig::default()
+        };
+        assert!(
+            cfg("http://app.example.com")
+                .validate(Some("prod"))
+                .is_err()
+        );
+        assert!(
+            cfg("https://app.example.com")
+                .validate(Some("prod"))
+                .is_ok()
+        );
+        // dev allows http for local testing.
+        assert!(cfg("http://localhost:3000").validate(Some("dev")).is_ok());
+        // https prefix without a real host is rejected in prod.
+        assert!(cfg("https://").validate(Some("prod")).is_err());
+        assert!(cfg("https:///path").validate(Some("prod")).is_err());
+        // query/fragment bases would break the appended ?token=… link.
+        assert!(
+            cfg("https://app.example.com?t=acme")
+                .validate(Some("prod"))
+                .is_err()
+        );
+        assert!(
+            cfg("https://app.example.com#x")
+                .validate(Some("prod"))
+                .is_err()
+        );
+        assert!(
+            cfg("https://app.example.com/base")
+                .validate(Some("prod"))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn canonical_subscriber_strips_name_and_lowercases() {
+        assert_eq!(
+            canonical_subscriber("Ada Lovelace <Ada@Example.com>"),
+            "ada@example.com"
+        );
+        assert_eq!(canonical_subscriber("USER@EXAMPLE.COM"), "user@example.com");
+    }
+
+    #[test]
+    fn mailto_only_runtime_does_not_support_one_click() {
+        let runtime = UnsubscribeRuntime {
+            base_url: None,
+            mailto: Some("u@example.com".to_owned()),
+            signing_keys: Arc::new(test_keys()),
+            ttl_days: 30,
+            suppression: None,
+        };
+        assert!(!runtime.supports_one_click());
+        let header = runtime
+            .list_unsubscribe_header("a@x.com", "list")
+            .expect("mailto header");
+        assert!(header.contains("mailto:u@example.com"));
+        assert!(!header.contains("token="));
+    }
+
+    #[test]
+    fn mailto_value_with_scheme_is_not_double_prefixed() {
+        let runtime = UnsubscribeRuntime {
+            base_url: None,
+            mailto: Some("mailto:u@example.com".to_owned()),
+            signing_keys: Arc::new(test_keys()),
+            ttl_days: 30,
+            suppression: None,
+        };
+        let header = runtime
+            .list_unsubscribe_header("a@x.com", "list")
+            .expect("mailto header");
+        assert!(header.contains("<mailto:u@example.com?subject=unsubscribe>"));
+        assert!(!header.contains("mailto:mailto:"));
+    }
+
+    #[test]
+    fn one_click_body_detection() {
+        assert!(is_one_click_body("List-Unsubscribe=One-Click"));
+        assert!(is_one_click_body("foo=bar&List-Unsubscribe=One-Click"));
+        assert!(is_one_click_body("list-unsubscribe=one-click")); // case-insensitive
+        assert!(!is_one_click_body(""));
+        assert!(!is_one_click_body("List-Unsubscribe=Nope"));
+        assert!(!is_one_click_body("something=else"));
     }
 
     #[test]
@@ -2787,5 +4481,141 @@ mod tests {
         );
 
         crate::circuit_breaker::global_registry().clear();
+    }
+
+    #[test]
+    fn validate_log_transport_in_prod_fails() {
+        let cfg = MailConfig {
+            transport: Transport::Log,
+            ..MailConfig::default()
+        };
+        assert!(cfg.validate(Some("prod")).is_err());
+        assert!(cfg.validate(Some("production")).is_err());
+        // allow flag lifts the restriction.
+        let allowed = MailConfig {
+            transport: Transport::Log,
+            allow_log_in_production: true,
+            ..MailConfig::default()
+        };
+        assert!(allowed.validate(Some("prod")).is_ok());
+    }
+
+    #[test]
+    fn validate_preview_outside_dev_fails() {
+        let cfg = MailConfig {
+            preview: true,
+            ..MailConfig::default()
+        };
+        assert!(cfg.validate(Some("prod")).is_err());
+        assert!(cfg.validate(Some("dev")).is_ok());
+        assert!(cfg.validate(Some("development")).is_ok());
+    }
+
+    #[test]
+    fn is_valid_https_base_url_edge_cases() {
+        assert!(is_valid_https_base_url("https://app.example.com"));
+        assert!(is_valid_https_base_url("https://app.example.com/base"));
+        assert!(!is_valid_https_base_url("http://app.example.com"));
+        assert!(!is_valid_https_base_url("https://"));
+        assert!(!is_valid_https_base_url("https:///path"));
+        assert!(!is_valid_https_base_url("https://app.example.com?q=1"));
+        assert!(!is_valid_https_base_url("https://app.example.com#frag"));
+        assert!(!is_valid_https_base_url("https://host name.com"));
+        // Malformed authorities that a naive `/`-split would wrongly accept.
+        assert!(!is_valid_https_base_url("https://app.example.com:abc"));
+        assert!(!is_valid_https_base_url("https://@/base"));
+        assert!(!is_valid_https_base_url("https://user@app.example.com"));
+        // A valid explicit port is fine.
+        assert!(is_valid_https_base_url("https://app.example.com:8443"));
+        // Characters unsafe inside an RFC 2369 angle-bracket URI are rejected,
+        // even though `Url::parse` would percent-encode them.
+        assert!(!is_valid_https_base_url("https://example.com/<x>"));
+        assert!(!is_valid_https_base_url("https://example.com/a b"));
+        assert!(!is_valid_https_base_url("https://example.com/a\r\nb"));
+        // Missing/short authority that `Url::parse` would normalize to a valid
+        // host — rejected so prod can't advertise an unusable one-click URL.
+        assert!(!is_valid_https_base_url("https:/app.example.com"));
+        assert!(!is_valid_https_base_url("https:app.example.com"));
+    }
+
+    #[test]
+    fn is_valid_mailto_address_edge_cases() {
+        assert!(is_valid_mailto_address("unsub@example.com"));
+        assert!(is_valid_mailto_address("mailto:unsub@example.com"));
+        assert!(is_valid_mailto_address(
+            "mailto:unsub@example.com?subject=hi"
+        ));
+        assert!(!is_valid_mailto_address("not-an-email"));
+        assert!(!is_valid_mailto_address("missing@dot"));
+        assert!(!is_valid_mailto_address("space @example.com"));
+        assert!(!is_valid_mailto_address(""));
+        assert!(!is_valid_mailto_address("@example.com")); // empty local
+        assert!(!is_valid_mailto_address("local@")); // empty domain
+        // Other URI schemes must be rejected, not coerced into <mailto:…>.
+        assert!(!is_valid_mailto_address("https://unsub@example.com"));
+        assert!(!is_valid_mailto_address("mailto:https://unsub@example.com"));
+        assert!(!is_valid_mailto_address("unsub@https://example.com"));
+        // CRLF / control characters (header-injection attempt) are rejected even
+        // when hidden behind a `?query` the address check would otherwise drop.
+        assert!(!is_valid_mailto_address(
+            "mailto:unsub@example.com?subject=x\r\nBcc: victim@example.com"
+        ));
+        assert!(!is_valid_mailto_address("unsub@example.com\nBcc: v@x.com"));
+        // RFC 2369 delimiters (`<`/`>`/`,`) would close the angle-bracket entry
+        // and inject an extra List-Unsubscribe target.
+        assert!(!is_valid_mailto_address(
+            "unsub@example.com>,<bogus@example.com"
+        ));
+        assert!(!is_valid_mailto_address("a@x.com,b@x.com"));
+    }
+
+    #[test]
+    fn unsubscribe_header_mailto_drops_configured_query_no_injection() {
+        // Even if a malformed value slipped past validation (e.g. set outside
+        // prod), the rendered header must carry only the bare mailbox plus the
+        // canonical subject — never an injected CRLF/Bcc.
+        let runtime = UnsubscribeRuntime {
+            base_url: None,
+            mailto: Some("mailto:u@example.com?subject=x\r\nBcc: v@x.com".to_owned()),
+            signing_keys: Arc::new(test_keys()),
+            ttl_days: 30,
+            suppression: None,
+        };
+        let header = runtime
+            .list_unsubscribe_header("a@x.com", "list")
+            .expect("mailto header");
+        assert_eq!(header, "<mailto:u@example.com?subject=unsubscribe>");
+        assert!(!header.contains('\r') && !header.contains('\n'));
+        assert!(!header.contains("Bcc"));
+    }
+
+    #[test]
+    fn unsubscribe_runtime_header_both_base_url_and_mailto() {
+        let runtime = UnsubscribeRuntime {
+            base_url: Some("https://app.example.com".to_owned()),
+            mailto: Some("u@example.com".to_owned()),
+            signing_keys: Arc::new(test_keys()),
+            ttl_days: 30,
+            suppression: None,
+        };
+        let header = runtime
+            .list_unsubscribe_header("a@x.com", "list")
+            .expect("header with both");
+        assert!(header.contains("https://app.example.com/_autumn/unsubscribe?token="));
+        assert!(header.contains("mailto:u@example.com?subject=unsubscribe"));
+        assert!(runtime.supports_one_click());
+    }
+
+    #[test]
+    fn unsubscribe_runtime_header_neither_configured_returns_none() {
+        let runtime = UnsubscribeRuntime {
+            base_url: None,
+            mailto: None,
+            signing_keys: Arc::new(test_keys()),
+            ttl_days: 30,
+            suppression: None,
+        };
+        assert!(runtime.list_unsubscribe_header("a@x.com", "list").is_none());
+        assert!(!runtime.supports_one_click());
     }
 }

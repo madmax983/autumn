@@ -254,6 +254,8 @@ pub struct TestApp {
     state_initializers: Vec<Box<dyn FnOnce(&AppState) + Send>>,
     jobs: Vec<crate::job::JobInfo>,
     exception_filters: Vec<std::sync::Arc<dyn crate::middleware::ExceptionFilter>>,
+    #[cfg(feature = "mail")]
+    suppression_store: Option<crate::mail::SuppressionStoreHandle>,
     registered_plugins: std::collections::HashSet<String>,
     extensions: std::collections::HashMap<std::any::TypeId, Box<dyn std::any::Any + Send>>,
     /// Injected clock; `None` means use [`crate::time::SystemClock`].
@@ -321,6 +323,8 @@ impl TestApp {
             state_initializers: Vec::new(),
             jobs: Vec::new(),
             exception_filters: Vec::new(),
+            #[cfg(feature = "mail")]
+            suppression_store: None,
             registered_plugins: std::collections::HashSet::new(),
             extensions: std::collections::HashMap::new(),
             clock: None,
@@ -646,6 +650,23 @@ impl TestApp {
             self.inbound_mail_router = Some(router);
         }
 
+        // Carry a plugin-registered suppression store (List-Unsubscribe storage)
+        // into the test app so unsubscribe POSTs and send-time suppression behave
+        // under TestApp exactly as they do under AppBuilder::run.
+        #[cfg(feature = "mail")]
+        if let Some(handle) = app_builder.suppression_store {
+            self.suppression_store = Some(handle);
+        }
+
+        // Carry a plugin's `mount_unsubscribe_endpoint()` opt-in: production copies
+        // this builder flag into config.mail before router assembly, so a plugin
+        // that mounts the default unsubscribe endpoint must mount it under TestApp
+        // too (otherwise /_autumn/unsubscribe 404s in tests but works in prod).
+        #[cfg(feature = "mail")]
+        if app_builder.mount_unsubscribe_endpoint {
+            self.config.mail.mount_unsubscribe_endpoint = true;
+        }
+
         // Carry plugin-registered error reporters into the test app so
         // reporting-enabled plugins exercise the same behavior under `TestApp`
         // that they get from `AppBuilder::run`.
@@ -699,6 +720,30 @@ impl TestApp {
         interceptor: impl crate::interceptor::MailInterceptor,
     ) -> Self {
         self.mail_interceptor = Some(std::sync::Arc::new(interceptor));
+        self
+    }
+
+    /// Register a [`SuppressionStore`](crate::mail::SuppressionStore) so
+    /// List-Unsubscribe sends skip suppressed recipients and the unsubscribe
+    /// endpoint records opt-outs. Mirrors
+    /// [`AppBuilder::with_suppression_store`](crate::app::AppBuilder::with_suppression_store).
+    #[cfg(feature = "mail")]
+    #[must_use]
+    pub fn with_suppression_store(
+        mut self,
+        store: impl crate::mail::SuppressionStore + 'static,
+    ) -> Self {
+        self.suppression_store = Some(crate::mail::SuppressionStoreHandle::new(store));
+        self
+    }
+
+    /// Mount the framework's default one-click unsubscribe endpoint (opt-in).
+    /// Mirrors
+    /// [`AppBuilder::mount_unsubscribe_endpoint`](crate::app::AppBuilder::mount_unsubscribe_endpoint).
+    #[cfg(feature = "mail")]
+    #[must_use]
+    pub const fn mount_unsubscribe_endpoint(mut self) -> Self {
+        self.config.mail.mount_unsubscribe_endpoint = true;
         self
     }
 
@@ -1052,6 +1097,9 @@ impl TestApp {
 
         #[cfg(feature = "mail")]
         {
+            if let Some(handle) = self.suppression_store.clone() {
+                state.insert_extension(handle);
+            }
             crate::mail::install_mailer(&state, &self.config.mail, false)
                 .expect("Failed to configure test mailer");
         }
@@ -2300,6 +2348,32 @@ mod tests {
         );
 
         crate::job::clear_global_job_client();
+    }
+
+    #[cfg(feature = "mail")]
+    #[test]
+    fn plugin_suppression_store_and_endpoint_optin_carry_into_test_app() {
+        struct SuppressionPlugin;
+        impl crate::plugin::Plugin for SuppressionPlugin {
+            fn build(self, app: crate::app::AppBuilder) -> crate::app::AppBuilder {
+                app.with_suppression_store(crate::mail::InMemorySuppressionStore::new())
+                    .mount_unsubscribe_endpoint()
+            }
+        }
+
+        // A plugin that wires List-Unsubscribe storage and opts into the default
+        // endpoint must propagate both into the TestApp, so unsubscribe POSTs /
+        // send-time suppression behave under TestApp exactly as in production
+        // without every test repeating the setup manually.
+        let app = TestApp::new().plugin(SuppressionPlugin);
+        assert!(
+            app.suppression_store.is_some(),
+            "plugin-registered suppression store must be carried into TestApp"
+        );
+        assert!(
+            app.config.mail.mount_unsubscribe_endpoint,
+            "plugin endpoint opt-in must be carried into TestApp config"
+        );
     }
 
     /// End-to-end acceptance for issue #605: a plain `<form method="post">`

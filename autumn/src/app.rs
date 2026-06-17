@@ -116,6 +116,10 @@ pub fn app() -> AppBuilder {
         #[cfg(feature = "mail")]
         mail_delivery_queue_factory: None,
         #[cfg(feature = "mail")]
+        suppression_store: None,
+        #[cfg(feature = "mail")]
+        mount_unsubscribe_endpoint: false,
+        #[cfg(feature = "mail")]
         mail_previews: Vec::new(),
         declared_routes: Vec::new(),
         idempotency_enabled: false,
@@ -339,6 +343,10 @@ pub struct AppBuilder {
     /// can capture framework-managed resources (DB pool, channels, etc.).
     #[cfg(feature = "mail")]
     mail_delivery_queue_factory: Option<MailDeliveryQueueFactory>,
+    #[cfg(feature = "mail")]
+    pub(crate) suppression_store: Option<crate::mail::SuppressionStoreHandle>,
+    #[cfg(feature = "mail")]
+    pub(crate) mount_unsubscribe_endpoint: bool,
     /// Mail template previews registered for the dev preview UI.
     #[cfg(feature = "mail")]
     mail_previews: Vec<crate::mail::MailPreview>,
@@ -1871,6 +1879,39 @@ impl AppBuilder {
         self
     }
 
+    /// Register a [`SuppressionStore`](crate::mail::SuppressionStore) used by
+    /// List-Unsubscribe sends to skip opted-out recipients and by the default
+    /// unsubscribe endpoint to record opt-outs.
+    ///
+    /// When the `db` feature is enabled and a connection pool is configured, a
+    /// Diesel-backed store is auto-wired, so most apps never call this — use it
+    /// to plug a custom backend. Mirrors
+    /// [`Self::with_mail_delivery_queue`].
+    #[cfg(feature = "mail")]
+    #[must_use]
+    pub fn with_suppression_store(
+        mut self,
+        store: impl crate::mail::SuppressionStore + 'static,
+    ) -> Self {
+        self.suppression_store = Some(crate::mail::SuppressionStoreHandle::new(store));
+        self
+    }
+
+    /// Mount the framework's default RFC 8058 one-click unsubscribe endpoint at
+    /// `/_autumn/unsubscribe` (`GET` confirmation page + `POST` one-click).
+    ///
+    /// Opt-in: a plain JSON API never gets an HTML endpoint it didn't ask for.
+    /// Requires `mail.unsubscribe_base_url` to be configured. When mounted, the
+    /// path is automatically exempted from CSRF and CAPTCHA (mailbox-provider
+    /// POSTs carry neither token). To serve a custom unsubscribe page instead,
+    /// skip this and register your own route at the path.
+    #[cfg(feature = "mail")]
+    #[must_use]
+    pub const fn mount_unsubscribe_endpoint(mut self) -> Self {
+        self.mount_unsubscribe_endpoint = true;
+        self
+    }
+
     /// Register an inbound mail router that creates webhook HTTP endpoints and
     /// dispatches parsed [`InboundEmail`](crate::inbound_mail::InboundEmail)
     /// values to registered handlers.
@@ -2283,6 +2324,10 @@ impl AppBuilder {
             #[cfg(feature = "mail")]
             mail_delivery_queue_factory,
             #[cfg(feature = "mail")]
+            suppression_store,
+            #[cfg(feature = "mail")]
+            mount_unsubscribe_endpoint,
+            #[cfg(feature = "mail")]
             mail_previews,
             declared_routes: _,
             idempotency_enabled,
@@ -2307,6 +2352,11 @@ impl AppBuilder {
         // 1 & 2. Load configuration and initialize logging/telemetry
         let (mut config, telemetry_guard) =
             load_config_and_telemetry(config_loader_factory, telemetry_provider).await;
+
+        #[cfg(feature = "mail")]
+        if mount_unsubscribe_endpoint {
+            config.mail.mount_unsubscribe_endpoint = true;
+        }
 
         // Apply builder-level flag: `.idempotent()` enables the middleware when
         // neither `autumn.toml` nor the environment explicitly disable it.
@@ -2605,6 +2655,10 @@ impl AppBuilder {
         // the "wired the macro arg, forgot the `.policy(...)`
         // builder call" footgun before any 500 lands.
         validate_repository_policies_registered(&all_routes, &scoped_groups, &state, &config);
+        #[cfg(feature = "mail")]
+        if let Some(handle) = suppression_store {
+            state.insert_extension(handle);
+        }
         #[cfg(feature = "mail")]
         crate::mail::install_mailer_with_factory(
             &state,
@@ -3087,6 +3141,10 @@ impl AppBuilder {
             #[cfg(feature = "mail")]
             mail_delivery_queue_factory,
             #[cfg(feature = "mail")]
+            suppression_store,
+            #[cfg(feature = "mail")]
+            mount_unsubscribe_endpoint,
+            #[cfg(feature = "mail")]
             mail_previews,
             declared_routes: _,
             idempotency_enabled,
@@ -3114,6 +3172,11 @@ impl AppBuilder {
         // Load config (same as normal startup)
         let (mut config, telemetry_guard) =
             load_config_and_telemetry(config_loader_factory, telemetry_provider).await;
+
+        #[cfg(feature = "mail")]
+        if mount_unsubscribe_endpoint {
+            config.mail.mount_unsubscribe_endpoint = true;
+        }
         if idempotency_enabled {
             let env_disabled = std::env::var("AUTUMN_IDEMPOTENCY__ENABLED")
                 .is_ok_and(|v| matches!(v.to_lowercase().as_str(), "false" | "0" | "no" | "off"));
@@ -3284,6 +3347,10 @@ impl AppBuilder {
         // may open Redis/Harvest connections unavailable here), and the guard
         // itself is bypassed too — the Mailer is still installed so static
         // routes that extract `Mailer` for immediate `send` calls resolve.
+        #[cfg(feature = "mail")]
+        if let Some(handle) = suppression_store {
+            state.insert_extension(handle);
+        }
         #[cfg(feature = "mail")]
         crate::mail::install_mailer_with_factory(
             &state,
@@ -3607,6 +3674,10 @@ impl AppBuilder {
             #[cfg(feature = "mail")]
             mail_delivery_queue_factory,
             #[cfg(feature = "mail")]
+            suppression_store,
+            #[cfg(feature = "mail")]
+                mount_unsubscribe_endpoint: _,
+            #[cfg(feature = "mail")]
             mail_interceptor,
             job_interceptor,
             #[cfg(feature = "db")]
@@ -3740,6 +3811,10 @@ impl AppBuilder {
             register(state.policy_registry());
         }
 
+        #[cfg(feature = "mail")]
+        if let Some(handle) = suppression_store {
+            state.insert_extension(handle);
+        }
         #[cfg(feature = "mail")]
         crate::mail::install_mailer_with_factory(
             &state,
