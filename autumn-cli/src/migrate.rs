@@ -466,18 +466,7 @@ fn check_concurrent_index_transaction_opt_out(
         return;
     }
 
-    let metadata_path = migration_dir.join("metadata.toml");
-    let opted_out = std::fs::read_to_string(&metadata_path)
-        .ok()
-        .and_then(|content| toml::from_str::<toml::Table>(&content).ok())
-        .and_then(|table| {
-            table
-                .get("run_in_transaction")
-                .and_then(toml::Value::as_bool)
-        })
-        .is_some_and(|v| !v);
-
-    if !opted_out {
+    if !migration_opts_out_of_transaction(migration_dir) {
         findings.push(safety::SafetyFinding {
             operation: "CONCURRENTLY index operation (missing transaction opt-out)".to_owned(),
             risk: safety::RiskLevel::PotentiallyBlocking,
@@ -489,6 +478,21 @@ fn check_concurrent_index_transaction_opt_out(
                           echo 'run_in_transaction = false' > migrations/<name>/metadata.toml",
         });
     }
+}
+
+/// Whether the migration directory's `metadata.toml` sets
+/// `run_in_transaction = false`, opting out of Diesel's default per-migration
+/// transaction wrapping (required for `CONCURRENTLY` index operations).
+fn migration_opts_out_of_transaction(migration_dir: &Path) -> bool {
+    std::fs::read_to_string(migration_dir.join("metadata.toml"))
+        .ok()
+        .and_then(|content| toml::from_str::<toml::Table>(&content).ok())
+        .and_then(|table| {
+            table
+                .get("run_in_transaction")
+                .and_then(toml::Value::as_bool)
+        })
+        .is_some_and(|v| !v)
 }
 
 /// Resolve the primary/write database URL from autumn.toml and environment variables.
@@ -722,6 +726,25 @@ fn has_revertable_down_sql(m: &AppliedUserMigration) -> bool {
     })
 }
 
+/// Whether reverting `m` would fail mid-rollback because its `down.sql` runs a
+/// `CREATE`/`DROP INDEX CONCURRENTLY` but the migration does not opt out of
+/// Diesel's default per-migration transaction via `metadata.toml`.
+///
+/// `PostgreSQL` rejects `CONCURRENTLY` index operations inside a transaction
+/// block, so such a revert fails at execution time. In a multi-step rollback
+/// that failure lands *after* earlier (newer) migrations have already been
+/// reverted and committed, leaving a partial rollback — so it is surfaced in
+/// preflight, before anything is mutated. Migrations missing locally (`dir`
+/// is `None`) are reported by the separate `has_revertable_down_sql` preflight.
+fn down_sql_concurrent_without_opt_out(m: &AppliedUserMigration) -> bool {
+    m.dir.as_ref().is_some_and(|d| {
+        std::fs::read_to_string(d.join("down.sql"))
+            .ok()
+            .is_some_and(|sql| safety::contains_concurrent_index(&sql))
+            && !migration_opts_out_of_transaction(d)
+    })
+}
+
 /// Build the newest-first list of user-migration versions to revert.
 ///
 /// With `--to VERSION`, every applied user migration strictly newer than
@@ -868,6 +891,34 @@ fn run_down_target(
                 }
                 eprintln!(
                     "  Add a down.sql to each migration before running `autumn migrate down`."
+                );
+                std::process::exit(1);
+            }
+
+            // Preflight: a down.sql running `CONCURRENTLY` index ops without
+            // `run_in_transaction = false` will fail inside Diesel's
+            // per-migration transaction. In a multi-step plan that failure lands
+            // after earlier (newer) reverts have already committed, so refuse
+            // the whole plan up front rather than leave a partial rollback.
+            let needs_opt_out: Vec<&str> = plan
+                .iter()
+                .filter_map(|version| {
+                    let m = applied.iter().find(|m| &m.version == version)?;
+                    down_sql_concurrent_without_opt_out(m).then_some(m.name.as_str())
+                })
+                .collect();
+            if !needs_opt_out.is_empty() {
+                eprintln!(
+                    "\u{2717} The following migration(s) revert a `CONCURRENTLY` index but do not set \
+                     `run_in_transaction = false` and cannot be reverted safely:"
+                );
+                for name in &needs_opt_out {
+                    eprintln!("    \u{2022} {name}");
+                }
+                eprintln!(
+                    "  `PostgreSQL` rejects `CONCURRENTLY` index operations inside a transaction, so \
+                     the revert would fail partway through. Add `run_in_transaction = false` to each \
+                     migration's metadata.toml before running `autumn migrate down`."
                 );
                 std::process::exit(1);
             }
@@ -1403,6 +1454,60 @@ mod tests {
             dir: Some(dir),
         };
         assert!(!has_revertable_down_sql(&m));
+    }
+
+    /// Build an `AppliedUserMigration` backed by a temp dir containing the given
+    /// `down.sql` (and optional `metadata.toml`). Returns the migration plus the
+    /// `TempDir` guard, which must be kept alive for the files to exist.
+    fn migration_with_down(
+        down_sql: &str,
+        metadata: Option<&str>,
+    ) -> (AppliedUserMigration, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("20260101000000_add_index");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("down.sql"), down_sql).unwrap();
+        if let Some(meta) = metadata {
+            std::fs::write(dir.join("metadata.toml"), meta).unwrap();
+        }
+        let m = AppliedUserMigration {
+            version: "20260101000000".to_string(),
+            name: "20260101000000_add_index".to_string(),
+            dir: Some(dir),
+        };
+        (m, tmp)
+    }
+
+    #[test]
+    fn down_concurrent_without_metadata_needs_opt_out() {
+        let (m, _tmp) = migration_with_down("DROP INDEX CONCURRENTLY idx_posts_title;", None);
+        assert!(down_sql_concurrent_without_opt_out(&m));
+    }
+
+    #[test]
+    fn down_concurrent_with_opt_out_is_safe() {
+        let (m, _tmp) = migration_with_down(
+            "DROP INDEX CONCURRENTLY idx_posts_title;",
+            Some("run_in_transaction = false\n"),
+        );
+        assert!(!down_sql_concurrent_without_opt_out(&m));
+    }
+
+    #[test]
+    fn down_without_concurrent_index_is_safe() {
+        let (m, _tmp) = migration_with_down("DROP TABLE posts;", None);
+        assert!(!down_sql_concurrent_without_opt_out(&m));
+    }
+
+    #[test]
+    fn down_concurrent_missing_locally_is_not_flagged_here() {
+        // Reported by the separate missing-down.sql preflight, not this one.
+        let m = AppliedUserMigration {
+            version: "20260101000000".to_string(),
+            name: "20260101000000_add_index".to_string(),
+            dir: None,
+        };
+        assert!(!down_sql_concurrent_without_opt_out(&m));
     }
 
     #[test]
