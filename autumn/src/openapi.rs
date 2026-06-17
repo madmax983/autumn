@@ -180,6 +180,9 @@ pub enum SchemaKind {
 /// to enable spec generation and mount the documentation endpoints.
 #[cfg(feature = "openapi")]
 #[derive(Clone)]
+/// Configuration for the generated OpenAPI specification.
+///
+/// Allows customizing the API title, version, and global security schemes.
 pub struct OpenApiConfig {
     /// API title that appears in the Swagger UI header.
     pub title: String,
