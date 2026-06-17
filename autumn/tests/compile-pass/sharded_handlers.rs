@@ -1,5 +1,5 @@
 // Compile-pass: handler signatures using the sharding extractors, and the
-// generated `with_pool` repository constructor over a shard pool.
+// generated `with_pool_untracked` / `from_shard` repository constructors.
 
 mod schema {
     autumn_web::reexports::diesel::table! {
@@ -46,14 +46,20 @@ async fn user_notes(shards: Shards, Path(user_id): Path<i64>) -> AutumnResult<&'
     Ok("ok")
 }
 
-// Repository constructed over an explicit shard pool.
-async fn repo_on_shard(shards: &Shards, tenant: &str) -> AutumnResult<PgNoteRepository> {
+// Repository constructed over an explicit shard pool (untracked escape hatch).
+async fn repo_on_shard_untracked(shards: &Shards, tenant: &str) -> AutumnResult<PgNoteRepository> {
     let shard = shards.set().route(tenant).await?;
-    Ok(PgNoteRepository::with_pool(shard.primary_pool().clone()))
+    Ok(PgNoteRepository::with_pool_untracked(shard.primary_pool().clone()))
+}
+
+// Repository constructed from a ShardedDb — preserves full instrumentation.
+async fn repo_from_shard(db: &ShardedDb) -> PgNoteRepository {
+    PgNoteRepository::from_shard(db)
 }
 
 fn main() {
     let _ = list_notes;
     let _ = user_notes;
-    let _ = repo_on_shard;
+    let _ = repo_on_shard_untracked;
+    let _ = repo_from_shard;
 }
