@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **sharding:** `from_shard(db: &ShardedDb) -> Self` constructor on generated
+  repositories (#1273)
+  - `#[repository]` now emits `from_shard` as the standard way to build a
+    repository over a shard while preserving full request instrumentation:
+    statement timeout, slow-query threshold, and shard-tagged route metric
+    label are all carried from the `ShardedDb` context rather than reset to
+    framework defaults.
+  - The previous `with_pool` constructor is **renamed** to
+    `with_pool_untracked` to signal at the call site that request
+    observability is bypassed. Uses of `with_pool` on generated repositories
+    must be updated to `with_pool_untracked` (only the name changes; the
+    signature and semantics are identical).
+  - `ShardedDb` gains a `#[doc(hidden)]` `__autumn_repository_seed()` accessor
+    exposing the `ShardRepositorySeed` carrier struct used by generated code.
+
 - **middleware:** `AppBuilder::static_gate` — auth gating for SSG/ISG routes
   via a pre-static middleware hook (#848)
   - Cached SSG/ISG pages are served by the static-first middleware before the

@@ -821,21 +821,56 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             quote! {}
         };
         quote! {
-            /// Construct this repository over an explicit pool instead of
-            /// the request-extracted control pool — e.g. a shard's primary
-            /// pool from the `Shards` extractor or `state.shards()`:
+            /// Construct this repository from a [`ShardedDb`](::autumn_web::sharding::ShardedDb)
+            /// extractor, preserving the full request instrumentation — statement
+            /// timeout, slow-query threshold, and route metric label — from the
+            /// shard context:
             ///
             /// ```rust,ignore
-            /// let shard = shards.set().route(&tenant_id).await?;
-            /// let repo = Self::with_pool(shard.primary_pool().clone());
+            /// #[post("/bookmarks")]
+            /// async fn create(db: ShardedDb, Json(body): Json<Body>) -> AutumnResult<Json<Bookmark>> {
+            ///     let repo = BookmarkRepository::from_shard(&db);
+            ///     // repo carries the same timeout / slow-query / route label as `db`
+            ///     let bookmark = repo.save(&body.into()).await?;
+            ///     Ok(Json(bookmark))
+            /// }
             /// ```
             ///
-            /// Framework defaults apply: no statement timeout, 500ms
-            /// slow-query threshold, no route-level metrics label (those
-            /// come from the request when the repository is used as an
-            /// extractor), and reads run on the supplied pool.
+            /// Reads are pinned to the shard's primary pool.  Use this constructor
+            /// as the standard way to build a repository on a shard; prefer
+            /// [`with_pool_untracked`](Self::with_pool_untracked) only when you
+            /// intentionally want to bypass request instrumentation.
             #[must_use]
-            pub fn with_pool(
+            pub fn from_shard(db: &::autumn_web::sharding::ShardedDb) -> Self {
+                #register_hooks
+                let __seed = db.__autumn_repository_seed();
+                Self {
+                    pool: ::core::clone::Clone::clone(&__seed.pool),
+                    #hooks_field
+                    #idempotency_field
+                    #tenant_init_field
+                    __autumn_read_route: ::autumn_web::repository::ReadRoute::Primary,
+                    __autumn_statement_timeout_ms: __seed.statement_timeout_ms,
+                    __autumn_slow_threshold: __seed.slow_query_threshold,
+                    __autumn_route: ::core::clone::Clone::clone(&__seed.route),
+                }
+            }
+
+            /// Construct this repository over an explicit pool, **bypassing**
+            /// request instrumentation.
+            ///
+            /// Statement timeout, slow-query threshold, and route metric labels
+            /// are reset to framework defaults (no timeout, 500 ms threshold,
+            /// no route label).  Prefer [`from_shard`](Self::from_shard) when
+            /// you have a [`ShardedDb`](::autumn_web::sharding::ShardedDb)
+            /// available; use this constructor only when you need an explicit
+            /// pool without any request context:
+            ///
+            /// ```rust,ignore
+            /// let repo = BookmarkRepository::with_pool_untracked(pool.clone());
+            /// ```
+            #[must_use]
+            pub fn with_pool_untracked(
                 pool: ::autumn_web::reexports::diesel_async::pooled_connection::deadpool::Pool<
                     ::autumn_web::reexports::diesel_async::AsyncPgConnection,
                 >,
@@ -8135,6 +8170,20 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 &self.pool
             }
 
+            /// Statement timeout in milliseconds (`0` = no limit).
+            /// Exposed for tests; not a public API.
+            #[doc(hidden)]
+            pub fn __autumn_statement_timeout_ms(&self) -> u64 {
+                self.__autumn_statement_timeout_ms
+            }
+
+            /// Slow-query logging threshold.
+            /// Exposed for tests; not a public API.
+            #[doc(hidden)]
+            pub fn __autumn_slow_threshold(&self) -> ::std::time::Duration {
+                self.__autumn_slow_threshold
+            }
+
             /// Acquire a primary-pool connection for mutating methods and
             /// pessimistic locks. Also used by `#[repository(scope = ...)]`
             /// generated endpoints; not part of the public surface.
@@ -8218,9 +8267,10 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             }
 
             /// Returns the route label for metrics, e.g. `"GET /users"`.
+            /// Exposed for tests; not a public API.
             #[doc(hidden)]
             #[inline]
-            fn __autumn_route_label(&self) -> &str {
+            pub fn __autumn_route_label(&self) -> &str {
                 self.__autumn_route.as_deref().unwrap_or("unknown")
             }
 

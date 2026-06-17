@@ -1025,6 +1025,57 @@ impl Shards {
     }
 }
 
+/// Instrumentation seed for building a `#[repository]` over a shard.
+///
+/// Carries the shard's primary pool plus the three request-derived
+/// observability values captured by [`ShardedDb`] at extraction time.
+/// Generated repositories read this via `__autumn_repository_seed()` when
+/// their `from_shard` constructor is called, so they apply the same
+/// statement timeout, slow-query threshold, and route label as the
+/// [`Shards`] extractor does when checking out a [`Db`](crate::db::Db).
+///
+/// This type is sealed behind `#[doc(hidden)]`; it is part of the
+/// framework's internal ABI for generated code and must not be considered
+/// a stable public API.
+#[doc(hidden)]
+#[derive(Clone)]
+pub struct ShardRepositorySeed {
+    pub pool: Pool<AsyncPgConnection>,
+    /// Statement timeout in milliseconds (`0` = no limit, matching the
+    /// Postgres `statement_timeout = 0` convention).  Capped at
+    /// `i32::MAX` ms to match the Postgres signed-integer constraint.
+    pub statement_timeout_ms: u64,
+    pub slow_query_threshold: std::time::Duration,
+    /// Shard-tagged route label (e.g. `"GET /bookmarks shard=shard0"`),
+    /// or `None` when no `MatchedPath` was present in the request.
+    pub route: Option<String>,
+}
+
+impl ShardRepositorySeed {
+    pub(crate) fn from_ctx(
+        pool: &Pool<AsyncPgConnection>,
+        ctx: &crate::db::RequestDbContext,
+        shard_name: &str,
+    ) -> Self {
+        // Postgres `statement_timeout` is a signed 32-bit integer (ms); cap
+        // to `i32::MAX` so the cast back to a `u64` field is always lossless.
+        const PG_TIMEOUT_MAX_MS: u64 = i32::MAX as u64;
+        let statement_timeout_ms = ctx.statement_timeout.map_or(0, |d| {
+            u64::try_from(d.as_millis().min(u128::from(PG_TIMEOUT_MAX_MS)))
+                .unwrap_or(PG_TIMEOUT_MAX_MS)
+        });
+        Self {
+            pool: pool.clone(),
+            statement_timeout_ms,
+            slow_query_threshold: ctx.slow_query_threshold,
+            route: ctx
+                .route_key
+                .as_ref()
+                .map(|key| format!("{key} shard={shard_name}")),
+        }
+    }
+}
+
 /// Tenant-routed shard connection extractor.
 ///
 /// Resolves the routing key automatically and checks out a connection to
@@ -1056,6 +1107,7 @@ pub struct ShardedDb {
     db: crate::db::Db,
     shard_name: Arc<str>,
     shard_id: ShardId,
+    repo_seed: ShardRepositorySeed,
 }
 
 impl ShardedDb {
@@ -1103,6 +1155,14 @@ impl ShardedDb {
     pub const fn db_mut(&mut self) -> &mut crate::db::Db {
         &mut self.db
     }
+
+    /// Instrumentation seed for `from_shard` on generated repositories.
+    /// Internal ABI; not a stable public API.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn __autumn_repository_seed(&self) -> &ShardRepositorySeed {
+        &self.repo_seed
+    }
 }
 
 impl std::ops::Deref for ShardedDb {
@@ -1137,11 +1197,14 @@ impl axum::extract::FromRequestParts<crate::AppState> for ShardedDb {
         let shard = shards.set.route(&key).await?;
         let shard_name = Arc::clone(&shard.name);
         let shard_id = shard.id();
+        let repo_seed =
+            ShardRepositorySeed::from_ctx(shard.primary_pool(), &shards.ctx, &shard_name);
         let db = shards.checkout_primary(shard).await?;
         Ok(Self {
             db,
             shard_name,
             shard_id,
+            repo_seed,
         })
     }
 }
@@ -1700,5 +1763,67 @@ mod tests {
             .expect("configured");
         // a primary (7) + b primary (7) + b replica (3).
         assert_eq!(set.total_max_connections(), 17);
+    }
+
+    // ── ShardRepositorySeed (#1273) ─────────────────────────────────────
+
+    #[test]
+    fn repo_seed_from_ctx_preserves_statement_timeout() {
+        let set = shard_set(&["shard0"]);
+        let shard = set.get(ShardId(0)).expect("shard");
+        let ctx = crate::db::RequestDbContext {
+            statement_timeout: Some(std::time::Duration::from_secs(3)),
+            route_key: Some("GET /test".to_owned()),
+            metrics: None,
+            slow_query_threshold: std::time::Duration::from_millis(200),
+            interceptors: Vec::new(),
+        };
+        let seed = ShardRepositorySeed::from_ctx(shard.primary_pool(), &ctx, "shard0");
+        assert_eq!(seed.statement_timeout_ms, 3_000, "timeout preserved as ms");
+        assert_eq!(
+            seed.slow_query_threshold,
+            std::time::Duration::from_millis(200),
+            "slow threshold preserved"
+        );
+        assert_eq!(
+            seed.route.as_deref(),
+            Some("GET /test shard=shard0"),
+            "route tagged with shard name"
+        );
+    }
+
+    #[test]
+    fn repo_seed_none_timeout_maps_to_zero() {
+        let set = shard_set(&["shard0"]);
+        let shard = set.get(ShardId(0)).expect("shard");
+        let ctx = crate::db::RequestDbContext {
+            statement_timeout: None,
+            route_key: None,
+            metrics: None,
+            slow_query_threshold: std::time::Duration::from_millis(500),
+            interceptors: Vec::new(),
+        };
+        let seed = ShardRepositorySeed::from_ctx(shard.primary_pool(), &ctx, "shard0");
+        assert_eq!(seed.statement_timeout_ms, 0, "None timeout maps to 0");
+        assert!(seed.route.is_none(), "None route_key propagates as None");
+    }
+
+    #[test]
+    fn repo_seed_timeout_capped_at_i32_max() {
+        let set = shard_set(&["shard0"]);
+        let shard = set.get(ShardId(0)).expect("shard");
+        let ctx = crate::db::RequestDbContext {
+            statement_timeout: Some(std::time::Duration::from_secs(u64::MAX / 1_000)),
+            route_key: None,
+            metrics: None,
+            slow_query_threshold: std::time::Duration::from_millis(500),
+            interceptors: Vec::new(),
+        };
+        let seed = ShardRepositorySeed::from_ctx(shard.primary_pool(), &ctx, "shard0");
+        assert_eq!(
+            seed.statement_timeout_ms,
+            i32::MAX as u64,
+            "timeout capped at i32::MAX ms"
+        );
     }
 }
