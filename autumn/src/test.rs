@@ -217,6 +217,7 @@ pub struct TestApp {
     merge_routers: Vec<axum::Router<crate::state::AppState>>,
     nest_routers: Vec<(String, axum::Router<crate::state::AppState>)>,
     custom_layers: Vec<crate::app::CustomLayerRegistration>,
+    static_gate_layers: Vec<crate::app::CustomLayerRegistration>,
     config: AutumnConfig,
     #[cfg(feature = "openapi")]
     openapi: Option<crate::openapi::OpenApiConfig>,
@@ -294,6 +295,7 @@ impl TestApp {
             merge_routers: Vec::new(),
             nest_routers: Vec::new(),
             custom_layers: Vec::new(),
+            static_gate_layers: Vec::new(),
             config,
             #[cfg(feature = "openapi")]
             openapi: None,
@@ -527,6 +529,22 @@ impl TestApp {
         self
     }
 
+    /// Register a pre-static gate layer for this test application.
+    ///
+    /// Mirrors [`crate::app::AppBuilder::static_gate`]: the layer runs
+    /// outermost (outside session and before the static cache lookup) so tests
+    /// can exercise auth-gating wiring that protects cached SSG/ISG pages.
+    #[must_use]
+    pub fn static_gate<L: crate::app::IntoAppLayer>(mut self, layer: L) -> Self {
+        self.static_gate_layers
+            .push(crate::app::CustomLayerRegistration {
+                type_id: std::any::TypeId::of::<L>(),
+                type_name: std::any::type_name::<L>(),
+                apply: Box::new(move |router| layer.apply_to(router)),
+            });
+        self
+    }
+
     /// Register an [`ErrorReporter`](crate::reporting::ErrorReporter) for this
     /// test app.
     ///
@@ -639,6 +657,8 @@ impl TestApp {
         self.merge_routers.extend(app_builder.merge_routers);
         self.nest_routers.extend(app_builder.nest_routers);
         self.custom_layers.extend(app_builder.custom_layers);
+        self.static_gate_layers
+            .extend(app_builder.static_gate_layers);
         self.jobs.extend(app_builder.jobs);
         self.exception_filters.extend(app_builder.exception_filters);
         self.metrics_sources.extend(app_builder.metrics_sources);
@@ -1202,6 +1222,7 @@ impl TestApp {
                 merge_routers,
                 nest_routers: self.nest_routers,
                 custom_layers: self.custom_layers,
+                static_gate_layers: self.static_gate_layers,
                 error_page_renderer: None,
                 session_store: None,
                 #[cfg(feature = "openapi")]

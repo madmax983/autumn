@@ -70,6 +70,30 @@ fn plugin_can_preflight_check_for_required_layer() {
 }
 
 #[test]
+fn static_gate_registers_and_is_introspectable() {
+    // A gate registered via `static_gate` is tracked independently of the
+    // regular `layer` stack so plugins can pre-flight for it.
+    let with_gate = app().static_gate(AuthLayer);
+    assert!(with_gate.has_static_gate::<AuthLayer>());
+    assert!(!with_gate.has_static_gate::<RateLimitLayer>());
+    // A `static_gate` registration must NOT show up as a regular layer.
+    assert!(!with_gate.has_layer::<AuthLayer>());
+
+    let without_gate = app();
+    assert!(!without_gate.has_static_gate::<AuthLayer>());
+}
+
+#[test]
+fn get_static_gate_types_returns_registration_order() {
+    let builder = app().static_gate(AuthLayer).static_gate(RateLimitLayer);
+
+    assert_eq!(
+        builder.get_static_gate_types(),
+        vec![TypeId::of::<AuthLayer>(), TypeId::of::<RateLimitLayer>()]
+    );
+}
+
+#[test]
 #[should_panic(expected = "AuthLayer must be registered before RequireAuthPlugin")]
 fn plugin_preflight_panics_when_required_layer_is_missing() {
     let _ = app().plugin(RequireAuthPlugin);

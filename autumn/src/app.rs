@@ -79,6 +79,7 @@ pub fn app() -> AppBuilder {
         merge_routers: Vec::new(),
         nest_routers: Vec::new(),
         custom_layers: Vec::new(),
+        static_gate_layers: Vec::new(),
         startup_hooks: Vec::new(),
         state_initializers: Vec::new(),
         shutdown_hooks: Vec::new(),
@@ -251,6 +252,11 @@ pub struct AppBuilder {
     /// Custom Tower layers registered via [`AppBuilder::layer`], applied
     /// inside `RequestIdLayer` on ingress so they observe the request ID.
     pub(crate) custom_layers: Vec<CustomLayerRegistration>,
+    /// Pre-static gate layers registered via [`AppBuilder::static_gate`],
+    /// applied outermost (outside session and before the static cache lookup)
+    /// so they can auth-gate / redirect requests before a cached SSG/ISG page
+    /// is served.
+    pub(crate) static_gate_layers: Vec<CustomLayerRegistration>,
     pub(crate) startup_hooks: Vec<StartupHook>,
     pub(crate) state_initializers: Vec<StateInitializer>,
     pub(crate) shutdown_hooks: Vec<ShutdownHook>,
@@ -1037,6 +1043,128 @@ impl AppBuilder {
     #[must_use]
     pub fn get_layer_types(&self) -> Vec<TypeId> {
         self.custom_layers
+            .iter()
+            .map(|registered| registered.type_id)
+            .collect()
+    }
+
+    /// Register a Tower layer that runs **before** the static file middleware
+    /// and the static cache lookup — Autumn's equivalent of Next.js *Edge
+    /// Middleware*.
+    ///
+    /// Cached SSG/ISG pages are served by the static-first middleware before
+    /// the inner router (session, auth) is ever reached, so framework auth
+    /// layers cannot gate pre-rendered responses. A `static_gate` layer runs
+    /// outermost — outside the session layer and ahead of the static cache —
+    /// so it can redirect or reject a request before a cached page is served.
+    ///
+    /// This is the right place for auth gating that protects pre-rendered
+    /// routes: redirect unauthenticated visitors to a login page while leaving
+    /// the cached HTML free of user-specific content. Personalised content
+    /// still requires a fully dynamic route or client-side fetching.
+    ///
+    /// # Position and limitations
+    ///
+    /// * Runs as the **outermost** user middleware in *both* SSG/ISG and
+    ///   fully-dynamic modes, so the same gate behaves identically regardless
+    ///   of whether static generation is active.
+    /// * Has access to request **headers and cookies**, but **NOT** the
+    ///   session [`Extension`](axum::Extension) — the session layer runs inside
+    ///   it. Verify a signed/JWT session cookie directly (e.g. with the same
+    ///   signing key configured for the session) rather than relying on
+    ///   session-populated extensions.
+    /// * Like [`layer`](Self::layer), it applies globally to every route.
+    /// * **Page-cache gate, not API auth.** The gate guards GET/HEAD page
+    ///   serving and acts by issuing a browser redirect/reject. It is **not**
+    ///   applied to MCP `tools/call` dispatch (a JSON-RPC call, where a redirect
+    ///   is meaningless) in *either* mode: the gate is applied after the MCP
+    ///   dispatch clone is taken. Gate MCP tools and JSON APIs with route-level
+    ///   guards / `#[secured]` / session auth, which always traverse the
+    ///   dispatch path. A well-behaved gate should therefore no-op on non-GET
+    ///   requests (such as the `/mcp` JSON-RPC POST transport).
+    /// * Short-circuit responses (the redirect/reject) are wrapped by the
+    ///   framework's security-header layer, so they still carry HSTS/CSP, etc.
+    /// * Because the gate runs **outside** the request stack (it must run before
+    ///   session and the static cache), a gate short-circuit does **not** pass
+    ///   through trusted-host validation or the per-request timeout — same as any
+    ///   middleware registered with [`layer`](Self::layer) that runs before
+    ///   those framework layers. Keep gate work bounded (prefer local
+    ///   cookie/JWT checks over unbounded remote calls), and rely on the
+    ///   framework's trusted-host policy for the routes the gate forwards to.
+    ///
+    /// Layers are wrapped in registration order with the first-registered gate
+    /// outermost, matching [`tower::ServiceBuilder`] semantics.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use autumn_web::prelude::*;
+    /// use axum::{
+    ///     extract::Request,
+    ///     http::{header, Method, StatusCode},
+    ///     middleware::Next,
+    ///     response::Response,
+    /// };
+    ///
+    /// async fn require_auth(req: Request, next: Next) -> Response {
+    ///     // Only gate page navigation. Pass non-GET/HEAD requests (JSON APIs,
+    ///     // form POSTs, the `/mcp` JSON-RPC transport, CORS preflights) straight
+    ///     // through so a browser redirect never turns them into a 302.
+    ///     let is_page = matches!(req.method(), &Method::GET | &Method::HEAD);
+    ///     // Inspect a signed session cookie directly — no session Extension
+    ///     // is available this far out in the stack.
+    ///     if !is_page || req.headers().contains_key("x-authed") {
+    ///         next.run(req).await
+    ///     } else {
+    ///         Response::builder()
+    ///             .status(StatusCode::FOUND)
+    ///             .header(header::LOCATION, "/login")
+    ///             .body(axum::body::Body::empty())
+    ///             .unwrap()
+    ///     }
+    /// }
+    ///
+    /// # #[get("/")] async fn index() -> &'static str { "ok" }
+    /// # #[autumn_web::main]
+    /// # async fn main() {
+    /// autumn_web::app()
+    ///     .routes(routes![index])
+    ///     .static_gate(axum::middleware::from_fn(require_auth))
+    ///     .run()
+    ///     .await;
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn static_gate<L: IntoAppLayer>(mut self, layer: L) -> Self {
+        self.static_gate_layers.push(CustomLayerRegistration {
+            type_id: TypeId::of::<L>(),
+            type_name: std::any::type_name::<L>(),
+            apply: Box::new(move |router| layer.apply_to(router)),
+        });
+        self
+    }
+
+    /// Returns `true` when a pre-static gate layer of type `L` has already
+    /// been registered via [`AppBuilder::static_gate`].
+    ///
+    /// Intended for plugin pre-flight validation before the app is started.
+    #[must_use]
+    pub fn has_static_gate<L: 'static>(&self) -> bool {
+        let layer_type = TypeId::of::<L>();
+        self.static_gate_layers
+            .iter()
+            .any(|registered| registered.type_id == layer_type)
+    }
+
+    /// Returns the registered pre-static gate layer types in registration
+    /// order.
+    ///
+    /// This includes only user-installed gates from
+    /// [`AppBuilder::static_gate`], not regular layers or framework
+    /// middleware.
+    #[must_use]
+    pub fn get_static_gate_types(&self) -> Vec<TypeId> {
+        self.static_gate_layers
             .iter()
             .map(|registered| registered.type_id)
             .collect()
@@ -2287,6 +2415,7 @@ impl AppBuilder {
             merge_routers,
             nest_routers,
             custom_layers,
+            static_gate_layers,
             startup_hooks,
             state_initializers,
             shutdown_hooks,
@@ -2800,6 +2929,7 @@ impl AppBuilder {
                 merge_routers,
                 nest_routers,
                 custom_layers,
+                static_gate_layers,
                 error_page_renderer,
                 session_store,
                 // Respect the [openapi] profile gate: if disabled in config,
@@ -3104,6 +3234,7 @@ impl AppBuilder {
             merge_routers: _,
             nest_routers: _,
             custom_layers,
+            static_gate_layers: _,
             startup_hooks: _,
             state_initializers,
             shutdown_hooks: _,
@@ -3414,6 +3545,7 @@ impl AppBuilder {
                 merge_routers,
                 nest_routers: Vec::new(),
                 custom_layers,
+                static_gate_layers: Vec::new(),
                 error_page_renderer: None,
                 session_store,
                 #[cfg(feature = "openapi")]
@@ -7049,6 +7181,7 @@ mod tests {
                 merge_routers: Vec::new(),
                 nest_routers: Vec::new(),
                 custom_layers,
+                static_gate_layers: Vec::new(),
                 error_page_renderer: None,
                 session_store: None,
                 #[cfg(feature = "openapi")]

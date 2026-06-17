@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **middleware:** `AppBuilder::static_gate` — auth gating for SSG/ISG routes
+  via a pre-static middleware hook (#848)
+  - Cached SSG/ISG pages are served by the static-first middleware before the
+    inner router (session, auth) is reached, so framework auth layers could not
+    gate pre-rendered responses. `static_gate` registers a Tower layer that runs
+    **outermost** — outside the session layer and ahead of the static cache —
+    so it can redirect or reject a request before a cached page is served
+    (Autumn's analogue of Next.js Edge Middleware).
+  - Runs in the same outermost position in both SSG/ISG and fully-dynamic
+    modes, so gating code is portable. Has access to request headers/cookies but
+    **not** the session `Extension` (verify a signed/JWT cookie directly).
+  - Plugin pre-flight helpers `has_static_gate::<L>()` /
+    `get_static_gate_types()`, and a matching `TestApp::static_gate` for tests.
+  - Additive only; documented in `docs/guide/middleware.md`.
 - **db:** Declarative associations and eager loading for `#[model]` / `#[repository]` (#835)
   - `#[model]` accepts struct-level `#[belongs_to(Target, fk = ...)]`,
     `#[has_many(Target, fk = ...)]`, and `#[has_one(Target, fk = ...)]`.
