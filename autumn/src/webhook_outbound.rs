@@ -22,8 +22,11 @@ const TRUNCATED_RESPONSE_BODY_SUFFIX: &str = "\n[truncated]";
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum WebhookSubscriptionStatus {
+    /// The subscription is active and delivering events.
     Active,
+    /// The subscription was manually disabled.
     Disabled,
+    /// The subscription failed to deliver events too many times and has been suspended.
     Failed,
 }
 
@@ -48,29 +51,48 @@ impl std::fmt::Display for WebhookSubscriptionStatus {
 /// A registered webhook subscription targeting a consumer endpoint.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WebhookSubscription {
+    /// The unique identifier of the subscription.
     pub id: String,
+    /// The URL endpoint to deliver events to.
     pub target_url: String,
+    /// A list of topics this subscription listens for.
     pub event_topics: Vec<String>,
+    /// The secret used to sign outbound requests.
     pub secret: String,
+    /// The current operational status of the subscription.
     pub status: WebhookSubscriptionStatus,
+    /// The number of consecutive failed delivery attempts.
     pub consecutive_failures: u32,
 }
 
 /// A structured log of an outbound webhook delivery attempt.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WebhookDeliveryLog {
+    /// The unique identifier for this delivery attempt.
     pub id: String,
+    /// The associated subscription ID.
     pub subscription_id: String,
+    /// The topic of the event being delivered.
     pub topic: String,
+    /// The JSON payload delivered to the endpoint.
     pub payload: String,
+    /// The headers sent with the outbound request.
     pub request_headers: HashMap<String, String>,
+    /// The HTTP status code returned by the endpoint, if a response was received.
     pub response_status: Option<u16>,
+    /// The body returned by the endpoint, if a response was received.
     pub response_body: Option<String>,
+    /// The duration of the delivery attempt in milliseconds.
     pub elapsed_ms: u64,
+    /// The attempt sequence number (e.g., 1 for the first attempt).
     pub attempt: u32,
+    /// The maximum number of retry attempts configured.
     pub max_attempts: u32,
+    /// True if the payload has been moved to the dead-letter queue.
     pub is_dlq: bool,
+    /// A descriptive error message if the delivery attempt failed.
     pub last_error: Option<String>,
+    /// The UTC timestamp of the delivery attempt.
     pub timestamp: DateTime<Utc>,
 }
 
