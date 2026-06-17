@@ -330,6 +330,27 @@ const fn is_separator(c: char) -> bool {
     )
 }
 
+/// Scrubs raw literal values from a SQL query string to prevent PII leaks.
+///
+/// This function normalizes SQL statements before they are emitted to logs,
+/// error trackers, or metrics. It strips out strings, numbers, and identifiers
+/// that might contain sensitive data (like user IDs, email addresses, or
+/// password hashes) and replaces them with `?` placeholders.
+///
+/// By scrubbing literals, telemetry systems can safely group structurally identical
+/// queries (e.g., `SELECT * FROM users WHERE id = ?`) without logging the
+/// actual parameters used.
+///
+/// # Examples
+///
+/// ```
+/// use autumn_web::db::scrub_sql;
+///
+/// let raw = "SELECT * FROM users WHERE email = 'test@example.com' AND age > 21;";
+/// let scrubbed = scrub_sql(raw);
+///
+/// assert_eq!(scrubbed, "SELECT * FROM users WHERE email = '?' AND age > ?;");
+/// ```
 #[must_use]
 pub fn scrub_sql(sql: &str) -> String {
     let mut out = String::with_capacity(sql.len());
