@@ -802,9 +802,11 @@ fn restart_server(
 
 fn tailwind_build() -> bool {
     let Some(mut cmd) = build_tailwind_command() else {
-        eprintln!(
-            "  \u{2717} Tailwind CSS CLI not found. Run `autumn setup` or install `tailwindcss`."
-        );
+        if crate::doctor::tailwind_enabled() {
+            eprintln!(
+                "  \u{2717} Tailwind CSS CLI not found. Run `autumn setup` or install `tailwindcss`."
+            );
+        }
         return false;
     };
 
