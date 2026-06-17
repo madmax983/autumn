@@ -9,7 +9,7 @@
     clippy::collapsible_if
 )]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -111,7 +111,9 @@ pub struct CircuitBreaker {
 
 pub(crate) struct CircuitBreakerInner {
     pub(crate) state: CircuitState,
-    pub(crate) history: Vec<(Instant, bool)>,
+    /// Ring buffer used to optimize O(1) front pop operations when cleaning
+    /// expired samples, avoiding O(N) retain shifting allocations on hot paths.
+    pub(crate) history: VecDeque<(Instant, bool)>,
     pub(crate) open_until: Option<Instant>,
     pub(crate) half_open_successes: u64,
     pub(crate) half_open_failures: u64,
@@ -122,7 +124,13 @@ pub(crate) struct CircuitBreakerInner {
 impl CircuitBreakerInner {
     fn clean_history(&mut self, window: Duration, now: Instant) {
         let cutoff = now.checked_sub(window).unwrap_or(now);
-        self.history.retain(|(t, _)| *t >= cutoff);
+        while let Some(&(t, _)) = self.history.front() {
+            if t < cutoff {
+                self.history.pop_front();
+            } else {
+                break;
+            }
+        }
     }
 
     fn failure_ratio(&self) -> f64 {
@@ -154,7 +162,7 @@ impl CircuitBreaker {
             name: name.into(),
             inner: Arc::new(Mutex::new(CircuitBreakerInner {
                 state: CircuitState::Closed,
-                history: Vec::new(),
+                history: VecDeque::new(),
                 open_until: None,
                 half_open_successes: 0,
                 half_open_failures: 0,
@@ -243,7 +251,7 @@ impl CircuitBreaker {
 
         match inner.state {
             CircuitState::Closed => {
-                inner.history.push((now, success));
+                inner.history.push_back((now, success));
                 let window = inner.config.sample_window;
                 inner.clean_history(window, now);
 
