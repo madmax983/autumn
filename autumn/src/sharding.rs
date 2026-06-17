@@ -1772,7 +1772,7 @@ mod tests {
         let set = shard_set(&["shard0"]);
         let shard = set.get(ShardId(0)).expect("shard");
         let ctx = crate::db::RequestDbContext {
-            statement_timeout: Some(std::time::Duration::from_millis(3_000)),
+            statement_timeout: Some(std::time::Duration::from_secs(3)),
             route_key: Some("GET /test".to_owned()),
             metrics: None,
             slow_query_threshold: std::time::Duration::from_millis(200),
