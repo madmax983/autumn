@@ -934,11 +934,17 @@ impl IntoResponse for AutumnError {
 
         let mut builder = Response::builder()
             .status(status)
-            .header(header::CONTENT_TYPE, HeaderValue::from_static("application/problem+json"))
+            .header(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/problem+json"),
+            )
             .header(header::CONTENT_LENGTH, content_length.to_string());
 
         if status == StatusCode::CONFLICT {
-            builder = builder.header("HX-Trigger", HeaderValue::from_static(r#"{"autumn:conflict":true}"#));
+            builder = builder.header(
+                "HX-Trigger",
+                HeaderValue::from_static(r#"{"autumn:conflict":true}"#),
+            );
         }
 
         let mut response = builder.body(axum::body::Body::from(body_bytes)).unwrap();
