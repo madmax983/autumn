@@ -1,3 +1,23 @@
+//! Interceptors for observing and modifying framework operations.
+//!
+//! Interceptors provide hooks into the lifecycle of various Autumn components,
+//! allowing you to log, modify, or block operations. This is an advanced feature
+//! typically used for instrumentation, custom tracing, or enforcing test isolation
+//! boundaries.
+//!
+//! # Available Interceptors
+//!
+//! - `MailInterceptor` - Intercepts outbound email deliveries.
+//! - [`crate::interceptor::JobInterceptor`] - Intercepts background job enqueue and execution.
+//! - [`DbConnectionInterceptor`] - Intercepts database connection checkout (e.g., for test transactions).
+//! - `ChannelsInterceptor` - Intercepts WebSocket channel message publication.
+//! - `HttpInterceptor` - Intercepts outbound HTTP requests.
+//!
+//! # Usage
+//!
+//! Interceptors are implemented as traits. The framework maintains registries
+//! for active interceptors, usually populated at application startup or test setup.
+
 #[cfg(feature = "oauth2")]
 use std::sync::Arc;
 

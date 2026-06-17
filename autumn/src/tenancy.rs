@@ -1,3 +1,27 @@
+//! Multi-tenancy primitives and middleware.
+//!
+//! This module provides the infrastructure for isolating data across multiple tenants
+//! within a single database. Autumn's tenancy model works by intercepting queries
+//! and database writes to automatically append or check a `tenant_id` column, ensuring
+//! that users can only interact with data belonging to their resolved tenant.
+//!
+//! # Core Concepts
+//!
+//! - **Tenant Resolution**: The [`tenancy_middleware`] resolves the current tenant from the
+//!   incoming HTTP request (e.g., via a subdomain or a JWT claim) and stores it in
+//!   request-local state.
+//! - **Database Injection**: Traits like [`TenantInsertable`] and [`HasTenantIdColumn`] bridge
+//!   the resolved tenant ID into Diesel queries, transparently adding `tenant_id = ?` filters
+//!   and insert values.
+//! - **Streaming Boundaries**: The [`TenantPropagatingBody`] wrapper ensures the tenant
+//!   context survives across `.poll_frame()` boundaries for async streaming responses.
+//!
+//! # Configuration
+//!
+//! Tenancy is enabled via the `[tenancy]` section in `autumn.toml`. When enabled, you must
+//! specify the `source` (e.g., `subdomain` or `jwt`) and relevant configuration like the
+//! `base_domain` or `jwt_claim`.
+
 use axum::{
     extract::State,
     http::Request,

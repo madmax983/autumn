@@ -1,3 +1,37 @@
+//! Circuit breaker pattern for resilience against cascading failures.
+//!
+//! A circuit breaker sits between your application and a remote service (or database).
+//! It monitors for failures. When the failure rate exceeds a configured threshold, the
+//! breaker trips into the [`CircuitState::Open`] state. In this state, it "fails fast"
+//! by returning an error immediately without actually making the remote call, allowing
+//! the failing service time to recover.
+//!
+//! After a configurable open duration, the breaker transitions to [`CircuitState::HalfOpen`].
+//! In this state, it allows a limited number of trial requests through to test if the
+//! service has recovered. If the trial requests succeed, the breaker resets to
+//! [`CircuitState::Closed`]. If they fail, it trips back to [`CircuitState::Open`].
+//!
+//! # Core Components
+//!
+//! - [`CircuitBreaker`] - The main entry point for wrapping futures.
+//! - [`CircuitBreakerPolicy`] - Configuration (thresholds, windows, timeouts).
+//! - [`CircuitState`] - The current state (`Closed`, `Open`, `HalfOpen`).
+//! - [`CircuitBreakerLayer`] - Tower middleware for applying circuit breakers to routes.
+//!
+//! # Examples
+//!
+//! ```rust,ignore
+//! use autumn_web::circuit_breaker::{CircuitBreaker, CircuitBreakerPolicy};
+//!
+//! let breaker = CircuitBreaker::new("payment-gateway", CircuitBreakerPolicy::default());
+//!
+//! // Run an async block through the breaker
+//! let result = breaker.run(async {
+//!     // your remote call here
+//!     Ok::<_, &'static str>("success")
+//! }).await;
+//! ```
+
 #![allow(
     clippy::missing_panics_doc,
     clippy::missing_errors_doc,
