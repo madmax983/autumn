@@ -585,9 +585,9 @@ enum MigrateCommands {
     Status,
     /// Run a production-safety preflight check on all migration SQL files.
     ///
-    /// Classifies every `up.sql` in the migrations directory into one of:
-    /// safe, potentially-blocking, destructive, irreversible, data-backfill,
-    /// or manual-review-required.
+    /// Classifies every `up.sql` and `down.sql` in the migrations directory
+    /// into one of: safe, potentially-blocking, destructive, irreversible,
+    /// data-backfill, or manual-review-required.
     ///
     /// Exits with code 0 when all migrations are safe for a rolling deploy.
     /// Exits with code 1 and prints a detailed report when any unsafe or
@@ -600,6 +600,48 @@ enum MigrateCommands {
     ///   autumn migrate check
     #[command(verbatim_doc_comment)]
     Check,
+    /// Revert the most recently applied user migration(s).
+    ///
+    /// Executes each migration's `down.sql` in reverse chronological order and
+    /// removes its record from `__diesel_schema_migrations`.
+    ///
+    /// Framework-owned migrations (the ones Autumn ships internally) are
+    /// **never** rolled back by this command — they are forward-only by design.
+    ///
+    /// # Examples
+    ///
+    ///   # Revert the most recently applied migration (default --steps 1):
+    ///   autumn migrate down
+    ///
+    ///   # Revert the last 3 applied user migrations:
+    ///   autumn migrate down --steps 3
+    ///
+    ///   # Revert until <version> is the latest applied:
+    ///   autumn migrate down --to 20260101000000
+    ///
+    ///   # Required when the active profile is prod/production:
+    ///   autumn migrate down --yes-i-mean-prod
+    #[command(verbatim_doc_comment)]
+    Down {
+        /// Number of user migrations to revert in newest-first order (default: 1).
+        ///
+        /// Mutually exclusive with --to.
+        #[arg(long, value_name = "N", conflicts_with = "to")]
+        steps: Option<usize>,
+        /// Revert user migrations until VERSION is the latest applied.
+        ///
+        /// VERSION must be a currently applied *user* migration (fails cleanly
+        /// otherwise). Framework migrations are forward-only and cannot be used
+        /// as a boundary. Mutually exclusive with --steps.
+        #[arg(long, value_name = "VERSION", conflicts_with = "steps")]
+        to: Option<String>,
+        /// Required when the active profile is prod or production.
+        ///
+        /// Without this flag the command exits non-zero with a clear message
+        /// before touching the database.
+        #[arg(long)]
+        yes_i_mean_prod: bool,
+    },
 }
 
 /// Subcommands for `autumn data`.
@@ -1297,6 +1339,15 @@ fn run_command(command: Commands) {
             let action = match action {
                 Some(MigrateCommands::Status) => migrate::MigrateAction::Status,
                 Some(MigrateCommands::Check) => migrate::MigrateAction::Check,
+                Some(MigrateCommands::Down {
+                    steps,
+                    to,
+                    yes_i_mean_prod,
+                }) => migrate::MigrateAction::Down(migrate::DownArgs {
+                    steps,
+                    to,
+                    yes_i_mean_prod,
+                }),
                 None => migrate::MigrateAction::Run,
             };
             let target = match (shard, control_only) {
@@ -1304,7 +1355,7 @@ fn run_command(command: Commands) {
                 (None, true) => migrate::MigrateTarget::ControlOnly,
                 (None, false) => migrate::MigrateTarget::All,
             };
-            migrate::run(action, with_maintenance, &target);
+            migrate::run(&action, with_maintenance, &target);
         }
         Commands::Maintenance(cmd) => match cmd {
             MaintenanceCommands::On {
@@ -3513,6 +3564,78 @@ mod tests {
         };
         assert!(matches!(action, Some(MigrateCommands::Status)));
         assert!(with_maintenance);
+    }
+
+    #[test]
+    fn parse_migrate_down_default() {
+        let cli = Cli::try_parse_from(["autumn", "migrate", "down"]).unwrap();
+        let Commands::Migrate { action, .. } = cli.command else {
+            panic!("expected migrate");
+        };
+        assert!(matches!(
+            action,
+            Some(MigrateCommands::Down {
+                steps: None,
+                to: None,
+                yes_i_mean_prod: false
+            })
+        ));
+    }
+
+    #[test]
+    fn parse_migrate_down_steps() {
+        let cli = Cli::try_parse_from(["autumn", "migrate", "down", "--steps", "3"]).unwrap();
+        let Commands::Migrate { action, .. } = cli.command else {
+            panic!("expected migrate");
+        };
+        assert!(matches!(
+            action,
+            Some(MigrateCommands::Down {
+                steps: Some(3),
+                to: None,
+                yes_i_mean_prod: false
+            })
+        ));
+    }
+
+    #[test]
+    fn parse_migrate_down_to_version() {
+        let cli =
+            Cli::try_parse_from(["autumn", "migrate", "down", "--to", "20260101000000"]).unwrap();
+        let Commands::Migrate { action, .. } = cli.command else {
+            panic!("expected migrate");
+        };
+        let Some(MigrateCommands::Down { to, steps, .. }) = action else {
+            panic!("expected Down");
+        };
+        assert_eq!(to.as_deref(), Some("20260101000000"));
+        assert!(steps.is_none());
+    }
+
+    #[test]
+    fn parse_migrate_down_yes_i_mean_prod() {
+        let cli = Cli::try_parse_from(["autumn", "migrate", "down", "--yes-i-mean-prod"]).unwrap();
+        let Commands::Migrate { action, .. } = cli.command else {
+            panic!("expected migrate");
+        };
+        let Some(MigrateCommands::Down {
+            yes_i_mean_prod, ..
+        }) = action
+        else {
+            panic!("expected Down");
+        };
+        assert!(yes_i_mean_prod);
+    }
+
+    #[test]
+    fn parse_migrate_down_steps_and_to_are_mutually_exclusive() {
+        let result = Cli::try_parse_from([
+            "autumn", "migrate", "down", "--steps", "2", "--to", "20260101",
+        ]);
+        assert!(
+            result.is_err(),
+            "--steps and --to must be mutually exclusive"
+        );
     }
 
     #[test]

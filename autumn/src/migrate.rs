@@ -25,9 +25,11 @@
 //! }
 //! ```
 
-use diesel::migration::Migration;
+use diesel::migration::{Migration, MigrationSource};
+use diesel::pg::Pg;
 use diesel::{Connection, RunQueryDsl};
-use diesel_migrations::{HarnessWithOutput, MigrationHarness};
+use diesel_migrations::{FileBasedMigrations, HarnessWithOutput, MigrationHarness};
+use std::path::Path;
 
 /// Re-export `EmbeddedMigrations` so users can reference it without adding
 /// `diesel_migrations` as a direct dependency.
@@ -400,6 +402,251 @@ impl Drop for MigrationLockGuard {
     }
 }
 
+/// A single user migration that was successfully reverted.
+///
+/// Emitted by the `on_reverted` callback in [`revert_user_migrations_locked`] after
+/// each successful revert so callers can stream per-migration UX output.
+#[derive(Debug)]
+pub struct RevertedMigration {
+    /// Version string (e.g. `"20260101000000"`).
+    pub version: String,
+    /// Full migration name including version prefix (e.g. `"20260101000000_create_posts"`).
+    pub name: String,
+    /// Wall-clock time taken by the revert.
+    pub duration: std::time::Duration,
+}
+
+/// An applied **user** migration, resolved against the local `migrations/`
+/// directory using Diesel's own version normalisation.
+///
+/// `dir` is `None` when the migration is recorded as applied in the database
+/// but is no longer present locally (e.g. deploying from a branch that lacks
+/// it). Such migrations are surfaced — not silently dropped — so a rollback can
+/// refuse rather than revert an older migration out of order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppliedUserMigration {
+    /// Normalised version string (Diesel's `version()`), e.g. `"20260101000000"`.
+    pub version: String,
+    /// Local migration directory name (e.g. `"20260101000000_create_posts"`),
+    /// or the bare version if the migration is not present locally.
+    pub name: String,
+    /// Path to the local migration directory, or `None` if it is missing.
+    pub dir: Option<std::path::PathBuf>,
+}
+
+/// Versions of the embedded framework migrations (`FRAMEWORK_MIGRATIONS`).
+///
+/// Used to exclude framework-owned migrations from user rollback planning so
+/// the forward-only contract is preserved regardless of which migrations are
+/// applied locally.
+fn framework_migration_versions() -> Result<std::collections::BTreeSet<String>, MigrationError> {
+    let migrations = MigrationSource::<Pg>::migrations(&FRAMEWORK_MIGRATIONS)
+        .map_err(|e| MigrationError::Migration(e.to_string()))?;
+    Ok(migrations
+        .iter()
+        .map(|m| m.name().version().to_string())
+        .collect())
+}
+
+/// Classify the database's applied migrations into user migrations (ascending
+/// by version), excluding framework-owned ones and resolving each to its local
+/// directory via Diesel's `name()`/`version()` metadata.
+fn resolve_applied_user_migrations(
+    conn: &mut diesel::PgConnection,
+    all_migrations: &[Box<dyn Migration<Pg>>],
+    migrations_dir: &Path,
+) -> Result<Vec<AppliedUserMigration>, MigrationError> {
+    // version -> local directory name, using Diesel's normalisation so that
+    // hyphenated directories (e.g. `2026-01-01-000000_x`) match the applied
+    // version (`20260101000000`).
+    let by_version: std::collections::BTreeMap<String, String> = all_migrations
+        .iter()
+        .map(|m| (m.name().version().to_string(), m.name().to_string()))
+        .collect();
+
+    let framework = framework_migration_versions()?;
+
+    let applied: Vec<String> = conn
+        .applied_migrations()
+        .map_err(|e| MigrationError::Migration(e.to_string()))?
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+
+    Ok(classify_applied_user_migrations(
+        &applied,
+        &by_version,
+        &framework,
+        migrations_dir,
+    ))
+}
+
+/// Pure classification of applied versions into user migrations (ascending by
+/// version), separated from DB/IO so it can be unit-tested.
+///
+/// `by_version` maps a normalised migration version to its local directory name
+/// (from the file-based source). `framework` is the embedded framework version
+/// set. A version is treated as a **user** migration when it is present locally
+/// (`by_version`) — local presence wins over a framework-version collision — or
+/// when it is neither local nor framework-owned (applied but missing locally,
+/// returned with `dir: None` so callers can surface it).
+fn classify_applied_user_migrations(
+    applied: &[String],
+    by_version: &std::collections::BTreeMap<String, String>,
+    framework: &std::collections::BTreeSet<String>,
+    migrations_dir: &Path,
+) -> Vec<AppliedUserMigration> {
+    let mut user: Vec<AppliedUserMigration> = applied
+        .iter()
+        // Local presence wins: a version present in `migrations_dir` is a user
+        // migration even if it collides with a framework shim version (e.g. the
+        // placeholder `00000000000000` shared by `create_api_tokens` and some
+        // apps' first migration). Only framework-owned versions that are absent
+        // locally are excluded.
+        .filter(|v| by_version.contains_key(*v) || !framework.contains(*v))
+        .map(|version| {
+            by_version.get(version).map_or_else(
+                || AppliedUserMigration {
+                    name: version.clone(),
+                    dir: None,
+                    version: version.clone(),
+                },
+                |name| AppliedUserMigration {
+                    dir: Some(migrations_dir.join(name)),
+                    name: name.clone(),
+                    version: version.clone(),
+                },
+            )
+        })
+        .collect();
+    user.sort_by(|a, b| a.version.cmp(&b.version));
+    user
+}
+
+/// Return the applied **user** migrations (ascending by version), excluding any
+/// framework-owned migrations, each resolved to its local directory.
+///
+/// Framework migrations are excluded by version (the embedded
+/// `FRAMEWORK_MIGRATIONS` set), except where a version is also present in the
+/// local `migrations_dir` — local presence wins so a user migration that
+/// collides with a framework shim version is not dropped. An applied user
+/// migration that is no longer present locally is still returned, with
+/// [`AppliedUserMigration::dir`] set to `None`, so callers can surface it rather
+/// than silently dropping it.
+///
+/// This is a read-only listing for status display; it does **not** take the
+/// migration advisory lock. Use [`revert_user_migrations_locked`] to plan and
+/// execute a rollback atomically under the lock.
+///
+/// # Errors
+///
+/// - [`MigrationError::Connection`] if the database is unreachable.
+/// - [`MigrationError::Migration`] if `migrations_dir` cannot be read or if
+///   querying applied versions from the database fails.
+pub fn applied_user_migrations(
+    database_url: &str,
+    migrations_dir: &Path,
+) -> Result<Vec<AppliedUserMigration>, MigrationError> {
+    let mut conn = diesel::PgConnection::establish(database_url)
+        .map_err(|e| MigrationError::Connection(e.to_string()))?;
+
+    let source = FileBasedMigrations::from_path(migrations_dir)
+        .map_err(|e| MigrationError::Migration(format!("failed to read migrations dir: {e}")))?;
+    let all_migrations: Vec<Box<dyn Migration<Pg>>> = source
+        .migrations()
+        .map_err(|e| MigrationError::Migration(e.to_string()))?;
+
+    resolve_applied_user_migrations(&mut conn, &all_migrations, migrations_dir)
+}
+
+/// Plan and execute a user-migration rollback atomically under the migration
+/// advisory lock.
+///
+/// After acquiring the lock, the applied user migrations are listed and
+/// resolved (framework migrations excluded), then `plan` is invoked to choose
+/// the versions to revert (newest-first). Because listing, planning, and
+/// reverting all happen while the lock is held, the plan cannot go stale: two
+/// concurrent `down` runs are fully serialized, so neither double-reverts.
+///
+/// `plan` may inspect each [`AppliedUserMigration`] (including whether it is
+/// resolvable locally) and return an error — or terminate the process — to
+/// refuse the rollback. `on_reverted` is invoked after each successful revert
+/// so the caller can stream per-migration UX. Returns the number reverted.
+///
+/// If a planned version is applied but missing from `migrations_dir`, the
+/// revert fails (rather than skipping it) because its `down.sql` is unavailable.
+///
+/// # Errors
+///
+/// - [`MigrationError::Connection`] if the database is unreachable.
+/// - [`MigrationError::LockTimeout`] if the advisory lock cannot be acquired.
+/// - [`MigrationError::Migration`] if `plan` returns an error, a revert fails,
+///   or a planned version is not present in `migrations_dir`.
+pub fn revert_user_migrations_locked<P, F>(
+    database_url: &str,
+    migrations_dir: &Path,
+    wait_timeout: Option<std::time::Duration>,
+    plan: P,
+    mut on_reverted: F,
+) -> Result<usize, MigrationError>
+where
+    P: FnOnce(&[AppliedUserMigration]) -> Result<Vec<String>, MigrationError>,
+    F: FnMut(&RevertedMigration),
+{
+    let timeout = wait_timeout.unwrap_or(DEFAULT_LOCK_WAIT_TIMEOUT);
+
+    let mut conn = diesel::PgConnection::establish(database_url)
+        .map_err(|e| MigrationError::Connection(e.to_string()))?;
+
+    let source = FileBasedMigrations::from_path(migrations_dir)
+        .map_err(|e| MigrationError::Migration(format!("failed to read migrations dir: {e}")))?;
+    let all_migrations: Vec<Box<dyn Migration<Pg>>> = source
+        .migrations()
+        .map_err(|e| MigrationError::Migration(e.to_string()))?;
+
+    acquire_migration_lock(&mut conn, timeout)?;
+
+    let result: Result<usize, MigrationError> = (|| {
+        let applied_user =
+            resolve_applied_user_migrations(&mut conn, &all_migrations, migrations_dir)?;
+        let versions = plan(&applied_user)?;
+
+        let mut count = 0;
+        for version in &versions {
+            // Build a borrowed `MigrationVersion` once per version (no heap
+            // allocation) instead of allocating a `String` for every migration.
+            let target = diesel::migration::MigrationVersion::from(version.as_str());
+            let migration = all_migrations
+                .iter()
+                .find(|m| m.name().version() == target)
+                .ok_or_else(|| {
+                    MigrationError::Migration(format!(
+                        "migration version {version} is applied but not present in {} — \
+                         cannot revert (its down.sql is unavailable)",
+                        migrations_dir.display()
+                    ))
+                })?;
+
+            let started = std::time::Instant::now();
+            conn.revert_migration(migration.as_ref())
+                .map_err(|e| MigrationError::Migration(e.to_string()))?;
+            let duration = started.elapsed();
+
+            on_reverted(&RevertedMigration {
+                version: version.clone(),
+                name: migration.name().to_string(),
+                duration,
+            });
+            count += 1;
+        }
+        Ok(count)
+    })();
+
+    release_migration_lock(&mut conn);
+
+    result
+}
+
 /// Open a new Postgres connection and acquire the migration advisory lock,
 /// returning a [`MigrationLockGuard`] that releases it on drop.
 ///
@@ -683,6 +930,183 @@ mod tests {
     }
 
     // ── Existing tests ─────────────────────────────────────────────────────
+
+    // ── applied_user_migrations / revert_user_migrations ─────────────────────
+
+    #[test]
+    fn applied_user_migrations_fails_with_connection_error_on_bad_url() {
+        // Red-phase: function exists and returns Connection error on unreachable host.
+        let dir = std::path::Path::new("../examples/todo-app/migrations");
+        let result =
+            applied_user_migrations("postgres://invalid:invalid@0.0.0.0:1/invalid_db", dir);
+        assert!(result.is_err());
+        assert!(
+            matches!(result.unwrap_err(), MigrationError::Connection(_)),
+            "unreachable host must produce Connection error"
+        );
+    }
+
+    #[test]
+    fn revert_user_migrations_locked_fails_with_connection_error_on_bad_url() {
+        // The connection is established before the lock/plan, so an unreachable
+        // host produces a Connection error and the plan closure never runs.
+        let dir = std::path::Path::new("../examples/todo-app/migrations");
+        let mut planned = false;
+        let result = revert_user_migrations_locked(
+            "postgres://invalid:invalid@0.0.0.0:1/invalid_db",
+            dir,
+            None,
+            |_applied| {
+                planned = true;
+                Ok(Vec::new())
+            },
+            |_| {},
+        );
+        assert!(result.is_err());
+        assert!(
+            matches!(result.unwrap_err(), MigrationError::Connection(_)),
+            "unreachable host must produce Connection error"
+        );
+        assert!(
+            !planned,
+            "plan closure must not run when the connection fails"
+        );
+    }
+
+    #[test]
+    fn applied_user_migration_resolves_dir_field() {
+        let m = AppliedUserMigration {
+            version: "20260101000000".to_string(),
+            name: "20260101000000_create_posts".to_string(),
+            dir: Some(std::path::PathBuf::from(
+                "migrations/20260101000000_create_posts",
+            )),
+        };
+        let s = format!("{m:?}");
+        assert!(s.contains("create_posts"));
+        assert!(m.dir.is_some());
+    }
+
+    fn version_map(pairs: &[(&str, &str)]) -> std::collections::BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(v, n)| ((*v).to_string(), (*n).to_string()))
+            .collect()
+    }
+
+    fn version_set(versions: &[&str]) -> std::collections::BTreeSet<String> {
+        versions.iter().map(|v| (*v).to_string()).collect()
+    }
+
+    #[test]
+    fn classify_excludes_framework_versions_absent_locally() {
+        let applied = vec!["00000000000000".to_string(), "20260101000000".to_string()];
+        let by_version = version_map(&[("20260101000000", "20260101000000_create_posts")]);
+        let framework = version_set(&["00000000000000"]);
+
+        let user = classify_applied_user_migrations(
+            &applied,
+            &by_version,
+            &framework,
+            Path::new("migrations"),
+        );
+
+        // The framework version (absent locally) is dropped; the user migration remains.
+        assert_eq!(user.len(), 1);
+        assert_eq!(user[0].version, "20260101000000");
+        assert_eq!(
+            user[0].dir,
+            Some(Path::new("migrations").join("20260101000000_create_posts"))
+        );
+    }
+
+    #[test]
+    fn classify_keeps_user_migration_colliding_with_framework_version() {
+        // A local user migration whose version equals a framework shim version
+        // (the placeholder `00000000000000`) must be kept — local presence wins.
+        let applied = vec!["00000000000000".to_string()];
+        let by_version = version_map(&[("00000000000000", "00000000000000_create_todos")]);
+        let framework = version_set(&["00000000000000"]);
+
+        let user = classify_applied_user_migrations(
+            &applied,
+            &by_version,
+            &framework,
+            Path::new("migrations"),
+        );
+
+        assert_eq!(
+            user.len(),
+            1,
+            "user migration sharing a framework version must not be dropped"
+        );
+        assert_eq!(user[0].name, "00000000000000_create_todos");
+        assert!(user[0].dir.is_some());
+    }
+
+    #[test]
+    fn classify_surfaces_applied_migration_missing_locally() {
+        // Applied, not framework-owned, but absent from the local dir: keep it
+        // with dir = None so callers can refuse rather than silently drop it.
+        let applied = vec!["20260101000000".to_string()];
+        let by_version = version_map(&[]);
+        let framework = version_set(&["00000000000000"]);
+
+        let user = classify_applied_user_migrations(
+            &applied,
+            &by_version,
+            &framework,
+            Path::new("migrations"),
+        );
+
+        assert_eq!(user.len(), 1);
+        assert_eq!(user[0].version, "20260101000000");
+        assert!(
+            user[0].dir.is_none(),
+            "missing-locally migration must have dir = None"
+        );
+    }
+
+    #[test]
+    fn classify_sorts_ascending_and_resolves_hyphenated_dirs() {
+        // `by_version` keys are Diesel-normalised (hyphens stripped); the dir
+        // name can be the raw hyphenated form, and it must still resolve.
+        let applied = vec!["20260102000000".to_string(), "20260101000000".to_string()];
+        let by_version = version_map(&[
+            ("20260101000000", "2026-01-01-000000_create_posts"),
+            ("20260102000000", "20260102000000_add_body"),
+        ]);
+        let framework = version_set(&[]);
+
+        let user = classify_applied_user_migrations(
+            &applied,
+            &by_version,
+            &framework,
+            Path::new("migrations"),
+        );
+
+        assert_eq!(user.len(), 2);
+        // Ascending by version regardless of input order.
+        assert_eq!(user[0].version, "20260101000000");
+        assert_eq!(user[1].version, "20260102000000");
+        // Hyphenated dir resolved via the normalised version key.
+        assert_eq!(
+            user[0].dir,
+            Some(Path::new("migrations").join("2026-01-01-000000_create_posts"))
+        );
+    }
+
+    #[test]
+    fn reverted_migration_debug_includes_name() {
+        let r = RevertedMigration {
+            version: "20260101000000".to_string(),
+            name: "20260101000000_create_posts".to_string(),
+            duration: std::time::Duration::from_millis(42),
+        };
+        let s = format!("{r:?}");
+        assert!(s.contains("create_posts"));
+        assert!(s.contains("20260101000000"));
+    }
 
     #[test]
     fn migration_result_debug() {
