@@ -1150,6 +1150,18 @@ impl TestApp {
             }
         }
 
+        // Mirror production `AppBuilder` wiring: surface each configured shard's
+        // replica readiness as a `db:shard:<name>` indicator so `/ready`
+        // refreshes shard replica health (gating `fail_readiness` shards and
+        // marking healthy replicas ready for `ShardedDb` read routing).
+        #[cfg(feature = "db")]
+        if let Some(set) = state.shards() {
+            crate::sharding::register_shard_health_indicators(
+                set,
+                &state.health_indicator_registry,
+            );
+        }
+
         for initializer in self.state_initializers {
             initializer(&state);
         }

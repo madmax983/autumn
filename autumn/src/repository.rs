@@ -11,6 +11,15 @@
 //! the generated `on_primary()` method. When no replica is configured, all
 //! methods use the primary — nothing changes for single-pool apps.
 //!
+//! Sharded repositories built from a
+//! [`ShardedDb`](crate::sharding::ShardedDb) via the generated `from_shard`
+//! constructor get the same treatment **per shard**: reads route to the
+//! shard's replica when one is configured and healthy (honoring the shard's
+//! `replica_fallback` policy via
+//! [`Shard::read_route`](crate::sharding::Shard::read_route)), writes stay on
+//! the shard primary, and `primary_reads` / `on_primary()` pin reads back to
+//! the shard primary.
+//!
 //! [`RepositoryError`] surfaces typed errors that arise during repository
 //! operations — most notably optimistic-lock conflicts when two replicas
 //! write the same row concurrently.
