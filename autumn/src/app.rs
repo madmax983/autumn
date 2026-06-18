@@ -405,7 +405,9 @@ pub(crate) type MailDeliveryQueueFactory = Box<
 /// Created by [`AppBuilder::scoped`]. The routes are mounted under the
 /// prefix with the middleware applied only to this group.
 pub struct ScopedGroup {
+    /// The URL path prefix prepended to all routes in this group (e.g., `/api/v1`).
     pub prefix: String,
+    /// The collection of routes mounted under this prefix.
     pub routes: Vec<Route>,
     /// Registration origin: user application or a named plugin.
     pub source: crate::route_listing::RouteSource,
@@ -1408,6 +1410,36 @@ impl AppBuilder {
         self.extensions.get(&TypeId::of::<T>())?.downcast_ref::<T>()
     }
 
+    /// Registers a custom interceptor for outgoing mail.
+    ///
+    /// Interceptors wrap the mail delivery process and can mutate the mail struct,
+    /// drop messages, or run code before/after the actual delivery attempt.
+    ///
+    /// ## Examples
+    ///
+    /// ```rust
+    /// # use autumn_web::app::AppBuilder;
+    /// # use autumn_web::interceptor::MailInterceptor;
+    /// # use std::pin::Pin;
+    /// # use std::future::Future;
+    /// # use autumn_web::mail::{Mail, MailError};
+    /// struct NoOpMailInterceptor;
+    ///
+    /// impl MailInterceptor for NoOpMailInterceptor {
+    ///     fn intercept<'a>(
+    ///         &'a self,
+    ///         mail: &'a Mail,
+    ///         next: Pin<Box<dyn Future<Output = Result<(), MailError>> + Send + 'a>>,
+    ///     ) -> Pin<Box<dyn Future<Output = Result<(), MailError>> + Send + 'a>> {
+    ///         Box::pin(async move {
+    ///             // Intercept logic here
+    ///             next.await
+    ///         })
+    ///     }
+    /// }
+    ///
+    /// let app = autumn_web::app::app().with_mail_interceptor(NoOpMailInterceptor);
+    /// ```
     #[cfg(feature = "mail")]
     #[must_use]
     pub fn with_mail_interceptor(
@@ -1418,6 +1450,45 @@ impl AppBuilder {
         self
     }
 
+    /// Registers a custom interceptor for background jobs.
+    ///
+    /// Job interceptors can wrap both the enqueueing phase and the actual
+    /// execution phase, allowing you to add custom telemetry, routing logic,
+    /// or conditionally block execution.
+    ///
+    /// ## Examples
+    ///
+    /// ```rust
+    /// # use autumn_web::app::AppBuilder;
+    /// # use autumn_web::interceptor::JobInterceptor;
+    /// # use std::pin::Pin;
+    /// # use std::future::Future;
+    /// # use autumn_web::AutumnResult;
+    /// # use serde_json::Value;
+    /// struct NoOpJobInterceptor;
+    ///
+    /// impl JobInterceptor for NoOpJobInterceptor {
+    ///     fn intercept_enqueue<'a>(
+    ///         &'a self,
+    ///         name: &'a str,
+    ///         payload: &'a Value,
+    ///         next: Pin<Box<dyn Future<Output = AutumnResult<()>> + Send + 'a>>,
+    ///     ) -> Pin<Box<dyn Future<Output = AutumnResult<()>> + Send + 'a>> {
+    ///         Box::pin(async move { next.await })
+    ///     }
+    ///
+    ///     fn intercept_execute<'a>(
+    ///         &'a self,
+    ///         name: &'a str,
+    ///         payload: &'a Value,
+    ///         next: Pin<Box<dyn Future<Output = AutumnResult<()>> + Send + 'a>>,
+    ///     ) -> Pin<Box<dyn Future<Output = AutumnResult<()>> + Send + 'a>> {
+    ///         Box::pin(async move { next.await })
+    ///     }
+    /// }
+    ///
+    /// let app = autumn_web::app::app().with_job_interceptor(NoOpJobInterceptor);
+    /// ```
     #[must_use]
     pub fn with_job_interceptor(
         mut self,

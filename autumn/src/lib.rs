@@ -95,6 +95,7 @@ pub mod health;
 pub mod hooks;
 #[cfg(feature = "i18n")]
 pub mod i18n;
+/// Middleware and storage for HTTP idempotency keys, preventing duplicate side effects.
 pub mod idempotency;
 pub mod seo;
 /// Translation lookup macro with compile-time key validation.
@@ -106,6 +107,7 @@ pub use crate::i18n::t;
 #[cfg(feature = "inbound-mail")]
 pub mod inbound_mail;
 pub mod inspector;
+/// Intercept and modify outgoing infrastructure requests (mail, jobs, HTTP, db).
 pub mod interceptor;
 #[cfg(feature = "mail")]
 pub mod mail;
@@ -164,6 +166,7 @@ pub use http_client as http;
 pub mod flash;
 #[cfg(feature = "htmx")]
 pub(crate) mod htmx;
+/// Context-aware structured logging with JSON formatting and redaction.
 pub mod log;
 pub(crate) mod logging;
 /// Project typed JSON endpoints as Model Context Protocol (MCP) tools so AI
@@ -211,6 +214,7 @@ pub mod static_gen;
 pub mod step_up;
 #[cfg(feature = "storage")]
 pub mod storage;
+/// Task-local multi-tenancy extractors and context tracking.
 pub mod tenancy;
 pub mod time;
 pub mod time_zone;
