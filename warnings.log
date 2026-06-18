@@ -1,0 +1,1218 @@
+warning: missing documentation for a module
+  --> autumn/src/lib.rs:97:1
+   |
+97 | pub mod idempotency;
+   | ^^^^^^^^^^^^^^^^^^^
+   |
+   = note: requested on the command line with `-W missing-docs`
+
+warning: missing documentation for a module
+   --> autumn/src/lib.rs:108:1
+    |
+108 | pub mod interceptor;
+    | ^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a module
+   --> autumn/src/lib.rs:163:1
+    |
+163 | pub mod log;
+    | ^^^^^^^^^^^
+
+warning: missing documentation for a module
+   --> autumn/src/lib.rs:205:1
+    |
+205 | pub mod tenancy;
+    | ^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn/src/app.rs:368:5
+    |
+368 |     pub prefix: String,
+    |     ^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn/src/app.rs:369:5
+    |
+369 |     pub routes: Vec<Route>,
+    |     ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a method
+    --> autumn/src/app.rs:1251:5
+     |
+1251 | /     pub fn with_mail_interceptor(
+1252 | |         mut self,
+1253 | |         interceptor: impl crate::interceptor::MailInterceptor,
+1254 | |     ) -> Self {
+     | |_____________^
+
+warning: missing documentation for a method
+    --> autumn/src/app.rs:1260:5
+     |
+1260 | /     pub fn with_job_interceptor(
+1261 | |         mut self,
+1262 | |         interceptor: impl crate::interceptor::JobInterceptor,
+1263 | |     ) -> Self {
+     | |_____________^
+
+warning: missing documentation for a method
+    --> autumn/src/app.rs:1270:5
+     |
+1270 | /     pub fn with_db_interceptor(
+1271 | |         mut self,
+1272 | |         interceptor: impl crate::interceptor::DbConnectionInterceptor,
+1273 | |     ) -> Self {
+     | |_____________^
+
+warning: missing documentation for a method
+    --> autumn/src/app.rs:1280:5
+     |
+1280 | /     pub fn with_channels_interceptor(
+1281 | |         mut self,
+1282 | |         interceptor: impl crate::interceptor::ChannelsInterceptor,
+1283 | |     ) -> Self {
+     | |_____________^
+
+warning: missing documentation for a method
+    --> autumn/src/app.rs:1290:5
+     |
+1290 | /     pub fn with_http_interceptor(
+1291 | |         mut self,
+1292 | |         interceptor: impl crate::interceptor::HttpInterceptor,
+1293 | |     ) -> Self {
+     | |_____________^
+
+warning: missing documentation for a struct
+    --> autumn/src/auth.rs:1291:1
+     |
+1291 | pub struct HttpClient {
+     | ^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct
+    --> autumn/src/auth.rs:1296:1
+     |
+1296 | pub struct HttpRequestBuilder {
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for an associated function
+    --> autumn/src/auth.rs:1311:5
+     |
+1311 |     pub const fn new(inner: reqwest::Client) -> Self {
+     |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a method
+    --> autumn/src/auth.rs:1316:5
+     |
+1316 |     pub fn post(&self, url: &str) -> HttpRequestBuilder {
+     |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a method
+    --> autumn/src/auth.rs:1324:5
+     |
+1324 |     pub fn get(&self, url: &str) -> HttpRequestBuilder {
+     |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a method
+    --> autumn/src/auth.rs:1342:5
+     |
+1342 | /     pub fn header<K, V>(mut self, key: K, value: V) -> Self
+1343 | |     where
+1344 | |         reqwest::header::HeaderName: TryFrom<K>,
+1345 | |         <reqwest::header::HeaderName as TryFrom<K>>::Error: Into<http::Error>,
+1346 | |         reqwest::header::HeaderValue: TryFrom<V>,
+1347 | |         <reqwest::header::HeaderValue as TryFrom<V>>::Error: Into<http::Error>,
+     | |_______________________________________________________________________________^
+
+warning: missing documentation for a method
+    --> autumn/src/auth.rs:1354:5
+     |
+1354 | /     pub fn bearer_auth<T>(mut self, token: T) -> Self
+1355 | |     where
+1356 | |         T: std::fmt::Display,
+     | |_____________________________^
+
+warning: missing documentation for a method
+    --> autumn/src/auth.rs:1363:5
+     |
+1363 |     pub fn form<T: serde::Serialize + ?Sized>(mut self, form: &T) -> Self {
+     |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct
+   --> autumn/src/channels.rs:807:1
+    |
+807 | pub struct InterceptedChannelsBackend {
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for an associated function
+   --> autumn/src/channels.rs:815:5
+    |
+815 | /     pub fn new(
+816 | |         inner: Arc<dyn ChannelsBackend>,
+817 | |         interceptors: Vec<Arc<dyn crate::interceptor::ChannelsInterce...
+818 | |     ) -> Self {
+    | |_____________^
+
+warning: missing documentation for a variant
+    --> autumn/src/config.rs:1341:5
+     |
+1341 |     Memory,
+     |     ^^^^^^
+
+warning: missing documentation for a variant
+    --> autumn/src/config.rs:1342:5
+     |
+1342 |     Redis,
+     |     ^^^^^
+
+warning: missing documentation for a struct
+    --> autumn/src/config.rs:2843:1
+     |
+2843 | pub struct ServerConfig {
+     | ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a function
+   --> autumn/src/db.rs:327:1
+    |
+327 | pub fn scrub_sql(sql: &str) -> String {
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct
+   --> autumn/src/db.rs:746:1
+    |
+746 | pub struct Db {
+    | ^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn/src/idempotency.rs:202:5
+    |
+202 |     pub status: u16,
+    |     ^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn/src/idempotency.rs:203:5
+    |
+203 |     pub headers: Vec<(String, Vec<u8>)>,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn/src/idempotency.rs:204:5
+    |
+204 |     pub body: Vec<u8>,
+    |     ^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn/src/idempotency.rs:205:5
+    |
+205 |     pub metadata: Vec<(String, Vec<u8>)>,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a method
+   --> autumn/src/idempotency.rs:288:5
+    |
+288 |     pub fn key(&self) -> &str {
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a method
+   --> autumn/src/idempotency.rs:293:5
+    |
+293 |     pub fn scoped_key(&self) -> &str {
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn/src/idempotency.rs:321:5
+    |
+321 |     pub record: IdempotencyRecord,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn/src/idempotency.rs:322:5
+    |
+322 |     pub body_hash: Vec<u8>,
+    |     ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn/src/idempotency.rs:323:5
+    |
+323 |     pub expires_at: Instant,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for an associated function
+   --> autumn/src/idempotency.rs:338:5
+    |
+338 |     pub fn backend(message: impl Into<String>) -> Self {
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for an associated function
+   --> autumn/src/idempotency.rs:449:5
+    |
+449 |     pub fn new(default_ttl: Duration) -> Self {
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct
+   --> autumn/src/idempotency.rs:873:1
+    |
+873 | pub struct IdempotencyReplayService<S> {
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for an associated function
+   --> autumn/src/idempotency.rs:938:5
+    |
+938 |     pub fn new(store: Arc<dyn IdempotencyStore>) -> Self {
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a method
+   --> autumn/src/idempotency.rs:951:5
+    |
+951 |     pub const fn with_ttl(mut self, ttl: Duration) -> Self {
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a method
+   --> autumn/src/idempotency.rs:957:5
+    |
+957 |     pub const fn with_in_flight_ttl(mut self, ttl: Duration) -> Self {
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a method
+   --> autumn/src/idempotency.rs:963:5
+    |
+963 |     pub const fn replay_through_inner(mut self) -> Self {
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a method
+   --> autumn/src/idempotency.rs:970:5
+    |
+970 |     pub const fn fail_closed_on_replay(mut self) -> Self {
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a method
+   --> autumn/src/idempotency.rs:977:5
+    |
+977 |     pub fn with_metrics(mut self, metrics: crate::middleware::MetricsCollector) -> Self {
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a variant
+   --> autumn/src/seo.rs:136:5
+    |
+136 |     Always,
+    |     ^^^^^^
+
+warning: missing documentation for a variant
+   --> autumn/src/seo.rs:137:5
+    |
+137 |     Hourly,
+    |     ^^^^^^
+
+warning: missing documentation for a variant
+   --> autumn/src/seo.rs:138:5
+    |
+138 |     Daily,
+    |     ^^^^^
+
+warning: missing documentation for a variant
+   --> autumn/src/seo.rs:139:5
+    |
+139 |     Weekly,
+    |     ^^^^^^
+
+warning: missing documentation for a variant
+   --> autumn/src/seo.rs:140:5
+    |
+140 |     Monthly,
+    |     ^^^^^^^
+
+warning: missing documentation for a variant
+   --> autumn/src/seo.rs:141:5
+    |
+141 |     Yearly,
+    |     ^^^^^^
+
+warning: missing documentation for a variant
+   --> autumn/src/seo.rs:142:5
+    |
+142 |     Never,
+    |     ^^^^^
+
+warning: missing documentation for a trait
+ --> autumn/src/interceptor.rs:5:1
+  |
+5 | pub trait MailInterceptor: Send + Sync + 'static {
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a method
+  --> autumn/src/interceptor.rs:6:5
+   |
+ 6 | /     fn intercept<'a>(
+ 7 | |         &'a self,
+ 8 | |         mail: &'a crate::mail::Mail,
+ 9 | |         next: std::pin::Pin<
+...  |
+13 | |         Box<dyn std::future::Future<Output = Result<(), crate::mail::M...
+14 | |     >;
+   | |______^
+
+warning: missing documentation for a trait
+  --> autumn/src/interceptor.rs:17:1
+   |
+17 | pub trait JobInterceptor: Send + Sync + 'static {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a method
+  --> autumn/src/interceptor.rs:18:5
+   |
+18 | /     fn intercept_enqueue<'a>(
+19 | |         &'a self,
+20 | |         name: &'a str,
+21 | |         payload: &'a serde_json::Value,
+...  |
+24 | |         >,
+25 | |     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = crate::AutumnResult<()>> + Send + 'a>>;
+   | |___________________________________________________________________________________________________^
+
+warning: missing documentation for a method
+  --> autumn/src/interceptor.rs:27:5
+   |
+27 | /     fn intercept_execute<'a>(
+28 | |         &'a self,
+29 | |         name: &'a str,
+30 | |         payload: &'a serde_json::Value,
+...  |
+33 | |         >,
+34 | |     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = crate::AutumnResult<()>> + Send + 'a>>;
+   | |___________________________________________________________________________________________________^
+
+warning: missing documentation for a struct
+  --> autumn/src/interceptor.rs:38:1
+   |
+38 | pub struct DbCheckoutContext {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn/src/interceptor.rs:39:5
+   |
+39 |     pub pool_name: String,
+   |     ^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a trait
+  --> autumn/src/interceptor.rs:43:1
+   |
+43 | pub trait DbConnectionInterceptor: Send + Sync + 'static {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a method
+  --> autumn/src/interceptor.rs:44:5
+   |
+44 | /     fn intercept_checkout<'a>(
+45 | |         &'a self,
+46 | |         ctx: DbCheckoutContext,
+47 | |         next: std::pin::Pin<
+...  |
+61 | |         >,
+62 | |     >;
+   | |______^
+
+warning: missing documentation for a trait
+  --> autumn/src/interceptor.rs:71:1
+   |
+71 | pub trait ChannelsInterceptor: Send + Sync + 'static {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a type alias
+  --> autumn/src/interceptor.rs:88:1
+   |
+88 | pub type HttpInterceptorFuture<'a> = std::pin::Pin<
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a trait
+  --> autumn/src/interceptor.rs:93:1
+   |
+93 | pub trait HttpInterceptor: Send + Sync + 'static {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a method
+  --> autumn/src/interceptor.rs:94:5
+   |
+94 | /     fn intercept<'a>(
+95 | |         &'a self,
+96 | |         req: reqwest::Request,
+97 | |         next: &'a dyn Fn(reqwest::Request) -> HttpInterceptorFuture<'a>,
+98 | |     ) -> HttpInterceptorFuture<'a>;
+   | |___________________________________^
+
+warning: missing documentation for a static
+   --> autumn/src/interceptor.rs:102:1
+    |
+102 | / tokio::task_local! {
+103 | |     pub static ACTIVE_HTTP_INTERCEPTORS: Vec<Arc<dyn HttpInterceptor>>;
+104 | | }
+    | |_^
+    |
+    = note: this warning originates in the macro `$crate::__task_local_inner` which comes from the expansion of the macro `tokio::task_local` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: missing documentation for a struct
+  --> autumn/src/system_info.rs:11:1
+   |
+11 | pub struct SystemInfo {
+   | ^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn/src/system_info.rs:12:5
+   |
+12 |     pub os: String,
+   |     ^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn/src/system_info.rs:13:5
+   |
+13 |     pub arch: String,
+   |     ^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn/src/system_info.rs:14:5
+   |
+14 |     pub available_parallelism: usize,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a method
+   --> autumn/src/repository.rs:135:5
+    |
+135 |     fn set_tenant_id(&mut self, tenant_id: String);
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for an associated constant
+   --> autumn/src/repository.rs:140:5
+    |
+140 |     const IS_SEARCHABLE: bool;
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for an associated constant
+   --> autumn/src/repository.rs:141:5
+    |
+141 |     const SEARCH_LANGUAGE: &'static str;
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for an associated constant
+   --> autumn/src/repository.rs:142:5
+    |
+142 |     const SEARCH_FIELDS: &'static [(&'static str, char)];
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+    --> autumn/src/router.rs:4736:5
+     |
+4736 |     pub version: String,
+     |     ^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+    --> autumn/src/router.rs:4737:5
+     |
+4737 |     pub sunset_opt_out: bool,
+     |     ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+    --> autumn/src/router.rs:4738:5
+     |
+4738 |     pub secured: bool,
+     |     ^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+    --> autumn/src/router.rs:4739:5
+     |
+4739 |     pub required_roles: &'static [&'static str],
+     |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+    --> autumn/src/router.rs:4740:5
+     |
+4740 |     pub has_policy: bool,
+     |     ^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a module
+ --> autumn/src/log/mod.rs:3:1
+  |
+3 | pub mod filter;
+  | ^^^^^^^^^^^^^^
+
+warning: missing documentation for a constant
+ --> autumn/src/log/filter.rs:4:1
+  |
+4 | pub const FILTERED_PLACEHOLDER: &str = "[FILTERED]";
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a constant
+ --> autumn/src/log/filter.rs:6:1
+  |
+6 | pub const DEFAULT_FILTER_KEYS: &[&str] = &[
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct
+  --> autumn/src/log/filter.rs:24:1
+   |
+24 | pub struct ParameterFilter {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for an associated function
+  --> autumn/src/log/filter.rs:37:5
+   |
+37 |     pub fn new(additional: &[String], opt_out_defaults: &[String]) -> Self {
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a method
+  --> autumn/src/log/filter.rs:70:5
+   |
+70 |     pub fn scrub_json(&self, value: &Value) -> Value {
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a method
+  --> autumn/src/log/filter.rs:91:5
+   |
+91 |     pub fn matches_key(&self, key: &str) -> bool {
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a function
+   --> autumn/src/log/filter.rs:114:1
+    |
+114 | pub fn normalized_opt_out_defaults(opt_out_defaults: &[String]) -> Vec<String> {
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a function
+   --> autumn/src/log/filter.rs:132:1
+    |
+132 | pub fn scrub(value: &Value) -> Value {
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a variant
+   --> autumn/src/middleware/maintenance.rs:226:1
+    |
+226 | / pin_project! {
+227 | |     /// Future returned by [`MaintenanceService`].
+228 | |     ///
+229 | |     /// Either resolves immediately with a 503 response (short-circui...
+...   |
+236 | | }
+    | |_^
+    |
+    = note: this warning originates in the macro `$crate::__pin_project_reconstruct` which comes from the expansion of the macro `pin_project` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: missing documentation for a struct field
+   --> autumn/src/middleware/maintenance.rs:226:1
+    |
+226 | / pin_project! {
+227 | |     /// Future returned by [`MaintenanceService`].
+228 | |     ///
+229 | |     /// Either resolves immediately with a 503 response (short-circui...
+...   |
+236 | | }
+    | |_^
+    |
+    = note: this warning originates in the macro `$crate::__pin_project_reconstruct` which comes from the expansion of the macro `pin_project` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: missing documentation for a function
+   --> autumn/src/openapi.rs:542:1
+    |
+542 | / pub fn generate_spec_at(
+543 | |     config: &OpenApiConfig,
+544 | |     routes: &[&ApiDoc],
+545 | |     now: chrono::DateTime<chrono::Utc>,
+546 | | ) -> OpenApiSpec {
+    | |________________^
+
+warning: missing documentation for a module
+   --> autumn/src/security/mod.rs:144:1
+    |
+144 | pub mod proxy;
+    | ^^^^^^^^^^^^^
+
+warning: missing documentation for a struct
+ --> autumn/src/security/proxy.rs:6:1
+  |
+6 | pub struct TrustedProxy {
+  | ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+ --> autumn/src/security/proxy.rs:7:5
+  |
+7 |     pub network: IpAddr,
+  |     ^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+ --> autumn/src/security/proxy.rs:8:5
+  |
+8 |     pub prefix_len: u8,
+  |     ^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for an associated function
+  --> autumn/src/security/proxy.rs:13:5
+   |
+13 |     pub fn parse(value: &str) -> Option<Self> {
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a method
+  --> autumn/src/security/proxy.rs:44:5
+   |
+44 |     pub fn contains(&self, ip: IpAddr) -> bool {
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct
+   --> autumn/src/security/rate_limit.rs:754:1
+    |
+754 | pub struct RateLimitLayer {
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn/src/storage/variant.rs:146:22
+    |
+146 |     SourceTooLarge { byte_size: u64, max_bytes: u64 },
+    |                      ^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn/src/storage/variant.rs:146:38
+    |
+146 |     SourceTooLarge { byte_size: u64, max_bytes: u64 },
+    |                                      ^^^^^^^^^^^^^^
+
+warning: missing documentation for a static
+  --> autumn/src/tenancy.rs:14:1
+   |
+14 | / tokio::task_local! {
+15 | |     pub static CURRENT_TENANT: Option<String>;
+16 | | }
+   | |_^
+   |
+   = note: this warning originates in the macro `$crate::__task_local_inner` which comes from the expansion of the macro `tokio::task_local` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: missing documentation for a struct
+  --> autumn/src/tenancy.rs:20:1
+   |
+20 | pub struct Tenant(pub String);
+   | ^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a function
+  --> autumn/src/tenancy.rs:40:1
+   |
+40 | / pub async fn with_tenant<F, R>(tenant_id: String, future: F) -> R
+41 | | where
+42 | |     F: Future<Output = R>,
+   | |__________________________^
+
+warning: missing documentation for a function
+  --> autumn/src/tenancy.rs:49:1
+   |
+49 | / pub async fn extract_tenant_from_parts(
+50 | |     parts: &mut axum::http::request::Parts,
+51 | |     config: &crate::config::AutumnConfig,
+52 | | ) -> Result<String, crate::AutumnError> {
+   | |_______________________________________^
+
+warning: missing documentation for a function
+   --> autumn/src/tenancy.rs:300:1
+    |
+300 | / pub async fn tenancy_middleware(
+301 | |     State(state): State<crate::AppState>,
+302 | |     request: Request<axum::body::Body>,
+303 | |     next: Next,
+304 | | ) -> Response {
+    | |_____________^
+
+warning: missing documentation for a struct field
+   --> autumn/src/tenancy.rs:338:1
+    |
+338 | / pin_project! {
+339 | |     /// A response body wrapper that re-establishes the tenant context
+340 | |     /// for each poll of the inner body, so lazy/streaming bodies can
+341 | |     /// access tenant-scoped repositories during their polling phase.
+...   |
+347 | | }
+    | |_^
+    |
+    = note: this warning originates in the macro `$crate::__pin_project_reconstruct` which comes from the expansion of the macro `pin_project` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: missing documentation for an associated type
+   --> autumn/src/tenancy.rs:380:5
+    |
+380 |     type Values;
+    |     ^^^^^^^^^^^
+
+warning: missing documentation for a method
+   --> autumn/src/tenancy.rs:381:5
+    |
+381 |     fn tenant_values(self, tenant_id: &'a str) -> Self::Values;
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for an associated type
+   --> autumn/src/tenancy.rs:396:5
+    |
+396 |     type Column: ::diesel::Expression;
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for an associated function
+   --> autumn/src/tenancy.rs:397:5
+    |
+397 |     fn column() -> Self::Column;
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn/src/tenancy.rs:403:5
+    |
+403 |     pub inner: T,
+    |     ^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn/src/tenancy.rs:404:5
+    |
+404 |     pub tenant_id: &'a str,
+    |     ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn/src/tenancy.rs:405:5
+    |
+405 |     pub _marker: std::marker::PhantomData<Table>,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for an associated type
+   --> autumn/src/tenancy.rs:411:5
+    |
+411 |     type Values;
+    |     ^^^^^^^^^^^
+
+warning: missing documentation for a method
+   --> autumn/src/tenancy.rs:412:5
+    |
+412 |     fn get_values(self) -> Self::Values;
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a module
+    --> autumn/src/experiments.rs:1508:1
+     |
+1508 | pub mod pg {
+     | ^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn/src/job.rs:127:5
+    |
+127 |     pub interceptor: Option<Arc<dyn crate::interceptor::JobInterceptor>>,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a function
+    --> autumn/src/job.rs:1250:1
+     |
+1250 | pub fn global_job_runtime_test_lock() -> &'static tokio::sync::Mutex<()> {
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a function
+    --> autumn/src/job.rs:1439:1
+     |
+1439 | pub fn clear_global_job_client() {
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn/src/runtime_config.rs:277:9
+    |
+277 |         min: Option<i64>,
+    |         ^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn/src/runtime_config.rs:279:9
+    |
+279 |         max: Option<i64>,
+    |         ^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn/src/runtime_config.rs:284:9
+    |
+284 |         min: Option<f64>,
+    |         ^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn/src/runtime_config.rs:286:9
+    |
+286 |         max: Option<f64>,
+    |         ^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn/src/runtime_config.rs:551:5
+    |
+551 |     pub name: String,
+    |     ^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn/src/runtime_config.rs:552:5
+    |
+552 |     pub value_type: ConfigValueType,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn/src/runtime_config.rs:553:5
+    |
+553 |     pub default: ConfigValue,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn/src/runtime_config.rs:554:5
+    |
+554 |     pub description: Option<String>,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn/src/runtime_config.rs:555:5
+    |
+555 |     pub validators: Vec<ConfigValidator>,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn/src/runtime_config.rs:635:9
+    |
+635 |         key: String,
+    |         ^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn/src/runtime_config.rs:636:9
+    |
+636 |         declared_type: ConfigValueType,
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn/src/runtime_config.rs:637:9
+    |
+637 |         default_type: ConfigValueType,
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn/src/runtime_config.rs:641:22
+    |
+641 |     InvalidDefault { key: String, reason: String },
+    |                      ^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn/src/runtime_config.rs:641:35
+    |
+641 |     InvalidDefault { key: String, reason: String },
+    |                                   ^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+    --> autumn/src/runtime_config.rs:1330:20
+     |
+1330 |     TypeMismatch { key: String, reason: String },
+     |                    ^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+    --> autumn/src/runtime_config.rs:1330:33
+     |
+1330 |     TypeMismatch { key: String, reason: String },
+     |                                 ^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+    --> autumn/src/runtime_config.rs:1334:24
+     |
+1334 |     ValidationFailed { key: String, reason: String },
+     |                        ^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+    --> autumn/src/runtime_config.rs:1334:37
+     |
+1334 |     ValidationFailed { key: String, reason: String },
+     |                                     ^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+    --> autumn/src/runtime_config.rs:1346:5
+     |
+1346 |     pub name: String,
+     |     ^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+    --> autumn/src/runtime_config.rs:1347:5
+     |
+1347 |     pub value_type: ConfigValueType,
+     |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+    --> autumn/src/runtime_config.rs:1348:5
+     |
+1348 |     pub current: ConfigValue,
+     |     ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+    --> autumn/src/runtime_config.rs:1349:5
+     |
+1349 |     pub default: ConfigValue,
+     |     ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+    --> autumn/src/runtime_config.rs:1350:5
+     |
+1350 |     pub is_overridden: bool,
+     |     ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+    --> autumn/src/runtime_config.rs:1351:5
+     |
+1351 |     pub description: Option<String>,
+     |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn/src/data/csv.rs:181:18
+    |
+181 |     FieldError { column: String, message: String },
+    |                  ^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+   --> autumn/src/data/csv.rs:181:34
+    |
+181 |     FieldError { column: String, message: String },
+    |                                  ^^^^^^^^^^^^^^^
+
+warning: missing documentation for a static
+    --> autumn/src/webhook.rs:1025:1
+     |
+1025 | / tokio::task_local! {
+1026 | |     pub static WEBHOOK_REPLAY_KEY: ReplayStoreCell;
+1027 | | }
+     | |_^
+     |
+     = note: this warning originates in the macro `$crate::__task_local_inner` which comes from the expansion of the macro `tokio::task_local` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: missing documentation for a variant
+  --> autumn/src/webhook_outbound.rs:25:5
+   |
+25 |     Active,
+   |     ^^^^^^
+
+warning: missing documentation for a variant
+  --> autumn/src/webhook_outbound.rs:26:5
+   |
+26 |     Disabled,
+   |     ^^^^^^^^
+
+warning: missing documentation for a variant
+  --> autumn/src/webhook_outbound.rs:27:5
+   |
+27 |     Failed,
+   |     ^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn/src/webhook_outbound.rs:51:5
+   |
+51 |     pub id: String,
+   |     ^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn/src/webhook_outbound.rs:52:5
+   |
+52 |     pub target_url: String,
+   |     ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn/src/webhook_outbound.rs:53:5
+   |
+53 |     pub event_topics: Vec<String>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn/src/webhook_outbound.rs:54:5
+   |
+54 |     pub secret: String,
+   |     ^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn/src/webhook_outbound.rs:55:5
+   |
+55 |     pub status: WebhookSubscriptionStatus,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn/src/webhook_outbound.rs:56:5
+   |
+56 |     pub consecutive_failures: u32,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn/src/webhook_outbound.rs:62:5
+   |
+62 |     pub id: String,
+   |     ^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn/src/webhook_outbound.rs:63:5
+   |
+63 |     pub subscription_id: String,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn/src/webhook_outbound.rs:64:5
+   |
+64 |     pub topic: String,
+   |     ^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn/src/webhook_outbound.rs:65:5
+   |
+65 |     pub payload: String,
+   |     ^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn/src/webhook_outbound.rs:66:5
+   |
+66 |     pub request_headers: HashMap<String, String>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn/src/webhook_outbound.rs:67:5
+   |
+67 |     pub response_status: Option<u16>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn/src/webhook_outbound.rs:68:5
+   |
+68 |     pub response_body: Option<String>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn/src/webhook_outbound.rs:69:5
+   |
+69 |     pub elapsed_ms: u64,
+   |     ^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn/src/webhook_outbound.rs:70:5
+   |
+70 |     pub attempt: u32,
+   |     ^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn/src/webhook_outbound.rs:71:5
+   |
+71 |     pub max_attempts: u32,
+   |     ^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn/src/webhook_outbound.rs:72:5
+   |
+72 |     pub is_dlq: bool,
+   |     ^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn/src/webhook_outbound.rs:73:5
+   |
+73 |     pub last_error: Option<String>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a struct field
+  --> autumn/src/webhook_outbound.rs:74:5
+   |
+74 |     pub timestamp: DateTime<Utc>,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: missing documentation for a method
+   --> autumn/src/test.rs:697:5
+    |
+697 | /     pub fn with_mail_interceptor(
+698 | |         mut self,
+699 | |         interceptor: impl crate::interceptor::MailInterceptor,
+700 | |     ) -> Self {
+    | |_____________^
+
+warning: missing documentation for a method
+   --> autumn/src/test.rs:706:5
+    |
+706 | /     pub fn with_job_interceptor(
+707 | |         mut self,
+708 | |         interceptor: impl crate::interceptor::JobInterceptor,
+709 | |     ) -> Self {
+    | |_____________^
+
+warning: missing documentation for a method
+   --> autumn/src/test.rs:716:5
+    |
+716 | /     pub fn with_db_interceptor(
+717 | |         mut self,
+718 | |         interceptor: impl crate::interceptor::DbConnectionInterceptor,
+719 | |     ) -> Self {
+    | |_____________^
+
+warning: missing documentation for a method
+   --> autumn/src/test.rs:726:5
+    |
+726 | /     pub fn with_channels_interceptor(
+727 | |         mut self,
+728 | |         interceptor: impl crate::interceptor::ChannelsInterceptor,
+729 | |     ) -> Self {
+    | |_____________^
+
+warning: missing documentation for a method
+   --> autumn/src/test.rs:736:5
+    |
+736 | /     pub fn with_http_interceptor(
+737 | |         mut self,
+738 | |         interceptor: impl crate::interceptor::HttpInterceptor,
+739 | |     ) -> Self {
+    | |_____________^
+
+warning: unresolved link to `ErrorEvent`
+  |
+  = note: the link appears in this line:
+
+          turned into a structured [`ErrorEvent`] and delivered to every registered
+                                    ^^^^^^^^^^^^
+  = note: no item named `ErrorEvent` in scope
+  = help: to escape `[` and `]` characters, add '\' before them like `\[` or `\]`
+  = note: `#[warn(rustdoc::broken_intra_doc_links)]` on by default
+
+warning: unresolved link to `ErrorReporter`
+  |
+  = note: the link appears in this line:
+
+          [`ErrorReporter`]. This is the "where do my errors go?" seam: ship events to
+           ^^^^^^^^^^^^^^^
+  = note: no item named `ErrorReporter` in scope
+  = help: to escape `[` and `]` characters, add '\' before them like `\[` or `\]`
+
+warning: unresolved link to `LogReporter`
+  |
+  = note: the link appears in this line:
+
+          [`Cache`](crate::cache::Cache)): a built-in [`LogReporter`] (which uses
+                                                       ^^^^^^^^^^^^^
+  = note: no item named `LogReporter` in scope
+  = help: to escape `[` and `]` characters, add '\' before them like `\[` or `\]`
+
+warning: unresolved link to `ReportingLayer`
+  |
+  = note: the link appears in this line:
+
+          - **Handler panics.** A [`ReportingLayer`] catches unwinding panics at the
+                                   ^^^^^^^^^^^^^^^^
+  = note: no item named `ReportingLayer` in scope
+  = help: to escape `[` and `]` characters, add '\' before them like `\[` or `\]`
+
+warning: unresolved link to `ErrorEvent`
+  |
+  = note: the link appears in this line:
+
+            `500` Problem Details response, and reports an [`ErrorEvent`] carrying the
+                                                            ^^^^^^^^^^^^
+  = note: no item named `ErrorEvent` in scope
+  = help: to escape `[` and `]` characters, add '\' before them like `\[` or `\]`
+
+warning: unresolved link to `AppState::for_test`
+   --> autumn/src/system_test.rs:296:11
+    |
+296 |     /// [`AppState::for_test()`].
+    |           ^^^^^^^^^^^^^^^^^^^^ no item named `AppState` in scope
+
+warning: `inbound_mail` is both a module and an attribute macro
+   --> autumn/src/lib.rs:415:11
+    |
+415 | /// See [`inbound_mail`] for usage documentation.
+    |           ^^^^^^^^^^^^ ambiguous link
+    |
+help: to link to the module, prefix with `mod@`
+    |
+415 | /// See [`mod@inbound_mail`] for usage documentation.
+    |           ++++
+help: to link to the attribute macro, prefix with `macro@`
+    |
+415 | /// See [`macro@inbound_mail`] for usage documentation.
+    |           ++++++
+
+warning: `autumn-web` (lib doc) generated 179 warnings
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.50s
+   Generated /app/target/doc/autumn_web/index.html
