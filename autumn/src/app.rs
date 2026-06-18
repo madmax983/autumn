@@ -3737,6 +3737,12 @@ impl AppBuilder {
         crate::route_listing::append_dev_reload_routes(&mut infos);
         crate::route_listing::sort_route_infos(&mut infos);
 
+        if std::env::var("AUTUMN_ROUTES_FORMAT").ok().as_deref() == Some("markdown") {
+            let md = crate::route_listing::export_markdown(&infos);
+            println!("{md}");
+            std::process::exit(0);
+        }
+
         let json = serde_json::to_string_pretty(&infos).unwrap_or_else(|e| {
             eprintln!("Failed to serialize route listing: {e}");
             std::process::exit(1);
