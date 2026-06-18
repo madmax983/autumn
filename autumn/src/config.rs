@@ -3292,6 +3292,25 @@ pub struct DatabaseConfig {
     /// while tenant data is routed across the shards. See [`ShardConfig`].
     #[serde(default)]
     pub shards: Vec<ShardConfig>,
+
+    /// Emit a startup warning when the aggregate maximum connection count
+    /// across the control topology and every shard pool reaches this value.
+    /// Default: `100`.
+    ///
+    /// Pool sizes multiply across shards: an N-shard fleet with a pool size
+    /// of 20 opens up to `20 * N` connections, which can exhaust Postgres's
+    /// `max_connections` (default 100) long before the app looks busy. This
+    /// threshold surfaces that footgun at boot. Set to `0` to disable.
+    #[serde(default = "default_max_connections_warn_threshold")]
+    pub max_connections_warn_threshold: usize,
+}
+
+/// Decide whether the aggregate connection count warrants a startup warning.
+///
+/// Pure so the boundary condition is unit-testable without booting an app.
+/// A `threshold` of `0` disables the warning entirely.
+pub(crate) fn should_warn_total_connections(total: usize, threshold: usize) -> bool {
+    threshold != 0 && total >= threshold
 }
 
 /// Render a sorted slot list as compact `A-B` ranges for error messages
@@ -4036,6 +4055,10 @@ const fn default_pool_size() -> usize {
     10
 }
 
+const fn default_max_connections_warn_threshold() -> usize {
+    100
+}
+
 const fn default_connect_timeout() -> u64 {
     5
 }
@@ -4116,6 +4139,7 @@ impl Default for DatabaseConfig {
             statement_timeout: None,
             slow_query_threshold: default_slow_query_threshold(),
             shards: Vec::new(),
+            max_connections_warn_threshold: default_max_connections_warn_threshold(),
         }
     }
 }
@@ -4486,6 +4510,26 @@ impl AutumnConfig {
 mod tests {
 
     use super::*;
+
+    #[test]
+    fn should_warn_total_connections_at_and_above_threshold() {
+        // At or above the threshold warns; below does not.
+        assert!(should_warn_total_connections(100, 100));
+        assert!(should_warn_total_connections(250, 100));
+        assert!(!should_warn_total_connections(99, 100));
+    }
+
+    #[test]
+    fn should_warn_total_connections_zero_threshold_disables() {
+        // A zero threshold silences the warning regardless of the total.
+        assert!(!should_warn_total_connections(0, 0));
+        assert!(!should_warn_total_connections(10_000, 0));
+    }
+
+    #[test]
+    fn database_config_default_warn_threshold_is_100() {
+        assert_eq!(DatabaseConfig::default().max_connections_warn_threshold, 100);
+    }
 
     /// Mock loader for tests — returns a hand-built config without touching disk.
     struct MockConfigLoader {
