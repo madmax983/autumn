@@ -21,7 +21,9 @@ use crate::time::{ClockSource, SystemClock};
 pub struct GlobalCacheEntry(pub Arc<dyn Cache>);
 
 use crate::actuator;
-use crate::authorization::{ForbiddenResponse, Policy, PolicyRegistry, Scope};
+use crate::authorization::{
+    ForbiddenResponse, Policy, PolicyRegistry, ProvideAuthorizationState, Scope,
+};
 #[cfg(feature = "ws")]
 use crate::channels::Channels;
 #[cfg(feature = "db")]
@@ -621,6 +623,28 @@ impl AppState {
     #[must_use]
     pub fn for_test() -> Self {
         Self::detached()
+    }
+}
+
+impl ProvideAuthorizationState for AppState {
+    fn auth_session_key(&self) -> &str {
+        &self.auth_session_key
+    }
+
+    fn policy_registry(&self) -> &PolicyRegistry {
+        &self.policy_registry
+    }
+
+    fn forbidden_response(&self) -> ForbiddenResponse {
+        self.forbidden_response
+    }
+
+    #[cfg(feature = "db")]
+    fn pool(
+        &self,
+    ) -> Option<&diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>>
+    {
+        self.pool.as_ref()
     }
 }
 
