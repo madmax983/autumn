@@ -1,3 +1,43 @@
+//! Multi-tenancy support for shared infrastructure.
+//!
+//! Multi-tenancy allows a single running instance of an application to serve multiple
+//! independent tenants (customers, organizations, etc.) while keeping their data
+//! strictly separated. In Autumn, the tenancy layer identifies the active tenant
+//! for a request and propagates that identity through the application stack.
+//!
+//! # Tenant Extraction
+//!
+//! The framework can extract the tenant ID from various sources depending on configuration
+//! (`security.tenancy.source`):
+//! - **`header`**: A specific HTTP header (e.g., `x-tenant-id`).
+//! - **`subdomain`**: The subdomain of the request host (e.g., `tenant1` in `tenant1.example.com`).
+//! - **`session`**: A key within the user's session data.
+//! - **`jwt`**: A custom claim extracted from the `Authorization: Bearer` JWT payload.
+//!
+//! # Using the `Tenant` Extractor
+//!
+//! If you need to access the tenant ID in your handlers directly (for example, to prefix
+//! keys in a key-value store), you can use the [`Tenant`] extractor:
+//!
+//! ```rust,no_run
+//! use autumn_web::prelude::*;
+//!
+//! #[get("/settings")]
+//! async fn get_tenant_settings(Tenant(tenant_id): Tenant) -> impl IntoResponse {
+//!     format!("Settings for tenant: {}", tenant_id)
+//! }
+//! ```
+//!
+//! # Task-Local Context (`CURRENT_TENANT`)
+//!
+//! For deeply nested logic (like repository layers or background jobs) that shouldn't
+//! need to pass `tenant_id` parameters everywhere, Autumn utilizes a task-local
+//! variable: [`CURRENT_TENANT`]. The `tenancy_middleware` automatically sets this
+//! for the duration of the request.
+//!
+//! ```rust,ignore
+//! let tenant = autumn_web::tenancy::CURRENT_TENANT.get();
+//! ```
 use axum::{
     extract::State,
     http::Request,

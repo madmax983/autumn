@@ -1,3 +1,34 @@
+//! API idempotency for safe retries.
+//!
+//! Idempotency ensures that safely retrying an API request (like submitting a payment)
+//! does not result in the underlying mutation happening more than once. When a client
+//! includes the `idempotency-key` header in a mutating request (POST, PUT, PATCH, DELETE),
+//! this middleware captures the server's final response. If the client retries the
+//! exact same request with the same `idempotency-key`, the server short-circuits the handler
+//! and returns the previously cached response, appending the `x-idempotent-replayed: true` header.
+//!
+//! By default, this layer intercepts routes globally, but it only caches responses
+//! when an `idempotency-key` is present and valid.
+//!
+//! # Examples
+//!
+//! When configuring an application, the `IdempotencyLayer` is usually applied automatically,
+//! but you can understand the client experience as follows:
+//!
+//! ```text
+//! // 1. Client makes the initial request:
+//! // POST /orders
+//! // idempotency-key: unique-uuid-123
+//! //
+//! // (Server processes the order, caches the 201 response, and returns it)
+//!
+//! // 2. Client network drops, client retries exact same request:
+//! // POST /orders
+//! // idempotency-key: unique-uuid-123
+//! //
+//! // (Server sees the key, skips processing, returns the cached 201 response
+//! // with an added `x-idempotent-replayed: true` header)
+//! ```
 use bytes::Bytes;
 use futures::StreamExt as FuturesStreamExt;
 
