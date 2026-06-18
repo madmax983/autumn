@@ -719,6 +719,38 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         quote! {}
     };
 
+    // `__autumn_shards` carries the full ShardSet for cross-shard fan-out
+    // under `across_tenants()`. Only present when `sharded = true`; `None`
+    // in constructors that lack request context (from_shard, with_pool_untracked).
+    let shards_struct_field = if config.sharded {
+        quote! {
+            #[doc(hidden)]
+            __autumn_shards: ::core::option::Option<::autumn_web::sharding::ShardSet>,
+        }
+    } else {
+        quote! {}
+    };
+
+    let shards_clone_field = if config.sharded {
+        quote! { __autumn_shards: self.__autumn_shards.clone(), }
+    } else {
+        quote! {}
+    };
+
+    // The non-sharded extractor and shard-unaware constructors always use None.
+    let shards_none_field = if config.sharded {
+        quote! { __autumn_shards: ::core::option::Option::None, }
+    } else {
+        quote! {}
+    };
+
+    // The self-routing sharded extractor populates this from the resolved ShardSet.
+    let shards_some_field = if config.sharded {
+        quote! { __autumn_shards: ::core::option::Option::Some(__shard_set), }
+    } else {
+        quote! {}
+    };
+
     let across_tenants_method = if config.tenant_scoped {
         if let Some(hooks_ident) = &config.hooks_type {
             let idempotency_clone_field = if commit_hooks_enabled {
@@ -738,6 +770,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         hooks: <#hooks_ident as ::autumn_web::hooks::RepositoryHooksClone>::autumn_clone(&self.hooks),
                         #idempotency_clone_field
                         across_tenants: true,
+                        #shards_clone_field
                         __autumn_read_route: self.__autumn_read_route.clone(),
                         __autumn_statement_timeout_ms: self.__autumn_statement_timeout_ms,
                         __autumn_slow_threshold: self.__autumn_slow_threshold,
@@ -754,6 +787,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     Self {
                         pool: self.pool.clone(),
                         across_tenants: true,
+                        #shards_clone_field
                         __autumn_read_route: self.__autumn_read_route.clone(),
                         __autumn_statement_timeout_ms: self.__autumn_statement_timeout_ms,
                         __autumn_slow_threshold: self.__autumn_slow_threshold,
@@ -879,6 +913,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     #hooks_field
                     #idempotency_field
                     #tenant_init_field
+                    #shards_none_field
                     __autumn_read_route: #from_shard_read_route,
                     __autumn_statement_timeout_ms: __seed.statement_timeout_ms,
                     __autumn_slow_threshold: __seed.slow_query_threshold,
@@ -911,6 +946,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     #hooks_field
                     #idempotency_field
                     #tenant_init_field
+                    #shards_none_field
                     __autumn_read_route: ::autumn_web::repository::ReadRoute::Primary,
                     __autumn_statement_timeout_ms: 0,
                     __autumn_slow_threshold: ::std::time::Duration::from_millis(500),
@@ -974,6 +1010,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             hooks: #hooks_ident,
             #idempotency_struct_field
             #tenant_struct_field
+            #shards_struct_field
             /// Read-routing snapshot for generated read-only methods (#971).
             __autumn_read_route: ::autumn_web::repository::ReadRoute,
             /// Statement timeout to apply on every connection checkout (ms). 0 = no limit.
@@ -992,6 +1029,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         hooks: <#hooks_ident as ::autumn_web::hooks::RepositoryHooksClone>::autumn_clone(&self.hooks),
                         #idempotency_clone_field
                         #tenant_clone_field
+                        #shards_clone_field
                         __autumn_read_route: self.__autumn_read_route.clone(),
                         __autumn_statement_timeout_ms: self.__autumn_statement_timeout_ms,
                         __autumn_slow_threshold: self.__autumn_slow_threshold,
@@ -1032,6 +1070,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         .get::<::autumn_web::idempotency::IdempotencyContext>()
                         .cloned(),
                     #tenant_init_field
+                    #shards_none_field
                     __autumn_read_route,
                     __autumn_statement_timeout_ms: __autumn_timeout_ms,
                     __autumn_slow_threshold,
@@ -1045,6 +1084,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     pool,
                     hooks: <#hooks_ident as ::autumn_web::hooks::RepositoryHooksDefault>::autumn_default(),
                     #tenant_init_field
+                    #shards_none_field
                     __autumn_read_route,
                     __autumn_statement_timeout_ms: __autumn_timeout_ms,
                     __autumn_slow_threshold,
@@ -4086,6 +4126,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 ::autumn_web::reexports::diesel_async::AsyncPgConnection,
             >,
             #tenant_struct_field
+            #shards_struct_field
             /// Read-routing snapshot for generated read-only methods (#971).
             __autumn_read_route: ::autumn_web::repository::ReadRoute,
             /// Statement timeout to apply on every connection checkout (ms). 0 = no limit.
@@ -4102,6 +4143,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     Self {
                         pool: self.pool.clone(),
                         #tenant_clone_field
+                        #shards_clone_field
                         __autumn_read_route: self.__autumn_read_route.clone(),
                         __autumn_statement_timeout_ms: self.__autumn_statement_timeout_ms,
                         __autumn_slow_threshold: self.__autumn_slow_threshold,
@@ -4135,6 +4177,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             Ok(#pg_name {
                 pool,
                 #tenant_init_field
+                #shards_none_field
                 __autumn_read_route,
                 __autumn_statement_timeout_ms: __autumn_timeout_ms,
                 __autumn_slow_threshold,
@@ -7976,6 +8019,84 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     // - Uses diesel-async RunQueryDsl for async .load()/.first() etc.
     // - Table/New/Update types must be in scope where the macro is invoked
     //   (the user brings them in via `use crate::models::*` or similar)
+
+    // §1209: when `sharded`, the extractor resolves tenant → shard via the
+    // framework's __autumn_resolve_repo_seed helper instead of pulling the
+    // control pool from AppState. The sharded extractor requires `mut parts`
+    // so it can call resolve_shard_key (which may extract from request headers).
+    let from_request_parts_impl = if config.sharded {
+        // Build the idempotency init for the sharded path (reads from `_parts`
+        // directly, since the seed doesn't carry it).
+        let sharded_idempotency_init = if commit_hooks_enabled {
+            quote! {
+                idempotency: _parts
+                    .extensions
+                    .get::<::autumn_web::idempotency::IdempotencyContext>()
+                    .cloned(),
+            }
+        } else {
+            quote! {}
+        };
+        let sharded_hooks_init = config.hooks_type.as_ref().map_or_else(
+            || quote! {},
+            |hooks_ident| quote! {
+                hooks: <#hooks_ident as ::autumn_web::hooks::RepositoryHooksDefault>::autumn_default(),
+            },
+        );
+        let sharded_register_hooks = if commit_hooks_enabled {
+            quote! { #pg_name::__autumn_register_repository_commit_hooks(); }
+        } else {
+            quote! {}
+        };
+        let sharded_read_route = if config.primary_reads {
+            quote! { ::autumn_web::repository::ReadRoute::Primary }
+        } else {
+            quote! { ::core::clone::Clone::clone(&__seed.read_route) }
+        };
+        quote! {
+            impl ::autumn_web::reexports::axum::extract::FromRequestParts<::autumn_web::AppState> for #pg_name {
+                type Rejection = ::autumn_web::AutumnError;
+
+                async fn from_request_parts(
+                    _parts: &mut ::autumn_web::reexports::http::request::Parts,
+                    state: &::autumn_web::AppState,
+                ) -> Result<Self, Self::Rejection> {
+                    #sharded_register_hooks
+                    let (__seed, __shard_set) =
+                        ::autumn_web::sharding::__autumn_resolve_repo_seed(_parts, state).await?;
+                    ::core::result::Result::Ok(Self {
+                        pool: ::core::clone::Clone::clone(&__seed.pool),
+                        #sharded_hooks_init
+                        #sharded_idempotency_init
+                        #tenant_init_field
+                        #shards_some_field
+                        __autumn_read_route: #sharded_read_route,
+                        __autumn_statement_timeout_ms: __seed.statement_timeout_ms,
+                        __autumn_slow_threshold: __seed.slow_query_threshold,
+                        __autumn_route: ::core::clone::Clone::clone(&__seed.route),
+                    })
+                }
+            }
+        }
+    } else {
+        quote! {
+            // Extractor: pull pool from AppState (same pattern as Db extractor)
+            impl ::autumn_web::reexports::axum::extract::FromRequestParts<::autumn_web::AppState> for #pg_name {
+                type Rejection = ::autumn_web::AutumnError;
+
+                async fn from_request_parts(
+                    _parts: &mut ::autumn_web::reexports::http::request::Parts,
+                    state: &::autumn_web::AppState,
+                ) -> Result<Self, Self::Rejection> {
+                    let pool = state.pool()
+                        .ok_or_else(|| ::autumn_web::AutumnError::service_unavailable_msg("No database pool configured"))?
+                        .clone();
+                    #extractor_init
+                }
+            }
+        }
+    };
+
     quote! {
         /// Generated repository trait with CRUD + derived queries.
         #vis trait #trait_name: Send + Sync {
@@ -8003,20 +8124,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             #struct_fields
         }
 
-        // Extractor: pull pool from AppState (same pattern as Db extractor)
-        impl ::autumn_web::reexports::axum::extract::FromRequestParts<::autumn_web::AppState> for #pg_name {
-            type Rejection = ::autumn_web::AutumnError;
-
-            async fn from_request_parts(
-                _parts: &mut ::autumn_web::reexports::http::request::Parts,
-                state: &::autumn_web::AppState,
-            ) -> Result<Self, Self::Rejection> {
-                let pool = state.pool()
-                    .ok_or_else(|| ::autumn_web::AutumnError::service_unavailable_msg("No database pool configured"))?
-                    .clone();
-                #extractor_init
-            }
-        }
+        #from_request_parts_impl
 
         #clone_impl
 

@@ -1282,8 +1282,11 @@ pub async fn __autumn_resolve_repo_seed(
     parts: &mut axum::http::request::Parts,
     state: &crate::AppState,
 ) -> Result<(ShardRepositorySeed, ShardSet), AutumnError> {
-    use axum::extract::FromRequestParts as _;
-    let shards = Shards::from_request_parts(parts, state).await?;
+    let shards =
+        <Shards as axum::extract::FromRequestParts<crate::AppState>>::from_request_parts(
+            parts, state,
+        )
+        .await?;
     let key = resolve_shard_key(parts, state).await?;
     let shard = shards.set.route(&key).await?;
     let shard_name = Arc::clone(&shard.name);
