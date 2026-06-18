@@ -57,9 +57,16 @@ async fn repo_from_shard(db: &ShardedDb) -> PgNoteRepository {
     PgNoteRepository::from_shard(db)
 }
 
+// Explicit replica-only extractor: 503 if no replica is configured/healthy.
+#[get("/analytics")]
+async fn analytics(db: ShardedReadDb) -> AutumnResult<String> {
+    Ok(format!("replica of shard {}", db.shard()))
+}
+
 fn main() {
     let _ = list_notes;
     let _ = user_notes;
     let _ = repo_on_shard_untracked;
     let _ = repo_from_shard;
+    let _ = analytics;
 }
