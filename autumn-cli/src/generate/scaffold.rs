@@ -85,7 +85,7 @@ pub fn plan_scaffold_with_options(
     // Resolve shard key before planning the model (propagates to model render).
     let resolved_shard_key = resolve_shard_key(&fields, &options.model)?;
     let model_options_with_key = ModelOptions {
-        shard_key: resolved_shard_key.clone(),
+        shard_key: resolved_shard_key,
         ..options.model.clone()
     };
     let options_with_key = ScaffoldOptions {
@@ -322,12 +322,14 @@ fn render_repository_file(
     let query_body = render_repository_queries(pascal_name, queries);
     let soft_delete_attr = if soft_delete { ", soft_delete" } else { "" };
     let sharded_note = if sharded {
-        "//!\n\
-         //! This is a shard-aware repository. Handlers construct it via\n\
-         //! `Pg{pascal_name}Repository::from_shard(&db)` where `db` is a `ShardedDb` extractor;\n\
-         //! the extractor routes the request to the correct shard automatically.\n"
+        format!(
+            "//!\n\
+             //! This is a shard-aware repository. Handlers construct it via\n\
+             //! `Pg{pascal_name}Repository::from_shard(&db)` where `db` is a `ShardedDb` extractor;\n\
+             //! the extractor routes the request to the correct shard automatically.\n"
+        )
     } else {
-        ""
+        String::new()
     };
     let api_sharded_note = if sharded && api {
         "//!\n\
@@ -361,9 +363,6 @@ fn render_repository_file(
              {sharded_note}"
         )
     };
-    let pascal_name_str = pascal_name;
-    // Replace placeholder {pascal_name} in sharded_note with actual name.
-    let doc_comment = doc_comment.replace("{pascal_name}", pascal_name_str);
     format!(
         "{doc_comment}\n\
          use crate::models::{snake_name}::{{{pascal_name}, New{pascal_name}, Update{pascal_name}}};\n\
@@ -558,10 +557,9 @@ pub async fn index(
 
     // Imports: when sharded, drop Db from brace-import and add ShardedDb separately.
     let db_import = if sharded {
-        format!(
-            "use autumn_web::sharding::ShardedDb;\n\
-             use autumn_web::{{AutumnError, AutumnResult, Markup, get, html, post, secured}};"
-        )
+        "use autumn_web::sharding::ShardedDb;\n\
+         use autumn_web::{AutumnError, AutumnResult, Markup, get, html, post, secured};"
+            .to_owned()
     } else {
         "use autumn_web::{AutumnError, AutumnResult, Db, Markup, get, html, post, secured};"
             .to_owned()
