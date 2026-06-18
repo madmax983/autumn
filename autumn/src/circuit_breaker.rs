@@ -169,7 +169,10 @@ impl CircuitBreaker {
     }
 
     pub fn state(&self) -> CircuitState {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let now = Instant::now();
         if inner.state == CircuitState::Open {
             if let Some(until) = inner.open_until {
@@ -186,18 +189,27 @@ impl CircuitBreaker {
     }
 
     pub fn config(&self) -> CircuitBreakerPolicy {
-        let inner = self.inner.lock().unwrap();
+        let inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         inner.config.clone()
     }
 
     pub fn update_config(&self, mut config: CircuitBreakerPolicy) {
         config.failure_ratio_threshold = config.failure_ratio_threshold.clamp(0.000_1, 1.0);
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         inner.config = config;
     }
 
     pub fn failure_ratio(&self) -> f64 {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let window = inner.config.sample_window;
         inner.clean_history(window, Instant::now());
         inner.failure_ratio()
@@ -205,7 +217,10 @@ impl CircuitBreaker {
 
     #[allow(clippy::significant_drop_tightening)]
     pub(crate) fn before_call(&self) -> Result<(), CircuitBreakerError<()>> {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let now = Instant::now();
 
         if inner.state == CircuitState::Open {
@@ -236,7 +251,10 @@ impl CircuitBreaker {
     }
 
     pub(crate) fn after_call(&self, success: bool) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let now = Instant::now();
         let window = inner.config.sample_window;
         inner.clean_history(window, now);
@@ -336,7 +354,11 @@ impl CircuitBreakerGuard {
 impl Drop for CircuitBreakerGuard {
     fn drop(&mut self) {
         if !self.completed {
-            let mut inner = self.breaker.inner.lock().unwrap();
+            let mut inner = self
+                .breaker
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if inner.state == CircuitState::HalfOpen {
                 if inner.half_open_in_flight > 0 {
                     inner.half_open_in_flight -= 1;
@@ -358,7 +380,10 @@ impl CircuitBreakerRegistry {
     }
 
     pub fn get_or_create(&self, name: &str, config: CircuitBreakerPolicy) -> CircuitBreaker {
-        let mut breakers = self.breakers.lock().unwrap();
+        let mut breakers = self
+            .breakers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         breakers
             .entry(name.to_owned())
             .or_insert_with(|| CircuitBreaker::new(name, config))
@@ -370,7 +395,10 @@ impl CircuitBreakerRegistry {
         name: &str,
         config: CircuitBreakerPolicy,
     ) -> CircuitBreaker {
-        let mut breakers = self.breakers.lock().unwrap();
+        let mut breakers = self
+            .breakers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(breaker) = breakers.get(name) {
             breaker.update_config(config);
             breaker.clone()
@@ -383,21 +411,23 @@ impl CircuitBreakerRegistry {
 
     /// Returns a list of all currently registered circuit breakers.
     ///
-    /// # Panics
     ///
-    /// Panics if the internal registry lock is poisoned.
     pub fn all_breakers(&self) -> Vec<CircuitBreaker> {
-        let breakers = self.breakers.lock().unwrap();
+        let breakers = self
+            .breakers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         breakers.values().cloned().collect()
     }
 
     /// Clears all registered circuit breakers from the registry.
     ///
-    /// # Panics
     ///
-    /// Panics if the internal registry lock is poisoned.
     pub fn clear(&self) {
-        let mut breakers = self.breakers.lock().unwrap();
+        let mut breakers = self
+            .breakers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         breakers.clear();
     }
 }
@@ -653,7 +683,10 @@ mod tests {
 
         // Put the breaker in HalfOpen state
         {
-            let mut inner = breaker.inner.lock().unwrap();
+            let mut inner = breaker
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             inner.state = CircuitState::HalfOpen;
             inner.half_open_in_flight = 0;
         }
@@ -680,14 +713,22 @@ mod tests {
 
         // Call the service: this will increment half_open_in_flight since it's HalfOpen
         let fut = svc.call("ok");
-        let in_flight_before = breaker.inner.lock().unwrap().half_open_in_flight;
+        let in_flight_before = breaker
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .half_open_in_flight;
         assert_eq!(in_flight_before, 1);
 
         // Drop the future (cancellation)
         drop(fut);
 
         // half_open_in_flight should be decremented back to 0!
-        let in_flight_after = breaker.inner.lock().unwrap().half_open_in_flight;
+        let in_flight_after = breaker
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .half_open_in_flight;
         assert_eq!(in_flight_after, 0);
     }
 
@@ -712,5 +753,35 @@ mod tests {
             assert!(res.is_ok());
         }
         assert_eq!(breaker.state(), CircuitState::Closed);
+    }
+
+    #[test]
+    fn test_should_recover_from_poisoned_lock() {
+        use std::thread;
+        let policy = CircuitBreakerPolicy {
+            failure_ratio_threshold: 0.5,
+            sample_window: Duration::from_secs(10),
+            minimum_sample_count: 5,
+            open_duration: Duration::from_secs(60),
+            half_open_trial_count: 2,
+        };
+        let breaker = CircuitBreaker::new("poison_test", policy);
+
+        // Poison the lock intentionally
+        let breaker_clone = breaker.clone();
+        let res = thread::spawn(move || {
+            let _inner = breaker_clone.inner.lock().unwrap();
+            panic!("intentional panic to poison the lock");
+        })
+        .join();
+        assert!(res.is_err());
+
+        // The lock is now poisoned. State transition or access should recover.
+        let state = breaker.state();
+        assert_eq!(state, CircuitState::Closed);
+
+        // Failure ratio check should also recover
+        let failure_ratio = breaker.failure_ratio();
+        assert!(failure_ratio < f64::EPSILON);
     }
 }
