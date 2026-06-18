@@ -157,3 +157,166 @@ fn is_trusted_proxy(ip: IpAddr, trusted_proxies: &[TrustedProxy]) -> bool {
         .iter()
         .any(|trusted_proxy| trusted_proxy.contains(ip))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{Ipv4Addr, Ipv6Addr};
+    use std::str::FromStr;
+
+    #[test]
+    fn test_trusted_proxy_parse() {
+        // Valid v4
+        let p = TrustedProxy::parse("192.168.1.1/24").unwrap();
+        assert_eq!(p.network, IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)));
+        assert_eq!(p.prefix_len, 24);
+
+        let p = TrustedProxy::parse("10.0.0.1").unwrap();
+        assert_eq!(p.network, IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+        assert_eq!(p.prefix_len, 32);
+
+        // Valid v6
+        let p = TrustedProxy::parse("2001:db8::1/64").unwrap();
+        assert_eq!(
+            p.network,
+            IpAddr::V6(Ipv6Addr::from_str("2001:db8::1").unwrap())
+        );
+        assert_eq!(p.prefix_len, 64);
+
+        let p = TrustedProxy::parse("::1").unwrap();
+        assert_eq!(p.network, IpAddr::V6(Ipv6Addr::from_str("::1").unwrap()));
+        assert_eq!(p.prefix_len, 128);
+
+        // Invalid
+        assert!(TrustedProxy::parse("").is_none());
+        assert!(TrustedProxy::parse("invalid").is_none());
+        assert!(TrustedProxy::parse("192.168.1.1/invalid").is_none());
+        assert!(TrustedProxy::parse("192.168.1.1/33").is_none());
+        assert!(TrustedProxy::parse("::1/129").is_none());
+    }
+
+    #[test]
+    fn test_trusted_proxy_contains() {
+        let p_v4 = TrustedProxy::parse("192.168.1.0/24").unwrap();
+        assert!(p_v4.contains(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 100))));
+        assert!(!p_v4.contains(IpAddr::V4(Ipv4Addr::new(192, 168, 2, 1))));
+        assert!(!p_v4.contains(IpAddr::V6(Ipv6Addr::from_str("::1").unwrap())));
+
+        let p_v6 = TrustedProxy::parse("2001:db8::/64").unwrap();
+        assert!(p_v6.contains(IpAddr::V6(Ipv6Addr::from_str("2001:db8::1").unwrap())));
+        assert!(!p_v6.contains(IpAddr::V6(Ipv6Addr::from_str("2001:db9::1").unwrap())));
+        assert!(!p_v6.contains(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1))));
+
+        let p_zero_v4 = TrustedProxy::parse("0.0.0.0/0").unwrap();
+        assert!(p_zero_v4.contains(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1))));
+        assert!(!p_zero_v4.contains(IpAddr::V6(Ipv6Addr::from_str("::1").unwrap())));
+
+        let p_zero_v6 = TrustedProxy::parse("::/0").unwrap();
+        assert!(p_zero_v6.contains(IpAddr::V6(Ipv6Addr::from_str("2001:db8::1").unwrap())));
+        assert!(!p_zero_v6.contains(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1))));
+    }
+
+    #[test]
+    fn test_is_trusted_proxy() {
+        let proxies = vec![TrustedProxy::parse("10.0.0.0/8").unwrap()];
+        assert!(is_trusted_proxy(
+            IpAddr::V4(Ipv4Addr::new(10, 1, 2, 3)),
+            &proxies
+        ));
+        assert!(!is_trusted_proxy(
+            IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)),
+            &proxies
+        ));
+    }
+
+    #[test]
+    fn test_client_ip_from_x_forwarded_for() {
+        let peer_ip = Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+        let trusted_proxies = vec![TrustedProxy::parse("10.0.0.0/8").unwrap()];
+
+        // Unconfigured proxies (trust all)
+        assert_eq!(
+            client_ip_from_x_forwarded_for("1.2.3.4, 5.6.7.8, 10.0.0.1", peer_ip, &[], false),
+            Some(IpAddr::V4(Ipv4Addr::new(5, 6, 7, 8))) // Uses the one before the peer
+        );
+
+        assert_eq!(
+            client_ip_from_x_forwarded_for("1.2.3.4, 5.6.7.8", peer_ip, &[], false),
+            Some(IpAddr::V4(Ipv4Addr::new(5, 6, 7, 8))) // Doesn't match peer, uses last valid
+        );
+
+        // Configured proxies
+        assert_eq!(
+            client_ip_from_x_forwarded_for("1.2.3.4, 10.0.0.2", peer_ip, &trusted_proxies, true),
+            Some(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4))) // 10.0.0.2 is trusted, so it looks at the previous one
+        );
+
+        assert_eq!(
+            client_ip_from_x_forwarded_for(
+                "1.2.3.4, 5.6.7.8, 10.0.0.2",
+                peer_ip,
+                &trusted_proxies,
+                true
+            ),
+            Some(IpAddr::V4(Ipv4Addr::new(5, 6, 7, 8))) // 10.0.0.2 is trusted, 5.6.7.8 is not, stops there
+        );
+
+        assert_eq!(
+            client_ip_from_x_forwarded_for("invalid", peer_ip, &[], false),
+            None
+        );
+
+        assert_eq!(
+            client_ip_from_x_forwarded_for("invalid", peer_ip, &trusted_proxies, true),
+            None
+        );
+    }
+
+    #[test]
+    fn test_extract_client_ip() {
+        let mut req = Request::builder().body(()).unwrap();
+        req.extensions_mut().insert(ConnectInfo(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            8080,
+        )));
+        req.headers_mut()
+            .insert("x-forwarded-for", "1.2.3.4, 10.0.0.2".parse().unwrap());
+        req.headers_mut()
+            .insert("x-real-ip", "5.6.7.8".parse().unwrap());
+
+        let trusted_proxies = vec![TrustedProxy::parse("10.0.0.0/8").unwrap()];
+
+        // trust_forwarded_headers = false
+        assert_eq!(
+            extract_client_ip(&req, false, &trusted_proxies, true),
+            Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)))
+        );
+
+        // trust_forwarded_headers = true, but peer not trusted
+        let untrusted_proxies = vec![TrustedProxy::parse("192.168.1.0/24").unwrap()];
+        assert_eq!(
+            extract_client_ip(&req, true, &untrusted_proxies, true),
+            Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)))
+        );
+
+        // trust_forwarded_headers = true, peer is trusted
+        assert_eq!(
+            extract_client_ip(&req, true, &trusted_proxies, true),
+            Some(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)))
+        );
+
+        // test fallback to x-real-ip
+        let mut req2 = Request::builder().body(()).unwrap();
+        req2.extensions_mut().insert(ConnectInfo(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            8080,
+        )));
+        req2.headers_mut()
+            .insert("x-real-ip", "5.6.7.8".parse().unwrap());
+
+        assert_eq!(
+            extract_client_ip(&req2, true, &trusted_proxies, true),
+            Some(IpAddr::V4(Ipv4Addr::new(5, 6, 7, 8)))
+        );
+    }
+}
