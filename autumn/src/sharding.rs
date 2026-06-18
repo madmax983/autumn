@@ -1270,6 +1270,33 @@ impl AsMut<crate::db::Db> for ShardedDb {
     }
 }
 
+/// Internal ABI for generated `#[repository(sharded)]` extractors.
+///
+/// Resolves the tenant→shard routing from a request, builds the
+/// [`ShardRepositorySeed`] that carries the shard's pool and observability
+/// context, and returns a cheap clone of the [`ShardSet`] for cross-shard
+/// fan-out. Unlike [`ShardedDb::from_request_parts`] it does **not** check
+/// out a connection, so generated repositories can acquire their own lazily.
+#[doc(hidden)]
+pub async fn __autumn_resolve_repo_seed(
+    parts: &mut axum::http::request::Parts,
+    state: &crate::AppState,
+) -> Result<(ShardRepositorySeed, ShardSet), AutumnError> {
+    use axum::extract::FromRequestParts as _;
+    let shards = Shards::from_request_parts(parts, state).await?;
+    let key = resolve_shard_key(parts, state).await?;
+    let shard = shards.set.route(&key).await?;
+    let shard_name = Arc::clone(&shard.name);
+    let seed = ShardRepositorySeed::from_ctx(
+        shard.primary_pool(),
+        &shards.ctx,
+        &shard_name,
+        shard.read_route(),
+    );
+    let set = shards.set.clone();
+    Ok((seed, set))
+}
+
 impl axum::extract::FromRequestParts<crate::AppState> for ShardedDb {
     type Rejection = AutumnError;
 
