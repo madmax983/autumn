@@ -1495,3 +1495,178 @@ pub(crate) fn install_registry_from_config(
     state.insert_extension(registry);
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use http::HeaderValue;
+    use std::time::Duration;
+
+    #[test]
+    fn parse_stripe_signature_valid() {
+        let sig =
+            "t=1492774577,v1=5257a869e7ecebeda32affa62cdca3fa51cad7e77a0e56ff536d0ce8e108d8bd";
+        let (timestamp, signatures) = parse_stripe_signature(sig).unwrap();
+        assert_eq!(timestamp, 1492774577);
+        assert_eq!(signatures.len(), 1);
+        assert_eq!(
+            signatures[0],
+            "5257a869e7ecebeda32affa62cdca3fa51cad7e77a0e56ff536d0ce8e108d8bd"
+        );
+    }
+
+    #[test]
+    fn parse_stripe_signature_multiple_v1() {
+        let sig = "t=1492774577,v1=sig1,v1=sig2,v0=sig3";
+        let (timestamp, signatures) = parse_stripe_signature(sig).unwrap();
+        assert_eq!(timestamp, 1492774577);
+        assert_eq!(signatures.len(), 2);
+        assert_eq!(signatures[0], "sig1");
+        assert_eq!(signatures[1], "sig2");
+    }
+
+    #[test]
+    fn parse_stripe_signature_missing_t() {
+        let sig = "v1=sig1";
+        let err = parse_stripe_signature(sig).unwrap_err();
+        assert!(matches!(err, WebhookVerifyError::MalformedTimestamp));
+    }
+
+    #[test]
+    fn parse_stripe_signature_missing_v1() {
+        let sig = "t=1492774577,v0=sig1";
+        let err = parse_stripe_signature(sig).unwrap_err();
+        assert!(matches!(err, WebhookVerifyError::MalformedSignature));
+    }
+
+    #[test]
+    fn parse_stripe_signature_malformed_timestamp() {
+        let sig = "t=abc,v1=sig1";
+        let err = parse_stripe_signature(sig).unwrap_err();
+        assert!(matches!(err, WebhookVerifyError::MalformedTimestamp));
+    }
+
+    #[test]
+    fn parse_stripe_signature_malformed_key_value() {
+        let sig = "t=1492774577,v1";
+        let err = parse_stripe_signature(sig).unwrap_err();
+        assert!(matches!(err, WebhookVerifyError::MalformedSignature));
+    }
+
+    #[test]
+    fn verify_timestamp_within_tolerance() {
+        let received_at = UNIX_EPOCH + Duration::from_secs(100);
+        let timestamp = 95;
+        let tolerance = 10;
+        assert!(verify_timestamp(timestamp, received_at, tolerance).is_ok());
+    }
+
+    #[test]
+    fn verify_timestamp_outside_tolerance_past() {
+        let received_at = UNIX_EPOCH + Duration::from_secs(100);
+        let timestamp = 80;
+        let tolerance = 10;
+        let err = verify_timestamp(timestamp, received_at, tolerance).unwrap_err();
+        assert!(matches!(err, WebhookVerifyError::StaleTimestamp));
+    }
+
+    #[test]
+    fn verify_timestamp_outside_tolerance_future() {
+        let received_at = UNIX_EPOCH + Duration::from_secs(100);
+        let timestamp = 120;
+        let tolerance = 10;
+        let err = verify_timestamp(timestamp, received_at, tolerance).unwrap_err();
+        assert!(matches!(err, WebhookVerifyError::StaleTimestamp));
+    }
+
+    #[test]
+    fn resolve_delivery_id_from_header() {
+        let config = WebhookEndpointConfig {
+            delivery_id_header: Some("X-Delivery".to_owned()),
+            ..WebhookEndpointConfig::default()
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Delivery", HeaderValue::from_static("12345"));
+        let id = resolve_delivery_id(&config, &headers, None);
+        assert_eq!(id, Some("12345".to_owned()));
+    }
+
+    #[test]
+    fn resolve_delivery_id_from_json_fallback() {
+        let config = WebhookEndpointConfig::default();
+        let headers = HeaderMap::new();
+        let json = serde_json::json!({"id": "67890"});
+        let id = resolve_delivery_id(&config, &headers, Some(&json));
+        assert_eq!(id, Some("67890".to_owned()));
+    }
+
+    #[test]
+    fn resolve_delivery_id_slack_event_id() {
+        let config = WebhookEndpointConfig {
+            provider: WebhookProvider::Slack,
+            ..WebhookEndpointConfig::default()
+        };
+        let headers = HeaderMap::new();
+        let json = serde_json::json!({"event_id": "evt_123"});
+        let id = resolve_delivery_id(&config, &headers, Some(&json));
+        assert_eq!(id, Some("evt_123".to_owned()));
+    }
+
+    #[test]
+    fn resolve_delivery_id_slack_url_verification() {
+        let config = WebhookEndpointConfig {
+            provider: WebhookProvider::Slack,
+            ..WebhookEndpointConfig::default()
+        };
+        let headers = HeaderMap::new();
+        let json = serde_json::json!({
+            "type": "url_verification",
+            "challenge": "ch_123"
+        });
+        let id = resolve_delivery_id(&config, &headers, Some(&json));
+        assert_eq!(id, Some("ch_123".to_owned()));
+    }
+
+    #[test]
+    fn resolve_event_type_from_header() {
+        let config = WebhookEndpointConfig {
+            event_type_header: Some("X-Event".to_owned()),
+            ..WebhookEndpointConfig::default()
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Event", HeaderValue::from_static("user.created"));
+        let event_type = resolve_event_type(&config, &headers, None);
+        assert_eq!(event_type, Some("user.created".to_owned()));
+    }
+
+    #[test]
+    fn resolve_event_type_from_json_type() {
+        let config = WebhookEndpointConfig::default();
+        let headers = HeaderMap::new();
+        let json = serde_json::json!({"type": "charge.succeeded"});
+        let event_type = resolve_event_type(&config, &headers, Some(&json));
+        assert_eq!(event_type, Some("charge.succeeded".to_owned()));
+    }
+
+    #[test]
+    fn resolve_event_type_from_nested_json() {
+        let config = WebhookEndpointConfig::default();
+        let headers = HeaderMap::new();
+        let json = serde_json::json!({
+            "event": {
+                "type": "issue.opened"
+            }
+        });
+        let event_type = resolve_event_type(&config, &headers, Some(&json));
+        assert_eq!(event_type, Some("issue.opened".to_owned()));
+    }
+
+    #[test]
+    fn resolve_event_type_none_if_missing() {
+        let config = WebhookEndpointConfig::default();
+        let headers = HeaderMap::new();
+        let json = serde_json::json!({"foo": "bar"});
+        let event_type = resolve_event_type(&config, &headers, Some(&json));
+        assert_eq!(event_type, None);
+    }
+}
