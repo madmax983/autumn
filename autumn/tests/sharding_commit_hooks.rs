@@ -49,15 +49,21 @@ mod sharding_commit_hook_tests {
         #[id]
         pub id: i64,
         pub title: String,
+        // tenant_scoped: framework-managed, omitted from `NewNote` and stamped
+        // from the current tenant on insert.
+        #[default]
         pub tenant_id: String,
     }
 
     // ── Hooks (commit_hooks = true requires a hooks type) ──────
 
+    #[derive(Clone, Default)]
     pub struct NoteHooks;
 
     impl autumn_web::hooks::MutationHooks for NoteHooks {
         type Model = Note;
+        type NewModel = NewNote;
+        type UpdateModel = UpdateNote;
 
         // Overriding an after-*-commit hook is what causes the generated save
         // to durably stage a row into `autumn_repository_commit_hooks` inside
@@ -86,7 +92,7 @@ mod sharding_commit_hook_tests {
     // ── Handler ────────────────────────────────────────────────
 
     #[derive(serde::Deserialize)]
-    struct NewNote {
+    struct NoteInput {
         title: String,
     }
 
@@ -96,15 +102,10 @@ mod sharding_commit_hook_tests {
     #[post("/notes")]
     async fn create_note(
         repo: PgNoteRepository,
-        Json(input): Json<NewNote>,
+        Json(input): Json<NoteInput>,
     ) -> AutumnResult<(axum::http::StatusCode, Json<Note>)> {
-        let note = repo
-            .save(Note {
-                id: 0,
-                title: input.title,
-                tenant_id: String::new(), // filled by tenant_scoped from the route key
-            })
-            .await?;
+        // tenant_id is stamped from the current tenant by the tenant_scoped repo.
+        let note = repo.save(&NewNote { title: input.title }).await?;
         Ok((axum::http::StatusCode::CREATED, Json(note)))
     }
 

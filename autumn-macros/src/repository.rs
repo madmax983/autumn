@@ -3917,20 +3917,26 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
             let delete_returning_expr = if config.soft_delete {
                 if config.tenant_scoped {
+                    // Braces required: this fragment is assigned with
+                    // `let chunk_deleted_ids = #delete_returning_expr` in the
+                    // versioned path, so the leading `let query` must be inside
+                    // a block expression.
                     quote! {
-                        let query = #table_ident::table.filter(#table_ident::id.eq_any(chunk)).filter(#table_ident::deleted_at.is_null());
-                        if let ::core::option::Option::Some(t) = tenant_id {
-                            ::autumn_web::reexports::diesel::update(query.filter(#table_ident::tenant_id.eq(t)))
-                                .set(#table_ident::deleted_at.eq(::core::option::Option::Some(__now)))
-                                .returning(#table_ident::id)
-                                .get_results::<i64>(conn)
-                                .await
-                        } else {
-                            ::autumn_web::reexports::diesel::update(query)
-                                .set(#table_ident::deleted_at.eq(::core::option::Option::Some(__now)))
-                                .returning(#table_ident::id)
-                                .get_results::<i64>(conn)
-                                .await
+                        {
+                            let query = #table_ident::table.filter(#table_ident::id.eq_any(chunk)).filter(#table_ident::deleted_at.is_null());
+                            if let ::core::option::Option::Some(t) = tenant_id {
+                                ::autumn_web::reexports::diesel::update(query.filter(#table_ident::tenant_id.eq(t)))
+                                    .set(#table_ident::deleted_at.eq(::core::option::Option::Some(__now)))
+                                    .returning(#table_ident::id)
+                                    .get_results::<i64>(conn)
+                                    .await
+                            } else {
+                                ::autumn_web::reexports::diesel::update(query)
+                                    .set(#table_ident::deleted_at.eq(::core::option::Option::Some(__now)))
+                                    .returning(#table_ident::id)
+                                    .get_results::<i64>(conn)
+                                    .await
+                            }
                         }
                     }
                 } else {
@@ -3945,17 +3951,19 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             } else {
                 if config.tenant_scoped {
                     quote! {
-                        let query = #table_ident::table.filter(#table_ident::id.eq_any(chunk));
-                        if let ::core::option::Option::Some(t) = tenant_id {
-                            ::autumn_web::reexports::diesel::delete(query.filter(#table_ident::tenant_id.eq(t)))
-                                .returning(#table_ident::id)
-                                .get_results::<i64>(conn)
-                                .await
-                        } else {
-                            ::autumn_web::reexports::diesel::delete(query)
-                                .returning(#table_ident::id)
-                                .get_results::<i64>(conn)
-                                .await
+                        {
+                            let query = #table_ident::table.filter(#table_ident::id.eq_any(chunk));
+                            if let ::core::option::Option::Some(t) = tenant_id {
+                                ::autumn_web::reexports::diesel::delete(query.filter(#table_ident::tenant_id.eq(t)))
+                                    .returning(#table_ident::id)
+                                    .get_results::<i64>(conn)
+                                    .await
+                            } else {
+                                ::autumn_web::reexports::diesel::delete(query)
+                                    .returning(#table_ident::id)
+                                    .get_results::<i64>(conn)
+                                    .await
+                            }
                         }
                     }
                 } else {
@@ -7440,23 +7448,40 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     // for across_tenants reads.  Uses ShardSet::fan_out_shards for concurrent
     // execution.  The sub-repo uses `with_pool_untracked` so its
     // `__autumn_shards` is `None`, preventing recursion.
-    let find_all_impl = if config.sharded && config.tenant_scoped {
-        quote! {
+    // §1d: fan out `find_all` across all shards for `across_tenants()`. The
+    // per-shard work runs through the inherent `__autumn_find_all_one_shard`
+    // helper (emitted below) rather than the trait method, so `find_all`'s
+    // RPITIT future never transitively names its own opaque type — which would
+    // make its `Send` auto-trait unprovable once hooks/versioning add captured
+    // state to the future.
+    let (find_all_impl, find_all_one_shard_helper) = if config.sharded && config.tenant_scoped {
+        let base = find_all_impl;
+        let dispatch = quote! {
             if self.across_tenants {
                 if let ::core::option::Option::Some(ref __shards) = self.__autumn_shards {
                     let __vecs = __shards.fan_out_shards(|__pool| {
                         let __sub = Self::with_pool_untracked(__pool).across_tenants();
-                        async move { __sub.find_all().await }
+                        async move { __sub.__autumn_find_all_one_shard().await }
                     }).await?;
                     return ::core::result::Result::Ok(
                         __vecs.into_iter().flatten().collect()
                     );
                 }
             }
-            #find_all_impl
-        }
+            #base
+        };
+        let helper = quote! {
+            #[doc(hidden)]
+            async fn __autumn_find_all_one_shard(&self) -> ::autumn_web::AutumnResult<::std::vec::Vec<#model_name>> {
+                use ::autumn_web::reexports::diesel::prelude::*;
+                use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                let mut conn = self.__autumn_acquire_read_conn().await?;
+                #base
+            }
+        };
+        (dispatch, helper)
     } else {
-        find_all_impl
+        (find_all_impl, quote! {})
     };
 
     let count_impl = if config.tenant_scoped {
@@ -7496,21 +7521,32 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     };
 
-    let count_impl = if config.sharded && config.tenant_scoped {
-        quote! {
+    let (count_impl, count_one_shard_helper) = if config.sharded && config.tenant_scoped {
+        let base = count_impl;
+        let dispatch = quote! {
             if self.across_tenants {
                 if let ::core::option::Option::Some(ref __shards) = self.__autumn_shards {
                     let __counts = __shards.fan_out_shards(|__pool| {
                         let __sub = Self::with_pool_untracked(__pool).across_tenants();
-                        async move { __sub.count().await }
+                        async move { __sub.__autumn_count_one_shard().await }
                     }).await?;
                     return ::core::result::Result::Ok(__counts.into_iter().sum());
                 }
             }
-            #count_impl
-        }
+            #base
+        };
+        let helper = quote! {
+            #[doc(hidden)]
+            async fn __autumn_count_one_shard(&self) -> ::autumn_web::AutumnResult<i64> {
+                use ::autumn_web::reexports::diesel::prelude::*;
+                use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                let mut conn = self.__autumn_acquire_read_conn().await?;
+                #base
+            }
+        };
+        (dispatch, helper)
     } else {
-        count_impl
+        (count_impl, quote! {})
     };
 
     let exists_by_id_impl = if config.tenant_scoped {
@@ -7556,21 +7592,32 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     };
 
-    let exists_by_id_impl = if config.sharded && config.tenant_scoped {
-        quote! {
+    let (exists_by_id_impl, exists_by_id_one_shard_helper) = if config.sharded && config.tenant_scoped {
+        let base = exists_by_id_impl;
+        let dispatch = quote! {
             if self.across_tenants {
                 if let ::core::option::Option::Some(ref __shards) = self.__autumn_shards {
                     let __results = __shards.fan_out_shards(|__pool| {
                         let __sub = Self::with_pool_untracked(__pool).across_tenants();
-                        async move { __sub.exists_by_id(id).await }
+                        async move { __sub.__autumn_exists_by_id_one_shard(id).await }
                     }).await?;
                     return ::core::result::Result::Ok(__results.into_iter().any(|b| b));
                 }
             }
-            #exists_by_id_impl
-        }
+            #base
+        };
+        let helper = quote! {
+            #[doc(hidden)]
+            async fn __autumn_exists_by_id_one_shard(&self, id: i64) -> ::autumn_web::AutumnResult<bool> {
+                use ::autumn_web::reexports::diesel::prelude::*;
+                use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                let mut conn = self.__autumn_acquire_read_conn().await?;
+                #base
+            }
+        };
+        (dispatch, helper)
     } else {
-        exists_by_id_impl
+        (exists_by_id_impl, quote! {})
     };
 
     let upsert_many_trait_method = if config.hooks_type.is_none() && !config.no_upsert_trait {
@@ -8341,6 +8388,9 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
         impl #pg_name {
             #across_tenants_method
+            #find_all_one_shard_helper
+            #count_one_shard_helper
+            #exists_by_id_one_shard_helper
             #with_pool_method
             #hook_support_methods
 
@@ -10132,6 +10182,52 @@ mod tests {
     }
 
     #[test]
+    fn sharded_fan_out_calls_inherent_one_shard_helpers_not_trait_methods() {
+        // Regression: the fan-out must route through inherent
+        // `__autumn_*_one_shard` helpers rather than recursively calling the
+        // RPITIT trait methods, or the read futures' `Send` auto-trait becomes
+        // unprovable once hooks/versioning add captured state (issue #1209 §1d).
+        let generated = repository_macro(
+            quote! { Post, tenant_scoped, sharded, versioned = true, hooks = PostHooks },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        for helper in [
+            "__autumn_find_all_one_shard",
+            "__autumn_count_one_shard",
+            "__autumn_exists_by_id_one_shard",
+        ] {
+            assert!(
+                generated.contains(helper),
+                "fan-out must define and call the inherent helper {helper}: {generated}"
+            );
+        }
+    }
+
+    #[test]
+    fn versioned_tenant_scoped_delete_many_chunk_is_a_block_expression() {
+        // Regression: the chunked delete in the versioned path is assigned with
+        // `let chunk_deleted_ids = <expr>`, so the tenant-scoped
+        // `delete_returning_expr` must be a braced block — otherwise it emits
+        // `let chunk_deleted_ids = let query = ...` (issue #1209 §1e).
+        let generated = repository_macro(
+            quote! { Post, tenant_scoped, versioned = true, hooks = PostHooks },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("let chunk_deleted_ids = {"),
+            "versioned+tenant_scoped delete_many must wrap the chunk expression in a block: {generated}"
+        );
+        assert!(
+            !generated.contains("let chunk_deleted_ids = let "),
+            "versioned+tenant_scoped delete_many must not emit `let x = let y` : {generated}"
+        );
+    }
+
+    #[test]
     fn sharded_tenant_scoped_count_contains_fan_out_guard() {
         let generated = repository_macro(
             quote! { Post, tenant_scoped, sharded },
@@ -10235,3 +10331,4 @@ mod tests {
         );
     }
 }
+
