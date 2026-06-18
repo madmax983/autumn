@@ -1,0 +1,132 @@
+autumn/src/db.rs:79:5: replace record_after_commit_failure -> u64 with 0
+autumn/src/db.rs:79:5: replace record_after_commit_failure -> u64 with 1
+autumn/src/db.rs:79:65: replace + with - in record_after_commit_failure
+autumn/src/db.rs:79:65: replace + with * in record_after_commit_failure
+autumn/src/db.rs:83:5: replace reject_ambient_after_commit_registry_for_tx -> Result<(), AutumnError> with Ok(())
+autumn/src/db.rs:94:5: replace spawn_committed_after_commit_callbacks -> Option<tokio::task::JoinHandle<()>> with None
+autumn/src/db.rs:94:5: replace spawn_committed_after_commit_callbacks -> Option<tokio::task::JoinHandle<()>> with Some(JoinHandle::new())
+autumn/src/db.rs:94:5: replace spawn_committed_after_commit_callbacks -> Option<tokio::task::JoinHandle<()>> with Some(JoinHandle::from_iter([()]))
+autumn/src/db.rs:94:5: replace spawn_committed_after_commit_callbacks -> Option<tokio::task::JoinHandle<()>> with Some(JoinHandle::new(()))
+autumn/src/db.rs:94:5: replace spawn_committed_after_commit_callbacks -> Option<tokio::task::JoinHandle<()>> with Some(JoinHandle::from(()))
+autumn/src/db.rs:128:5: replace after_commit_panic_message -> String with String::new()
+autumn/src/db.rs:128:5: replace after_commit_panic_message -> String with "xyzzy".into()
+autumn/src/db.rs:177:5: replace register_after_commit with ()
+autumn/src/db.rs:208:9: replace DbState::metrics -> Option<&crate::middleware::MetricsCollector> with Some(Box::leak(Box::new(Default::default())))
+autumn/src/db.rs:213:9: replace DbState::replica_pool -> Option<&Pool<AsyncPgConnection>> with Some(Box::leak(Box::new(Pool::new())))
+autumn/src/db.rs:213:9: replace DbState::replica_pool -> Option<&Pool<AsyncPgConnection>> with Some(Box::leak(Box::new(Pool::from_iter([Default::default()]))))
+autumn/src/db.rs:213:9: replace DbState::replica_pool -> Option<&Pool<AsyncPgConnection>> with Some(Box::leak(Box::new(Pool::new(Default::default()))))
+autumn/src/db.rs:213:9: replace DbState::replica_pool -> Option<&Pool<AsyncPgConnection>> with Some(Box::leak(Box::new(Pool::from(Default::default()))))
+autumn/src/db.rs:220:9: replace DbState::read_pool -> Option<&Pool<AsyncPgConnection>> with None
+autumn/src/db.rs:220:9: replace DbState::read_pool -> Option<&Pool<AsyncPgConnection>> with Some(Box::leak(Box::new(Pool::new())))
+autumn/src/db.rs:220:9: replace DbState::read_pool -> Option<&Pool<AsyncPgConnection>> with Some(Box::leak(Box::new(Pool::from_iter([Default::default()]))))
+autumn/src/db.rs:220:9: replace DbState::read_pool -> Option<&Pool<AsyncPgConnection>> with Some(Box::leak(Box::new(Pool::new(Default::default()))))
+autumn/src/db.rs:220:9: replace DbState::read_pool -> Option<&Pool<AsyncPgConnection>> with Some(Box::leak(Box::new(Pool::from(Default::default()))))
+autumn/src/db.rs:227:9: replace DbState::shards -> Option<&crate::sharding::ShardSet> with Some(Box::leak(Box::new(Default::default())))
+autumn/src/db.rs:234:9: replace DbState::db_interceptors -> Vec<std::sync::Arc<dyn crate::interceptor::DbConnectionInterceptor>> with vec![]
+autumn/src/db.rs:234:9: replace DbState::db_interceptors -> Vec<std::sync::Arc<dyn crate::interceptor::DbConnectionInterceptor>> with vec![Arc::new(Default::default())]
+autumn/src/db.rs:238:9: replace DbState::statement_timeout -> Option<std::time::Duration> with Some(Default::default())
+autumn/src/db.rs:243:9: replace DbState::slow_query_threshold -> std::time::Duration with Default::default()
+autumn/src/db.rs:277:5: replace consume_estring_body with ()
+autumn/src/db.rs:281:33: replace == with != in consume_estring_body
+autumn/src/db.rs:300:5: replace consume_dollar_quoted_body with ()
+autumn/src/db.rs:304:15: replace == with != in consume_dollar_quoted_body
+autumn/src/db.rs:305:25: replace += with -= in consume_dollar_quoted_body
+autumn/src/db.rs:305:25: replace += with *= in consume_dollar_quoted_body
+autumn/src/db.rs:306:28: replace == with != in consume_dollar_quoted_body
+autumn/src/db.rs:312:19: replace == with != in consume_dollar_quoted_body
+autumn/src/db.rs:323:5: replace is_separator -> bool with true
+autumn/src/db.rs:323:5: replace is_separator -> bool with false
+autumn/src/db.rs:335:5: replace scrub_sql -> String with String::new()
+autumn/src/db.rs:335:5: replace scrub_sql -> String with "xyzzy".into()
+autumn/src/db.rs:347:35: replace && with || in scrub_sql
+autumn/src/db.rs:347:22: replace || with && in scrub_sql
+autumn/src/db.rs:347:15: replace == with != in scrub_sql
+autumn/src/db.rs:347:27: replace == with != in scrub_sql
+autumn/src/db.rs:347:51: replace == with != in scrub_sql
+autumn/src/db.rs:356:14: replace == with != in scrub_sql
+autumn/src/db.rs:363:41: replace == with != in scrub_sql
+autumn/src/db.rs:378:14: replace == with != in scrub_sql
+autumn/src/db.rs:398:24: replace == with != in scrub_sql
+autumn/src/db.rs:402:67: replace || with && in scrub_sql
+autumn/src/db.rs:402:73: replace == with != in scrub_sql
+autumn/src/db.rs:405:27: replace == with != in scrub_sql
+autumn/src/db.rs:409:52: replace || with && in scrub_sql
+autumn/src/db.rs:409:58: replace == with != in scrub_sql
+autumn/src/db.rs:436:37: replace && with || in scrub_sql
+autumn/src/db.rs:436:22: replace && with || in scrub_sql
+autumn/src/db.rs:436:15: replace == with != in scrub_sql
+autumn/src/db.rs:437:48: replace || with && in scrub_sql
+autumn/src/db.rs:437:32: replace && with || in scrub_sql
+autumn/src/db.rs:445:66: replace || with && in scrub_sql
+autumn/src/db.rs:445:53: replace || with && in scrub_sql
+autumn/src/db.rs:445:59: replace == with != in scrub_sql
+autumn/src/db.rs:445:72: replace == with != in scrub_sql
+autumn/src/db.rs:450:55: replace || with && in scrub_sql
+autumn/src/db.rs:450:48: replace == with != in scrub_sql
+autumn/src/db.rs:450:61: replace == with != in scrub_sql
+autumn/src/db.rs:452:59: replace || with && in scrub_sql
+autumn/src/db.rs:452:52: replace == with != in scrub_sql
+autumn/src/db.rs:452:65: replace == with != in scrub_sql
+autumn/src/db.rs:500:5: replace run_instrumented -> Result<T, AutumnError> with Ok(Default::default())
+autumn/src/db.rs:511:16: replace >= with < in run_instrumented
+autumn/src/db.rs:545:5: replace is_query_canceled -> bool with true
+autumn/src/db.rs:545:5: replace is_query_canceled -> bool with false
+autumn/src/db.rs:550:9: replace || with && in is_query_canceled
+autumn/src/db.rs:549:9: replace || with && in is_query_canceled
+autumn/src/db.rs:548:9: replace || with && in is_query_canceled
+autumn/src/db.rs:547:9: replace || with && in is_query_canceled
+autumn/src/db.rs:561:13: replace == with != in is_query_canceled
+autumn/src/db.rs:567:49: replace == with != in is_query_canceled
+autumn/src/db.rs:599:9: replace DatabaseTopology::from_pools -> Self with Default::default()
+autumn/src/db.rs:605:9: replace DatabaseTopology::primary_only -> Self with Default::default()
+autumn/src/db.rs:614:9: replace DatabaseTopology::primary -> &Pool<AsyncPgConnection> with Box::leak(Box::new(Pool::new()))
+autumn/src/db.rs:614:9: replace DatabaseTopology::primary -> &Pool<AsyncPgConnection> with Box::leak(Box::new(Pool::from_iter([Default::default()])))
+autumn/src/db.rs:614:9: replace DatabaseTopology::primary -> &Pool<AsyncPgConnection> with Box::leak(Box::new(Pool::new(Default::default())))
+autumn/src/db.rs:614:9: replace DatabaseTopology::primary -> &Pool<AsyncPgConnection> with Box::leak(Box::new(Pool::from(Default::default())))
+autumn/src/db.rs:620:9: replace DatabaseTopology::replica -> Option<&Pool<AsyncPgConnection>> with None
+autumn/src/db.rs:620:9: replace DatabaseTopology::replica -> Option<&Pool<AsyncPgConnection>> with Some(Box::leak(Box::new(Pool::new())))
+autumn/src/db.rs:620:9: replace DatabaseTopology::replica -> Option<&Pool<AsyncPgConnection>> with Some(Box::leak(Box::new(Pool::from_iter([Default::default()]))))
+autumn/src/db.rs:620:9: replace DatabaseTopology::replica -> Option<&Pool<AsyncPgConnection>> with Some(Box::leak(Box::new(Pool::new(Default::default()))))
+autumn/src/db.rs:620:9: replace DatabaseTopology::replica -> Option<&Pool<AsyncPgConnection>> with Some(Box::leak(Box::new(Pool::from(Default::default()))))
+autumn/src/db.rs:626:9: replace DatabaseTopology::read -> &Pool<AsyncPgConnection> with Box::leak(Box::new(Pool::new()))
+autumn/src/db.rs:626:9: replace DatabaseTopology::read -> &Pool<AsyncPgConnection> with Box::leak(Box::new(Pool::from_iter([Default::default()])))
+autumn/src/db.rs:626:9: replace DatabaseTopology::read -> &Pool<AsyncPgConnection> with Box::leak(Box::new(Pool::new(Default::default())))
+autumn/src/db.rs:626:9: replace DatabaseTopology::read -> &Pool<AsyncPgConnection> with Box::leak(Box::new(Pool::from(Default::default())))
+autumn/src/db.rs:635:5: replace build_pool -> Result<Pool<AsyncPgConnection>, PoolError> with Ok(Pool::new())
+autumn/src/db.rs:635:5: replace build_pool -> Result<Pool<AsyncPgConnection>, PoolError> with Ok(Pool::from_iter([Default::default()]))
+autumn/src/db.rs:635:5: replace build_pool -> Result<Pool<AsyncPgConnection>, PoolError> with Ok(Pool::new(Default::default()))
+autumn/src/db.rs:635:5: replace build_pool -> Result<Pool<AsyncPgConnection>, PoolError> with Ok(Pool::from(Default::default()))
+autumn/src/db.rs:656:5: replace create_pool -> Result<Option<Pool<AsyncPgConnection>>, PoolError> with Ok(None)
+autumn/src/db.rs:656:5: replace create_pool -> Result<Option<Pool<AsyncPgConnection>>, PoolError> with Ok(Some(Pool::new()))
+autumn/src/db.rs:656:5: replace create_pool -> Result<Option<Pool<AsyncPgConnection>>, PoolError> with Ok(Some(Pool::from_iter([Default::default()])))
+autumn/src/db.rs:656:5: replace create_pool -> Result<Option<Pool<AsyncPgConnection>>, PoolError> with Ok(Some(Pool::new(Default::default())))
+autumn/src/db.rs:656:5: replace create_pool -> Result<Option<Pool<AsyncPgConnection>>, PoolError> with Ok(Some(Pool::from(Default::default())))
+autumn/src/db.rs:678:5: replace create_topology -> Result<Option<DatabaseTopology>, PoolError> with Ok(None)
+autumn/src/db.rs:678:5: replace create_topology -> Result<Option<DatabaseTopology>, PoolError> with Ok(Some(Default::default()))
+autumn/src/db.rs:712:5: replace create_shard_topology -> Result<DatabaseTopology, PoolError> with Ok(Default::default())
+autumn/src/db.rs:745:9: replace <impl Drop for TxDepthGuard<'_>>::drop with ()
+autumn/src/db.rs:745:21: replace -= with += in <impl Drop for TxDepthGuard<'_>>::drop
+autumn/src/db.rs:745:21: replace -= with /= in <impl Drop for TxDepthGuard<'_>>::drop
+autumn/src/db.rs:746:12: delete ! in <impl Drop for TxDepthGuard<'_>>::drop
+autumn/src/db.rs:822:9: replace Db::span -> &tracing::Span with Box::leak(Box::new(Default::default()))
+autumn/src/db.rs:855:9: replace Db::tx -> Result<T, crate::error::AutumnError> with Ok(Default::default())
+autumn/src/db.rs:862:26: replace > with == in Db::tx
+autumn/src/db.rs:862:26: replace > with < in Db::tx
+autumn/src/db.rs:862:26: replace > with >= in Db::tx
+autumn/src/db.rs:868:23: replace += with -= in Db::tx
+autumn/src/db.rs:868:23: replace += with *= in Db::tx
+autumn/src/db.rs:900:38: replace && with || in Db::tx
+autumn/src/db.rs:900:16: delete ! in Db::tx
+autumn/src/db.rs:900:41: delete ! in Db::tx
+autumn/src/db.rs:912:9: replace <impl std::ops::Deref for Db>::deref -> &Self::Target with Box::leak(Box::new(Default::default()))
+autumn/src/db.rs:922:9: replace <impl std::ops::DerefMut for Db>::deref_mut -> &mut Self::Target with Box::leak(Box::new(Default::default()))
+autumn/src/db.rs:961:9: replace Db::checkout -> Result<Self, AutumnError> with Ok(Default::default())
+autumn/src/db.rs:1052:9: replace RequestDbContext::from_parts -> Self with Default::default()
+autumn/src/db.rs:1079:9: replace <impl FromRequestParts<S> for Db>::from_request_parts -> Result<Self, Self::Rejection> with Ok(Default::default())
+autumn/src/db.rs:1100:9: replace <impl Drop for Db>::drop with ()
+autumn/src/db.rs:1109:24: replace >= with < in <impl Drop for Db>::drop
+autumn/src/db.rs:1249:9: replace <impl DatabasePoolProvider for DieselDeadpoolPoolProvider>::create_pool -> Result<Option<Pool<AsyncPgConnection>>, PoolError> with Ok(None)
+autumn/src/db.rs:1249:9: replace <impl DatabasePoolProvider for DieselDeadpoolPoolProvider>::create_pool -> Result<Option<Pool<AsyncPgConnection>>, PoolError> with Ok(Some(Pool::new()))
+autumn/src/db.rs:1249:9: replace <impl DatabasePoolProvider for DieselDeadpoolPoolProvider>::create_pool -> Result<Option<Pool<AsyncPgConnection>>, PoolError> with Ok(Some(Pool::from_iter([Default::default()])))
+autumn/src/db.rs:1249:9: replace <impl DatabasePoolProvider for DieselDeadpoolPoolProvider>::create_pool -> Result<Option<Pool<AsyncPgConnection>>, PoolError> with Ok(Some(Pool::new(Default::default())))
+autumn/src/db.rs:1249:9: replace <impl DatabasePoolProvider for DieselDeadpoolPoolProvider>::create_pool -> Result<Option<Pool<AsyncPgConnection>>, PoolError> with Ok(Some(Pool::from(Default::default())))

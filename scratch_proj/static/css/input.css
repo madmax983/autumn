@@ -1,0 +1,14 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer utilities {
+  /* Skip-to-content link — visually hidden at rest, revealed on keyboard focus.
+     Pair with the skip_link() helper from autumn_web::form. */
+  .skip-link {
+    @apply absolute -top-full left-0 z-50 px-4 py-2 bg-white text-gray-900 border border-gray-300 rounded-b font-medium text-sm;
+  }
+  .skip-link:focus {
+    @apply top-0 outline-none ring-2 ring-offset-2 ring-blue-500;
+  }
+}

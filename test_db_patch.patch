@@ -1,0 +1,31 @@
+--- autumn/src/db.rs
++++ autumn/src/db.rs
+@@ -1254,4 +1254,16 @@
+ mod tests {
+     use super::*;
++    use diesel::result::{Error, DatabaseErrorKind};
++
++    #[derive(Debug)]
++    struct MockDbError(String);
++    impl diesel::result::DatabaseErrorInformation for MockDbError {
++        fn message(&self) -> &str { &self.0 }
++        fn details(&self) -> Option<&str> { None }
++        fn hint(&self) -> Option<&str> { None }
++        fn table_name(&self) -> Option<&str> { None }
++        fn column_name(&self) -> Option<&str> { None }
++        fn constraint_name(&self) -> Option<&str> { None }
++        fn statement_position(&self) -> Option<i32> { None }
++    }
++
+     use crate::config::DatabaseConfig;
+@@ -1262,4 +1274,10 @@
+     // ── after_commit tests ───────────────────────────────────────
+
++    #[test]
++    fn test_is_query_canceled_string() {
++        let err = Error::DatabaseError(DatabaseErrorKind::Unknown, Box::new(MockDbError("57014".to_string())));
++        assert!(is_query_canceled(&err));
++    }
++
+     #[tokio::test]
+     async fn register_after_commit_outside_tx_runs_eagerly() {
