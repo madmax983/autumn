@@ -283,6 +283,32 @@ Routing is async, so a directory router may consult a cache or the
 control database. Custom pool construction per shard goes through
 `DatabasePoolProvider::create_shard_topology`.
 
+### Built-in directory router
+
+You usually don't need to hand-write the router above. The framework ships
+`DirectoryShardRouter`, which reads a control-plane `_autumn_shard_directory`
+table (`tenant_key → shard_name`), caches results with a TTL, and falls back
+to the hash router for any tenant without a row:
+
+```rust
+// Apply the framework migrations to the control DB first (creates
+// _autumn_shard_directory), then opt in:
+autumn_web::app().with_directory_shard_router()
+```
+
+Pin a tenant by inserting a row and invalidating the cache entry:
+
+```sql
+INSERT INTO _autumn_shard_directory (tenant_key, shard_name)
+VALUES ('whale-corp', 'whale')
+ON CONFLICT (tenant_key) DO UPDATE SET shard_name = EXCLUDED.shard_name;
+```
+
+The directory is the routing complement to the slot-move runbook below: move
+the data, pin the tenant to its new shard, and unpinned tenants keep hashing
+as before. (You can also enable it via `database.directory_shard_router =
+true`; an explicit `with_shard_router` always takes precedence.)
+
 ## Read-your-own-writes, × N
 
 Each shard inherits the replica story's read-your-own-writes gap:
@@ -308,6 +334,36 @@ the control replica.
 
 Moving a slot moves only that slot's keys — the framework's tests pin
 this property (`moving_a_slot_in_config_moves_only_that_slot`).
+
+### Worked example: moving a tenant's data
+
+[`examples/bookmarks-sharded/src/bin/move_slot.rs`](../../examples/bookmarks-sharded/src/bin/move_slot.rs)
+is a runnable, commented implementation of step 3's data copy. For a set of
+tenant keys it:
+
+1. copies their rows source → destination inside a single transaction on the
+   destination (the shard-local `BIGSERIAL` id is not copied, so re-runs never
+   collide on the primary key),
+2. verifies the move — row counts **and** an id-independent content checksum
+   must match on both shards,
+3. deletes the source rows only with `--confirm`, and only after verification
+   passes.
+
+```bash
+# Copy + verify only (source rows kept) — inspect both shards first:
+cargo run --bin move_slot -- \
+  --from postgres://autumn:autumn@localhost:5443/bookmarks_shard0 \
+  --to   postgres://autumn:autumn@localhost:5444/bookmarks_shard1 \
+  --tenant acme
+
+# Flip the slot in autumn.toml and deploy, then delete the stale source rows:
+cargo run --bin move_slot -- --from … --to … --tenant acme --confirm
+```
+
+The script never edits the slot map — copy and verify, cut the slot over in
+`autumn.toml`, then delete. Pinning relocated tenants explicitly (rather than
+relying on the slot move alone) is what the
+[`DirectoryShardRouter`](#custom-routing-and-whale-tenants) is for.
 
 ## Testing
 
