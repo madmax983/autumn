@@ -89,7 +89,12 @@ pub enum MigrateTarget {
 }
 
 /// Run the migrate command.
-pub fn run(action: &MigrateAction, with_maintenance: bool, target: &MigrateTarget) {
+pub fn run(
+    action: &MigrateAction,
+    with_maintenance: bool,
+    target: &MigrateTarget,
+    profile: Option<&str>,
+) {
     eprintln!("\u{1F342} autumn migrate\n");
 
     match action {
@@ -99,14 +104,15 @@ pub fn run(action: &MigrateAction, with_maintenance: bool, target: &MigrateTarge
             return;
         }
         MigrateAction::Down(args) => {
-            run_down(args, with_maintenance, target);
+            run_down(args, with_maintenance, target, profile);
             return;
         }
         _ => {}
     }
 
-    // 1. Resolve migration target databases from autumn.toml + env
-    let targets = resolve_targets(target);
+    // 1. Resolve migration target databases from autumn.toml (+ profile
+    //    overlay) + env
+    let targets = resolve_targets(target, profile);
 
     // 2. Resolve migrations directory
     let migrations_dir = resolve_migrations_dir();
@@ -139,9 +145,16 @@ pub fn run(action: &MigrateAction, with_maintenance: bool, target: &MigrateTarge
 
 /// Resolve the `(label, database_url)` pairs the command operates on,
 /// in apply order (control first, then shards in declaration order).
-fn resolve_targets(target: &MigrateTarget) -> Vec<(String, String)> {
-    let control = try_resolve_database_url();
-    let shards = resolve_shard_database_urls();
+fn resolve_targets(target: &MigrateTarget, profile: Option<&str>) -> Vec<(String, String)> {
+    // Read autumn.toml once, deep-merging the `autumn-<profile>.toml` overlay
+    // when a profile is selected, so control and shard URLs both resolve from
+    // the same effective configuration. Environment overrides still win over
+    // the merged file (handled inside the `_from_sources` helpers).
+    let config_table = read_autumn_toml_table_with_profile(profile);
+    let control =
+        resolve_primary_database_url_from_sources(|key| std::env::var(key), config_table.as_ref());
+    let shards =
+        resolve_shard_database_urls_from_sources(|key| std::env::var(key), config_table.as_ref());
     match build_targets(control, shards, target) {
         Ok(targets) => targets,
         Err(message) => {
@@ -519,13 +532,6 @@ fn resolve_database_url() -> String {
     resolve_database_url_with_env(|key| std::env::var(key))
 }
 
-/// Like [`resolve_database_url`], but returns `None` instead of exiting
-/// when no control URL is configured (valid for shard-only deployments).
-fn try_resolve_database_url() -> Option<String> {
-    let config_table = read_autumn_toml_table();
-    resolve_primary_database_url_from_sources(|key| std::env::var(key), config_table.as_ref())
-}
-
 fn resolve_database_url_with_env<F>(env_var: F) -> String
 where
     F: Fn(&str) -> Result<String, std::env::VarError>,
@@ -550,6 +556,62 @@ fn read_autumn_toml_table() -> Option<toml::Table> {
     std::fs::read_to_string(config_path)
         .ok()
         .and_then(|contents| toml::from_str::<toml::Table>(&contents).ok())
+}
+
+/// Read `autumn.toml`, deep-merging the `autumn-<profile>.toml` overlay on
+/// top when `profile` is set. This mirrors the framework's legacy
+/// `autumn-{profile}.toml` override layer (see `autumn/src/config.rs`) so
+/// `autumn migrate --profile prod` resolves the same control + shard URLs the
+/// running app would under that profile. With no profile (or no overlay file),
+/// the base table is returned unchanged.
+fn read_autumn_toml_table_with_profile(profile: Option<&str>) -> Option<toml::Table> {
+    read_autumn_toml_table_with_profile_in(Path::new("."), profile)
+}
+
+/// Directory-parameterized core of [`read_autumn_toml_table_with_profile`],
+/// separated so the overlay-merge behavior is unit-testable without mutating
+/// the process-global current directory.
+fn read_autumn_toml_table_with_profile_in(dir: &Path, profile: Option<&str>) -> Option<toml::Table> {
+    let read_table = |path: &Path| -> Option<toml::Table> {
+        if !path.exists() {
+            return None;
+        }
+        std::fs::read_to_string(path)
+            .ok()
+            .and_then(|contents| toml::from_str::<toml::Table>(&contents).ok())
+    };
+
+    let base = read_table(&dir.join("autumn.toml"));
+    let Some(profile) = profile.filter(|p| !p.is_empty()) else {
+        return base;
+    };
+
+    let overlay = read_table(&dir.join(format!("autumn-{profile}.toml")));
+    match (base, overlay) {
+        (Some(mut base), Some(overlay)) => {
+            deep_merge_toml(&mut base, overlay);
+            Some(base)
+        }
+        (base, None) => base,
+        (None, Some(overlay)) => Some(overlay),
+    }
+}
+
+/// Deep-merge `overlay` into `base`: nested tables are merged recursively,
+/// every other value (scalars, arrays) in `overlay` replaces the matching key
+/// in `base`. Keys present only in `base` are preserved. This matches the
+/// framework's profile-overlay merge semantics (`autumn/src/config.rs`).
+fn deep_merge_toml(base: &mut toml::Table, overlay: toml::Table) {
+    for (key, overlay_val) in overlay {
+        match (base.get_mut(&key), overlay_val) {
+            (Some(toml::Value::Table(base_child)), toml::Value::Table(overlay_child)) => {
+                deep_merge_toml(base_child, overlay_child);
+            }
+            (_, overlay_val) => {
+                base.insert(key, overlay_val);
+            }
+        }
+    }
 }
 
 fn resolve_primary_database_url_from_sources<F>(
@@ -591,18 +653,6 @@ where
 /// `AUTUMN_DATABASE__SHARDS__{i}__NAME` / `__PRIMARY_URL` override entry
 /// `i` of the TOML declaration (or append a new entry when both are set
 /// for the next free index); probing stops at the first absent index.
-fn resolve_shard_database_urls() -> Vec<(String, String)> {
-    resolve_shard_database_urls_with_env(|key| std::env::var(key))
-}
-
-fn resolve_shard_database_urls_with_env<F>(env_var: F) -> Vec<(String, String)>
-where
-    F: Fn(&str) -> Result<String, std::env::VarError>,
-{
-    let config_table = read_autumn_toml_table();
-    resolve_shard_database_urls_from_sources(env_var, config_table.as_ref())
-}
-
 fn resolve_shard_database_urls_from_sources<F>(
     env_var: F,
     table: Option<&toml::Table>,
@@ -844,7 +894,12 @@ fn build_rollback_plan(args: &DownArgs, applied: &[AppliedUserMigration]) -> Vec
 }
 
 /// Run `autumn migrate down`.
-fn run_down(args: &DownArgs, with_maintenance: bool, target: &MigrateTarget) {
+fn run_down(
+    args: &DownArgs,
+    with_maintenance: bool,
+    target: &MigrateTarget,
+    profile: Option<&str>,
+) {
     // 1. Production guard
     if is_production_profile() && !args.yes_i_mean_prod {
         eprintln!("\u{2717} Production profile detected.");
@@ -856,7 +911,7 @@ fn run_down(args: &DownArgs, with_maintenance: bool, target: &MigrateTarget) {
     // 2. Resolve target databases (control + shards / a single shard /
     //    control-only) and the migrations dir. `down` honors --shard /
     //    --control-only exactly like `migrate run`.
-    let targets = resolve_targets(target);
+    let targets = resolve_targets(target, profile);
     let migrations_dir = resolve_migrations_dir();
     let dir = Path::new(&migrations_dir);
 
@@ -1974,6 +2029,122 @@ primary_url = "postgres://toml:5432/app"
     #[test]
     fn shard_urls_empty_without_shards() {
         assert!(resolve_shard_database_urls_from_sources(no_env, None).is_empty());
+    }
+
+    // ── deep_merge_toml / profile overlay ──────────────────────────────────
+
+    #[test]
+    fn deep_merge_toml_overlay_scalar_wins() {
+        let mut base = toml::from_str::<toml::Table>(
+            r#"
+[database]
+primary_url = "postgres://base:5432/app"
+pool_size = 5
+"#,
+        )
+        .unwrap();
+        let overlay = toml::from_str::<toml::Table>(
+            r#"
+[database]
+primary_url = "postgres://prod:5432/app"
+"#,
+        )
+        .unwrap();
+
+        deep_merge_toml(&mut base, overlay);
+
+        let database = base.get("database").and_then(toml::Value::as_table).unwrap();
+        // Overlay scalar replaces the base value...
+        assert_eq!(
+            database.get("primary_url").and_then(toml::Value::as_str),
+            Some("postgres://prod:5432/app")
+        );
+        // ...while base-only keys in the same table are preserved.
+        assert_eq!(
+            database.get("pool_size").and_then(toml::Value::as_integer),
+            Some(5)
+        );
+    }
+
+    #[test]
+    fn deep_merge_toml_arrays_replaced_wholesale() {
+        // Shard arrays must be replaced, not concatenated, so a profile can
+        // point at an entirely different set of shard databases.
+        let mut base = toml::from_str::<toml::Table>(
+            r#"
+[[database.shards]]
+name = "s0"
+primary_url = "postgres://base-s0:5432/app"
+"#,
+        )
+        .unwrap();
+        let overlay = toml::from_str::<toml::Table>(
+            r#"
+[[database.shards]]
+name = "s0"
+primary_url = "postgres://prod-s0:5432/app"
+"#,
+        )
+        .unwrap();
+
+        deep_merge_toml(&mut base, overlay);
+
+        let shards = resolve_shard_database_urls_from_sources(no_env, Some(&base));
+        assert_eq!(
+            shards,
+            vec![("s0".to_owned(), "postgres://prod-s0:5432/app".to_owned())]
+        );
+    }
+
+    #[test]
+    fn profile_overlay_overrides_shard_url() {
+        // End-to-end through the file loader: a base autumn.toml plus an
+        // autumn-prod.toml overlay; --profile prod resolves the prod URLs.
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join("autumn.toml"),
+            r#"
+[database]
+primary_url = "postgres://base-control:5432/app"
+
+[[database.shards]]
+name = "s0"
+primary_url = "postgres://base-s0:5432/app"
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("autumn-prod.toml"),
+            r#"
+[database]
+primary_url = "postgres://prod-control:5432/app"
+
+[[database.shards]]
+name = "s0"
+primary_url = "postgres://prod-s0:5432/app"
+"#,
+        )
+        .unwrap();
+
+        let with_profile = read_autumn_toml_table_with_profile_in(tmp.path(), Some("prod"));
+        let without_profile = read_autumn_toml_table_with_profile_in(tmp.path(), None);
+
+        let merged = with_profile.unwrap();
+        assert_eq!(
+            resolve_primary_database_url_from_sources(no_env, Some(&merged)).as_deref(),
+            Some("postgres://prod-control:5432/app")
+        );
+        assert_eq!(
+            resolve_shard_database_urls_from_sources(no_env, Some(&merged)),
+            vec![("s0".to_owned(), "postgres://prod-s0:5432/app".to_owned())]
+        );
+
+        // Without a profile, the base file is returned unchanged.
+        let base = without_profile.unwrap();
+        assert_eq!(
+            resolve_primary_database_url_from_sources(no_env, Some(&base)).as_deref(),
+            Some("postgres://base-control:5432/app")
+        );
     }
 
     // ── check_concurrent_index_transaction_opt_out ────────────────────────

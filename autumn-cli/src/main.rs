@@ -104,6 +104,11 @@ enum Commands {
         /// skipping any configured shards.
         #[arg(long)]
         control_only: bool,
+        /// Resolve database URLs through a profile overlay: deep-merge
+        /// `autumn-<profile>.toml` over `autumn.toml` before reading the
+        /// control and shard URLs. Defaults to the `AUTUMN_PROFILE` env var.
+        #[arg(long, value_name = "PROFILE", env = "AUTUMN_PROFILE")]
+        profile: Option<String>,
     },
     /// Live monitoring dashboard for a running Autumn application
     Monitor {
@@ -1343,6 +1348,7 @@ fn run_command(command: Commands) {
             with_maintenance,
             shard,
             control_only,
+            profile,
         } => {
             let action = match action {
                 Some(MigrateCommands::Status) => migrate::MigrateAction::Status,
@@ -1363,7 +1369,7 @@ fn run_command(command: Commands) {
                 (None, true) => migrate::MigrateTarget::ControlOnly,
                 (None, false) => migrate::MigrateTarget::All,
             };
-            migrate::run(&action, with_maintenance, &target);
+            migrate::run(&action, with_maintenance, &target, profile.as_deref());
         }
         Commands::Maintenance(cmd) => match cmd {
             MaintenanceCommands::On {
