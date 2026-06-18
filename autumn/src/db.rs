@@ -125,14 +125,11 @@ pub(crate) fn spawn_committed_after_commit_callbacks(
 }
 
 fn after_commit_panic_message(payload: &(dyn Any + Send)) -> String {
-    match (
-        payload.downcast_ref::<&'static str>(),
-        payload.downcast_ref::<String>(),
-    ) {
-        (Some(message), _) => (*message).to_owned(),
-        (_, Some(message)) => message.clone(),
-        (None, None) => "non-string panic payload".to_owned(),
-    }
+    payload
+        .downcast_ref::<&'static str>()
+        .map(|message| (*message).to_owned())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "non-string panic payload".to_owned())
 }
 
 /// Register a callback to run after the current database transaction commits.
@@ -274,20 +271,19 @@ pub trait DbState {
 /// Called after the opening `'` has already been consumed. Handles
 /// `\'` backslash-escaped quotes so they do not prematurely close the string.
 fn consume_estring_body(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
-    loop {
-        match chars.next() {
-            None => break,
-            Some('\'') => {
+    while let Some(c) = chars.next() {
+        match c {
+            '\'' => {
                 if chars.peek() == Some(&'\'') {
                     chars.next(); // consume the doubled quote
                 } else {
                     break;
                 }
             }
-            Some('\\') => {
+            '\\' => {
                 chars.next(); // skip the character after the backslash
             }
-            Some(_) => {}
+            _ => {}
         }
     }
 }
@@ -356,19 +352,15 @@ pub fn scrub_sql(sql: &str) -> String {
         if c == '\'' {
             out.push_str("'?'");
             prev_is_sep = false;
-            loop {
-                match chars.next() {
-                    None => break,
-                    Some('\'') => {
-                        if chars.peek() == Some(&'\'') {
-                            // Escaped quote ('') — consume both, stay inside string
-                            chars.next();
-                        } else {
-                            // Closing quote
-                            break;
-                        }
+            while let Some(sc) = chars.next() {
+                if sc == '\'' {
+                    if chars.peek() == Some(&'\'') {
+                        // Escaped quote ('') — consume both, stay inside string
+                        chars.next();
+                    } else {
+                        // Closing quote
+                        break;
                     }
-                    Some(_) => {}
                 }
             }
             continue;
