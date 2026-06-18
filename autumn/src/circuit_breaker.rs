@@ -1,3 +1,61 @@
+//! Fault tolerance primitives to prevent cascading failures.
+//!
+//! The Circuit Breaker pattern prevents an application from repeatedly trying to
+//! execute an operation that's likely to fail. It is a state machine that wraps
+//! a potentially failing call and tracks successes and failures over time.
+//!
+//! When failures exceed a certain threshold, the circuit "opens" and immediately
+//! rejects further calls without executing them. After a timeout, it transitions
+//! to a "half-open" state to test if the underlying issue has been resolved.
+//!
+//! # Examples
+//!
+//! ```
+//! use std::time::Duration;
+//! use autumn_web::circuit_breaker::{CircuitBreaker, CircuitBreakerPolicy, CircuitState};
+//!
+//! # tokio::runtime::Runtime::new().unwrap().block_on(async {
+//! let policy = CircuitBreakerPolicy {
+//!     failure_ratio_threshold: 0.5,
+//!     sample_window: Duration::from_secs(10),
+//!     minimum_sample_count: 2,
+//!     open_duration: Duration::from_secs(60),
+//!     half_open_trial_count: 1,
+//! };
+//!
+//! let breaker = CircuitBreaker::new("my_api", policy);
+//!
+//! // Execute a successful async call
+//! let res: Result<&str, _> = breaker.run(async { Ok::<_, &'static str>("success") }).await;
+//! assert_eq!(res.unwrap(), "success");
+//! assert_eq!(breaker.state(), CircuitState::Closed);
+//! # })
+//! ```
+//!
+//! # State Machine Details
+//!
+//! The circuit breaker operates in three states:
+//!
+//! - **Closed:** Normal operation. Calls are executed. If the failure ratio exceeds
+//!   [`CircuitBreakerPolicy::failure_ratio_threshold`] (after a minimum number of samples),
+//!   the circuit transitions to Open.
+//! - **Open:** The circuit is tripped. All calls immediately fail with
+//!   [`CircuitBreakerError::Open`]. It remains open for [`CircuitBreakerPolicy::open_duration`].
+//! - **Half-Open:** After the open duration expires, a limited number of test calls
+//!   (defined by [`CircuitBreakerPolicy::half_open_trial_count`]) are allowed through.
+//!   If they succeed, the circuit closes. If any fail, it trips back to Open.
+//!
+//! # Tower Integration
+//!
+//! For HTTP and RPC clients, you can wrap an inner `Service` using
+//! [`CircuitBreakerLayer`].
+//!
+//! # Panics
+//!
+//! Internal registry operations such as [`CircuitBreakerRegistry::all_breakers`]
+//! and [`CircuitBreakerRegistry::clear`] will panic if the underlying registry lock
+//! has been poisoned.
+
 #![allow(
     clippy::missing_panics_doc,
     clippy::missing_errors_doc,
