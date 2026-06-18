@@ -147,6 +147,16 @@ mod tests {
     }
 
     #[test]
+    fn test_encode_path_segment() {
+        assert_eq!(encode_path_segment("a/b"), "a%2Fb");
+        assert_eq!(encode_path_segment("c d"), "c%20d");
+        assert_eq!(
+            encode_path_segment("hello-world_foo.bar~baz"),
+            "hello-world_foo.bar~baz"
+        );
+    }
+
+    #[test]
     fn test_encode_catch_all_param() {
         assert_eq!(encode_catch_all_param("a/b/c d"), "a/b/c%20d");
         assert_eq!(encode_catch_all_param("foo bar/baz"), "foo%20bar/baz");
