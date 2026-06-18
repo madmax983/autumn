@@ -1364,7 +1364,7 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         let field_exists = key == "id"
             || all_fields
                 .iter()
-                .any(|f| f.ident.as_ref().map_or(false, |i| i == key));
+                .any(|f| f.ident.as_ref().is_some_and(|i| i == key));
         if !field_exists {
             let attr = outer_attrs
                 .iter()
