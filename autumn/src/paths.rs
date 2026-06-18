@@ -32,11 +32,15 @@ pub trait PathExt {
 }
 
 impl PathExt for String {
-    fn with_query(self, key: impl std::fmt::Display, value: impl std::fmt::Display) -> String {
-        let encoded_key = percent_encode(&key.to_string());
-        let encoded_value = percent_encode(&value.to_string());
+    /// Reduces heap allocations by mutating `self` directly instead of allocating
+    /// intermediate formatting strings for the final URL and URL-encoded parts.
+    fn with_query(mut self, key: impl std::fmt::Display, value: impl std::fmt::Display) -> String {
         let sep = if self.contains('?') { '&' } else { '?' };
-        format!("{self}{sep}{encoded_key}={encoded_value}")
+        self.push(sep);
+        percent_encode_to(&key.to_string(), &mut self);
+        self.push('=');
+        percent_encode_to(&value.to_string(), &mut self);
+        self
     }
 }
 
@@ -56,20 +60,24 @@ pub fn encode_path_segment(value: impl std::fmt::Display) -> String {
 /// other characters in each segment.
 #[doc(hidden)]
 #[must_use]
+/// Reduces heap allocations by URL-encoding segments into a single pre-allocated
+/// String buffer rather than collecting into intermediate `Vec<String>`.
 pub fn encode_catch_all_param(value: impl std::fmt::Display) -> String {
     let s = value.to_string();
-    s.split('/')
-        .map(|segment| {
-            if segment == "." {
-                "%2E".to_string()
-            } else if segment == ".." {
-                "%2E%2E".to_string()
-            } else {
-                percent_encode(segment)
-            }
-        })
-        .collect::<Vec<String>>()
-        .join("/")
+    let mut out = String::with_capacity(s.len());
+    for (i, segment) in s.split('/').enumerate() {
+        if i > 0 {
+            out.push('/');
+        }
+        if segment == "." {
+            out.push_str("%2E");
+        } else if segment == ".." {
+            out.push_str("%2E%2E");
+        } else {
+            percent_encode_to(segment, &mut out);
+        }
+    }
+    out
 }
 
 /// Percent-encode a query component per RFC 3986.
@@ -78,6 +86,13 @@ pub fn encode_catch_all_param(value: impl std::fmt::Display) -> String {
 /// unchanged; everything else is `%XX`-encoded.
 fn percent_encode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
+    percent_encode_to(s, &mut out);
+    out
+}
+
+/// Percent-encode a query component per RFC 3986, appending directly to `out`.
+/// This avoids allocating intermediate `String`s when chaining URLs.
+fn percent_encode_to(s: &str, out: &mut String) {
     for byte in s.bytes() {
         match byte {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
@@ -100,7 +115,6 @@ fn percent_encode(s: &str) -> String {
             }
         }
     }
-    out
 }
 
 #[cfg(test)]
