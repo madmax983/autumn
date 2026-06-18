@@ -157,3 +157,166 @@ fn is_trusted_proxy(ip: IpAddr, trusted_proxies: &[TrustedProxy]) -> bool {
         .iter()
         .any(|trusted_proxy| trusted_proxy.contains(ip))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::Request;
+
+    #[test]
+    fn trusted_proxy_parse_valid() {
+        let tp = TrustedProxy::parse("10.0.0.1/24").unwrap();
+        assert_eq!(tp.network, "10.0.0.1".parse::<IpAddr>().unwrap());
+        assert_eq!(tp.prefix_len, 24);
+
+        let tp = TrustedProxy::parse("192.168.1.5").unwrap();
+        assert_eq!(tp.network, "192.168.1.5".parse::<IpAddr>().unwrap());
+        assert_eq!(tp.prefix_len, 32);
+
+        let tp = TrustedProxy::parse("::1").unwrap();
+        assert_eq!(tp.network, "::1".parse::<IpAddr>().unwrap());
+        assert_eq!(tp.prefix_len, 128);
+    }
+
+    #[test]
+    fn trusted_proxy_parse_invalid() {
+        assert!(TrustedProxy::parse("").is_none());
+        assert!(TrustedProxy::parse("   ").is_none());
+        assert!(TrustedProxy::parse("invalid").is_none());
+        assert!(TrustedProxy::parse("10.0.0.1/invalid").is_none());
+        assert!(TrustedProxy::parse("10.0.0.1/33").is_none());
+        assert!(TrustedProxy::parse("::1/129").is_none());
+    }
+
+    #[test]
+    fn trusted_proxy_contains() {
+        let tp = TrustedProxy::parse("10.0.0.0/8").unwrap();
+        assert!(tp.contains("10.1.2.3".parse().unwrap()));
+        assert!(!tp.contains("11.0.0.1".parse().unwrap()));
+
+        let tp = TrustedProxy::parse("192.168.1.5").unwrap();
+        assert!(tp.contains("192.168.1.5".parse().unwrap()));
+        assert!(!tp.contains("192.168.1.6".parse().unwrap()));
+
+        let tp = TrustedProxy::parse("2001:db8::/32").unwrap();
+        assert!(tp.contains("2001:db8:1234::1".parse().unwrap()));
+        assert!(!tp.contains("2001:db9::".parse().unwrap()));
+
+        // Mismatched families
+        let tp = TrustedProxy::parse("10.0.0.0/8").unwrap();
+        assert!(!tp.contains("::1".parse().unwrap()));
+
+        let tp = TrustedProxy::parse("::1/128").unwrap();
+        assert!(!tp.contains("127.0.0.1".parse().unwrap()));
+
+        let tp = TrustedProxy::parse("0.0.0.0/0").unwrap();
+        assert!(tp.contains("1.2.3.4".parse().unwrap()));
+    }
+
+    #[test]
+    fn extract_client_ip_no_trusted_proxies_configured() {
+        let req = Request::builder()
+            .header("x-forwarded-for", "1.2.3.4, 5.6.7.8")
+            .extension(ConnectInfo(SocketAddr::from(([5, 6, 7, 8], 12345))))
+            .body(())
+            .unwrap();
+
+        let trusted_proxies = [];
+        let ip = extract_client_ip(&req, true, &trusted_proxies, false);
+        assert_eq!(ip, Some("1.2.3.4".parse().unwrap()));
+    }
+
+    #[test]
+    fn extract_client_ip_no_trusted_proxies_configured_ignores_unmatched_peer() {
+        let req = Request::builder()
+            .header("x-forwarded-for", "1.2.3.4, 5.6.7.8")
+            .extension(ConnectInfo(SocketAddr::from(([9, 9, 9, 9], 12345))))
+            .body(())
+            .unwrap();
+
+        let trusted_proxies = [];
+        let ip = extract_client_ip(&req, true, &trusted_proxies, false);
+        assert_eq!(ip, Some("5.6.7.8".parse().unwrap()));
+    }
+
+    #[test]
+    fn extract_client_ip_trusted_proxies_configured_peer_trusted() {
+        let req = Request::builder()
+            .header("x-forwarded-for", "1.2.3.4, 10.0.0.1")
+            .extension(ConnectInfo(SocketAddr::from(([10, 0, 0, 2], 12345))))
+            .body(())
+            .unwrap();
+
+        let trusted_proxies = [TrustedProxy::parse("10.0.0.0/8").unwrap()];
+        let ip = extract_client_ip(&req, true, &trusted_proxies, true);
+        assert_eq!(ip, Some("1.2.3.4".parse().unwrap()));
+    }
+
+    #[test]
+    fn extract_client_ip_trusted_proxies_configured_peer_untrusted() {
+        let req = Request::builder()
+            .header("x-forwarded-for", "1.2.3.4, 10.0.0.1")
+            .extension(ConnectInfo(SocketAddr::from(([9, 9, 9, 9], 12345))))
+            .body(())
+            .unwrap();
+
+        let trusted_proxies = [TrustedProxy::parse("10.0.0.0/8").unwrap()];
+        let ip = extract_client_ip(&req, true, &trusted_proxies, true);
+        assert_eq!(ip, Some("9.9.9.9".parse().unwrap())); // Falls back to peer IP because peer is not trusted
+    }
+
+    #[test]
+    fn extract_client_ip_falls_back_to_x_real_ip() {
+        let req = Request::builder()
+            .header("x-real-ip", "1.2.3.4")
+            .extension(ConnectInfo(SocketAddr::from(([10, 0, 0, 2], 12345))))
+            .body(())
+            .unwrap();
+
+        let trusted_proxies = [TrustedProxy::parse("10.0.0.0/8").unwrap()];
+        let ip = extract_client_ip(&req, true, &trusted_proxies, true);
+        assert_eq!(ip, Some("1.2.3.4".parse().unwrap()));
+    }
+
+    #[test]
+    fn extract_client_ip_no_headers() {
+        let req = Request::builder()
+            .extension(ConnectInfo(SocketAddr::from(([1, 2, 3, 4], 12345))))
+            .body(())
+            .unwrap();
+
+        let trusted_proxies = [];
+        let ip = extract_client_ip(&req, true, &trusted_proxies, false);
+        assert_eq!(ip, Some("1.2.3.4".parse().unwrap()));
+    }
+
+    #[test]
+    fn extract_client_ip_trust_forwarded_headers_false() {
+        let req = Request::builder()
+            .header("x-forwarded-for", "9.9.9.9")
+            .header("x-real-ip", "8.8.8.8")
+            .extension(ConnectInfo(SocketAddr::from(([1, 2, 3, 4], 12345))))
+            .body(())
+            .unwrap();
+
+        let trusted_proxies = [];
+        let ip = extract_client_ip(&req, false, &trusted_proxies, false);
+        assert_eq!(ip, Some("1.2.3.4".parse().unwrap()));
+    }
+
+    #[test]
+    fn client_ip_from_x_forwarded_for_invalid_ip() {
+        let peer_ip = Some("5.6.7.8".parse().unwrap());
+        let trusted_proxies = [];
+        let ip = client_ip_from_x_forwarded_for(
+            "1.2.3.4, invalid, 5.6.7.8",
+            peer_ip,
+            &trusted_proxies,
+            false,
+        );
+        assert_eq!(ip, Some("5.6.7.8".parse().unwrap())); // Because peer matched the last valid IP? No, the last string is 5.6.7.8 which parses.
+
+        let ip = client_ip_from_x_forwarded_for("invalid", peer_ip, &trusted_proxies, false);
+        assert_eq!(ip, None);
+    }
+}
