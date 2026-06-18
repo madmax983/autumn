@@ -3118,7 +3118,7 @@ impl SlotSpec {
 /// replica_url = "postgres://db-shard1-ro/app"
 /// replica_fallback = "primary"
 /// ```
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct ShardConfig {
     /// Stable shard identity used in logs, metric tags, health component
     /// names (`db:shard:<name>`), and `autumn migrate --shard <name>`.
