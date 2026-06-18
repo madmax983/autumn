@@ -1,9 +1,50 @@
-//! Liveness, readiness, and startup probes.
+//! Liveness, readiness, and startup probes for application health monitoring.
 //!
-//! Autumn exposes explicit cloud-native probe contracts:
-//! - liveness ignores startup and dependency state
-//! - readiness reflects startup completion, shutdown draining, and core dependencies
-//! - startup stays unavailable until startup hooks complete
+//! This module provides the core state machine and HTTP handlers for standard
+//! health probes, designed to integrate seamlessly with container orchestrators
+//! like Kubernetes.
+//!
+//! # The Three Probes
+//!
+//! Autumn's probe system implements the three standard probe types:
+//!
+//! 1. **`/startup`**: Answers "Is the application done initializing?"
+//!    This prevents readiness and liveness checks from killing the container
+//!    while it's performing long-running startup tasks (e.g., initial database migrations).
+//! 2. **`/ready`**: Answers "Is the application ready to receive traffic?"
+//!    This checks external dependencies (like the database pool) and is used
+//!    to route traffic to healthy replicas. It also flips to `false` during
+//!    graceful shutdown.
+//! 3. **`/live`**: Answers "Is the application running?"
+//!    This is a simple check that the process is alive. If this fails, the
+//!    container is restarted.
+//!
+//! # Integration
+//!
+//! To use the probe handlers, your application state must implement the
+//! [`ProvideProbeState`] trait, which exposes the shared [`ProbeState`] and
+//! necessary dependencies to the handlers.
+//!
+//! ```rust
+//! use autumn_web::probe::{ProbeState, ProvideProbeState};
+//!
+//! #[derive(Clone)]
+//! struct AppState {
+//!     probes: ProbeState,
+//! }
+//!
+//! impl ProvideProbeState for AppState {
+//!     fn probes(&self) -> &ProbeState { &self.probes }
+//!     fn health_detailed(&self) -> bool { true }
+//!     fn profile(&self) -> &str { "dev" }
+//!     fn uptime_display(&self) -> String { "1h".to_string() }
+//!     #[cfg(feature = "db")]
+//!     fn pool(&self) -> Option<&diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>> { None }
+//! }
+//! ```
+//!
+//! Handlers like [`live_handler`], [`ready_handler`], and [`startup_handler`]
+//! can then be mounted to an `axum::Router` directly.
 
 use std::sync::Arc;
 #[cfg(feature = "db")]
@@ -553,6 +594,40 @@ async fn check_readiness_indicators<S: ProvideProbeState + Sync>(state: &S) -> b
 }
 
 /// `GET /live`
+///
+/// Liveness probe handler that always returns HTTP 200 OK as long as the
+/// HTTP server is running and accepting connections.
+///
+/// Use this to tell orchestrators (like Kubernetes) that the container has not
+/// completely deadlocked or crashed. If this probe fails, the orchestrator
+/// should restart the container.
+///
+/// # Returns
+///
+/// - `200 OK`
+///
+/// # Examples
+///
+/// ```rust
+/// use autumn_web::probe::{live_handler, ProbeState, ProvideProbeState};
+/// use axum::routing::get;
+///
+/// #[derive(Clone)]
+/// struct AppState { probes: ProbeState }
+/// impl ProvideProbeState for AppState {
+///     fn probes(&self) -> &ProbeState { &self.probes }
+///     fn health_detailed(&self) -> bool { true }
+///     fn profile(&self) -> &str { "dev" }
+///     fn uptime_display(&self) -> String { "1h".to_string() }
+///     #[cfg(feature = "db")]
+///     fn pool(&self) -> Option<&diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>> { None }
+/// }
+///
+/// let app_state = AppState { probes: ProbeState::ready_for_test() };
+/// let app: axum::Router = axum::Router::new()
+///     .route("/live", get(live_handler::<AppState>))
+///     .with_state(app_state);
+/// ```
 pub async fn live_handler<S: ProvideProbeState + Send + Sync + 'static>(
     State(state): State<S>,
 ) -> impl IntoResponse {
@@ -560,6 +635,44 @@ pub async fn live_handler<S: ProvideProbeState + Send + Sync + 'static>(
 }
 
 /// `GET /ready`
+///
+/// Readiness probe handler that verifies the application is fully started,
+/// not currently shutting down, and all essential dependencies (like the
+/// database connection pool) are healthy.
+///
+/// Use this to tell load balancers and orchestrators whether they should
+/// route traffic to this specific instance. If this probe fails, the
+/// orchestrator will temporarily remove the pod from the load balancer
+/// without restarting it.
+///
+/// # Returns
+///
+/// - `200 OK` if the app is started, not draining, and dependencies are healthy.
+/// - `503 Service Unavailable` otherwise (e.g. still starting up, draining,
+///   or database is unreachable).
+///
+/// # Examples
+///
+/// ```rust
+/// use autumn_web::probe::{ready_handler, ProbeState, ProvideProbeState};
+/// use axum::routing::get;
+///
+/// #[derive(Clone)]
+/// struct AppState { probes: ProbeState }
+/// impl ProvideProbeState for AppState {
+///     fn probes(&self) -> &ProbeState { &self.probes }
+///     fn health_detailed(&self) -> bool { true }
+///     fn profile(&self) -> &str { "dev" }
+///     fn uptime_display(&self) -> String { "1h".to_string() }
+///     #[cfg(feature = "db")]
+///     fn pool(&self) -> Option<&diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>> { None }
+/// }
+///
+/// let app_state = AppState { probes: ProbeState::ready_for_test() };
+/// let app: axum::Router = axum::Router::new()
+///     .route("/ready", get(ready_handler::<AppState>))
+///     .with_state(app_state);
+/// ```
 pub async fn ready_handler<S: ProvideProbeState + Send + Sync + 'static>(
     State(state): State<S>,
 ) -> impl IntoResponse {
@@ -575,6 +688,40 @@ pub async fn ready_handler<S: ProvideProbeState + Send + Sync + 'static>(
 }
 
 /// `GET /startup`
+///
+/// Startup probe handler that indicates whether long-running initialization
+/// tasks (like database migrations or warming up caches) have finished.
+///
+/// Use this in container orchestrators to delay the activation of liveness
+/// and readiness probes until the application is fully bootstrapped.
+///
+/// # Returns
+///
+/// - `200 OK` if initialization is complete.
+/// - `503 Service Unavailable` if still initializing.
+///
+/// # Examples
+///
+/// ```rust
+/// use autumn_web::probe::{startup_handler, ProbeState, ProvideProbeState};
+/// use axum::routing::get;
+///
+/// #[derive(Clone)]
+/// struct AppState { probes: ProbeState }
+/// impl ProvideProbeState for AppState {
+///     fn probes(&self) -> &ProbeState { &self.probes }
+///     fn health_detailed(&self) -> bool { true }
+///     fn profile(&self) -> &str { "dev" }
+///     fn uptime_display(&self) -> String { "1h".to_string() }
+///     #[cfg(feature = "db")]
+///     fn pool(&self) -> Option<&diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>> { None }
+/// }
+///
+/// let app_state = AppState { probes: ProbeState::ready_for_test() };
+/// let app: axum::Router = axum::Router::new()
+///     .route("/startup", get(startup_handler::<AppState>))
+///     .with_state(app_state);
+/// ```
 pub async fn startup_handler<S: ProvideProbeState + Send + Sync + 'static>(
     State(state): State<S>,
 ) -> impl IntoResponse {
