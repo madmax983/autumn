@@ -391,7 +391,10 @@ where
     }
 
     fn call(&mut self, mut req: Request<axum::body::Body>) -> Self::Future {
-        let path = req.uri().path();
+        let raw_path = req.uri().path();
+        let clean = crate::security::path::clean_path(raw_path);
+        let path = clean.as_str();
+
         let is_exempt = self.settings.exempt_paths.iter().any(|prefix| {
             if path == prefix {
                 true

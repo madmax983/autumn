@@ -148,6 +148,7 @@ pub(crate) mod trusted_proxies;
 // Re-export commonly used types at the module level.
 #[cfg(feature = "maud")]
 pub use captcha::bot_protection_widget;
+pub(crate) mod path;
 pub use captcha::{
     AlwaysPassProvider, BotProtectionConfig, BotProtectionLayer, CaptchaProvider,
     CaptchaProviderKind, TestCaptchaProvider,
