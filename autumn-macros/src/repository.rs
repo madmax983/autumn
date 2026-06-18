@@ -108,6 +108,12 @@ struct RepoConfig {
     /// replica is configured (#971). Use for read-after-write-sensitive
     /// aggregates that cannot tolerate replication lag.
     primary_reads: bool,
+    /// When `true`, the generated `FromRequestParts` resolves the tenant → shard
+    /// automatically so handlers can extract the repository directly without a
+    /// [`ShardedDb`] extractor. Requires shards to be configured in `[[database.shards]]`.
+    /// Works with `tenant_scoped` for per-tenant routing and `across_tenants` for
+    /// cross-shard fan-out reads. (issue #1209)
+    sharded: bool,
 }
 
 #[allow(clippy::too_many_lines)]
@@ -128,6 +134,7 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
     let mut versioned = false;
     let mut no_versioned_record_impl = false;
     let mut primary_reads = false;
+    let mut sharded = false;
 
     syn::meta::parser(|meta| {
         // `hooks = Ident` must be checked before the catch-all model_name case,
@@ -186,12 +193,15 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
         } else if meta.path.is_ident("primary_reads") {
             primary_reads = true;
             Ok(())
+        } else if meta.path.is_ident("sharded") {
+            sharded = true;
+            Ok(())
         } else if meta.path.get_ident().is_some() && model_name.is_none() {
             model_name = Some(meta.path.get_ident().unwrap().clone());
             Ok(())
         } else {
             Err(meta.error(
-                "expected model name, table = \"...\", hooks = Type, commit_hooks = true, api = \"/path\", policy = Type, scope = Type, cursor_key = field, cursor_key_type = Type, soft_delete, tenant_scoped, no_upsert_trait, searchable, versioned = true, no_versioned_record_impl, or primary_reads",
+                "expected model name, table = \"...\", hooks = Type, commit_hooks = true, api = \"/path\", policy = Type, scope = Type, cursor_key = field, cursor_key_type = Type, soft_delete, tenant_scoped, no_upsert_trait, searchable, versioned = true, no_versioned_record_impl, primary_reads, or sharded",
             ))
         }
     })
@@ -228,6 +238,7 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
         versioned,
         no_versioned_record_impl,
         primary_reads,
+        sharded,
     })
 }
 
@@ -9816,5 +9827,32 @@ mod tests {
             generated.contains("save"),
             "non-versioned repository must still generate save"
         );
+    }
+
+    #[test]
+    fn parse_repo_args_sharded_flag() {
+        let tokens: proc_macro2::TokenStream =
+            "Post, tenant_scoped, sharded".parse().unwrap();
+        let config = parse_repo_args(tokens).unwrap();
+        assert_eq!(config.model_name.to_string(), "Post");
+        assert!(config.sharded, "sharded attribute must be set");
+        assert!(config.tenant_scoped, "tenant_scoped must also be set");
+    }
+
+    #[test]
+    fn parse_repo_args_sharded_defaults_off() {
+        let tokens: proc_macro2::TokenStream = "Post".parse().unwrap();
+        let config = parse_repo_args(tokens).unwrap();
+        assert!(!config.sharded, "sharded must default to false");
+    }
+
+    #[test]
+    fn parse_repo_args_sharded_alone() {
+        // `sharded` without `tenant_scoped` is allowed — routing uses
+        // ShardKeyOverride or the tenancy config.
+        let tokens: proc_macro2::TokenStream = "Post, sharded".parse().unwrap();
+        let config = parse_repo_args(tokens).unwrap();
+        assert!(config.sharded);
+        assert!(!config.tenant_scoped);
     }
 }
