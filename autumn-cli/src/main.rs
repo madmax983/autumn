@@ -1308,6 +1308,14 @@ enum GenerateCommands {
         /// Scaffold a JSON-only API resource (no HTML/Maud views, mount CRUD endpoints).
         #[arg(long)]
         api: bool,
+        /// Generate shard-aware handlers: uses `ShardedDb` instead of `Db` and
+        /// calls `from_shard(&db)` on generated repositories.
+        #[arg(long)]
+        sharded: bool,
+        /// The model field used as the sharding key (e.g. `tenant_id`).
+        /// Defaults to `tenant_id` if that field is present, otherwise `id`.
+        #[arg(long, value_name = "FIELD")]
+        shard_key: Option<String>,
         /// Print the file plan and exit without writing anything.
         #[arg(long)]
         dry_run: bool,
@@ -1952,6 +1960,8 @@ fn run_generate_command(cmd: GenerateCommands) {
             config,
             soft_delete,
             api,
+            sharded,
+            shard_key,
             dry_run,
             force,
         } => {
@@ -1982,6 +1992,8 @@ fn run_generate_command(cmd: GenerateCommands) {
                 &query,
                 soft_delete,
                 api,
+                sharded,
+                shard_key.as_deref(),
             );
             generate::scaffold::run(&name, &fields, generate::Flags { dry_run, force }, &options);
         }
@@ -4061,5 +4073,60 @@ mod tests {
         };
         assert!(!dry_run);
         assert!(force);
+    }
+
+    #[test]
+    fn parse_scaffold_sharded_flags() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "generate",
+            "scaffold",
+            "Post",
+            "title:String",
+            "--sharded",
+            "--shard-key",
+            "tenant_id",
+        ])
+        .unwrap();
+        let Commands::Generate(GenerateCommands::Scaffold {
+            name,
+            sharded,
+            shard_key,
+            ..
+        }) = cli.command
+        else {
+            panic!("expected Scaffold variant");
+        };
+        assert_eq!(name, "Post");
+        assert!(sharded, "--sharded flag must set sharded=true");
+        assert_eq!(
+            shard_key.as_deref(),
+            Some("tenant_id"),
+            "--shard-key must capture the field name"
+        );
+    }
+
+    #[test]
+    fn parse_scaffold_sharded_without_shard_key() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "generate",
+            "scaffold",
+            "Post",
+            "name:String",
+            "--sharded",
+        ])
+        .unwrap();
+        let Commands::Generate(GenerateCommands::Scaffold {
+            sharded, shard_key, ..
+        }) = cli.command
+        else {
+            panic!("expected Scaffold variant");
+        };
+        assert!(sharded);
+        assert!(
+            shard_key.is_none(),
+            "shard_key should be None when not specified"
+        );
     }
 }
