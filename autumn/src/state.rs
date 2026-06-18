@@ -766,6 +766,10 @@ impl crate::actuator::ProvideActuatorState for AppState {
         &self.channels
     }
 
+    fn registered_routes(&self) -> Option<std::sync::Arc<crate::app::RegisteredRoutes>> {
+        self.extension::<crate::app::RegisteredRoutes>()
+    }
+
     #[cfg(feature = "ws")]
     fn shutdown_token(&self) -> tokio_util::sync::CancellationToken {
         self.shutdown_token()
