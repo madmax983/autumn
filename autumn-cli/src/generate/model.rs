@@ -24,6 +24,11 @@ pub struct ModelOptions {
     /// Emit a `deleted_at: Option<NaiveDateTime>` field and a nullable
     /// `deleted_at TIMESTAMP NULL` column for soft-delete support.
     pub soft_delete: bool,
+    /// Generate shard-aware handlers (`ShardedDb` instead of `Db`).
+    pub sharded: bool,
+    /// The field used as the sharding key (validated against model fields).
+    /// Defaults to `tenant_id` if present, otherwise `id`.
+    pub shard_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -129,6 +134,11 @@ pub fn plan_model_with_options(
             &fields,
             &metadata,
             options.soft_delete,
+            if options.sharded {
+                options.shard_key.as_deref()
+            } else {
+                None
+            },
         ),
     );
 
@@ -139,12 +149,22 @@ pub fn plan_model_with_options(
     // (b) Diesel migration
     let migration_dir_name = format!("{timestamp}_create_{table}");
     let migration_dir = project_root.join("migrations").join(&migration_dir_name);
-    let up_sql = create_table_sql_with_metadata(
+    let table_sql = create_table_sql_with_metadata(
         &table,
         &schema_fields,
         metadata.indexes(),
         metadata.defaults(),
     );
+    let up_sql = if options.sharded {
+        format!(
+            "-- Sharded model: this migration runs against the control DB by default.\n\
+             -- To apply to shards, run: autumn migrate --shard <name>\n\
+             -- See: autumn migrate --help\n\
+             {table_sql}"
+        )
+    } else {
+        table_sql
+    };
     plan.create(migration_dir.join("up.sql"), up_sql);
     plan.create(migration_dir.join("down.sql"), drop_table_sql(&table));
 
@@ -641,6 +661,7 @@ fn render_model_file(
     fields: &[Field],
     metadata: &ModelMetadata,
     soft_delete: bool,
+    shard_key: Option<&str>,
 ) -> String {
     use std::fmt::Write as _;
     let mut out = String::with_capacity(fields.len() * 128 + 256);
@@ -651,6 +672,9 @@ fn render_model_file(
     let _ = writeln!(out, "use crate::schema::{table};");
     out.push('\n');
     out.push_str("#[autumn_web::model]\n");
+    if let Some(key) = shard_key {
+        let _ = writeln!(out, "#[shard_key = \"{key}\"]");
+    }
     let _ = writeln!(out, "pub struct {name} {{");
     out.push_str("    #[id]\n");
     out.push_str("    pub id: i64,\n");
@@ -1261,6 +1285,106 @@ autumn-web = \"0.3\"\n";
         assert!(
             schema.contains("deleted_at"),
             "schema.rs must include deleted_at column when soft_delete is enabled: {schema}"
+        );
+    }
+
+    // ── sharding tests ─────────────────────────────────────────────────────
+
+    #[test]
+    fn model_emits_shard_key_attr() {
+        let tmp = project();
+        let plan = plan_model_with_options(
+            tmp.path(),
+            "Account",
+            &["tenant_id:i64".into(), "name:String".into()],
+            "20260427000000",
+            &ModelOptions {
+                sharded: true,
+                shard_key: Some("tenant_id".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let model = fs::read_to_string(tmp.path().join("src/models/account.rs")).unwrap();
+        assert!(
+            model.contains("#[shard_key = \"tenant_id\"]"),
+            "sharded model must emit #[shard_key] attribute: {model}"
+        );
+    }
+
+    #[test]
+    fn model_no_shard_key_attr_when_not_sharded() {
+        let tmp = project();
+        let plan = plan_model(
+            tmp.path(),
+            "Post",
+            &["title:String".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let model = fs::read_to_string(tmp.path().join("src/models/post.rs")).unwrap();
+        assert!(
+            !model.contains("shard_key"),
+            "non-sharded model must not emit shard_key: {model}"
+        );
+    }
+
+    #[test]
+    fn migration_notes_shard_target_when_sharded() {
+        let tmp = project();
+        let plan = plan_model_with_options(
+            tmp.path(),
+            "Account",
+            &["tenant_id:i64".into()],
+            "20260427000000",
+            &ModelOptions {
+                sharded: true,
+                shard_key: Some("tenant_id".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let up_sql = fs::read_to_string(
+            tmp.path()
+                .join("migrations/20260427000000_create_accounts/up.sql"),
+        )
+        .unwrap();
+        assert!(
+            up_sql.contains("autumn migrate --shard"),
+            "sharded migration up.sql must note autumn migrate --shard: {up_sql}"
+        );
+        assert!(
+            up_sql.contains("control DB"),
+            "sharded migration up.sql must note control DB default: {up_sql}"
+        );
+    }
+
+    #[test]
+    fn migration_no_shard_comment_when_not_sharded() {
+        let tmp = project();
+        let plan = plan_model(
+            tmp.path(),
+            "Post",
+            &["title:String".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let up_sql = fs::read_to_string(
+            tmp.path()
+                .join("migrations/20260427000000_create_posts/up.sql"),
+        )
+        .unwrap();
+        assert!(
+            !up_sql.contains("autumn migrate --shard"),
+            "non-sharded migration must not have shard comment: {up_sql}"
         );
     }
 }

@@ -749,6 +749,36 @@ fn parse_model_searchable_lang(attrs: &[syn::Attribute]) -> syn::Result<Option<S
     Ok(None)
 }
 
+/// Parse `#[shard_key = "field_name"]` from struct-level outer attributes.
+///
+/// Returns `Some(field_name)` when the attribute is present, `None` otherwise.
+/// The named field must exist on the model struct; validation happens after
+/// `all_fields` is constructed in `model_macro`.
+fn parse_model_shard_key(attrs: &[syn::Attribute]) -> syn::Result<Option<String>> {
+    for attr in attrs {
+        if attr.path().is_ident("shard_key") {
+            let syn::Meta::NameValue(ref nv) = attr.meta else {
+                return Err(syn::Error::new_spanned(
+                    attr,
+                    "shard_key attribute requires a string value: #[shard_key = \"field\"]",
+                ));
+            };
+            let syn::Expr::Lit(syn::ExprLit {
+                lit: syn::Lit::Str(ref lit_str),
+                ..
+            }) = nv.value
+            else {
+                return Err(syn::Error::new_spanned(
+                    &nv.value,
+                    "shard_key value must be a string literal",
+                ));
+            };
+            return Ok(Some(lit_str.value()));
+        }
+    }
+    Ok(None)
+}
+
 enum FieldSearchable {
     NotSearchable,
     SearchableDefault,
@@ -1302,6 +1332,11 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let is_searchable = searchable_lang.is_some();
     let search_language = searchable_lang.unwrap_or_else(|| "simple".to_string());
 
+    let shard_key_field = match parse_model_shard_key(outer_attrs) {
+        Ok(key) => key,
+        Err(err) => return err.to_compile_error(),
+    };
+
     let associations = match resolve_associations(name, outer_attrs) {
         Ok(assocs) => assocs,
         Err(err) => return err.to_compile_error(),
@@ -1310,7 +1345,11 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     let filtered_outer_attrs: Vec<&syn::Attribute> = outer_attrs
         .iter()
-        .filter(|a| !a.path().is_ident("searchable") && !is_association_attr(a))
+        .filter(|a| {
+            !a.path().is_ident("searchable")
+                && !is_association_attr(a)
+                && !a.path().is_ident("shard_key")
+        })
         .collect();
 
     let new_name = format_ident!("New{name}");
@@ -1319,6 +1358,25 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     // Classify fields
     let all_fields: Vec<&Field> = fields.named.iter().collect();
+
+    // Validate that the declared shard_key names an existing field (or "id").
+    if let Some(ref key) = shard_key_field {
+        let field_exists = key == "id"
+            || all_fields
+                .iter()
+                .any(|f| f.ident.as_ref().is_some_and(|i| i == key));
+        if !field_exists {
+            let attr = outer_attrs
+                .iter()
+                .find(|a| a.path().is_ident("shard_key"))
+                .expect("attribute was parsed above");
+            return syn::Error::new_spanned(
+                attr,
+                format!("shard_key field `{key}` not found on model"),
+            )
+            .to_compile_error();
+        }
+    }
 
     // Collect state machine specs from all fields (RED → GREEN: declarative SM support).
     let mut state_machine_impls: Vec<TokenStream> = Vec::new();

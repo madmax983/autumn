@@ -81,11 +81,27 @@ pub fn plan_scaffold_with_options(
     options: &ScaffoldOptions,
 ) -> Result<Plan, GenerateError> {
     ensure_project_root(project_root)?;
-    let mut plan =
-        plan_model_with_options(project_root, name, field_tokens, timestamp, &options.model)?;
     let fields = parse_fields(field_tokens)?;
-    let metadata = parse_model_metadata(&fields, &options.model)?;
-    let queries = parse_query_specs(&fields, &options.queries)?;
+    // Resolve shard key before planning the model (propagates to model render).
+    let resolved_shard_key = resolve_shard_key(&fields, &options.model)?;
+    let model_options_with_key = ModelOptions {
+        shard_key: resolved_shard_key,
+        ..options.model.clone()
+    };
+    let options_with_key = ScaffoldOptions {
+        model: model_options_with_key,
+        queries: options.queries.clone(),
+        api: options.api,
+    };
+    let mut plan = plan_model_with_options(
+        project_root,
+        name,
+        field_tokens,
+        timestamp,
+        &options_with_key.model,
+    )?;
+    let metadata = parse_model_metadata(&fields, &options_with_key.model)?;
+    let queries = parse_query_specs(&fields, &options_with_key.queries)?;
     let form_fields = fields
         .iter()
         .filter(|field| !metadata.defaults().contains_key(&field.name))
@@ -103,8 +119,9 @@ pub fn plan_scaffold_with_options(
             &pascal_name,
             &snake_name,
             &queries,
-            options.model.soft_delete,
-            options.api,
+            options_with_key.model.soft_delete,
+            options_with_key.api,
+            options_with_key.model.sharded,
         ),
     );
     let repo_mod_path = repos_dir.join("mod.rs");
@@ -114,11 +131,17 @@ pub fn plan_scaffold_with_options(
     );
 
     // Route file under `src/routes/<plural>.rs`
-    if !options.api {
+    if !options_with_key.api {
         let routes_dir = project_root.join("src").join("routes");
         plan.create(
             routes_dir.join(format!("{plural}.rs")),
-            render_routes_file(&pascal_name, &snake_name, &plural, &form_fields),
+            render_routes_file(
+                &pascal_name,
+                &snake_name,
+                &plural,
+                &form_fields,
+                options_with_key.model.sharded,
+            ),
         );
         let route_mod_path = routes_dir.join("mod.rs");
         plan.modify(
@@ -130,7 +153,7 @@ pub fn plan_scaffold_with_options(
     // Smoke test under `tests/<snake>.rs`
     plan.create(
         project_root.join("tests").join(format!("{snake_name}.rs")),
-        render_smoke_test(&pascal_name, &plural, options.api, &fields),
+        render_smoke_test(&pascal_name, &plural, options_with_key.api, &fields),
     );
 
     // `src/main.rs` updates: declare modules + register all new routes.
@@ -141,9 +164,9 @@ pub fn plan_scaffold_with_options(
             format!("missing {}", main_path.display()),
         ))
     })?;
-    let route_entries = main_route_entries(&plural, &snake_name, options.api);
+    let route_entries = main_route_entries(&plural, &snake_name, options_with_key.api);
     let mut mods = vec!["models", "schema", "repositories"];
-    if !options.api {
+    if !options_with_key.api {
         mods.push("routes");
     }
     let updated = update_main_rs(&main_existing, &mods, &route_entries);
@@ -256,35 +279,92 @@ fn is_valid_fn_name(name: &str) -> bool {
         && chars.all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_')
 }
 
+/// Resolve the sharding key field from options and field list.
+///
+/// Returns `None` when sharding is not enabled. When sharding is enabled,
+/// returns the explicitly requested key (validated against model fields and
+/// `id`), or falls back to `tenant_id` if present, then `id`.
+fn resolve_shard_key(
+    fields: &[Field],
+    options: &ModelOptions,
+) -> Result<Option<String>, GenerateError> {
+    if !options.sharded {
+        return Ok(None);
+    }
+    if let Some(ref key) = options.shard_key {
+        let valid = key == "id" || field_by_name(fields, key).is_some();
+        if !valid {
+            return Err(GenerateError::InvalidField {
+                token: key.clone(),
+                reason: format!(
+                    "shard_key field `{key}` does not exist on this model; \
+                     pass an existing field name or `id`"
+                ),
+            });
+        }
+        return Ok(Some(key.clone()));
+    }
+    if field_by_name(fields, "tenant_id").is_some() {
+        return Ok(Some("tenant_id".to_owned()));
+    }
+    Ok(Some("id".to_owned()))
+}
+
 fn render_repository_file(
     pascal_name: &str,
     snake_name: &str,
     queries: &[QuerySpec],
     soft_delete: bool,
     api: bool,
+    sharded: bool,
 ) -> String {
     let plural = pluralize(snake_name);
     let query_body = render_repository_queries(pascal_name, queries);
     let soft_delete_attr = if soft_delete { ", soft_delete" } else { "" };
-    let doc_comment = if api {
-        "//! Generated by `autumn generate scaffold --api`.\n\
-         //!\n\
-         //! `#[repository]` auto-generates CRUD methods and JSON REST handlers.\n\
-         //! When using `--api`, all 5 JSON CRUD endpoints are mounted in `src/main.rs`.\n\
-         //! Note: To start the application in a production profile, you must either\n\
-         //! add a policy (e.g. `policy = SomePolicy`) to this repository or explicitly\n\
-         //! allow unguarded writes by setting `allow_unauthorized_repository_api = true`\n\
-         //! under `[security]` in `autumn.toml`."
+    let sharded_note = if sharded {
+        format!(
+            "//!\n\
+             //! This is a shard-aware repository. Handlers construct it via\n\
+             //! `Pg{pascal_name}Repository::from_shard(&db)` where `db` is a `ShardedDb` extractor;\n\
+             //! the extractor routes the request to the correct shard automatically.\n"
+        )
     } else {
-        "//! Generated by `autumn generate scaffold`.\n\
-         //!\n\
-         //! `#[repository]` auto-generates CRUD methods and JSON REST handlers.\n\
-         //! The scaffold registers only read handlers in `src/main.rs` by\n\
-         //! default. Mount mutating API handlers only after adding a policy."
+        String::new()
+    };
+    let api_sharded_note = if sharded && api {
+        "//!\n\
+         //! Note: auto-generated REST handlers (mounted via `api = ...`) route through\n\
+         //! the control pool, not individual shards. Shard-aware REST is planned for a\n\
+         //! future release. Use the HTML handlers or build custom shard-aware endpoints\n\
+         //! with `ShardedDb` in the meantime.\n"
+    } else {
+        ""
+    };
+    let doc_comment = if api {
+        format!(
+            "//! Generated by `autumn generate scaffold --api`.\n\
+             //!\n\
+             //! `#[repository]` auto-generates CRUD methods and JSON REST handlers.\n\
+             //! When using `--api`, all 5 JSON CRUD endpoints are mounted in `src/main.rs`.\n\
+             //! Note: To start the application in a production profile, you must either\n\
+             //! add a policy (e.g. `policy = SomePolicy`) to this repository or explicitly\n\
+             //! allow unguarded writes by setting `allow_unauthorized_repository_api = true`\n\
+             //! under `[security]` in `autumn.toml`.\n\
+             {api_sharded_note}\
+             {sharded_note}"
+        )
+    } else {
+        format!(
+            "//! Generated by `autumn generate scaffold`.\n\
+             //!\n\
+             //! `#[repository]` auto-generates CRUD methods and JSON REST handlers.\n\
+             //! The scaffold registers only read handlers in `src/main.rs` by\n\
+             //! default. Mount mutating API handlers only after adding a policy.\n\
+             {sharded_note}"
+        )
     };
     format!(
         "{doc_comment}\n\
-         \n\
          use crate::models::{snake_name}::{{{pascal_name}, New{pascal_name}, Update{pascal_name}}};\n\
          use crate::schema::{plural};\n\
          \n\
@@ -370,11 +450,13 @@ fn render_decoded_form(_pascal_name: &str, fields: &[Field]) -> (String, String)
     reason = "This is a single template — splitting it produces less readable output, \
               not more. The whole point is one place that prints one file."
 )]
+#[allow(clippy::too_many_arguments)]
 fn render_routes_file(
     pascal_name: &str,
     snake_name: &str,
     plural: &str,
     fields: &[Field],
+    sharded: bool,
 ) -> String {
     let create_inputs = render_create_form_inputs(fields);
     let edit_inputs = render_edit_form_inputs(fields);
@@ -387,6 +469,7 @@ fn render_routes_file(
     // a CSRF-protected endpoint (see docs/guide/storage.md#direct-uploads).
     let form_enctype = "";
 
+    let db_ty = if sharded { "ShardedDb" } else { "Db" };
     let (
         create_signature,
         decode_create_call,
@@ -395,21 +478,93 @@ fn render_routes_file(
         decode_form_sig,
     ) = if has_attachments {
         (
-            "state: autumn_web::extract::State<autumn_web::AppState>, mut db: Db, body: Bytes".to_owned(),
+            format!(
+                "state: autumn_web::extract::State<autumn_web::AppState>, mut db: {db_ty}, body: Bytes"
+            ),
             "decode_form(&state, body).await?".to_owned(),
-            "state: autumn_web::extract::State<autumn_web::AppState>,\n    id: Path<i64>,\n    mut db: Db,\n    body: Bytes,".to_owned(),
+            format!(
+                "state: autumn_web::extract::State<autumn_web::AppState>,\n    id: Path<i64>,\n    mut db: {db_ty},\n    body: Bytes,"
+            ),
             "decode_form(&state, body).await?".to_owned(),
-            format!("async fn decode_form(state: &autumn_web::AppState, body: Bytes) -> AutumnResult<New{pascal_name}>"),
+            format!(
+                "async fn decode_form(state: &autumn_web::AppState, body: Bytes) -> AutumnResult<New{pascal_name}>"
+            ),
         )
     } else {
         (
-            "mut db: Db, body: Bytes".to_owned(),
+            format!("mut db: {db_ty}, body: Bytes"),
             "decode_form(body)?".to_owned(),
-            "id: Path<i64>,\n    mut db: Db,\n    body: Bytes,".to_owned(),
+            format!("id: Path<i64>,\n    mut db: {db_ty},\n    body: Bytes,"),
             "decode_form(body)?".to_owned(),
             format!("fn decode_form(body: Bytes) -> AutumnResult<New{pascal_name}>"),
         )
     };
+
+    // The `index` handler: when sharded, use from_shard explicitly so the
+    // generated code shows the canonical sharding pattern.
+    let index_handler = if sharded {
+        format!(
+            r#"/// `GET /{plural}` — paginated list of {snake_name}s.
+///
+/// Accepts `?page=N&size=M` query parameters via the [`PageRequest`] extractor.
+/// Out-of-range or missing values are clamped silently — list endpoints never
+/// return HTTP 400 for bad paging parameters.
+#[get("/{plural}")]
+pub async fn index(
+    page_req: PageRequest,
+    db: ShardedDb,
+) -> AutumnResult<Markup> {{
+    let repo = Pg{pascal_name}Repository::from_shard(&db);
+    let page_data: Page<{pascal_name}> = repo.page(&page_req).await?;
+    Ok(layout("{pascal_name} index", html! {{
+        h1 {{ "{pascal_name}s" }}
+        a href="/{plural}/new" {{ "New {pascal_name}" }}
+        ul {{
+            @for row in &page_data.content {{
+                li {{ a href=(format!("/{plural}/{{}}", row.id)) {{ (row.id) }} }}
+            }}
+        }}
+        (pagination_nav(&page_data, "/{plural}"))
+    }}))
+}}"#
+        )
+    } else {
+        format!(
+            r#"/// `GET /{plural}` — paginated list of {snake_name}s.
+///
+/// Accepts `?page=N&size=M` query parameters via the [`PageRequest`] extractor.
+/// Out-of-range or missing values are clamped silently — list endpoints never
+/// return HTTP 400 for bad paging parameters.
+#[get("/{plural}")]
+pub async fn index(
+    page_req: PageRequest,
+    repo: Pg{pascal_name}Repository,
+) -> AutumnResult<Markup> {{
+    let page_data: Page<{pascal_name}> = repo.page(&page_req).await?;
+    Ok(layout("{pascal_name} index", html! {{
+        h1 {{ "{pascal_name}s" }}
+        a href="/{plural}/new" {{ "New {pascal_name}" }}
+        ul {{
+            @for row in &page_data.content {{
+                li {{ a href=(format!("/{plural}/{{}}", row.id)) {{ (row.id) }} }}
+            }}
+        }}
+        (pagination_nav(&page_data, "/{plural}"))
+    }}))
+}}"#
+        )
+    };
+
+    // Imports: when sharded, drop Db from brace-import and add ShardedDb separately.
+    let db_import = if sharded {
+        "use autumn_web::sharding::ShardedDb;\n\
+         use autumn_web::{AutumnError, AutumnResult, Markup, get, html, post, secured};"
+            .to_owned()
+    } else {
+        "use autumn_web::{AutumnError, AutumnResult, Db, Markup, get, html, post, secured};"
+            .to_owned()
+    };
+
     format!(
         r"//! Generated by `autumn generate scaffold`.
 //!
@@ -421,7 +576,7 @@ use autumn_web::pagination::{{Page, PageRequest}};
 use autumn_web::reexports::axum::body::Bytes;
 use autumn_web::reexports::serde_json;
 use autumn_web::security::{{CsrfFormField, CsrfToken}};
-use autumn_web::{{AutumnError, AutumnResult, Db, Markup, get, html, post, secured}};
+{db_import}
 use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
 
@@ -502,32 +657,11 @@ fn pagination_nav<T>(page: &Page<T>, base_url: &str) -> Markup {{
     }}
 }}
 
-/// `GET /{plural}` — paginated list of {snake_name}s.
-///
-/// Accepts `?page=N&size=M` query parameters via the [`PageRequest`] extractor.
-/// Out-of-range or missing values are clamped silently — list endpoints never
-/// return HTTP 400 for bad paging parameters.
-#[get("/{plural}")]
-pub async fn index(
-    page_req: PageRequest,
-    repo: Pg{pascal_name}Repository,
-) -> AutumnResult<Markup> {{
-    let page_data: Page<{pascal_name}> = repo.page(&page_req).await?;
-    Ok(layout("{pascal_name} index", html! {{
-        h1 {{ "{pascal_name}s" }}
-        a href="/{plural}/new" {{ "New {pascal_name}" }}
-        ul {{
-            @for row in &page_data.content {{
-                li {{ a href=(format!("/{plural}/{{}}", row.id)) {{ (row.id) }} }}
-            }}
-        }}
-        (pagination_nav(&page_data, "/{plural}"))
-    }}))
-}}
+{index_handler}
 
 /// `GET /{plural}/{{id}}` — show one {snake_name}.
 #[get("/{plural}/{{id}}")]
-pub async fn show(id: Path<i64>, mut db: Db) -> AutumnResult<Markup> {{
+pub async fn show(id: Path<i64>, mut db: {db_ty}) -> AutumnResult<Markup> {{
     let row: {pascal_name} = {plural}::table
         .find(*id)
         .select({pascal_name}::as_select())
@@ -576,7 +710,7 @@ pub async fn create({create_signature}) -> AutumnResult<Markup> {{
 #[get("/{plural}/{{id}}/edit")]
 pub async fn edit_form(
     id: Path<i64>,
-    mut db: Db,
+    mut db: {db_ty},
     csrf: Option<CsrfToken>,
     csrf_field: Option<CsrfFormField>,
 ) -> AutumnResult<Markup> {{
@@ -1440,6 +1574,183 @@ async fn main() {
         assert!(main.contains("repositories::post::post_api_list"));
         assert!(main.contains("repositories::post::post_api_get"));
         assert!(!main.contains("routes::posts::index"));
+    }
+
+    // ── sharding tests ─────────────────────────────────────────────────────
+
+    fn sharded_options_with_key(key: &str) -> ScaffoldOptions {
+        ScaffoldOptions {
+            model: ModelOptions {
+                sharded: true,
+                shard_key: Some(key.into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn resolves_shard_key_explicit_field() {
+        let fields = parse_fields(&["tenant_id:i64".into(), "name:String".into()]).unwrap();
+        let opts = ModelOptions {
+            sharded: true,
+            shard_key: Some("tenant_id".into()),
+            ..Default::default()
+        };
+        let key = resolve_shard_key(&fields, &opts).unwrap();
+        assert_eq!(key, Some("tenant_id".to_owned()));
+    }
+
+    #[test]
+    fn resolves_shard_key_explicit_id() {
+        let fields = parse_fields(&["name:String".into()]).unwrap();
+        let opts = ModelOptions {
+            sharded: true,
+            shard_key: Some("id".into()),
+            ..Default::default()
+        };
+        let key = resolve_shard_key(&fields, &opts).unwrap();
+        assert_eq!(key, Some("id".to_owned()));
+    }
+
+    #[test]
+    fn resolves_shard_key_invalid_field_errors() {
+        let fields = parse_fields(&["name:String".into()]).unwrap();
+        let opts = ModelOptions {
+            sharded: true,
+            shard_key: Some("bogus".into()),
+            ..Default::default()
+        };
+        assert!(
+            resolve_shard_key(&fields, &opts).is_err(),
+            "unknown shard_key field must return an error"
+        );
+    }
+
+    #[test]
+    fn resolves_shard_key_defaults_to_tenant_id_when_present() {
+        let fields = parse_fields(&["tenant_id:i64".into(), "name:String".into()]).unwrap();
+        let opts = ModelOptions {
+            sharded: true,
+            shard_key: None,
+            ..Default::default()
+        };
+        let key = resolve_shard_key(&fields, &opts).unwrap();
+        assert_eq!(key, Some("tenant_id".to_owned()));
+    }
+
+    #[test]
+    fn resolves_shard_key_defaults_to_id_when_no_tenant_id() {
+        let fields = parse_fields(&["name:String".into()]).unwrap();
+        let opts = ModelOptions {
+            sharded: true,
+            shard_key: None,
+            ..Default::default()
+        };
+        let key = resolve_shard_key(&fields, &opts).unwrap();
+        assert_eq!(key, Some("id".to_owned()));
+    }
+
+    #[test]
+    fn resolves_shard_key_none_when_not_sharded() {
+        let fields = parse_fields(&["tenant_id:i64".into()]).unwrap();
+        let opts = ModelOptions {
+            sharded: false,
+            shard_key: None,
+            ..Default::default()
+        };
+        let key = resolve_shard_key(&fields, &opts).unwrap();
+        assert!(key.is_none());
+    }
+
+    #[test]
+    fn routes_use_sharded_db_when_sharded() {
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold_with_options(
+            tmp.path(),
+            "Account",
+            &["tenant_id:i64".into(), "name:String".into()],
+            "20260427000000",
+            &sharded_options_with_key("tenant_id"),
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let routes = fs::read_to_string(tmp.path().join("src/routes/accounts.rs")).unwrap();
+        // ShardedDb must be imported from the correct path (not crate root).
+        assert!(
+            routes.contains("use autumn_web::sharding::ShardedDb;"),
+            "sharded routes must import ShardedDb from autumn_web::sharding: {routes}"
+        );
+        // Db must NOT appear in the brace-import or as a handler param type.
+        assert!(
+            !routes.contains("mut db: Db"),
+            "sharded routes must not use Db extractor: {routes}"
+        );
+        // ShardedDb must be used in handler signatures.
+        assert!(
+            routes.contains("mut db: ShardedDb"),
+            "sharded routes must use ShardedDb in handler signatures: {routes}"
+        );
+        // index must call from_shard explicitly for a literal proof.
+        assert!(
+            routes.contains("from_shard(&db)"),
+            "sharded index handler must call from_shard(&db): {routes}"
+        );
+    }
+
+    #[test]
+    fn routes_use_db_when_not_sharded() {
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &["title:String".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+        assert!(
+            routes.contains("mut db: Db"),
+            "non-sharded routes must still use Db"
+        );
+        assert!(
+            !routes.contains("ShardedDb"),
+            "non-sharded routes must not reference ShardedDb"
+        );
+    }
+
+    #[test]
+    fn repository_notes_sharded() {
+        let rendered = render_repository_file("Account", "account", &[], false, false, true);
+        assert!(
+            rendered.contains("shard-aware"),
+            "sharded repository doc must mention shard-aware: {rendered}"
+        );
+        assert!(
+            rendered.contains("from_shard"),
+            "sharded repository doc must mention from_shard: {rendered}"
+        );
+    }
+
+    #[test]
+    fn repository_notes_api_sharded_caveat() {
+        let rendered = render_repository_file("Account", "account", &[], false, true, true);
+        assert!(
+            rendered.contains("control pool"),
+            "sharded api repository doc must note control pool: {rendered}"
+        );
+    }
+
+    #[test]
+    fn repository_no_sharded_note_when_not_sharded() {
+        let rendered = render_repository_file("Post", "post", &[], false, false, false);
+        assert!(
+            !rendered.contains("shard-aware"),
+            "non-sharded repository must not mention shard-aware: {rendered}"
+        );
     }
 
     #[test]

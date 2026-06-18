@@ -3051,3 +3051,197 @@ fn generate_wizard_rejects_gen_keyword() {
         "error must mention the keyword issue; got: {stderr}"
     );
 }
+
+// ── autumn generate scaffold --sharded integration tests ─────────────────────
+
+#[test]
+fn generate_sharded_scaffold_in_fresh_project() {
+    let (_tmp, project) = fresh_project("sharded-scaffold-app");
+
+    run_autumn(
+        &project,
+        &[
+            "generate",
+            "scaffold",
+            "Account",
+            "shard_id:i64",
+            "name:String",
+            "--sharded",
+        ],
+    );
+
+    // Model file: must have #[shard_key = "tenant_id"] or #[shard_key = "shard_id"]
+    // (shard_id present, tenant_id absent → fallback to id; but shard_id is not tenant_id,
+    //  so no tenant_id field → default key is "id")
+    // With shard_id but no tenant_id field, default key is "id"
+    let model = fs::read_to_string(project.join("src/models/account.rs")).unwrap();
+    assert!(
+        model.contains("#[shard_key = \"id\"]"),
+        "model must have #[shard_key = \"id\"] (default when no tenant_id field):\n{model}"
+    );
+    assert!(
+        model.contains("#[autumn_web::model]"),
+        "model must have #[autumn_web::model] attr:\n{model}"
+    );
+
+    // Routes file: must use ShardedDb not Db
+    let routes = fs::read_to_string(project.join("src/routes/accounts.rs")).unwrap();
+    assert!(
+        routes.contains("use autumn_web::sharding::ShardedDb"),
+        "routes must import ShardedDb:\n{routes}"
+    );
+    assert!(
+        routes.contains("mut db: ShardedDb"),
+        "routes must use ShardedDb in handler signatures:\n{routes}"
+    );
+    assert!(
+        routes.contains("from_shard(&db)"),
+        "routes index must use from_shard(&db):\n{routes}"
+    );
+    assert!(
+        !routes.contains("mut db: Db"),
+        "routes must not use bare Db extractor when sharded:\n{routes}"
+    );
+
+    // Repository file: must have shard-aware doc note
+    let repo = fs::read_to_string(project.join("src/repositories/account.rs")).unwrap();
+    assert!(
+        repo.contains("from_shard"),
+        "repository must mention from_shard in doc comment:\n{repo}"
+    );
+
+    // Migration: must have shard target comment
+    let migrations: Vec<_> = fs::read_dir(project.join("migrations"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .ends_with("_create_accounts")
+        })
+        .collect();
+    assert_eq!(
+        migrations.len(),
+        1,
+        "expected one create_accounts migration"
+    );
+    let up = fs::read_to_string(migrations[0].path().join("up.sql")).unwrap();
+    assert!(
+        up.contains("autumn migrate --shard"),
+        "up.sql must mention `autumn migrate --shard`:\n{up}"
+    );
+}
+
+#[test]
+fn generate_sharded_scaffold_with_tenant_id_field_uses_tenant_id_as_default_key() {
+    let (_tmp, project) = fresh_project("sharded-tenant-app");
+
+    run_autumn(
+        &project,
+        &[
+            "generate",
+            "scaffold",
+            "Booking",
+            "tenant_id:i64",
+            "title:String",
+            "--sharded",
+        ],
+    );
+
+    let model = fs::read_to_string(project.join("src/models/booking.rs")).unwrap();
+    assert!(
+        model.contains("#[shard_key = \"tenant_id\"]"),
+        "model must default shard_key to tenant_id when that field is present:\n{model}"
+    );
+}
+
+#[test]
+fn generate_sharded_scaffold_with_explicit_shard_key() {
+    let (_tmp, project) = fresh_project("sharded-explicit-app");
+
+    run_autumn(
+        &project,
+        &[
+            "generate",
+            "scaffold",
+            "Widget",
+            "org_id:i64",
+            "label:String",
+            "--sharded",
+            "--shard-key",
+            "org_id",
+        ],
+    );
+
+    let model = fs::read_to_string(project.join("src/models/widget.rs")).unwrap();
+    assert!(
+        model.contains("#[shard_key = \"org_id\"]"),
+        "model must use explicitly supplied --shard-key:\n{model}"
+    );
+}
+
+#[test]
+fn generate_sharded_scaffold_rejects_bogus_shard_key() {
+    let (_tmp, project) = fresh_project("sharded-bogus-app");
+
+    let (_, stderr, code) = run_autumn_failing(
+        &project,
+        &[
+            "generate",
+            "scaffold",
+            "Widget",
+            "label:String",
+            "--sharded",
+            "--shard-key",
+            "bogus",
+        ],
+    );
+    assert_eq!(
+        code,
+        Some(1),
+        "--shard-key with non-existent field must fail"
+    );
+    assert!(
+        stderr.contains("bogus"),
+        "error must mention the invalid field name; got: {stderr}"
+    );
+}
+
+/// Slow end-to-end check: scaffold a sharded project, patch Cargo.toml to the
+/// local autumn-web, and `cargo check --tests` the result. Verifies that
+/// `use autumn_web::sharding::ShardedDb` resolves, `#[shard_key]` compiles
+/// (requires Track A), and `from_shard` typechecks.
+///
+/// Requires Track A (`#[shard_key]` in `#[model]` macro) to be merged first.
+/// Run with: `cargo test -p autumn-cli -- --ignored generated_sharded_scaffold_cargo_checks`
+#[test]
+#[ignore = "slow: cargo-checks a fresh sharded project — run with `cargo test -p autumn-cli -- --ignored`"]
+fn generated_sharded_scaffold_cargo_checks() {
+    let (_tmp, project) = fresh_project("sharded-build");
+
+    patch_generated_cargo_toml(&project);
+
+    run_autumn(
+        &project,
+        &[
+            "generate",
+            "scaffold",
+            "Account",
+            "shard_id:i64",
+            "name:String",
+            "--sharded",
+        ],
+    );
+
+    let check = Command::new("cargo")
+        .args(["check", "--tests"])
+        .current_dir(&project)
+        .output()
+        .unwrap();
+    assert!(
+        check.status.success(),
+        "cargo check on generated sharded scaffold failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&check.stdout),
+        String::from_utf8_lossy(&check.stderr),
+    );
+}

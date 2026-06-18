@@ -21,6 +21,8 @@ fn compile_fail_tests() {
     // Model macro failures (require db feature)
     #[cfg(feature = "db")]
     t.compile_fail("tests/compile-fail/model_on_enum.rs");
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/model_shard_key_unknown.rs");
 
     // Repository hooks failures (require db feature)
     #[cfg(feature = "db")]
@@ -136,6 +138,10 @@ fn compile_pass_tests() {
     // Soft delete (requires db feature)
     #[cfg(feature = "db")]
     t.pass("tests/compile-pass/repository_soft_delete.rs");
+
+    // shard_key model attribute (requires db feature)
+    #[cfg(feature = "db")]
+    t.pass("tests/compile-pass/model_shard_key.rs");
 }
 
 #[cfg(feature = "db")]
