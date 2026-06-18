@@ -418,6 +418,27 @@ impl Shard {
         })
     }
 
+    /// The shard's replica pool for **explicit replica-only** reads.
+    ///
+    /// Returns the replica pool only when a replica is configured *and* has
+    /// passed its readiness checks. Never returns the primary pool — this is
+    /// the `replica_fallback`-independent counterpart to [`read_pool`]:
+    ///
+    /// - no replica configured → `None`;
+    /// - replica configured but unready (regardless of `replica_fallback`) → `None`;
+    /// - replica configured and ready → `Some(replica_pool)`.
+    ///
+    /// Backs [`ShardedReadDb`], which always requires a healthy replica.
+    ///
+    /// [`read_pool`]: Self::read_pool
+    pub(crate) fn replica_read_pool(&self) -> Option<&Pool<AsyncPgConnection>> {
+        if self.runtime.replica_configured && self.runtime.replica_ready() {
+            self.topology.replica()
+        } else {
+            None
+        }
+    }
+
     /// [`read_pool`](Self::read_pool) plus the role label of the returned
     /// pool, for interceptor/metric naming.
     pub(crate) fn read_pool_with_role(&self) -> Option<(&Pool<AsyncPgConnection>, &'static str)> {
@@ -930,6 +951,37 @@ impl Shards {
         self.checkout(shard, pool, role).await
     }
 
+    /// Check out a **replica-only** connection to the shard that owns `key`.
+    ///
+    /// Unlike [`read_for`], this method ignores the shard's `replica_fallback`
+    /// policy and **never** falls back to the primary. It returns `503 Service
+    /// Unavailable` whenever a healthy, ready replica is unavailable — whether
+    /// no replica is configured, or the replica has not yet passed its
+    /// readiness checks. Use this for analytics/reporting paths that must
+    /// guarantee replica-only semantics.
+    ///
+    /// # Errors
+    ///
+    /// Returns the router's error, a checkout failure, or
+    /// `503 Service Unavailable` when no healthy replica is available for the
+    /// resolved shard.
+    ///
+    /// [`read_for`]: Self::read_for
+    pub async fn read_replica_for<'k>(
+        &self,
+        key: impl Into<ShardKey<'k>>,
+    ) -> Result<crate::db::Db, AutumnError> {
+        let shard = self.set.route(key).await?;
+        let pool = shard.replica_read_pool().ok_or_else(|| {
+            AutumnError::service_unavailable_msg(format!(
+                "shard {:?} has no healthy replica; read_replica_for requires a \
+                 configured, ready replica (no primary fallback)",
+                shard.name()
+            ))
+        })?;
+        self.checkout(shard, pool, "replica").await
+    }
+
     /// Check out a connection to a shard's primary **by name** —
     /// intended for admin/operational paths, not request routing.
     ///
@@ -1243,6 +1295,111 @@ impl axum::extract::FromRequestParts<crate::AppState> for ShardedDb {
             shard_name,
             shard_id,
             repo_seed,
+        })
+    }
+}
+
+/// Explicit replica-only shard connection extractor.
+///
+/// Resolves the routing key exactly like [`ShardedDb`] and checks out a
+/// connection to the **replica** of the owning shard. Unlike [`ShardedDb`]'s
+/// transparent read-routing (which follows the shard's `replica_fallback`
+/// policy), `ShardedReadDb` **always** requires a healthy replica and returns
+/// `503 Service Unavailable` immediately if one is not available — it never
+/// silently falls back to the primary.
+///
+/// Use this extractor for analytics, reporting, or admin scatter-gather
+/// handlers where replica-only semantics must be guaranteed:
+///
+/// ```rust,no_run
+/// use autumn_web::prelude::*;
+///
+/// #[get("/analytics")]
+/// async fn analytics(db: ShardedReadDb) -> impl IntoResponse {
+///     // guaranteed replica connection; 503 if none is configured or healthy
+///     "ok"
+/// }
+/// ```
+///
+/// Pairs with the transparent default routing provided by [`ShardedDb`]:
+/// that is the opt-out-free default; `ShardedReadDb` is the explicit
+/// replica-only override (see issue #1275).
+pub struct ShardedReadDb {
+    db: crate::db::Db,
+    shard_name: Arc<str>,
+    shard_id: ShardId,
+}
+
+impl ShardedReadDb {
+    /// Name of the shard this connection belongs to.
+    #[must_use]
+    pub fn shard(&self) -> &str {
+        &self.shard_name
+    }
+
+    /// Id of the shard this connection belongs to.
+    #[must_use]
+    pub const fn shard_id(&self) -> ShardId {
+        self.shard_id
+    }
+
+    /// Connection-scoped tracing span (see [`Db::span`](crate::db::Db::span)).
+    #[must_use]
+    pub const fn span(&self) -> &tracing::Span {
+        self.db.span()
+    }
+
+    /// Borrow the underlying [`Db`](crate::db::Db) (e.g. to pass to
+    /// helpers written against the unsharded extractor).
+    pub const fn db_mut(&mut self) -> &mut crate::db::Db {
+        &mut self.db
+    }
+}
+
+impl std::ops::Deref for ShardedReadDb {
+    type Target = AsyncPgConnection;
+    fn deref(&self) -> &Self::Target {
+        &self.db
+    }
+}
+
+impl std::ops::DerefMut for ShardedReadDb {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.db
+    }
+}
+
+impl AsMut<crate::db::Db> for ShardedReadDb {
+    fn as_mut(&mut self) -> &mut crate::db::Db {
+        &mut self.db
+    }
+}
+
+impl axum::extract::FromRequestParts<crate::AppState> for ShardedReadDb {
+    type Rejection = AutumnError;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        state: &crate::AppState,
+    ) -> Result<Self, Self::Rejection> {
+        let shards = Shards::from_request_parts(parts, state).await?;
+        let key = resolve_shard_key(parts, state).await?;
+
+        let shard = shards.set.route(&key).await?;
+        let shard_name = Arc::clone(&shard.name);
+        let shard_id = shard.id();
+        let pool = shard.replica_read_pool().ok_or_else(|| {
+            AutumnError::service_unavailable_msg(format!(
+                "shard {:?} has no healthy replica; ShardedReadDb requires a \
+                 configured, ready replica (no primary fallback)",
+                shard.name()
+            ))
+        })?;
+        let db = shards.checkout(shard, pool, "replica").await?;
+        Ok(Self {
+            db,
+            shard_name,
+            shard_id,
         })
     }
 }
@@ -1964,6 +2121,96 @@ mod tests {
             seed.statement_timeout_ms,
             i32::MAX as u64,
             "timeout capped at i32::MAX ms"
+        );
+    }
+
+    // ── ShardedReadDb / replica_read_pool (issue #1275) ─────────────────
+
+    #[test]
+    fn replica_read_pool_is_none_without_replica() {
+        let set = shard_set(&["a"]);
+        let shard = set.get(ShardId(0)).expect("shard");
+        assert!(
+            shard.replica_read_pool().is_none(),
+            "no replica configured → replica_read_pool must be None"
+        );
+    }
+
+    #[test]
+    fn replica_read_pool_is_none_when_unready_even_under_primary_fallback() {
+        // The key difference from read_pool(): even with ReplicaFallback::Primary,
+        // replica_read_pool never falls back to the primary — returns None.
+        let shard = shard_with_sized_replica(ReplicaFallback::Primary);
+        assert!(
+            shard.replica_read_pool().is_none(),
+            "unready replica under primary fallback must still return None for replica_read_pool"
+        );
+    }
+
+    #[test]
+    fn replica_read_pool_is_none_when_unready_under_fail_readiness() {
+        let shard = shard_with_sized_replica(ReplicaFallback::FailReadiness);
+        assert!(
+            shard.replica_read_pool().is_none(),
+            "unready replica under fail_readiness must return None"
+        );
+    }
+
+    #[test]
+    fn replica_read_pool_targets_replica_when_ready() {
+        let shard = shard_with_sized_replica(ReplicaFallback::Primary);
+        shard.runtime().mark_replica_connection_ready();
+        assert!(shard.runtime().replica_ready());
+        assert_eq!(
+            shard.replica_read_pool().map(|p| p.status().max_size),
+            Some(REPLICA_SIZE),
+            "a ready replica must be returned by replica_read_pool"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_replica_for_fails_when_no_replica_configured() {
+        let shards = shards_handle(&["a"]);
+        let Err(error) = shards.read_replica_for("tenant-1").await else {
+            panic!("no replica configured must be rejected");
+        };
+        // Error must mention replica (not checkout failure) and must not
+        // mention fail_readiness (this path is policy-independent).
+        let msg = error.to_string();
+        assert!(
+            msg.contains("replica"),
+            "error must name the missing replica: {msg}"
+        );
+        assert!(
+            !msg.contains("fail_readiness"),
+            "error must not mention fallback policy: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_replica_for_fails_when_replica_unready_under_primary_fallback() {
+        // Unlike read_for, read_replica_for must NOT fall back to the primary.
+        let mut config = sharded_config(&["a"]);
+        config.shards[0].replica_url = Some("postgres://localhost/a_ro".to_owned());
+        config.shards[0].replica_fallback = Some(ReplicaFallback::Primary);
+        let shards = Shards {
+            set: create_shard_set(&config, Arc::new(HashShardRouter))
+                .expect("build")
+                .expect("configured"),
+            ctx: crate::db::RequestDbContext {
+                statement_timeout: None,
+                route_key: None,
+                metrics: None,
+                slow_query_threshold: std::time::Duration::from_millis(500),
+                interceptors: Vec::new(),
+            },
+        };
+        let Err(error) = shards.read_replica_for("tenant-1").await else {
+            panic!("unready replica must be rejected even under primary fallback");
+        };
+        assert!(
+            error.to_string().contains("replica"),
+            "must name the replica: {error}"
         );
     }
 }

@@ -10,7 +10,7 @@ use std::sync::Arc;
 use autumn_web::AppState;
 use autumn_web::config::{AutumnConfig, DatabaseConfig, ShardConfig};
 use autumn_web::sharding::{
-    HashShardRouter, ShardKeyOverride, ShardedDb, Shards, create_shard_set,
+    HashShardRouter, ShardKeyOverride, ShardedDb, ShardedReadDb, Shards, create_shard_set,
 };
 use axum::extract::FromRequestParts;
 use axum::http::Request;
@@ -183,6 +183,32 @@ async fn sharded_db_resolves_key_from_tenancy_task_local() {
     assert!(
         !rejection.to_string().contains("ShardKeyOverride"),
         "tenant context must resolve the key: {rejection}"
+    );
+}
+
+#[tokio::test]
+async fn sharded_read_db_without_replica_rejects_with_503() {
+    // A state whose shard has no replica must reject with a 503 that names
+    // the missing replica, not a ShardKeyOverride-guidance message.
+    let state = sharded_state(&["alpha"]);
+    state.insert_extension(AutumnConfig::default());
+    let mut parts = request_parts("/");
+    parts
+        .extensions
+        .insert(ShardKeyOverride("tenant-1".to_owned()));
+
+    let rejection = ShardedReadDb::from_request_parts(&mut parts, &state)
+        .await
+        .err()
+        .expect("no replica → must reject");
+    let msg = rejection.to_string();
+    assert!(
+        msg.contains("replica"),
+        "rejection must name the missing replica: {msg}"
+    );
+    assert!(
+        !msg.contains("ShardKeyOverride"),
+        "must get past key resolution: {msg}"
     );
 }
 

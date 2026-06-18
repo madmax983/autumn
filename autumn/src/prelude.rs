@@ -79,7 +79,7 @@ pub use crate::mail::{
 };
 /// Shard routing extractors and types for `[[database.shards]]` apps.
 #[cfg(feature = "db")]
-pub use crate::sharding::{ShardKey, ShardKeyOverride, ShardedDb, Shards};
+pub use crate::sharding::{ShardKey, ShardKeyOverride, ShardedDb, ShardedReadDb, Shards};
 /// Server-Sent Events (SSE) support.
 pub use crate::sse::{Event, Sse};
 /// Structured CLI argument extractor for one-off `#[task]` handlers.
