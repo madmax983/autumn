@@ -95,6 +95,8 @@ pub fn app() -> AppBuilder {
         shard_provider_factory: None,
         #[cfg(feature = "db")]
         shard_router: None,
+        #[cfg(feature = "db")]
+        directory_shard_router: false,
         telemetry_provider: None,
         session_store: None,
         #[cfg(feature = "ws")]
@@ -284,6 +286,10 @@ pub struct AppBuilder {
     /// is used.
     #[cfg(feature = "db")]
     shard_router: Option<Arc<dyn crate::sharding::ShardRouter>>,
+    /// Builder opt-in for the control-DB [`DirectoryShardRouter`](crate::sharding::DirectoryShardRouter),
+    /// applied to `config.database.directory_shard_router` at build time.
+    #[cfg(feature = "db")]
+    directory_shard_router: bool,
     /// Custom telemetry provider (tier-1 subsystem replacement). When `None`,
     /// the default [`TracingOtlpTelemetryProvider`](crate::telemetry::TracingOtlpTelemetryProvider) runs.
     telemetry_provider: Option<Box<dyn crate::telemetry::TelemetryProvider>>,
@@ -1611,6 +1617,23 @@ impl AppBuilder {
         self
     }
 
+    /// Route tenants through the control-plane `_autumn_shard_directory` table
+    /// via a [`DirectoryShardRouter`](crate::sharding::DirectoryShardRouter).
+    ///
+    /// The router is bound to the control primary pool at build time. Tenants
+    /// with a directory row are pinned to the named shard; everyone else falls
+    /// back to the slot-hash router. Apply the framework migrations to the
+    /// control database (`autumn migrate`) so `_autumn_shard_directory` exists.
+    ///
+    /// An explicit [`with_shard_router`](Self::with_shard_router) takes
+    /// precedence over this flag.
+    #[cfg(feature = "db")]
+    #[must_use]
+    pub fn with_directory_shard_router(mut self) -> Self {
+        self.directory_shard_router = true;
+        self
+    }
+
     /// Install a custom [`TelemetryProvider`](crate::telemetry::TelemetryProvider),
     /// replacing the default `tracing-subscriber + OTLP` initializer.
     ///
@@ -2431,6 +2454,8 @@ impl AppBuilder {
             shard_provider_factory,
             #[cfg(feature = "db")]
             shard_router,
+            #[cfg(feature = "db")]
+            directory_shard_router,
             telemetry_provider,
             session_store,
             #[cfg(feature = "ws")]
@@ -2572,6 +2597,7 @@ impl AppBuilder {
             pool_provider_factory,
             shard_provider_factory,
             shard_router,
+            directory_shard_router,
             RepositoryCommitHookQueueMigrationMode::Runtime,
         )
         .await
@@ -3271,6 +3297,8 @@ impl AppBuilder {
             shard_provider_factory,
             #[cfg(feature = "db")]
             shard_router,
+            #[cfg(feature = "db")]
+            directory_shard_router,
             telemetry_provider,
             session_store,
             #[cfg(feature = "ws")]
@@ -3421,6 +3449,7 @@ impl AppBuilder {
             pool_provider_factory,
             shard_provider_factory,
             shard_router,
+            directory_shard_router,
             RepositoryCommitHookQueueMigrationMode::StaticBuild,
         )
         .await
@@ -3811,6 +3840,8 @@ impl AppBuilder {
             shard_provider_factory,
             #[cfg(feature = "db")]
             shard_router,
+            #[cfg(feature = "db")]
+            directory_shard_router,
             telemetry_provider,
             session_store,
             #[cfg(feature = "ws")]
@@ -3892,6 +3923,7 @@ impl AppBuilder {
             pool_provider_factory,
             shard_provider_factory,
             shard_router,
+            directory_shard_router,
             RepositoryCommitHookQueueMigrationMode::Runtime,
         )
         .await
@@ -5166,6 +5198,7 @@ async fn setup_database(
     pool_provider: Option<PoolProviderFactory>,
     shard_provider: Option<ShardProviderFactory>,
     shard_router: Option<Arc<dyn crate::sharding::ShardRouter>>,
+    directory_shard_router: bool,
     hook_queue_migration_mode: RepositoryCommitHookQueueMigrationMode,
 ) -> Result<DatabaseBootstrap, String> {
     let migrations = migrations_with_repository_framework_migrations(
@@ -5181,7 +5214,28 @@ async fn setup_database(
     }
     .map_err(|e| format!("Failed to create database pool: {e}"))?;
 
-    let router = shard_router.unwrap_or_else(|| Arc::new(crate::sharding::HashShardRouter));
+    // Resolve the shard router: an explicit `with_shard_router` wins; otherwise
+    // `directory_shard_router` opts into the control-DB directory router (bound
+    // to the just-built control primary pool); otherwise the hash router.
+    let use_directory_router = directory_shard_router || config.database.directory_shard_router;
+    let router: Arc<dyn crate::sharding::ShardRouter> = match shard_router {
+        Some(explicit) => explicit,
+        None if use_directory_router => {
+            match topology.as_ref().map(crate::db::DatabaseTopology::primary) {
+                Some(control_primary) => Arc::new(crate::sharding::DirectoryShardRouter::new(
+                    control_primary.clone(),
+                )),
+                None => {
+                    tracing::warn!(
+                        "directory_shard_router is enabled but no control database is \
+                         configured; falling back to the hash router"
+                    );
+                    Arc::new(crate::sharding::HashShardRouter)
+                }
+            }
+        }
+        None => Arc::new(crate::sharding::HashShardRouter),
+    };
     let shards = if config.database.has_shards() {
         let set = match shard_provider {
             Some(factory) => {
@@ -6552,6 +6606,7 @@ mod tests {
             pool_provider_factory,
             None,
             None,
+            false,
             RepositoryCommitHookQueueMigrationMode::Runtime,
         )
         .await
@@ -6622,6 +6677,7 @@ mod tests {
             None,
             None,
             None,
+            false,
             RepositoryCommitHookQueueMigrationMode::Runtime,
         )
         .await
@@ -6708,6 +6764,7 @@ mod tests {
             pool_provider_factory,
             shard_provider_factory,
             None,
+            false,
             RepositoryCommitHookQueueMigrationMode::Runtime,
         )
         .await

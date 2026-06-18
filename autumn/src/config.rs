@@ -3293,6 +3293,18 @@ pub struct DatabaseConfig {
     #[serde(default)]
     pub shards: Vec<ShardConfig>,
 
+    /// Route tenants through the control-plane `_autumn_shard_directory` table
+    /// (a [`DirectoryShardRouter`](crate::sharding::DirectoryShardRouter))
+    /// instead of pure slot-hash routing. Default: `false`.
+    ///
+    /// Tenants with a directory row are pinned to the named shard; everyone
+    /// else falls back to the hash router. Usually set via
+    /// [`AppBuilder::with_directory_shard_router`](crate::app::AppBuilder::with_directory_shard_router).
+    /// Ignored when no shards are configured or an explicit
+    /// [`with_shard_router`](crate::app::AppBuilder::with_shard_router) is set.
+    #[serde(default)]
+    pub directory_shard_router: bool,
+
     /// Emit a startup warning when the aggregate maximum connection count
     /// across the control topology and every shard pool reaches this value.
     /// Default: `100`.
@@ -4139,6 +4151,7 @@ impl Default for DatabaseConfig {
             statement_timeout: None,
             slow_query_threshold: default_slow_query_threshold(),
             shards: Vec::new(),
+            directory_shard_router: false,
             max_connections_warn_threshold: default_max_connections_warn_threshold(),
         }
     }

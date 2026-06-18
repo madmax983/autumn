@@ -211,6 +211,196 @@ impl ShardRouter for HashShardRouter {
     }
 }
 
+/// A [`ShardRouter`] that consults an explicit `_autumn_shard_directory`
+/// table on the control database, falling back to the hash router for any
+/// tenant without a directory row.
+///
+/// This is the routing half of "move a tenant to a specific shard": a row in
+/// `_autumn_shard_directory(tenant_key, shard_name)` pins that tenant to a
+/// named shard regardless of where the slot hash would place it. Tenants with
+/// no row route by [`HashShardRouter`], so the directory only needs entries
+/// for relocated/"whale" tenants.
+///
+/// Resolutions are cached for [`DEFAULT_DIRECTORY_CACHE_TTL`] (positive *and*
+/// fallback results) so steady-state routing issues no control-DB query.
+/// After changing a directory row, call [`invalidate`](Self::invalidate) for
+/// that key so the next route re-reads it. (NOTIFY-based cross-process
+/// invalidation is a planned follow-up; today the TTL bounds staleness and
+/// `invalidate` clears the local entry immediately.)
+///
+/// Install with
+/// [`AppBuilder::with_directory_shard_router`](crate::app::AppBuilder::with_directory_shard_router).
+///
+/// Only string keys are looked up in the directory (tenants are strings);
+/// numeric/byte keys route straight through the fallback.
+pub struct DirectoryShardRouter {
+    control_pool: Pool<AsyncPgConnection>,
+    fallback: Arc<dyn ShardRouter>,
+    cache: std::sync::RwLock<HashMap<String, DirectoryCacheEntry>>,
+    ttl: std::time::Duration,
+}
+
+/// Default time a resolved tenant→shard mapping is cached before re-reading
+/// the directory table.
+pub const DEFAULT_DIRECTORY_CACHE_TTL: std::time::Duration =
+    std::time::Duration::from_secs(30);
+
+#[derive(Clone, Copy)]
+struct DirectoryCacheEntry {
+    shard: ShardId,
+    expires_at: std::time::Instant,
+}
+
+#[derive(diesel::QueryableByName)]
+struct ShardNameRow {
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    shard_name: String,
+}
+
+impl std::fmt::Debug for DirectoryShardRouter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DirectoryShardRouter")
+            .field("ttl", &self.ttl)
+            .field("cached_keys", &self.cache.read().map(|c| c.len()).unwrap_or(0))
+            .finish_non_exhaustive()
+    }
+}
+
+impl DirectoryShardRouter {
+    /// Build a directory router over the given control pool, falling back to
+    /// [`HashShardRouter`] and using [`DEFAULT_DIRECTORY_CACHE_TTL`].
+    #[must_use]
+    pub fn new(control_pool: Pool<AsyncPgConnection>) -> Self {
+        Self::with_fallback(control_pool, Arc::new(HashShardRouter))
+    }
+
+    /// Build a directory router with an explicit fallback router and the
+    /// default cache TTL.
+    #[must_use]
+    pub fn with_fallback(
+        control_pool: Pool<AsyncPgConnection>,
+        fallback: Arc<dyn ShardRouter>,
+    ) -> Self {
+        Self {
+            control_pool,
+            fallback,
+            cache: std::sync::RwLock::new(HashMap::new()),
+            ttl: DEFAULT_DIRECTORY_CACHE_TTL,
+        }
+    }
+
+    /// Override the cache TTL.
+    #[must_use]
+    pub fn with_cache_ttl(mut self, ttl: std::time::Duration) -> Self {
+        self.ttl = ttl;
+        self
+    }
+
+    /// Drop the cached mapping for `tenant_key`, forcing the next route to
+    /// re-read the directory. Call this after inserting, updating, or deleting
+    /// that tenant's directory row.
+    pub fn invalidate(&self, tenant_key: &str) {
+        if let Ok(mut cache) = self.cache.write() {
+            cache.remove(tenant_key);
+        }
+    }
+
+    /// Drop every cached mapping.
+    pub fn invalidate_all(&self) {
+        if let Ok(mut cache) = self.cache.write() {
+            cache.clear();
+        }
+    }
+
+    fn cache_get(&self, key: &str) -> Option<ShardId> {
+        let cache = self.cache.read().ok()?;
+        let entry = cache.get(key)?;
+        (entry.expires_at > std::time::Instant::now()).then_some(entry.shard)
+    }
+
+    fn cache_put(&self, key: String, shard: ShardId) {
+        if let Ok(mut cache) = self.cache.write() {
+            cache.insert(
+                key,
+                DirectoryCacheEntry {
+                    shard,
+                    expires_at: std::time::Instant::now() + self.ttl,
+                },
+            );
+        }
+    }
+
+    /// Look up a tenant key in the directory table. Returns the resolved
+    /// `ShardId` on a directory hit, or `None` when the tenant has no row
+    /// (the caller then falls back to the hash router).
+    async fn lookup_directory(
+        &self,
+        key: &str,
+        shards: &ShardSet,
+    ) -> Result<Option<ShardId>, AutumnError> {
+        use diesel::OptionalExtension as _;
+        use diesel_async::RunQueryDsl;
+
+        let mut conn = self.control_pool.get().await.map_err(|e| {
+            AutumnError::service_unavailable_msg(format!(
+                "DirectoryShardRouter could not acquire a control connection: {e}"
+            ))
+        })?;
+
+        let row = diesel::sql_query(
+            "SELECT shard_name FROM _autumn_shard_directory WHERE tenant_key = $1",
+        )
+        .bind::<diesel::sql_types::Text, _>(key)
+        .get_result::<ShardNameRow>(&mut conn)
+        .await
+        .optional()
+        .map_err(|e| {
+            AutumnError::service_unavailable_msg(format!(
+                "DirectoryShardRouter directory lookup failed: {e}"
+            ))
+        })?;
+
+        let Some(row) = row else {
+            return Ok(None);
+        };
+
+        let shard = shards.by_name(&row.shard_name).ok_or_else(|| {
+            AutumnError::service_unavailable_msg(format!(
+                "shard directory pins tenant {key:?} to unknown shard {:?}",
+                row.shard_name
+            ))
+        })?;
+        Ok(Some(shard.id()))
+    }
+}
+
+impl ShardRouter for DirectoryShardRouter {
+    fn route<'a>(
+        &'a self,
+        key: ShardKey<'a>,
+        shards: &'a ShardSet,
+    ) -> futures::future::BoxFuture<'a, Result<ShardId, AutumnError>> {
+        Box::pin(async move {
+            // Only string keys participate in the directory (tenants are
+            // strings); numeric/byte keys route straight through the fallback.
+            let ShardKey::Str(key_str) = key else {
+                return self.fallback.route(key, shards).await;
+            };
+
+            if let Some(cached) = self.cache_get(key_str) {
+                return Ok(cached);
+            }
+
+            let resolved = match self.lookup_directory(key_str, shards).await? {
+                Some(shard) => shard,
+                None => self.fallback.route(key, shards).await?,
+            };
+            self.cache_put(key_str.to_owned(), resolved);
+            Ok(resolved)
+        })
+    }
+}
+
 // ── Shard runtime state ──────────────────────────────────────────────────────
 
 /// Mutable per-shard replica readiness, updated by the per-shard health
