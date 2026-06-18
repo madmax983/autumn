@@ -164,6 +164,7 @@ csv = { workspace = true, optional = true }
 lettre = { version = "0.11.21", default-features = false, features = ["builder", "smtp-transport", "tokio1-rustls-tls"], optional = true }
 chromiumoxide = { workspace = true, optional = true }
 image = { workspace = true, optional = true }
+itertools = "0.14.0"
 
 [dev-dependencies]
 diesel = { version = "2", features = ["chrono", "postgres"] }

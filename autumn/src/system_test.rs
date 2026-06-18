@@ -151,11 +151,7 @@ impl fmt::Display for BrowserCheck {
                 write!(
                     f,
                     "Chromium not found. Searched:\n{}",
-                    searched_paths
-                        .iter()
-                        .map(|p| format!("  {}", p.display()))
-                        .collect::<Vec<_>>()
-                        .join("\n")
+                    itertools::Itertools::join(&mut searched_paths.iter().map(|p| format!("  {}", p.display())), "\n")
                 )?;
                 write!(
                     f,
@@ -177,7 +173,7 @@ pub enum SystemTestError {
         "Chromium browser not found. Searched:\n{}\n\n\
          To install: apt-get install chromium-browser\n\
          Or set AUTUMN_CHROMIUM=/path/to/chrome",
-        searched.iter().map(|p| format!("  {}", p.display())).collect::<Vec<_>>().join("\n")
+        itertools::Itertools::join(&mut searched.iter().map(|p| format!("  {}", p.display())), "\n")
     )]
     BrowserNotFound {
         /// Paths that were checked.

@@ -451,17 +451,20 @@ pub async fn wizard_progress(ctx: &WizardContext, current_step: &str) -> Markup 
 }
 
 /// Convert a `snake_case` or `kebab-case` step name into a Title Case label.
+///
+/// ⚡ Optimization: Uses `itertools::join` to eliminate intermediate `Vec` allocations during string concatenation.
 fn title_case(s: &str) -> String {
-    s.split(['_', '-'])
-        .filter(|w| !w.is_empty())
-        .map(|w| {
-            let mut c = w.chars();
-            c.next().map_or_else(String::new, |f| {
-                f.to_uppercase().collect::<String>() + c.as_str()
-            })
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
+    itertools::join(
+        s.split(['_', '-'])
+            .filter(|w| !w.is_empty())
+            .map(|w| {
+                let mut c = w.chars();
+                c.next().map_or_else(String::new, |f| {
+                    f.to_uppercase().collect::<String>() + c.as_str()
+                })
+            }),
+        " ",
+    )
 }
 
 // ── Tests ──────────────────────────────────────────────────────────

@@ -350,17 +350,19 @@ pub fn check_route_prefix(
 /// Both named params (`{id}`) and catch-all params (`{*rest}`) normalize to
 /// `{}`. matchit (Axum's router) treats a named param and a catch-all at the
 /// same path position as a conflict, so they must map to the same key.
+///
+/// ⚡ Optimization: Uses `itertools::join` to eliminate intermediate `Vec` allocations during string concatenation.
 fn normalize_path_for_collision(path: &str) -> String {
-    path.split('/')
-        .map(|seg| {
+    itertools::join(
+        path.split('/').map(|seg| {
             if seg.starts_with('{') && seg.ends_with('}') {
                 "{}"
             } else {
                 seg
             }
-        })
-        .collect::<Vec<_>>()
-        .join("/")
+        }),
+        "/",
+    )
 }
 
 /// Detect route collisions: any two routes sharing the same (method, path) pair.
