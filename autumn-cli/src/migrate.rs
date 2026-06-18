@@ -564,7 +564,7 @@ fn read_autumn_toml_table() -> Option<toml::Table> {
 /// `autumn migrate --profile prod` resolves the same control + shard URLs the
 /// running app would under that profile. With no profile (or no overlay file),
 /// the base table is returned unchanged.
-fn read_autumn_toml_table_with_profile(profile: Option<&str>) -> Option<toml::Table> {
+pub(crate) fn read_autumn_toml_table_with_profile(profile: Option<&str>) -> Option<toml::Table> {
     read_autumn_toml_table_with_profile_in(Path::new("."), profile)
 }
 
@@ -653,7 +653,7 @@ where
 /// `AUTUMN_DATABASE__SHARDS__{i}__NAME` / `__PRIMARY_URL` override entry
 /// `i` of the TOML declaration (or append a new entry when both are set
 /// for the next free index); probing stops at the first absent index.
-fn resolve_shard_database_urls_from_sources<F>(
+pub(crate) fn resolve_shard_database_urls_from_sources<F>(
     env_var: F,
     table: Option<&toml::Table>,
 ) -> Vec<(String, String)>

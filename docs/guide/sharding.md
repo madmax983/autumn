@@ -365,6 +365,28 @@ The script never edits the slot map — copy and verify, cut the slot over in
 relying on the slot move alone) is what the
 [`DirectoryShardRouter`](#custom-routing-and-whale-tenants) is for.
 
+### `autumn shard move-slot`
+
+The same copy → verify → `--confirm` delete flow ships as a framework command
+that resolves `--from` / `--to` by their configured shard names (honoring
+`--profile` and env, like `autumn migrate`) and works on any table:
+
+```bash
+# Copy + verify only (source rows kept):
+autumn shard move-slot --from shard0 --to shard1 \
+  --table bookmarks --tenant acme
+
+# Flip acme's slot to shard1 in autumn.toml and deploy, then delete the
+# stale source rows:
+autumn shard move-slot --from shard0 --to shard1 \
+  --table bookmarks --tenant acme --confirm
+```
+
+It copies every column (so references to a moved row stay valid), verifies row
+counts and a `to_jsonb` content checksum on both shards, and only deletes from
+the source with `--confirm`. Like the example, it never edits the slot map.
+Requires the `psql` client on `PATH`.
+
 ## Testing
 
 Deadpool builds pools lazily, so sharded states are constructible in
