@@ -974,7 +974,7 @@ impl Shards {
         let shard = self.set.route(key).await?;
         let pool = shard.replica_read_pool().ok_or_else(|| {
             AutumnError::service_unavailable_msg(format!(
-                "shard {:?} has no healthy replica; ShardedReadDb requires a \
+                "shard {:?} has no healthy replica; read_replica_for requires a \
                  configured, ready replica (no primary fallback)",
                 shard.name()
             ))
