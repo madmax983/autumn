@@ -7436,20 +7436,21 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     };
 
-    // §1d: when sharded + tenant_scoped, fan out across all shards for
-    // across_tenants reads.  The sub-repo uses `with_pool_untracked` so its
+    // §1d: when sharded + tenant_scoped, fan out across all shards concurrently
+    // for across_tenants reads.  Uses ShardSet::fan_out_shards for concurrent
+    // execution.  The sub-repo uses `with_pool_untracked` so its
     // `__autumn_shards` is `None`, preventing recursion.
     let find_all_impl = if config.sharded && config.tenant_scoped {
         quote! {
             if self.across_tenants {
                 if let ::core::option::Option::Some(ref __shards) = self.__autumn_shards {
-                    let mut __all: ::std::vec::Vec<#model_name> = ::std::vec::Vec::new();
-                    for __shard in __shards.iter() {
-                        let __sub = Self::with_pool_untracked(__shard.primary_pool().clone()).across_tenants();
-                        let mut __rows = __sub.find_all().await?;
-                        __all.append(&mut __rows);
-                    }
-                    return ::core::result::Result::Ok(__all);
+                    let __vecs = __shards.fan_out_shards(|__pool| {
+                        let __sub = Self::with_pool_untracked(__pool).across_tenants();
+                        async move { __sub.find_all().await }
+                    }).await?;
+                    return ::core::result::Result::Ok(
+                        __vecs.into_iter().flatten().collect()
+                    );
                 }
             }
             #find_all_impl
@@ -7499,12 +7500,11 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         quote! {
             if self.across_tenants {
                 if let ::core::option::Option::Some(ref __shards) = self.__autumn_shards {
-                    let mut __total: i64 = 0;
-                    for __shard in __shards.iter() {
-                        let __sub = Self::with_pool_untracked(__shard.primary_pool().clone()).across_tenants();
-                        __total += __sub.count().await?;
-                    }
-                    return ::core::result::Result::Ok(__total);
+                    let __counts = __shards.fan_out_shards(|__pool| {
+                        let __sub = Self::with_pool_untracked(__pool).across_tenants();
+                        async move { __sub.count().await }
+                    }).await?;
+                    return ::core::result::Result::Ok(__counts.into_iter().sum());
                 }
             }
             #count_impl
@@ -7560,13 +7560,11 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         quote! {
             if self.across_tenants {
                 if let ::core::option::Option::Some(ref __shards) = self.__autumn_shards {
-                    for __shard in __shards.iter() {
-                        let __sub = Self::with_pool_untracked(__shard.primary_pool().clone()).across_tenants();
-                        if __sub.exists_by_id(id).await? {
-                            return ::core::result::Result::Ok(true);
-                        }
-                    }
-                    return ::core::result::Result::Ok(false);
+                    let __results = __shards.fan_out_shards(|__pool| {
+                        let __sub = Self::with_pool_untracked(__pool).across_tenants();
+                        async move { __sub.exists_by_id(id).await }
+                    }).await?;
+                    return ::core::result::Result::Ok(__results.into_iter().any(|b| b));
                 }
             }
             #exists_by_id_impl
@@ -10109,5 +10107,131 @@ mod tests {
         let config = parse_repo_args(tokens).unwrap();
         assert!(config.sharded);
         assert!(!config.tenant_scoped);
+    }
+
+    // ── §1d: sharded + tenant_scoped across_tenants fan-out ────────
+
+    #[test]
+    fn sharded_tenant_scoped_find_all_contains_fan_out_guard() {
+        let generated = repository_macro(
+            quote! { Post, tenant_scoped, sharded },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        // The fan-out guard iterates __shards
+        assert!(
+            generated.contains("__shards"),
+            "sharded+tenant_scoped find_all must contain fan-out guard over __shards: {generated}"
+        );
+        // It must build a sub-repo with with_pool_untracked
+        assert!(
+            generated.contains("with_pool_untracked"),
+            "fan-out guard must call with_pool_untracked for sub-repo: {generated}"
+        );
+    }
+
+    #[test]
+    fn sharded_tenant_scoped_count_contains_fan_out_guard() {
+        let generated = repository_macro(
+            quote! { Post, tenant_scoped, sharded },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        let count_pos = generated
+            .find("async fn count")
+            .expect("count must be generated");
+        let section = &generated[count_pos..count_pos + 600];
+        assert!(
+            section.contains("__shards"),
+            "sharded+tenant_scoped count must fan out across shards: {section}"
+        );
+    }
+
+    #[test]
+    fn sharded_tenant_scoped_exists_by_id_contains_fan_out_guard() {
+        let generated = repository_macro(
+            quote! { Post, tenant_scoped, sharded },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        let pos = generated
+            .find("async fn exists_by_id")
+            .expect("exists_by_id must be generated");
+        let section = &generated[pos..pos + 800];
+        assert!(
+            section.contains("__shards"),
+            "sharded+tenant_scoped exists_by_id must fan out across shards: {section}"
+        );
+    }
+
+    #[test]
+    fn sharded_tenant_scoped_write_methods_have_cross_shard_guard() {
+        let generated = repository_macro(
+            quote! { Post, tenant_scoped, sharded },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        // The error message for cross-shard writes must appear in generated code
+        assert!(
+            generated.contains("cross-shard writes are not supported"),
+            "sharded+tenant_scoped write methods must include cross-shard write guard: {generated}"
+        );
+    }
+
+    #[test]
+    fn sharded_tenant_scoped_page_has_cross_shard_guard() {
+        let generated = repository_macro(
+            quote! { Post, tenant_scoped, sharded },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        let page_pos = generated
+            .find("async fn page")
+            .expect("page must be generated");
+        let section = &generated[page_pos..page_pos + 600];
+        assert!(
+            section.contains("cross-shard pagination is not supported"),
+            "sharded+tenant_scoped page() must include cross-shard pagination guard: {section}"
+        );
+    }
+
+    #[test]
+    fn non_sharded_tenant_scoped_has_no_fan_out_guard() {
+        // Non-sharded repos must NOT have the shard fan-out code
+        let generated = repository_macro(
+            quote! { Post, tenant_scoped },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        assert!(
+            !generated.contains("cross-shard writes are not supported"),
+            "non-sharded repo must not contain cross-shard write guard: {generated}"
+        );
+        assert!(
+            !generated.contains("cross-shard pagination is not supported"),
+            "non-sharded repo must not contain cross-shard pagination guard: {generated}"
+        );
+    }
+
+    #[test]
+    fn sharded_without_tenant_scoped_has_no_write_guard() {
+        // `sharded` alone (no `tenant_scoped`) means no across_tenants(), so
+        // the write guard is also not generated.
+        let generated = repository_macro(
+            quote! { Post, sharded },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        assert!(
+            !generated.contains("cross-shard writes are not supported"),
+            "sharded-only repo must not contain cross-shard write guard: {generated}"
+        );
     }
 }

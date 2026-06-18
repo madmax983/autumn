@@ -580,6 +580,50 @@ impl ShardSet {
             .sum()
     }
 
+    /// Whether `key` is owned by the shard at the given index in declaration order.
+    ///
+    /// Uses the hash-based slot assignment, **not** the installed router (which
+    /// may override routing for individual tenants via a directory). Use this for
+    /// tooling / slot-move scripts where you need to verify ownership without
+    /// issuing an async router call.
+    #[must_use]
+    pub fn owns_key<'k>(&self, shard_id: ShardId, key: impl Into<ShardKey<'k>>) -> bool {
+        let slot = self.slot_for_key(key);
+        self.shard_for_slot(slot)
+            .map(|s| s.id() == shard_id)
+            .unwrap_or(false)
+    }
+
+    /// All logical slots assigned to the shard at index `shard_id`.
+    ///
+    /// Returns `None` when the id is out of range.
+    #[must_use]
+    pub fn slots_for_shard(&self, shard_id: ShardId) -> Option<&[u16]> {
+        self.inner.shards.get(shard_id.0).map(|s| s.slots())
+    }
+
+    /// Partition string `keys` by their owning shard based on hash-slot assignment.
+    ///
+    /// Keys are grouped in declaration order; the returned map may have fewer
+    /// entries than `self.len()` when some shards own none of the given keys.
+    /// Useful for slot-move tooling that needs to issue `WHERE tenant_id = ANY($1)`
+    /// per destination shard.
+    #[must_use]
+    pub fn partition_by_shard<'k>(
+        &self,
+        keys: impl IntoIterator<Item = &'k str>,
+    ) -> std::collections::HashMap<ShardId, Vec<&'k str>> {
+        let mut map: std::collections::HashMap<ShardId, Vec<&'k str>> =
+            std::collections::HashMap::new();
+        for key in keys {
+            let slot = slot_for_key(ShardKey::Str(key));
+            if let Some(shard) = self.shard_for_slot(slot) {
+                map.entry(shard.id()).or_default().push(key);
+            }
+        }
+        map
+    }
+
     /// Fan out a closure over every shard concurrently, collecting one result
     /// per shard.  Fails the whole call if **any** shard errors.
     ///
@@ -587,7 +631,13 @@ impl ShardSet {
     /// `#[repository(tenant_scoped, sharded)]` repositories.  The sub-repo
     /// created inside `f` must use `with_pool_untracked` so that
     /// `__autumn_shards` is `None` and recursion is impossible.
-    pub(crate) async fn fan_out_shards<T, Fut, F>(
+    ///
+    /// This is a framework-internal primitive used by generated repository
+    /// code.  It is `pub` so that downstream crates can call it from
+    /// `#[repository]`-generated `impl` blocks, but it is not part of the
+    /// stable public API.
+    #[doc(hidden)]
+    pub async fn fan_out_shards<T, Fut, F>(
         &self,
         f: F,
     ) -> Result<Vec<T>, crate::AutumnError>
@@ -670,6 +720,82 @@ pub fn create_shard_set(
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
+    build_shard_set(config, topologies, router).map(Some)
+}
+
+/// Build a [`ShardSet`] where every shard primary pool uses `max_size(1)` and
+/// wraps each connection in a test transaction that is rolled back when the
+/// connection is returned.
+///
+/// This mirrors the transactional control-pool logic in [`TestApp`] so that
+/// shard repositories in integration tests see rolled-back state between test
+/// runs.
+///
+/// **Deadlock caveat:** with `max_size(1)` a handler that checks out the same
+/// shard connection twice in a single request will deadlock (same as the
+/// control pool).  Use a separate non-transactional shard set when a test
+/// requires concurrent shard checkouts.
+///
+/// # Errors
+///
+/// Returns [`ShardSetBuildError`] when no shards are configured, any pool
+/// cannot be built, or the slot map is invalid.
+pub fn create_shard_set_transactional(
+    config: &DatabaseConfig,
+    router: Arc<dyn ShardRouter>,
+) -> Result<Option<ShardSet>, ShardSetBuildError> {
+    if !config.has_shards() {
+        return Ok(None);
+    }
+
+    let timeout =
+        std::time::Duration::from_secs(config.connect_timeout_secs);
+
+    let topologies = config
+        .shards
+        .iter()
+        .map(|shard| {
+            let manager =
+                diesel_async::pooled_connection::AsyncDieselConnectionManager::<
+                    diesel_async::AsyncPgConnection,
+                >::new(&shard.primary_url);
+            let pool = Pool::builder(manager)
+                .max_size(1)
+                .wait_timeout(Some(timeout))
+                .create_timeout(Some(timeout))
+                .runtime(deadpool::Runtime::Tokio1)
+                .post_create(deadpool::managed::Hook::async_fn(
+                    |conn: &mut diesel_async::AsyncPgConnection, _| {
+                        Box::pin(async move {
+                            use diesel_async::AsyncConnection as _;
+                            use diesel_async::RunQueryDsl as _;
+                            conn.begin_test_transaction().await.map_err(|e| {
+                                deadpool::managed::HookError::Backend(
+                                    diesel_async::pooled_connection::PoolError::QueryError(e),
+                                )
+                            })?;
+                            diesel::sql_query(
+                                "SET autumn.test_transaction_started = 'true'",
+                            )
+                            .execute(conn)
+                            .await
+                            .map_err(|e| {
+                                deadpool::managed::HookError::Backend(
+                                    diesel_async::pooled_connection::PoolError::QueryError(e),
+                                )
+                            })?;
+                            Ok(())
+                        })
+                    },
+                ))
+                .build()
+                .map_err(|source| ShardSetBuildError::Pool {
+                    shard: shard.name.clone(),
+                    source,
+                })?;
+            Ok(crate::db::DatabaseTopology::primary_only(pool))
+        })
+        .collect::<Result<Vec<_>, ShardSetBuildError>>()?;
     build_shard_set(config, topologies, router).map(Some)
 }
 
@@ -1712,6 +1838,45 @@ mod tests {
             set.get(ShardId(1)).expect("b").slots(),
             (8192..16384).collect::<Vec<u16>>()
         );
+    }
+
+    // §3 slot-move helpers
+    #[test]
+    fn owns_key_agrees_with_route() {
+        // shard a owns slots 0-8191, shard b owns 8192-16383.
+        // "hooli" → slot 3974 → shard a (ShardId(0)).
+        // "a"     → slot 11404 → shard b (ShardId(1)).
+        let set = shard_set(&["a", "b"]);
+        assert!(set.owns_key(ShardId(0), "hooli"), "hooli (slot 3974) must be shard a");
+        assert!(!set.owns_key(ShardId(1), "hooli"), "hooli must not be shard b");
+        assert!(set.owns_key(ShardId(1), "a"), "key 'a' (slot 11404) must be shard b");
+        assert!(!set.owns_key(ShardId(0), "a"), "key 'a' must not be shard a");
+    }
+
+    #[test]
+    fn slots_for_shard_returns_correct_slice() {
+        let set = shard_set(&["a", "b"]);
+        let a_slots = set.slots_for_shard(ShardId(0)).expect("shard a exists");
+        let b_slots = set.slots_for_shard(ShardId(1)).expect("shard b exists");
+        assert_eq!(a_slots.len(), 8192);
+        assert_eq!(b_slots.len(), 8192);
+        assert!(a_slots.iter().all(|&s| s < 8192));
+        assert!(b_slots.iter().all(|&s| s >= 8192));
+        assert!(set.slots_for_shard(ShardId(9)).is_none());
+    }
+
+    #[test]
+    fn partition_by_shard_groups_golden_keys() {
+        // Using the golden-vector keys: "hooli"→3974 (shard a), "a"→11404 (shard b).
+        let set = shard_set(&["a", "b"]);
+        let keys = ["hooli", "a", "tenant-1"]; // tenant-1 → 12427 → shard b
+        let map = set.partition_by_shard(keys.iter().copied());
+        let shard_a_keys = map.get(&ShardId(0)).map(Vec::as_slice).unwrap_or(&[]);
+        let shard_b_keys = map.get(&ShardId(1)).map(Vec::as_slice).unwrap_or(&[]);
+        assert!(shard_a_keys.contains(&"hooli"), "hooli must go to shard a");
+        assert!(shard_b_keys.contains(&"a"), "key 'a' must go to shard b");
+        assert!(shard_b_keys.contains(&"tenant-1"), "tenant-1 (slot 12427) must go to shard b");
+        assert_eq!(shard_a_keys.len() + shard_b_keys.len(), keys.len(), "no key dropped");
     }
 
     #[test]
