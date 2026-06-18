@@ -391,6 +391,33 @@ impl Shard {
         self.read_pool_with_role().map(|(pool, _)| pool)
     }
 
+    /// Snapshot this shard's read-routing decision as a
+    /// [`ReadRoute`](crate::repository::ReadRoute), the per-shard analogue of
+    /// [`ReadRoute::from_state`](crate::repository::ReadRoute::from_state).
+    ///
+    /// [`ShardedDb`] captures this at extraction time so a generated
+    /// `#[repository]` built with `from_shard` routes its read-only methods
+    /// to the shard's replica automatically — mirroring [`read_pool`] and
+    /// honoring the shard's `replica_fallback` policy and replica readiness:
+    ///
+    /// - no replica configured → [`Primary`](crate::repository::ReadRoute::Primary);
+    /// - replica ready → [`ReadPool`](crate::repository::ReadRoute::ReadPool) over the replica;
+    /// - replica unready, fallback `primary` → `ReadPool` over the primary;
+    /// - replica unready, fallback `fail_readiness` →
+    ///   [`Unavailable`](crate::repository::ReadRoute::Unavailable).
+    ///
+    /// [`read_pool`]: Self::read_pool
+    #[must_use]
+    pub fn read_route(&self) -> crate::repository::ReadRoute {
+        use crate::repository::ReadRoute;
+        if !self.runtime.replica_configured {
+            return ReadRoute::Primary;
+        }
+        self.read_pool().map_or(ReadRoute::Unavailable, |pool| {
+            ReadRoute::ReadPool(pool.clone())
+        })
+    }
+
     /// [`read_pool`](Self::read_pool) plus the role label of the returned
     /// pool, for interceptor/metric naming.
     pub(crate) fn read_pool_with_role(&self) -> Option<(&Pool<AsyncPgConnection>, &'static str)> {
@@ -1049,6 +1076,11 @@ pub struct ShardRepositorySeed {
     /// Shard-tagged route label (e.g. `"GET /bookmarks shard=shard0"`),
     /// or `None` when no `MatchedPath` was present in the request.
     pub route: Option<String>,
+    /// The shard's read-routing decision, snapshotted at extraction time so
+    /// `from_shard` repositories send read-only methods to the shard's
+    /// replica when one is healthy (issue #1274). Built via
+    /// [`Shard::read_route`].
+    pub read_route: crate::repository::ReadRoute,
 }
 
 impl ShardRepositorySeed {
@@ -1056,6 +1088,7 @@ impl ShardRepositorySeed {
         pool: &Pool<AsyncPgConnection>,
         ctx: &crate::db::RequestDbContext,
         shard_name: &str,
+        read_route: crate::repository::ReadRoute,
     ) -> Self {
         // Postgres `statement_timeout` is a signed 32-bit integer (ms); cap
         // to `i32::MAX` so the cast back to a `u64` field is always lossless.
@@ -1072,6 +1105,7 @@ impl ShardRepositorySeed {
                 .route_key
                 .as_ref()
                 .map(|key| format!("{key} shard={shard_name}")),
+            read_route,
         }
     }
 }
@@ -1197,8 +1231,12 @@ impl axum::extract::FromRequestParts<crate::AppState> for ShardedDb {
         let shard = shards.set.route(&key).await?;
         let shard_name = Arc::clone(&shard.name);
         let shard_id = shard.id();
-        let repo_seed =
-            ShardRepositorySeed::from_ctx(shard.primary_pool(), &shards.ctx, &shard_name);
+        let repo_seed = ShardRepositorySeed::from_ctx(
+            shard.primary_pool(),
+            &shards.ctx,
+            &shard_name,
+            shard.read_route(),
+        );
         let db = shards.checkout_primary(shard).await?;
         Ok(Self {
             db,
@@ -1558,6 +1596,105 @@ mod tests {
         assert!(shard.runtime().detail().expect("detail").contains("lags"));
     }
 
+    // ── read_route: per-shard ReadRoute snapshot (issue #1274) ───────────
+
+    const PRIMARY_SIZE: usize = 7;
+    const REPLICA_SIZE: usize = 3;
+
+    /// A one-shard set whose primary and replica pools have *distinct*
+    /// `max_size` so `read_route()` reveals which pool it selected.
+    fn shard_with_sized_replica(fallback: ReplicaFallback) -> Shard {
+        let mut config = sharded_config(&["a"]);
+        config.shards[0].replica_url = Some("postgres://localhost/a_ro".to_owned());
+        config.shards[0].replica_fallback = Some(fallback);
+        config.shards[0].primary_pool_size = Some(PRIMARY_SIZE);
+        config.shards[0].replica_pool_size = Some(REPLICA_SIZE);
+        let set = create_shard_set(&config, Arc::new(HashShardRouter))
+            .expect("build")
+            .expect("configured");
+        set.get(ShardId(0)).expect("shard").clone()
+    }
+
+    /// `max_size` of the pool a `ReadPool` route would acquire from, or
+    /// `None` for the `Primary` / `Unavailable` variants.
+    fn read_pool_size(route: &crate::repository::ReadRoute) -> Option<usize> {
+        match route {
+            crate::repository::ReadRoute::ReadPool(pool) => Some(pool.status().max_size),
+            crate::repository::ReadRoute::Primary | crate::repository::ReadRoute::Unavailable => {
+                None
+            }
+        }
+    }
+
+    #[test]
+    fn read_route_is_primary_without_replica() {
+        let set = shard_set(&["a"]);
+        let shard = set.get(ShardId(0)).expect("shard");
+        assert!(
+            matches!(shard.read_route(), crate::repository::ReadRoute::Primary),
+            "a shard with no replica must keep reads on the primary"
+        );
+    }
+
+    #[test]
+    fn read_route_targets_replica_when_ready() {
+        let shard = shard_with_sized_replica(ReplicaFallback::Primary);
+        shard.runtime().mark_replica_connection_ready();
+        assert!(shard.runtime().replica_ready());
+        assert_eq!(
+            read_pool_size(&shard.read_route()),
+            Some(REPLICA_SIZE),
+            "a ready replica must route reads to the replica pool"
+        );
+    }
+
+    #[test]
+    fn read_route_falls_back_to_primary_when_unready_and_policy_allows() {
+        // Replica configured but never checked → fallback policy applies.
+        let shard = shard_with_sized_replica(ReplicaFallback::Primary);
+        assert_eq!(
+            read_pool_size(&shard.read_route()),
+            Some(PRIMARY_SIZE),
+            "primary fallback must route reads to the primary pool"
+        );
+    }
+
+    #[test]
+    fn read_route_is_unavailable_when_unready_and_fallback_forbidden() {
+        let shard = shard_with_sized_replica(ReplicaFallback::FailReadiness);
+        assert!(
+            matches!(
+                shard.read_route(),
+                crate::repository::ReadRoute::Unavailable
+            ),
+            "fail_readiness must not silently fall back to the primary"
+        );
+    }
+
+    #[test]
+    fn repository_seed_snapshots_the_shard_read_route() {
+        let shard = shard_with_sized_replica(ReplicaFallback::Primary);
+        shard.runtime().mark_replica_connection_ready();
+        let ctx = crate::db::RequestDbContext {
+            statement_timeout: None,
+            route_key: Some("GET /notes".to_owned()),
+            metrics: None,
+            slow_query_threshold: std::time::Duration::from_millis(500),
+            interceptors: Vec::new(),
+        };
+        let seed = ShardRepositorySeed::from_ctx(
+            shard.primary_pool(),
+            &ctx,
+            shard.name(),
+            shard.read_route(),
+        );
+        assert_eq!(
+            read_pool_size(&seed.read_route),
+            Some(REPLICA_SIZE),
+            "the seed must carry the shard's read route for from_shard"
+        );
+    }
+
     // ── Shards routing surface ──────────────────────────────────────────
 
     fn shards_handle(names: &[&str]) -> Shards {
@@ -1778,7 +1915,8 @@ mod tests {
             slow_query_threshold: std::time::Duration::from_millis(200),
             interceptors: Vec::new(),
         };
-        let seed = ShardRepositorySeed::from_ctx(shard.primary_pool(), &ctx, "shard0");
+        let seed =
+            ShardRepositorySeed::from_ctx(shard.primary_pool(), &ctx, "shard0", shard.read_route());
         assert_eq!(seed.statement_timeout_ms, 3_000, "timeout preserved as ms");
         assert_eq!(
             seed.slow_query_threshold,
@@ -1803,7 +1941,8 @@ mod tests {
             slow_query_threshold: std::time::Duration::from_millis(500),
             interceptors: Vec::new(),
         };
-        let seed = ShardRepositorySeed::from_ctx(shard.primary_pool(), &ctx, "shard0");
+        let seed =
+            ShardRepositorySeed::from_ctx(shard.primary_pool(), &ctx, "shard0", shard.read_route());
         assert_eq!(seed.statement_timeout_ms, 0, "None timeout maps to 0");
         assert!(seed.route.is_none(), "None route_key propagates as None");
     }
@@ -1819,7 +1958,8 @@ mod tests {
             slow_query_threshold: std::time::Duration::from_millis(500),
             interceptors: Vec::new(),
         };
-        let seed = ShardRepositorySeed::from_ctx(shard.primary_pool(), &ctx, "shard0");
+        let seed =
+            ShardRepositorySeed::from_ctx(shard.primary_pool(), &ctx, "shard0", shard.read_route());
         assert_eq!(
             seed.statement_timeout_ms,
             i32::MAX as u64,

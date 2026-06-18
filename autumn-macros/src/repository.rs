@@ -820,6 +820,24 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         } else {
             quote! {}
         };
+        // #1274: snapshot the shard's read route so read-only methods reach
+        // the shard's replica when one is healthy, mirroring the non-shard
+        // `read_route_init` below. `primary_reads` still pins reads to the
+        // shard primary at compile time.
+        let from_shard_read_route = if config.primary_reads {
+            quote! { ::autumn_web::repository::ReadRoute::Primary }
+        } else {
+            quote! { ::core::clone::Clone::clone(&__seed.read_route) }
+        };
+        let from_shard_reads_doc = if config.primary_reads {
+            quote! {
+                #[doc = "This repository is declared `primary_reads`, so reads stay on the shard's primary pool."]
+            }
+        } else {
+            quote! {
+                #[doc = "Read-only methods route to the shard's read replica when one is configured and healthy (honoring the shard's `replica_fallback` policy); mutating methods always use the shard's primary. Pin a single call chain to the primary with [`on_primary`](Self::on_primary)."]
+            }
+        };
         quote! {
             /// Construct this repository from a [`ShardedDb`](::autumn_web::sharding::ShardedDb)
             /// extractor, preserving the full request instrumentation — statement
@@ -836,10 +854,11 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             /// }
             /// ```
             ///
-            /// Reads are pinned to the shard's primary pool.  Use this constructor
-            /// as the standard way to build a repository on a shard; prefer
-            /// [`with_pool_untracked`](Self::with_pool_untracked) only when you
-            /// intentionally want to bypass request instrumentation.
+            #from_shard_reads_doc
+            ///
+            /// Use this constructor as the standard way to build a repository on
+            /// a shard; prefer [`with_pool_untracked`](Self::with_pool_untracked)
+            /// only when you intentionally want to bypass request instrumentation.
             #[must_use]
             pub fn from_shard(db: &::autumn_web::sharding::ShardedDb) -> Self {
                 #register_hooks
@@ -849,7 +868,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     #hooks_field
                     #idempotency_field
                     #tenant_init_field
-                    __autumn_read_route: ::autumn_web::repository::ReadRoute::Primary,
+                    __autumn_read_route: #from_shard_read_route,
                     __autumn_statement_timeout_ms: __seed.statement_timeout_ms,
                     __autumn_slow_threshold: __seed.slow_query_threshold,
                     __autumn_route: ::core::clone::Clone::clone(&__seed.route),

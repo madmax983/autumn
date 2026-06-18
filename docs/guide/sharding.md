@@ -153,6 +153,16 @@ async fn create(db: ShardedDb, Json(body): Json<Body>) -> AutumnResult<Json<Book
 }
 ```
 
+A `from_shard` repository routes its read-only methods (`find_*`, `count`,
+`paginate`, …) to the shard's **read replica** automatically when one is
+configured and healthy — the same transparent read scale-out as the
+control replica, now per shard. Mutating methods always run on the shard
+primary. The decision honors that shard's `replica_fallback` policy and
+replica readiness, so adding a `replica_url` to a shard doubles its read
+capacity with no handler changes. Pin a read-after-write-sensitive
+repository to the shard primary with `#[repository(Model, primary_reads)]`,
+or a single call chain with `repo.on_primary()`.
+
 If you need a repository over an explicit pool **without** request context
 (e.g. a background job that resolved a shard pool from state), use
 `with_pool_untracked`. Statement timeout, slow-query threshold, and route
