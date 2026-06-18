@@ -579,6 +579,31 @@ impl ShardSet {
             })
             .sum()
     }
+
+    /// Fan out a closure over every shard concurrently, collecting one result
+    /// per shard.  Fails the whole call if **any** shard errors.
+    ///
+    /// Intended for cross-shard read fan-out from `across_tenants()` reads on
+    /// `#[repository(tenant_scoped, sharded)]` repositories.  The sub-repo
+    /// created inside `f` must use `with_pool_untracked` so that
+    /// `__autumn_shards` is `None` and recursion is impossible.
+    pub(crate) async fn fan_out_shards<T, Fut, F>(
+        &self,
+        f: F,
+    ) -> Result<Vec<T>, crate::AutumnError>
+    where
+        T: Send + 'static,
+        Fut: std::future::Future<Output = Result<T, crate::AutumnError>> + Send + 'static,
+        F: Fn(Pool<AsyncPgConnection>) -> Fut + Send + Sync,
+    {
+        let futs: Vec<_> = self
+            .inner
+            .shards
+            .iter()
+            .map(|shard| f(shard.primary_pool().clone()))
+            .collect();
+        futures::future::try_join_all(futs).await
+    }
 }
 
 impl std::fmt::Debug for ShardSet {

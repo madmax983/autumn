@@ -5954,6 +5954,53 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         )
     };
 
+    // §1d: cross-shard write guard.  When `sharded + tenant_scoped`, writes
+    // that arrive with `across_tenants = true` AND `__autumn_shards.is_some()`
+    // cannot be safely fanned-out (no cross-shard transaction semantics), so we
+    // return a clear error instead of silently hitting only one shard.
+    let (
+        save_body,
+        update_body,
+        delete_body,
+        save_many_body,
+        save_many_skip_invalid_body,
+        update_many_body,
+        delete_many_body,
+    ) = if config.sharded && config.tenant_scoped {
+        let write_guard = quote! {
+            if self.across_tenants {
+                if self.__autumn_shards.is_some() {
+                    return ::core::result::Result::Err(
+                        ::autumn_web::AutumnError::bad_request_msg(
+                            "cross-shard writes are not supported: \
+                             across_tenants() cannot be used for mutation \
+                             on a sharded repository"
+                        )
+                    );
+                }
+            }
+        };
+        (
+            quote! { #write_guard #save_body },
+            quote! { #write_guard #update_body },
+            quote! { #write_guard #delete_body },
+            quote! { #write_guard #save_many_body },
+            quote! { #write_guard #save_many_skip_invalid_body },
+            quote! { #write_guard #update_many_body },
+            quote! { #write_guard #delete_many_body },
+        )
+    } else {
+        (
+            save_body,
+            update_body,
+            delete_body,
+            save_many_body,
+            save_many_skip_invalid_body,
+            update_many_body,
+            delete_many_body,
+        )
+    };
+
     let route_hook_registration = if commit_hooks_enabled {
         quote! { #pg_name::__autumn_register_repository_commit_hooks(); }
     } else {
@@ -5988,12 +6035,32 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             -> impl ::std::future::Future<Output = ::autumn_web::AutumnResult<::autumn_web::pagination::Page<#model_name>>> + Send;
     };
 
+    // §1d: cross-shard paginate guard token stream (empty when not sharded).
+    let page_cross_shard_guard = if config.sharded && config.tenant_scoped {
+        quote! {
+            if self.across_tenants {
+                if self.__autumn_shards.is_some() {
+                    return ::core::result::Result::Err(
+                        ::autumn_web::AutumnError::bad_request_msg(
+                            "cross-shard pagination is not supported: \
+                             use find_all() with across_tenants() on a \
+                             sharded repository instead"
+                        )
+                    );
+                }
+            }
+        }
+    } else {
+        quote! {}
+    };
+
     let pagination_impl_method = if config.tenant_scoped {
         quote! {
             async fn page(
                 &self,
                 req: &::autumn_web::pagination::PageRequest,
             ) -> ::autumn_web::AutumnResult<::autumn_web::pagination::Page<#model_name>> {
+                #page_cross_shard_guard
                 use ::autumn_web::reexports::diesel::prelude::*;
                 use ::autumn_web::reexports::diesel_async::RunQueryDsl;
                 let tenant_id = if self.across_tenants {
@@ -6120,6 +6187,25 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             fn cursor_page(&self, req: &::autumn_web::pagination::CursorRequest)
                 -> impl ::std::future::Future<Output = ::autumn_web::AutumnResult<::autumn_web::pagination::CursorPage<#model_name>>> + Send;
         };
+        // §1d: cross-shard cursor_page guard (empty when not sharded).
+        let cursor_cross_shard_guard = if config.sharded && config.tenant_scoped {
+            quote! {
+                if self.across_tenants {
+                    if self.__autumn_shards.is_some() {
+                        return ::core::result::Result::Err(
+                            ::autumn_web::AutumnError::bad_request_msg(
+                                "cross-shard cursor pagination is not supported: \
+                                 use find_all() with across_tenants() on a \
+                                 sharded repository instead"
+                            )
+                        );
+                    }
+                }
+            }
+        } else {
+            quote! {}
+        };
+
         let impl_method = if let Some(ref key_type) = config.cursor_key_type {
             // Full two-part keyset filter ΓÇö always correct regardless of whether
             // cursor_key and id are monotonically correlated.
@@ -6128,6 +6214,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     &self,
                     req: &::autumn_web::pagination::CursorRequest,
                 ) -> ::autumn_web::AutumnResult<::autumn_web::pagination::CursorPage<#model_name>> {
+                    #cursor_cross_shard_guard
                     use ::autumn_web::reexports::diesel::prelude::*;
                     use ::autumn_web::reexports::diesel_async::RunQueryDsl;
                     let mut conn = self.__autumn_acquire_read_conn().await?;
@@ -6171,6 +6258,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     &self,
                     req: &::autumn_web::pagination::CursorRequest,
                 ) -> ::autumn_web::AutumnResult<::autumn_web::pagination::CursorPage<#model_name>> {
+                    #cursor_cross_shard_guard
                     use ::autumn_web::reexports::diesel::prelude::*;
                     use ::autumn_web::reexports::diesel_async::RunQueryDsl;
                     let mut conn = self.__autumn_acquire_read_conn().await?;
@@ -7348,6 +7436,28 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     };
 
+    // §1d: when sharded + tenant_scoped, fan out across all shards for
+    // across_tenants reads.  The sub-repo uses `with_pool_untracked` so its
+    // `__autumn_shards` is `None`, preventing recursion.
+    let find_all_impl = if config.sharded && config.tenant_scoped {
+        quote! {
+            if self.across_tenants {
+                if let ::core::option::Option::Some(ref __shards) = self.__autumn_shards {
+                    let mut __all: ::std::vec::Vec<#model_name> = ::std::vec::Vec::new();
+                    for __shard in __shards.iter() {
+                        let __sub = Self::with_pool_untracked(__shard.primary_pool().clone()).across_tenants();
+                        let mut __rows = __sub.find_all().await?;
+                        __all.append(&mut __rows);
+                    }
+                    return ::core::result::Result::Ok(__all);
+                }
+            }
+            #find_all_impl
+        }
+    } else {
+        find_all_impl
+    };
+
     let count_impl = if config.tenant_scoped {
         quote! {
             let tenant_id = if self.across_tenants {
@@ -7383,6 +7493,24 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 .await
                 .map_err(::autumn_web::AutumnError::from)
         }
+    };
+
+    let count_impl = if config.sharded && config.tenant_scoped {
+        quote! {
+            if self.across_tenants {
+                if let ::core::option::Option::Some(ref __shards) = self.__autumn_shards {
+                    let mut __total: i64 = 0;
+                    for __shard in __shards.iter() {
+                        let __sub = Self::with_pool_untracked(__shard.primary_pool().clone()).across_tenants();
+                        __total += __sub.count().await?;
+                    }
+                    return ::core::result::Result::Ok(__total);
+                }
+            }
+            #count_impl
+        }
+    } else {
+        count_impl
     };
 
     let exists_by_id_impl = if config.tenant_scoped {
@@ -7426,6 +7554,25 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             .await
             .map_err(::autumn_web::AutumnError::from)
         }
+    };
+
+    let exists_by_id_impl = if config.sharded && config.tenant_scoped {
+        quote! {
+            if self.across_tenants {
+                if let ::core::option::Option::Some(ref __shards) = self.__autumn_shards {
+                    for __shard in __shards.iter() {
+                        let __sub = Self::with_pool_untracked(__shard.primary_pool().clone()).across_tenants();
+                        if __sub.exists_by_id(id).await? {
+                            return ::core::result::Result::Ok(true);
+                        }
+                    }
+                    return ::core::result::Result::Ok(false);
+                }
+            }
+            #exists_by_id_impl
+        }
+    } else {
+        exists_by_id_impl
     };
 
     let upsert_many_trait_method = if config.hooks_type.is_none() && !config.no_upsert_trait {
