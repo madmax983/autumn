@@ -726,6 +726,56 @@ pub fn run_pending_locked(
     })
 }
 
+/// Apply the framework migrations required on every **shard** target.
+///
+/// Shard databases hold tenant data and must have the version-history and
+/// commit-hook queue tables, but do **not** host the full control-plane schema
+/// (API tokens, sessions, job queues, etc.). This function applies only those
+/// two migration sets under the migration advisory lock.
+///
+/// Called by `autumn migrate` when iterating over `[[database.shards]]`
+/// entries, in contrast to [`run_pending_locked`] with [`FRAMEWORK_MIGRATIONS`]
+/// which is used for the control database.
+///
+/// # Errors
+///
+/// Returns [`MigrationError::Connection`] if the database is unreachable,
+/// [`MigrationError::LockTimeout`] if the advisory lock cannot be acquired,
+/// or [`MigrationError::Migration`] if a migration fails to apply.
+pub fn run_pending_shard_framework_migrations(
+    database_url: &str,
+) -> Result<MigrationResult, MigrationError> {
+    #[cfg(feature = "db")]
+    {
+        let mut applied: Vec<String> = Vec::new();
+
+        let vh_result = run_pending_locked(
+            database_url,
+            EmbeddedMigrationsRef(&crate::version_history::VERSION_HISTORY_MIGRATIONS),
+            None,
+        )?;
+        applied.extend(vh_result.applied);
+
+        let ch_result = run_pending_locked(
+            database_url,
+            EmbeddedMigrationsRef(
+                &crate::repository_commit_hooks::REPOSITORY_COMMIT_HOOK_MIGRATIONS,
+            ),
+            None,
+        )?;
+        applied.extend(ch_result.applied);
+
+        Ok(MigrationResult { applied })
+    }
+    #[cfg(not(feature = "db"))]
+    {
+        let _ = database_url;
+        Ok(MigrationResult {
+            applied: Vec::new(),
+        })
+    }
+}
+
 fn should_auto_apply(profile: Option<&str>, allow_auto_migrate_in_production: bool) -> bool {
     let profile_name = profile.unwrap_or("none");
     matches!(profile_name, "dev" | "development")

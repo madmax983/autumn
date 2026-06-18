@@ -201,7 +201,11 @@ fn run_all_targets(targets: &[(String, String)], migrations_dir: &str, with_main
     let mut completed: Vec<&str> = Vec::new();
     for (label, url) in targets {
         eprintln!("\u{2500}\u{2500} Migrating {label} \u{2500}\u{2500}");
-        if run_single_target(url, migrations_dir) {
+        // Labels starting with "shard:" are shard targets; they receive only
+        // the shard-required framework migrations (version history + commit
+        // hook queue), not the full control-plane schema.
+        let is_shard = label.starts_with("shard:");
+        if run_single_target(url, migrations_dir, is_shard) {
             completed.push(label);
             eprintln!();
         } else {
@@ -268,7 +272,11 @@ fn disable_maintenance_after_migrate() {
 
 /// Apply app + framework migrations to one database. Returns whether
 /// everything succeeded; the caller decides how to fail.
-fn run_single_target(database_url: &str, migrations_dir: &str) -> bool {
+///
+/// When `is_shard` is `true`, applies only the shard-required framework
+/// migrations (version history + commit-hook queue) instead of the full
+/// control-plane `FRAMEWORK_MIGRATIONS` set.
+fn run_single_target(database_url: &str, migrations_dir: &str, is_shard: bool) -> bool {
     use autumn_web::migrate::{DEFAULT_LOCK_WAIT_TIMEOUT, hold_migration_lock};
 
     // Acquire this target database's Postgres advisory lock before reading
@@ -322,7 +330,11 @@ fn run_single_target(database_url: &str, migrations_dir: &str) -> bool {
         }
     }
 
-    run_framework_migrations(database_url)
+    if is_shard {
+        run_shard_framework_migrations(database_url)
+    } else {
+        run_framework_migrations(database_url)
+    }
 }
 
 /// Print the safety findings for one migration direction (`up.sql`/`down.sql`).
@@ -697,6 +709,48 @@ where
     F: FnOnce(&str, EmbeddedMigrations) -> Result<MigrationResult, MigrationError>,
 {
     run_pending(database_url, FRAMEWORK_MIGRATIONS)
+}
+
+/// Apply only the shard-required framework migrations to a shard target.
+///
+/// Shards need version-history and commit-hook queue tables but do **not**
+/// host the full control-plane schema (API tokens, sessions, job queues, …).
+/// In production this delegates to
+/// [`autumn_web::migrate::run_pending_shard_framework_migrations`]; the inner
+/// helper takes a closure so the dispatch can be tested without a live database.
+fn run_shard_framework_migrations(database_url: &str) -> bool {
+    eprintln!("  Running pending Autumn shard framework migrations...\n");
+
+    match run_shard_framework_migrations_inner(
+        database_url,
+        autumn_web::migrate::run_pending_shard_framework_migrations,
+    ) {
+        Ok(result) if result.applied.is_empty() => {
+            eprintln!("\n\u{2713} Shard framework migrations are up to date.");
+            true
+        }
+        Ok(result) => {
+            for migration in &result.applied {
+                eprintln!("  Applied {migration}");
+            }
+            eprintln!("\n\u{2713} Shard framework migrations applied successfully.");
+            true
+        }
+        Err(e) => {
+            eprintln!("\n\u{2717} Shard framework migration failed: {e}");
+            false
+        }
+    }
+}
+
+fn run_shard_framework_migrations_inner<F>(
+    database_url: &str,
+    run_shard: F,
+) -> Result<MigrationResult, MigrationError>
+where
+    F: FnOnce(&str) -> Result<MigrationResult, MigrationError>,
+{
+    run_shard(database_url)
 }
 
 /// True iff the active profile resolves to `prod`/`production`.
@@ -1615,6 +1669,65 @@ mod tests {
         assert!(called);
         assert_eq!(
             pending,
+            vec!["20260512000000_create_api_tokens".to_string()]
+        );
+    }
+
+    // ── Shard-specific framework migrations (§5a) ──────────────────────────────
+    //
+    // Shards hold tenant data and need only the version-history and
+    // commit-hook queue tables — not the full control-plane schema (API tokens,
+    // sessions, jobs, …).  `run_shard_framework_migrations_inner` is the
+    // testable core; in production it delegates to
+    // `autumn_web::migrate::run_pending_shard_framework_migrations`.
+
+    #[test]
+    fn shard_target_applies_only_shard_framework_migrations() {
+        let mut called = false;
+
+        let result = run_shard_framework_migrations_inner(
+            "postgres://shard0/app",
+            |database_url| {
+                assert_eq!(database_url, "postgres://shard0/app");
+                called = true;
+                Ok(autumn_web::migrate::MigrationResult {
+                    applied: vec![
+                        "vh_migration".to_string(),
+                        "commit_hook_migration".to_string(),
+                    ],
+                })
+            },
+        )
+        .unwrap();
+
+        assert!(called, "shard framework migration helper must be called");
+        assert_eq!(
+            result.applied,
+            vec!["vh_migration", "commit_hook_migration"]
+        );
+    }
+
+    #[test]
+    fn control_target_still_uses_full_framework_migrations() {
+        let mut called_with_url = String::new();
+        let mut called = false;
+
+        let result = run_framework_migrations_inner(
+            "postgres://control/app",
+            |database_url, _embedded| {
+                called_with_url = database_url.to_owned();
+                called = true;
+                Ok(autumn_web::migrate::MigrationResult {
+                    applied: vec!["20260512000000_create_api_tokens".to_string()],
+                })
+            },
+        )
+        .unwrap();
+
+        assert!(called, "run_framework_migrations_inner must call the closure");
+        assert_eq!(called_with_url, "postgres://control/app");
+        assert_eq!(
+            result.applied,
             vec!["20260512000000_create_api_tokens".to_string()]
         );
     }
