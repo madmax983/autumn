@@ -459,7 +459,12 @@ impl MemoryIdempotencyStore {
 impl IdempotencyStore for MemoryIdempotencyStore {
     fn get(&self, key: &str) -> Option<IdempotencyEntry> {
         // Release the read lock immediately after cloning.
-        let entry = self.entries.read().unwrap().get(key).cloned();
+        let entry = self
+            .entries
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(key)
+            .cloned();
         entry.filter(|e| e.expires_at > Instant::now())
     }
 
@@ -469,7 +474,7 @@ impl IdempotencyStore for MemoryIdempotencyStore {
             body_hash,
             expires_at: Instant::now() + ttl,
         };
-        let mut entries = self.entries.write().unwrap();
+        let mut entries = self.entries.write().unwrap_or_else(std::sync::PoisonError::into_inner);
         entries.insert(key.to_owned(), entry);
         // Periodically evict expired entries to bound memory growth for
         // long-running processes. O(N) scan is amortised over every 128 writes.
@@ -486,7 +491,7 @@ impl IdempotencyStore for MemoryIdempotencyStore {
 
     fn try_lock_owned(&self, key: &str, owner: &str, lock_ttl: Duration) -> bool {
         let now = Instant::now();
-        let mut in_flight = self.in_flight.write().unwrap();
+        let mut in_flight = self.in_flight.write().unwrap_or_else(std::sync::PoisonError::into_inner);
         // Check only the requested key's active in-flight marker.
         if let Some(lock) = in_flight.get(key)
             && lock.expires_at > now
