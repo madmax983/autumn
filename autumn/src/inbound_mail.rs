@@ -1308,8 +1308,10 @@ fn decode_quoted_printable_bytes(input: &[u8]) -> Vec<u8> {
                 && input[i + 1].is_ascii_hexdigit()
                 && input[i + 2].is_ascii_hexdigit()
             {
-                let hi = (input[i + 1] as char).to_digit(16).unwrap_or(0) as u8;
-                let lo = (input[i + 2] as char).to_digit(16).unwrap_or(0) as u8;
+                let hi =
+                    u8::try_from((input[i + 1] as char).to_digit(16).unwrap_or(0)).unwrap_or(0);
+                let lo =
+                    u8::try_from((input[i + 2] as char).to_digit(16).unwrap_or(0)).unwrap_or(0);
                 out.push((hi << 4) | lo);
                 i += 3;
             } else {
@@ -1656,8 +1658,8 @@ fn decode_rfc2047_q(input: &[u8]) -> Vec<u8> {
             && input[i + 1].is_ascii_hexdigit()
             && input[i + 2].is_ascii_hexdigit()
         {
-            let hi = (input[i + 1] as char).to_digit(16).unwrap_or(0) as u8;
-            let lo = (input[i + 2] as char).to_digit(16).unwrap_or(0) as u8;
+            let hi = u8::try_from((input[i + 1] as char).to_digit(16).unwrap_or(0)).unwrap_or(0);
+            let lo = u8::try_from((input[i + 2] as char).to_digit(16).unwrap_or(0)).unwrap_or(0);
             out.push((hi << 4) | lo);
             i += 3;
         } else {
@@ -1761,6 +1763,106 @@ fn find_part_end(body: &[u8], crlf_delim: &[u8], lf_delim: &[u8]) -> Option<usiz
 /// Parse a `multipart/form-data` Mailgun webhook body into a field map and attachment list.
 ///
 /// Operates at the byte level so binary file parts are not corrupted by lossy UTF-8 conversion.
+
+/// Process a single part of a `multipart/form-data` Mailgun webhook body.
+fn process_mailgun_part(
+    part: &[u8],
+    map: &mut HashMap<String, String>,
+    file_parts: &mut Vec<Attachment>,
+) {
+    // Split part headers from body on the blank line.
+    let (headers_bytes, body_bytes) = if let Some(sep) = find_subslice(part, b"\r\n\r\n") {
+        (&part[..sep], &part[sep + 4..])
+    } else if let Some(sep) = find_subslice(part, b"\n\n") {
+        (&part[..sep], &part[sep + 2..])
+    } else {
+        return;
+    };
+
+    // Headers are ASCII; lossy conversion is safe here.  Unfold before
+    // parsing so a folded Content-Disposition reads as one logical line.
+    let headers_str = unfold_mime_headers(&String::from_utf8_lossy(headers_bytes));
+
+    // Preserve the original disposition value so that filename casing is not
+    // corrupted — parameter values are case-sensitive (RFC 2183 §2).
+    // Key matching (name=, filename=) is done case-insensitively.
+    let disposition = headers_str
+        .lines()
+        .find(|l| l.to_ascii_lowercase().starts_with("content-disposition:"))
+        .map(|l| l[l.find(':').map_or(0, |p| p + 1)..].trim().to_string())
+        .unwrap_or_default();
+
+    // Use the quote-aware parser so that filenames containing semicolons,
+    // e.g. filename="Q1;final.pdf", are not truncated at the semicolon.
+    let name = mime_param(&disposition, "name");
+    let Some(name) = name else {
+        return;
+    };
+
+    let filename = mime_param(&disposition, "filename");
+
+    if let Some(filename) = filename {
+        // File part: use raw bytes from the original buffer to avoid lossy UTF-8 corruption.
+        let (part_ct, part_cte) = parse_part_headers(&headers_str);
+        let data: Bytes = if part_cte == "base64" {
+            // base64 is ASCII; string round-trip is safe.
+            decode_base64_part(body_bytes)
+        } else {
+            // Binary (8-bit): copy raw bytes without any string conversion.
+            Bytes::copy_from_slice(body_bytes)
+        };
+        file_parts.push(Attachment {
+            filename: Some(filename),
+            content_type: part_ct,
+            data,
+        });
+    } else {
+        // Text field: lossy conversion is acceptable.
+        // Do not trim trailing newlines — the boundary separator is already excluded
+        // by the line-anchored boundary split, so trailing content is intentional.
+        map.insert(name, String::from_utf8_lossy(body_bytes).into_owned());
+    }
+}
+
+fn parse_part_headers(headers_str: &str) -> (String, String) {
+    let part_ct = headers_str
+        .lines()
+        .find(|l| l.to_ascii_lowercase().starts_with("content-type:"))
+        .map(|l| {
+            l[13..]
+                .trim()
+                .split(';')
+                .next()
+                .map(str::trim)
+                .unwrap_or("application/octet-stream")
+                .to_ascii_lowercase()
+        })
+        .unwrap_or_else(|| "application/octet-stream".to_string());
+    let part_cte = headers_str
+        .lines()
+        .find(|l| {
+            l.to_ascii_lowercase()
+                .starts_with("content-transfer-encoding:")
+        })
+        .map(|l| l[26..].trim().to_ascii_lowercase())
+        .unwrap_or_default();
+    (part_ct, part_cte)
+}
+
+fn decode_base64_part(body_bytes: &[u8]) -> Bytes {
+    let stripped: String = String::from_utf8_lossy(body_bytes)
+        .chars()
+        .filter(|c| !c.is_ascii_whitespace())
+        .collect();
+    base64::engine::general_purpose::STANDARD
+        .decode(stripped.as_bytes())
+        .map(Bytes::from)
+        .unwrap_or_else(|_| Bytes::copy_from_slice(body_bytes))
+}
+
+/// Parse a `multipart/form-data` Mailgun webhook body into a field map and attachment list.
+///
+/// Operates at the byte level so binary file parts are not corrupted by lossy UTF-8 conversion.
 fn parse_mailgun_form_data(
     body: &[u8],
     content_type: &str,
@@ -1826,89 +1928,11 @@ fn parse_mailgun_form_data(
         search_from = part_end;
         let part = &body[part_start..part_end];
 
-        // Split part headers from body on the blank line.
-        let (headers_bytes, body_bytes) = if let Some(sep) = find_subslice(part, b"\r\n\r\n") {
-            (&part[..sep], &part[sep + 4..])
-        } else if let Some(sep) = find_subslice(part, b"\n\n") {
-            (&part[..sep], &part[sep + 2..])
-        } else {
-            continue;
-        };
-
-        // Headers are ASCII; lossy conversion is safe here.  Unfold before
-        // parsing so a folded Content-Disposition reads as one logical line.
-        let headers_str = unfold_mime_headers(&String::from_utf8_lossy(headers_bytes));
-
-        // Preserve the original disposition value so that filename casing is not
-        // corrupted — parameter values are case-sensitive (RFC 2183 §2).
-        // Key matching (name=, filename=) is done case-insensitively.
-        let disposition = headers_str
-            .lines()
-            .find(|l| l.to_ascii_lowercase().starts_with("content-disposition:"))
-            .map(|l| l[l.find(':').map_or(0, |p| p + 1)..].trim().to_string())
-            .unwrap_or_default();
-
-        // Use the quote-aware parser so that filenames containing semicolons,
-        // e.g. filename="Q1;final.pdf", are not truncated at the semicolon.
-        let name = mime_param(&disposition, "name");
-        let Some(name) = name else { continue };
-
-        let filename = mime_param(&disposition, "filename");
-
-        if let Some(filename) = filename {
-            // File part: use raw bytes from the original buffer to avoid lossy UTF-8 corruption.
-            let part_ct = headers_str
-                .lines()
-                .find(|l| l.to_ascii_lowercase().starts_with("content-type:"))
-                .map(|l| {
-                    l[13..]
-                        .trim()
-                        .split(';')
-                        .next()
-                        .map(str::trim)
-                        .unwrap_or("application/octet-stream")
-                        .to_ascii_lowercase()
-                })
-                .unwrap_or_else(|| "application/octet-stream".to_string());
-            let part_cte = headers_str
-                .lines()
-                .find(|l| {
-                    l.to_ascii_lowercase()
-                        .starts_with("content-transfer-encoding:")
-                })
-                .map(|l| l[26..].trim().to_ascii_lowercase())
-                .unwrap_or_default();
-            let data: Bytes = if part_cte == "base64" {
-                // base64 is ASCII; string round-trip is safe.
-                let stripped: String = String::from_utf8_lossy(body_bytes)
-                    .chars()
-                    .filter(|c| !c.is_ascii_whitespace())
-                    .collect();
-                base64::engine::general_purpose::STANDARD
-                    .decode(stripped.as_bytes())
-                    .map(Bytes::from)
-                    .unwrap_or_else(|_| Bytes::copy_from_slice(body_bytes))
-            } else {
-                // Binary (8-bit): copy raw bytes without any string conversion.
-                Bytes::copy_from_slice(body_bytes)
-            };
-            file_parts.push(Attachment {
-                filename: Some(filename),
-                content_type: part_ct,
-                data,
-            });
-        } else {
-            // Text field: lossy conversion is acceptable.
-            // Do not trim trailing newlines — the boundary separator is already excluded
-            // by the line-anchored boundary split, so trailing content is intentional.
-            map.insert(name, String::from_utf8_lossy(body_bytes).into_owned());
-        }
+        process_mailgun_part(part, &mut map, &mut file_parts);
     }
     (map, file_parts)
 }
 
-/// Decode a Mailgun webhook body, supporting both `application/x-www-form-urlencoded`
-/// and `multipart/form-data` content types.
 fn decode_mailgun_body(
     body: &[u8],
     content_type: &str,
