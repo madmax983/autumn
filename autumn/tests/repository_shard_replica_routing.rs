@@ -20,7 +20,7 @@
 
 use autumn_web::config::{AutumnConfig, DatabaseConfig, ReplicaFallback, ShardConfig};
 use autumn_web::reexports::axum;
-use autumn_web::sharding::{ShardKeyOverride, ShardedDb};
+use autumn_web::sharding::{ShardKeyOverride, ShardedDb, ShardedReadDb};
 use autumn_web::test::{TestApp, TestClient};
 use testcontainers::ContainerAsync;
 use testcontainers::runners::AsyncRunner;
@@ -103,6 +103,30 @@ async fn find_all(db: ShardedDb) -> String {
     }
 }
 
+/// Explicit replica-only extractor (issue #1275): exercises the
+/// `ShardedReadDb` success path — a real replica checkout — plus its full
+/// accessor surface (`shard`, `shard_id`, `span`, `db_mut`, `AsMut`) and the
+/// `Deref`/`DerefMut` to `AsyncPgConnection` by running a query on the replica
+/// connection. Reachable only once the replica has passed its readiness check.
+#[autumn_web::get("/replica-only")]
+async fn replica_only(mut db: ShardedReadDb) -> String {
+    use autumn_web::reexports::diesel;
+    use autumn_web::reexports::diesel_async::RunQueryDsl as _;
+
+    let shard = db.shard().to_owned();
+    let shard_id = db.shard_id();
+    let _span = db.span();
+    // AsMut<Db> and db_mut() both borrow the inner Db.
+    let _as_mut: &mut autumn_web::db::Db = db.as_mut();
+    let _db_mut: &mut autumn_web::db::Db = db.db_mut();
+    // Deref/DerefMut to AsyncPgConnection: run a real query on the replica.
+    let rows = diesel::sql_query("SELECT 1")
+        .execute(&mut *db)
+        .await
+        .expect("replica query runs");
+    format!("replica shard={shard} id={} rows={rows}", shard_id.0)
+}
+
 // ── Test harness ────────────────────────────────────────────────────────────
 
 /// One shared Postgres container reused across the (ignored) tests in this file.
@@ -164,7 +188,8 @@ fn app(url: &str, fallback: ReplicaFallback) -> TestClient {
             read_route,
             write_pool,
             pinned_route,
-            find_all
+            find_all,
+            replica_only
         ])
         .layer(axum::middleware::from_fn(inject_shard_key))
         .config(config(url, fallback))
@@ -226,6 +251,35 @@ async fn primary_reads_repository_never_routes_to_the_replica() {
         route.text(),
         "ReadRoute::Primary",
         "primary_reads repositories must keep reads on the shard primary"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn sharded_read_db_serves_only_a_ready_replica() {
+    let url = db_url().await;
+    // fail_readiness so an unchecked replica is genuinely unavailable, not a
+    // silent primary fallback — ShardedReadDb must 503 either way.
+    let client = app(url, ReplicaFallback::FailReadiness);
+
+    // Before the readiness probe there is no healthy replica → 503.
+    let before = client.get("/replica-only").send().await;
+    assert_eq!(
+        before.status,
+        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+        "ShardedReadDb must fail fast with 503 until the replica is ready"
+    );
+
+    // The readiness probe marks the replica ready; the extractor now checks
+    // out the replica and the handler exercises its accessor surface.
+    client.get("/ready").send().await.assert_ok();
+
+    let after = client.get("/replica-only").send().await;
+    after.assert_ok();
+    let body = after.text();
+    assert!(
+        body.starts_with("replica shard=shard0") && body.contains("rows="),
+        "replica-only handler must serve the ready replica, got: {body}"
     );
 }
 
