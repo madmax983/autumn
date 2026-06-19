@@ -1053,6 +1053,21 @@ impl TestApp {
             (self.pool, self.replica_pool, self.db_interceptor)
         };
 
+        // Mirror production router selection (see `setup_database`): when the
+        // test config enables directory routing, build a `DirectoryShardRouter`
+        // over the control pool so tests that pin tenants in
+        // `_autumn_shard_directory` route the same way production would. Falls
+        // back to the hash router when directory routing is off or there is no
+        // control pool.
+        #[cfg(feature = "db")]
+        let shard_router: std::sync::Arc<dyn crate::sharding::ShardRouter> =
+            match (self.config.database.directory_shard_router, &pool) {
+                (true, Some(control_pool)) => std::sync::Arc::new(
+                    crate::sharding::DirectoryShardRouter::new(control_pool.clone()),
+                ),
+                _ => std::sync::Arc::new(crate::sharding::HashShardRouter),
+            };
+
         let probes = crate::probe::ProbeState::ready_for_test();
         #[cfg(feature = "ws")]
         let test_channels = crate::channels::Channels::new(32);
@@ -1078,15 +1093,12 @@ impl TestApp {
             shards: if self.transactional {
                 crate::sharding::create_shard_set_transactional(
                     &self.config.database,
-                    std::sync::Arc::new(crate::sharding::HashShardRouter),
+                    shard_router.clone(),
                 )
                 .expect("transactional test shard pools should build from config")
             } else {
-                crate::sharding::create_shard_set(
-                    &self.config.database,
-                    std::sync::Arc::new(crate::sharding::HashShardRouter),
-                )
-                .expect("test shard pools should build from config")
+                crate::sharding::create_shard_set(&self.config.database, shard_router.clone())
+                    .expect("test shard pools should build from config")
             },
             profile: self.config.profile.clone(),
             started_at: std::time::Instant::now(),
