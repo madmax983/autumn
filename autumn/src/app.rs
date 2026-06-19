@@ -5431,11 +5431,12 @@ async fn run_startup_migrations(
     #[cfg(not(feature = "managed-pg"))]
     let managed_fallback: Option<String> = None;
     let control_url = if control_configured {
-        config
-            .database
-            .effective_primary_url()
-            .map(str::to_owned)
-            .or(managed_fallback)
+        // Prefer the managed cluster's URL whenever a managed provider published
+        // one: the runtime pool is built from it, so embedded startup migrations
+        // must target it — even if a stale `database.url`/`primary_url` is still
+        // configured (e.g. an existing app adopting the provider). Fall back to
+        // the configured URL when no managed provider is active.
+        managed_fallback.or_else(|| config.database.effective_primary_url().map(str::to_owned))
     } else {
         None
     };
