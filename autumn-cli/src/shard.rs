@@ -561,4 +561,26 @@ mod tests {
         }
         parts.iter().all(|p| is_valid_simple_identifier(p))
     }
+
+    #[test]
+    fn dest_contains_source_handles_subset_superset_and_multiplicity() {
+        let v = |xs: &[&str]| xs.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+
+        // Empty source is vacuously contained.
+        assert!(dest_contains_source(&v(&[]), &v(&[])));
+        assert!(dest_contains_source(&v(&[]), &v(&["a"])));
+
+        // Exact match and superset both pass (destination may hold extra rows
+        // written after the dry-run copy).
+        assert!(dest_contains_source(&v(&["a", "b"]), &v(&["a", "b"])));
+        assert!(dest_contains_source(&v(&["a", "b"]), &v(&["a", "b", "c"])));
+
+        // A source row missing on the destination fails (would block deletion).
+        assert!(!dest_contains_source(&v(&["a", "b"]), &v(&["a"])));
+        assert!(!dest_contains_source(&v(&["a"]), &v(&[])));
+
+        // Multiplicity is respected: two of a needs two of a on the destination.
+        assert!(!dest_contains_source(&v(&["a", "a"]), &v(&["a"])));
+        assert!(dest_contains_source(&v(&["a", "a"]), &v(&["a", "a", "a"])));
+    }
 }
