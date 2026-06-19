@@ -5496,37 +5496,54 @@ fn migrations_with_repository_framework_migrations(
 ) -> Vec<crate::migrate::EmbeddedMigrations> {
     if hook_queue_required
         && mode == RepositoryCommitHookQueueMigrationMode::Runtime
-        && !migration_sets_include(&migrations, REPOSITORY_COMMIT_HOOK_QUEUE_MIGRATION)
+        && !shard_applied_sets_include(&migrations, REPOSITORY_COMMIT_HOOK_QUEUE_MIGRATION)
     {
         migrations.push(crate::repository_commit_hooks::REPOSITORY_COMMIT_HOOK_MIGRATIONS);
     }
     if version_history_required
         && mode == RepositoryCommitHookQueueMigrationMode::Runtime
-        && !migration_sets_include(&migrations, VERSION_HISTORY_MIGRATION)
+        && !shard_applied_sets_include(&migrations, VERSION_HISTORY_MIGRATION)
     {
         migrations.push(crate::version_history::VERSION_HISTORY_MIGRATIONS);
     }
     migrations
 }
 
+/// Whether `migration_name` is already present in a set that shard targets will
+/// actually apply — i.e. a *non*-control-framework set.
+///
+/// The full control [`FRAMEWORK_MIGRATIONS`](crate::migrate::FRAMEWORK_MIGRATIONS)
+/// set is deliberately excluded: `run_startup_migrations` strips it from shard
+/// targets, so a migration present *only* inside it never reaches the shards. If
+/// de-duplication counted it, a sharded app that registers `FRAMEWORK_MIGRATIONS`
+/// (and uses commit hooks / versioning) would skip appending the standalone
+/// shard-required set yet have the control set filtered out on shards — leaving
+/// shards without `_autumn_repository_commit_hook_queue` / `_autumn_version_history`.
+/// Matching only shard-applied sets ensures the standalone set is appended
+/// whenever the shards would otherwise be missing it. Re-applying it to the
+/// control target is harmless: it shares the migration version already recorded
+/// by the control framework set, so Diesel skips it there.
 #[cfg(feature = "db")]
-fn migration_sets_include(
+fn shard_applied_sets_include(
     migrations: &[crate::migrate::EmbeddedMigrations],
     migration_name: &str,
 ) -> bool {
     use diesel::migration::{Migration, MigrationSource as _};
     use diesel::pg::Pg;
 
-    migrations.iter().any(|source| {
-        let Ok(source_migrations): Result<Vec<Box<dyn Migration<Pg>>>, _> = source.migrations()
-        else {
-            return false;
-        };
+    migrations
+        .iter()
+        .filter(|set| !migration_set_is_control_framework(set))
+        .any(|source| {
+            let Ok(source_migrations): Result<Vec<Box<dyn Migration<Pg>>>, _> = source.migrations()
+            else {
+                return false;
+            };
 
-        source_migrations
-            .iter()
-            .any(|migration| migration.name().to_string() == migration_name)
-    })
+            source_migrations
+                .iter()
+                .any(|migration| migration.name().to_string() == migration_name)
+        })
 }
 
 /// Whether a migration set is the control-plane
@@ -7144,6 +7161,53 @@ mod tests {
         assert!(!migration_set_is_control_framework(
             &crate::repository_commit_hooks::REPOSITORY_COMMIT_HOOK_MIGRATIONS
         ));
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn sharded_app_with_full_framework_still_gets_shard_required_sets() {
+        // A sharded app that registers the full control FRAMEWORK_MIGRATIONS and
+        // also uses commit hooks + versioning. The hook-queue / version-history
+        // migrations are present *inside* the control set, but that set is
+        // stripped from shard targets by `migration_set_is_control_framework`, so
+        // the standalone shard-required sets must still be appended — otherwise
+        // shards never get those tables.
+        let migrations = migrations_with_repository_framework_migrations(
+            vec![crate::migrate::FRAMEWORK_MIGRATIONS],
+            true,
+            true,
+            RepositoryCommitHookQueueMigrationMode::Runtime,
+        );
+
+        // The migration names the shard apply loop will actually run: every set
+        // that is not the control framework set (which gets stripped on shards).
+        use diesel::migration::{Migration, MigrationSource as _};
+        use diesel::pg::Pg;
+        let shard_names: Vec<String> = migrations
+            .iter()
+            .filter(|set| !migration_set_is_control_framework(set))
+            .flat_map(|set| {
+                let ms: Vec<Box<dyn Migration<Pg>>> = set.migrations().unwrap_or_default();
+                ms.into_iter()
+                    .map(|m| m.name().to_string())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+
+        assert!(
+            shard_names
+                .iter()
+                .any(|name| name == REPOSITORY_COMMIT_HOOK_QUEUE_MIGRATION),
+            "shards must receive the commit-hook queue migration even when the full \
+             control framework set is also registered: {shard_names:?}"
+        );
+        assert!(
+            shard_names
+                .iter()
+                .any(|name| name == VERSION_HISTORY_MIGRATION),
+            "shards must receive the version-history migration even when the full \
+             control framework set is also registered: {shard_names:?}"
+        );
     }
 
     #[cfg(feature = "db")]
