@@ -7764,13 +7764,12 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let (find_all_impl, find_all_one_shard_helper) = if config.sharded && config.tenant_scoped {
         let base = find_all_impl;
         let dispatch = quote! {
+            // Dispatch the cross-shard fan-out BEFORE acquiring any connection:
+            // no routed-shard connection is held here, so a dead parent replica
+            // or exhausted parent pool can't fail the fan-out. Each shard's own
+            // read route/fallback is chosen by `__autumn_for_shard` (#1d).
             if self.across_tenants {
                 if let ::core::option::Option::Some(ref __shards) = self.__autumn_shards {
-                    // Release the routed-shard read connection acquired by the
-                    // trait method before fanning out: holding it while
-                    // re-acquiring from every shard (including this one)
-                    // deadlocks pools sized to one connection (#1d).
-                    ::core::mem::drop(conn);
                     let __vecs = __shards.fan_out_shards(|__shard| {
                         let __sub = self.__autumn_for_shard(__shard);
                         async move { __sub.__autumn_find_all_one_shard().await }
@@ -7780,6 +7779,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     );
                 }
             }
+            let mut conn = self.__autumn_acquire_read_conn().await?;
             #base
         };
         let helper = quote! {
@@ -7803,9 +7803,9 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let (find_by_id_impl, find_by_id_one_shard_helper) = if config.sharded && config.tenant_scoped {
         let base = find_by_id_impl;
         let dispatch = quote! {
+            // Fan out before acquiring a parent-shard connection (see find_all).
             if self.across_tenants {
                 if let ::core::option::Option::Some(ref __shards) = self.__autumn_shards {
-                    ::core::mem::drop(conn);
                     let __found = __shards.fan_out_shards(|__shard| {
                         let __sub = self.__autumn_for_shard(__shard);
                         async move { __sub.__autumn_find_by_id_one_shard(id).await }
@@ -7827,6 +7827,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     return ::core::result::Result::Ok(__first);
                 }
             }
+            let mut conn = self.__autumn_acquire_read_conn().await?;
             #base
         };
         let helper = quote! {
@@ -7883,9 +7884,9 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let (count_impl, count_one_shard_helper) = if config.sharded && config.tenant_scoped {
         let base = count_impl;
         let dispatch = quote! {
+            // Fan out before acquiring a parent-shard connection (see find_all).
             if self.across_tenants {
                 if let ::core::option::Option::Some(ref __shards) = self.__autumn_shards {
-                    ::core::mem::drop(conn);
                     let __counts = __shards.fan_out_shards(|__shard| {
                         let __sub = self.__autumn_for_shard(__shard);
                         async move { __sub.__autumn_count_one_shard().await }
@@ -7893,6 +7894,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     return ::core::result::Result::Ok(__counts.into_iter().sum());
                 }
             }
+            let mut conn = self.__autumn_acquire_read_conn().await?;
             #base
         };
         let helper = quote! {
@@ -7957,9 +7959,9 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     {
         let base = exists_by_id_impl;
         let dispatch = quote! {
+            // Fan out before acquiring a parent-shard connection (see find_all).
             if self.across_tenants {
                 if let ::core::option::Option::Some(ref __shards) = self.__autumn_shards {
-                    ::core::mem::drop(conn);
                     let __results = __shards.fan_out_shards(|__shard| {
                         let __sub = self.__autumn_for_shard(__shard);
                         async move { __sub.__autumn_exists_by_id_one_shard(id).await }
@@ -7967,6 +7969,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     return ::core::result::Result::Ok(__results.into_iter().any(|b| b));
                 }
             }
+            let mut conn = self.__autumn_acquire_read_conn().await?;
             #base
         };
         let helper = quote! {
@@ -8796,6 +8799,17 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         quote! {}
     };
 
+    // For sharded + tenant_scoped repos, the cross-shard read dispatch acquires
+    // its own read connection lazily inside the single-shard branch, so a dead
+    // parent replica or exhausted parent pool can't fail the fan-out before
+    // per-shard routing chooses each shard's own read route/fallback. Other
+    // configs acquire up front in the trait method as before.
+    let read_conn_acquire = if config.sharded && config.tenant_scoped {
+        quote! {}
+    } else {
+        quote! { let mut conn = self.__autumn_acquire_read_conn().await?; }
+    };
+
     quote! {
         /// Generated repository trait with CRUD + derived queries.
         #vis trait #trait_name: Send + Sync {
@@ -8833,14 +8847,14 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             async fn find_by_id(&self, id: i64) -> ::autumn_web::AutumnResult<Option<#model_name>> {
                 use ::autumn_web::reexports::diesel::prelude::*;
                 use ::autumn_web::reexports::diesel_async::RunQueryDsl;
-                let mut conn = self.__autumn_acquire_read_conn().await?;
+                #read_conn_acquire
                 #find_by_id_impl
             }
 
             async fn find_all(&self) -> ::autumn_web::AutumnResult<Vec<#model_name>> {
                 use ::autumn_web::reexports::diesel::prelude::*;
                 use ::autumn_web::reexports::diesel_async::RunQueryDsl;
-                let mut conn = self.__autumn_acquire_read_conn().await?;
+                #read_conn_acquire
                 #find_all_impl
             }
 
@@ -8859,14 +8873,14 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             async fn count(&self) -> ::autumn_web::AutumnResult<i64> {
                 use ::autumn_web::reexports::diesel::prelude::*;
                 use ::autumn_web::reexports::diesel_async::RunQueryDsl;
-                let mut conn = self.__autumn_acquire_read_conn().await?;
+                #read_conn_acquire
                 #count_impl
             }
 
             async fn exists_by_id(&self, id: i64) -> ::autumn_web::AutumnResult<bool> {
                 use ::autumn_web::reexports::diesel::prelude::*;
                 use ::autumn_web::reexports::diesel_async::RunQueryDsl;
-                let mut conn = self.__autumn_acquire_read_conn().await?;
+                #read_conn_acquire
                 #exists_by_id_impl
             }
 
