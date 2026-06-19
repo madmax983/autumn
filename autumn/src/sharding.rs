@@ -260,10 +260,7 @@ impl std::fmt::Debug for DirectoryShardRouter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DirectoryShardRouter")
             .field("ttl", &self.ttl)
-            .field(
-                "cached_keys",
-                &self.cache.read().map_or(0, |c| c.len()),
-            )
+            .field("cached_keys", &self.cache.read().map_or(0, |c| c.len()))
             .finish_non_exhaustive()
     }
 }
