@@ -239,6 +239,24 @@ pub fn force_kill(pid: u32) {
     }
 }
 
+/// Force-kill the process *group* led by `pgid` with `SIGKILL`.
+///
+/// Daemons are spawned as their own group leader (`process_group(0)`), so the
+/// recorded daemon PID is also its PGID. Signalling the group reaps the daemon's
+/// descendants — e.g. a managed Postgres child — that a bare `SIGKILL` to the app
+/// PID alone would orphan (holding the data dir/port). Only call this for
+/// detached daemons, never a foreground child that shares our group.
+#[cfg(unix)]
+pub fn force_kill_group(pgid: u32) {
+    if let Some(p) = validate_pid_for_kill(pgid) {
+        let _ = nix::sys::signal::killpg(nix::unistd::Pid::from_raw(p), nix::sys::signal::Signal::SIGKILL);
+    }
+}
+
+/// Non-Unix fallback: no process groups in this MVP.
+#[cfg(not(unix))]
+pub fn force_kill_group(_pgid: u32) {}
+
 /// Wait up to `timeout` for `pid` to exit, polling its liveness.
 /// Returns `true` if the process exited within the timeout.
 #[cfg(unix)]
@@ -260,7 +278,12 @@ pub fn wait_for_pid_exit(pid: u32, timeout: Duration) -> bool {
 pub fn stop_pid(pid: u32, timeout: Duration) {
     let _ = signal_terminate(pid);
     if !wait_for_pid_exit(pid, timeout) {
+        // The app missed its graceful-drain budget, so its `on_shutdown` hooks
+        // (which stop a managed Postgres child) may not have run. Kill the whole
+        // daemon process group, not just the app PID, so supervised children are
+        // not orphaned holding the data dir/port.
         force_kill(pid);
+        force_kill_group(pid);
         let _ = wait_for_pid_exit(pid, Duration::from_secs(5));
     }
 }

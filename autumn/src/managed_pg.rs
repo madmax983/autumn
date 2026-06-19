@@ -44,14 +44,16 @@ const STARTUP_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// The managed primary URL, published by the provider once the cluster is up so
 /// `run_startup_migrations` can target it (the app's config has no
-/// `primary_url`). Set at most once per process.
-static RESOLVED_PRIMARY_URL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+/// `primary_url`). Last-writer-wins rather than set-once: if a second managed
+/// app boots in the same process (integration tests, or after stopping one and
+/// starting another), its migrations must target *its* cluster, not the first.
+static RESOLVED_PRIMARY_URL: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
-/// The managed provider that started a cluster this process, retained so
-/// abnormal boot-failure paths can stop the supervised child even though they
-/// bypass `on_shutdown`. Set at most once per process.
-static EMERGENCY_PROVIDER: std::sync::OnceLock<ManagedPostgresPoolProvider> =
-    std::sync::OnceLock::new();
+/// The managed provider that most recently started a cluster this process,
+/// retained so abnormal boot-failure paths can stop the supervised child even
+/// though they bypass `on_shutdown`. Last-writer-wins for the same reason.
+static EMERGENCY_PROVIDER: std::sync::Mutex<Option<ManagedPostgresPoolProvider>> =
+    std::sync::Mutex::new(None);
 
 /// Synchronously stop the managed Postgres cluster started this process, if any.
 ///
@@ -61,7 +63,7 @@ static EMERGENCY_PROVIDER: std::sync::OnceLock<ManagedPostgresPoolProvider> =
 /// holds the data dir and port. Best-effort and idempotent: a no-op when no
 /// managed cluster is running or it was already stopped cleanly.
 pub(crate) fn emergency_stop() {
-    let Some(provider) = EMERGENCY_PROVIDER.get() else {
+    let Some(provider) = EMERGENCY_PROVIDER.lock().ok().and_then(|g| g.clone()) else {
         return;
     };
     // These exit paths run on a blocking migration thread (no async runtime
@@ -82,7 +84,7 @@ pub(crate) fn emergency_stop() {
 /// started its cluster this process. Used by the migration runner.
 #[must_use]
 pub(crate) fn resolved_primary_url() -> Option<String> {
-    RESOLVED_PRIMARY_URL.get().cloned()
+    RESOLVED_PRIMARY_URL.lock().ok().and_then(|g| g.clone())
 }
 
 /// Generate a random 24-character alphanumeric password for the managed cluster.
@@ -190,7 +192,9 @@ impl ManagedPostgresPoolProvider {
 
         // Publish the resolved URL so `run_startup_migrations` can target the
         // managed database (the user's `autumn.toml` has no `primary_url`).
-        let _ = RESOLVED_PRIMARY_URL.set(url.clone());
+        if let Ok(mut g) = RESOLVED_PRIMARY_URL.lock() {
+            *g = Some(url.clone());
+        }
 
         // Retain the handle so the child keeps running after this returns.
         if let Ok(mut guard) = self.instance.lock() {
@@ -201,7 +205,9 @@ impl ManagedPostgresPoolProvider {
         // bypasses `on_shutdown`) still stops the supervised child instead of
         // orphaning it. The clone shares `instance`, so this is idempotent with
         // a normal `stop()`.
-        let _ = EMERGENCY_PROVIDER.set(self.clone());
+        if let Ok(mut g) = EMERGENCY_PROVIDER.lock() {
+            *g = Some(self.clone());
+        }
 
         Ok(url)
     }
@@ -221,6 +227,18 @@ impl ManagedPostgresPoolProvider {
         if let Ok(existing) = std::fs::read_to_string(&password_file) {
             let trimmed = existing.trim();
             if !trimmed.is_empty() {
+                // An existing file (older build, manual creation) may have a
+                // permissive mode; the create-time `0600` below never applied to
+                // it. Tighten it before reusing — it holds the cluster superuser
+                // password.
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = std::fs::set_permissions(
+                        &password_file,
+                        std::fs::Permissions::from_mode(0o600),
+                    );
+                }
                 return (trimmed.to_owned(), password_file);
             }
         }
@@ -282,21 +300,45 @@ impl DatabasePoolProvider for ManagedPostgresPoolProvider {
     }
 }
 
-/// Resolve the cluster data dir: the `AUTUMN_MANAGED_PG_DATA_DIR` override, then
-/// a per-user XDG-style default, then a temp-dir fallback.
+/// Resolve the cluster data dir: the `AUTUMN_MANAGED_PG_DATA_DIR` override
+/// (set per-project by `autumn serve`), then a per-user XDG-style default, then a
+/// temp-dir fallback. The default/fallback are namespaced per project so two
+/// unrelated apps using the provider directly (e.g. `cargo run`) don't share —
+/// and contend for — one cluster.
 fn default_data_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os(MANAGED_PG_DATA_DIR_ENV) {
         return PathBuf::from(dir);
     }
+    let project = project_data_namespace();
     if let Some(home) = std::env::var_os("HOME") {
-        return PathBuf::from(home).join(".local/share/autumn/pg");
+        return PathBuf::from(home)
+            .join(".local/share/autumn/pg")
+            .join(project);
     }
     // Windows (where HOME is usually unset): use a persistent app-data dir
     // rather than the volatile temp dir, which is cleared on reboot.
     if let Some(local_appdata) = std::env::var_os("LOCALAPPDATA") {
-        return PathBuf::from(local_appdata).join("autumn").join("pg");
+        return PathBuf::from(local_appdata)
+            .join("autumn")
+            .join("pg")
+            .join(project);
     }
-    std::env::temp_dir().join("autumn").join("pg")
+    std::env::temp_dir().join("autumn").join("pg").join(project)
+}
+
+/// A per-project namespace component for the fallback data dir, derived from the
+/// app's manifest dir (compile-time `AUTUMN_MANIFEST_DIR`, else CWD) hashed with
+/// SHA-256. Stable across runs and toolchains so an app keeps finding its
+/// cluster.
+fn project_data_namespace() -> String {
+    use sha2::{Digest, Sha256};
+    let base = std::env::var_os("AUTUMN_MANIFEST_DIR")
+        .map(PathBuf::from)
+        .or_else(|| std::env::current_dir().ok())
+        .and_then(|d| std::fs::canonicalize(&d).ok().or(Some(d)))
+        .unwrap_or_else(|| PathBuf::from("."));
+    let digest = Sha256::digest(base.to_string_lossy().as_bytes());
+    hex::encode(&digest[..4])
 }
 
 #[cfg(test)]

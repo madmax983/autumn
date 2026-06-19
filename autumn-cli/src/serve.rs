@@ -63,6 +63,12 @@ pub struct AddrFile {
     pub started_at: u64,
     /// Whether the app supervises a bundled/managed Postgres.
     pub managed_pg: bool,
+    /// Whether the daemon was built/started in release mode. Recovered by
+    /// `restart` so a bare `autumn serve restart` keeps the optimized binary and
+    /// the corresponding (prod) profile defaults. Defaults to `false` for address
+    /// files written before this field existed.
+    #[serde(default)]
+    pub release: bool,
 }
 
 impl AddrFile {
@@ -109,9 +115,9 @@ fn run_non_unix(action: Option<ServeAction>, opts: &ServeOptions) -> i32 {
 }
 
 /// Foreground server on non-Unix platforms: build, then run the app binary in
-/// the foreground (it binds TCP per its config, inheriting this terminal so
-/// Ctrl-C reaches it). None of the pidfile/socket/address-file machinery applies
-/// here — that is part of the Unix daemon lifecycle.
+/// the foreground (it binds TCP per its config). Reuses the shared
+/// [`run_foreground`] runner; the daemon lifecycle (pidfile/socket/address file)
+/// is Unix-only.
 #[cfg(not(unix))]
 fn run_foreground_non_unix(opts: &ServeOptions) -> i32 {
     let paths = resolve_paths(opts.package.as_deref());
@@ -125,17 +131,7 @@ fn run_foreground_non_unix(opts: &ServeOptions) -> i32 {
         return 1;
     }
     let binary = crate::dev::find_binary(opts.package.as_deref(), opts.release);
-    eprintln!("  Running {} in the foreground", binary.display());
-    eprintln!("  Press Ctrl+C to stop\n");
-    // `base_command` sets the managed-Postgres data dir when bundled; the
-    // Unix-socket env is compiled out off-Unix, so the app binds TCP.
-    match base_command(&binary, &paths, opts).status() {
-        Ok(status) => status.code().unwrap_or(1),
-        Err(e) => {
-            eprintln!("\u{2717} Failed to start {}: {e}", binary.display());
-            1
-        }
-    }
+    run_foreground(&binary, &paths, opts)
 }
 
 /// Unix implementation of `run` (daemon lifecycle).
@@ -147,16 +143,19 @@ fn run_unix(action: Option<ServeAction>, opts: &ServeOptions) -> i32 {
         Some(ServeAction::Status) => status(opts),
         Some(ServeAction::Restart) => {
             // `restart` is a fresh invocation, so `opts` reflects the restart
-            // command's flags — not the original `start`. Recover managed-PG
-            // mode from the running daemon's address file so a bare `restart`
-            // keeps the project data dir, the longer readiness budget, and the
-            // managed_pg flag. Always relaunch in the background.
-            let keep_managed =
-                opts.bundled_pg || running_daemon_is_managed(opts.package.as_deref());
+            // command's flags — not the original `start`. Recover managed-PG mode
+            // and release mode from the running daemon's address file so a bare
+            // `restart` keeps the project data dir, the longer readiness budget,
+            // the optimized binary, and the matching profile defaults. Always
+            // relaunch in the background.
+            let running = running_daemon_addr(opts.package.as_deref());
+            let keep_managed = opts.bundled_pg || running.as_ref().is_some_and(|a| a.managed_pg);
+            let keep_release = opts.release || running.as_ref().is_some_and(|a| a.release);
             let _ = stop(opts);
             let daemon_opts = ServeOptions {
                 daemon: true,
                 bundled_pg: keep_managed,
+                release: keep_release,
                 ..opts.clone()
             };
             start(&daemon_opts)
@@ -164,17 +163,14 @@ fn run_unix(action: Option<ServeAction>, opts: &ServeOptions) -> i32 {
     }
 }
 
-/// Whether the currently-recorded daemon was started in managed-Postgres mode,
-/// read from its address file. Best-effort: false if anything can't be read.
+/// The currently-recorded daemon's address file, if present and parseable.
+/// Best-effort: `None` if anything can't be read.
 #[cfg(unix)]
-fn running_daemon_is_managed(package: Option<&str>) -> bool {
-    let Ok(paths) = RuntimePaths::resolve(&project_identity(package)) else {
-        return false;
-    };
+fn running_daemon_addr(package: Option<&str>) -> Option<AddrFile> {
+    let paths = RuntimePaths::resolve(&project_identity(package)).ok()?;
     std::fs::read_to_string(paths.addr_file())
         .ok()
         .and_then(|s| AddrFile::parse(&s).ok())
-        .is_some_and(|a| a.managed_pg)
 }
 
 /// Resolve the project's runtime paths, exiting on failure.
@@ -227,15 +223,18 @@ fn read_package_name() -> Option<String> {
 /// to the canonicalized CWD when no package is given or its manifest dir can't
 /// be resolved.
 fn project_dir_hash(package: Option<&str>) -> String {
-    use std::hash::{Hash, Hasher};
+    use sha2::{Digest, Sha256};
     let dir = package
         .and_then(crate::dev::find_manifest_dir)
         .or_else(|| std::env::current_dir().ok())
         .and_then(|d| std::fs::canonicalize(&d).ok().or(Some(d)))
         .unwrap_or_else(|| std::path::PathBuf::from("."));
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    dir.hash(&mut hasher);
-    format!("{:08x}", hasher.finish() & 0xffff_ffff)
+    // A fixed SHA-256 over the canonical path — `DefaultHasher` is explicitly
+    // not stable across std/toolchain versions, so a CLI upgrade while a daemon
+    // is running must not change the namespace (which would orphan it). First
+    // 4 bytes (8 hex) keep the resulting Unix socket path within `sun_path`.
+    let digest = Sha256::digest(dir.to_string_lossy().as_bytes());
+    hex::encode(&digest[..4])
 }
 
 /// Build, then start the server (foreground or daemon). Returns the exit code.
@@ -287,20 +286,28 @@ fn base_command(binary: &Path, paths: &RuntimePaths, opts: &ServeOptions) -> Com
         cmd.current_dir(&dir);
         cmd.env("AUTUMN_MANIFEST_DIR", &dir);
     }
-    // Unix-socket binding is Unix-only; on other platforms the app rejects the
-    // setting and exits, so leave it unset there (the app binds TCP instead).
+    // The Unix-domain socket is the daemon's private transport (for address-file
+    // discovery and the thin client). Only force it for daemon starts: a plain
+    // foreground `autumn serve` must stay on its configured `server.host`/`port`
+    // (the app rejects `unix_socket` off-Unix anyway), so it remains reachable at
+    // the expected TCP address like any production server.
     #[cfg(unix)]
-    cmd.env("AUTUMN_SERVER__UNIX_SOCKET", paths.socket_file());
+    if opts.daemon {
+        cmd.env("AUTUMN_SERVER__UNIX_SOCKET", paths.socket_file());
+    }
     if opts.bundled_pg {
         cmd.env("AUTUMN_MANAGED_PG_DATA_DIR", paths.pg_data_dir());
     }
     cmd
 }
 
-/// Run the server in the foreground, blocking until it exits. Ctrl-C reaches
-/// the child directly (shared process group) and triggers its graceful drain.
+/// Run the server in the foreground on its configured transport, blocking until
+/// it exits. The child shares this terminal's process group, so Ctrl-C reaches
+/// it and triggers its graceful drain; a no-op SIGINT handler keeps this
+/// supervisor alive until the child finishes draining. No daemon
+/// pidfile/socket/address-file machinery applies to a foreground run — that is
+/// part of the background daemon lifecycle.
 fn run_foreground(binary: &Path, paths: &RuntimePaths, opts: &ServeOptions) -> i32 {
-    let socket = paths.socket_file();
     let mut child = match base_command(binary, paths, opts).spawn() {
         Ok(child) => child,
         Err(e) => {
@@ -309,23 +316,15 @@ fn run_foreground(binary: &Path, paths: &RuntimePaths, opts: &ServeOptions) -> i
         }
     };
 
-    if let Err(code) = record_started(paths, child.id(), &socket, opts, || {
-        let _ = child.kill();
-    }) {
-        return code;
-    }
-
     // Install a no-op SIGINT handler so Ctrl-C does not kill this supervisor
-    // before the child drains; the child (same process group) receives SIGINT
-    // and shuts down gracefully, after which `wait()` returns.
+    // before the child drains; the child receives SIGINT and shuts down
+    // gracefully, after which `wait()` returns.
     let _ = ctrlc::set_handler(|| {});
 
-    eprintln!("  Listening on unix:{}", socket.display());
-    eprintln!("  Address file: {}", paths.addr_file().display());
+    eprintln!("  Running {} in the foreground", binary.display());
     eprintln!("  Press Ctrl+C to stop\n");
 
     let status = child.wait();
-    cleanup(paths, &socket);
     // Propagate the child's exit code. A signal death (`code()` is `None`) or a
     // failed `wait` is an abnormal exit, so report non-zero — supervisors and
     // scripts must not see a crash as success.
@@ -344,7 +343,16 @@ fn create_private_log(path: &Path) -> std::io::Result<std::fs::File> {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    options.open(path)
+    let file = options.open(path)?;
+    // `mode(0o600)` only applies when *creating* the file; an existing log
+    // (from an earlier version or manual creation) keeps its old, possibly
+    // world-readable mode, so tighten it explicitly after opening.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
+    }
+    Ok(file)
 }
 
 /// Spawn the server detached into the background and supervise readiness.
@@ -406,12 +414,14 @@ fn spawn_daemon(binary: &Path, paths: &RuntimePaths, opts: &ServeOptions) -> i32
         Err(AcquireError::AlreadyRunning(existing)) => {
             eprintln!("autumn serve: already running (pid {existing}).");
             let _ = child.kill();
+            process::force_kill_group(pid);
             let _ = child.wait();
             return 1;
         }
         Err(AcquireError::Io(e)) => {
             eprintln!("autumn serve: cannot write pidfile: {e}");
             let _ = child.kill();
+            process::force_kill_group(pid);
             let _ = child.wait();
             return 1;
         }
@@ -423,7 +433,7 @@ fn spawn_daemon(binary: &Path, paths: &RuntimePaths, opts: &ServeOptions) -> i32
         READY_TIMEOUT
     };
     if wait_for_ready(&socket, &mut child, ready_timeout) {
-        write_addr_file(paths, pid, &socket, opts.bundled_pg);
+        write_addr_file(paths, pid, &socket, opts.bundled_pg, opts.release);
         println!(
             "autumn serve: started (pid {pid}) on unix:{}",
             socket.display()
@@ -437,41 +447,17 @@ fn spawn_daemon(binary: &Path, paths: &RuntimePaths, opts: &ServeOptions) -> i32
     } else {
         eprintln!(
             "autumn serve: daemon did not become ready within {}s; see {}",
-            READY_TIMEOUT.as_secs(),
+            ready_timeout.as_secs(),
             log_path.display()
         );
+        // Kill the whole group: a startup that timed out may have spawned
+        // children (e.g. managed Postgres during `--bundled-pg` provisioning)
+        // that `Child::kill()` alone would leave orphaned.
         let _ = child.kill();
+        process::force_kill_group(pid);
         let _ = child.wait();
         cleanup(paths, &socket);
         1
-    }
-}
-
-/// Record the pidfile + address file for a started server. Calls `on_conflict`
-/// (e.g. to kill the just-spawned child) when another daemon already holds the
-/// lock. Returns `Err(exit_code)` on failure.
-fn record_started(
-    paths: &RuntimePaths,
-    pid: u32,
-    socket: &Path,
-    opts: &ServeOptions,
-    on_conflict: impl FnOnce(),
-) -> Result<(), i32> {
-    match process::acquire_pidfile(&paths.pid_file(), pid) {
-        Ok(()) => {
-            write_addr_file(paths, pid, socket, opts.bundled_pg);
-            Ok(())
-        }
-        Err(AcquireError::AlreadyRunning(existing)) => {
-            eprintln!("autumn serve: already running (pid {existing}).");
-            on_conflict();
-            Err(1)
-        }
-        Err(AcquireError::Io(e)) => {
-            eprintln!("autumn serve: cannot write pidfile: {e}");
-            on_conflict();
-            Err(1)
-        }
     }
 }
 
@@ -530,7 +516,7 @@ fn wait_for_ready(socket: &Path, child: &mut std::process::Child, timeout: Durat
 }
 
 /// Write the address-discovery file with `0600` permissions.
-fn write_addr_file(paths: &RuntimePaths, pid: u32, socket: &Path, managed_pg: bool) {
+fn write_addr_file(paths: &RuntimePaths, pid: u32, socket: &Path, managed_pg: bool, release: bool) {
     let addr = AddrFile {
         pid,
         transport: "unix".to_owned(),
@@ -539,6 +525,7 @@ fn write_addr_file(paths: &RuntimePaths, pid: u32, socket: &Path, managed_pg: bo
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_secs()),
         managed_pg,
+        release,
     };
     let path = paths.addr_file();
     if let Err(e) = std::fs::write(&path, addr.to_toml()) {
@@ -627,9 +614,11 @@ fn resolve_shutdown_budget(base_dir: &Path) -> (u64, u64) {
         }
     }
 
-    // autumn-<profile>.toml [server] overrides (first match wins).
+    // autumn-<profile>.toml [server] overrides. Only the first existing file is
+    // loaded, in the app loader's preference order (the explicitly-selected
+    // spelling first, else the canonical name), so we match the daemon's budget.
     if let Some(prof) = profile.as_deref() {
-        for name in profile_aliases(prof) {
+        for name in profile_file_lookup(prof) {
             if let Ok(contents) =
                 std::fs::read_to_string(base_dir.join(format!("autumn-{name}.toml")))
                 && let Ok(table) = toml::from_str::<toml::Table>(&contents)
@@ -670,12 +659,28 @@ fn apply_server_slice(server: Option<&toml::Value>, prestop: &mut u64, shutdown:
     }
 }
 
-/// Profile name plus legacy aliases, matching the app's lookup order.
+/// Inline `[profile.<name>]` section names plus legacy aliases, matching the
+/// app's `profile_lookup_names` (all matching sections are merged in order, so
+/// the canonical spelling, applied last, wins).
 fn profile_aliases(profile: &str) -> Vec<String> {
     match profile.trim().to_ascii_lowercase().as_str() {
         "prod" | "production" => vec!["production".to_owned(), "prod".to_owned()],
         "dev" | "development" => vec!["development".to_owned(), "dev".to_owned()],
         _ => vec![profile.trim().to_owned()],
+    }
+}
+
+/// Ordered `autumn-<name>.toml` lookup names, mirroring the app's
+/// `profile_override_file_lookup_names`: only the first existing file is loaded,
+/// preferring the explicitly-selected spelling, else the canonical name first.
+fn profile_file_lookup(raw_profile: &str) -> Vec<String> {
+    let raw = raw_profile.trim();
+    match raw.to_ascii_lowercase().as_str() {
+        "production" => vec!["production".to_owned(), "prod".to_owned()],
+        "prod" => vec!["prod".to_owned(), "production".to_owned()],
+        "development" => vec!["development".to_owned(), "dev".to_owned()],
+        "dev" => vec!["dev".to_owned(), "development".to_owned()],
+        _ => vec![raw.to_owned()],
     }
 }
 
@@ -714,19 +719,34 @@ fn cleanup(paths: &RuntimePaths, socket: &Path) {
     remove_socket_if_not_live(socket);
 }
 
-/// Unlink the socket file only when no live listener still owns it.
+/// Unlink the socket file only when it is a stale socket we can safely reclaim.
 ///
-/// After our daemon exits the socket is stale (a `connect` is refused) and safe
-/// to remove. But if a *foreign* live listener owns this path — e.g. our child
-/// refused to bind over it (`prepare_unix_socket_path`) and exited — unlinking
-/// would make that service unreachable, so leave it in place.
+/// Two guards mirror the app's own bind-path policy:
+/// - Skip a path that is **not a socket** (a regular file or other type the app
+///   would refuse to clobber) so we never delete something we didn't create.
+/// - Skip a socket still owned by a **live listener** (a `connect` succeeds) —
+///   e.g. a foreign daemon, or our child that refused to bind over it and exited
+///   — so we don't make that service unreachable.
+///
+/// After our own daemon exits its socket is a dead socket file (connect refused)
+/// and is removed.
+#[cfg(unix)]
 fn remove_socket_if_not_live(socket: &Path) {
-    #[cfg(unix)]
-    if std::os::unix::net::UnixStream::connect(socket).is_ok() {
-        return;
+    use std::os::unix::fs::FileTypeExt;
+    match std::fs::symlink_metadata(socket) {
+        Ok(meta) if meta.file_type().is_socket() => {
+            if std::os::unix::net::UnixStream::connect(socket).is_ok() {
+                return; // live listener owns it
+            }
+            let _ = std::fs::remove_file(socket);
+        }
+        // Not a socket (or missing): leave it untouched.
+        _ => {}
     }
-    let _ = std::fs::remove_file(socket);
 }
+
+#[cfg(not(unix))]
+fn remove_socket_if_not_live(_socket: &Path) {}
 
 #[cfg(test)]
 mod tests {
@@ -739,7 +759,26 @@ mod tests {
             address: address.to_owned(),
             started_at: 1_700_000_000,
             managed_pg,
+            release: false,
         }
+    }
+
+    #[test]
+    fn addr_file_release_defaults_false_for_legacy_files() {
+        // Address files written before the `release` field omit it; parsing must
+        // not fail and must default to false.
+        let legacy = "pid = 7\ntransport = \"unix\"\naddress = \"/tmp/s.sock\"\n\
+                      started_at = 1700000000\nmanaged_pg = false\n";
+        let parsed = AddrFile::parse(legacy).expect("parse legacy addr file");
+        assert!(!parsed.release);
+    }
+
+    #[test]
+    fn addr_file_release_roundtrips() {
+        let mut a = sample("unix", "/tmp/s.sock", true);
+        a.release = true;
+        let parsed = AddrFile::parse(&a.to_toml()).expect("parse");
+        assert!(parsed.release);
     }
 
     #[test]
@@ -760,7 +799,14 @@ mod tests {
     fn addr_file_is_valid_toml() {
         let a = sample("unix", "/tmp/x.sock", false);
         let table: toml::Table = toml::from_str(&a.to_toml()).expect("valid toml");
-        for key in ["pid", "transport", "address", "started_at", "managed_pg"] {
+        for key in [
+            "pid",
+            "transport",
+            "address",
+            "started_at",
+            "managed_pg",
+            "release",
+        ] {
             assert!(table.contains_key(key), "missing key {key}");
         }
     }
@@ -851,5 +897,42 @@ mod tests {
         assert_eq!(profile_aliases("production"), vec!["production", "prod"]);
         assert_eq!(profile_aliases("DEV"), vec!["development", "dev"]);
         assert_eq!(profile_aliases("staging"), vec!["staging"]);
+    }
+
+    #[test]
+    fn profile_file_lookup_prefers_selected_spelling() {
+        // Mirrors the app loader: the canonical `prod` is preferred unless the
+        // user explicitly selected the `production` spelling.
+        assert_eq!(profile_file_lookup("prod"), vec!["prod", "production"]);
+        assert_eq!(profile_file_lookup("production"), vec!["production", "prod"]);
+        assert_eq!(profile_file_lookup("dev"), vec!["dev", "development"]);
+        assert_eq!(profile_file_lookup("staging"), vec!["staging"]);
+    }
+
+    #[test]
+    fn shutdown_budget_profile_file_prefers_prod_over_production() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("autumn.toml"),
+            "[server]\nshutdown_timeout_secs = 30\n",
+        )
+        .expect("write");
+        // Both spellings present; with AUTUMN_ENV=prod the app loads autumn-prod
+        // first, so our budget must too.
+        std::fs::write(
+            dir.path().join("autumn-prod.toml"),
+            "[server]\nshutdown_timeout_secs = 111\n",
+        )
+        .expect("write");
+        std::fs::write(
+            dir.path().join("autumn-production.toml"),
+            "[server]\nshutdown_timeout_secs = 222\n",
+        )
+        .expect("write");
+        let mut vars = clear_shutdown_env();
+        vars.push(("AUTUMN_ENV", Some("prod")));
+        temp_env::with_vars(vars, || {
+            assert_eq!(resolve_shutdown_budget(dir.path()).1, 111);
+        });
     }
 }
