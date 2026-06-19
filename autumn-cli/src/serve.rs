@@ -904,7 +904,10 @@ mod tests {
         // Mirrors the app loader: the canonical `prod` is preferred unless the
         // user explicitly selected the `production` spelling.
         assert_eq!(profile_file_lookup("prod"), vec!["prod", "production"]);
-        assert_eq!(profile_file_lookup("production"), vec!["production", "prod"]);
+        assert_eq!(
+            profile_file_lookup("production"),
+            vec!["production", "prod"]
+        );
         assert_eq!(profile_file_lookup("dev"), vec!["dev", "development"]);
         assert_eq!(profile_file_lookup("staging"), vec!["staging"]);
     }

@@ -249,7 +249,10 @@ pub fn force_kill(pid: u32) {
 #[cfg(unix)]
 pub fn force_kill_group(pgid: u32) {
     if let Some(p) = validate_pid_for_kill(pgid) {
-        let _ = nix::sys::signal::killpg(nix::unistd::Pid::from_raw(p), nix::sys::signal::Signal::SIGKILL);
+        let _ = nix::sys::signal::killpg(
+            nix::unistd::Pid::from_raw(p),
+            nix::sys::signal::Signal::SIGKILL,
+        );
     }
 }
 
