@@ -89,6 +89,12 @@ pub fn run_move_slot(args: &MoveSlotArgs) {
     // duplicate PKs) and go straight to delete.
     eprintln!("\u{2192} Checking source\u{2026}");
     let src_count = psql_scalar(&from_url, &count_sql(&args.table, &filter));
+    // Source ids captured atomically with their content fingerprints, so a
+    // later `--confirm` deletes exactly the rows that were verified copied —
+    // never a row written to the source after this snapshot (which gets a fresh
+    // id, even if a per-shard sequence reuses an id value present on the
+    // destination).
+    let mut verified_src_ids: Vec<String> = Vec::new();
     if src_count == "0" {
         eprintln!("\u{26A0}\u{FE0F}  No rows found on source shard for the given tenant(s).");
     } else {
@@ -97,8 +103,9 @@ pub fn run_move_slot(args: &MoveSlotArgs) {
         // copy and a route flip, new writes for the moved tenant make the
         // destination a superset of the source; a `--confirm` re-run must then
         // skip the copy (re-inserting copied PKs would abort) and proceed to
-        // delete the stale source rows.
-        let src_fp = row_fingerprints(&from_url, &args.table, &filter);
+        // delete the snapshotted source rows.
+        let (src_ids, src_fp) = source_snapshot(&from_url, &args.table, &args.id_column, &filter);
+        verified_src_ids = src_ids;
         let dst_fp = row_fingerprints(&to_url, &args.table, &filter);
         if dest_contains_source(&src_fp, &dst_fp) {
             eprintln!(
@@ -161,7 +168,13 @@ pub fn run_move_slot(args: &MoveSlotArgs) {
         return;
     }
     eprintln!("\u{2192} Deleting rows from source (--confirm)\u{2026}");
-    delete_verified_source_rows(&from_url, &to_url, &args.table, &args.id_column, &filter);
+    delete_source_rows_by_id(
+        &from_url,
+        &args.table,
+        &args.id_column,
+        &filter,
+        &verified_src_ids,
+    );
     eprintln!(
         "\u{2713} Done. Source rows removed; shard {:?} now owns these tenant(s).\n  \
          Confirm routing sends them to {:?}: pin each tenant in the directory\n  \
@@ -171,26 +184,25 @@ pub fn run_move_slot(args: &MoveSlotArgs) {
     );
 }
 
-/// Delete from the source only the rows actually present (verified) on the
-/// destination — its current ids for these keys — rather than everything
-/// matching the filter.
+/// Delete from the source only the rows in `ids` — the source snapshot whose
+/// content was just verified present on the destination — rather than
+/// everything matching the filter.
 ///
-/// A row written to the source after the copy (e.g. a straggler write during
-/// the cutover window) has no destination row, so a blanket delete would drop
-/// it permanently; scoping to verified ids leaves such rows on the source. This
-/// still assumes the moved keys are otherwise quiesced on the source (writes
-/// re-routed to the destination) — a *changed* (not just added) row is caught
-/// by the verification before this point, which fails the move before deletion.
-fn delete_verified_source_rows(
+/// A row written to the source after the snapshot (e.g. a straggler write
+/// during the cutover window) is not in `ids`, so it is preserved; this holds
+/// even if a per-shard sequence handed that row an id value that also exists on
+/// the destination, because `ids` come from the source snapshot, not the
+/// destination. A *changed* (not added) snapshot row is caught earlier by the
+/// verification, which fails the move before deletion.
+fn delete_source_rows_by_id(
     from_url: &str,
-    to_url: &str,
     table: &str,
     id_column: &str,
     filter: &str,
+    ids: &[String],
 ) {
-    let verified_ids = psql_lines(to_url, &select_ids_sql(table, id_column, filter));
-    if verified_ids.is_empty() {
-        eprintln!("  No verified destination rows for these tenant(s); nothing deleted.");
+    if ids.is_empty() {
+        eprintln!("  No verified source rows for these tenant(s); nothing deleted.");
         return;
     }
     run_psql(
@@ -198,7 +210,7 @@ fn delete_verified_source_rows(
         &[
             "--single-transaction",
             "-c",
-            &delete_verified_sql(table, id_column, filter, &verified_ids),
+            &delete_verified_sql(table, id_column, filter, ids),
         ],
     );
 }
@@ -414,18 +426,41 @@ fn row_fingerprints(url: &str, table: &str, filter: &str) -> Vec<String> {
     )
 }
 
-/// `SELECT id::text` for the filtered rows on a shard, as text so any id type
-/// (bigint, uuid, …) round-trips. Used to scope the source delete to exactly
-/// the rows present (verified) on the destination.
-fn select_ids_sql(table: &str, id_column: &str, filter: &str) -> String {
+/// `SELECT md5(row) || '|' || id::text` for the filtered rows, so each row's
+/// content fingerprint and its id are captured together in one snapshot query.
+/// The id is cast to text so any id type (bigint, uuid, …) round-trips; the
+/// `md5` is fixed 32-hex so it never contains the `|` separator.
+fn source_snapshot_sql(table: &str, id_column: &str, filter: &str) -> String {
     let qt = quote_identifier(table);
     let qcol = quote_identifier(id_column);
-    format!("SELECT {qcol}::text FROM {qt} WHERE {filter}")
+    format!("SELECT md5(to_jsonb(t)::text) || '|' || {qcol}::text FROM {qt} t WHERE {filter}")
 }
 
-/// `DELETE` for the filtered rows whose id is in `ids` — i.e. only the rows
-/// confirmed present on the destination, so a source-only row written during
-/// the confirm window is never dropped.
+/// Capture the filtered source rows' `(ids, fingerprints)` in one query so the
+/// two describe exactly the same snapshot — the ids are what `--confirm` will
+/// delete, the fingerprints are what verification checks against the destination.
+fn source_snapshot(
+    url: &str,
+    table: &str,
+    id_column: &str,
+    filter: &str,
+) -> (Vec<String>, Vec<String>) {
+    let lines = psql_lines(url, &source_snapshot_sql(table, id_column, filter));
+    let mut ids = Vec::with_capacity(lines.len());
+    let mut fps = Vec::with_capacity(lines.len());
+    for line in &lines {
+        // md5 (32 hex, no `|`) is first, so split on the first `|`.
+        if let Some((fp, id)) = line.split_once('|') {
+            fps.push(fp.to_owned());
+            ids.push(id.to_owned());
+        }
+    }
+    (ids, fps)
+}
+
+/// `DELETE` for the filtered rows whose id is in `ids` — i.e. only the
+/// snapshotted-and-verified source rows, so a source-only row written after the
+/// snapshot is never dropped.
 fn delete_verified_sql(table: &str, id_column: &str, filter: &str, ids: &[String]) -> String {
     let qt = quote_identifier(table);
     let qcol = quote_identifier(id_column);
@@ -526,8 +561,9 @@ mod tests {
             "SELECT count(*) FROM \"bookmarks\" WHERE \"tenant_id\"::text = ANY(ARRAY['acme']::text[])"
         );
         assert_eq!(
-            select_ids_sql("bookmarks", "id", &f),
-            "SELECT \"id\"::text FROM \"bookmarks\" WHERE \"tenant_id\"::text = ANY(ARRAY['acme']::text[])"
+            source_snapshot_sql("bookmarks", "id", &f),
+            "SELECT md5(to_jsonb(t)::text) || '|' || \"id\"::text FROM \"bookmarks\" t \
+             WHERE \"tenant_id\"::text = ANY(ARRAY['acme']::text[])"
         );
         assert_eq!(
             delete_verified_sql("bookmarks", "id", &f, &["1".to_owned(), "2".to_owned()]),

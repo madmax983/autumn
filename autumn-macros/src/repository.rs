@@ -9050,6 +9050,12 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 use ::autumn_web::reexports::diesel_async::AsyncConnection;
                 use ::autumn_web::reexports::scoped_futures::ScopedFutureExt as _;
 
+                // with_lock is a write (SELECT ... FOR UPDATE + mutation): reject
+                // cross-shard across_tenants(). It locks only the routed shard and
+                // drops tenant scoping, so a per-shard-reused id could lock/mutate
+                // another tenant's row.
+                #cross_shard_write_guard
+
                 let mut conn = self.__autumn_acquire_conn().await?;
                 conn.transaction::<T, ::autumn_web::AutumnError, _>(|conn| {
                     async move {
