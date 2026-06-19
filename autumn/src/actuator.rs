@@ -554,6 +554,18 @@ impl JobRegistry {
         }
     }
 
+    /// Helper to mutate a job's status if it exists.
+    fn with_job_mut<F>(&self, name: &str, f: F)
+    where
+        F: FnOnce(&mut JobStatus),
+    {
+        if let Ok(mut guard) = self.inner.write()
+            && let Some(status) = guard.get_mut(name)
+        {
+            f(status);
+        }
+    }
+
     /// Record that a new job instance was enqueued.
     pub fn record_enqueue(&self, name: &str) {
         if let Ok(mut guard) = self.inner.write() {
@@ -567,30 +579,24 @@ impl JobRegistry {
     /// Reverses the `record_enqueue` bookkeeping for the coalesced instance
     /// and bumps the deduplication counter.
     pub fn record_deduplicated(&self, name: &str) {
-        if let Ok(mut guard) = self.inner.write()
-            && let Some(status) = guard.get_mut(name)
-        {
+        self.with_job_mut(name, |status| {
             status.queued = status.queued.saturating_sub(1);
             status.total_deduplicated = status.total_deduplicated.saturating_add(1);
-        }
+        });
     }
 
     /// Record that a job is parked waiting on a free concurrency slot.
     pub fn record_concurrency_blocked(&self, name: &str) {
-        if let Ok(mut guard) = self.inner.write()
-            && let Some(status) = guard.get_mut(name)
-        {
+        self.with_job_mut(name, |status| {
             status.blocked_on_concurrency = status.blocked_on_concurrency.saturating_add(1);
-        }
+        });
     }
 
     /// Record that a parked job was released back to the queue.
     pub fn record_concurrency_unblocked(&self, name: &str) {
-        if let Ok(mut guard) = self.inner.write()
-            && let Some(status) = guard.get_mut(name)
-        {
+        self.with_job_mut(name, |status| {
             status.blocked_on_concurrency = status.blocked_on_concurrency.saturating_sub(1);
-        }
+        });
     }
 
     /// Replace the blocked-on-concurrency gauges from a backend-wide survey.
@@ -608,56 +614,46 @@ impl JobRegistry {
 
     /// Record that a queued job started execution.
     pub fn record_start(&self, name: &str) {
-        if let Ok(mut guard) = self.inner.write()
-            && let Some(status) = guard.get_mut(name)
-        {
+        self.with_job_mut(name, |status| {
             status.queued = status.queued.saturating_sub(1);
             status.in_flight = status.in_flight.saturating_add(1);
-        }
+        });
     }
 
     /// Record that a queued job was canceled before execution.
     pub fn record_cancel(&self, name: &str) {
-        if let Ok(mut guard) = self.inner.write()
-            && let Some(status) = guard.get_mut(name)
-        {
+        self.with_job_mut(name, |status| {
             status.queued = status.queued.saturating_sub(1);
-        }
+        });
     }
 
     /// Record a successful execution.
     pub fn record_success(&self, name: &str) {
-        if let Ok(mut guard) = self.inner.write()
-            && let Some(status) = guard.get_mut(name)
-        {
+        self.with_job_mut(name, |status| {
             status.in_flight = status.in_flight.saturating_sub(1);
             status.total_successes = status.total_successes.saturating_add(1);
             status.last_error = None;
-        }
+        });
     }
 
     /// Record a retriable failure.
     pub fn record_retry(&self, name: &str, error: &str, _attempt: u32) {
-        if let Ok(mut guard) = self.inner.write()
-            && let Some(status) = guard.get_mut(name)
-        {
+        self.with_job_mut(name, |status| {
             status.in_flight = status.in_flight.saturating_sub(1);
             status.last_error = Some(error.to_string());
-        }
+        });
     }
 
     /// Record a terminal failure.
     pub fn record_failure(&self, name: &str, error: String, dead_lettered: bool) {
-        if let Ok(mut guard) = self.inner.write()
-            && let Some(status) = guard.get_mut(name)
-        {
+        self.with_job_mut(name, |status| {
             status.in_flight = status.in_flight.saturating_sub(1);
             status.total_failures = status.total_failures.saturating_add(1);
             status.last_error = Some(error);
             if dead_lettered {
                 status.dead_letters = status.dead_letters.saturating_add(1);
             }
-        }
+        });
     }
 
     /// Snapshot all registered jobs.
@@ -727,76 +723,68 @@ impl TaskRegistry {
         );
     }
 
+    /// Helper to mutate a task's status if it exists.
+    fn with_task_mut<F>(&self, name: &str, f: F)
+    where
+        F: FnOnce(&mut TaskStatus),
+    {
+        if let Ok(mut guard) = self.inner.write()
+            && let Some(task) = guard.get_mut(name)
+        {
+            f(task);
+        }
+    }
+
     /// Record the replica that acquired leadership for a global task tick.
     pub fn record_leader(&self, name: &str, leader_id: &str, tick_key: &str) {
-        let Ok(mut guard) = self.inner.write() else {
-            return;
-        };
-        let Some(task) = guard.get_mut(name) else {
-            return;
-        };
-        task.current_leader = Some(leader_id.to_string());
-        task.last_tick = Some(tick_key.to_string());
+        self.with_task_mut(name, |task| {
+            task.current_leader = Some(leader_id.to_string());
+            task.last_tick = Some(tick_key.to_string());
+        });
     }
 
     /// Record that a task started running.
     pub fn record_start(&self, name: &str) {
-        let Ok(mut guard) = self.inner.write() else {
-            return;
-        };
-        let Some(task) = guard.get_mut(name) else {
-            return;
-        };
-        task.status = "running".to_string();
-        task.next_run_at = None;
+        self.with_task_mut(name, |task| {
+            task.status = "running".to_string();
+            task.next_run_at = None;
+        });
     }
 
     /// Record the next scheduled run time for an idle task.
     pub fn record_next_run_at(&self, name: &str, next_run_at: &str) {
-        let Ok(mut guard) = self.inner.write() else {
-            return;
-        };
-        let Some(task) = guard.get_mut(name) else {
-            return;
-        };
-        task.next_run_at = Some(next_run_at.to_string());
+        self.with_task_mut(name, |task| {
+            task.next_run_at = Some(next_run_at.to_string());
+        });
     }
 
     /// Record that a task completed successfully.
     pub fn record_success(&self, name: &str, duration_ms: u64) {
-        let Ok(mut guard) = self.inner.write() else {
-            return;
-        };
-        let Some(task) = guard.get_mut(name) else {
-            return;
-        };
-        task.status = "idle".to_string();
-        let now = chrono::Utc::now().to_rfc3339();
-        task.last_run = Some(now.clone());
-        task.last_fired_at = Some(now);
-        task.last_duration_ms = Some(duration_ms);
-        task.last_result = Some("ok".to_string());
-        task.last_error = None;
-        task.total_runs += 1;
+        self.with_task_mut(name, |task| {
+            task.status = "idle".to_string();
+            let now = chrono::Utc::now().to_rfc3339();
+            task.last_run = Some(now.clone());
+            task.last_fired_at = Some(now);
+            task.last_duration_ms = Some(duration_ms);
+            task.last_result = Some("ok".to_string());
+            task.last_error = None;
+            task.total_runs += 1;
+        });
     }
 
     /// Record that a task failed.
     pub fn record_failure(&self, name: &str, duration_ms: u64, error: &str) {
-        let Ok(mut guard) = self.inner.write() else {
-            return;
-        };
-        let Some(task) = guard.get_mut(name) else {
-            return;
-        };
-        task.status = "idle".to_string();
-        let now = chrono::Utc::now().to_rfc3339();
-        task.last_run = Some(now.clone());
-        task.last_fired_at = Some(now);
-        task.last_duration_ms = Some(duration_ms);
-        task.last_result = Some("failed".to_string());
-        task.last_error = Some(error.to_string());
-        task.total_runs += 1;
-        task.total_failures += 1;
+        self.with_task_mut(name, |task| {
+            task.status = "idle".to_string();
+            let now = chrono::Utc::now().to_rfc3339();
+            task.last_run = Some(now.clone());
+            task.last_fired_at = Some(now);
+            task.last_duration_ms = Some(duration_ms);
+            task.last_result = Some("failed".to_string());
+            task.last_error = Some(error.to_string());
+            task.total_runs += 1;
+            task.total_failures += 1;
+        });
     }
 
     /// Get a snapshot of all task statuses.
