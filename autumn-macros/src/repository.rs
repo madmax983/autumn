@@ -706,6 +706,19 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     })
                     .collect();
 
+                // A borrowed (reference) parameter can't be cloned into an owned,
+                // `'static` value for the per-shard fan-out futures (cloning a
+                // `&str` yields a `&str`), so cross-shard fan-out of such a derived
+                // read would not compile. Reject it instead, with guidance to use
+                // an owned parameter type.
+                let has_borrowed_param = method.sig.inputs.iter().any(|arg| {
+                    matches!(
+                        arg,
+                        syn::FnArg::Typed(pat_type)
+                            if matches!(pat_type.ty.as_ref(), syn::Type::Reference(_))
+                    )
+                });
+
                 let body = generate_derived_query(
                     &query,
                     &table_ident,
@@ -724,7 +737,28 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 // reject write-prefix ones (delete). Non-sharded repos keep the
                 // plain body (zero-cost).
                 let is_read_prefix = matches!(query.prefix.as_str(), "find" | "count" | "exists");
-                if config.sharded && config.tenant_scoped && is_read_prefix {
+                if config.sharded && config.tenant_scoped && is_read_prefix && has_borrowed_param {
+                    // Borrowed-param derived read on a sharded repo: can't fan out
+                    // ('static futures need owned params), so reject cross-shard.
+                    let method_name = fn_ident.to_string();
+                    let msg = format!(
+                        "cross-shard {method_name} is not supported: across_tenants() cannot fan \
+                         out a derived query with a borrowed parameter; declare the parameter as \
+                         an owned type (e.g. String) to enable fan-out, or query a specific shard"
+                    );
+                    derived_impl_methods.push(quote! {
+                        async fn #fn_ident(&self, #(#params),*) -> ::autumn_web::AutumnResult<#return_type> {
+                            use ::autumn_web::reexports::diesel::prelude::*;
+                            use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                            if self.across_tenants && self.__autumn_shards.is_some() {
+                                return ::core::result::Result::Err(
+                                    ::autumn_web::AutumnError::bad_request_msg(#msg)
+                                );
+                            }
+                            #body
+                        }
+                    });
+                } else if config.sharded && config.tenant_scoped && is_read_prefix {
                     let one_shard_ident = format_ident!("__autumn_{}_one_shard", fn_ident);
                     let merge = match query.prefix.as_str() {
                         "find" => quote! { __results.into_iter().flatten().collect() },
@@ -10672,6 +10706,31 @@ mod tests {
         assert!(
             generated.contains("__autumn_find_by_title_one_shard"),
             "derived read must fan out via a one-shard helper: {generated}"
+        );
+    }
+
+    #[test]
+    fn sharded_tenant_scoped_derived_read_with_borrowed_param_rejects() {
+        let generated = repository_macro(
+            quote! { Post, tenant_scoped, sharded },
+            quote! {
+                pub trait PostRepository {
+                    async fn find_by_title(&self, title: &str) -> Vec<Post>;
+                }
+            },
+        )
+        .to_string();
+
+        // A borrowed param can't be cloned into an owned 'static value for the
+        // fan-out futures, so it must reject cross-shard rather than emit a
+        // one-shard helper (which would not compile).
+        assert!(
+            !generated.contains("__autumn_find_by_title_one_shard"),
+            "borrowed-param derived read must not fan out: {generated}"
+        );
+        assert!(
+            generated.contains("cross-shard find_by_title is not supported"),
+            "borrowed-param derived read must reject cross-shard: {generated}"
         );
     }
 
