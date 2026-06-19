@@ -1465,6 +1465,90 @@ fn no_shards_configured() -> AutumnError {
     )
 }
 
+/// Build a tenant-free repository seed for cross-shard admin reads.
+///
+/// Unlike [`__autumn_resolve_repo_seed`], this resolves no tenant key. It seeds
+/// from the first configured shard (its primary pool and read route) so the
+/// pre-fan-out connection the trait methods acquire succeeds, then strips the
+/// shard tag from the route label — the fan-out re-tags each per-shard query
+/// with the shard actually executing it (see [`reshard_route_label`]).
+fn cross_shard_seed(
+    set: &ShardSet,
+    ctx: &crate::db::RequestDbContext,
+) -> Result<ShardRepositorySeed, AutumnError> {
+    let shard = set.iter().next().ok_or_else(no_shards_configured)?;
+    let mut seed =
+        ShardRepositorySeed::from_ctx(shard.primary_pool(), ctx, shard.name(), shard.read_route());
+    seed.route.clone_from(&ctx.route_key);
+    Ok(seed)
+}
+
+/// Marks a repository built for tenant-free cross-shard reads.
+///
+/// Implemented by the `#[repository(tenant_scoped, sharded)]` macro and used by
+/// [`CrossShard`] to construct the repository from a [`ShardSet`] without
+/// resolving a tenant. Not intended to be implemented by hand.
+pub trait CrossShardRepository: Sized {
+    /// Construct the repository in `across_tenants()` mode from a tenant-free
+    /// seed and the full shard set.
+    #[doc(hidden)]
+    fn __autumn_from_cross_shard(seed: ShardRepositorySeed, set: ShardSet) -> Self;
+}
+
+/// Axum extractor for tenant-free cross-shard reads on a
+/// `#[repository(tenant_scoped, sharded)]` repository.
+///
+/// Cross-tenant admin endpoints normally have no tenant header or task-local, so
+/// the standard repository extractor — which resolves a tenant to route to a
+/// single shard — rejects them during extraction. `CrossShard<R>` instead loads
+/// the full [`ShardSet`] without a tenant and yields a repository already in
+/// `across_tenants()` mode: reads fan out across every
+/// shard, while writes are rejected (cross-shard writes are unsupported).
+///
+/// ```ignore
+/// async fn admin_list(
+///     CrossShard(repo): CrossShard<PgBookmarkRepository>,
+/// ) -> AutumnResult<Json<Vec<Bookmark>>> {
+///     // fans out across all shards
+///     Ok(Json(repo.find_all().await?))
+/// }
+/// ```
+pub struct CrossShard<R>(pub R);
+
+impl<R> std::ops::Deref for CrossShard<R> {
+    type Target = R;
+    fn deref(&self) -> &R {
+        &self.0
+    }
+}
+
+impl<R> std::ops::DerefMut for CrossShard<R> {
+    fn deref_mut(&mut self) -> &mut R {
+        &mut self.0
+    }
+}
+
+impl<S, R> axum::extract::FromRequestParts<S> for CrossShard<R>
+where
+    S: crate::db::DbState + Send + Sync,
+    R: CrossShardRepository,
+{
+    type Rejection = AutumnError;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        // Load the shard set without resolving a tenant (the whole point), then
+        // seed from it and build the repo in across_tenants() fan-out mode.
+        let shards =
+            <Shards as axum::extract::FromRequestParts<S>>::from_request_parts(parts, state)
+                .await?;
+        let seed = cross_shard_seed(&shards.set, &shards.ctx)?;
+        Ok(Self(R::__autumn_from_cross_shard(seed, shards.set)))
+    }
+}
+
 /// How many shards `each_shard` queries concurrently.
 const FAN_OUT_CONCURRENCY: usize = 8;
 
@@ -2809,6 +2893,31 @@ mod tests {
         assert_eq!(
             reshard_route_label(Some("GET /admin"), "shard2").as_deref(),
             Some("GET /admin shard=shard2"),
+        );
+    }
+
+    #[test]
+    fn cross_shard_seed_is_tenant_free_and_untagged() {
+        // No tenant is resolved; the seed is built straight from the set so an
+        // admin CrossShard<R> extractor can construct the repo without a header.
+        let set = shard_set(&["shard0", "shard1"]);
+        let ctx = crate::db::RequestDbContext {
+            statement_timeout: Some(std::time::Duration::from_millis(1500)),
+            route_key: Some("GET /admin".to_owned()),
+            metrics: None,
+            slow_query_threshold: std::time::Duration::from_millis(250),
+            interceptors: Vec::new(),
+        };
+        let seed = cross_shard_seed(&set, &ctx).expect("seed");
+        // The route carries only the base key — the fan-out re-tags it per
+        // executing shard via reshard_route_label, so it must NOT be pre-tagged
+        // with the seed shard.
+        assert_eq!(seed.route.as_deref(), Some("GET /admin"));
+        assert!(!seed.route.as_deref().unwrap().contains("shard="));
+        assert_eq!(seed.statement_timeout_ms, 1500);
+        assert_eq!(
+            seed.slow_query_threshold,
+            std::time::Duration::from_millis(250)
         );
     }
 

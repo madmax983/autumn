@@ -8744,6 +8744,58 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     };
 
+    // For tenant-scoped sharded repos, implement `CrossShardRepository` so the
+    // `CrossShard<Self>` extractor can build an across_tenants() fan-out repo
+    // for admin endpoints that have no tenant to route on. Mirrors the routed
+    // extractor's field init, but seeds tenant-free (across_tenants: true, no
+    // idempotency context — cross-shard writes are rejected anyway).
+    let cross_shard_repository_impl = if config.sharded && config.tenant_scoped {
+        let register_hooks = if commit_hooks_enabled {
+            quote! { #pg_name::__autumn_register_repository_commit_hooks(); }
+        } else {
+            quote! {}
+        };
+        let hooks_init = config.hooks_type.as_ref().map_or_else(
+            || quote! {},
+            |hooks_ident| quote! {
+                hooks: <#hooks_ident as ::autumn_web::hooks::RepositoryHooksDefault>::autumn_default(),
+            },
+        );
+        let idempotency_init = if commit_hooks_enabled {
+            quote! { idempotency: ::core::option::Option::None, }
+        } else {
+            quote! {}
+        };
+        let cross_read_route = if config.primary_reads {
+            quote! { ::autumn_web::repository::ReadRoute::Primary }
+        } else {
+            quote! { ::core::clone::Clone::clone(&__seed.read_route) }
+        };
+        quote! {
+            impl ::autumn_web::sharding::CrossShardRepository for #pg_name {
+                fn __autumn_from_cross_shard(
+                    __seed: ::autumn_web::sharding::ShardRepositorySeed,
+                    __set: ::autumn_web::sharding::ShardSet,
+                ) -> Self {
+                    #register_hooks
+                    Self {
+                        pool: ::core::clone::Clone::clone(&__seed.pool),
+                        #hooks_init
+                        #idempotency_init
+                        across_tenants: true,
+                        __autumn_shards: ::core::option::Option::Some(__set),
+                        __autumn_read_route: #cross_read_route,
+                        __autumn_statement_timeout_ms: __seed.statement_timeout_ms,
+                        __autumn_slow_threshold: __seed.slow_query_threshold,
+                        __autumn_route: ::core::clone::Clone::clone(&__seed.route),
+                    }
+                }
+            }
+        }
+    } else {
+        quote! {}
+    };
+
     quote! {
         /// Generated repository trait with CRUD + derived queries.
         #vis trait #trait_name: Send + Sync {
@@ -8772,6 +8824,8 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
 
         #from_request_parts_impl
+
+        #cross_shard_repository_impl
 
         #clone_impl
 
