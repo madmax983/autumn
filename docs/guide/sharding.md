@@ -390,11 +390,13 @@ autumn shard move-slot --from shard0 --to shard1 \
 ```
 
 It copies every column (so references to a moved row stay valid), verifies row
-counts and a `to_jsonb` content checksum on both shards, and only deletes from
-the source with `--confirm`. Like the example, it never edits routing — and the
-same hash-slot caveat applies: to move a single tenant, pin it with the
-`DirectoryShardRouter` rather than remapping a shared slot. Requires the `psql`
-client on `PATH`.
+counts and a `to_jsonb` content checksum on both shards, advances the
+destination's PK sequence after a verified copy (configurable with
+`--id-column`, default `id`) so the next insert there won't collide with a
+copied id, and only deletes from the source with `--confirm`. Like the example,
+it never edits routing — and the same hash-slot caveat applies: to move a single
+tenant, pin it with the `DirectoryShardRouter` rather than remapping a shared
+slot. Requires the `psql` client on `PATH`.
 
 ## Testing
 

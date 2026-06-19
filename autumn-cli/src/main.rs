@@ -666,14 +666,14 @@ enum ShardSubcommand {
     /// Resolves --from / --to by their `[[database.shards]]` names (honoring
     /// --profile and env, like `autumn migrate`), copies the rows, verifies
     /// counts + a content checksum, and deletes the source rows only with
-    /// --confirm. It never edits the slot map — copy & verify, cut the slot
-    /// over in autumn.toml, then re-run with --confirm to delete.
+    /// --confirm. It never edits routing — copy & verify, re-route the tenant
+    /// (pin it in the directory router), then re-run with --confirm to delete.
     ///
     /// # Example
     ///
     ///   autumn shard move-slot --from shard0 --to shard1 \
     ///     --table bookmarks --tenant acme
-    ///   # …flip acme's slot to shard1 in autumn.toml, deploy, then:
+    ///   # …pin acme to shard1 (directory router), deploy, then:
     ///   autumn shard move-slot --from shard0 --to shard1 \
     ///     --table bookmarks --tenant acme --confirm
     #[command(verbatim_doc_comment)]
@@ -690,6 +690,11 @@ enum ShardSubcommand {
         /// Column holding the tenant/routing key. Default: `tenant_id`.
         #[arg(long, value_name = "COLUMN", default_value = "tenant_id")]
         key_column: String,
+        /// Primary-key column whose `BIGSERIAL`/identity sequence is advanced on
+        /// the destination after the copy (PK values are copied as-is).
+        /// Default: `id`.
+        #[arg(long, value_name = "COLUMN", default_value = "id")]
+        id_column: String,
         /// Tenant key to move (repeat for several).
         #[arg(long = "tenant", value_name = "KEY", required = true)]
         tenants: Vec<String>,
@@ -1430,6 +1435,7 @@ fn run_command(command: Commands) {
                 to,
                 table,
                 key_column,
+                id_column,
                 tenants,
                 confirm,
                 profile,
@@ -1438,6 +1444,7 @@ fn run_command(command: Commands) {
                 to,
                 table,
                 key_column,
+                id_column,
                 tenants,
                 confirm,
                 profile,
