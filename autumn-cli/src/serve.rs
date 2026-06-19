@@ -622,8 +622,17 @@ fn stop_timeout(opts: &ServeOptions, recorded_release: bool) -> Duration {
         .as_deref()
         .and_then(crate::dev::find_manifest_dir)
         .unwrap_or_else(|| std::path::PathBuf::from("."));
-    let profile = env_profile().or_else(|| recorded_release.then(|| "prod".to_owned()));
-    let (prestop, shutdown) = resolve_shutdown_budget(&base_dir, profile.as_deref());
+    // With no explicit profile env, the daemon still ran a profile via the app's
+    // build-mode detection — `prod` for a release build, else `dev` — so mirror
+    // it to pick up `[profile.<name>]`/`autumn-<profile>.toml` shutdown settings.
+    let profile = env_profile().unwrap_or_else(|| {
+        if recorded_release {
+            "prod".to_owned()
+        } else {
+            "dev".to_owned()
+        }
+    });
+    let (prestop, shutdown) = resolve_shutdown_budget(&base_dir, Some(&profile));
     Duration::from_secs(prestop + shutdown) + STOP_GRACE_BUFFER
 }
 

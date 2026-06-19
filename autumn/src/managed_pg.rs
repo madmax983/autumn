@@ -80,6 +80,16 @@ pub(crate) fn emergency_stop() {
     }
 }
 
+/// Async variant of [`emergency_stop`] for boot-failure paths that run *inside*
+/// the async runtime (e.g. a socket-bind failure after the cluster started),
+/// where [`emergency_stop`]'s nested blocking runtime would panic.
+pub(crate) async fn emergency_stop_async() {
+    let provider = EMERGENCY_PROVIDER.lock().ok().and_then(|g| g.clone());
+    if let Some(provider) = provider {
+        provider.stop().await;
+    }
+}
+
 /// The managed-Postgres primary URL resolved at boot, if a managed provider has
 /// started its cluster this process. Used by the migration runner.
 #[must_use]
@@ -268,6 +278,15 @@ impl ManagedPostgresPoolProvider {
         {
             tracing::warn!(error = %e, "failed to stop managed Postgres cleanly");
         }
+        // Clear the process-global publications so a later app in the same
+        // process (integration tests) doesn't run migrations against this
+        // now-stopped cluster's URL or try to emergency-stop a dead handle.
+        if let Ok(mut g) = RESOLVED_PRIMARY_URL.lock() {
+            *g = None;
+        }
+        if let Ok(mut g) = EMERGENCY_PROVIDER.lock() {
+            *g = None;
+        }
     }
 }
 
@@ -297,6 +316,20 @@ impl DatabasePoolProvider for ManagedPostgresPoolProvider {
         managed.primary_url = Some(url);
         managed.url = None;
         create_pool(&managed)
+    }
+
+    async fn create_topology(
+        &self,
+        config: &DatabaseConfig,
+    ) -> Result<Option<crate::db::DatabaseTopology>, PoolError> {
+        // The managed cluster is a single local primary. Ignore any external
+        // `replica_url` from the original config so reads don't silently hit an
+        // unrelated/stale replica while writes and migrations go to the managed
+        // primary; the default impl would build that replica pool.
+        let Some(primary) = self.create_pool(config).await? else {
+            return Ok(None);
+        };
+        Ok(Some(crate::db::DatabaseTopology::from_pools(primary, None)))
     }
 }
 

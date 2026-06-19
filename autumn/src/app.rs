@@ -2968,12 +2968,21 @@ impl AppBuilder {
                 let path = std::path::Path::new(socket_path);
                 if let Err(e) = prepare_unix_socket_path(path) {
                     tracing::error!(socket = %socket_path, "Failed to prepare unix socket: {e}");
+                    // `setup_database` already started the managed Postgres child;
+                    // `process::exit` skips `on_shutdown`, so stop it first.
+                    #[cfg(feature = "managed-pg")]
+                    crate::managed_pg::emergency_stop_async().await;
                     std::process::exit(1);
                 }
-                let listener = tokio::net::UnixListener::bind(path).unwrap_or_else(|e| {
-                    tracing::error!(socket = %socket_path, "Failed to bind unix socket: {e}");
-                    std::process::exit(1);
-                });
+                let listener = match tokio::net::UnixListener::bind(path) {
+                    Ok(listener) => listener,
+                    Err(e) => {
+                        tracing::error!(socket = %socket_path, "Failed to bind unix socket: {e}");
+                        #[cfg(feature = "managed-pg")]
+                        crate::managed_pg::emergency_stop_async().await;
+                        std::process::exit(1);
+                    }
+                };
                 // Local-daemon socket: owner-only access.
                 if let Err(e) =
                     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
@@ -2996,12 +3005,17 @@ impl AppBuilder {
             }
         } else {
             let addr = format!("{}:{}", config.server.host, config.server.port);
-            let listener = tokio::net::TcpListener::bind(&addr)
-                .await
-                .unwrap_or_else(|e| {
+            let listener = match tokio::net::TcpListener::bind(&addr).await {
+                Ok(listener) => listener,
+                Err(e) => {
                     tracing::error!(addr = %addr, "Failed to bind: {e}");
+                    // Stop the managed Postgres child started by `setup_database`
+                    // before bailing; `process::exit` skips `on_shutdown`.
+                    #[cfg(feature = "managed-pg")]
+                    crate::managed_pg::emergency_stop_async().await;
                     std::process::exit(1);
-                });
+                }
+            };
             (BoundListener::Tcp(listener), addr, None)
         };
 
