@@ -6087,17 +6087,10 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     // §1d: cross-shard write guard.  When `sharded + tenant_scoped`, writes
     // that arrive with `across_tenants = true` AND `__autumn_shards.is_some()`
     // cannot be safely fanned-out (no cross-shard transaction semantics), so we
-    // return a clear error instead of silently hitting only one shard.
-    let (
-        save_body,
-        update_body,
-        delete_body,
-        save_many_body,
-        save_many_skip_invalid_body,
-        update_many_body,
-        delete_many_body,
-    ) = if config.sharded && config.tenant_scoped {
-        let write_guard = quote! {
+    // return a clear error instead of silently hitting only one shard. Shared
+    // by the core write bodies below and the `upsert_many` body further down.
+    let cross_shard_write_guard = if config.sharded && config.tenant_scoped {
+        quote! {
             if self.across_tenants {
                 if self.__autumn_shards.is_some() {
                     return ::core::result::Result::Err(
@@ -6109,7 +6102,21 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     );
                 }
             }
-        };
+        }
+    } else {
+        quote! {}
+    };
+
+    let (
+        save_body,
+        update_body,
+        delete_body,
+        save_many_body,
+        save_many_skip_invalid_body,
+        update_many_body,
+        delete_many_body,
+    ) = if config.sharded && config.tenant_scoped {
+        let write_guard = &cross_shard_write_guard;
         (
             quote! { #write_guard #save_body },
             quote! { #write_guard #update_body },
@@ -7626,9 +7633,21 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         let __sub = self.__autumn_for_shard(__shard);
                         async move { __sub.__autumn_find_by_id_one_shard(id).await }
                     }).await?;
-                    return ::core::result::Result::Ok(
-                        __found.into_iter().flatten().next()
-                    );
+                    // Ids are unique only within a shard: with per-shard
+                    // sequences two shards can hold the same id, so a match on
+                    // more than one shard is ambiguous. Reject rather than
+                    // silently returning whichever shard sorts first (#1d).
+                    let mut __hits = __found.into_iter().flatten();
+                    let __first = __hits.next();
+                    if __hits.next().is_some() {
+                        return ::core::result::Result::Err(
+                            ::autumn_web::AutumnError::internal_server_error_msg(
+                                "ambiguous cross-shard find_by_id: id matched rows on \
+                                 multiple shards; query a specific shard instead"
+                            )
+                        );
+                    }
+                    return ::core::result::Result::Ok(__first);
                 }
             }
             #base
@@ -7811,6 +7830,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             where
                 #model_name: ::autumn_web::reexports::diesel::Insertable<#table_ident::table>
             {
+                #cross_shard_write_guard
                 #upsert_many_body
             }
         }
