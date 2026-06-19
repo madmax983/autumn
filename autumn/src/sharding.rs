@@ -1732,7 +1732,7 @@ impl ShardRepositorySeed {
 ///
 /// Keeps per-shard DB metrics and slow-query logs attributed to the shard that
 /// actually runs the query rather than the originally-routed shard. The parent
-/// label is `"<key> shard=<orig>"` (see [`ShardRepositorySeed::from_ctx`]); this
+/// label is `"<key> shard=<orig>"` (see `ShardRepositorySeed::from_ctx`); this
 /// swaps the `shard=` tag for `shard_name` while preserving the base route key.
 /// Returns `None` when the parent had no label (no `MatchedPath`), so unlabelled
 /// repos stay unlabelled.

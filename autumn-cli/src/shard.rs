@@ -27,6 +27,19 @@
 //! destination. Only remap a hash slot when you have copied **every** key in
 //! that slot.
 //!
+//! **Requires source quiescence.** The named tenant key(s) must be read-only on
+//! the *source* shard — no inserts, updates, or **deletes** — from before step 1
+//! (the initial copy) until step 3 (the post-cutover delete). Verification only
+//! checks that the destination *contains* every current source row, so it
+//! tolerates rows written to the destination after the re-route. It cannot,
+//! however, tell a legitimate post-route write apart from a row that the dry-run
+//! copied and that was then deleted on the source mid-move: both look like "on
+//! the destination, not on the source", because the dry-run copy set is not
+//! persisted between runs. Without source quiescence such a delete is silently
+//! resurrected on the destination after cutover. Put the moved tenant into a
+//! read-only / "moving" state before copying (gating writes at the directory
+//! pin is a natural place) and keep it there until the move completes.
+//!
 //! Row movement uses `psql`'s `\copy` over a pipe (the same "shell out to the
 //! standard Postgres tool" approach `autumn migrate` takes with `diesel`).
 
@@ -68,6 +81,13 @@ pub fn run_move_slot(args: &MoveSlotArgs) {
         args.table,
         args.from,
         args.to
+    );
+    eprintln!(
+        "\u{26A0}\u{FE0F}  These tenant(s) MUST be quiesced (read-only) on source shard {:?} for the\n  \
+         whole move — from this copy until the post-cutover delete. A delete on the\n  \
+         source mid-move is otherwise resurrected on {:?} after cutover. See the\n  \
+         `move-slot` module runbook.",
+        args.from, args.to
     );
 
     // ── 1. Snapshot source and destination ────────────────────────────────
