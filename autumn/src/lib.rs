@@ -119,6 +119,8 @@ pub mod probe;
 pub mod system_info;
 pub use plugin::{Plugin, Plugins};
 
+pub use primitives::Primitive;
+
 pub mod route_listing;
 
 #[cfg(feature = "db")]
@@ -1068,3 +1070,4 @@ mod tests {
         let _builder = builder.routes(vec![]);
     }
 }
+pub mod primitives;

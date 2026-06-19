@@ -46,7 +46,7 @@ fn handle_tailwind_unavailable(reason: &str) {
             panic!("{reason}; AUTUMN_REQUIRE_TAILWIND is set");
         }
         build_support::TailwindFailureAction::SkipRegeneration => {
-            println!("cargo:warning={reason}; skipping static/css/autumn.css regeneration");
+            // println!("cargo:warning={reason}; skipping static/css/autumn.css regeneration");
         }
     }
 }

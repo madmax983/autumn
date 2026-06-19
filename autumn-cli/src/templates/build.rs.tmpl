@@ -25,11 +25,8 @@ fn main() {
             panic!("Tailwind CSS compilation failed");
         }
     } else {
-        // Output a warning ONLY if this is not part of a documentation build
-        // or a test where we don't care about CSS.
-        // Usually, `autumn dev` will complain if it is actually required.
-        // As per DX audit, removing the warning or making it quieter is better,
-        // we'll just not emit a warning for missing tailwind when it's optional.
+        // Tailwind CSS CLI not found.
+        // It is optional, so we do not emit a cargo warning.
     }
 }
 
@@ -45,7 +42,6 @@ fn find_tailwind_cli() -> Option<std::path::PathBuf> {
         return Some(path);
     }
 
-    // 3. Return None to treat this as optional.
     None
 }
 
