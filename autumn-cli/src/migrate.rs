@@ -577,14 +577,16 @@ pub fn effective_profile(explicit: Option<&str>) -> Option<String> {
         .filter(|v| !v.trim().is_empty())
 }
 
-/// Profile name spellings to look up `[profile.<name>]` sections under,
-/// mirroring `autumn_web::config::profile_lookup_names` so `prod`/`production`
-/// and `dev`/`development` are treated as aliases.
-fn profile_lookup_names(profile: &str) -> Vec<&str> {
-    match profile.trim() {
-        "prod" | "production" => vec!["production", "prod"],
-        "dev" | "development" => vec!["development", "dev"],
-        other => vec![other],
+/// Profile name spellings (in precedence order) to probe for both inline
+/// `[profile.<name>]` sections and `autumn-<name>.toml` overlay files, mirroring
+/// `autumn_web::config`'s alias handling so `prod`/`production` and
+/// `dev`/`development` are interchangeable. Matching is case-insensitive; custom
+/// profile names are used verbatim.
+fn profile_lookup_names(profile: &str) -> Vec<String> {
+    match profile.trim().to_ascii_lowercase().as_str() {
+        "prod" | "production" => vec!["production".to_owned(), "prod".to_owned()],
+        "dev" | "development" => vec!["development".to_owned(), "dev".to_owned()],
+        _ => vec![profile.trim().to_owned()],
     }
 }
 
@@ -623,7 +625,13 @@ fn read_autumn_toml_table_with_profile_in(
         return base;
     };
 
-    let overlay = read_table(&dir.join(format!("autumn-{profile}.toml")));
+    // Probe overlay files across canonical alias spellings (e.g. the operator
+    // sets `AUTUMN_ENV=production` but the file is the common `autumn-prod.toml`)
+    // and load the first that exists, mirroring the runtime loader's lookup.
+    let lookup_names = profile_lookup_names(profile);
+    let overlay = lookup_names
+        .iter()
+        .find_map(|name| read_table(&dir.join(format!("autumn-{name}.toml"))));
     if base.is_none() && overlay.is_none() {
         return None;
     }
@@ -633,7 +641,7 @@ fn read_autumn_toml_table_with_profile_in(
     // the base, matching the runtime loader's precedence. Co-located profile
     // config (e.g. `[profile.prod.database]`) must be honored, not just a
     // separate `autumn-<profile>.toml` file.
-    for name in profile_lookup_names(profile) {
+    for name in &lookup_names {
         if let Some(inline) = merged
             .get("profile")
             .and_then(toml::Value::as_table)
@@ -2208,6 +2216,31 @@ primary_url = "postgres://prod-s0:5432/app"
         assert_eq!(
             resolve_primary_database_url_from_sources(no_env, Some(&base)).as_deref(),
             Some("postgres://base-control:5432/app")
+        );
+    }
+
+    #[test]
+    fn overlay_file_resolved_via_profile_alias() {
+        // Operator selects `production`, but the overlay file uses the common
+        // `autumn-prod.toml` spelling — the alias must still resolve it, just
+        // like the runtime loader.
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join("autumn.toml"),
+            "[database]\nprimary_url = \"postgres://base:5432/app\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("autumn-prod.toml"),
+            "[database]\nprimary_url = \"postgres://prod:5432/app\"\n",
+        )
+        .unwrap();
+
+        let merged =
+            read_autumn_toml_table_with_profile_in(tmp.path(), Some("production")).unwrap();
+        assert_eq!(
+            resolve_primary_database_url_from_sources(no_env, Some(&merged)).as_deref(),
+            Some("postgres://prod:5432/app")
         );
     }
 
