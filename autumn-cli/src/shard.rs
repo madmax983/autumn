@@ -77,12 +77,12 @@ pub fn run_move_slot(args: &MoveSlotArgs) {
     // duplicate PKs) and go straight to delete.
     eprintln!("\u{2192} Checking source\u{2026}");
     let src_count = psql_scalar(&from_url, &count_sql(&args.table, &filter));
-    // Source ids captured atomically with their content fingerprints, so a
-    // later `--confirm` deletes exactly the rows that were verified copied —
-    // never a row written to the source after this snapshot (which gets a fresh
-    // id, even if a per-shard sequence reuses an id value present on the
-    // destination).
-    let mut verified_src_ids: Vec<String> = Vec::new();
+    // Source rows captured as `md5(row)|id` snapshot entries, so a later
+    // `--confirm` deletes exactly the rows that were verified copied — never a
+    // row written to the source after this snapshot (a fresh id is absent from
+    // the snapshot) and never a row whose content changed in the cutover window
+    // (its current md5 no longer matches the staged entry).
+    let mut verified_src_entries: Vec<String> = Vec::new();
     if src_count == "0" {
         eprintln!("\u{26A0}\u{FE0F}  No rows found on source shard for the given tenant(s).");
     } else {
@@ -92,8 +92,9 @@ pub fn run_move_slot(args: &MoveSlotArgs) {
         // destination a superset of the source; a `--confirm` re-run must then
         // skip the copy (re-inserting copied PKs would abort) and proceed to
         // delete the snapshotted source rows.
-        let (src_ids, src_fp) = source_snapshot(&from_url, &args.table, &args.id_column, &filter);
-        verified_src_ids = src_ids;
+        let (src_entries, src_fp) =
+            source_snapshot(&from_url, &args.table, &args.id_column, &filter);
+        verified_src_entries = src_entries;
         let dst_fp = row_fingerprints(&to_url, &args.table, &filter);
         if dest_contains_source(&src_fp, &dst_fp) {
             eprintln!(
@@ -161,7 +162,7 @@ pub fn run_move_slot(args: &MoveSlotArgs) {
         &args.table,
         &args.id_column,
         &filter,
-        &verified_src_ids,
+        &verified_src_entries,
     );
     eprintln!(
         "\u{2713} Done. Source rows removed; shard {:?} now owns these tenant(s).\n  \
@@ -172,33 +173,35 @@ pub fn run_move_slot(args: &MoveSlotArgs) {
     );
 }
 
-/// Delete from the source only the rows in `ids` — the source snapshot whose
-/// content was just verified present on the destination — rather than
-/// everything matching the filter.
+/// Delete from the source only the rows in `entries` — the `md5(row)|id` source
+/// snapshot whose content was just verified present on the destination — rather
+/// than everything matching the filter.
 ///
-/// A row written to the source after the snapshot (e.g. a straggler write
-/// during the cutover window) is not in `ids`, so it is preserved; this holds
-/// even if a per-shard sequence handed that row an id value that also exists on
-/// the destination, because `ids` come from the source snapshot, not the
-/// destination. A *changed* (not added) snapshot row is caught earlier by the
-/// verification, which fails the move before deletion.
+/// A row written to the source after the snapshot (e.g. a straggler write during
+/// the cutover window) is not in `entries`, so it is preserved; this holds even
+/// if a per-shard sequence handed that row an id value that also exists on the
+/// destination, because `entries` come from the source snapshot, not the
+/// destination. A snapshot row *updated* in the cutover window is likewise
+/// preserved: the delete matches on the live row's reconstructed `md5(row)|id`,
+/// which no longer equals the staged entry once its content changed — so its
+/// uncopied new contents are never dropped.
 fn delete_source_rows_by_id(
     from_url: &str,
     table: &str,
     id_column: &str,
     filter: &str,
-    ids: &[String],
+    entries: &[String],
 ) {
     use std::io::Write as _;
 
-    if ids.is_empty() {
+    if entries.is_empty() {
         eprintln!("  No verified source rows for these tenant(s); nothing deleted.");
         return;
     }
-    // Stream the ids into a temp table over stdin and delete by joining against
-    // it, all in one transaction. This avoids building one giant `ARRAY[...]`
-    // delete that could blow the OS argv / statement-size limit for a large
-    // tenant, and keeps the cleanup atomic.
+    // Stream the snapshot entries into a temp table over stdin and delete by
+    // joining against it, all in one transaction. This avoids building one giant
+    // `ARRAY[...]` delete that could blow the OS argv / statement-size limit for
+    // a large tenant, and keeps the cleanup atomic.
     let delete = delete_by_staged_ids_sql(table, id_column, filter);
     let mut child = Command::new("psql")
         .args([
@@ -219,11 +222,11 @@ fn delete_source_rows_by_id(
 
     {
         let mut stdin = child.stdin.take().expect("piped stdin");
-        for id in ids {
-            // ids come from id::text (bigint/uuid/plain text); one per line for
-            // the single-column `\copy ... FROM STDIN`.
-            writeln!(stdin, "{id}")
-                .unwrap_or_else(|e| fail(&format!("failed to stream ids to psql: {e}")));
+        for entry in entries {
+            // Each entry is `md5(row)|id::text` from the snapshot; one per line
+            // for the single-column `\copy ... FROM STDIN`.
+            writeln!(stdin, "{entry}")
+                .unwrap_or_else(|e| fail(&format!("failed to stream entries to psql: {e}")));
         }
     }
 
@@ -482,33 +485,40 @@ fn source_snapshot_sql(table: &str, id_column: &str, filter: &str) -> String {
     format!("SELECT md5(to_jsonb(t)::text) || '|' || {qcol}::text FROM {qt} t WHERE {filter}")
 }
 
-/// Capture the filtered source rows' `(ids, fingerprints)` in one query so the
-/// two describe exactly the same snapshot — the ids are what `--confirm` will
-/// delete, the fingerprints are what verification checks against the destination.
+/// Capture the filtered source rows as `(entries, fingerprints)` in one query so
+/// the two describe exactly the same snapshot. Each `entry` is the raw
+/// `md5(row)|id` line: it is what `--confirm` deletes against — the delete
+/// reconstructs `md5(row)|id` from each *live* source row and only removes rows
+/// whose current content still matches a snapshot entry, so a source row updated
+/// in the cutover window (same id, new md5) is preserved rather than dropped with
+/// its uncopied contents. The `fingerprints` are the `md5(row)` halves, which
+/// verification checks against the destination.
 fn source_snapshot(
     url: &str,
     table: &str,
     id_column: &str,
     filter: &str,
 ) -> (Vec<String>, Vec<String>) {
-    let lines = psql_lines(url, &source_snapshot_sql(table, id_column, filter));
-    let mut ids = Vec::with_capacity(lines.len());
-    let mut fps = Vec::with_capacity(lines.len());
-    for line in &lines {
-        // md5 (32 hex, no `|`) is first, so split on the first `|`.
-        if let Some((fp, id)) = line.split_once('|') {
-            fps.push(fp.to_owned());
-            ids.push(id.to_owned());
-        }
-    }
-    (ids, fps)
+    let entries = psql_lines(url, &source_snapshot_sql(table, id_column, filter));
+    // md5 (32 hex, no `|`) is first, so the first `|` separates it from the id;
+    // the id half may itself contain `|`, which is fine — the delete matches the
+    // whole entry string, and verification only needs the md5 prefix here.
+    let fps = entries
+        .iter()
+        .filter_map(|line| line.split_once('|').map(|(fp, _)| fp.to_owned()))
+        .collect();
+    (entries, fps)
 }
 
-/// SQL builders for the staged-id delete: ids are streamed into a temp table
-/// (no `ARRAY[...]` argv/SQL-size limit for large tenants) and the delete joins
-/// against it. The temp table holds the verified source-snapshot ids.
+/// SQL builders for the staged-snapshot delete: the verified source-snapshot
+/// entries (`md5(row)|id` lines) are streamed into a temp table (no `ARRAY[...]`
+/// argv/SQL-size limit for large tenants) and the delete joins against it. The
+/// delete reconstructs `md5(row)|id` from each live source row and removes only
+/// rows whose *current* content still matches a staged entry — so a row updated
+/// in the cutover window (same id, different md5) is left in place, not dropped
+/// with contents that were never copied to the destination.
 const fn stage_ids_create_sql() -> &'static str {
-    "CREATE TEMP TABLE __autumn_del_ids (id text)"
+    "CREATE TEMP TABLE __autumn_del_ids (entry text)"
 }
 
 const fn stage_ids_copy_in_sql() -> &'static str {
@@ -518,7 +528,15 @@ const fn stage_ids_copy_in_sql() -> &'static str {
 fn delete_by_staged_ids_sql(table: &str, id_column: &str, filter: &str) -> String {
     let qt = quote_identifier(table);
     let qcol = quote_identifier(id_column);
-    format!("DELETE FROM {qt} WHERE {filter} AND {qcol}::text IN (SELECT id FROM __autumn_del_ids)")
+    // Reconstruct the same `md5(row)|id` string the snapshot captured and match
+    // it against the staged entries: only rows whose current content (md5) and
+    // id both still match are deleted. The alias `t` mirrors the snapshot query
+    // so `to_jsonb(t)` sees the identical column set/order.
+    format!(
+        "DELETE FROM {qt} t WHERE {filter} AND EXISTS (\
+         SELECT 1 FROM __autumn_del_ids d \
+         WHERE d.entry = md5(to_jsonb(t)::text) || '|' || t.{qcol}::text)"
+    )
 }
 
 /// Whether `dst` contains every fingerprint in `src`, counting multiplicity —
@@ -616,8 +634,9 @@ mod tests {
         );
         assert_eq!(
             delete_by_staged_ids_sql("bookmarks", "id", &f),
-            "DELETE FROM \"bookmarks\" WHERE \"tenant_id\"::text = ANY(ARRAY['acme']::text[]) \
-             AND \"id\"::text IN (SELECT id FROM __autumn_del_ids)"
+            "DELETE FROM \"bookmarks\" t WHERE \"tenant_id\"::text = ANY(ARRAY['acme']::text[]) \
+             AND EXISTS (SELECT 1 FROM __autumn_del_ids d \
+             WHERE d.entry = md5(to_jsonb(t)::text) || '|' || t.\"id\"::text)"
         );
         assert!(
             copy_out_sql("bookmarks", &f).starts_with("\\copy (SELECT * FROM \"bookmarks\" WHERE")

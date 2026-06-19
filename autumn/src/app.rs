@@ -5208,10 +5208,15 @@ async fn setup_database(
     // The tenant→shard directory table is a CONTROL-plane table: create it at
     // startup only when directory routing is enabled (and shards exist), and
     // only on the control target — not via the shared list above, which is also
-    // applied to every shard.
-    let directory_migration_required = (directory_shard_router
-        || config.database.directory_shard_router)
-        && config.database.has_shards();
+    // applied to every shard. Like the other runtime framework migrations, it is
+    // suppressed during a static build (`autumn build`, AUTUMN_BUILD_STATIC=1):
+    // the build only renders assets and must not touch the database, so it must
+    // not create `_autumn_shard_directory`.
+    let directory_migration_required = directory_migration_is_required(
+        directory_shard_router || config.database.directory_shard_router,
+        config.database.has_shards(),
+        hook_queue_migration_mode,
+    );
     let check_replica_migrations = !migrations.is_empty();
     let topology = match pool_provider {
         Some(factory) => factory(config.database.clone()).await,
@@ -5440,6 +5445,23 @@ const REPOSITORY_COMMIT_HOOK_QUEUE_MIGRATION: &str =
 
 #[cfg(feature = "db")]
 const VERSION_HISTORY_MIGRATION: &str = "20260526000000_create_version_history";
+
+/// Whether startup should create the control-plane `_autumn_shard_directory`
+/// table. It is required only when directory routing is enabled AND shards are
+/// configured AND we are in a real runtime boot — never during a static build
+/// (`autumn build`, `AUTUMN_BUILD_STATIC=1`), which renders assets and must not
+/// touch the database, mirroring how the other runtime framework migrations are
+/// suppressed in [`migrations_with_repository_framework_migrations`].
+#[cfg(feature = "db")]
+const fn directory_migration_is_required(
+    directory_routing_enabled: bool,
+    has_shards: bool,
+    mode: RepositoryCommitHookQueueMigrationMode,
+) -> bool {
+    directory_routing_enabled
+        && has_shards
+        && matches!(mode, RepositoryCommitHookQueueMigrationMode::Runtime)
+}
 
 #[cfg(feature = "db")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -7039,6 +7061,23 @@ mod tests {
             migrations.is_empty(),
             "static/export builds that pass no migrations must not mutate the database"
         );
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn directory_migration_required_only_at_runtime_with_shards_and_routing() {
+        use RepositoryCommitHookQueueMigrationMode::{Runtime, StaticBuild};
+
+        // The happy path: routing on, shards present, real runtime boot.
+        assert!(directory_migration_is_required(true, true, Runtime));
+
+        // A static build must never create the directory table, even with
+        // routing enabled and shards configured.
+        assert!(!directory_migration_is_required(true, true, StaticBuild));
+
+        // Routing disabled, or no shards, means no directory table at all.
+        assert!(!directory_migration_is_required(false, true, Runtime));
+        assert!(!directory_migration_is_required(true, false, Runtime));
     }
 
     #[cfg(feature = "db")]

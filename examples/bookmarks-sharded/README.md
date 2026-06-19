@@ -97,10 +97,14 @@ curl -s http://localhost:3000/actuator/metrics | jq '.database_shards'
 
 Shard 0 is configured with a streaming read replica
 (`postgres-shard-0-replica`); `autumn-docker.toml` sets its `replica_url`.
-Each shard is a full primary/replica topology, so `ShardedReadDb` (and the
-SELECT routing built into `ShardedDb`) reads shard-0 from the replica while
-writes stay on the primary — shard 1, which has no replica, transparently
-reads from its own primary. Confirm replication is live:
+Each shard is a full primary/replica topology. To actually read from the
+replica, use a replica-aware accessor: the `ShardedReadDb` extractor, or a
+`#[repository(tenant_scoped, sharded)]` repo whose read route resolves to the
+replica (also reachable via `Shards::read_for`). Plain `ShardedDb` always checks
+out the shard **primary** — it does not route SELECTs to the replica — so use it
+for writes (and read-your-writes), and `ShardedReadDb` for replica-backed reads.
+Either way, shard 1, which has no replica, transparently reads from its own
+primary. Confirm replication is live:
 
 ```bash
 # Replica is in recovery (streaming from the primary):
