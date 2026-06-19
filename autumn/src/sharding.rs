@@ -183,6 +183,24 @@ pub trait ShardRouter: Send + Sync + 'static {
     ) -> futures::future::BoxFuture<'a, Result<ShardId, AutumnError>>;
 }
 
+/// `Arc<R>` routes through its inner router. This lets a caller build a single
+/// `Arc<DirectoryShardRouter>`, share one clone with
+/// [`DirectoryShardRouter::spawn_invalidation_listener`] (which takes an
+/// `Arc<Self>`) and install another clone via `AppBuilder::with_shard_router` —
+/// both then read and invalidate the **same** cache. Without it the
+/// manually-installed router
+/// and the listener would hold separate caches, so directory re-pins would stay
+/// stale until the TTL despite the documented manual-listener path.
+impl<R: ShardRouter + ?Sized> ShardRouter for Arc<R> {
+    fn route<'a>(
+        &'a self,
+        key: ShardKey<'a>,
+        shards: &'a ShardSet,
+    ) -> futures::future::BoxFuture<'a, Result<ShardId, AutumnError>> {
+        (**self).route(key, shards)
+    }
+}
+
 /// Default router: key → logical slot (deterministic hash) → shard
 /// (configured slot map).
 #[derive(Debug, Default, Clone, Copy)]
@@ -2321,6 +2339,26 @@ mod tests {
             // Same key always lands on the same shard.
             assert_eq!(set.route(key).await.expect("route").id(), routed.id());
         }
+    }
+
+    #[tokio::test]
+    async fn arc_shard_router_delegates_to_inner() {
+        // `Arc<R>: ShardRouter` is what lets a custom DirectoryShardRouter be
+        // shared between routing (`with_shard_router`) and its invalidation
+        // listener (`spawn_invalidation_listener`, which needs `Arc<Self>`).
+        // Install one through a ShardSet and confirm routing flows to the inner
+        // router rather than failing the trait bound.
+        let config = sharded_config(&["a", "b"]);
+        let set = create_shard_set(&config, Arc::new(Arc::new(HashShardRouter)))
+            .expect("build")
+            .expect("configured");
+        let first = set.route("tenant-42").await.expect("route");
+        let again = set.route("tenant-42").await.expect("route");
+        assert_eq!(
+            first.id(),
+            again.id(),
+            "Arc<R> routes deterministically through its inner router"
+        );
     }
 
     #[tokio::test]

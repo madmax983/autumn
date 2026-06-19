@@ -338,10 +338,27 @@ Postgres delivers `NOTIFY` at commit, the eviction lands the moment the new
 mapping becomes visible — a re-pin during a slot move takes effect immediately,
 well before the cache TTL (default 30s) would expire it, and a slow-committing
 transaction can't be missed. The TTL remains the backstop if the control DB /
-LISTEN connection is briefly unreachable. (Building your own
-`DirectoryShardRouter` and installing it via `with_shard_router` instead? Call
-`DirectoryShardRouter::spawn_invalidation_listener(..)` yourself, or rely on
-the TTL.)
+LISTEN connection is briefly unreachable.
+
+Building your own `DirectoryShardRouter` and installing it via
+`with_shard_router` instead? Wrap it in an `Arc` **once** and share clones, so
+the listener and the installed router invalidate the *same* cache
+(`Arc<DirectoryShardRouter>` implements `ShardRouter`):
+
+```rust
+let router = std::sync::Arc::new(DirectoryShardRouter::new(control_pool));
+// Listener and router share one cache:
+DirectoryShardRouter::spawn_invalidation_listener(
+    std::sync::Arc::clone(&router),
+    control_url,
+    sweep_interval,
+);
+app.with_shard_router(std::sync::Arc::clone(&router));
+```
+
+Spawning the listener on a *separate* `DirectoryShardRouter` only invalidates
+that instance's cache, leaving the installed router's routing stale until the
+TTL. If you skip the listener entirely, the TTL is your only refresh.
 
 The directory is the routing complement to the slot-move runbook below: move
 the data, pin the tenant to its new shard, and unpinned tenants keep hashing
