@@ -1291,14 +1291,7 @@ fn push_hook_id_component(hasher: &mut sha2::Sha256, label: &str, value: &[u8]) 
 }
 
 fn hex_lower(bytes: impl AsRef<[u8]>) -> String {
-    bytes.as_ref().iter().fold(
-        String::with_capacity(bytes.as_ref().len() * 2),
-        |mut out, byte| {
-            use std::fmt::Write as _;
-            let _ = write!(out, "{byte:02x}");
-            out
-        },
-    )
+    hex::encode(bytes)
 }
 
 fn repository_commit_hook_worker_id() -> String {
