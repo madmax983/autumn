@@ -161,20 +161,45 @@ pub fn run_move_slot(args: &MoveSlotArgs) {
         return;
     }
     eprintln!("\u{2192} Deleting rows from source (--confirm)\u{2026}");
-    run_psql(
-        &from_url,
-        &[
-            "--single-transaction",
-            "-c",
-            &delete_sql(&args.table, &filter),
-        ],
-    );
+    delete_verified_source_rows(&from_url, &to_url, &args.table, &args.id_column, &filter);
     eprintln!(
         "\u{2713} Done. Source rows removed; shard {:?} now owns these tenant(s).\n  \
          Confirm routing sends them to {:?}: pin each tenant in the directory\n  \
          router, or (hash routing only) ensure every key in the moved slot was\n  \
          copied — a shared slot must move as a whole or co-tenants lose data.",
         args.to, args.to
+    );
+}
+
+/// Delete from the source only the rows actually present (verified) on the
+/// destination — its current ids for these keys — rather than everything
+/// matching the filter.
+///
+/// A row written to the source after the copy (e.g. a straggler write during
+/// the cutover window) has no destination row, so a blanket delete would drop
+/// it permanently; scoping to verified ids leaves such rows on the source. This
+/// still assumes the moved keys are otherwise quiesced on the source (writes
+/// re-routed to the destination) — a *changed* (not just added) row is caught
+/// by the verification before this point, which fails the move before deletion.
+fn delete_verified_source_rows(
+    from_url: &str,
+    to_url: &str,
+    table: &str,
+    id_column: &str,
+    filter: &str,
+) {
+    let verified_ids = psql_lines(to_url, &select_ids_sql(table, id_column, filter));
+    if verified_ids.is_empty() {
+        eprintln!("  No verified destination rows for these tenant(s); nothing deleted.");
+        return;
+    }
+    run_psql(
+        from_url,
+        &[
+            "--single-transaction",
+            "-c",
+            &delete_verified_sql(table, id_column, filter, &verified_ids),
+        ],
     );
 }
 
@@ -286,11 +311,6 @@ fn staging_insert_sql(table: &str) -> String {
     format!("INSERT INTO {qt} SELECT * FROM {STAGING_TABLE} ON CONFLICT DO NOTHING")
 }
 
-fn delete_sql(table: &str, filter: &str) -> String {
-    let qt = quote_identifier(table);
-    format!("DELETE FROM {qt} WHERE {filter}")
-}
-
 /// Advance `table`'s owned sequence for `id_column` to its current max, so the
 /// next insert on the destination shard doesn't collide with a copied PK.
 ///
@@ -372,18 +392,49 @@ fn psql_scalar(url: &str, sql: &str) -> String {
     String::from_utf8_lossy(&out.stdout).trim().to_owned()
 }
 
+/// Run a one-shot `psql -At -c <sql>` and return one `String` per output row
+/// (empty when there are no rows).
+fn psql_lines(url: &str, sql: &str) -> Vec<String> {
+    let out = psql_scalar(url, sql);
+    if out.is_empty() {
+        return Vec::new();
+    }
+    out.lines().map(str::to_owned).collect()
+}
+
 /// Per-row content fingerprints (one `md5(to_jsonb(row))` per matching row,
 /// sorted) for the filtered set. Used to recognize a destination that is a
 /// *superset* of the source so a post-route `--confirm` re-run skips the copy
 /// instead of aborting on already-copied primary keys.
 fn row_fingerprints(url: &str, table: &str, filter: &str) -> Vec<String> {
     let qt = quote_identifier(table);
-    let sql = format!("SELECT md5(to_jsonb(t)::text) FROM {qt} t WHERE {filter} ORDER BY 1");
-    let out = psql_scalar(url, &sql);
-    if out.is_empty() {
-        return Vec::new();
-    }
-    out.lines().map(str::to_owned).collect()
+    psql_lines(
+        url,
+        &format!("SELECT md5(to_jsonb(t)::text) FROM {qt} t WHERE {filter} ORDER BY 1"),
+    )
+}
+
+/// `SELECT id::text` for the filtered rows on a shard, as text so any id type
+/// (bigint, uuid, …) round-trips. Used to scope the source delete to exactly
+/// the rows present (verified) on the destination.
+fn select_ids_sql(table: &str, id_column: &str, filter: &str) -> String {
+    let qt = quote_identifier(table);
+    let qcol = quote_identifier(id_column);
+    format!("SELECT {qcol}::text FROM {qt} WHERE {filter}")
+}
+
+/// `DELETE` for the filtered rows whose id is in `ids` — i.e. only the rows
+/// confirmed present on the destination, so a source-only row written during
+/// the confirm window is never dropped.
+fn delete_verified_sql(table: &str, id_column: &str, filter: &str, ids: &[String]) -> String {
+    let qt = quote_identifier(table);
+    let qcol = quote_identifier(id_column);
+    let list = ids
+        .iter()
+        .map(|i| format!("'{}'", i.replace('\'', "''")))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("DELETE FROM {qt} WHERE {filter} AND {qcol}::text = ANY(ARRAY[{list}]::text[])")
 }
 
 /// Whether `dst` contains every fingerprint in `src`, counting multiplicity —
@@ -475,8 +526,13 @@ mod tests {
             "SELECT count(*) FROM \"bookmarks\" WHERE \"tenant_id\"::text = ANY(ARRAY['acme']::text[])"
         );
         assert_eq!(
-            delete_sql("bookmarks", &f),
-            "DELETE FROM \"bookmarks\" WHERE \"tenant_id\"::text = ANY(ARRAY['acme']::text[])"
+            select_ids_sql("bookmarks", "id", &f),
+            "SELECT \"id\"::text FROM \"bookmarks\" WHERE \"tenant_id\"::text = ANY(ARRAY['acme']::text[])"
+        );
+        assert_eq!(
+            delete_verified_sql("bookmarks", "id", &f, &["1".to_owned(), "2".to_owned()]),
+            "DELETE FROM \"bookmarks\" WHERE \"tenant_id\"::text = ANY(ARRAY['acme']::text[]) \
+             AND \"id\"::text = ANY(ARRAY['1', '2']::text[])"
         );
         assert!(
             copy_out_sql("bookmarks", &f).starts_with("\\copy (SELECT * FROM \"bookmarks\" WHERE")

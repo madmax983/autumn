@@ -858,9 +858,10 @@ impl ShardSet {
     /// Concurrency is bounded at [`FAN_OUT_CONCURRENCY`] so a cross-tenant admin
     /// read does not check out a connection from every shard at once (which
     /// could spike load or exhaust connection limits on large fleets), matching
-    /// the public [`Shards::each_shard`] pipeline. Results are returned in
-    /// completion order; callers merge them order-independently (concat / sum /
-    /// any). Fails the whole call on the first shard error.
+    /// the public [`Shards::each_shard`] pipeline. Results are returned in shard
+    /// **declaration order** (not completion order), so order-dependent merges
+    /// such as `search`'s per-shard ranking concatenation are deterministic.
+    /// Fails the whole call on the first shard error.
     ///
     /// This is a framework-internal primitive used by generated repository
     /// code.  It is `pub` so that downstream crates can call it from
@@ -875,22 +876,29 @@ impl ShardSet {
     {
         use futures::StreamExt as _;
 
-        let mut results: Vec<T> = Vec::with_capacity(self.inner.shards.len());
-        let mut in_flight: futures::stream::FuturesUnordered<Fut> =
-            futures::stream::FuturesUnordered::new();
+        // Results are placed by shard index so declaration order is preserved
+        // even though `FuturesUnordered` yields them in completion order.
+        let mut slots: Vec<Option<T>> = (0..self.inner.shards.len()).map(|_| None).collect();
+        let mut in_flight = futures::stream::FuturesUnordered::new();
 
-        for shard in &self.inner.shards {
+        for (idx, shard) in self.inner.shards.iter().enumerate() {
             if in_flight.len() >= FAN_OUT_CONCURRENCY
-                && let Some(result) = in_flight.next().await
+                && let Some((i, result)) = in_flight.next().await
             {
-                results.push(result?);
+                slots[i] = Some(result?);
             }
-            in_flight.push(f(shard));
+            let fut = f(shard);
+            in_flight.push(async move { (idx, fut.await) });
         }
-        while let Some(result) = in_flight.next().await {
-            results.push(result?);
+        while let Some((i, result)) = in_flight.next().await {
+            slots[i] = Some(result?);
         }
-        Ok(results)
+        // Every shard pushed exactly one future and all were drained above, so
+        // on the success path every slot is filled.
+        Ok(slots
+            .into_iter()
+            .map(|slot| slot.expect("every shard produced a result"))
+            .collect())
     }
 }
 
