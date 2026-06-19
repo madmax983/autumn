@@ -746,6 +746,9 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                             use ::autumn_web::reexports::diesel_async::RunQueryDsl;
                             if self.across_tenants {
                                 if let ::core::option::Option::Some(ref __shards) = self.__autumn_shards {
+                                    // Params are cloned once per shard (the fan-out closure is
+                                    // `Fn`); allow it for `Copy` params too (e.g. an i64 filter).
+                                    #[allow(clippy::clone_on_copy)]
                                     let __results = __shards.fan_out_shards(|__shard| {
                                         let __sub = self.__autumn_for_shard(__shard);
                                         #(let #param_idents = ::core::clone::Clone::clone(&#param_idents);)*
