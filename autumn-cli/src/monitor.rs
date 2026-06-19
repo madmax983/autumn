@@ -1432,6 +1432,248 @@ mod tests {
     use std::thread;
 
     #[test]
+    fn test_poll_handles_health_error_500() {
+        let listener =
+            TcpListener::bind("127.0.0.1:0").expect("failed extracting response component");
+        let port = listener
+            .local_addr()
+            .expect("failed extracting response component")
+            .port();
+        let url = format!("http://127.0.0.1:{port}");
+
+        thread::spawn(move || {
+            for stream in listener.incoming().take(1) {
+                let mut stream = stream.expect("failed extracting response component");
+                let mut reader = BufReader::new(&mut stream);
+                let mut req_line = String::new();
+                if reader.read_line(&mut req_line).is_err() || req_line.is_empty() {
+                    continue;
+                }
+                loop {
+                    let mut header_line = String::new();
+                    if reader.read_line(&mut header_line).is_err()
+                        || header_line == "\r\n"
+                        || header_line.trim().is_empty()
+                    {
+                        break;
+                    }
+                }
+                let body = "{\"status\":\"down\"}";
+                let response = format!(
+                    "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+
+        let mut state = DashboardState::new(url);
+        state.poll();
+        assert!(state.connected);
+        assert!(state.last_error.is_some());
+        assert!(state.last_error.unwrap().contains("500"));
+    }
+
+    #[test]
+    fn test_poll_handles_health_error_503() {
+        let listener =
+            TcpListener::bind("127.0.0.1:0").expect("failed extracting response component");
+        let port = listener
+            .local_addr()
+            .expect("failed extracting response component")
+            .port();
+        let url = format!("http://127.0.0.1:{port}");
+
+        thread::spawn(move || {
+            for stream in listener.incoming().take(1) {
+                let mut stream = stream.expect("failed extracting response component");
+                let mut reader = BufReader::new(&mut stream);
+                let mut req_line = String::new();
+                if reader.read_line(&mut req_line).is_err() || req_line.is_empty() {
+                    continue;
+                }
+                loop {
+                    let mut header_line = String::new();
+                    if reader.read_line(&mut header_line).is_err()
+                        || header_line == "\r\n"
+                        || header_line.trim().is_empty()
+                    {
+                        break;
+                    }
+                }
+                let body = "{\"status\":\"degraded\",\"version\":\"1.0\",\"profile\":\"prod\",\"uptime\":\"0\"}";
+                let response = format!(
+                    "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+
+        let mut state = DashboardState::new(url);
+        state.poll();
+        assert!(state.connected);
+        assert!(state.last_error.is_none());
+        assert_eq!(state.health.status, "degraded");
+    }
+
+    #[test]
+    fn test_fetch_metrics_records_throughput() {
+        let listener =
+            TcpListener::bind("127.0.0.1:0").expect("failed extracting response component");
+        let port = listener
+            .local_addr()
+            .expect("failed extracting response component")
+            .port();
+        let url = format!("http://127.0.0.1:{port}");
+
+        thread::spawn(move || {
+            for stream in listener.incoming().take(1) {
+                let mut stream = stream.expect("failed extracting response component");
+                let mut reader = BufReader::new(&mut stream);
+                let mut req_line = String::new();
+                if reader.read_line(&mut req_line).is_err() || req_line.is_empty() {
+                    continue;
+                }
+                loop {
+                    let mut header_line = String::new();
+                    if reader.read_line(&mut header_line).is_err()
+                        || header_line == "\r\n"
+                        || header_line.trim().is_empty()
+                    {
+                        break;
+                    }
+                }
+                let body = "{\"http\":{\"requests_total\":42,\"requests_active\":0,\"latency_ms\":{\"p50\":0,\"p95\":0,\"p99\":0},\"by_route\":{},\"by_status\":{\"s2xx\":0,\"s3xx\":0,\"s4xx\":0,\"s5xx\":0}}}";
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+
+        let mut state = DashboardState::new(url);
+        state.prev_requests_total = 10;
+        state.throughput_history.clear(); // Ensure it's empty
+
+        let client = reqwest::blocking::Client::new();
+        state.fetch_metrics(&client);
+
+        assert_eq!(state.throughput_history.len(), 1);
+        assert_eq!(state.throughput_history[0], 32); // 42 - 10
+    }
+
+    #[test]
+    fn test_fetch_metrics_ignores_first_fetch_throughput() {
+        let listener =
+            TcpListener::bind("127.0.0.1:0").expect("failed extracting response component");
+        let port = listener
+            .local_addr()
+            .expect("failed extracting response component")
+            .port();
+        let url = format!("http://127.0.0.1:{port}");
+
+        thread::spawn(move || {
+            for stream in listener.incoming().take(1) {
+                let mut stream = stream.expect("failed extracting response component");
+                let mut reader = BufReader::new(&mut stream);
+                let mut req_line = String::new();
+                if reader.read_line(&mut req_line).is_err() || req_line.is_empty() {
+                    continue;
+                }
+                loop {
+                    let mut header_line = String::new();
+                    if reader.read_line(&mut header_line).is_err()
+                        || header_line == "\r\n"
+                        || header_line.trim().is_empty()
+                    {
+                        break;
+                    }
+                }
+                let body = "{\"http\":{\"requests_total\":42,\"requests_active\":0,\"latency_ms\":{\"p50\":0,\"p95\":0,\"p99\":0},\"by_route\":{},\"by_status\":{\"s2xx\":0,\"s3xx\":0,\"s4xx\":0,\"s5xx\":0}}}";
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+
+        let mut state = DashboardState::new(url);
+        state.prev_requests_total = 0;
+        state.throughput_history.clear(); // Ensure it's empty
+
+        let client = reqwest::blocking::Client::new();
+        state.fetch_metrics(&client);
+
+        assert!(state.throughput_history.is_empty());
+    }
+
+    #[test]
+    fn test_fetch_metrics_caps_history_at_sparkline_depth() {
+        let listener =
+            TcpListener::bind("127.0.0.1:0").expect("failed extracting response component");
+        let port = listener
+            .local_addr()
+            .expect("failed extracting response component")
+            .port();
+        let url = format!("http://127.0.0.1:{port}");
+
+        thread::spawn(move || {
+            for stream in listener.incoming().take(1) {
+                let mut stream = stream.expect("failed extracting response component");
+                let mut reader = BufReader::new(&mut stream);
+                let mut req_line = String::new();
+                if reader.read_line(&mut req_line).is_err() || req_line.is_empty() {
+                    continue;
+                }
+                loop {
+                    let mut header_line = String::new();
+                    if reader.read_line(&mut header_line).is_err()
+                        || header_line == "\r\n"
+                        || header_line.trim().is_empty()
+                    {
+                        break;
+                    }
+                }
+                let body = "{\"http\":{\"requests_total\":42,\"requests_active\":0,\"latency_ms\":{\"p50\":0,\"p95\":0,\"p99\":0},\"by_route\":{},\"by_status\":{\"s2xx\":0,\"s3xx\":0,\"s4xx\":0,\"s5xx\":0}}}";
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+
+        let mut state = DashboardState::new(url);
+        state.prev_requests_total = 10;
+
+        // Fill history to exactly SPARKLINE_DEPTH
+        for i in 0..SPARKLINE_DEPTH {
+            state.throughput_history.push_back(i as u64);
+            state.latency_p50_history.push_back(i as u64);
+            state.latency_p99_history.push_back(i as u64);
+        }
+
+        let client = reqwest::blocking::Client::new();
+        state.fetch_metrics(&client);
+
+        assert_eq!(state.throughput_history.len(), SPARKLINE_DEPTH);
+        // The first element should have been popped
+        assert_eq!(state.throughput_history[0], 1);
+        // The new element should be at the end
+        assert_eq!(*state.throughput_history.back().unwrap(), 32);
+
+        // Same for latency
+        assert_eq!(state.latency_p50_history.len(), SPARKLINE_DEPTH);
+        assert_eq!(state.latency_p50_history[0], 1);
+
+        assert_eq!(state.latency_p99_history.len(), SPARKLINE_DEPTH);
+        assert_eq!(state.latency_p99_history[0], 1);
+    }
+
+    #[test]
     fn test_poll_updates_state() {
         // Start a mock server
         let listener =
