@@ -48,7 +48,14 @@ pub struct ShardedTenantPost {
     tenant_scoped,
     sharded
 )]
-pub trait ShardedTenantPostRepository {}
+pub trait ShardedTenantPostRepository {
+    // Derived read: must fan out across shards under `across_tenants()` (a
+    // generated `__autumn_find_by_title_one_shard` helper). Compiling this
+    // exercises the per-shard fan-out codegen for user-declared read methods.
+    async fn find_by_title(&self, title: String) -> Vec<ShardedTenantPost>;
+    // Derived write: must reject under cross-shard `across_tenants()`.
+    async fn delete_by_title(&self, title: String);
+}
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 

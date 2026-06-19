@@ -614,21 +614,22 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     // Parse derived query methods from trait body
     let mut derived_trait_methods = Vec::new();
     let mut derived_impl_methods = Vec::new();
+    // §1d: per-shard helpers for derived read methods that fan out under
+    // across_tenants. Emitted into the inherent impl (a trait impl cannot hold
+    // non-trait members), so kept in a separate list.
+    let mut derived_one_shard_helpers = Vec::new();
 
-    // §1d: cross-shard derived-query guard. `across_tenants()` only fans out the
-    // framework's own reads (find_all/count/exists_by_id/find_by_id). A
-    // user-declared derived method run under across_tenants on a sharded repo
-    // would otherwise silently hit only the originally-routed shard, so reject
-    // it with a clear error instead. Empty (zero-cost) unless sharded.
-    let derived_cross_shard_guard = if config.sharded && config.tenant_scoped {
+    // §1d: cross-shard reject for derived *write* methods (delete_by_*). Writes
+    // cannot be fanned out (no cross-shard transaction), so reject under
+    // across_tenants on a sharded repo instead of silently hitting one shard.
+    // Empty (zero-cost) unless sharded.
+    let derived_cross_shard_write_guard = if config.sharded && config.tenant_scoped {
         quote! {
             if self.across_tenants && self.__autumn_shards.is_some() {
                 return ::core::result::Result::Err(
                     ::autumn_web::AutumnError::bad_request_msg(
-                        "cross-shard derived queries are not supported: across_tenants() on a \
-                         sharded repository fans out only find_all/count/exists_by_id/find_by_id; \
-                         use a specific-shard repository (e.g. PgRepo::from_shard) for other \
-                         derived methods"
+                        "cross-shard derived writes are not supported: across_tenants() cannot be \
+                         used for mutation on a sharded repository"
                     )
                 );
             }
@@ -689,6 +690,22 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
                 let params = &user_params;
 
+                // Bare parameter names, for forwarding to the per-shard helper.
+                let param_idents: Vec<Ident> = method
+                    .sig
+                    .inputs
+                    .iter()
+                    .filter_map(|arg| {
+                        let syn::FnArg::Typed(pat_type) = arg else {
+                            return None;
+                        };
+                        let syn::Pat::Ident(pat_ident) = pat_type.pat.as_ref() else {
+                            return None;
+                        };
+                        Some(pat_ident.ident.clone())
+                    })
+                    .collect();
+
                 let body = generate_derived_query(
                     &query,
                     &table_ident,
@@ -702,14 +719,54 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     fn #fn_ident(&self, #(#params),*) -> impl ::std::future::Future<Output = ::autumn_web::AutumnResult<#return_type>> + Send;
                 });
 
-                derived_impl_methods.push(quote! {
-                    async fn #fn_ident(&self, #(#params),*) -> ::autumn_web::AutumnResult<#return_type> {
-                        use ::autumn_web::reexports::diesel::prelude::*;
-                        use ::autumn_web::reexports::diesel_async::RunQueryDsl;
-                        #derived_cross_shard_guard
-                        #body
-                    }
-                });
+                // §1d: under across_tenants on a sharded repo, fan out read-prefix
+                // derived methods (find/count/exists) across all shards and merge;
+                // reject write-prefix ones (delete). Non-sharded repos keep the
+                // plain body (zero-cost).
+                let is_read_prefix = matches!(query.prefix.as_str(), "find" | "count" | "exists");
+                if config.sharded && config.tenant_scoped && is_read_prefix {
+                    let one_shard_ident = format_ident!("__autumn_{}_one_shard", fn_ident);
+                    let merge = match query.prefix.as_str() {
+                        "find" => quote! { __results.into_iter().flatten().collect() },
+                        "count" => quote! { __results.into_iter().sum() },
+                        // "exists"
+                        _ => quote! { __results.into_iter().any(|__b| __b) },
+                    };
+                    derived_one_shard_helpers.push(quote! {
+                        #[doc(hidden)]
+                        async fn #one_shard_ident(&self, #(#params),*) -> ::autumn_web::AutumnResult<#return_type> {
+                            use ::autumn_web::reexports::diesel::prelude::*;
+                            use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                            #body
+                        }
+                    });
+                    derived_impl_methods.push(quote! {
+                        async fn #fn_ident(&self, #(#params),*) -> ::autumn_web::AutumnResult<#return_type> {
+                            use ::autumn_web::reexports::diesel::prelude::*;
+                            use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                            if self.across_tenants {
+                                if let ::core::option::Option::Some(ref __shards) = self.__autumn_shards {
+                                    let __results = __shards.fan_out_shards(|__shard| {
+                                        let __sub = self.__autumn_for_shard(__shard);
+                                        #(let #param_idents = ::core::clone::Clone::clone(&#param_idents);)*
+                                        async move { __sub.#one_shard_ident(#(#param_idents),*).await }
+                                    }).await?;
+                                    return ::core::result::Result::Ok(#merge);
+                                }
+                            }
+                            #body
+                        }
+                    });
+                } else {
+                    derived_impl_methods.push(quote! {
+                        async fn #fn_ident(&self, #(#params),*) -> ::autumn_web::AutumnResult<#return_type> {
+                            use ::autumn_web::reexports::diesel::prelude::*;
+                            use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                            #derived_cross_shard_write_guard
+                            #body
+                        }
+                    });
+                }
             }
         }
     }
@@ -8492,6 +8549,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             #find_by_id_one_shard_helper
             #count_one_shard_helper
             #exists_by_id_one_shard_helper
+            #(#derived_one_shard_helpers)*
             #with_pool_method
             #hook_support_methods
 
@@ -10327,7 +10385,7 @@ mod tests {
     }
 
     #[test]
-    fn sharded_tenant_scoped_derived_methods_reject_cross_shard() {
+    fn sharded_tenant_scoped_derived_read_fans_out() {
         let generated = repository_macro(
             quote! { Post, tenant_scoped, sharded },
             quote! {
@@ -10338,9 +10396,29 @@ mod tests {
         )
         .to_string();
 
+        // A derived read fans out via a generated one-shard helper rather than
+        // hitting only the originally-routed shard.
         assert!(
-            generated.contains("cross-shard derived queries are not supported"),
-            "derived methods on a sharded across_tenants repo must reject cross-shard: {generated}"
+            generated.contains("__autumn_find_by_title_one_shard"),
+            "derived read must fan out via a one-shard helper: {generated}"
+        );
+    }
+
+    #[test]
+    fn sharded_tenant_scoped_derived_write_rejects_cross_shard() {
+        let generated = repository_macro(
+            quote! { Post, tenant_scoped, sharded },
+            quote! {
+                pub trait PostRepository {
+                    async fn delete_by_title(&self, title: String);
+                }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("cross-shard derived writes are not supported"),
+            "derived write on a sharded across_tenants repo must reject: {generated}"
         );
     }
 
