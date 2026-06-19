@@ -5203,6 +5203,8 @@ async fn setup_database(
         migrations,
         crate::repository_commit_hooks::has_repository_commit_hook_descriptors(),
         crate::version_history::has_versioned_repository_descriptors(),
+        (directory_shard_router || config.database.directory_shard_router)
+            && config.database.has_shards(),
         hook_queue_migration_mode,
     );
     let check_replica_migrations = !migrations.is_empty();
@@ -5399,6 +5401,9 @@ const REPOSITORY_COMMIT_HOOK_QUEUE_MIGRATION: &str =
 const VERSION_HISTORY_MIGRATION: &str = "20260526000000_create_version_history";
 
 #[cfg(feature = "db")]
+const SHARD_DIRECTORY_MIGRATION: &str = "20260612000000_create_shard_directory";
+
+#[cfg(feature = "db")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RepositoryCommitHookQueueMigrationMode {
     Runtime,
@@ -5410,6 +5415,7 @@ fn migrations_with_repository_framework_migrations(
     mut migrations: Vec<crate::migrate::EmbeddedMigrations>,
     hook_queue_required: bool,
     version_history_required: bool,
+    directory_router_required: bool,
     mode: RepositoryCommitHookQueueMigrationMode,
 ) -> Vec<crate::migrate::EmbeddedMigrations> {
     if hook_queue_required
@@ -5423,6 +5429,15 @@ fn migrations_with_repository_framework_migrations(
         && !migration_sets_include(&migrations, VERSION_HISTORY_MIGRATION)
     {
         migrations.push(crate::version_history::VERSION_HISTORY_MIGRATIONS);
+    }
+    // Auto-create the tenant→shard directory table when directory routing is
+    // enabled, so an auto-migrate deployment doesn't hit a missing-relation
+    // error on the first routed request (the control-plane `migrations/` copy
+    // is otherwise only applied by `autumn migrate`).
+    if directory_router_required
+        && !migration_sets_include(&migrations, SHARD_DIRECTORY_MIGRATION)
+    {
+        migrations.push(crate::sharding::SHARD_DIRECTORY_MIGRATIONS);
     }
     migrations
 }
@@ -6874,6 +6889,7 @@ mod tests {
             vec![APP_TEST_MIGRATIONS],
             true,
             false,
+            false,
             RepositoryCommitHookQueueMigrationMode::Runtime,
         );
         let names = migration_names(&migrations);
@@ -6897,6 +6913,7 @@ mod tests {
             Vec::new(),
             true,
             false,
+            false,
             RepositoryCommitHookQueueMigrationMode::Runtime,
         );
         let names = migration_names(&migrations);
@@ -6916,6 +6933,7 @@ mod tests {
             vec![APP_TEST_MIGRATIONS],
             false,
             true,
+            false,
             RepositoryCommitHookQueueMigrationMode::Runtime,
         );
         let names = migration_names(&migrations);
@@ -6939,6 +6957,7 @@ mod tests {
             Vec::new(),
             false,
             true,
+            false,
             RepositoryCommitHookQueueMigrationMode::Runtime,
         );
         let names = migration_names(&migrations);
@@ -6956,6 +6975,7 @@ mod tests {
             Vec::new(),
             true,
             true,
+            false,
             RepositoryCommitHookQueueMigrationMode::StaticBuild,
         );
 
@@ -6972,12 +6992,49 @@ mod tests {
             Vec::new(),
             false,
             false,
+            false,
             RepositoryCommitHookQueueMigrationMode::Runtime,
         );
 
         assert!(
             migrations.is_empty(),
             "unhooked apps should not get durable hook queue migrations for free"
+        );
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn directory_router_apps_include_shard_directory_migration() {
+        let migrations = migrations_with_repository_framework_migrations(
+            Vec::new(),
+            false,
+            false,
+            true,
+            RepositoryCommitHookQueueMigrationMode::Runtime,
+        );
+        let names = migration_names(&migrations);
+
+        assert!(
+            names.iter().any(|name| name == SHARD_DIRECTORY_MIGRATION),
+            "directory-routing apps must auto-register the shard directory migration: {names:?}"
+        );
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn non_directory_apps_do_not_include_shard_directory_migration() {
+        let migrations = migrations_with_repository_framework_migrations(
+            Vec::new(),
+            false,
+            false,
+            false,
+            RepositoryCommitHookQueueMigrationMode::Runtime,
+        );
+        let names = migration_names(&migrations);
+
+        assert!(
+            !names.iter().any(|name| name == SHARD_DIRECTORY_MIGRATION),
+            "apps without directory routing must not auto-register the shard directory migration"
         );
     }
 

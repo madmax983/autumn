@@ -2130,6 +2130,11 @@ impl AutumnConfig {
             "AUTUMN_DATABASE__AUTO_MIGRATE_IN_PRODUCTION",
             &mut self.database.auto_migrate_in_production,
         );
+        parse_env_bool(
+            env,
+            "AUTUMN_DATABASE__DIRECTORY_SHARD_ROUTER",
+            &mut self.database.directory_shard_router,
+        );
         self.apply_shard_env_overrides(env);
     }
 
