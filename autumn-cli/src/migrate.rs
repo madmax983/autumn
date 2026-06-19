@@ -1040,14 +1040,19 @@ fn run_down(
     let migrations_dir = resolve_migrations_dir();
     let dir = Path::new(&migrations_dir);
 
-    // Multi-target rollbacks are fail-fast and applied in order, matching the
-    // forward `migrate run`: each target is reverted before the next is
-    // planned. If a later target fails (a runtime down.sql error, or shards at
-    // divergent migration states), earlier targets are already rolled back —
-    // re-running `down` then plans from each target's current state. To roll a
-    // single database back in isolation, scope the command with --shard /
-    // --control-only. (Missing/empty down.sql is caught by preflight before any
-    // mutation, since all targets share one migrations dir.)
+    // Preflight EVERY target before mutating any of them: build and validate
+    // each target's rollback plan (down.sql present, CONCURRENTLY opt-out) up
+    // front, so a divergent shard whose plan can't be reverted fails before the
+    // control DB (or an earlier shard) has already been rolled back — which
+    // would leave control and shards at different schema versions. Each target
+    // re-validates under its own lock in run_down_target as well.
+    for (label, url) in &targets {
+        preflight_rollback_target(args, url, dir, label);
+    }
+
+    // Targets are reverted in order; each plans + executes under its own
+    // advisory lock. To roll a single database back in isolation, scope the
+    // command with --shard / --control-only.
     //
     // Maintenance mode is a global flag, so enable it at most once (the first
     // time any target actually has work) and disable it after all targets
@@ -1088,6 +1093,67 @@ fn run_down(
     }
 }
 
+/// Validate that every planned rollback migration can be reverted: it must have
+/// an executable `down.sql`, and a `CONCURRENTLY` index revert must opt out of
+/// the per-migration transaction. Prints the offending migrations and exits the
+/// process on failure (before any schema is mutated).
+fn check_rollback_plan_revertable(applied: &[AppliedUserMigration], plan: &[String]) {
+    let missing: Vec<&str> = plan
+        .iter()
+        .filter_map(|version| {
+            let m = applied.iter().find(|m| &m.version == version)?;
+            (!has_revertable_down_sql(m)).then_some(m.name.as_str())
+        })
+        .collect();
+    if !missing.is_empty() {
+        eprintln!(
+            "\u{2717} The following migration(s) have no executable down.sql and cannot be reverted:"
+        );
+        for name in &missing {
+            eprintln!("    \u{2022} {name}");
+        }
+        eprintln!("  Add a down.sql to each migration before running `autumn migrate down`.");
+        std::process::exit(1);
+    }
+
+    let needs_opt_out: Vec<&str> = plan
+        .iter()
+        .filter_map(|version| {
+            let m = applied.iter().find(|m| &m.version == version)?;
+            down_sql_concurrent_without_opt_out(m).then_some(m.name.as_str())
+        })
+        .collect();
+    if !needs_opt_out.is_empty() {
+        eprintln!(
+            "\u{2717} The following migration(s) revert a `CONCURRENTLY` index but do not set \
+             `run_in_transaction = false` and cannot be reverted safely:"
+        );
+        for name in &needs_opt_out {
+            eprintln!("    \u{2022} {name}");
+        }
+        eprintln!(
+            "  `PostgreSQL` rejects `CONCURRENTLY` index operations inside a transaction, so \
+             the revert would fail partway through. Add `run_in_transaction = false` to each \
+             migration's metadata.toml before running `autumn migrate down`."
+        );
+        std::process::exit(1);
+    }
+}
+
+/// Up-front (read-only, no lock) preflight of one target's rollback plan, run
+/// for every target before any is mutated. Exits on a plan that cannot be
+/// reverted, naming the target.
+fn preflight_rollback_target(args: &DownArgs, database_url: &str, dir: &Path, label: &str) {
+    use autumn_web::migrate::applied_user_migrations;
+
+    let applied = applied_user_migrations(database_url, dir).unwrap_or_else(|e| {
+        eprintln!("\u{2717} Could not preflight rollback for {label}: {e}");
+        std::process::exit(1);
+    });
+    let plan = build_rollback_plan(args, &applied);
+    check_rollback_plan_revertable(&applied, &plan);
+}
+
 /// Roll back the planned user migrations on a single target database, under the
 /// migration advisory lock. Returns the number of migrations reverted.
 ///
@@ -1116,56 +1182,9 @@ fn run_down_target(
                 return Ok(plan);
             }
 
-            // Preflight: every planned migration must have an executable
-            // down.sql. Applied-but-missing-locally migrations (dir = None) are
-            // surfaced here by name rather than silently skipped.
-            let missing: Vec<&str> = plan
-                .iter()
-                .filter_map(|version| {
-                    let m = applied.iter().find(|m| &m.version == version)?;
-                    (!has_revertable_down_sql(m)).then_some(m.name.as_str())
-                })
-                .collect();
-            if !missing.is_empty() {
-                eprintln!(
-                    "\u{2717} The following migration(s) have no executable down.sql and cannot be reverted:"
-                );
-                for name in &missing {
-                    eprintln!("    \u{2022} {name}");
-                }
-                eprintln!(
-                    "  Add a down.sql to each migration before running `autumn migrate down`."
-                );
-                std::process::exit(1);
-            }
-
-            // Preflight: a down.sql running `CONCURRENTLY` index ops without
-            // `run_in_transaction = false` will fail inside Diesel's
-            // per-migration transaction. In a multi-step plan that failure lands
-            // after earlier (newer) reverts have already committed, so refuse
-            // the whole plan up front rather than leave a partial rollback.
-            let needs_opt_out: Vec<&str> = plan
-                .iter()
-                .filter_map(|version| {
-                    let m = applied.iter().find(|m| &m.version == version)?;
-                    down_sql_concurrent_without_opt_out(m).then_some(m.name.as_str())
-                })
-                .collect();
-            if !needs_opt_out.is_empty() {
-                eprintln!(
-                    "\u{2717} The following migration(s) revert a `CONCURRENTLY` index but do not set \
-                     `run_in_transaction = false` and cannot be reverted safely:"
-                );
-                for name in &needs_opt_out {
-                    eprintln!("    \u{2022} {name}");
-                }
-                eprintln!(
-                    "  `PostgreSQL` rejects `CONCURRENTLY` index operations inside a transaction, so \
-                     the revert would fail partway through. Add `run_in_transaction = false` to each \
-                     migration's metadata.toml before running `autumn migrate down`."
-                );
-                std::process::exit(1);
-            }
+            // Re-validate under the lock (defense-in-depth against the plan
+            // going stale between the up-front preflight and here).
+            check_rollback_plan_revertable(applied, &plan);
 
             // Preflight passed: enable maintenance mode (if requested and not
             // already enabled for an earlier target) before we mutate schema,

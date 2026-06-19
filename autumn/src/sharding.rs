@@ -384,20 +384,21 @@ impl DirectoryShardRouter {
         })?;
 
         // Bound the lookup so a stuck control query / lock doesn't hang routing.
-        // The raw pooled checkout above does not apply request/global timeouts.
-        if self.statement_timeout_ms > 0 {
-            diesel::sql_query(format!(
-                "SET statement_timeout = {}",
-                self.statement_timeout_ms
+        // Always issued (even for 0 = disabled) because the raw pooled checkout
+        // can return a connection carrying a shorter route-specific timeout set
+        // by a prior `Db`/repository checkout; mirror the normal checkout path,
+        // which always sets `statement_timeout`.
+        diesel::sql_query(format!(
+            "SET statement_timeout = {}",
+            self.statement_timeout_ms
+        ))
+        .execute(&mut conn)
+        .await
+        .map_err(|e| {
+            AutumnError::service_unavailable_msg(format!(
+                "DirectoryShardRouter could not set statement_timeout: {e}"
             ))
-            .execute(&mut conn)
-            .await
-            .map_err(|e| {
-                AutumnError::service_unavailable_msg(format!(
-                    "DirectoryShardRouter could not set statement_timeout: {e}"
-                ))
-            })?;
-        }
+        })?;
 
         let row = diesel::sql_query(
             "SELECT shard_name FROM _autumn_shard_directory WHERE tenant_key = $1",

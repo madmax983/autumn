@@ -201,18 +201,50 @@ fn delete_source_rows_by_id(
     filter: &str,
     ids: &[String],
 ) {
+    use std::io::Write as _;
+
     if ids.is_empty() {
         eprintln!("  No verified source rows for these tenant(s); nothing deleted.");
         return;
     }
-    run_psql(
-        from_url,
-        &[
+    // Stream the ids into a temp table over stdin and delete by joining against
+    // it, all in one transaction. This avoids building one giant `ARRAY[...]`
+    // delete that could blow the OS argv / statement-size limit for a large
+    // tenant, and keeps the cleanup atomic.
+    let delete = delete_by_staged_ids_sql(table, id_column, filter);
+    let mut child = Command::new("psql")
+        .args([
+            from_url,
+            "-v",
+            "ON_ERROR_STOP=1",
             "--single-transaction",
             "-c",
-            &delete_verified_sql(table, id_column, filter, ids),
-        ],
-    );
+            stage_ids_create_sql(),
+            "-c",
+            stage_ids_copy_in_sql(),
+            "-c",
+            &delete,
+        ])
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|e| fail(&format!("failed to start delete psql: {e}")));
+
+    {
+        let mut stdin = child.stdin.take().expect("piped stdin");
+        for id in ids {
+            // ids come from id::text (bigint/uuid/plain text); one per line for
+            // the single-column `\copy ... FROM STDIN`.
+            writeln!(stdin, "{id}")
+                .unwrap_or_else(|e| fail(&format!("failed to stream ids to psql: {e}")));
+        }
+    }
+
+    let status = child
+        .wait()
+        .unwrap_or_else(|e| fail(&format!("delete psql did not finish: {e}")));
+    if !status.success() {
+        fail("source delete failed (see psql output above).");
+    }
 }
 
 /// Resolve a configured shard name to its primary URL.
@@ -458,18 +490,21 @@ fn source_snapshot(
     (ids, fps)
 }
 
-/// `DELETE` for the filtered rows whose id is in `ids` — i.e. only the
-/// snapshotted-and-verified source rows, so a source-only row written after the
-/// snapshot is never dropped.
-fn delete_verified_sql(table: &str, id_column: &str, filter: &str, ids: &[String]) -> String {
+/// SQL builders for the staged-id delete: ids are streamed into a temp table
+/// (no `ARRAY[...]` argv/SQL-size limit for large tenants) and the delete joins
+/// against it. The temp table holds the verified source-snapshot ids.
+const fn stage_ids_create_sql() -> &'static str {
+    "CREATE TEMP TABLE __autumn_del_ids (id text)"
+}
+
+const fn stage_ids_copy_in_sql() -> &'static str {
+    "\\copy __autumn_del_ids FROM STDIN"
+}
+
+fn delete_by_staged_ids_sql(table: &str, id_column: &str, filter: &str) -> String {
     let qt = quote_identifier(table);
     let qcol = quote_identifier(id_column);
-    let list = ids
-        .iter()
-        .map(|i| format!("'{}'", i.replace('\'', "''")))
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!("DELETE FROM {qt} WHERE {filter} AND {qcol}::text = ANY(ARRAY[{list}]::text[])")
+    format!("DELETE FROM {qt} WHERE {filter} AND {qcol}::text IN (SELECT id FROM __autumn_del_ids)")
 }
 
 /// Whether `dst` contains every fingerprint in `src`, counting multiplicity —
@@ -566,9 +601,9 @@ mod tests {
              WHERE \"tenant_id\"::text = ANY(ARRAY['acme']::text[])"
         );
         assert_eq!(
-            delete_verified_sql("bookmarks", "id", &f, &["1".to_owned(), "2".to_owned()]),
+            delete_by_staged_ids_sql("bookmarks", "id", &f),
             "DELETE FROM \"bookmarks\" WHERE \"tenant_id\"::text = ANY(ARRAY['acme']::text[]) \
-             AND \"id\"::text = ANY(ARRAY['1', '2']::text[])"
+             AND \"id\"::text IN (SELECT id FROM __autumn_del_ids)"
         );
         assert!(
             copy_out_sql("bookmarks", &f).starts_with("\\copy (SELECT * FROM \"bookmarks\" WHERE")
