@@ -7166,6 +7166,9 @@ mod tests {
     #[cfg(feature = "db")]
     #[test]
     fn sharded_app_with_full_framework_still_gets_shard_required_sets() {
+        use diesel::migration::{Migration, MigrationSource as _};
+        use diesel::pg::Pg;
+
         // A sharded app that registers the full control FRAMEWORK_MIGRATIONS and
         // also uses commit hooks + versioning. The hook-queue / version-history
         // migrations are present *inside* the control set, but that set is
@@ -7181,8 +7184,6 @@ mod tests {
 
         // The migration names the shard apply loop will actually run: every set
         // that is not the control framework set (which gets stripped on shards).
-        use diesel::migration::{Migration, MigrationSource as _};
-        use diesel::pg::Pg;
         let shard_names: Vec<String> = migrations
             .iter()
             .filter(|set| !migration_set_is_control_framework(set))
