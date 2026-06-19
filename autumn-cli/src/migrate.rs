@@ -1132,11 +1132,18 @@ fn run_down(
     let mut total_reverted = 0usize;
     let multi = targets.len() > 1;
 
-    for (label, url) in &targets {
+    for ((label, url), (_, preflighted_plan)) in targets.iter().zip(plans.iter()) {
         if multi {
             eprintln!("\u{2500}\u{2500} Rolling back {label} \u{2500}\u{2500}");
         }
-        match run_down_target(args, url, dir, with_maintenance, &mut maintenance_enabled) {
+        match run_down_target(
+            args,
+            url,
+            dir,
+            with_maintenance,
+            &mut maintenance_enabled,
+            preflighted_plan,
+        ) {
             Ok(n) => {
                 total_reverted += n;
                 if multi {
@@ -1285,14 +1292,23 @@ fn reject_divergent_rollback_plans(plans: &[(String, Vec<String>)]) {
 /// stale between read and execute (e.g. two concurrent `down` runs).
 /// `maintenance_enabled` is shared across targets so maintenance mode is
 /// enabled at most once, the first time any target has work to do.
+///
+/// `preflighted_plan` is the version list computed for this target during the
+/// up-front (unlocked) preflight, which the cross-target divergence check
+/// verified was uniform across all targets. Under the lock we recompute the plan
+/// and compare: if a concurrent migrate/down changed this target's applied
+/// history since preflight, the plans differ and we abort *before mutating this
+/// target* — otherwise a multi-target rollback could revert a different version
+/// list here than on the targets already rolled back, diverging the fleet.
 fn run_down_target(
     args: &DownArgs,
     database_url: &str,
     dir: &Path,
     with_maintenance: bool,
     maintenance_enabled: &mut bool,
+    preflighted_plan: &[String],
 ) -> Result<usize, autumn_web::migrate::MigrationError> {
-    use autumn_web::migrate::revert_user_migrations_locked;
+    use autumn_web::migrate::{MigrationError, revert_user_migrations_locked};
 
     revert_user_migrations_locked(
         database_url,
@@ -1300,6 +1316,24 @@ fn run_down_target(
         None,
         |applied| {
             let plan = build_rollback_plan(args, applied);
+
+            // Recheck under the lock that this target's plan still matches what
+            // preflight saw (and verified uniform across targets). A concurrent
+            // migrate/down may have changed the applied history in the window
+            // between preflight and acquiring this lock; rolling back a now-
+            // different version list would diverge this target from the ones
+            // already reverted.
+            if plan != preflighted_plan {
+                return Err(MigrationError::Migration(format!(
+                    "rollback plan for this target changed under the lock since preflight \
+                     (a concurrent migrate/down likely altered its applied history). \
+                     Preflighted [{}] but now [{}]. Aborting before mutating this target; \
+                     re-run `autumn migrate down` once migrations are quiesced.",
+                    preflighted_plan.join(", "),
+                    plan.join(", "),
+                )));
+            }
+
             if plan.is_empty() {
                 eprintln!("  \u{2713} Nothing to roll back.");
                 return Ok(plan);
