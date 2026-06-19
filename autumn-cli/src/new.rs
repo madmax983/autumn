@@ -86,10 +86,8 @@ pub fn generate(name: &str, parent_dir: &Path) -> Result<(), NewError> {
     generate_with(name, parent_dir, GenerateOptions::default())
 }
 
-/// Generate a new Autumn project under `parent_dir/name`, honouring `opts`.
-pub fn generate_with(name: &str, parent_dir: &Path, opts: GenerateOptions) -> Result<(), NewError> {
-    validate_name(name)?;
-
+/// Reject unsupported flag combinations before any files are written.
+fn check_option_combination(opts: GenerateOptions) -> Result<(), NewError> {
     // The DB-free daemon starter builds with no database, so a seed binary
     // (which needs `autumn_web::seed::SeedContext` and the `db` feature) cannot
     // compile. Reject the combination rather than scaffolding a broken project.
@@ -101,6 +99,24 @@ pub fn generate_with(name: &str, parent_dir: &Path, opts: GenerateOptions) -> Re
                 .to_owned(),
         ));
     }
+    // A managed-Postgres daemon owns its database URL at runtime (chosen by the
+    // provider); the `autumn seed` CLI is a separate process that only reads
+    // env/config URLs, so it can't reach the managed DB. Reject the combo.
+    if opts.with_bundled_pg && opts.with_seed {
+        return Err(NewError::IncompatibleOptions(
+            "--bundled-pg manages Postgres inside the daemon, so the `autumn \
+             seed` CLI cannot reach its database; --with-seed is not supported \
+             with --bundled-pg. Seed from the app instead (e.g. a startup hook)."
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+/// Generate a new Autumn project under `parent_dir/name`, honouring `opts`.
+pub fn generate_with(name: &str, parent_dir: &Path, opts: GenerateOptions) -> Result<(), NewError> {
+    validate_name(name)?;
+    check_option_combination(opts)?;
 
     let project_dir = parent_dir.join(name);
     if project_dir.exists() {
@@ -722,6 +738,24 @@ mod tests {
         assert!(matches!(err, NewError::IncompatibleOptions(_)));
         // Nothing should be scaffolded on rejection.
         assert!(!tmp.path().join("daemon-seed-app").exists());
+    }
+
+    #[test]
+    fn bundled_pg_with_seed_is_rejected() {
+        let tmp = TempDir::new().unwrap();
+        let err = generate_with(
+            "pg-seed-app",
+            tmp.path(),
+            GenerateOptions {
+                with_bundled_pg: true,
+                with_daemon: true,
+                with_seed: true,
+                ..GenerateOptions::default()
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, NewError::IncompatibleOptions(_)));
+        assert!(!tmp.path().join("pg-seed-app").exists());
     }
 
     #[test]

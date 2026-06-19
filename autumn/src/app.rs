@@ -4754,19 +4754,34 @@ impl
     }
 }
 
-/// Prepare a Unix-socket path for binding: remove a stale socket left by a
+/// Prepare a Unix-socket path for binding: remove a *stale* socket left by a
 /// previous run, but refuse to touch a non-socket file (guards against
-/// clobbering a regular file at a misconfigured path). A missing path is fine.
+/// clobbering a regular file) or a socket with a **live** listener (probed via
+/// `connect`; clobbering it would silently make that service unreachable —
+/// instead we fail like a TCP `EADDRINUSE`). A missing path is fine.
 ///
 /// # Errors
 ///
-/// Returns an error if the path exists and is not a socket, or if removing the
-/// stale socket fails.
+/// Returns an error if the path exists and is not a socket, names a live
+/// listener, or the stale socket cannot be removed.
 #[cfg(unix)]
 fn prepare_unix_socket_path(path: &std::path::Path) -> std::io::Result<()> {
     use std::os::unix::fs::FileTypeExt;
     match std::fs::symlink_metadata(path) {
-        Ok(meta) if meta.file_type().is_socket() => std::fs::remove_file(path),
+        Ok(meta) if meta.file_type().is_socket() => {
+            // A successful connect means another process is listening here.
+            if std::os::unix::net::UnixStream::connect(path).is_ok() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::AddrInUse,
+                    format!(
+                        "refusing to bind unix socket: {} is already in use by a \
+                         live listener",
+                        path.display()
+                    ),
+                ));
+            }
+            std::fs::remove_file(path)
+        }
         Ok(_) => Err(std::io::Error::new(
             std::io::ErrorKind::AlreadyExists,
             format!(
@@ -5374,8 +5389,18 @@ async fn run_startup_migrations(
     shards_configured: bool,
     migrations: Vec<crate::migrate::EmbeddedMigrations>,
 ) {
+    // Managed Postgres has no `primary_url` in config — its URL is resolved at
+    // runtime, so fall back to whatever a managed provider published.
+    #[cfg(feature = "managed-pg")]
+    let managed_fallback = crate::managed_pg::resolved_primary_url();
+    #[cfg(not(feature = "managed-pg"))]
+    let managed_fallback: Option<String> = None;
     let control_url = if control_configured {
-        config.database.effective_primary_url().map(str::to_owned)
+        config
+            .database
+            .effective_primary_url()
+            .map(str::to_owned)
+            .or(managed_fallback)
     } else {
         None
     };
@@ -9768,6 +9793,17 @@ mod unix_socket_tests {
         assert!(path.exists(), "socket file should exist before prepare");
         prepare_unix_socket_path(&path).expect("stale socket should be removed");
         assert!(!path.exists(), "stale socket should be unlinked");
+    }
+
+    #[test]
+    fn prepare_unix_socket_path_refuses_live_socket() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("live.sock");
+        // Keep the listener bound so a connect probe succeeds.
+        let _listener = std::os::unix::net::UnixListener::bind(&path).expect("bind socket");
+        let err = prepare_unix_socket_path(&path).expect_err("must refuse a live socket");
+        assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse);
+        assert!(path.exists(), "live socket must not be removed");
     }
 
     #[test]

@@ -42,6 +42,39 @@ pub const MANAGED_PG_DATA_DIR_ENV: &str = "AUTUMN_MANAGED_PG_DATA_DIR";
 /// How long to allow each `initdb`/`start` step before surfacing a diagnostic.
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// The managed primary URL, published by the provider once the cluster is up so
+/// `run_startup_migrations` can target it (the app's config has no
+/// `primary_url`). Set at most once per process.
+static RESOLVED_PRIMARY_URL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// The managed-Postgres primary URL resolved at boot, if a managed provider has
+/// started its cluster this process. Used by the migration runner.
+#[must_use]
+pub(crate) fn resolved_primary_url() -> Option<String> {
+    RESOLVED_PRIMARY_URL.get().cloned()
+}
+
+/// Generate a random 24-character alphanumeric password for the managed cluster.
+fn generate_password() -> String {
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+    let mut bytes = [0u8; 24];
+    // Fall back to a time-seeded value only if the OS RNG is unavailable; the
+    // password protects a local single-user cluster.
+    if getrandom::getrandom(&mut bytes).is_err() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0u128, |d| d.as_nanos());
+        let seed = nanos.to_le_bytes();
+        for (i, b) in bytes.iter_mut().enumerate() {
+            *b = seed[i % seed.len()];
+        }
+    }
+    bytes
+        .iter()
+        .map(|b| ALPHABET[usize::from(*b) % ALPHABET.len()] as char)
+        .collect()
+}
+
 /// A [`DatabasePoolProvider`] backed by a managed, locally-supervised Postgres.
 ///
 /// `create_pool` runs `initdb` (idempotent), starts the server, ensures the
@@ -106,6 +139,13 @@ impl ManagedPostgresPoolProvider {
         // Persistent cluster tied to the daemon, not a throwaway temp dir.
         settings.temporary = false;
         settings.timeout = Some(STARTUP_TIMEOUT);
+        // Stable superuser credentials: `initdb` bakes the password into the
+        // cluster on first boot only, but `Settings::new()` generates a *fresh*
+        // random password (and a temp password file) every time. Persisting
+        // them next to the data dir keeps later boots able to authenticate.
+        let (password, password_file) = self.stable_credentials();
+        settings.password = password;
+        settings.password_file = password_file;
 
         let mut pg = PostgreSQL::new(settings);
         // `setup` is idempotent: it downloads/extracts and runs `initdb` only
@@ -117,11 +157,50 @@ impl ManagedPostgresPoolProvider {
         }
         let url = pg.settings().url(MANAGED_DB_NAME);
 
+        // Publish the resolved URL so `run_startup_migrations` can target the
+        // managed database (the user's `autumn.toml` has no `primary_url`).
+        let _ = RESOLVED_PRIMARY_URL.set(url.clone());
+
         // Retain the handle so the child keeps running after this returns.
         if let Ok(mut guard) = self.instance.lock() {
             *guard = Some(pg);
         }
         Ok(url)
+    }
+
+    /// Stable superuser password + password-file path persisted alongside the
+    /// cluster (in the data dir's parent, since `initdb` requires an empty data
+    /// dir). Generated once on first boot and reused on every later boot.
+    fn stable_credentials(&self) -> (String, PathBuf) {
+        let parent = self
+            .data_dir
+            .parent()
+            .unwrap_or(&self.data_dir)
+            .to_path_buf();
+        let _ = std::fs::create_dir_all(&parent);
+        let password_file = parent.join(".autumn-pg-superuser");
+
+        if let Ok(existing) = std::fs::read_to_string(&password_file) {
+            let trimmed = existing.trim();
+            if !trimmed.is_empty() {
+                return (trimmed.to_owned(), password_file);
+            }
+        }
+
+        let password = generate_password();
+        // 0600 — the password grants superuser on the local cluster.
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        if let Ok(mut f) = options.open(&password_file) {
+            use std::io::Write;
+            let _ = f.write_all(password.as_bytes());
+        }
+        (password, password_file)
     }
 
     /// Stop the supervised Postgres child. Wire this to the daemon's

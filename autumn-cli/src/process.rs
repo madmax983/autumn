@@ -56,14 +56,68 @@ impl std::fmt::Display for AcquireError {
 
 impl std::error::Error for AcquireError {}
 
-/// Read and parse the PID recorded in a lockfile, if any.
+/// A parsed PID lockfile: the recorded PID plus, when available, the process
+/// start time, used to detect PID reuse after a crash.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PidRecord {
+    /// Recorded process ID.
+    pub pid: u32,
+    /// Process start time captured when the lockfile was written, or `None`
+    /// when the platform can't report it (e.g. non-Linux) or it wasn't stored.
+    pub start_time: Option<u64>,
+}
+
+/// Read and parse a lockfile: `"<pid>"` or `"<pid> <start_time>"`.
 #[must_use]
-pub fn read_pidfile(path: &Path) -> Option<u32> {
-    std::fs::read_to_string(path)
-        .ok()?
-        .trim()
-        .parse::<u32>()
-        .ok()
+pub fn read_pidfile(path: &Path) -> Option<PidRecord> {
+    let contents = std::fs::read_to_string(path).ok()?;
+    let mut parts = contents.split_whitespace();
+    let pid = parts.next()?.parse::<u32>().ok()?;
+    let start_time = parts
+        .next()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|&s| s != 0);
+    Some(PidRecord { pid, start_time })
+}
+
+/// The kernel-reported start time of `pid`, when the platform exposes it.
+///
+/// Linux reads field 22 (`starttime`, jiffies since boot) of
+/// `/proc/<pid>/stat`. Returns `None` elsewhere, where callers fall back to a
+/// PID-only liveness check.
+#[must_use]
+pub fn process_start_time(pid: u32) -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        // Field 2 (`comm`) is parenthesized and may contain spaces/parens, so
+        // split after the last ')'. The remainder begins at field 3 (`state`),
+        // and `starttime` is field 22 → index 19 of the remainder.
+        let rest = stat.rsplit_once(')')?.1;
+        rest.split_whitespace().nth(19)?.parse::<u64>().ok()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
+/// Whether a recorded lockfile owner is still our live daemon.
+///
+/// Requires the PID to be alive AND — when both the recorded and current start
+/// times are known — that they match, so a PID reused by an unrelated process
+/// after a crash is treated as stale rather than "our daemon".
+#[must_use]
+pub fn is_record_alive(record: &PidRecord) -> bool {
+    if !is_process_alive(record.pid) {
+        return false;
+    }
+    match (record.start_time, process_start_time(record.pid)) {
+        (Some(recorded), Some(current)) => recorded == current,
+        // Unknown on either side: best-effort liveness only.
+        _ => true,
+    }
 }
 
 /// Atomically acquire the PID lockfile for `pid`, reclaiming a stale lock left
@@ -89,14 +143,17 @@ pub fn acquire_pidfile(path: &Path, pid: u32) -> Result<(), AcquireError> {
         {
             Ok(mut file) => {
                 use std::io::Write;
+                // Record `<pid> <start_time>` so a later reader can reject a
+                // reused PID (0 = start time unknown on this platform).
+                let start = process_start_time(pid).unwrap_or(0);
                 return file
-                    .write_all(format!("{pid}\n").as_bytes())
+                    .write_all(format!("{pid} {start}\n").as_bytes())
                     .map_err(AcquireError::Io);
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                 let recorded = read_pidfile(path);
-                let alive = recorded.is_some_and(is_process_alive);
-                match classify(recorded, alive) {
+                let alive = recorded.as_ref().is_some_and(is_record_alive);
+                match classify(recorded.map(|r| r.pid), alive) {
                     PidState::Alive(existing) => {
                         return Err(AcquireError::AlreadyRunning(existing));
                     }
@@ -261,7 +318,49 @@ mod tests {
         let path = dir.path().join("serve.pid");
         let pid = std::process::id();
         acquire_pidfile(&path, pid).expect("acquire");
-        assert_eq!(read_pidfile(&path), Some(pid));
+        assert_eq!(read_pidfile(&path).map(|r| r.pid), Some(pid));
+    }
+
+    #[test]
+    fn read_pidfile_parses_pid_and_start_time() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("serve.pid");
+        std::fs::write(&path, "4242 99887766\n").expect("write");
+        let rec = read_pidfile(&path).expect("record");
+        assert_eq!(rec.pid, 4242);
+        assert_eq!(rec.start_time, Some(99_887_766));
+    }
+
+    #[test]
+    fn read_pidfile_back_compat_pid_only() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("serve.pid");
+        std::fs::write(&path, "4242\n").expect("write");
+        let rec = read_pidfile(&path).expect("record");
+        assert_eq!(rec.pid, 4242);
+        assert_eq!(rec.start_time, None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn record_with_mismatched_start_time_is_not_alive() {
+        // Our PID is alive, but a bogus recorded start time must read as stale.
+        let rec = PidRecord {
+            pid: std::process::id(),
+            start_time: Some(1),
+        };
+        assert!(!is_record_alive(&rec));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn record_with_matching_start_time_is_alive() {
+        let pid = std::process::id();
+        let rec = PidRecord {
+            pid,
+            start_time: process_start_time(pid),
+        };
+        assert!(is_record_alive(&rec));
     }
 
     #[test]
@@ -283,7 +382,7 @@ mod tests {
         // A very high PID that is not running on any sane system.
         std::fs::write(&path, "2147483640\n").expect("seed stale pidfile");
         acquire_pidfile(&path, std::process::id()).expect("stale lock should be reclaimed");
-        assert_eq!(read_pidfile(&path), Some(std::process::id()));
+        assert_eq!(read_pidfile(&path).map(|r| r.pid), Some(std::process::id()));
     }
 
     #[cfg(unix)]

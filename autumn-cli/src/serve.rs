@@ -86,22 +86,62 @@ impl AddrFile {
 
 /// Entry point dispatched from `main::run_command`.
 pub fn run(action: Option<ServeAction>, opts: &ServeOptions) {
-    let code = match action {
+    // Daemon mode is built on Unix domain sockets and POSIX signals; the
+    // Windows path isn't supported yet. Fail clearly instead of binding TCP and
+    // exiting (the app rejects `unix_socket` off-Unix) or signalling nothing.
+    #[cfg(not(unix))]
+    {
+        let _ = (action, opts);
+        eprintln!(
+            "autumn serve: daemon mode is currently supported on Unix only \
+             (Linux/macOS). Run the app binary directly on this platform."
+        );
+        std::process::exit(1);
+    }
+    #[cfg(unix)]
+    {
+        let code = run_unix(action, opts);
+        std::process::exit(code);
+    }
+}
+
+/// Unix implementation of `run` (daemon lifecycle).
+#[cfg(unix)]
+fn run_unix(action: Option<ServeAction>, opts: &ServeOptions) -> i32 {
+    match action {
         None => start(opts),
         Some(ServeAction::Stop) => stop(opts),
         Some(ServeAction::Status) => status(opts),
         Some(ServeAction::Restart) => {
+            // `restart` is a fresh invocation, so `opts` reflects the restart
+            // command's flags — not the original `start`. Recover managed-PG
+            // mode from the running daemon's address file so a bare `restart`
+            // keeps the project data dir, the longer readiness budget, and the
+            // managed_pg flag. Always relaunch in the background.
+            let keep_managed =
+                opts.bundled_pg || running_daemon_is_managed(opts.package.as_deref());
             let _ = stop(opts);
-            // `restart` is a daemon-lifecycle command: always relaunch in the
-            // background, even if `--daemon` wasn't repeated on the command line.
             let daemon_opts = ServeOptions {
                 daemon: true,
+                bundled_pg: keep_managed,
                 ..opts.clone()
             };
             start(&daemon_opts)
         }
+    }
+}
+
+/// Whether the currently-recorded daemon was started in managed-Postgres mode,
+/// read from its address file. Best-effort: false if anything can't be read.
+#[cfg(unix)]
+fn running_daemon_is_managed(package: Option<&str>) -> bool {
+    let Ok(paths) = RuntimePaths::resolve(&project_identity(package)) else {
+        return false;
     };
-    std::process::exit(code);
+    std::fs::read_to_string(paths.addr_file())
+        .ok()
+        .and_then(|s| AddrFile::parse(&s).ok())
+        .is_some_and(|a| a.managed_pg)
 }
 
 /// Resolve the project's runtime paths, exiting on failure.
@@ -165,12 +205,13 @@ fn start(opts: &ServeOptions) -> i32 {
     }
 
     // Reject a second start while a live daemon holds the lock.
-    if let Some(pid) = process::read_pidfile(&paths.pid_file())
-        && process::is_process_alive(pid)
+    if let Some(rec) = process::read_pidfile(&paths.pid_file())
+        && process::is_record_alive(&rec)
     {
         eprintln!(
-            "autumn serve: already running (pid {pid}). \
-             Use `autumn serve stop` or `autumn serve restart`."
+            "autumn serve: already running (pid {}). \
+             Use `autumn serve stop` or `autumn serve restart`.",
+            rec.pid
         );
         return 1;
     }
@@ -407,8 +448,7 @@ fn write_addr_file(paths: &RuntimePaths, pid: u32, socket: &Path, managed_pg: bo
         address: socket.display().to_string(),
         started_at: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0),
+            .map_or(0, |d| d.as_secs()),
         managed_pg,
     };
     let path = paths.addr_file();
@@ -427,17 +467,17 @@ fn write_addr_file(paths: &RuntimePaths, pid: u32, socket: &Path, managed_pg: bo
 fn stop(opts: &ServeOptions) -> i32 {
     let paths = resolve_paths(opts.package.as_deref());
     let socket = paths.socket_file();
-    let Some(pid) = process::read_pidfile(&paths.pid_file()) else {
+    let Some(rec) = process::read_pidfile(&paths.pid_file()) else {
         println!("autumn serve: not running");
         return 0;
     };
-    if !process::is_process_alive(pid) {
+    if !process::is_record_alive(&rec) {
         println!("autumn serve: not running (removed stale pidfile)");
         cleanup(&paths, &socket);
         return 0;
     }
 
-    process::stop_pid(pid, stop_timeout());
+    process::stop_pid(rec.pid, stop_timeout());
     cleanup(&paths, &socket);
     println!("autumn serve: stopped");
     0
@@ -476,16 +516,16 @@ fn stop_timeout() -> Duration {
 /// Report daemon status. Exit code 0 = running, 3 = stopped.
 fn status(opts: &ServeOptions) -> i32 {
     let paths = resolve_paths(opts.package.as_deref());
-    let Some(pid) = process::read_pidfile(&paths.pid_file()) else {
+    let Some(rec) = process::read_pidfile(&paths.pid_file()) else {
         println!("autumn serve: stopped");
         return 3;
     };
-    if process::is_process_alive(pid) {
+    if process::is_record_alive(&rec) {
         let address = std::fs::read_to_string(paths.addr_file())
             .ok()
             .and_then(|s| AddrFile::parse(&s).ok())
             .map_or_else(|| paths.socket_file().display().to_string(), |a| a.address);
-        println!("autumn serve: running (pid {pid}) on unix:{address}");
+        println!("autumn serve: running (pid {}) on unix:{address}", rec.pid);
         0
     } else {
         println!(

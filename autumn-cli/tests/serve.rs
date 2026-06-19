@@ -93,9 +93,10 @@ fn serve_daemon_start_status_stop_over_unix_socket() {
     assert!(addrfile.exists(), "address file should exist after start");
 
     // Ensure we clean up the detached process even if an assertion fails.
+    // The lockfile is `<pid> <start_time>`; take the first field.
     let pid = std::fs::read_to_string(&pidfile)
         .ok()
-        .and_then(|s| s.trim().parse::<u32>().ok());
+        .and_then(|s| s.split_whitespace().next()?.parse::<u32>().ok());
     let _guard = scopeguard(pid);
 
     // ── Reachable over the discovered socket ────────────────────────

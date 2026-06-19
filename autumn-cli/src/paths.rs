@@ -125,6 +125,12 @@ impl RuntimePaths {
     }
 
     /// Create the runtime and log directories if they do not exist.
+    /// Create the runtime, log, and data directories if they do not exist.
+    ///
+    /// The data dir is the parent of [`pg_data_dir`](Self::pg_data_dir); on
+    /// Linux with `XDG_RUNTIME_DIR` set it is a distinct tree from runtime/logs,
+    /// so it must be created here or managed-Postgres `initdb` would fail on a
+    /// missing parent.
     ///
     /// # Errors
     ///
@@ -132,6 +138,7 @@ impl RuntimePaths {
     pub fn ensure_dirs(&self) -> std::io::Result<()> {
         std::fs::create_dir_all(&self.runtime)?;
         std::fs::create_dir_all(&self.logs)?;
+        std::fs::create_dir_all(&self.data)?;
         Ok(())
     }
 }
