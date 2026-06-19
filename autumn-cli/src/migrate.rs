@@ -577,7 +577,7 @@ fn read_autumn_toml_table() -> Option<toml::Table> {
 /// `autumn migrate --profile prod` resolves the same control + shard URLs the
 /// running app would under that profile. With no profile (or no overlay file),
 /// the base table is returned unchanged.
-pub(crate) fn read_autumn_toml_table_with_profile(profile: Option<&str>) -> Option<toml::Table> {
+pub fn read_autumn_toml_table_with_profile(profile: Option<&str>) -> Option<toml::Table> {
     read_autumn_toml_table_with_profile_in(Path::new("."), profile)
 }
 
@@ -669,7 +669,7 @@ where
 /// `AUTUMN_DATABASE__SHARDS__{i}__NAME` / `__PRIMARY_URL` override entry
 /// `i` of the TOML declaration (or append a new entry when both are set
 /// for the next free index); probing stops at the first absent index.
-pub(crate) fn resolve_shard_database_urls_from_sources<F>(
+pub fn resolve_shard_database_urls_from_sources<F>(
     env_var: F,
     table: Option<&toml::Table>,
 ) -> Vec<(String, String)>
@@ -919,12 +919,10 @@ fn run_down(
     // 1. Production guard.  Check the explicit `--profile` arg first (highest
     //    priority), then fall back to the env-based `is_production_profile()`
     //    which reads `AUTUMN_ENV` / `AUTUMN_PROFILE` / `AUTUMN_IS_DEBUG`.
-    let is_prod = profile
-        .map(|p| {
-            let p = p.trim().to_lowercase();
-            p == "prod" || p == "production"
-        })
-        .unwrap_or_else(is_production_profile);
+    let is_prod = profile.map_or_else(is_production_profile, |p| {
+        let p = p.trim().to_lowercase();
+        p == "prod" || p == "production"
+    });
     if is_prod && !args.yes_i_mean_prod {
         eprintln!("\u{2717} Production profile detected.");
         eprintln!("  Rolling back migrations in production requires explicit confirmation.");
