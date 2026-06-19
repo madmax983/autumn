@@ -332,6 +332,21 @@ fn run_foreground(binary: &Path, paths: &RuntimePaths, opts: &ServeOptions) -> i
     status.map_or(1, |s| s.code().unwrap_or(1))
 }
 
+/// Create (truncating) the daemon log file with owner-only (`0600`) permissions
+/// on Unix. The log captures the child's stdout/stderr — request data, panics,
+/// and diagnostics — so other local users who can traverse the log dir must not
+/// be able to read it.
+fn create_private_log(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path)
+}
+
 /// Spawn the server detached into the background and supervise readiness.
 fn spawn_daemon(binary: &Path, paths: &RuntimePaths, opts: &ServeOptions) -> i32 {
     let socket = paths.socket_file();
@@ -353,7 +368,7 @@ fn spawn_daemon(binary: &Path, paths: &RuntimePaths, opts: &ServeOptions) -> i32
     }
 
     let log_path = paths.log_file();
-    let log = match std::fs::File::create(&log_path) {
+    let log = match create_private_log(&log_path) {
         Ok(f) => f,
         Err(e) => {
             eprintln!(
@@ -696,6 +711,20 @@ fn status(opts: &ServeOptions) -> i32 {
 fn cleanup(paths: &RuntimePaths, socket: &Path) {
     let _ = std::fs::remove_file(paths.pid_file());
     let _ = std::fs::remove_file(paths.addr_file());
+    remove_socket_if_not_live(socket);
+}
+
+/// Unlink the socket file only when no live listener still owns it.
+///
+/// After our daemon exits the socket is stale (a `connect` is refused) and safe
+/// to remove. But if a *foreign* live listener owns this path — e.g. our child
+/// refused to bind over it (`prepare_unix_socket_path`) and exited — unlinking
+/// would make that service unreachable, so leave it in place.
+fn remove_socket_if_not_live(socket: &Path) {
+    #[cfg(unix)]
+    if std::os::unix::net::UnixStream::connect(socket).is_ok() {
+        return;
+    }
     let _ = std::fs::remove_file(socket);
 }
 
