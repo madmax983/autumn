@@ -46,8 +46,11 @@ pub fn run_move_slot(args: &MoveSlotArgs) {
     validate_identifier("--key-column", &args.key_column);
 
     // Resolve shard names → URLs through the same config + profile + env stack
-    // as `autumn migrate` (reusing migrate's resolution helpers).
-    let table = crate::migrate::read_autumn_toml_table_with_profile(args.profile.as_deref());
+    // as `autumn migrate` (reusing migrate's resolution helpers). An explicit
+    // `--profile` wins, else fall back to `AUTUMN_ENV` so a move run targets the
+    // same shard URLs the app and `autumn migrate` use.
+    let effective = crate::migrate::effective_profile(args.profile.as_deref());
+    let table = crate::migrate::read_autumn_toml_table_with_profile(effective.as_deref());
     let shards = crate::migrate::resolve_shard_database_urls_from_sources(
         |k| std::env::var(k),
         table.as_ref(),

@@ -154,16 +154,8 @@ fn resolve_targets(target: &MigrateTarget, profile: Option<&str>) -> Vec<(String
     // When no profile is given explicitly (via `--profile` / `AUTUMN_PROFILE`),
     // fall back to `AUTUMN_ENV` — the framework's preferred profile selector —
     // so `autumn migrate` resolves the same overlay the app itself would use.
-    let env_profile;
-    let effective_profile = if profile.is_some() {
-        profile
-    } else {
-        env_profile = std::env::var("AUTUMN_ENV")
-            .ok()
-            .filter(|v| !v.trim().is_empty());
-        env_profile.as_deref()
-    };
-    let config_table = read_autumn_toml_table_with_profile(effective_profile);
+    let effective = effective_profile(profile);
+    let config_table = read_autumn_toml_table_with_profile(effective.as_deref());
     let control =
         resolve_primary_database_url_from_sources(|key| std::env::var(key), config_table.as_ref());
     let shards =
@@ -571,12 +563,41 @@ fn read_autumn_toml_table() -> Option<toml::Table> {
         .and_then(|contents| toml::from_str::<toml::Table>(&contents).ok())
 }
 
-/// Read `autumn.toml`, deep-merging the `autumn-<profile>.toml` overlay on
-/// top when `profile` is set. This mirrors the framework's legacy
-/// `autumn-{profile}.toml` override layer (see `autumn/src/config.rs`) so
-/// `autumn migrate --profile prod` resolves the same control + shard URLs the
-/// running app would under that profile. With no profile (or no overlay file),
-/// the base table is returned unchanged.
+/// The profile actually in effect for CLI config resolution: an explicit
+/// `--profile` (or `AUTUMN_PROFILE`, which clap fills into `profile`) wins,
+/// otherwise fall back to `AUTUMN_ENV` — the framework's preferred profile
+/// selector — so the CLI resolves the same overlay the running app would.
+/// Returns `None` when neither is set.
+pub fn effective_profile(explicit: Option<&str>) -> Option<String> {
+    if let Some(p) = explicit.filter(|p| !p.trim().is_empty()) {
+        return Some(p.to_owned());
+    }
+    std::env::var("AUTUMN_ENV")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+}
+
+/// Profile name spellings to look up `[profile.<name>]` sections under,
+/// mirroring `autumn_web::config::profile_lookup_names` so `prod`/`production`
+/// and `dev`/`development` are treated as aliases.
+fn profile_lookup_names(profile: &str) -> Vec<&str> {
+    match profile.trim() {
+        "prod" | "production" => vec!["production", "prod"],
+        "dev" | "development" => vec!["development", "dev"],
+        other => vec![other],
+    }
+}
+
+/// Read `autumn.toml`, layering profile overrides the same way the runtime
+/// loader does (see `autumn/src/config.rs`):
+///
+///   `autumn.toml` ← `[profile.{name}]` (inline) ← `autumn-{profile}.toml`
+///
+/// so `autumn migrate --profile prod` resolves the same control + shard URLs
+/// the running app would under that profile — whether the deployment keeps
+/// production URLs in an inline `[profile.prod.database]` section or a separate
+/// `autumn-prod.toml` file. With no profile (or no overrides), the base table
+/// is returned unchanged.
 pub fn read_autumn_toml_table_with_profile(profile: Option<&str>) -> Option<toml::Table> {
     read_autumn_toml_table_with_profile_in(Path::new("."), profile)
 }
@@ -603,14 +624,33 @@ fn read_autumn_toml_table_with_profile_in(
     };
 
     let overlay = read_table(&dir.join(format!("autumn-{profile}.toml")));
-    match (base, overlay) {
-        (Some(mut base), Some(overlay)) => {
-            deep_merge_toml(&mut base, overlay);
-            Some(base)
-        }
-        (base, None) => base,
-        (None, Some(overlay)) => Some(overlay),
+    if base.is_none() && overlay.is_none() {
+        return None;
     }
+    let mut merged = base.unwrap_or_default();
+
+    // Layer the inline `[profile.<name>]` section(s) from autumn.toml on top of
+    // the base, matching the runtime loader's precedence. Co-located profile
+    // config (e.g. `[profile.prod.database]`) must be honored, not just a
+    // separate `autumn-<profile>.toml` file.
+    for name in profile_lookup_names(profile) {
+        if let Some(inline) = merged
+            .get("profile")
+            .and_then(toml::Value::as_table)
+            .and_then(|profiles| profiles.get(name))
+            .and_then(toml::Value::as_table)
+            .cloned()
+        {
+            deep_merge_toml(&mut merged, inline);
+        }
+    }
+
+    // Finally, the legacy `autumn-<profile>.toml` overlay wins over both.
+    if let Some(overlay) = overlay {
+        deep_merge_toml(&mut merged, overlay);
+    }
+
+    Some(merged)
 }
 
 /// Deep-merge `overlay` into `base`: nested tables are merged recursively,
@@ -2168,6 +2208,44 @@ primary_url = "postgres://prod-s0:5432/app"
         assert_eq!(
             resolve_primary_database_url_from_sources(no_env, Some(&base)).as_deref(),
             Some("postgres://base-control:5432/app")
+        );
+    }
+
+    #[test]
+    fn inline_profile_section_overrides_base_url() {
+        // A deployment that keeps prod URLs in an inline `[profile.prod.*]`
+        // section of autumn.toml (no separate autumn-prod.toml) must still
+        // resolve the prod URLs under `--profile prod`, matching the runtime
+        // loader. `production` is honored as an alias for `prod`.
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join("autumn.toml"),
+            r#"
+[database]
+primary_url = "postgres://base-control:5432/app"
+
+[[database.shards]]
+name = "s0"
+primary_url = "postgres://base-s0:5432/app"
+
+[profile.production.database]
+primary_url = "postgres://prod-control:5432/app"
+
+[[profile.production.database.shards]]
+name = "s0"
+primary_url = "postgres://prod-s0:5432/app"
+"#,
+        )
+        .unwrap();
+
+        let merged = read_autumn_toml_table_with_profile_in(tmp.path(), Some("prod")).unwrap();
+        assert_eq!(
+            resolve_primary_database_url_from_sources(no_env, Some(&merged)).as_deref(),
+            Some("postgres://prod-control:5432/app")
+        );
+        assert_eq!(
+            resolve_shard_database_urls_from_sources(no_env, Some(&merged)),
+            vec![("s0".to_owned(), "postgres://prod-s0:5432/app".to_owned())]
         );
     }
 
