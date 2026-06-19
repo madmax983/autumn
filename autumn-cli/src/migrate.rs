@@ -797,13 +797,38 @@ where
         .and_then(|database| database.get("shards"))
         .and_then(toml::Value::as_array)
         .map(|entries| {
+            // Fail fast on a malformed `[[database.shards]]` entry rather than
+            // silently dropping it: the runtime config loader rejects the same
+            // config, so skipping a misspelled shard here would let `autumn
+            // migrate` "succeed" while leaving that shard unmigrated.
             entries
                 .iter()
-                .filter_map(toml::Value::as_table)
-                .filter_map(|shard| {
-                    let name = shard.get("name").and_then(toml::Value::as_str)?;
-                    let url = shard.get("primary_url").and_then(toml::Value::as_str)?;
-                    Some((name.to_owned(), url.to_owned()))
+                .enumerate()
+                .map(|(i, entry)| {
+                    let shard = entry.as_table().unwrap_or_else(|| {
+                        eprintln!("\u{2717} [[database.shards]] entry {i} is not a table.");
+                        std::process::exit(1);
+                    });
+                    let name = shard
+                        .get("name")
+                        .and_then(toml::Value::as_str)
+                        .unwrap_or_else(|| {
+                            eprintln!(
+                                "\u{2717} [[database.shards]] entry {i} is missing a string `name`."
+                            );
+                            std::process::exit(1);
+                        });
+                    let url = shard
+                        .get("primary_url")
+                        .and_then(toml::Value::as_str)
+                        .unwrap_or_else(|| {
+                            eprintln!(
+                                "\u{2717} [[database.shards]] entry {i} ({name:?}) is missing a \
+                                 string `primary_url`."
+                            );
+                            std::process::exit(1);
+                        });
+                    (name.to_owned(), url.to_owned())
                 })
                 .collect()
         })

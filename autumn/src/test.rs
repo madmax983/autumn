@@ -1056,9 +1056,7 @@ impl TestApp {
         // Mirror production router selection (see `setup_database`): when the
         // test config enables directory routing, build a `DirectoryShardRouter`
         // over the control pool so tests that pin tenants in
-        // `_autumn_shard_directory` route the same way production would. Falls
-        // back to the hash router when directory routing is off or there is no
-        // control pool.
+        // `_autumn_shard_directory` route the same way production would.
         #[cfg(feature = "db")]
         let shard_router: std::sync::Arc<dyn crate::sharding::ShardRouter> =
             match (self.config.database.directory_shard_router, &pool) {
@@ -1073,7 +1071,15 @@ impl TestApp {
                             .with_statement_timeout_ms(timeout_ms),
                     )
                 }
-                _ => std::sync::Arc::new(crate::sharding::HashShardRouter),
+                // Production `setup_database` errors here (the directory router
+                // needs a control DB), so fail the test app the same way rather
+                // than silently routing by hash and passing a test the deployed
+                // app would fail.
+                (true, None) => panic!(
+                    "directory_shard_router is enabled but TestApp has no control database pool; \
+                     configure a control pool (with_db) or disable directory routing"
+                ),
+                (false, _) => std::sync::Arc::new(crate::sharding::HashShardRouter),
             };
 
         let probes = crate::probe::ProbeState::ready_for_test();

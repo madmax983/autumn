@@ -57,19 +57,7 @@ pub fn run_move_slot(args: &MoveSlotArgs) {
     validate_identifier("--key-column", &args.key_column);
     validate_identifier("--id-column", &args.id_column);
 
-    // Resolve shard names → URLs through the same config + profile + env stack
-    // as `autumn migrate` (reusing migrate's resolution helpers). An explicit
-    // `--profile` wins, else fall back to `AUTUMN_ENV` so a move run targets the
-    // same shard URLs the app and `autumn migrate` use.
-    let effective = crate::migrate::effective_profile(args.profile.as_deref());
-    let table = crate::migrate::read_autumn_toml_table_with_profile(Some(&effective));
-    let shards = crate::migrate::resolve_shard_database_urls_from_sources(
-        |k| std::env::var(k),
-        table.as_ref(),
-    );
-
-    let from_url = resolve_shard_url(&args.from, &shards).unwrap_or_else(|e| fail(&e));
-    let to_url = resolve_shard_url(&args.to, &shards).unwrap_or_else(|e| fail(&e));
+    let (from_url, to_url) = resolve_move_urls(args);
 
     check_psql();
 
@@ -247,6 +235,30 @@ fn delete_source_rows_by_id(
     }
 }
 
+/// Resolve `--from` / `--to` shard names to their primary URLs through the same
+/// config + profile + env stack as `autumn migrate`, and refuse the move when
+/// they resolve to the same database (distinct names can map to one URL via
+/// profile/env overrides; copying a table onto itself would then delete the
+/// live rows from that single database).
+fn resolve_move_urls(args: &MoveSlotArgs) -> (String, String) {
+    let effective = crate::migrate::effective_profile(args.profile.as_deref());
+    let table = crate::migrate::read_autumn_toml_table_with_profile(Some(&effective));
+    let shards = crate::migrate::resolve_shard_database_urls_from_sources(
+        |k| std::env::var(k),
+        table.as_ref(),
+    );
+
+    let from_url = resolve_shard_url(&args.from, &shards).unwrap_or_else(|e| fail(&e));
+    let to_url = resolve_shard_url(&args.to, &shards).unwrap_or_else(|e| fail(&e));
+    if from_url == to_url {
+        fail(
+            "--from and --to resolve to the same database URL (check profile / \
+             AUTUMN_DATABASE__SHARDS__* overrides); refusing to move a table onto itself",
+        );
+    }
+    (from_url, to_url)
+}
+
 /// Resolve a configured shard name to its primary URL.
 fn resolve_shard_url(name: &str, shards: &[(String, String)]) -> Result<String, String> {
     if let Some((_, url)) = shards.iter().find(|(n, _)| n == name) {
@@ -366,12 +378,14 @@ fn staging_insert_sql(table: &str) -> String {
 fn reset_sequence_sql(table: &str, id_column: &str) -> String {
     let qt = quote_identifier(table);
     let qcol = quote_identifier(id_column);
-    // pg_get_serial_sequence takes the *raw* table and column name as string
-    // literals, not quoted identifiers: the column argument is treated as a
-    // literal column name (a double-quoted `"id"` would be looked up verbatim
-    // and return NULL, making the reset a silent no-op). Pass the unquoted
-    // names; `max()`/`FROM` below still use the quoted identifiers.
-    let tbl_lit = table.replace('\'', "''");
+    // pg_get_serial_sequence parses its first argument as a (possibly
+    // schema-qualified) identifier with normal case folding, so pass the
+    // *quoted* table to preserve case-sensitive / schema-qualified names (a raw
+    // `Bookmarks` would fold to `bookmarks` and return NULL). Its second
+    // argument, however, is treated as a literal column name (not parsed), so
+    // the column must be *raw* (a quoted `"id"` would be looked up verbatim and
+    // return NULL). Either NULL would make the reset a silent no-op.
+    let tbl_lit = qt.replace('\'', "''");
     let col_lit = id_column.replace('\'', "''");
     format!(
         "DO $$ DECLARE seq text := pg_get_serial_sequence('{tbl_lit}', '{col_lit}'); mx bigint; \
@@ -642,10 +656,11 @@ mod tests {
     #[test]
     fn reset_sequence_sql_quotes_and_guards() {
         let sql = reset_sequence_sql("bookmarks", "id");
-        // Raw (unquoted) names passed to pg_get_serial_sequence; a quoted
-        // "id" would be taken literally and return NULL (silent no-op).
+        // Quoted table (case/schema preserved) + raw column passed to
+        // pg_get_serial_sequence; a raw `Bookmarks` would fold to `bookmarks`,
+        // and a quoted `"id"` would be taken literally — either returns NULL.
         assert!(
-            sql.contains("pg_get_serial_sequence('bookmarks', 'id')"),
+            sql.contains("pg_get_serial_sequence('\"bookmarks\"', 'id')"),
             "{sql}"
         );
         // max()/FROM still use quoted identifiers.
@@ -660,11 +675,11 @@ mod tests {
             "{sql}"
         );
 
-        // Schema-qualified table passes the raw dotted name to
-        // pg_get_serial_sequence and quotes each part for max()/FROM.
+        // Schema-qualified table is quoted per-part for pg_get_serial_sequence
+        // (and for max()/FROM); the column stays raw.
         let sql = reset_sequence_sql("public.bookmarks", "id");
         assert!(
-            sql.contains("pg_get_serial_sequence('public.bookmarks', 'id')"),
+            sql.contains("pg_get_serial_sequence('\"public\".\"bookmarks\"', 'id')"),
             "{sql}"
         );
     }
