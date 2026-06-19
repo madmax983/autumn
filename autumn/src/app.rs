@@ -5238,17 +5238,21 @@ async fn resolve_shard_set(
             );
             // Spawn the cache-invalidation listener on the control DB so a re-pin
             // (e.g. during a slot move) evicts cached tenant→shard mappings fleet-
-            // wide within seconds rather than waiting out the TTL. Skipped during
-            // a static build (no DB access); needs the control URL, without one we
-            // silently fall back to TTL-only refresh.
+            // wide the moment it commits (LISTEN/NOTIFY) rather than waiting out
+            // the TTL. Skipped during a static build (no DB access); needs the
+            // control URL, without one we silently fall back to TTL-only refresh.
             if let Some(control_url) = spawn_directory_listener
                 .then(|| config.database.effective_primary_url())
                 .flatten()
             {
-                let _ = crate::sharding::DirectoryShardRouter::spawn_invalidation_listener(
-                    Arc::clone(&dir_router),
-                    control_url.to_owned(),
-                    crate::sharding::DEFAULT_DIRECTORY_INVALIDATION_POLL_INTERVAL,
+                // Detach: the listener runs for the life of the process; dropping
+                // the JoinHandle leaves the task running rather than aborting it.
+                drop(
+                    crate::sharding::DirectoryShardRouter::spawn_invalidation_listener(
+                        Arc::clone(&dir_router),
+                        control_url.to_owned(),
+                        crate::sharding::DEFAULT_DIRECTORY_INVALIDATION_SWEEP_INTERVAL,
+                    ),
                 );
             }
             dir_router

@@ -26,40 +26,28 @@ CREATE TABLE IF NOT EXISTS _autumn_shard_directory (
 CREATE INDEX IF NOT EXISTS idx_autumn_shard_directory_shard
     ON _autumn_shard_directory (shard_name);
 
--- Cache-invalidation log + NOTIFY.
+-- Cache invalidation via LISTEN/NOTIFY.
 --
--- Every change to the directory records the affected tenant_key here and fires
--- `NOTIFY autumn_shard_directory, <tenant_key>`. The framework's
--- DirectoryShardRouter invalidation listener reads this append-only log on a
--- timestamp cursor and evicts that tenant's cached pin within seconds, so a
--- re-pin during a slot move takes effect well before the cache TTL would
--- expire. Logging via a TRIGGER (not app code) captures operator SQL writes to
--- the directory too, not just writes made through the framework. This is a
--- low-volume log (one row per tenant relocation).
-CREATE TABLE IF NOT EXISTS _autumn_shard_directory_changes (
-    id          BIGSERIAL   PRIMARY KEY,
-    tenant_key  TEXT        NOT NULL,
-    changed_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-
-CREATE INDEX IF NOT EXISTS idx_autumn_shard_directory_changes_time
-    ON _autumn_shard_directory_changes (changed_at);
-
+-- Every change to the directory fires `NOTIFY autumn_shard_directory,
+-- <tenant_key>`. The framework's DirectoryShardRouter LISTENs on that channel
+-- and evicts the affected tenant's cached pin on every replica. Postgres
+-- delivers NOTIFY at COMMIT (never before), so the eviction lands exactly when
+-- the new mapping becomes visible — a slow-committing transaction can't be
+-- missed, and there is no change-log cursor to fall behind. Firing from a
+-- TRIGGER (not app code) also captures operator SQL writes to the directory,
+-- not just writes made through the framework.
 CREATE OR REPLACE FUNCTION autumn_notify_shard_directory_change()
 RETURNS trigger AS $$
 BEGIN
     IF (TG_OP = 'DELETE') THEN
-        INSERT INTO _autumn_shard_directory_changes (tenant_key) VALUES (OLD.tenant_key);
         PERFORM pg_notify('autumn_shard_directory', OLD.tenant_key);
         RETURN NULL;
     END IF;
     -- INSERT or UPDATE: invalidate the (new) key.
-    INSERT INTO _autumn_shard_directory_changes (tenant_key) VALUES (NEW.tenant_key);
     PERFORM pg_notify('autumn_shard_directory', NEW.tenant_key);
     -- A primary-key rename also strands the old key's cache entry, so invalidate
     -- both ends of the rename.
     IF (TG_OP = 'UPDATE' AND OLD.tenant_key IS DISTINCT FROM NEW.tenant_key) THEN
-        INSERT INTO _autumn_shard_directory_changes (tenant_key) VALUES (OLD.tenant_key);
         PERFORM pg_notify('autumn_shard_directory', OLD.tenant_key);
     END IF;
     RETURN NULL;

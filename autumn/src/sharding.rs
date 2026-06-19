@@ -280,27 +280,20 @@ struct ShardNameRow {
     shard_name: String,
 }
 
-/// Default poll interval for the directory invalidation listener.
+/// Postgres `LISTEN`/`NOTIFY` channel the directory trigger fires on. The
+/// invalidation listener subscribes to it; the trigger
+/// (`autumn_notify_shard_directory_change`, in the shard-directory migration)
+/// must `pg_notify` the same channel. Keep the two in sync.
+const DIRECTORY_NOTIFY_CHANNEL: &str = "autumn_shard_directory";
+
+/// How often the invalidation listener wakes while idle to sweep expired cache
+/// entries and notice a dropped LISTEN connection.
 ///
-/// Used by [`DirectoryShardRouter::spawn_invalidation_listener`]. Shorter than
-/// [`DEFAULT_DIRECTORY_CACHE_TTL`] so a re-pin is picked up well before the TTL
-/// would have expired the entry anyway.
-pub const DEFAULT_DIRECTORY_INVALIDATION_POLL_INTERVAL: std::time::Duration =
+/// Invalidation delivery itself is event-driven — a `NOTIFY` delivered at
+/// commit — so this only bounds idle housekeeping; kept well under
+/// [`DEFAULT_DIRECTORY_CACHE_TTL`].
+pub const DEFAULT_DIRECTORY_INVALIDATION_SWEEP_INTERVAL: std::time::Duration =
     std::time::Duration::from_secs(5);
-
-/// SQL the invalidation listener polls each cycle: the distinct tenant keys whose
-/// directory rows changed since the cursor timestamp (written by the
-/// `autumn_shard_directory_notify` trigger, so operator SQL writes are caught
-/// too). Re-invalidating a key is idempotent, so the cursor uses a lookback
-/// overlap rather than an exact high-water mark.
-const DIRECTORY_CHANGES_POLL_SQL: &str = "SELECT DISTINCT tenant_key FROM \
-     _autumn_shard_directory_changes WHERE changed_at > to_timestamp($1)";
-
-#[derive(diesel::QueryableByName)]
-struct DirectoryChangeKeyRow {
-    #[diesel(sql_type = diesel::sql_types::Text)]
-    tenant_key: String,
-}
 
 impl std::fmt::Debug for DirectoryShardRouter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -368,81 +361,70 @@ impl DirectoryShardRouter {
         }
     }
 
-    /// Spawn a background thread that polls the `_autumn_shard_directory_changes`
-    /// log on the control database and invalidates this router's cached pin for
-    /// every tenant whose directory row changed — including writes made on other
-    /// replicas or directly via operator SQL (the change log is populated by a
-    /// trigger). Without it the cache only refreshes when the TTL expires; with
-    /// it a re-pin during a slot move is picked up within `poll_interval`.
+    /// Spawn a background task that `LISTEN`s on the control DB's
+    /// [`DIRECTORY_NOTIFY_CHANNEL`] and invalidates this router's cached pin
+    /// whenever a tenant's directory row changes.
+    ///
+    /// This covers writes made on other replicas or directly via operator SQL
+    /// (the channel is fired by a trigger, not app code). Without it the cache
+    /// only refreshes when the TTL expires; with it a re-pin during a slot move
+    /// is picked up the moment it commits.
+    ///
+    /// Postgres delivers `NOTIFY` at **commit** (never before), so the
+    /// invalidation arrives exactly when the new mapping becomes visible: a
+    /// slow-committing re-pin cannot be skipped the way a timestamp-cursor poll
+    /// could. The cache TTL stays the backstop for any window where the LISTEN
+    /// connection is down.
     ///
     /// `control_url` is the control database URL backing this router's control
-    /// pool. The thread runs for the life of the process; the returned handle can
-    /// be detached. The framework spawns this automatically when directory
-    /// routing is enabled via the built-in path.
+    /// pool. Must be called from within a Tokio runtime; the returned handle can
+    /// be detached, and the task runs for the life of the process. The framework
+    /// spawns this automatically when directory routing is enabled via the
+    /// built-in path. `sweep_interval` only bounds idle housekeeping (see
+    /// [`DEFAULT_DIRECTORY_INVALIDATION_SWEEP_INTERVAL`]).
     #[must_use]
     pub fn spawn_invalidation_listener(
         router: Arc<Self>,
         control_url: String,
-        poll_interval: std::time::Duration,
-    ) -> std::thread::JoinHandle<()> {
-        use diesel::Connection as _;
-        use diesel::RunQueryDsl as _;
+        sweep_interval: std::time::Duration,
+    ) -> tokio::task::JoinHandle<()> {
+        use diesel_async::{AsyncConnection as _, RunQueryDsl as _};
+        use futures::StreamExt as _;
 
-        std::thread::spawn(move || {
-            // Timestamp cursor with a lookback overlap. A sequence-id cursor
-            // (id > last_id) is unsafe: ids are allocated before commit, so a
-            // slow transaction can commit after a later one and be skipped. The
-            // overlap re-reads a few seconds each cycle; re-invalidating a key is
-            // idempotent. (Same approach as the feature-flag listener.)
-            const OVERLAP_SECS: i64 = 5;
-            let now_secs = || {
-                i64::try_from(
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs(),
-                )
-                .unwrap_or(i64::MAX)
-            };
-            // Start in the past so we don't replay the whole log: the cache
-            // starts empty and repopulates lazily, so only post-startup changes
-            // matter.
-            let mut last_polled_secs = now_secs() - OVERLAP_SECS;
-
+        tokio::spawn(async move {
             loop {
-                std::thread::sleep(poll_interval);
-                // Compute the next horizon before the query so writes landing
-                // during the query are caught next cycle. Only adopt it if this
-                // poll actually succeeds (below).
-                let new_horizon = now_secs() - OVERLAP_SECS;
-                // A poll "succeeds" only if both the control connection and the
-                // query land; `None` means connect or query failed.
-                let rows =
-                    diesel::PgConnection::establish(&control_url)
-                        .ok()
-                        .and_then(|mut conn| {
-                            diesel::sql_query(DIRECTORY_CHANGES_POLL_SQL)
-                                .bind::<diesel::sql_types::BigInt, _>(last_polled_secs)
-                                .load::<DirectoryChangeKeyRow>(&mut conn)
-                                .ok()
-                        });
-                let polled_ok = rows.is_some();
-                if let Some(rows) = rows {
-                    for row in rows {
-                        router.invalidate(&row.tenant_key);
-                    }
+                // (Re)connect and subscribe. On any failure back off for one
+                // sweep interval and retry; the cache TTL backstops staleness
+                // while we're disconnected.
+                let Ok(mut conn) = AsyncPgConnection::establish(&control_url).await else {
+                    tokio::time::sleep(sweep_interval).await;
+                    continue;
+                };
+                if diesel::sql_query(format!("LISTEN {DIRECTORY_NOTIFY_CHANNEL}"))
+                    .execute(&mut conn)
+                    .await
+                    .is_err()
+                {
+                    tokio::time::sleep(sweep_interval).await;
+                    continue;
                 }
-                // Reclaim entries that expired but were never looked up again
-                // (lazy eviction in `cache_get` only fires on re-observation).
-                router.sweep_expired();
-                // Advance the cursor only after a successful poll. On a control
-                // connection or query failure, keep the previous cursor so
-                // changes committed during the failed interval are re-read next
-                // cycle instead of being skipped (which would strand a stale pin
-                // until TTL expiry — e.g. a replica routing to the old shard
-                // across a re-pin).
-                if polled_ok {
-                    last_polled_secs = new_horizon;
+                // A re-pin may have committed between losing the previous
+                // connection and (re)subscribing; those NOTIFYs are gone, so drop
+                // the whole cache and let it repopulate lazily from the directory.
+                router.invalidate_all();
+
+                // Drain notifications until the stream errors or ends, then fall
+                // through to the outer loop and reconnect. Each idle
+                // `sweep_interval` we reclaim expired entries that were never
+                // looked up again (lazy eviction in `cache_get` only fires on
+                // re-observation).
+                let mut notifications = std::pin::pin!(conn.notifications_stream());
+                loop {
+                    match tokio::time::timeout(sweep_interval, notifications.next()).await {
+                        Ok(Some(Ok(notification))) => router.invalidate(&notification.payload),
+                        Ok(Some(Err(_)) | None) => break,
+                        Err(_elapsed) => router.sweep_expired(),
+                    }
                 }
             }
         })
@@ -2035,19 +2017,18 @@ mod tests {
     use crate::config::{ShardConfig, SlotSpec};
 
     #[test]
-    fn directory_invalidation_poll_sql_and_interval_are_sane() {
-        // The poller reads the trigger-populated change log on a timestamp
-        // cursor (not a sequence id, which could skip slow-committing rows).
-        assert_eq!(
-            DIRECTORY_CHANGES_POLL_SQL,
-            "SELECT DISTINCT tenant_key FROM _autumn_shard_directory_changes \
-             WHERE changed_at > to_timestamp($1)"
-        );
-        // The poll interval must be shorter than the cache TTL, otherwise the
-        // TTL would already have expired the entry before the listener acted.
+    fn directory_invalidation_channel_and_interval_are_sane() {
+        // The listener LISTENs on the same channel the migration's trigger
+        // fires via `pg_notify`. If these drift, invalidations are never
+        // delivered.
+        assert_eq!(DIRECTORY_NOTIFY_CHANNEL, "autumn_shard_directory");
+        // The idle sweep interval must be shorter than the cache TTL so a
+        // never-re-observed expired entry is reclaimed before the TTL would
+        // have done so anyway (delivery of an actual invalidation is immediate,
+        // independent of this interval).
         assert!(
-            DEFAULT_DIRECTORY_INVALIDATION_POLL_INTERVAL < DEFAULT_DIRECTORY_CACHE_TTL,
-            "poll interval should beat the TTL"
+            DEFAULT_DIRECTORY_INVALIDATION_SWEEP_INTERVAL < DEFAULT_DIRECTORY_CACHE_TTL,
+            "sweep interval should beat the TTL"
         );
     }
 

@@ -305,13 +305,15 @@ ON CONFLICT (tenant_key) DO UPDATE SET shard_name = EXCLUDED.shard_name;
 ```
 
 You don't need to invalidate the cache by hand. A trigger on the directory
-table logs every change (including this raw SQL write), and the built-in path
-spawns a background listener that polls the log and evicts the affected
-tenant's cached mapping on **every** replica within seconds — so a re-pin
-during a slot move takes effect well before the cache TTL (default 30s) would
-expire it. The TTL remains the backstop if the control DB is briefly
-unreachable. (Building your own `DirectoryShardRouter` and installing it via
-`with_shard_router` instead? Call
+table fires `NOTIFY` on every change (including this raw SQL write), and the
+built-in path spawns a background listener that `LISTEN`s on that channel and
+evicts the affected tenant's cached mapping on **every** replica. Because
+Postgres delivers `NOTIFY` at commit, the eviction lands the moment the new
+mapping becomes visible — a re-pin during a slot move takes effect immediately,
+well before the cache TTL (default 30s) would expire it, and a slow-committing
+transaction can't be missed. The TTL remains the backstop if the control DB /
+LISTEN connection is briefly unreachable. (Building your own
+`DirectoryShardRouter` and installing it via `with_shard_router` instead? Call
 `DirectoryShardRouter::spawn_invalidation_listener(..)` yourself, or rely on
 the TTL.)
 
