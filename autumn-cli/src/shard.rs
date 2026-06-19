@@ -156,7 +156,7 @@ pub fn run_move_slot(args: &MoveSlotArgs) {
         );
         return;
     }
-    delete_source_and_report(&from_url, &args, &filter, &verified_src_entries);
+    delete_source_and_report(&from_url, args, &filter, &verified_src_entries);
 }
 
 /// `--confirm` path: delete the verified source rows and report the outcome.
