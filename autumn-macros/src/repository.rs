@@ -615,6 +615,28 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let mut derived_trait_methods = Vec::new();
     let mut derived_impl_methods = Vec::new();
 
+    // §1d: cross-shard derived-query guard. `across_tenants()` only fans out the
+    // framework's own reads (find_all/count/exists_by_id/find_by_id). A
+    // user-declared derived method run under across_tenants on a sharded repo
+    // would otherwise silently hit only the originally-routed shard, so reject
+    // it with a clear error instead. Empty (zero-cost) unless sharded.
+    let derived_cross_shard_guard = if config.sharded && config.tenant_scoped {
+        quote! {
+            if self.across_tenants && self.__autumn_shards.is_some() {
+                return ::core::result::Result::Err(
+                    ::autumn_web::AutumnError::bad_request_msg(
+                        "cross-shard derived queries are not supported: across_tenants() on a \
+                         sharded repository fans out only find_all/count/exists_by_id/find_by_id; \
+                         use a specific-shard repository (e.g. PgRepo::from_shard) for other \
+                         derived methods"
+                    )
+                );
+            }
+        }
+    } else {
+        quote! {}
+    };
+
     for item in &trait_def.items {
         if let TraitItem::Fn(method) = item {
             let method_name = method.sig.ident.to_string();
@@ -684,6 +706,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     async fn #fn_ident(&self, #(#params),*) -> ::autumn_web::AutumnResult<#return_type> {
                         use ::autumn_web::reexports::diesel::prelude::*;
                         use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                        #derived_cross_shard_guard
                         #body
                     }
                 });
@@ -793,6 +816,45 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         __autumn_slow_threshold: self.__autumn_slow_threshold,
                         __autumn_route: self.__autumn_route.clone(),
                     }
+                }
+            }
+        }
+    } else {
+        quote! {}
+    };
+
+    // §1d: build a per-shard sub-repo for cross-shard read fan-out. Mirrors
+    // `across_tenants()` but routes to a specific shard: pool = that shard's
+    // primary, read route = that shard's `read_route()` (so replica routing /
+    // fail-closed is honored, not silently forced to primary), and
+    // `__autumn_shards = None` to stop recursion. The parent's statement timeout
+    // and slow-query threshold are preserved so a fan-out scan respects the same
+    // limits as an ordinary generated read. Only emitted for sharded +
+    // tenant_scoped repos (the only ones that fan out).
+    let for_shard_method = if config.sharded && config.tenant_scoped {
+        let hooks_field = config.hooks_type.as_ref().map(|hooks_ident| {
+            quote! {
+                hooks: <#hooks_ident as ::autumn_web::hooks::RepositoryHooksClone>::autumn_clone(&self.hooks),
+            }
+        });
+        let idempotency_field = if commit_hooks_enabled {
+            quote! { idempotency: self.idempotency.clone(), }
+        } else {
+            quote! {}
+        };
+        quote! {
+            #[doc(hidden)]
+            fn __autumn_for_shard(&self, __shard: &::autumn_web::sharding::Shard) -> Self {
+                Self {
+                    pool: ::core::clone::Clone::clone(__shard.primary_pool()),
+                    #hooks_field
+                    #idempotency_field
+                    across_tenants: true,
+                    __autumn_shards: ::core::option::Option::None,
+                    __autumn_read_route: __shard.read_route(),
+                    __autumn_statement_timeout_ms: self.__autumn_statement_timeout_ms,
+                    __autumn_slow_threshold: self.__autumn_slow_threshold,
+                    __autumn_route: self.__autumn_route.clone(),
                 }
             }
         }
@@ -7446,8 +7508,9 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     // §1d: when sharded + tenant_scoped, fan out across all shards concurrently
     // for across_tenants reads.  Uses ShardSet::fan_out_shards for concurrent
-    // execution.  The sub-repo uses `with_pool_untracked` so its
-    // `__autumn_shards` is `None`, preventing recursion.
+    // execution.  The sub-repo is built with `__autumn_for_shard`, which honors
+    // each shard's read routing and the parent request context and sets
+    // `__autumn_shards = None`, preventing recursion.
     // §1d: fan out `find_all` across all shards for `across_tenants()`. The
     // per-shard work runs through the inherent `__autumn_find_all_one_shard`
     // helper (emitted below) rather than the trait method, so `find_all`'s
@@ -7459,8 +7522,8 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         let dispatch = quote! {
             if self.across_tenants {
                 if let ::core::option::Option::Some(ref __shards) = self.__autumn_shards {
-                    let __vecs = __shards.fan_out_shards(|__pool| {
-                        let __sub = Self::with_pool_untracked(__pool).across_tenants();
+                    let __vecs = __shards.fan_out_shards(|__shard| {
+                        let __sub = self.__autumn_for_shard(__shard);
                         async move { __sub.__autumn_find_all_one_shard().await }
                     }).await?;
                     return ::core::result::Result::Ok(
@@ -7482,6 +7545,40 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         (dispatch, helper)
     } else {
         (find_all_impl, quote! {})
+    };
+
+    // §1d: fan out `find_by_id` across all shards for `across_tenants()`,
+    // returning the first shard that has the row (ids are unique within a
+    // shard). Without this, a cross-tenant `find_by_id` would only consult the
+    // originally-routed shard and report rows on other shards as missing.
+    let (find_by_id_impl, find_by_id_one_shard_helper) = if config.sharded && config.tenant_scoped {
+        let base = find_by_id_impl;
+        let dispatch = quote! {
+            if self.across_tenants {
+                if let ::core::option::Option::Some(ref __shards) = self.__autumn_shards {
+                    let __found = __shards.fan_out_shards(|__shard| {
+                        let __sub = self.__autumn_for_shard(__shard);
+                        async move { __sub.__autumn_find_by_id_one_shard(id).await }
+                    }).await?;
+                    return ::core::result::Result::Ok(
+                        __found.into_iter().flatten().next()
+                    );
+                }
+            }
+            #base
+        };
+        let helper = quote! {
+            #[doc(hidden)]
+            async fn __autumn_find_by_id_one_shard(&self, id: i64) -> ::autumn_web::AutumnResult<::core::option::Option<#model_name>> {
+                use ::autumn_web::reexports::diesel::prelude::*;
+                use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                let mut conn = self.__autumn_acquire_read_conn().await?;
+                #base
+            }
+        };
+        (dispatch, helper)
+    } else {
+        (find_by_id_impl, quote! {})
     };
 
     let count_impl = if config.tenant_scoped {
@@ -7526,8 +7623,8 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         let dispatch = quote! {
             if self.across_tenants {
                 if let ::core::option::Option::Some(ref __shards) = self.__autumn_shards {
-                    let __counts = __shards.fan_out_shards(|__pool| {
-                        let __sub = Self::with_pool_untracked(__pool).across_tenants();
+                    let __counts = __shards.fan_out_shards(|__shard| {
+                        let __sub = self.__autumn_for_shard(__shard);
                         async move { __sub.__autumn_count_one_shard().await }
                     }).await?;
                     return ::core::result::Result::Ok(__counts.into_iter().sum());
@@ -7599,8 +7696,8 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         let dispatch = quote! {
             if self.across_tenants {
                 if let ::core::option::Option::Some(ref __shards) = self.__autumn_shards {
-                    let __results = __shards.fan_out_shards(|__pool| {
-                        let __sub = Self::with_pool_untracked(__pool).across_tenants();
+                    let __results = __shards.fan_out_shards(|__shard| {
+                        let __sub = self.__autumn_for_shard(__shard);
                         async move { __sub.__autumn_exists_by_id_one_shard(id).await }
                     }).await?;
                     return ::core::result::Result::Ok(__results.into_iter().any(|b| b));
@@ -8390,7 +8487,9 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
         impl #pg_name {
             #across_tenants_method
+            #for_shard_method
             #find_all_one_shard_helper
+            #find_by_id_one_shard_helper
             #count_one_shard_helper
             #exists_by_id_one_shard_helper
             #with_pool_method
@@ -10175,10 +10274,73 @@ mod tests {
             generated.contains("__shards"),
             "sharded+tenant_scoped find_all must contain fan-out guard over __shards: {generated}"
         );
-        // It must build a sub-repo with with_pool_untracked
+        // It must build a per-shard sub-repo via __autumn_for_shard, which
+        // honors that shard's read routing and the parent request context
+        // (rather than with_pool_untracked, which forces primary + resets the
+        // timeout).
         assert!(
-            generated.contains("with_pool_untracked"),
-            "fan-out guard must call with_pool_untracked for sub-repo: {generated}"
+            generated.contains("__autumn_for_shard"),
+            "fan-out guard must build sub-repo via __autumn_for_shard: {generated}"
+        );
+    }
+
+    #[test]
+    fn sharded_for_shard_helper_honors_read_route_and_timeout() {
+        let generated = repository_macro(
+            quote! { Post, tenant_scoped, sharded },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        // __autumn_for_shard must source pool + read route from the shard and
+        // carry the parent's statement timeout / slow threshold.
+        assert!(
+            generated.contains("fn __autumn_for_shard"),
+            "must emit the __autumn_for_shard helper: {generated}"
+        );
+        assert!(
+            generated.contains("__shard . read_route ()")
+                || generated.contains("__shard.read_route()"),
+            "sub-repo must adopt the shard's read_route: {generated}"
+        );
+        assert!(
+            generated
+                .contains("__autumn_statement_timeout_ms : self . __autumn_statement_timeout_ms")
+                || generated
+                    .contains("__autumn_statement_timeout_ms: self.__autumn_statement_timeout_ms"),
+            "sub-repo must preserve the parent statement timeout: {generated}"
+        );
+    }
+
+    #[test]
+    fn sharded_tenant_scoped_find_by_id_fans_out() {
+        let generated = repository_macro(
+            quote! { Post, tenant_scoped, sharded },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("__autumn_find_by_id_one_shard"),
+            "sharded+tenant_scoped find_by_id must fan out via a one-shard helper: {generated}"
+        );
+    }
+
+    #[test]
+    fn sharded_tenant_scoped_derived_methods_reject_cross_shard() {
+        let generated = repository_macro(
+            quote! { Post, tenant_scoped, sharded },
+            quote! {
+                pub trait PostRepository {
+                    async fn find_by_title(&self, title: String) -> Vec<Post>;
+                }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("cross-shard derived queries are not supported"),
+            "derived methods on a sharded across_tenants repo must reject cross-shard: {generated}"
         );
     }
 

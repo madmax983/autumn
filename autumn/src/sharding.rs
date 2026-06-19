@@ -833,9 +833,15 @@ impl ShardSet {
     /// per shard.  Fails the whole call if **any** shard errors.
     ///
     /// Intended for cross-shard read fan-out from `across_tenants()` reads on
-    /// `#[repository(tenant_scoped, sharded)]` repositories.  The sub-repo
-    /// created inside `f` must use `with_pool_untracked` so that
-    /// `__autumn_shards` is `None` and recursion is impossible.
+    /// `#[repository(tenant_scoped, sharded)]` repositories.  The closure
+    /// receives each [`Shard`] so it can build a sub-repo that honors that
+    /// shard's read routing (replica/primary/fail-closed) and the parent
+    /// request context; the sub-repo must set `__autumn_shards = None` so
+    /// recursion is impossible.
+    ///
+    /// The closure is invoked synchronously per shard (the `&Shard` borrow ends
+    /// when it returns the owned, `'static` future), so the futures can run
+    /// concurrently without borrowing the [`ShardSet`].
     ///
     /// This is a framework-internal primitive used by generated repository
     /// code.  It is `pub` so that downstream crates can call it from
@@ -846,14 +852,9 @@ impl ShardSet {
     where
         T: Send + 'static,
         Fut: std::future::Future<Output = Result<T, crate::AutumnError>> + Send + 'static,
-        F: Fn(Pool<AsyncPgConnection>) -> Fut + Send + Sync,
+        F: Fn(&Shard) -> Fut + Send + Sync,
     {
-        let futs: Vec<_> = self
-            .inner
-            .shards
-            .iter()
-            .map(|shard| f(shard.primary_pool().clone()))
-            .collect();
+        let futs: Vec<_> = self.inner.shards.iter().map(|shard| f(shard)).collect();
         futures::future::try_join_all(futs).await
     }
 }
