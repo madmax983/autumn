@@ -25,6 +25,7 @@ mod schema {
             id -> Int8,
             tenant_id -> Text,
             title -> Text,
+            deleted_at -> Nullable<Timestamp>,
         }
     }
 }
@@ -32,21 +33,27 @@ mod schema {
 use schema::sharded_tenant_posts;
 
 /// A minimal model living on a tenant-scoped, sharded table.
+/// Carries `deleted_at` so the repository can enable `soft_delete` and exercise
+/// the cross-shard fan-out / reject codegen for the soft-delete readers.
 #[autumn_web::model(table = "sharded_tenant_posts")]
 pub struct ShardedTenantPost {
     #[id]
     pub id: i64,
     pub tenant_id: String,
     pub title: String,
+    pub deleted_at: Option<chrono::NaiveDateTime>,
 }
 
 /// Matching repository — tenant_scoped so `across_tenants()` is generated,
-/// sharded so `__autumn_shards` is present and the fan-out guard is emitted.
+/// sharded so `__autumn_shards` is present and the fan-out guard is emitted,
+/// soft_delete so the `with_deleted` / `only_deleted` fan-out and
+/// `page_only_deleted` cross-shard reject codegen is compiled.
 #[autumn_web::repository(
     ShardedTenantPost,
     table = "sharded_tenant_posts",
     tenant_scoped,
-    sharded
+    sharded,
+    soft_delete
 )]
 pub trait ShardedTenantPostRepository {
     // Derived read: must fan out across shards under `across_tenants()` (a

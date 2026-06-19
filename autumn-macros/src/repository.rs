@@ -976,6 +976,23 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         quote! { false }
     };
 
+    // §1d: cross-shard reject for preload. Empty unless sharded + tenant_scoped.
+    let preload_cross_shard_guard = if config.sharded && config.tenant_scoped {
+        quote! {
+            if self.across_tenants && self.__autumn_shards.is_some() {
+                return ::core::result::Result::Err(
+                    ::autumn_web::AutumnError::bad_request_msg(
+                        "cross-shard preload is not supported: \
+                         associations cannot be loaded from a single routed \
+                         connection across shards; preload per shard instead"
+                    )
+                );
+            }
+        }
+    } else {
+        quote! {}
+    };
+
     let with_pool_method = {
         let hooks_field = config.hooks_type.as_ref().map_or_else(
             || quote! {},
@@ -7278,6 +7295,90 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         quote! {}
     };
 
+    // §1d: cross-shard fan-out / reject fragments for the soft-delete readers.
+    // `with_deleted` / `only_deleted` are unpaginated `Vec`-returning reads, so
+    // under `across_tenants()` on a sharded repo they fan out across every shard
+    // and concatenate the per-shard results (via inherent one-shard helpers, the
+    // same pattern as `find_all`). `page_only_deleted` is paginated and a naive
+    // fan-out would produce wrong page boundaries / totals, so it rejects (like
+    // `page`). All fragments are empty (zero-cost) unless sharded + tenant_scoped.
+    let mut soft_delete_one_shard_helpers: Vec<proc_macro2::TokenStream> = Vec::new();
+    let (with_deleted_fan_out, only_deleted_fan_out, page_only_deleted_cross_shard_guard) =
+        if config.soft_delete && config.sharded && config.tenant_scoped {
+            let with_deleted_fan_out = quote! {
+                if self.across_tenants {
+                    if let ::core::option::Option::Some(ref __shards) = self.__autumn_shards {
+                        let __vecs = __shards.fan_out_shards(|__shard| {
+                            let __sub = self.__autumn_for_shard(__shard);
+                            async move { __sub.__autumn_with_deleted_one_shard().await }
+                        }).await?;
+                        return ::core::result::Result::Ok(
+                            __vecs.into_iter().flatten().collect()
+                        );
+                    }
+                }
+            };
+            let only_deleted_fan_out = quote! {
+                if self.across_tenants {
+                    if let ::core::option::Option::Some(ref __shards) = self.__autumn_shards {
+                        let __vecs = __shards.fan_out_shards(|__shard| {
+                            let __sub = self.__autumn_for_shard(__shard);
+                            async move { __sub.__autumn_only_deleted_one_shard().await }
+                        }).await?;
+                        return ::core::result::Result::Ok(
+                            __vecs.into_iter().flatten().collect()
+                        );
+                    }
+                }
+            };
+            let page_only_deleted_cross_shard_guard = quote! {
+                if self.across_tenants && self.__autumn_shards.is_some() {
+                    return ::core::result::Result::Err(
+                        ::autumn_web::AutumnError::bad_request_msg(
+                            "cross-shard page_only_deleted is not supported: \
+                             across_tenants() fans out unpaginated reads only; \
+                             page a specific shard instead"
+                        )
+                    );
+                }
+            };
+            // The per-shard helpers re-run the single-shard body. The
+            // sub-repo built by `__autumn_for_shard` has across_tenants = true
+            // and __autumn_shards = None, so its tenant_id resolves to None and
+            // the body loads every (deleted) row on that shard.
+            soft_delete_one_shard_helpers.push(quote! {
+                #[doc(hidden)]
+                async fn __autumn_with_deleted_one_shard(&self) -> ::autumn_web::AutumnResult<::std::vec::Vec<#model_name>> {
+                    use ::autumn_web::reexports::diesel::prelude::*;
+                    use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                    let mut conn = self.__autumn_acquire_read_conn().await?;
+                    #table_ident::table
+                        .load::<#model_name>(&mut conn)
+                        .await
+                        .map_err(::autumn_web::AutumnError::from)
+                }
+
+                #[doc(hidden)]
+                async fn __autumn_only_deleted_one_shard(&self) -> ::autumn_web::AutumnResult<::std::vec::Vec<#model_name>> {
+                    use ::autumn_web::reexports::diesel::prelude::*;
+                    use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                    let mut conn = self.__autumn_acquire_read_conn().await?;
+                    #table_ident::table
+                        .filter(#table_ident::deleted_at.is_not_null())
+                        .load::<#model_name>(&mut conn)
+                        .await
+                        .map_err(::autumn_web::AutumnError::from)
+                }
+            });
+            (
+                with_deleted_fan_out,
+                only_deleted_fan_out,
+                page_only_deleted_cross_shard_guard,
+            )
+        } else {
+            (quote! {}, quote! {}, quote! {})
+        };
+
     let soft_delete_impl_methods = if config.soft_delete {
         if config.tenant_scoped {
             let tenant_id_setup = quote! {
@@ -7344,6 +7445,10 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 async fn with_deleted(&self) -> ::autumn_web::AutumnResult<Vec<#model_name>> {
                     use ::autumn_web::reexports::diesel::prelude::*;
                     use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                    // §1d: fan out across all shards under across_tenants. The
+                    // dispatch runs before acquiring a routed connection so no
+                    // drop is needed (see the find_all deadlock rule).
+                    #with_deleted_fan_out
                     #tenant_id_setup
                     let mut conn = self.__autumn_acquire_read_conn().await?;
                     let query = #table_ident::table;
@@ -7362,6 +7467,8 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 async fn only_deleted(&self) -> ::autumn_web::AutumnResult<Vec<#model_name>> {
                     use ::autumn_web::reexports::diesel::prelude::*;
                     use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                    // §1d: fan out across all shards under across_tenants.
+                    #only_deleted_fan_out
                     #tenant_id_setup
                     let mut conn = self.__autumn_acquire_read_conn().await?;
                     let query = #table_ident::table.filter(#table_ident::deleted_at.is_not_null());
@@ -7383,6 +7490,9 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 ) -> ::autumn_web::AutumnResult<::autumn_web::pagination::Page<#model_name>> {
                     use ::autumn_web::reexports::diesel::prelude::*;
                     use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                    // §1d: paginated reads cannot fan out (page/total would be
+                    // wrong across shards); reject under cross-shard access.
+                    #page_only_deleted_cross_shard_guard
                     #tenant_id_setup
                     let mut conn = self.__autumn_acquire_read_conn().await?;
                     let query = #table_ident::table.filter(#table_ident::deleted_at.is_not_null());
@@ -7897,7 +8007,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         quote! {}
     };
 
-    let search_impl_methods = if config.searchable {
+    let (search_impl_methods, search_one_shard_helpers) = if config.searchable {
         let tenant_id_setup = if config.tenant_scoped {
             quote! {
                 let tenant_id = if self.across_tenants {
@@ -7914,11 +8024,50 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             }
         };
 
-        quote! {
-            async fn search(&self, query: &str) -> ::autumn_web::AutumnResult<Vec<#model_name>> {
-                use ::autumn_web::reexports::diesel::prelude::*;
-                use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+        // §1d: under across_tenants on a sharded repo the `Vec`-returning
+        // `search` fans out across every shard and concatenates results (ranking
+        // is per-shard; the merged order is the per-shard ranking concatenated).
+        // The paginated `search_page` rejects, since merging ranked pages across
+        // shards would produce wrong page boundaries / totals.
+        let search_fan_out = if config.sharded && config.tenant_scoped {
+            quote! {
+                if self.across_tenants {
+                    if let ::core::option::Option::Some(ref __shards) = self.__autumn_shards {
+                        let __q = ::std::string::ToString::to_string(query);
+                        let __vecs = __shards.fan_out_shards(|__shard| {
+                            let __sub = self.__autumn_for_shard(__shard);
+                            let __q = ::core::clone::Clone::clone(&__q);
+                            async move { __sub.__autumn_search_one_shard(&__q).await }
+                        }).await?;
+                        return ::core::result::Result::Ok(
+                            __vecs.into_iter().flatten().collect()
+                        );
+                    }
+                }
+            }
+        } else {
+            quote! {}
+        };
+        let search_page_cross_shard_guard = if config.sharded && config.tenant_scoped {
+            quote! {
+                if self.across_tenants && self.__autumn_shards.is_some() {
+                    return ::core::result::Result::Err(
+                        ::autumn_web::AutumnError::bad_request_msg(
+                            "cross-shard search_page is not supported: \
+                             across_tenants() fans out unpaginated reads only; \
+                             page a specific shard instead"
+                        )
+                    );
+                }
+            }
+        } else {
+            quote! {}
+        };
 
+        // The single-shard `search` body, shared by the trait method (as the
+        // fan-out fallthrough) and the inherent `__autumn_search_one_shard`
+        // helper, so the SQL is defined exactly once.
+        let search_body = quote! {
                 if query.trim().is_empty() {
                     return Ok(Vec::new());
                 }
@@ -7993,6 +8142,30 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     .collect();
 
                 Ok(sorted_records)
+        };
+
+        // The inherent per-shard helper for `search`, emitted into the inherent
+        // impl block (a trait impl cannot hold non-trait methods).
+        let search_one_shard_helpers = if config.sharded && config.tenant_scoped {
+            quote! {
+                #[doc(hidden)]
+                async fn __autumn_search_one_shard(&self, query: &str) -> ::autumn_web::AutumnResult<::std::vec::Vec<#model_name>> {
+                    use ::autumn_web::reexports::diesel::prelude::*;
+                    use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                    #search_body
+                }
+            }
+        } else {
+            quote! {}
+        };
+
+        let search_methods = quote! {
+            async fn search(&self, query: &str) -> ::autumn_web::AutumnResult<Vec<#model_name>> {
+                use ::autumn_web::reexports::diesel::prelude::*;
+                use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                // §1d: fan out across all shards under across_tenants.
+                #search_fan_out
+                #search_body
             }
 
             async fn search_page(
@@ -8002,6 +8175,8 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             ) -> ::autumn_web::AutumnResult<::autumn_web::pagination::Page<#model_name>> {
                 use ::autumn_web::reexports::diesel::prelude::*;
                 use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                // §1d: paginated search cannot fan out; reject cross-shard.
+                #search_page_cross_shard_guard
 
                 if query.trim().is_empty() {
                     return Ok(::autumn_web::pagination::Page::new(Vec::new(), 0, req));
@@ -8133,9 +8308,10 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
                 Ok(::autumn_web::pagination::Page::new(sorted_records, total, req))
             }
-        }
+        };
+        (search_methods, search_one_shard_helpers)
     } else {
-        quote! {}
+        (quote! {}, quote! {})
     };
 
     let upsert_set_ext_impl = quote! {};
@@ -8229,6 +8405,24 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     };
 
+    // §1d: cross-shard reject for version_history (keyed by a single, per-shard
+    // -ambiguous record_id and paginated). Empty unless sharded + tenant_scoped.
+    let version_history_cross_shard_guard = if config.sharded && config.tenant_scoped {
+        quote! {
+            if self.across_tenants && self.__autumn_shards.is_some() {
+                return ::core::result::Result::Err(
+                    ::autumn_web::AutumnError::bad_request_msg(
+                        "cross-shard version_history is not supported: \
+                         record ids are unique only within a shard; \
+                         query a specific shard instead"
+                    )
+                );
+            }
+        }
+    } else {
+        quote! {}
+    };
+
     let versioned_history_impl = if config.versioned {
         quote! {
             impl #pg_name {
@@ -8246,6 +8440,13 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     filter: ::autumn_web::version_history::VersionFilter,
                 ) -> ::autumn_web::AutumnResult<::autumn_web::version_history::VersionPage> {
                     use ::autumn_web::reexports::diesel_async::RunQueryDsl as _;
+
+                    // §1d: version_history is keyed by a single `record_id` and
+                    // is paginated; per-shard ids are ambiguous (per-shard
+                    // sequences can mint the same id on multiple shards) and a
+                    // naive page merge would be wrong. Reject under cross-shard
+                    // access rather than silently consulting one shard.
+                    #version_history_cross_shard_guard
 
                     // Private helper struct that can be deserialized from a raw SQL row.
                     #[derive(::autumn_web::reexports::diesel::QueryableByName)]
@@ -8589,6 +8790,8 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             #count_one_shard_helper
             #exists_by_id_one_shard_helper
             #(#derived_one_shard_helpers)*
+            #(#soft_delete_one_shard_helpers)*
+            #search_one_shard_helpers
             #with_pool_method
             #hook_support_methods
 
@@ -8664,6 +8867,10 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 if records.is_empty() {
                     return ::core::result::Result::Ok(::std::vec::Vec::new());
                 }
+                // §1d: a cross-shard result set cannot be preloaded from a
+                // single routed connection (associations may live on any
+                // shard). Reject under across_tenants on a sharded repo.
+                #preload_cross_shard_guard
                 let mut conn = self.__autumn_acquire_read_conn().await?;
                 let mut wrapped: ::std::vec::Vec<
                     ::autumn_web::preload::Preloaded<__Model>
@@ -10592,6 +10799,104 @@ mod tests {
         assert!(
             !generated.contains("cross-shard pagination is not supported"),
             "non-sharded repo must not contain cross-shard pagination guard: {generated}"
+        );
+    }
+
+    // ── §1d: cross-shard soft-delete / search / version_history / preload ──
+
+    #[test]
+    fn sharded_tenant_scoped_soft_delete_readers_fan_out_and_reject() {
+        let generated = repository_macro(
+            quote! { Post, tenant_scoped, sharded, soft_delete },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        // with_deleted / only_deleted fan out via inherent one-shard helpers.
+        assert!(
+            generated.contains("__autumn_with_deleted_one_shard"),
+            "with_deleted must fan out via a one-shard helper: {generated}"
+        );
+        assert!(
+            generated.contains("__autumn_only_deleted_one_shard"),
+            "only_deleted must fan out via a one-shard helper: {generated}"
+        );
+        // page_only_deleted is paginated and must reject cross-shard.
+        assert!(
+            generated.contains("cross-shard page_only_deleted is not supported"),
+            "page_only_deleted must reject cross-shard: {generated}"
+        );
+    }
+
+    #[test]
+    fn sharded_tenant_scoped_search_fans_out_and_search_page_rejects() {
+        let generated = repository_macro(
+            quote! { Post, tenant_scoped, sharded, searchable },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        // search (Vec-returning) fans out via an inherent one-shard helper.
+        assert!(
+            generated.contains("__autumn_search_one_shard"),
+            "search must fan out via a one-shard helper: {generated}"
+        );
+        // search_page is paginated and must reject cross-shard.
+        assert!(
+            generated.contains("cross-shard search_page is not supported"),
+            "search_page must reject cross-shard: {generated}"
+        );
+    }
+
+    #[test]
+    fn sharded_tenant_scoped_version_history_rejects_cross_shard() {
+        let generated = repository_macro(
+            quote! { Post, tenant_scoped, sharded, versioned = true },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        // version_history is keyed by a single (per-shard ambiguous) record_id
+        // and is paginated, so it rejects rather than fanning out.
+        assert!(
+            generated.contains("cross-shard version_history is not supported"),
+            "version_history must reject cross-shard: {generated}"
+        );
+    }
+
+    #[test]
+    fn sharded_tenant_scoped_preload_rejects_cross_shard() {
+        let generated = repository_macro(
+            quote! { Post, tenant_scoped, sharded },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        // preload cannot load associations from a single routed connection
+        // across shards, so it rejects cross-shard.
+        assert!(
+            generated.contains("cross-shard preload is not supported"),
+            "preload must reject cross-shard: {generated}"
+        );
+    }
+
+    #[test]
+    fn non_sharded_soft_delete_readers_have_no_fan_out() {
+        // Non-sharded soft_delete repos keep the plain readers (no helpers,
+        // no reject messages).
+        let generated = repository_macro(
+            quote! { Post, tenant_scoped, soft_delete },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        assert!(
+            !generated.contains("__autumn_with_deleted_one_shard"),
+            "non-sharded with_deleted must not emit a one-shard helper: {generated}"
+        );
+        assert!(
+            !generated.contains("cross-shard page_only_deleted is not supported"),
+            "non-sharded page_only_deleted must not reject cross-shard: {generated}"
         );
     }
 
