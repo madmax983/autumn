@@ -48,8 +48,6 @@ const READY_TIMEOUT_MANAGED_PG: Duration = Duration::from_secs(300);
 /// Extra seconds added to the app's configured shutdown budget before a
 /// graceful `stop` escalates to `SIGKILL`.
 const STOP_GRACE_BUFFER: Duration = Duration::from_secs(5);
-/// Fallback stop budget when the app's shutdown config can't be read.
-const DEFAULT_STOP_TIMEOUT: Duration = Duration::from_secs(40);
 
 /// Contents of the address-discovery file (`serve.addr`): how a client reaches
 /// the running daemon. Serialized as TOML.
@@ -86,22 +84,57 @@ impl AddrFile {
 
 /// Entry point dispatched from `main::run_command`.
 pub fn run(action: Option<ServeAction>, opts: &ServeOptions) {
-    // Daemon mode is built on Unix domain sockets and POSIX signals; the
-    // Windows path isn't supported yet. Fail clearly instead of binding TCP and
-    // exiting (the app rejects `unix_socket` off-Unix) or signalling nothing.
-    #[cfg(not(unix))]
-    {
-        let _ = (action, opts);
-        eprintln!(
-            "autumn serve: daemon mode is currently supported on Unix only \
-             (Linux/macOS). Run the app binary directly on this platform."
-        );
-        std::process::exit(1);
-    }
     #[cfg(unix)]
-    {
-        let code = run_unix(action, opts);
-        std::process::exit(code);
+    let code = run_unix(action, opts);
+    #[cfg(not(unix))]
+    let code = run_non_unix(action, opts);
+    std::process::exit(code);
+}
+
+/// Non-Unix entry point. The background-daemon lifecycle (`--daemon`, `stop`,
+/// `status`, `restart`) is built on Unix domain sockets and POSIX signals and is
+/// not supported here, but a plain foreground `autumn serve` still works: it
+/// builds and runs the app binary, which binds TCP per its config.
+#[cfg(not(unix))]
+fn run_non_unix(action: Option<ServeAction>, opts: &ServeOptions) -> i32 {
+    if action.is_some() || opts.daemon {
+        eprintln!(
+            "autumn serve: daemon mode (--daemon, stop, status, restart) is \
+             currently supported on Unix only (Linux/macOS). Plain `autumn serve` \
+             runs the app in the foreground on this platform."
+        );
+        return 1;
+    }
+    run_foreground_non_unix(opts)
+}
+
+/// Foreground server on non-Unix platforms: build, then run the app binary in
+/// the foreground (it binds TCP per its config, inheriting this terminal so
+/// Ctrl-C reaches it). None of the pidfile/socket/address-file machinery applies
+/// here — that is part of the Unix daemon lifecycle.
+#[cfg(not(unix))]
+fn run_foreground_non_unix(opts: &ServeOptions) -> i32 {
+    let paths = resolve_paths(opts.package.as_deref());
+    if let Err(e) = paths.ensure_dirs() {
+        eprintln!("autumn serve: cannot create runtime dirs: {e}");
+        return 1;
+    }
+    eprintln!("\u{1F342} autumn serve\n");
+    if !crate::dev::cargo_build(opts.package.as_deref(), opts.release) {
+        eprintln!("\u{2717} Build failed. Fix the errors above and retry.");
+        return 1;
+    }
+    let binary = crate::dev::find_binary(opts.package.as_deref(), opts.release);
+    eprintln!("  Running {} in the foreground", binary.display());
+    eprintln!("  Press Ctrl+C to stop\n");
+    // `base_command` sets the managed-Postgres data dir when bundled; the
+    // Unix-socket env is compiled out off-Unix, so the app binds TCP.
+    match base_command(&binary, &paths, opts).status() {
+        Ok(status) => status.code().unwrap_or(1),
+        Err(e) => {
+            eprintln!("\u{2717} Failed to start {}: {e}", binary.display());
+            1
+        }
     }
 }
 
@@ -234,6 +267,17 @@ fn start(opts: &ServeOptions) -> i32 {
 /// (for managed-Postgres apps) point the bundled cluster at a persistent dir.
 fn base_command(binary: &Path, paths: &RuntimePaths, opts: &ServeOptions) -> Command {
     let mut cmd = Command::new(binary);
+    // For a workspace member selected with `-p`, run the child from the member's
+    // manifest dir so its `autumn.toml`/profile and asset dirs resolve correctly
+    // instead of the workspace-root CWD. Set both `current_dir` (covers CWD-
+    // relative assets) and `AUTUMN_MANIFEST_DIR` (the config loader's explicit
+    // override) so the member's config is loaded regardless of build mode.
+    if let Some(pkg) = opts.package.as_deref()
+        && let Some(dir) = crate::dev::find_manifest_dir(pkg)
+    {
+        cmd.current_dir(&dir);
+        cmd.env("AUTUMN_MANIFEST_DIR", &dir);
+    }
     // Unix-socket binding is Unix-only; on other platforms the app rejects the
     // setting and exits, so leave it unset there (the app binds TCP instead).
     #[cfg(unix)]
@@ -282,6 +326,23 @@ fn run_foreground(binary: &Path, paths: &RuntimePaths, opts: &ServeOptions) -> i
 /// Spawn the server detached into the background and supervise readiness.
 fn spawn_daemon(binary: &Path, paths: &RuntimePaths, opts: &ServeOptions) -> i32 {
     let socket = paths.socket_file();
+
+    // A live listener already owning the socket means a daemon is serving here
+    // even if the pidfile is missing or stale. Our child would fail to bind (the
+    // app refuses to clobber a live socket), but readiness probes `connect` and
+    // would otherwise latch onto the *pre-existing* listener and report the
+    // just-spawned child "ready". Detect that here and refuse, mirroring the
+    // pidfile guard.
+    #[cfg(unix)]
+    if std::os::unix::net::UnixStream::connect(&socket).is_ok() {
+        eprintln!(
+            "autumn serve: already running (a live server owns {}). \
+             Use `autumn serve stop` or `autumn serve restart`.",
+            socket.display()
+        );
+        return 1;
+    }
+
     let log_path = paths.log_file();
     let log = match std::fs::File::create(&log_path) {
         Ok(f) => f,
@@ -420,6 +481,15 @@ fn detach(_cmd: &mut Command) {}
 fn wait_for_ready(socket: &Path, child: &mut std::process::Child, timeout: Duration) -> bool {
     let start = std::time::Instant::now();
     loop {
+        // Check child liveness *before* trusting the socket: a child that died
+        // during startup (e.g. failed to bind because another listener owns the
+        // socket) must not be reported ready by a `connect` that succeeds
+        // against that unrelated listener.
+        match child.try_wait() {
+            // Child exited/crashed before binding — fail fast.
+            Ok(Some(_)) | Err(_) => return false,
+            Ok(None) => {}
+        }
         #[cfg(unix)]
         if std::os::unix::net::UnixStream::connect(socket).is_ok() {
             return true;
@@ -427,11 +497,6 @@ fn wait_for_ready(socket: &Path, child: &mut std::process::Child, timeout: Durat
         #[cfg(not(unix))]
         if socket.exists() {
             return true;
-        }
-        match child.try_wait() {
-            // Child exited/crashed before binding — fail fast.
-            Ok(Some(_)) | Err(_) => return false,
-            Ok(None) => {}
         }
         if start.elapsed() >= timeout {
             return false;
@@ -477,7 +542,7 @@ fn stop(opts: &ServeOptions) -> i32 {
         return 0;
     }
 
-    process::stop_pid(rec.pid, stop_timeout());
+    process::stop_pid(rec.pid, stop_timeout(opts));
     cleanup(&paths, &socket);
     println!("autumn serve: stopped");
     0
@@ -486,31 +551,113 @@ fn stop(opts: &ServeOptions) -> i32 {
 /// Graceful-stop budget before escalating to `SIGKILL`, derived from the app's
 /// own `[server]` shutdown config (`prestop_grace_secs` plus
 /// `shutdown_timeout_secs` plus a small buffer) so we never cut off a drain the
-/// server is configured to allow. Falls back to a sane default when
-/// `autumn.toml` is absent or unreadable.
-fn stop_timeout() -> Duration {
-    #[derive(serde::Deserialize)]
-    struct ServerSlice {
-        prestop_grace_secs: Option<u64>,
-        shutdown_timeout_secs: Option<u64>,
+/// server is configured to allow.
+///
+/// Mirrors the app's layering for these two keys: base `autumn.toml`
+/// ← `[profile.<name>]` ← `autumn-<profile>.toml` ← `AUTUMN_SERVER__*` env. The
+/// active profile is read from `AUTUMN_ENV`/`AUTUMN_PROFILE`; the app's
+/// build-mode auto-detection (release ⇒ `prod`) isn't observable to a separate
+/// `stop` invocation, so profile *file* layering applies only when the profile
+/// is set explicitly. Env overrides — read identically by the daemon — always
+/// apply, so a deployment configuring shutdown via `AUTUMN_SERVER__*` is honored.
+/// Config is read from the same directory the daemon used (a `-p` member's
+/// manifest dir, else the current directory).
+fn stop_timeout(opts: &ServeOptions) -> Duration {
+    let base_dir = opts
+        .package
+        .as_deref()
+        .and_then(crate::dev::find_manifest_dir)
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let (prestop, shutdown) = resolve_shutdown_budget(&base_dir);
+    Duration::from_secs(prestop + shutdown) + STOP_GRACE_BUFFER
+}
+
+/// Resolve `(prestop_grace_secs, shutdown_timeout_secs)` with the app's layering.
+/// Defaults match the prod/dev profile smart-defaults for these keys.
+fn resolve_shutdown_budget(base_dir: &Path) -> (u64, u64) {
+    let mut prestop = 5u64;
+    let mut shutdown = 30u64;
+
+    let profile = std::env::var("AUTUMN_ENV")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| {
+            std::env::var("AUTUMN_PROFILE")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+        });
+
+    // Base autumn.toml [server], then inline [profile.<name>].server overrides.
+    if let Ok(contents) = std::fs::read_to_string(base_dir.join("autumn.toml"))
+        && let Ok(table) = toml::from_str::<toml::Table>(&contents)
+    {
+        apply_server_slice(table.get("server"), &mut prestop, &mut shutdown);
+        if let Some(prof) = profile.as_deref() {
+            for name in profile_aliases(prof) {
+                let section = table
+                    .get("profile")
+                    .and_then(|p| p.get(name.as_str()))
+                    .and_then(|p| p.get("server"));
+                apply_server_slice(section, &mut prestop, &mut shutdown);
+            }
+        }
     }
-    #[derive(serde::Deserialize)]
-    struct TomlSlice {
-        server: Option<ServerSlice>,
+
+    // autumn-<profile>.toml [server] overrides (first match wins).
+    if let Some(prof) = profile.as_deref() {
+        for name in profile_aliases(prof) {
+            if let Ok(contents) =
+                std::fs::read_to_string(base_dir.join(format!("autumn-{name}.toml")))
+                && let Ok(table) = toml::from_str::<toml::Table>(&contents)
+            {
+                apply_server_slice(table.get("server"), &mut prestop, &mut shutdown);
+                break;
+            }
+        }
     }
-    let Ok(contents) = std::fs::read_to_string("autumn.toml") else {
-        return DEFAULT_STOP_TIMEOUT;
-    };
-    let Ok(slice) = toml::from_str::<TomlSlice>(&contents) else {
-        return DEFAULT_STOP_TIMEOUT;
-    };
-    let server = slice.server.unwrap_or(ServerSlice {
-        prestop_grace_secs: None,
-        shutdown_timeout_secs: None,
-    });
-    let budget =
-        server.prestop_grace_secs.unwrap_or(5) + server.shutdown_timeout_secs.unwrap_or(30);
-    Duration::from_secs(budget) + STOP_GRACE_BUFFER
+
+    // Env overrides win (highest priority; read identically by the daemon).
+    if let Some(v) = env_u64("AUTUMN_SERVER__PRESTOP_GRACE_SECS") {
+        prestop = v;
+    }
+    if let Some(v) = env_u64("AUTUMN_SERVER__SHUTDOWN_TIMEOUT_SECS") {
+        shutdown = v;
+    }
+
+    (prestop, shutdown)
+}
+
+/// Overlay `prestop_grace_secs`/`shutdown_timeout_secs` from a `[server]` slice.
+fn apply_server_slice(server: Option<&toml::Value>, prestop: &mut u64, shutdown: &mut u64) {
+    let Some(server) = server else { return };
+    if let Some(v) = server
+        .get("prestop_grace_secs")
+        .and_then(toml::Value::as_integer)
+        .and_then(|v| u64::try_from(v).ok())
+    {
+        *prestop = v;
+    }
+    if let Some(v) = server
+        .get("shutdown_timeout_secs")
+        .and_then(toml::Value::as_integer)
+        .and_then(|v| u64::try_from(v).ok())
+    {
+        *shutdown = v;
+    }
+}
+
+/// Profile name plus legacy aliases, matching the app's lookup order.
+fn profile_aliases(profile: &str) -> Vec<String> {
+    match profile.trim().to_ascii_lowercase().as_str() {
+        "prod" | "production" => vec!["production".to_owned(), "prod".to_owned()],
+        "dev" | "development" => vec!["development".to_owned(), "dev".to_owned()],
+        _ => vec![profile.trim().to_owned()],
+    }
+}
+
+/// Parse a `u64` env var, ignoring empty or invalid values.
+fn env_u64(key: &str) -> Option<u64> {
+    std::env::var(key).ok()?.trim().parse::<u64>().ok()
 }
 
 /// Report daemon status. Exit code 0 = running, 3 = stopped.
@@ -587,5 +734,84 @@ mod tests {
         // so unrelated checkouts with the same package name don't collide.
         assert!(id.starts_with("my-svc-"), "got {id}");
         assert!(id.len() > "my-svc-".len());
+    }
+
+    // Env vars touched by these tests; cleared so a polluted outer environment
+    // can't skew the budget resolution.
+    const SHUTDOWN_ENV: [&str; 4] = [
+        "AUTUMN_ENV",
+        "AUTUMN_PROFILE",
+        "AUTUMN_SERVER__PRESTOP_GRACE_SECS",
+        "AUTUMN_SERVER__SHUTDOWN_TIMEOUT_SECS",
+    ];
+
+    fn clear_shutdown_env() -> Vec<(&'static str, Option<&'static str>)> {
+        SHUTDOWN_ENV.iter().map(|k| (*k, None)).collect()
+    }
+
+    #[test]
+    fn shutdown_budget_defaults_when_no_config() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        temp_env::with_vars(clear_shutdown_env(), || {
+            assert_eq!(resolve_shutdown_budget(dir.path()), (5, 30));
+        });
+    }
+
+    #[test]
+    fn shutdown_budget_reads_base_server_section() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("autumn.toml"),
+            "[server]\nprestop_grace_secs = 10\nshutdown_timeout_secs = 100\n",
+        )
+        .expect("write");
+        temp_env::with_vars(clear_shutdown_env(), || {
+            assert_eq!(resolve_shutdown_budget(dir.path()), (10, 100));
+        });
+    }
+
+    #[test]
+    fn shutdown_budget_env_override_wins() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("autumn.toml"),
+            "[server]\nprestop_grace_secs = 10\nshutdown_timeout_secs = 100\n",
+        )
+        .expect("write");
+        let mut vars = clear_shutdown_env();
+        vars.push(("AUTUMN_SERVER__SHUTDOWN_TIMEOUT_SECS", Some("7")));
+        temp_env::with_vars(vars, || {
+            // Env wins for shutdown; prestop still comes from the file.
+            assert_eq!(resolve_shutdown_budget(dir.path()), (10, 7));
+        });
+    }
+
+    #[test]
+    fn shutdown_budget_layers_profile_file_and_inline_section() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("autumn.toml"),
+            "[server]\nprestop_grace_secs = 10\nshutdown_timeout_secs = 100\n\
+             [profile.prod.server]\nprestop_grace_secs = 15\n",
+        )
+        .expect("write");
+        std::fs::write(
+            dir.path().join("autumn-prod.toml"),
+            "[server]\nshutdown_timeout_secs = 200\n",
+        )
+        .expect("write");
+        let mut vars = clear_shutdown_env();
+        vars.push(("AUTUMN_ENV", Some("prod")));
+        temp_env::with_vars(vars, || {
+            // prestop from inline [profile.prod], shutdown from autumn-prod.toml.
+            assert_eq!(resolve_shutdown_budget(dir.path()), (15, 200));
+        });
+    }
+
+    #[test]
+    fn profile_aliases_cover_canonical_and_custom() {
+        assert_eq!(profile_aliases("production"), vec!["production", "prod"]);
+        assert_eq!(profile_aliases("DEV"), vec!["development", "dev"]);
+        assert_eq!(profile_aliases("staging"), vec!["staging"]);
     }
 }

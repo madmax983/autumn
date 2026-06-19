@@ -375,6 +375,11 @@ mod tests {
         }
     }
 
+    // Reclaiming a stale lock depends on liveness detection recognizing the
+    // recorded PID as gone. The non-Unix `is_process_alive` is deliberately
+    // conservative (always "alive") so we never steal another instance's lock,
+    // so stale reclamation is only observable on Unix.
+    #[cfg(unix)]
     #[test]
     fn stale_pidfile_reclaimed() {
         let dir = tempfile::tempdir().expect("tempdir");

@@ -47,6 +47,37 @@ const STARTUP_TIMEOUT: Duration = Duration::from_secs(60);
 /// `primary_url`). Set at most once per process.
 static RESOLVED_PRIMARY_URL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
+/// The managed provider that started a cluster this process, retained so
+/// abnormal boot-failure paths can stop the supervised child even though they
+/// bypass `on_shutdown`. Set at most once per process.
+static EMERGENCY_PROVIDER: std::sync::OnceLock<ManagedPostgresPoolProvider> =
+    std::sync::OnceLock::new();
+
+/// Synchronously stop the managed Postgres cluster started this process, if any.
+///
+/// Wired into abnormal boot-failure paths (e.g. a failed startup migration) that
+/// call [`std::process::exit`] — which skips `on_shutdown` hooks and Rust
+/// destructors and would otherwise orphan the supervised Postgres child while it
+/// holds the data dir and port. Best-effort and idempotent: a no-op when no
+/// managed cluster is running or it was already stopped cleanly.
+pub(crate) fn emergency_stop() {
+    let Some(provider) = EMERGENCY_PROVIDER.get() else {
+        return;
+    };
+    // These exit paths run on a blocking migration thread (no async runtime
+    // entered), so drive the async stop to completion on a short-lived
+    // current-thread runtime.
+    match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt.block_on(provider.stop()),
+        Err(e) => {
+            tracing::warn!(error = %e, "could not stop managed Postgres during emergency shutdown");
+        }
+    }
+}
+
 /// The managed-Postgres primary URL resolved at boot, if a managed provider has
 /// started its cluster this process. Used by the migration runner.
 #[must_use]
@@ -165,6 +196,13 @@ impl ManagedPostgresPoolProvider {
         if let Ok(mut guard) = self.instance.lock() {
             *guard = Some(pg);
         }
+
+        // Register for emergency shutdown so an abnormal boot exit (which
+        // bypasses `on_shutdown`) still stops the supervised child instead of
+        // orphaning it. The clone shares `instance`, so this is idempotent with
+        // a normal `stop()`.
+        let _ = EMERGENCY_PROVIDER.set(self.clone());
+
         Ok(url)
     }
 

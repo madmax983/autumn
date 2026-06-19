@@ -885,6 +885,29 @@ fn cargo_metadata() -> serde_json::Value {
     serde_json::from_slice(&output.stdout).expect("parse cargo metadata")
 }
 
+/// Directory containing a workspace member's `Cargo.toml`, resolved via
+/// `cargo metadata`.
+///
+/// `autumn serve -p <member>` launched from a workspace root would otherwise run
+/// the app with the workspace-root CWD, so the app's config loader (which falls
+/// back to CWD when `AUTUMN_MANIFEST_DIR` is unset) skips the member's
+/// `autumn.toml`/profile and asset dirs. Callers use this to point the child at
+/// the member's directory. Returns `None` if metadata can't be read or the
+/// package isn't found.
+#[must_use]
+pub fn find_manifest_dir(package: &str) -> Option<PathBuf> {
+    let metadata = cargo_metadata();
+    metadata["packages"].as_array()?.iter().find_map(|pkg| {
+        if pkg["name"].as_str() == Some(package) {
+            Path::new(pkg["manifest_path"].as_str()?)
+                .parent()
+                .map(Path::to_path_buf)
+        } else {
+            None
+        }
+    })
+}
+
 /// Resolve a binary path from parsed cargo metadata JSON.
 ///
 /// Extracted from `find_binary` for testability. Takes the parsed

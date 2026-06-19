@@ -137,7 +137,14 @@ pub fn generate_with(name: &str, parent_dir: &Path, opts: GenerateOptions) -> Re
     }
 
     let render = |template: &str| -> String {
+        // Templates are embedded via `include_str!`; on Windows they may be
+        // checked out with CRLF line endings (git autocrlf), which would break
+        // the `\n`-anchored `.replace()` rewrites below (migration stripping,
+        // dependency edits) and silently emit the wrong scaffold. Normalize to
+        // LF so generation is deterministic — and generated projects use LF —
+        // regardless of the host platform's checkout.
         template
+            .replace("\r\n", "\n")
             .replace("{{project_name}}", name)
             .replace("{{crate_name}}", &crate_name)
             .replace("{{autumn_version}}", autumn_version)

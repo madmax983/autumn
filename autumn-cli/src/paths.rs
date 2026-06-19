@@ -157,6 +157,9 @@ mod tests {
         assert_eq!(paths.log_file(), Path::new("/var/run/demo/serve.log"));
     }
 
+    // Uses a Unix-style absolute base; `/tmp/...` is not absolute on Windows
+    // (no drive/UNC prefix), so the absoluteness assertion is unix-specific.
+    #[cfg(unix)]
     #[test]
     fn paths_socket_absolute_under_base() {
         let paths = RuntimePaths::from_base(Path::new("/tmp/xdg-base"), "svc");

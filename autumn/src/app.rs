@@ -3095,6 +3095,14 @@ impl AppBuilder {
             }
             #[cfg(unix)]
             BoundListener::Unix(listener) => {
+                // UDS requests carry no TCP peer, so stamp a loopback identity
+                // before `TrustedProxiesLayer` runs — local daemon requests then
+                // resolve a `ClientAddr` (and IP-based maintenance/rate-limit
+                // behavior works) exactly like a localhost TCP connection.
+                let service = tower::Layer::layer(
+                    &axum::middleware::from_fn(stamp_loopback_connect_info),
+                    service,
+                );
                 let make_service =
                     axum::ServiceExt::<axum::extract::Request>::into_make_service_with_connect_info::<
                         UdsConnectInfo,
@@ -4754,6 +4762,33 @@ impl
     }
 }
 
+/// Stamp a loopback peer (`127.0.0.1`) on Unix-domain-socket requests.
+///
+/// A UDS connection has no TCP peer `SocketAddr`, so without this the
+/// trusted-proxy resolver and the [`ClientAddr`](crate::extract::ClientAddr)
+/// extractor resolve no client address — breaking any route or middleware that
+/// requires `ClientAddr` and any IP-based maintenance/rate-limit behavior. Local
+/// daemon requests are loopback-equivalent, so present them as a `127.0.0.1`
+/// connection (matching how an equivalent localhost TCP request is treated).
+/// Installed before `TrustedProxiesLayer` on the UDS serve path only.
+#[cfg(unix)]
+async fn stamp_loopback_connect_info(
+    mut req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    if req
+        .extensions()
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+        .is_none()
+    {
+        let loopback =
+            std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 0);
+        req.extensions_mut()
+            .insert(axum::extract::ConnectInfo(loopback));
+    }
+    next.run(req).await
+}
+
 /// Prepare a Unix-socket path for binding: remove a *stale* socket left by a
 /// previous run, but refuse to touch a non-socket file (guards against
 /// clobbering a regular file) or a socket with a **live** listener (probed via
@@ -5437,6 +5472,10 @@ async fn run_startup_migrations(
     .await
     .unwrap_or_else(|e| {
         tracing::error!(error = %e, "Migration task panicked");
+        // Same orphan hazard as a migration failure: `process::exit` skips
+        // `on_shutdown`, so stop any managed Postgres before bailing.
+        #[cfg(feature = "managed-pg")]
+        crate::managed_pg::emergency_stop();
         std::process::exit(1);
     });
 }
