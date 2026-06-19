@@ -1,10 +1,16 @@
 //! Worked example: move one or more tenants' data from a source shard to a
 //! destination shard, safely (issue #1209 §3b).
 //!
-//! This is the *data movement* half of resharding. It does NOT flip the slot
-//! map — you do that in `autumn.toml` only AFTER this tool verifies the copy
-//! (see the runbook in `docs/guide/sharding.md`). Order matters:
-//! copy → verify → cut the slot over → delete from source.
+//! This is the *data movement* half of resharding. It does NOT change routing —
+//! you do that only AFTER this tool verifies the copy (see the runbook in
+//! `docs/guide/sharding.md`). Order matters:
+//! copy → verify → re-route the moved tenants → delete from source.
+//!
+//! Re-route by PINNING each moved tenant in the directory (`_autumn_shard_
+//! directory`), not by remapping a hash slot in `autumn.toml`: a slot is shared
+//! by every tenant that hashes to it, so remapping it for a single-tenant move
+//! also reroutes co-tenants whose rows were not copied, making their data
+//! disappear. Remap a slot only when copying every key in that slot.
 //!
 //! For the given tenant key(s) it:
 //!   1. SELECTs their `bookmarks` rows from the source and INSERTs them into
@@ -213,8 +219,14 @@ async fn main() {
         eprintln!(
             "✓ Copy verified but source rows were KEPT (no --confirm).\n  \
              Next steps:\n    \
-             1. Move these tenants' slot(s) to the destination shard in autumn.toml\n       \
-             and deploy, so new writes land on the destination.\n    \
+             1. Route these tenants to the destination shard, then deploy so new\n       \
+             writes land there. Prefer PINNING each tenant in the directory\n       \
+             (INSERT INTO _autumn_shard_directory (tenant_key, shard_name) …) so\n       \
+             ONLY the copied tenants move. Do NOT remap the hash slot in\n       \
+             autumn.toml for a single-tenant move: a slot is shared by every\n       \
+             tenant that hashes to it, and remapping reroutes those co-tenants\n       \
+             too — but their rows were not copied, so their data goes missing.\n       \
+             (Remap a slot only when copying every key in that slot.)\n    \
              2. Re-run with --confirm to delete the now-stale source rows."
         );
         return;

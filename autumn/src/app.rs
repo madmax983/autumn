@@ -5241,19 +5241,38 @@ async fn resolve_shard_set(
             // wide the moment it commits (LISTEN/NOTIFY) rather than waiting out
             // the TTL. Skipped during a static build (no DB access); needs the
             // control URL, without one we silently fall back to TTL-only refresh.
-            if let Some(control_url) = spawn_directory_listener
-                .then(|| config.database.effective_primary_url())
-                .flatten()
-            {
-                // Detach: the listener runs for the life of the process; dropping
-                // the JoinHandle leaves the task running rather than aborting it.
-                drop(
-                    crate::sharding::DirectoryShardRouter::spawn_invalidation_listener(
-                        Arc::clone(&dir_router),
-                        control_url.to_owned(),
-                        crate::sharding::DEFAULT_DIRECTORY_INVALIDATION_SWEEP_INTERVAL,
-                    ),
-                );
+            if spawn_directory_listener {
+                if let Some(control_url) = config.database.effective_primary_url() {
+                    // Detach: the listener runs for the life of the process;
+                    // dropping the JoinHandle leaves the task running rather than
+                    // aborting it.
+                    drop(
+                        crate::sharding::DirectoryShardRouter::spawn_invalidation_listener(
+                            Arc::clone(&dir_router),
+                            control_url.to_owned(),
+                            crate::sharding::DEFAULT_DIRECTORY_INVALIDATION_SWEEP_INTERVAL,
+                        ),
+                    );
+                } else {
+                    // Directory routing is active but there is no control URL to
+                    // open a dedicated LISTEN connection — e.g. a custom
+                    // `DatabasePoolProvider` supplied the control pool without
+                    // `database.primary_url`/`url`. The router still serves
+                    // lookups from the provided pool, but re-pins won't be
+                    // invalidated fleet-wide on commit; they only take effect
+                    // after the cache TTL expires. Warn rather than fall back
+                    // silently so operators relying on the directory for slot
+                    // moves can configure a control URL (or accept TTL-only
+                    // refresh) deliberately.
+                    tracing::warn!(
+                        "directory shard routing is enabled but no control database URL is \
+                         configured (database.primary_url/url is unset, e.g. a custom \
+                         DatabasePoolProvider supplied the control pool); the cache-\
+                         invalidation LISTEN/NOTIFY task cannot be started, so directory \
+                         re-pins will only take effect after the cache TTL expires rather \
+                         than fleet-wide on commit"
+                    );
+                }
             }
             dir_router
         }
