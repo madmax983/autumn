@@ -1529,6 +1529,82 @@ mod tests {
         );
     }
 
+    // ── effective_profile ─────────────────────────────────────────────────────
+
+    #[test]
+    fn effective_profile_prefers_autumn_env_over_legacy_and_flag() {
+        temp_env::with_vars(
+            [
+                ("AUTUMN_ENV", Some("prod")),
+                ("AUTUMN_PROFILE", Some("dev")),
+                ("AUTUMN_IS_DEBUG", None),
+            ],
+            || {
+                // AUTUMN_ENV wins over a stale legacy AUTUMN_PROFILE and an
+                // explicit --profile flag, mirroring the runtime loader.
+                assert_eq!(effective_profile(Some("staging")), "prod");
+            },
+        );
+    }
+
+    #[test]
+    fn effective_profile_uses_legacy_when_no_autumn_env() {
+        temp_env::with_vars(
+            [
+                ("AUTUMN_ENV", None),
+                ("AUTUMN_PROFILE", Some("prod")),
+                ("AUTUMN_IS_DEBUG", None),
+            ],
+            || {
+                assert_eq!(effective_profile(None), "prod");
+            },
+        );
+    }
+
+    #[test]
+    fn effective_profile_uses_explicit_flag_when_no_env() {
+        temp_env::with_vars(
+            [
+                ("AUTUMN_ENV", None::<&str>),
+                ("AUTUMN_PROFILE", None),
+                ("AUTUMN_IS_DEBUG", None),
+            ],
+            || {
+                assert_eq!(effective_profile(Some("staging")), "staging");
+            },
+        );
+    }
+
+    #[test]
+    fn effective_profile_defaults_to_dev() {
+        temp_env::with_vars(
+            [
+                ("AUTUMN_ENV", None::<&str>),
+                ("AUTUMN_PROFILE", None),
+                ("AUTUMN_IS_DEBUG", None),
+            ],
+            || {
+                // No env, no flag, debug build → dev (the runtime default), so the
+                // CLI applies the same [profile.dev]/autumn-dev.toml overlay.
+                assert_eq!(effective_profile(None), "dev");
+            },
+        );
+    }
+
+    #[test]
+    fn effective_profile_release_mode_defaults_to_prod() {
+        temp_env::with_vars(
+            [
+                ("AUTUMN_ENV", None),
+                ("AUTUMN_PROFILE", None),
+                ("AUTUMN_IS_DEBUG", Some("0")),
+            ],
+            || {
+                assert_eq!(effective_profile(None), "prod");
+            },
+        );
+    }
+
     // ── is_production_profile ─────────────────────────────────────────────────
 
     #[test]
