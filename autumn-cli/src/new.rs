@@ -64,6 +64,14 @@ pub struct GenerateOptions {
     pub with_i18n: bool,
     /// Scaffold the optional seed binary and enable `autumn-web/seed`.
     pub with_seed: bool,
+    /// Daemon-flavored starter: a model-free app that builds with **no** Postgres
+    /// (drops the default `db` feature and migrations), ready for `autumn serve`.
+    pub with_daemon: bool,
+    /// Managed/bundled-Postgres daemon starter: keeps `db`, enables the
+    /// `managed-pg` feature, and wires a managed local Postgres provider.
+    /// Implies [`Self::with_daemon`]-style serve usage. Mutually exclusive with a
+    /// DB-free daemon.
+    pub with_bundled_pg: bool,
 }
 
 /// Generate a new Autumn project under `parent_dir/name` with default options.
@@ -109,7 +117,7 @@ pub fn generate_with(name: &str, parent_dir: &Path, opts: GenerateOptions) -> Re
     );
     fs::write(project_dir.join("Cargo.toml"), cargo_toml)?;
 
-    let main_rs = if opts.with_i18n {
+    let mut main_rs = if opts.with_i18n {
         render(templates::MAIN_RS).replace(
             "        .routes(routes![index, hello, hello_name])",
             "        .i18n_auto()\n        .routes(routes![index, hello, hello_name])",
@@ -117,15 +125,25 @@ pub fn generate_with(name: &str, parent_dir: &Path, opts: GenerateOptions) -> Re
     } else {
         render(templates::MAIN_RS)
     };
+    if opts.with_daemon && !opts.with_bundled_pg {
+        // DB-free daemon: the `migrate` module is db-gated, so drop migrations.
+        main_rs = strip_migrations(&main_rs);
+    }
     fs::write(project_dir.join("src/main.rs"), main_rs)?;
 
-    let autumn_toml = if opts.with_i18n {
+    let mut autumn_toml = if opts.with_i18n {
         let mut s = render(templates::AUTUMN_TOML);
         s.push_str("\n[i18n]\ndefault_locale = \"en\"\nsupported_locales = [\"en\"]\n");
         s
     } else {
         render(templates::AUTUMN_TOML)
     };
+    if opts.with_daemon && !opts.with_bundled_pg {
+        autumn_toml.push_str(
+            "\n# Daemon starter: this app uses no database. Run it as a local\n\
+             # daemon with `autumn serve --daemon` (no Postgres required).\n",
+        );
+    }
     fs::write(project_dir.join("autumn.toml"), autumn_toml)?;
     fs::write(
         project_dir.join("Dockerfile"),
@@ -235,6 +253,31 @@ fn print_scaffold_summary(name: &str, opts: GenerateOptions) {
     }
 }
 
+/// Remove the diesel-migrations wiring from a generated `main.rs` so a DB-free
+/// app compiles without the db-gated `migrate` module.
+fn strip_migrations(main_rs: &str) -> String {
+    main_rs
+        .replace(
+            "use autumn_web::migrate::{EmbeddedMigrations, embed_migrations};\n",
+            "",
+        )
+        .replace(
+            "const MIGRATIONS: EmbeddedMigrations = embed_migrations!();\n\n",
+            "",
+        )
+        .replace("\n        .migrations(MIGRATIONS)", "")
+}
+
+/// Default `autumn-web` features minus `db` — the DB-free daemon feature set.
+const DAEMON_NO_DB_FEATURES: &[&str] = &[
+    "maud",
+    "htmx",
+    "tailwind",
+    "cache-moka",
+    "http-client",
+    "reporting",
+];
+
 fn render_cargo_toml(
     opts: GenerateOptions,
     autumn_version: &str,
@@ -242,6 +285,28 @@ fn render_cargo_toml(
     seed_bin_toml: &str,
 ) -> String {
     use std::fmt::Write;
+
+    // DB-free daemon starter: switch off default features (drops `db`) so the
+    // binary links no Postgres, and remove the diesel migrations dependency.
+    if opts.with_daemon && !opts.with_bundled_pg {
+        let plain_dep = format!(r#"autumn-web = "{autumn_version}""#);
+        let mut features: Vec<&str> = DAEMON_NO_DB_FEATURES.to_vec();
+        if opts.with_i18n {
+            features.push("i18n");
+        }
+        let features_str = features
+            .iter()
+            .map(|f| format!(r#""{f}""#))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let dep = format!(
+            r#"autumn-web = {{ version = "{autumn_version}", default-features = false, features = [{features_str}] }}"#
+        );
+        cargo_toml = cargo_toml.replace(&plain_dep, &dep);
+        cargo_toml = cargo_toml.replace("diesel_migrations = \"2\"\n", "");
+        return cargo_toml;
+    }
+
     let mut features = Vec::new();
     if opts.with_i18n {
         features.push("i18n");
@@ -590,6 +655,62 @@ mod tests {
         assert!(!main.contains(".i18n_auto()"));
     }
 
+    fn daemon_opts() -> GenerateOptions {
+        GenerateOptions {
+            with_daemon: true,
+            ..GenerateOptions::default()
+        }
+    }
+
+    #[test]
+    fn daemon_starter_omits_db_feature() {
+        let tmp = TempDir::new().unwrap();
+        generate_with("daemon-app", tmp.path(), daemon_opts()).unwrap();
+        let cargo = fs::read_to_string(tmp.path().join("daemon-app/Cargo.toml")).unwrap();
+        assert!(
+            cargo.contains("default-features = false"),
+            "daemon starter must disable default features (drop db): {cargo}"
+        );
+        assert!(!cargo.contains("\"db\""), "daemon starter must not enable db");
+        assert!(
+            !cargo.contains("diesel_migrations"),
+            "daemon starter must not depend on diesel_migrations"
+        );
+    }
+
+    #[test]
+    fn daemon_starter_main_has_no_migrations() {
+        let tmp = TempDir::new().unwrap();
+        generate_with("daemon-main-app", tmp.path(), daemon_opts()).unwrap();
+        let main = fs::read_to_string(tmp.path().join("daemon-main-app/src/main.rs")).unwrap();
+        assert!(!main.contains(".migrations("), "daemon main must not call .migrations()");
+        assert!(
+            !main.contains("embed_migrations"),
+            "daemon main must not embed migrations"
+        );
+    }
+
+    #[test]
+    fn daemon_starter_autumn_toml_documents_zero_db() {
+        let tmp = TempDir::new().unwrap();
+        generate_with("daemon-cfg-app", tmp.path(), daemon_opts()).unwrap();
+        let toml = fs::read_to_string(tmp.path().join("daemon-cfg-app/autumn.toml")).unwrap();
+        assert!(toml.contains("autumn serve"));
+    }
+
+    #[test]
+    fn default_generation_still_has_db() {
+        let tmp = TempDir::new().unwrap();
+        generate("plain-app", tmp.path()).unwrap();
+        let cargo = fs::read_to_string(tmp.path().join("plain-app/Cargo.toml")).unwrap();
+        // Default keeps the simple full-default dependency and migrations.
+        assert!(cargo.contains(r#"autumn-web = ""#));
+        assert!(!cargo.contains("default-features = false"));
+        assert!(cargo.contains("diesel_migrations"));
+        let main = fs::read_to_string(tmp.path().join("plain-app/src/main.rs")).unwrap();
+        assert!(main.contains(".migrations("));
+    }
+
     #[test]
     fn with_i18n_scaffolds_translation_dir_and_stub_file() {
         let tmp = TempDir::new().unwrap();
@@ -749,6 +870,7 @@ mod tests {
             GenerateOptions {
                 with_i18n: true,
                 with_seed: true,
+                ..GenerateOptions::default()
             },
         )
         .unwrap();

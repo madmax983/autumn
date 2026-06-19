@@ -65,6 +65,14 @@ enum Commands {
         /// Scaffold a stub `src/bin/seed.rs` for database seeding (default off)
         #[arg(long)]
         with_seed: bool,
+        /// Daemon starter: a model-free app that builds with no Postgres,
+        /// ready to run as a local daemon via `autumn serve`.
+        #[arg(long)]
+        daemon: bool,
+        /// Managed/bundled-Postgres daemon starter: keeps the database and
+        /// wires a managed local Postgres provider (implies a daemon app).
+        #[arg(long = "bundled-pg")]
+        bundled_pg: bool,
     },
     /// Pre-render static routes to dist/
     Build {
@@ -1496,11 +1504,16 @@ fn run_command(command: Commands) {
             name,
             with_i18n,
             with_seed,
+            daemon,
+            bundled_pg,
         } => new::run(
             &name,
             new::GenerateOptions {
                 with_i18n,
                 with_seed,
+                // --bundled-pg is a daemon flavor that keeps the database.
+                with_daemon: daemon || bundled_pg,
+                with_bundled_pg: bundled_pg,
             },
         ),
 
@@ -3087,11 +3100,35 @@ mod tests {
                 name,
                 with_i18n,
                 with_seed,
+                ..
             } => {
                 assert_eq!(name, "my-app");
                 assert!(with_i18n);
                 assert!(with_seed);
             }
+            _ => panic!("expected New command"),
+        }
+    }
+
+    #[test]
+    fn parse_new_daemon_flag() {
+        let cli = Cli::try_parse_from(["autumn", "new", "svc", "--daemon"]).unwrap();
+        match cli.command {
+            Commands::New {
+                daemon, bundled_pg, ..
+            } => {
+                assert!(daemon);
+                assert!(!bundled_pg);
+            }
+            _ => panic!("expected New command"),
+        }
+    }
+
+    #[test]
+    fn parse_new_bundled_pg_flag() {
+        let cli = Cli::try_parse_from(["autumn", "new", "svc", "--bundled-pg"]).unwrap();
+        match cli.command {
+            Commands::New { bundled_pg, .. } => assert!(bundled_pg),
             _ => panic!("expected New command"),
         }
     }
