@@ -1263,14 +1263,17 @@ pub fn build_shard_set(
 /// Framework health indicator registered per shard as `db:shard:<name>`.
 ///
 /// Mirrors the control topology's lifecycle: on every readiness probe it
-/// snapshots the primary pool, live-checks replica connectivity, and
-/// re-runs the migration parity comparison, feeding the shard's runtime
-/// state (which gates [`Shard::read_pool`]).
+/// live-checks primary and replica connectivity and re-runs the migration
+/// parity comparison, feeding the shard's runtime state (which gates
+/// [`Shard::read_pool`]). A shard whose primary is unreachable reports `Down`
+/// even when a replica can still serve reads, since writes and primary reads
+/// would fail.
 ///
-/// Reports `Down` — gating `/ready` — only when the shard's replica is
-/// unready **and** its `replica_fallback` is `fail_readiness`; a
-/// `primary`-fallback shard degrades to primary reads and stays `Up`
-/// with the replica state in its details.
+/// Reports `Down` — gating `/ready` — when the shard primary is unreachable,
+/// or when the shard's replica is unready **and** its `replica_fallback` is
+/// `fail_readiness`. A `primary`-fallback shard with a reachable primary
+/// degrades to primary reads and stays `Up` with the replica state in its
+/// details.
 pub(crate) struct ShardHealthIndicator {
     shard: Shard,
 }
@@ -1344,9 +1347,34 @@ impl crate::actuator::HealthIndicator for ShardHealthIndicator {
                 }
             }
 
-            // `read_pool()` is `None` exactly when the replica is unready
-            // under `fail_readiness` — the only state that gates `/ready`.
-            let output = if self.shard.read_pool().is_some() {
+            // Live-check the shard primary. `read_pool()` alone is not enough:
+            // a primary-only shard's `read_pool()` always returns the primary
+            // pool (so it is `Some` even when the primary is down), and a
+            // replicated shard's `read_pool()` can be `Some` via a healthy
+            // replica while the primary is unreachable — yet all shard writes
+            // and primary reads would fail at request time. Probe the primary
+            // (like the replica connectivity check above) and gate `/ready` on
+            // it so load balancers stop routing to an instance that cannot
+            // reach a shard primary.
+            let primary_ok = match self.shard.primary_pool().get().await {
+                Ok(conn) => {
+                    drop(conn);
+                    true
+                }
+                Err(error) => {
+                    details.insert(
+                        "primary_detail".to_owned(),
+                        serde_json::json!(format!("primary connection failed: {error}")),
+                    );
+                    false
+                }
+            };
+            details.insert("primary_ready".to_owned(), serde_json::json!(primary_ok));
+
+            // `read_pool()` is `None` exactly when the replica is unready under
+            // `fail_readiness`. Report `Up` only when the primary is reachable
+            // *and* a read pool is available; either failing gates `/ready`.
+            let output = if primary_ok && self.shard.read_pool().is_some() {
                 crate::actuator::HealthCheckOutput::up()
             } else {
                 crate::actuator::HealthCheckOutput::down()
@@ -2660,18 +2688,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shard_indicator_stays_up_for_primary_fallback_replica() {
+    async fn shard_indicator_reports_down_when_primary_unreachable() {
         use crate::actuator::HealthIndicator as _;
 
+        // `ReplicaFallback::Primary` would normally let a dead replica degrade
+        // to primary reads and stay Up — but here the primary is also
+        // unreachable, so the primary connectivity gate must force Down: an
+        // instance that cannot reach the shard primary fails all writes and
+        // primary reads, so `/ready` must not stay green. (The healthy-primary
+        // + dead-replica fallback path needs a live primary and is exercised by
+        // the `read_pool`/`read_route` fallback tests above, not the indicator.)
         let shard = shard_with_unreachable_replica(ReplicaFallback::Primary);
         let indicator = ShardHealthIndicator::new(shard);
         let output = indicator.check().await;
 
         assert!(
-            output.status.is_healthy(),
-            "primary fallback degrades to primary reads and must stay Up"
+            !output.status.is_healthy(),
+            "unreachable primary must report Down even under primary fallback"
         );
-        assert_eq!(output.details["replica_ready"], serde_json::json!(false));
+        assert_eq!(output.details["primary_ready"], serde_json::json!(false));
+        assert!(output.details.contains_key("primary_detail"));
     }
 
     #[tokio::test]
