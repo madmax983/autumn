@@ -5375,8 +5375,17 @@ async fn run_startup_migrations(
                 );
             }
         }
+        // Shards hold tenant data, not the control-plane schema. If the app
+        // registered the full control `FRAMEWORK_MIGRATIONS` set (as some
+        // examples do), skip it for shard targets — otherwise startup would
+        // create the control tables on every shard and (with auto-migrate off)
+        // keep reporting them as pending, even though `autumn migrate --shard`
+        // applies only the shard-required framework migrations.
         for (target, url) in &shard_targets {
-            for mig in &migrations {
+            for mig in migrations
+                .iter()
+                .filter(|mig| !migration_set_is_control_framework(mig))
+            {
                 crate::migrate::auto_migrate(url, profile.as_deref(), auto_in_prod, mig, target);
             }
         }
@@ -5479,6 +5488,32 @@ fn migration_sets_include(
             .iter()
             .any(|migration| migration.name().to_string() == migration_name)
     })
+}
+
+/// Whether a migration set is (or contains) the control-plane
+/// [`FRAMEWORK_MIGRATIONS`](crate::migrate::FRAMEWORK_MIGRATIONS), so it can be
+/// skipped on shard targets. App migrations and the shard-required
+/// version-history / commit-hook sets share no migration names with it, so a
+/// name overlap uniquely identifies the control framework set.
+#[cfg(feature = "db")]
+fn migration_set_is_control_framework(set: &crate::migrate::EmbeddedMigrations) -> bool {
+    use diesel::migration::{Migration, MigrationSource as _};
+    use diesel::pg::Pg;
+
+    let Ok(framework): Result<Vec<Box<dyn Migration<Pg>>>, _> =
+        crate::migrate::FRAMEWORK_MIGRATIONS.migrations()
+    else {
+        return false;
+    };
+    let framework_names: std::collections::HashSet<String> =
+        framework.iter().map(|m| m.name().to_string()).collect();
+
+    let Ok(set_migrations): Result<Vec<Box<dyn Migration<Pg>>>, _> = set.migrations() else {
+        return false;
+    };
+    set_migrations
+        .iter()
+        .any(|m| framework_names.contains(&m.name().to_string()))
 }
 
 #[cfg(feature = "db")]
