@@ -854,7 +854,7 @@ impl ShardSet {
         Fut: std::future::Future<Output = Result<T, crate::AutumnError>> + Send + 'static,
         F: Fn(&Shard) -> Fut + Send + Sync,
     {
-        let futs: Vec<_> = self.inner.shards.iter().map(|shard| f(shard)).collect();
+        let futs: Vec<_> = self.inner.shards.iter().map(f).collect();
         futures::future::try_join_all(futs).await
     }
 }
