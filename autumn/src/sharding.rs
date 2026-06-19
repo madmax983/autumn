@@ -221,12 +221,18 @@ impl ShardRouter for HashShardRouter {
 /// no row route by [`HashShardRouter`], so the directory only needs entries
 /// for relocated/"whale" tenants.
 ///
-/// Resolutions are cached for [`DEFAULT_DIRECTORY_CACHE_TTL`] (positive *and*
-/// fallback results) so steady-state routing issues no control-DB query.
-/// After changing a directory row, call [`invalidate`](Self::invalidate) for
-/// that key so the next route re-reads it. (NOTIFY-based cross-process
-/// invalidation is a planned follow-up; today the TTL bounds staleness and
-/// `invalidate` clears the local entry immediately.)
+/// Directory **hits** (a real pin) are cached for
+/// [`DEFAULT_DIRECTORY_CACHE_TTL`] so steady-state routing of pinned tenants
+/// issues no control-DB query. **Misses are not cached** — an unpinned tenant
+/// re-reads the directory on every route. This keeps the move workflow safe:
+/// once an operator inserts a directory row, no other process can keep routing
+/// that tenant to its old hash shard from a stale cached miss (there is no
+/// cross-process invalidation), so `move-slot --confirm` won't delete rows that
+/// late writes landed on the source. After changing a directory row, call
+/// [`invalidate`](Self::invalidate) for that key so the next route re-reads it.
+/// (NOTIFY-based cross-process invalidation is a planned follow-up; today the
+/// TTL bounds hit staleness and `invalidate` clears the local entry
+/// immediately.)
 ///
 /// Install with
 /// [`AppBuilder::with_directory_shard_router`](crate::app::AppBuilder::with_directory_shard_router).
@@ -392,12 +398,21 @@ impl ShardRouter for DirectoryShardRouter {
                 return Ok(cached);
             }
 
-            let resolved = match self.lookup_directory(key_str, shards).await? {
-                Some(shard) => shard,
-                None => self.fallback.route(key, shards).await?,
-            };
-            self.cache_put(key_str.to_owned(), resolved);
-            Ok(resolved)
+            // Only cache real directory hits. A miss routes through the hash
+            // fallback WITHOUT caching: during a tenant move the operator
+            // inserts a directory row, and a cached miss on another process
+            // (e.g. a replica) would keep routing that tenant to its old hash
+            // shard until the TTL expired — there is no cross-process
+            // invalidation — and `move-slot --confirm` could then delete rows
+            // those stale writes had landed on the source. Re-querying unpinned
+            // tenants each route is the safe default.
+            match self.lookup_directory(key_str, shards).await? {
+                Some(shard) => {
+                    self.cache_put(key_str.to_owned(), shard);
+                    Ok(shard)
+                }
+                None => self.fallback.route(key, shards).await,
+            }
         })
     }
 }
