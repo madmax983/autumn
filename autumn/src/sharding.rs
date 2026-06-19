@@ -242,8 +242,7 @@ pub struct DirectoryShardRouter {
 
 /// Default time a resolved tenant→shard mapping is cached before re-reading
 /// the directory table.
-pub const DEFAULT_DIRECTORY_CACHE_TTL: std::time::Duration =
-    std::time::Duration::from_secs(30);
+pub const DEFAULT_DIRECTORY_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
 
 #[derive(Clone, Copy)]
 struct DirectoryCacheEntry {
@@ -261,7 +260,10 @@ impl std::fmt::Debug for DirectoryShardRouter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DirectoryShardRouter")
             .field("ttl", &self.ttl)
-            .field("cached_keys", &self.cache.read().map(|c| c.len()).unwrap_or(0))
+            .field(
+                "cached_keys",
+                &self.cache.read().map(|c| c.len()).unwrap_or(0),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -806,7 +808,7 @@ impl ShardSet {
         let mut map: std::collections::HashMap<ShardId, Vec<&'k str>> =
             std::collections::HashMap::new();
         for key in keys {
-            let slot = slot_for_key(ShardKey::Str(key));
+            let slot = self.slot_for_key(key);
             if let Some(shard) = self.shard_for_slot(slot) {
                 map.entry(shard.id()).or_default().push(key);
             }
@@ -827,10 +829,7 @@ impl ShardSet {
     /// `#[repository]`-generated `impl` blocks, but it is not part of the
     /// stable public API.
     #[doc(hidden)]
-    pub async fn fan_out_shards<T, Fut, F>(
-        &self,
-        f: F,
-    ) -> Result<Vec<T>, crate::AutumnError>
+    pub async fn fan_out_shards<T, Fut, F>(&self, f: F) -> Result<Vec<T>, crate::AutumnError>
     where
         T: Send + 'static,
         Fut: std::future::Future<Output = Result<T, crate::AutumnError>> + Send + 'static,
@@ -917,7 +916,7 @@ pub fn create_shard_set(
 /// wraps each connection in a test transaction that is rolled back when the
 /// connection is returned.
 ///
-/// This mirrors the transactional control-pool logic in [`TestApp`] so that
+/// This mirrors the transactional control-pool logic in `TestApp` so that
 /// shard repositories in integration tests see rolled-back state between test
 /// runs.
 ///
@@ -938,17 +937,15 @@ pub fn create_shard_set_transactional(
         return Ok(None);
     }
 
-    let timeout =
-        std::time::Duration::from_secs(config.connect_timeout_secs);
+    let timeout = std::time::Duration::from_secs(config.connect_timeout_secs);
 
     let topologies = config
         .shards
         .iter()
         .map(|shard| {
-            let manager =
-                diesel_async::pooled_connection::AsyncDieselConnectionManager::<
-                    diesel_async::AsyncPgConnection,
-                >::new(&shard.primary_url);
+            let manager = diesel_async::pooled_connection::AsyncDieselConnectionManager::<
+                diesel_async::AsyncPgConnection,
+            >::new(&shard.primary_url);
             let pool = Pool::builder(manager)
                 .max_size(1)
                 .wait_timeout(Some(timeout))
@@ -964,16 +961,14 @@ pub fn create_shard_set_transactional(
                                     diesel_async::pooled_connection::PoolError::QueryError(e),
                                 )
                             })?;
-                            diesel::sql_query(
-                                "SET autumn.test_transaction_started = 'true'",
-                            )
-                            .execute(conn)
-                            .await
-                            .map_err(|e| {
-                                deadpool::managed::HookError::Backend(
-                                    diesel_async::pooled_connection::PoolError::QueryError(e),
-                                )
-                            })?;
+                            diesel::sql_query("SET autumn.test_transaction_started = 'true'")
+                                .execute(conn)
+                                .await
+                                .map_err(|e| {
+                                    deadpool::managed::HookError::Backend(
+                                        diesel_async::pooled_connection::PoolError::QueryError(e),
+                                    )
+                                })?;
                             Ok(())
                         })
                     },
@@ -1623,11 +1618,10 @@ pub async fn __autumn_resolve_repo_seed(
     parts: &mut axum::http::request::Parts,
     state: &crate::AppState,
 ) -> Result<(ShardRepositorySeed, ShardSet), AutumnError> {
-    let shards =
-        <Shards as axum::extract::FromRequestParts<crate::AppState>>::from_request_parts(
-            parts, state,
-        )
-        .await?;
+    let shards = <Shards as axum::extract::FromRequestParts<crate::AppState>>::from_request_parts(
+        parts, state,
+    )
+    .await?;
     let key = resolve_shard_key(parts, state).await?;
     let shard = shards.set.route(&key).await?;
     let shard_name = Arc::clone(&shard.name);
@@ -2037,10 +2031,22 @@ mod tests {
         // "hooli" → slot 3974 → shard a (ShardId(0)).
         // "a"     → slot 11404 → shard b (ShardId(1)).
         let set = shard_set(&["a", "b"]);
-        assert!(set.owns_key(ShardId(0), "hooli"), "hooli (slot 3974) must be shard a");
-        assert!(!set.owns_key(ShardId(1), "hooli"), "hooli must not be shard b");
-        assert!(set.owns_key(ShardId(1), "a"), "key 'a' (slot 11404) must be shard b");
-        assert!(!set.owns_key(ShardId(0), "a"), "key 'a' must not be shard a");
+        assert!(
+            set.owns_key(ShardId(0), "hooli"),
+            "hooli (slot 3974) must be shard a"
+        );
+        assert!(
+            !set.owns_key(ShardId(1), "hooli"),
+            "hooli must not be shard b"
+        );
+        assert!(
+            set.owns_key(ShardId(1), "a"),
+            "key 'a' (slot 11404) must be shard b"
+        );
+        assert!(
+            !set.owns_key(ShardId(0), "a"),
+            "key 'a' must not be shard a"
+        );
     }
 
     #[test]
@@ -2065,8 +2071,15 @@ mod tests {
         let shard_b_keys = map.get(&ShardId(1)).map(Vec::as_slice).unwrap_or(&[]);
         assert!(shard_a_keys.contains(&"hooli"), "hooli must go to shard a");
         assert!(shard_b_keys.contains(&"a"), "key 'a' must go to shard b");
-        assert!(shard_b_keys.contains(&"tenant-1"), "tenant-1 (slot 12427) must go to shard b");
-        assert_eq!(shard_a_keys.len() + shard_b_keys.len(), keys.len(), "no key dropped");
+        assert!(
+            shard_b_keys.contains(&"tenant-1"),
+            "tenant-1 (slot 12427) must go to shard b"
+        );
+        assert_eq!(
+            shard_a_keys.len() + shard_b_keys.len(),
+            keys.len(),
+            "no key dropped"
+        );
     }
 
     #[test]

@@ -42,7 +42,12 @@ pub struct ShardedTenantPost {
 
 /// Matching repository — tenant_scoped so `across_tenants()` is generated,
 /// sharded so `__autumn_shards` is present and the fan-out guard is emitted.
-#[autumn_web::repository(ShardedTenantPost, table = "sharded_tenant_posts", tenant_scoped, sharded)]
+#[autumn_web::repository(
+    ShardedTenantPost,
+    table = "sharded_tenant_posts",
+    tenant_scoped,
+    sharded
+)]
 pub trait ShardedTenantPostRepository {}
 
 // ── Helpers ─────────────────────────────────────────────────────────────────

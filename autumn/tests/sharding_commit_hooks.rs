@@ -27,9 +27,8 @@ mod sharding_commit_hook_tests {
 
     // The real framework migration SQL applied to the shard, so the test
     // exercises exactly the schema Section 5a ships to shard targets.
-    const VERSION_HISTORY_UP: &str = include_str!(
-        "../version_history_migrations/20260526000000_create_version_history/up.sql"
-    );
+    const VERSION_HISTORY_UP: &str =
+        include_str!("../version_history_migrations/20260526000000_create_version_history/up.sql");
     const COMMIT_HOOK_UP: &str = include_str!(
         "../repository_commit_hook_migrations/20260515000000_create_repository_commit_hook_queue/up.sql"
     );
@@ -212,7 +211,12 @@ mod sharding_commit_hook_tests {
         // The commit-hook queue row is on the shard DB (staged inside the same
         // mutation transaction that wrote the note).
         assert!(
-            count(db, "SELECT COUNT(*) AS n FROM autumn_repository_commit_hooks").await >= 1,
+            count(
+                db,
+                "SELECT COUNT(*) AS n FROM autumn_repository_commit_hooks"
+            )
+            .await
+                >= 1,
             "the after-commit hook must be staged on the shard's commit-hook queue"
         );
 

@@ -7592,7 +7592,9 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     };
 
-    let (exists_by_id_impl, exists_by_id_one_shard_helper) = if config.sharded && config.tenant_scoped {
+    let (exists_by_id_impl, exists_by_id_one_shard_helper) = if config.sharded
+        && config.tenant_scoped
+    {
         let base = exists_by_id_impl;
         let dispatch = quote! {
             if self.across_tenants {
@@ -10134,8 +10136,7 @@ mod tests {
 
     #[test]
     fn parse_repo_args_sharded_flag() {
-        let tokens: proc_macro2::TokenStream =
-            "Post, tenant_scoped, sharded".parse().unwrap();
+        let tokens: proc_macro2::TokenStream = "Post, tenant_scoped, sharded".parse().unwrap();
         let config = parse_repo_args(tokens).unwrap();
         assert_eq!(config.model_name.to_string(), "Post");
         assert!(config.sharded, "sharded attribute must be set");
@@ -10331,4 +10332,3 @@ mod tests {
         );
     }
 }
-

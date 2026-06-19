@@ -2637,10 +2637,7 @@ impl AppBuilder {
             // Pool sizes multiply across shards; warn before the aggregate
             // silently exhausts Postgres's server-side `max_connections`.
             let warn_threshold = config.database.max_connections_warn_threshold;
-            if crate::config::should_warn_total_connections(
-                total_max_connections,
-                warn_threshold,
-            ) {
+            if crate::config::should_warn_total_connections(total_max_connections, warn_threshold) {
                 tracing::warn!(
                     total_max_connections,
                     warn_threshold,

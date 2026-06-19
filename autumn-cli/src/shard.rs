@@ -48,8 +48,10 @@ pub fn run_move_slot(args: &MoveSlotArgs) {
     // Resolve shard names → URLs through the same config + profile + env stack
     // as `autumn migrate` (reusing migrate's resolution helpers).
     let table = crate::migrate::read_autumn_toml_table_with_profile(args.profile.as_deref());
-    let shards =
-        crate::migrate::resolve_shard_database_urls_from_sources(|k| std::env::var(k), table.as_ref());
+    let shards = crate::migrate::resolve_shard_database_urls_from_sources(
+        |k| std::env::var(k),
+        table.as_ref(),
+    );
 
     let from_url = resolve_shard_url(&args.from, &shards).unwrap_or_else(|e| fail(&e));
     let to_url = resolve_shard_url(&args.to, &shards).unwrap_or_else(|e| fail(&e));
@@ -91,7 +93,14 @@ pub fn run_move_slot(args: &MoveSlotArgs) {
         return;
     }
     eprintln!("\u{2192} Deleting rows from source (--confirm)\u{2026}");
-    run_psql(&from_url, &["--single-transaction", "-c", &delete_sql(&args.table, &filter)]);
+    run_psql(
+        &from_url,
+        &[
+            "--single-transaction",
+            "-c",
+            &delete_sql(&args.table, &filter),
+        ],
+    );
     eprintln!(
         "\u{2713} Done. Source rows removed; shard {:?} now owns these tenants.\n  \
          Ensure the slot map in autumn.toml routes them to {:?}.",
@@ -112,63 +121,109 @@ fn resolve_shard_url(name: &str, shards: &[(String, String)]) -> Result<String, 
     })
 }
 
-/// Reject anything that is not a bare `[A-Za-z_][A-Za-z0-9_]*` identifier, so
-/// the table/column names cannot inject SQL when interpolated.
-fn validate_identifier(flag: &str, value: &str) {
-    let valid = !value.is_empty()
-        && value
-            .chars()
+fn is_valid_simple_identifier(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars()
             .enumerate()
-            .all(|(i, c)| c == '_' || c.is_ascii_alphanumeric() && !(i == 0 && c.is_ascii_digit()));
-    if !valid {
+            .all(|(i, c)| c == '_' || c.is_ascii_alphanumeric() && !(i == 0 && c.is_ascii_digit()))
+}
+
+/// Validate a plain or schema-qualified SQL identifier (`schema.table` or
+/// `column`).  Each dot-separated part must match `[A-Za-z_][A-Za-z0-9_]*`.
+/// Rejects anything else so names cannot inject SQL when interpolated.
+fn validate_identifier(flag: &str, value: &str) {
+    let parts: Vec<&str> = value.split('.').collect();
+    if parts.is_empty() || parts.len() > 2 {
         fail(&format!(
-            "{flag} {value:?} must be a plain SQL identifier ([A-Za-z_][A-Za-z0-9_]*)"
+            "{flag} {value:?} must be a plain or schema-qualified SQL identifier \
+             (e.g. `bookmarks` or `public.bookmarks`)"
         ));
+    }
+    for part in &parts {
+        if !is_valid_simple_identifier(part) {
+            fail(&format!(
+                "{flag} {value:?} must be a plain or schema-qualified SQL identifier \
+                 ([A-Za-z_][A-Za-z0-9_]* parts)"
+            ));
+        }
     }
 }
 
-/// Build the `key_column = ANY(ARRAY['a','b',...]::text[])` predicate, with
-/// single quotes in tenant keys doubled so the literal is safe.
+/// Wrap each dot-separated part of an identifier in double quotes, producing a
+/// SQL identifier that is safe for case-sensitive and schema-qualified names.
+fn quote_identifier(value: &str) -> String {
+    value
+        .split('.')
+        .map(|part| format!("\"{part}\""))
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
+/// Build the `"key_column" = ANY(ARRAY['a','b',...]::text[])` predicate.
+/// Single quotes in tenant keys are doubled for SQL safety.
 fn build_key_filter(key_column: &str, tenants: &[String]) -> String {
     let list = tenants
         .iter()
         .map(|t| format!("'{}'", t.replace('\'', "''")))
         .collect::<Vec<_>>()
         .join(", ");
-    format!("{key_column} = ANY(ARRAY[{list}]::text[])")
+    let quoted_col = quote_identifier(key_column);
+    format!("{quoted_col} = ANY(ARRAY[{list}]::text[])")
 }
 
 fn count_sql(table: &str, filter: &str) -> String {
-    format!("SELECT count(*) FROM {table} WHERE {filter}")
+    let qt = quote_identifier(table);
+    format!("SELECT count(*) FROM {qt} WHERE {filter}")
 }
 
 /// id-independent content checksum over whole rows (`to_jsonb`), so it needs no
 /// column knowledge and matches whenever source and destination hold identical
 /// rows.
 fn checksum_sql(table: &str, filter: &str) -> String {
+    let qt = quote_identifier(table);
     format!(
         "SELECT COALESCE(md5(string_agg(j, '|' ORDER BY j)), '') \
-         FROM (SELECT to_jsonb(t)::text AS j FROM {table} t WHERE {filter}) s"
+         FROM (SELECT to_jsonb(t)::text AS j FROM {qt} t WHERE {filter}) s"
     )
 }
 
+// NOTE: `SELECT *` preserves column declaration order. Both shards are expected
+// to have identical schemas (Autumn migrations run in order on all shards), so
+// the order will match. If you have added columns manually outside the migration
+// system, verify column order matches before using this tool.
+//
+// Copying the primary key is intentional: it keeps cross-table FK references
+// valid after the move. If your table uses `GENERATED ALWAYS AS IDENTITY`,
+// `\copy` will fail; use `GENERATED BY DEFAULT AS IDENTITY` or `BIGSERIAL`
+// instead. After the copy you should reset the destination sequence:
+//   SELECT setval(pg_get_serial_sequence('table', 'id_col'), MAX(id_col))
+//   FROM table;
 fn copy_out_sql(table: &str, filter: &str) -> String {
-    format!("\\copy (SELECT * FROM {table} WHERE {filter}) TO STDOUT")
+    let qt = quote_identifier(table);
+    format!("\\copy (SELECT * FROM {qt} WHERE {filter}) TO STDOUT")
 }
 
 fn copy_in_sql(table: &str) -> String {
-    format!("\\copy {table} FROM STDIN")
+    let qt = quote_identifier(table);
+    format!("\\copy {qt} FROM STDIN")
 }
 
 fn delete_sql(table: &str, filter: &str) -> String {
-    format!("DELETE FROM {table} WHERE {filter}")
+    let qt = quote_identifier(table);
+    format!("DELETE FROM {qt} WHERE {filter}")
 }
 
 /// Stream rows from the source shard into the destination shard over a pipe,
 /// the destination copy wrapped in a single transaction.
 fn copy_rows(from_url: &str, to_url: &str, table: &str, filter: &str) {
     let mut src = Command::new("psql")
-        .args([from_url, "-v", "ON_ERROR_STOP=1", "-c", &copy_out_sql(table, filter)])
+        .args([
+            from_url,
+            "-v",
+            "ON_ERROR_STOP=1",
+            "-c",
+            &copy_out_sql(table, filter),
+        ])
         .stdout(Stdio::piped())
         .spawn()
         .unwrap_or_else(|e| fail(&format!("failed to start source psql: {e}")));
@@ -229,7 +284,9 @@ fn run_psql(url: &str, args: &[&str]) {
 
 fn check_psql() {
     if Command::new("psql").arg("--version").output().is_err() {
-        fail("`psql` not found on PATH. Install the PostgreSQL client tools to use `autumn shard move-slot`.");
+        fail(
+            "`psql` not found on PATH. Install the PostgreSQL client tools to use `autumn shard move-slot`.",
+        );
     }
 }
 
@@ -251,7 +308,10 @@ mod tests {
 
     #[test]
     fn resolve_shard_url_finds_by_name() {
-        assert_eq!(resolve_shard_url("shard1", &shards()).unwrap(), "postgres://h/s1");
+        assert_eq!(
+            resolve_shard_url("shard1", &shards()).unwrap(),
+            "postgres://h/s1"
+        );
     }
 
     #[test]
@@ -267,44 +327,59 @@ mod tests {
     }
 
     #[test]
-    fn build_key_filter_quotes_and_escapes() {
+    fn build_key_filter_quotes_column_and_escapes_values() {
         let f = build_key_filter("tenant_id", &["acme".to_owned(), "o'brien".to_owned()]);
-        assert_eq!(f, "tenant_id = ANY(ARRAY['acme', 'o''brien']::text[])");
+        assert_eq!(f, "\"tenant_id\" = ANY(ARRAY['acme', 'o''brien']::text[])");
     }
 
     #[test]
-    fn sql_builders_interpolate_table_and_filter() {
+    fn sql_builders_quote_table_and_interpolate_filter() {
         let f = build_key_filter("tenant_id", &["acme".to_owned()]);
         assert_eq!(
             count_sql("bookmarks", &f),
-            "SELECT count(*) FROM bookmarks WHERE tenant_id = ANY(ARRAY['acme']::text[])"
+            "SELECT count(*) FROM \"bookmarks\" WHERE \"tenant_id\" = ANY(ARRAY['acme']::text[])"
         );
         assert!(checksum_sql("bookmarks", &f).contains("to_jsonb(t)"));
         assert_eq!(
             delete_sql("bookmarks", &f),
-            "DELETE FROM bookmarks WHERE tenant_id = ANY(ARRAY['acme']::text[])"
+            "DELETE FROM \"bookmarks\" WHERE \"tenant_id\" = ANY(ARRAY['acme']::text[])"
         );
-        assert!(copy_out_sql("bookmarks", &f).starts_with("\\copy (SELECT * FROM bookmarks WHERE"));
-        assert_eq!(copy_in_sql("bookmarks"), "\\copy bookmarks FROM STDIN");
+        assert!(
+            copy_out_sql("bookmarks", &f).starts_with("\\copy (SELECT * FROM \"bookmarks\" WHERE")
+        );
+        assert_eq!(copy_in_sql("bookmarks"), "\\copy \"bookmarks\" FROM STDIN");
+    }
+
+    #[test]
+    fn sql_builders_support_schema_qualified_table() {
+        let f = build_key_filter("tenant_id", &["acme".to_owned()]);
+        assert_eq!(
+            count_sql("public.bookmarks", &f),
+            "SELECT count(*) FROM \"public\".\"bookmarks\" WHERE \"tenant_id\" = ANY(ARRAY['acme']::text[])"
+        );
+        assert_eq!(
+            copy_in_sql("public.bookmarks"),
+            "\\copy \"public\".\"bookmarks\" FROM STDIN"
+        );
     }
 
     #[test]
     fn validate_identifier_rejects_injection() {
-        // These should pass (no panic path is taken — we exercise the predicate).
-        for ok in ["bookmarks", "tenant_id", "_t", "t1"] {
-            assert!(is_valid_identifier(ok), "{ok} should be valid");
+        for ok in ["bookmarks", "tenant_id", "_t", "t1", "public.bookmarks"] {
+            assert!(is_valid_schema_or_simple(ok), "{ok} should be valid");
         }
-        for bad in ["", "1table", "drop table", "a;b", "a-b", "a.b"] {
-            assert!(!is_valid_identifier(bad), "{bad} should be invalid");
+        for bad in ["", "1table", "drop table", "a;b", "a-b", "a.b.c"] {
+            assert!(!is_valid_schema_or_simple(bad), "{bad} should be invalid");
         }
     }
 
-    // Mirror of validate_identifier's predicate, without the process exit, so
-    // the rule itself is unit-testable.
-    fn is_valid_identifier(value: &str) -> bool {
-        !value.is_empty()
-            && value.chars().enumerate().all(|(i, c)| {
-                c == '_' || c.is_ascii_alphanumeric() && !(i == 0 && c.is_ascii_digit())
-            })
+    // Mirror of validate_identifier's logic (without process exit) so the
+    // predicate is unit-testable.
+    fn is_valid_schema_or_simple(value: &str) -> bool {
+        let parts: Vec<&str> = value.split('.').collect();
+        if parts.is_empty() || parts.len() > 2 {
+            return false;
+        }
+        parts.iter().all(|p| is_valid_simple_identifier(p))
     }
 }

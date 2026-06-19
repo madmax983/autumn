@@ -3617,8 +3617,20 @@ mod tests {
     #[test]
     fn parse_shard_move_slot() {
         let cli = Cli::try_parse_from([
-            "autumn", "shard", "move-slot", "--from", "shard0", "--to", "shard1", "--table",
-            "bookmarks", "--tenant", "acme", "--tenant", "globex", "--confirm",
+            "autumn",
+            "shard",
+            "move-slot",
+            "--from",
+            "shard0",
+            "--to",
+            "shard1",
+            "--table",
+            "bookmarks",
+            "--tenant",
+            "acme",
+            "--tenant",
+            "globex",
+            "--confirm",
         ])
         .unwrap();
         let Commands::Shard(cmd) = cli.command else {
@@ -3645,7 +3657,14 @@ mod tests {
     fn parse_shard_move_slot_requires_tenant() {
         assert!(
             Cli::try_parse_from([
-                "autumn", "shard", "move-slot", "--from", "shard0", "--to", "shard1", "--table",
+                "autumn",
+                "shard",
+                "move-slot",
+                "--from",
+                "shard0",
+                "--to",
+                "shard1",
+                "--table",
                 "bookmarks",
             ])
             .is_err()

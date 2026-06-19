@@ -21,11 +21,11 @@
 use std::sync::Arc;
 
 use autumn_web::config::{DatabaseConfig, ShardConfig};
+#[cfg(feature = "test-support")]
+use autumn_web::sharding::ShardId;
 use autumn_web::sharding::{
     DirectoryShardRouter, HashShardRouter, ShardKey, ShardRouter, create_shard_set,
 };
-#[cfg(feature = "test-support")]
-use autumn_web::sharding::ShardId;
 #[cfg(feature = "test-support")]
 use autumn_web::test::TestDb;
 #[cfg(feature = "test-support")]
@@ -109,7 +109,10 @@ async fn directory_pins_tenant_then_invalidate_falls_back_to_hash() {
         .await
         .expect("directory routes the tenant");
     assert_eq!(routed, other, "directory row must override the hash owner");
-    assert_ne!(routed, hash_owner, "pinned shard differs from the hash owner");
+    assert_ne!(
+        routed, hash_owner,
+        "pinned shard differs from the hash owner"
+    );
 
     // 2. Cached: delete the row but do NOT invalidate. The next route must
     //    still return the pinned shard, proving it served from cache (no SQL).

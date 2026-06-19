@@ -4541,7 +4541,10 @@ mod tests {
 
     #[test]
     fn database_config_default_warn_threshold_is_100() {
-        assert_eq!(DatabaseConfig::default().max_connections_warn_threshold, 100);
+        assert_eq!(
+            DatabaseConfig::default().max_connections_warn_threshold,
+            100
+        );
     }
 
     /// Mock loader for tests — returns a hand-built config without touching disk.

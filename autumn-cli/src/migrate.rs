@@ -571,7 +571,10 @@ pub(crate) fn read_autumn_toml_table_with_profile(profile: Option<&str>) -> Opti
 /// Directory-parameterized core of [`read_autumn_toml_table_with_profile`],
 /// separated so the overlay-merge behavior is unit-testable without mutating
 /// the process-global current directory.
-fn read_autumn_toml_table_with_profile_in(dir: &Path, profile: Option<&str>) -> Option<toml::Table> {
+fn read_autumn_toml_table_with_profile_in(
+    dir: &Path,
+    profile: Option<&str>,
+) -> Option<toml::Table> {
     let read_table = |path: &Path| -> Option<toml::Table> {
         if !path.exists() {
             return None;
@@ -1740,9 +1743,8 @@ mod tests {
     fn shard_target_applies_only_shard_framework_migrations() {
         let mut called = false;
 
-        let result = run_shard_framework_migrations_inner(
-            "postgres://shard0/app",
-            |database_url| {
+        let result =
+            run_shard_framework_migrations_inner("postgres://shard0/app", |database_url| {
                 assert_eq!(database_url, "postgres://shard0/app");
                 called = true;
                 Ok(autumn_web::migrate::MigrationResult {
@@ -1751,9 +1753,8 @@ mod tests {
                         "commit_hook_migration".to_string(),
                     ],
                 })
-            },
-        )
-        .unwrap();
+            })
+            .unwrap();
 
         assert!(called, "shard framework migration helper must be called");
         assert_eq!(
@@ -1767,19 +1768,20 @@ mod tests {
         let mut called_with_url = String::new();
         let mut called = false;
 
-        let result = run_framework_migrations_inner(
-            "postgres://control/app",
-            |database_url, _embedded| {
+        let result =
+            run_framework_migrations_inner("postgres://control/app", |database_url, _embedded| {
                 called_with_url = database_url.to_owned();
                 called = true;
                 Ok(autumn_web::migrate::MigrationResult {
                     applied: vec!["20260512000000_create_api_tokens".to_string()],
                 })
-            },
-        )
-        .unwrap();
+            })
+            .unwrap();
 
-        assert!(called, "run_framework_migrations_inner must call the closure");
+        assert!(
+            called,
+            "run_framework_migrations_inner must call the closure"
+        );
         assert_eq!(called_with_url, "postgres://control/app");
         assert_eq!(
             result.applied,
@@ -2053,7 +2055,10 @@ primary_url = "postgres://prod:5432/app"
 
         deep_merge_toml(&mut base, overlay);
 
-        let database = base.get("database").and_then(toml::Value::as_table).unwrap();
+        let database = base
+            .get("database")
+            .and_then(toml::Value::as_table)
+            .unwrap();
         // Overlay scalar replaces the base value...
         assert_eq!(
             database.get("primary_url").and_then(toml::Value::as_str),

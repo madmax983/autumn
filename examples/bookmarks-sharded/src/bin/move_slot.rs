@@ -115,13 +115,11 @@ async fn snapshot(
     conn: &mut AsyncPgConnection,
     tenants: &[String],
 ) -> Result<(i64, String), diesel::result::Error> {
-    let count = diesel::sql_query(
-        "SELECT count(*) AS n FROM bookmarks WHERE tenant_id = ANY($1)",
-    )
-    .bind::<Array<Text>, _>(tenants)
-    .get_result::<CountRow>(conn)
-    .await?
-    .n;
+    let count = diesel::sql_query("SELECT count(*) AS n FROM bookmarks WHERE tenant_id = ANY($1)")
+        .bind::<Array<Text>, _>(tenants)
+        .get_result::<CountRow>(conn)
+        .await?
+        .n;
 
     // Hash the sorted concatenation of the movable columns, so the checksum is
     // independent of the shard-local ids (which differ after the copy).
@@ -212,12 +210,11 @@ async fn main() {
     }
 
     eprintln!("→ Deleting rows from source (--confirm)…");
-    let deleted = diesel::delete(
-        bookmarks::table.filter(bookmarks::tenant_id.eq_any(&args.tenants)),
-    )
-    .execute(&mut src)
-    .await
-    .unwrap_or_else(|e| fail(&format!("deleting source rows failed: {e}")));
+    let deleted =
+        diesel::delete(bookmarks::table.filter(bookmarks::tenant_id.eq_any(&args.tenants)))
+            .execute(&mut src)
+            .await
+            .unwrap_or_else(|e| fail(&format!("deleting source rows failed: {e}")));
     eprintln!(
         "✓ Done. Removed {deleted} source row(s); the destination now owns these tenants.\n  \
          Ensure the slot map in autumn.toml routes them to the destination shard."
