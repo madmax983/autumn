@@ -204,7 +204,11 @@ impl TickingClock {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Ok(delta) = chrono::Duration::from_std(duration) {
-            *guard += delta;
+            if let Some(new_time) = guard.checked_add_signed(delta) {
+                *guard = new_time;
+            } else {
+                *guard = chrono::DateTime::<chrono::Utc>::MAX_UTC;
+            }
         }
     }
 }
@@ -280,6 +284,15 @@ mod tests {
         let clock = TickingClock::starting_at(start);
         clock.advance(std::time::Duration::from_secs(3600));
         assert_eq!(clock.now(), start + chrono::Duration::hours(1));
+    }
+
+    #[test]
+    fn ticking_clock_advances_gracefully_on_overflow() {
+        let start = Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
+        let clock = TickingClock::starting_at(start);
+        // An impossibly large duration that exceeds chrono limits
+        clock.advance(std::time::Duration::from_secs(9_000_000_000_000));
+        assert_eq!(clock.now(), chrono::DateTime::<chrono::Utc>::MAX_UTC);
     }
 
     #[test]
