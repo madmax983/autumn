@@ -2897,6 +2897,14 @@ mod tests {
     }
 
     #[test]
+    fn cross_shard_wrapper_derefs_to_inner() {
+        let mut w = CrossShard(7i32);
+        assert_eq!(*w, 7); // Deref
+        *w = 9; // DerefMut
+        assert_eq!(w.0, 9);
+    }
+
+    #[test]
     fn cross_shard_seed_is_tenant_free_and_untagged() {
         // No tenant is resolved; the seed is built straight from the set so an
         // admin CrossShard<R> extractor can construct the repo without a header.
