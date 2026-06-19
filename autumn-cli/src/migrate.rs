@@ -210,9 +210,28 @@ fn build_targets(
             for (name, url) in shards {
                 targets.push((format!("shard:{name}"), url));
             }
+            reject_duplicate_target_urls(&targets)?;
             Ok(targets)
         }
     }
+}
+
+/// Reject distinct target labels that resolve to the same database URL (e.g.
+/// profile/env overrides mapping `control` and a shard to one DB). Without this,
+/// a multi-target `migrate down` would roll the shared database back once per
+/// label, reverting more migrations than requested.
+fn reject_duplicate_target_urls(targets: &[(String, String)]) -> Result<(), String> {
+    let mut seen: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
+    for (label, url) in targets {
+        if let Some(prev) = seen.insert(url.as_str(), label.as_str()) {
+            return Err(format!(
+                "\u{2717} Targets {prev:?} and {label:?} resolve to the same database URL. \
+                 Check profile / AUTUMN_DATABASE__* overrides; migrating or rolling back the \
+                 same database under two labels would apply/revert it twice."
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Apply migrations to every target in order, failing fast with a
@@ -849,6 +868,20 @@ where
         }
         if let Ok(url) = env_var(&url_var) {
             shards[i].1 = url;
+        }
+    }
+
+    // Reject duplicate shard names (the runtime config validator does too), so
+    // `--shard foo` / `move-slot --from foo` can't silently resolve only the
+    // first of two entries and target a different shard set than the app.
+    let mut seen = std::collections::HashSet::new();
+    for (name, _) in &shards {
+        if !seen.insert(name.as_str()) {
+            eprintln!(
+                "\u{2717} Duplicate shard name {name:?} in [[database.shards]] / \
+                 AUTUMN_DATABASE__SHARDS__* — shard names must be unique."
+            );
+            std::process::exit(1);
         }
     }
 

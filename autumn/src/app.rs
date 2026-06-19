@@ -5490,30 +5490,37 @@ fn migration_sets_include(
     })
 }
 
-/// Whether a migration set is (or contains) the control-plane
+/// Whether a migration set is the control-plane
 /// [`FRAMEWORK_MIGRATIONS`](crate::migrate::FRAMEWORK_MIGRATIONS), so it can be
-/// skipped on shard targets. App migrations and the shard-required
-/// version-history / commit-hook sets share no migration names with it, so a
-/// name overlap uniquely identifies the control framework set.
+/// skipped on shard targets.
+///
+/// Identified by containing a *control-only* migration — one in
+/// `FRAMEWORK_MIGRATIONS` but not in the shard-required version-history /
+/// commit-hook sets. Those two sets' migrations are duplicated into the control
+/// `migrations/` directory, so a plain name overlap would also (wrongly) match
+/// the standalone `VERSION_HISTORY_MIGRATIONS` / `REPOSITORY_COMMIT_HOOK_MIGRATIONS`
+/// sets and strip them from shards.
 #[cfg(feature = "db")]
 fn migration_set_is_control_framework(set: &crate::migrate::EmbeddedMigrations) -> bool {
     use diesel::migration::{Migration, MigrationSource as _};
     use diesel::pg::Pg;
 
-    let Ok(framework): Result<Vec<Box<dyn Migration<Pg>>>, _> =
-        crate::migrate::FRAMEWORK_MIGRATIONS.migrations()
-    else {
-        return false;
-    };
-    let framework_names: std::collections::HashSet<String> =
-        framework.iter().map(|m| m.name().to_string()).collect();
+    fn names(set: &crate::migrate::EmbeddedMigrations) -> std::collections::HashSet<String> {
+        let migrations: Vec<Box<dyn Migration<Pg>>> = set.migrations().unwrap_or_default();
+        migrations.iter().map(|m| m.name().to_string()).collect()
+    }
 
-    let Ok(set_migrations): Result<Vec<Box<dyn Migration<Pg>>>, _> = set.migrations() else {
-        return false;
-    };
-    set_migrations
-        .iter()
-        .any(|m| framework_names.contains(&m.name().to_string()))
+    let mut control_only = names(&crate::migrate::FRAMEWORK_MIGRATIONS);
+    for shard_required in [
+        &crate::version_history::VERSION_HISTORY_MIGRATIONS,
+        &crate::repository_commit_hooks::REPOSITORY_COMMIT_HOOK_MIGRATIONS,
+    ] {
+        for name in names(shard_required) {
+            control_only.remove(&name);
+        }
+    }
+
+    names(set).iter().any(|name| control_only.contains(name))
 }
 
 #[cfg(feature = "db")]
@@ -7063,6 +7070,24 @@ mod tests {
             })
             .map(|migration| migration.name().to_string())
             .collect()
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn control_framework_filter_skips_control_but_keeps_shard_required_sets() {
+        // The full control set is skipped on shards...
+        assert!(migration_set_is_control_framework(
+            &crate::migrate::FRAMEWORK_MIGRATIONS
+        ));
+        // ...but the standalone shard-required sets are kept (not flagged),
+        // even though their migrations are duplicated into the control
+        // `migrations/` directory.
+        assert!(!migration_set_is_control_framework(
+            &crate::version_history::VERSION_HISTORY_MIGRATIONS
+        ));
+        assert!(!migration_set_is_control_framework(
+            &crate::repository_commit_hooks::REPOSITORY_COMMIT_HOOK_MIGRATIONS
+        ));
     }
 
     #[cfg(feature = "db")]
