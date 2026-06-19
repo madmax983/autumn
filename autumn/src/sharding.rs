@@ -1579,6 +1579,10 @@ pub struct ShardedDb {
     shard_name: Arc<str>,
     shard_id: ShardId,
     repo_seed: ShardRepositorySeed,
+    // The full shard set, so `Repo::from_shard(&db).across_tenants()` can fan
+    // out across shards exactly like the generated extractor path (cheap to
+    // clone — `ShardSet` is `Arc`-backed).
+    shards: ShardSet,
 }
 
 impl ShardedDb {
@@ -1633,6 +1637,14 @@ impl ShardedDb {
     #[must_use]
     pub const fn __autumn_repository_seed(&self) -> &ShardRepositorySeed {
         &self.repo_seed
+    }
+
+    /// The full shard set, so `from_shard`-built repositories can fan out under
+    /// `across_tenants()`. Internal ABI; not a stable public API.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn __autumn_shard_set(&self) -> &ShardSet {
+        &self.shards
     }
 }
 
@@ -1703,12 +1715,14 @@ impl axum::extract::FromRequestParts<crate::AppState> for ShardedDb {
             &shard_name,
             shard.read_route(),
         );
+        let shard_set = shards.set.clone();
         let db = shards.checkout_primary(shard).await?;
         Ok(Self {
             db,
             shard_name,
             shard_id,
             repo_seed,
+            shards: shard_set,
         })
     }
 }

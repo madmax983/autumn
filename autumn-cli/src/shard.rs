@@ -62,7 +62,7 @@ pub fn run_move_slot(args: &MoveSlotArgs) {
     // `--profile` wins, else fall back to `AUTUMN_ENV` so a move run targets the
     // same shard URLs the app and `autumn migrate` use.
     let effective = crate::migrate::effective_profile(args.profile.as_deref());
-    let table = crate::migrate::read_autumn_toml_table_with_profile(effective.as_deref());
+    let table = crate::migrate::read_autumn_toml_table_with_profile(Some(&effective));
     let shards = crate::migrate::resolve_shard_database_urls_from_sources(
         |k| std::env::var(k),
         table.as_ref(),
@@ -229,8 +229,13 @@ fn quote_identifier(value: &str) -> String {
         .join(".")
 }
 
-/// Build the `"key_column" = ANY(ARRAY['a','b',...]::text[])` predicate.
+/// Build the `"key_column"::text = ANY(ARRAY['a','b',...]::text[])` predicate.
 /// Single quotes in tenant keys are doubled for SQL safety.
+///
+/// The column is cast to `text` so the tool works for non-`TEXT` shard keys
+/// (e.g. `tenant_id:i64` or a UUID key): the `--tenant` values arrive as strings
+/// and comparing both sides as text avoids a `bigint = text[]` / `uuid = text[]`
+/// operator mismatch that Postgres would reject before copying any rows.
 fn build_key_filter(key_column: &str, tenants: &[String]) -> String {
     let list = tenants
         .iter()
@@ -238,7 +243,7 @@ fn build_key_filter(key_column: &str, tenants: &[String]) -> String {
         .collect::<Vec<_>>()
         .join(", ");
     let quoted_col = quote_identifier(key_column);
-    format!("{quoted_col} = ANY(ARRAY[{list}]::text[])")
+    format!("{quoted_col}::text = ANY(ARRAY[{list}]::text[])")
 }
 
 fn count_sql(table: &str, filter: &str) -> String {
@@ -261,9 +266,24 @@ fn copy_out_sql(table: &str, filter: &str) -> String {
     format!("\\copy (SELECT * FROM {qt} WHERE {filter}) TO STDOUT")
 }
 
-fn copy_in_sql(table: &str) -> String {
+/// Rows are loaded into a session-temp staging table and then inserted with
+/// `ON CONFLICT DO NOTHING`, so a confirm run after a partial dry-run (some
+/// rows already copied, then more written during the cutover window) inserts
+/// only the missing rows instead of aborting on duplicate primary keys.
+const STAGING_TABLE: &str = "__autumn_move_staging";
+
+fn staging_create_sql(table: &str) -> String {
     let qt = quote_identifier(table);
-    format!("\\copy {qt} FROM STDIN")
+    format!("CREATE TEMP TABLE {STAGING_TABLE} (LIKE {qt})")
+}
+
+fn staging_copy_in_sql() -> String {
+    format!("\\copy {STAGING_TABLE} FROM STDIN")
+}
+
+fn staging_insert_sql(table: &str) -> String {
+    let qt = quote_identifier(table);
+    format!("INSERT INTO {qt} SELECT * FROM {STAGING_TABLE} ON CONFLICT DO NOTHING")
 }
 
 fn delete_sql(table: &str, filter: &str) -> String {
@@ -312,6 +332,8 @@ fn copy_rows(from_url: &str, to_url: &str, table: &str, filter: &str) {
         .unwrap_or_else(|e| fail(&format!("failed to start source psql: {e}")));
 
     let src_out = src.stdout.take().expect("piped stdout");
+    // Single session/transaction: stage the streamed rows, then upsert with
+    // ON CONFLICT DO NOTHING so re-runs only insert rows not already present.
     let dst_status = Command::new("psql")
         .args([
             to_url,
@@ -319,7 +341,11 @@ fn copy_rows(from_url: &str, to_url: &str, table: &str, filter: &str) {
             "ON_ERROR_STOP=1",
             "--single-transaction",
             "-c",
-            &copy_in_sql(table),
+            &staging_create_sql(table),
+            "-c",
+            &staging_copy_in_sql(),
+            "-c",
+            &staging_insert_sql(table),
         ])
         .stdin(src_out)
         .status()
@@ -435,7 +461,10 @@ mod tests {
     #[test]
     fn build_key_filter_quotes_column_and_escapes_values() {
         let f = build_key_filter("tenant_id", &["acme".to_owned(), "o'brien".to_owned()]);
-        assert_eq!(f, "\"tenant_id\" = ANY(ARRAY['acme', 'o''brien']::text[])");
+        assert_eq!(
+            f,
+            "\"tenant_id\"::text = ANY(ARRAY['acme', 'o''brien']::text[])"
+        );
     }
 
     #[test]
@@ -443,16 +472,27 @@ mod tests {
         let f = build_key_filter("tenant_id", &["acme".to_owned()]);
         assert_eq!(
             count_sql("bookmarks", &f),
-            "SELECT count(*) FROM \"bookmarks\" WHERE \"tenant_id\" = ANY(ARRAY['acme']::text[])"
+            "SELECT count(*) FROM \"bookmarks\" WHERE \"tenant_id\"::text = ANY(ARRAY['acme']::text[])"
         );
         assert_eq!(
             delete_sql("bookmarks", &f),
-            "DELETE FROM \"bookmarks\" WHERE \"tenant_id\" = ANY(ARRAY['acme']::text[])"
+            "DELETE FROM \"bookmarks\" WHERE \"tenant_id\"::text = ANY(ARRAY['acme']::text[])"
         );
         assert!(
             copy_out_sql("bookmarks", &f).starts_with("\\copy (SELECT * FROM \"bookmarks\" WHERE")
         );
-        assert_eq!(copy_in_sql("bookmarks"), "\\copy \"bookmarks\" FROM STDIN");
+        assert_eq!(
+            staging_create_sql("bookmarks"),
+            "CREATE TEMP TABLE __autumn_move_staging (LIKE \"bookmarks\")"
+        );
+        assert_eq!(
+            staging_copy_in_sql(),
+            "\\copy __autumn_move_staging FROM STDIN"
+        );
+        assert_eq!(
+            staging_insert_sql("bookmarks"),
+            "INSERT INTO \"bookmarks\" SELECT * FROM __autumn_move_staging ON CONFLICT DO NOTHING"
+        );
     }
 
     #[test]
@@ -460,11 +500,15 @@ mod tests {
         let f = build_key_filter("tenant_id", &["acme".to_owned()]);
         assert_eq!(
             count_sql("public.bookmarks", &f),
-            "SELECT count(*) FROM \"public\".\"bookmarks\" WHERE \"tenant_id\" = ANY(ARRAY['acme']::text[])"
+            "SELECT count(*) FROM \"public\".\"bookmarks\" WHERE \"tenant_id\"::text = ANY(ARRAY['acme']::text[])"
         );
         assert_eq!(
-            copy_in_sql("public.bookmarks"),
-            "\\copy \"public\".\"bookmarks\" FROM STDIN"
+            staging_create_sql("public.bookmarks"),
+            "CREATE TEMP TABLE __autumn_move_staging (LIKE \"public\".\"bookmarks\")"
+        );
+        assert_eq!(
+            staging_insert_sql("public.bookmarks"),
+            "INSERT INTO \"public\".\"bookmarks\" SELECT * FROM __autumn_move_staging ON CONFLICT DO NOTHING"
         );
     }
 

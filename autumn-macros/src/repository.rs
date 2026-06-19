@@ -834,6 +834,19 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         quote! {}
     };
 
+    // `from_shard(&ShardedDb)` carries the ShardSet from the ShardedDb so that
+    // `across_tenants()` on a from_shard-built repo fans out / guards writes
+    // exactly like the extractor path (it is the standard sharded constructor).
+    let shards_from_db_field = if config.sharded {
+        quote! {
+            __autumn_shards: ::core::option::Option::Some(
+                ::core::clone::Clone::clone(db.__autumn_shard_set()),
+            ),
+        }
+    } else {
+        quote! {}
+    };
+
     let across_tenants_method = if config.tenant_scoped {
         if let Some(hooks_ident) = &config.hooks_type {
             let idempotency_clone_field = if commit_hooks_enabled {
@@ -1060,7 +1073,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     #hooks_field
                     #idempotency_field
                     #tenant_init_field
-                    #shards_none_field
+                    #shards_from_db_field
                     __autumn_read_route: #from_shard_read_route,
                     __autumn_statement_timeout_ms: __seed.statement_timeout_ms,
                     __autumn_slow_threshold: __seed.slow_query_threshold,

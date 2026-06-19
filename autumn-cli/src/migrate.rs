@@ -157,7 +157,7 @@ fn resolve_targets(target: &MigrateTarget, profile: Option<&str>) -> Vec<(String
     // fall back to `AUTUMN_ENV` — the framework's preferred profile selector —
     // so `autumn migrate` resolves the same overlay the app itself would use.
     let effective = effective_profile(profile);
-    let config_table = read_autumn_toml_table_with_profile(effective.as_deref());
+    let config_table = read_autumn_toml_table_with_profile(Some(&effective));
     let control =
         resolve_primary_database_url_from_sources(|key| std::env::var(key), config_table.as_ref());
     let shards =
@@ -569,13 +569,15 @@ fn read_autumn_toml_table() -> Option<toml::Table> {
 /// runtime loader's precedence (`autumn_web::config::resolve_profile_input`) so
 /// the CLI resolves the same overlay/URLs the running app would: `AUTUMN_ENV`
 /// (preferred), then legacy `AUTUMN_PROFILE`, then an explicit `--profile` flag,
-/// then release build-mode (`AUTUMN_IS_DEBUG=0` resolves to `prod`).
+/// then release build-mode (`AUTUMN_IS_DEBUG=0` resolves to `prod`), and finally
+/// `dev` — the runtime's default — so a local `autumn migrate` applies the same
+/// `[profile.dev]` / `autumn-dev.toml` overlay the app would rather than the
+/// bare base config.
 ///
 /// `explicit` must be the real `--profile` flag value only — the clap arg no
 /// longer auto-fills it from `AUTUMN_PROFILE`, so env vars keep their documented
-/// precedence over the flag. Returns `None` when nothing selects a profile
-/// (debug build, no env/flag), in which case the base `autumn.toml` is used.
-pub fn effective_profile(explicit: Option<&str>) -> Option<String> {
+/// precedence over the flag. Always resolves to a profile (worst case `"dev"`).
+pub fn effective_profile(explicit: Option<&str>) -> String {
     let read = |key: &str| std::env::var(key).ok().filter(|v| !v.trim().is_empty());
     read("AUTUMN_ENV")
         .or_else(|| read("AUTUMN_PROFILE"))
@@ -585,9 +587,12 @@ pub fn effective_profile(explicit: Option<&str>) -> Option<String> {
                 .filter(|p| !p.is_empty())
                 .map(str::to_owned)
         })
-        .or_else(|| {
-            (std::env::var("AUTUMN_IS_DEBUG").ok().as_deref() == Some("0"))
-                .then(|| "prod".to_owned())
+        .unwrap_or_else(|| {
+            if std::env::var("AUTUMN_IS_DEBUG").ok().as_deref() == Some("0") {
+                "prod".to_owned()
+            } else {
+                "dev".to_owned()
+            }
         })
 }
 
@@ -912,9 +917,7 @@ fn is_production_profile(explicit: Option<&str>) -> bool {
     // Delegate to the shared effective-profile resolution (env precedence +
     // explicit `--profile` + build-mode signal) so the rollback guard and config
     // resolution agree on which profile (and thus which databases) is targeted.
-    effective_profile(explicit)
-        .as_deref()
-        .is_some_and(is_production_profile_name)
+    is_production_profile_name(&effective_profile(explicit))
 }
 
 /// Whether an applied user migration has a usable `down.sql` on disk.
