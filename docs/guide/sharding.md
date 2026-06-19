@@ -348,6 +348,15 @@ the data, pin the tenant to its new shard, and unpinned tenants keep hashing
 as before. (You can also enable it via `database.directory_shard_router =
 true`; an explicit `with_shard_router` always takes precedence.)
 
+> **Control pool sizing.** Directory routing resolves the tenant→shard key by
+> checking out a second control connection during extraction. A handler that
+> already holds a control connection (e.g. extracts `Db` and then `ShardedDb`
+> or a sharded repository) would deadlock on a control pool sized to **1** — the
+> first checkout can't be released until the handler runs. Startup therefore
+> requires the control pool to allow **at least 2** connections when directory
+> routing is enabled and fails fast with a clear error otherwise. Size
+> `database.pool.max_size` accordingly.
+
 ## Read-your-own-writes, × N
 
 Each shard inherits the replica story's read-your-own-writes gap:

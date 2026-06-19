@@ -5225,6 +5225,25 @@ async fn resolve_shard_set(
                      the hash router."
                         .to_owned()
                 })?;
+            // Directory routing resolves the tenant→shard key by checking out a
+            // *second* control connection during extraction. A handler that
+            // already holds `Db` (or another control checkout) before extracting
+            // `ShardedDb` / a sharded repository would then deadlock on a control
+            // pool sized to 1 — the first checkout cannot be released until the
+            // handler runs. Require at least 2 control connections so these
+            // mixed control+tenant handlers always make progress.
+            let control_max = control_primary.status().max_size;
+            if control_max < 2 {
+                return Err(format!(
+                    "directory_shard_router requires a control database pool of at least 2 \
+                     connections, but the configured maximum is {control_max}. Directory \
+                     routing checks out a second control connection during extraction to \
+                     resolve the tenant→shard key, which deadlocks a pool sized to 1 when a \
+                     handler already holds a control connection (e.g. `Db` + `ShardedDb`). \
+                     Increase the control pool size (database.pool.max_size), or disable \
+                     directory routing to use the hash router."
+                ));
+            }
             // Bound directory lookups with the configured database statement
             // timeout (capped to Postgres' i32 millisecond range).
             let timeout_ms = config.database.statement_timeout.map_or(0, |d| {
