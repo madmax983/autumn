@@ -107,8 +107,10 @@ enum Commands {
         control_only: bool,
         /// Resolve database URLs through a profile overlay: deep-merge
         /// `autumn-<profile>.toml` over `autumn.toml` before reading the
-        /// control and shard URLs. Defaults to the `AUTUMN_PROFILE` env var.
-        #[arg(long, value_name = "PROFILE", env = "AUTUMN_PROFILE")]
+        /// control and shard URLs. When omitted, the profile is selected from
+        /// `AUTUMN_ENV` (preferred) or the legacy `AUTUMN_PROFILE`, matching the
+        /// app's runtime precedence — so env vars are not overridden by this flag.
+        #[arg(long, value_name = "PROFILE")]
         profile: Option<String>,
     },
     /// Shard operations (e.g. moving a tenant's data between shards)
@@ -702,7 +704,9 @@ enum ShardSubcommand {
         #[arg(long)]
         confirm: bool,
         /// Resolve shard URLs through a profile overlay (like `autumn migrate`).
-        #[arg(long, value_name = "PROFILE", env = "AUTUMN_PROFILE")]
+        /// When omitted, the profile is selected from `AUTUMN_ENV` (preferred)
+        /// or the legacy `AUTUMN_PROFILE`, matching the app's runtime precedence.
+        #[arg(long, value_name = "PROFILE")]
         profile: Option<String>,
     },
 }

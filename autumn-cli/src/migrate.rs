@@ -565,18 +565,36 @@ fn read_autumn_toml_table() -> Option<toml::Table> {
         .and_then(|contents| toml::from_str::<toml::Table>(&contents).ok())
 }
 
-/// The profile actually in effect for CLI config resolution: an explicit
-/// `--profile` (or `AUTUMN_PROFILE`, which clap fills into `profile`) wins,
-/// otherwise fall back to `AUTUMN_ENV` — the framework's preferred profile
-/// selector — so the CLI resolves the same overlay the running app would.
-/// Returns `None` when neither is set.
+/// The profile actually in effect for CLI config resolution, mirroring the
+/// runtime loader's precedence (`autumn_web::config::resolve_profile_input`) so
+/// the CLI resolves the same overlay/URLs the running app would: `AUTUMN_ENV`
+/// (preferred), then legacy `AUTUMN_PROFILE`, then an explicit `--profile` flag,
+/// then release build-mode (`AUTUMN_IS_DEBUG=0` resolves to `prod`).
+///
+/// `explicit` must be the real `--profile` flag value only — the clap arg no
+/// longer auto-fills it from `AUTUMN_PROFILE`, so env vars keep their documented
+/// precedence over the flag. Returns `None` when nothing selects a profile
+/// (debug build, no env/flag), in which case the base `autumn.toml` is used.
 pub fn effective_profile(explicit: Option<&str>) -> Option<String> {
-    if let Some(p) = explicit.filter(|p| !p.trim().is_empty()) {
-        return Some(p.to_owned());
-    }
-    std::env::var("AUTUMN_ENV")
-        .ok()
-        .filter(|v| !v.trim().is_empty())
+    let read = |key: &str| std::env::var(key).ok().filter(|v| !v.trim().is_empty());
+    read("AUTUMN_ENV")
+        .or_else(|| read("AUTUMN_PROFILE"))
+        .or_else(|| {
+            explicit
+                .map(str::trim)
+                .filter(|p| !p.is_empty())
+                .map(str::to_owned)
+        })
+        .or_else(|| {
+            (std::env::var("AUTUMN_IS_DEBUG").ok().as_deref() == Some("0"))
+                .then(|| "prod".to_owned())
+        })
+}
+
+/// Whether a resolved profile name is production (`prod`/`production`).
+fn is_production_profile_name(profile: &str) -> bool {
+    let normalized = profile.trim().to_ascii_lowercase();
+    normalized == "prod" || normalized == "production"
 }
 
 /// Profile name spellings (in precedence order) to probe for both inline
@@ -613,13 +631,25 @@ fn read_autumn_toml_table_with_profile_in(
     dir: &Path,
     profile: Option<&str>,
 ) -> Option<toml::Table> {
+    // An absent file is a no-op (fall back to the next layer), but a file that
+    // EXISTS yet can't be read or parsed is a hard error — silently ignoring it
+    // would resolve different URLs than the running app (which the runtime
+    // loader rejects), risking migrations/row-moves against the wrong database.
     let read_table = |path: &Path| -> Option<toml::Table> {
         if !path.exists() {
             return None;
         }
-        std::fs::read_to_string(path)
-            .ok()
-            .and_then(|contents| toml::from_str::<toml::Table>(&contents).ok())
+        let contents = std::fs::read_to_string(path).unwrap_or_else(|e| {
+            eprintln!("\u{2717} Failed to read {}: {e}", path.display());
+            std::process::exit(1);
+        });
+        match toml::from_str::<toml::Table>(&contents) {
+            Ok(table) => Some(table),
+            Err(e) => {
+                eprintln!("\u{2717} Failed to parse {}: {e}", path.display());
+                std::process::exit(1);
+            }
+        }
     };
 
     let base = read_table(&dir.join("autumn.toml"));
@@ -869,29 +899,22 @@ where
     run_shard(database_url)
 }
 
-/// True iff the active profile resolves to `prod`/`production`.
+/// True iff the [effective profile](effective_profile) resolves to
+/// `prod`/`production`.
 ///
-/// Mirrors `autumn_web::config::resolve_profile`'s precedence: `AUTUMN_ENV`
-/// (preferred) then `AUTUMN_PROFILE` (legacy alias), normalising case and
-/// whitespace. When neither is set, fall back to the build-mode signal —
-/// `AUTUMN_IS_DEBUG=0` (set by `#[autumn_web::main]` in release builds) resolves
-/// to prod — so a release deployment that relies on that signal still trips the
-/// rollback guard. (The `--profile` CLI flag that `resolve_profile` also honours
-/// is not a recognised `migrate down` argument, so it cannot reach here.)
-fn is_production_profile() -> bool {
-    // Treat an empty/whitespace value as absent (matching `autumn_web::config`)
-    // so the next signal in the precedence chain is still consulted.
-    let read = |key: &str| std::env::var(key).ok().filter(|v| !v.trim().is_empty());
-    read("AUTUMN_ENV")
-        .or_else(|| read("AUTUMN_PROFILE"))
-        .map_or_else(
-            // No explicit profile: fall back to the build-mode signal.
-            || std::env::var("AUTUMN_IS_DEBUG").ok().as_deref() == Some("0"),
-            |profile| {
-                let normalized = profile.trim().to_lowercase();
-                normalized == "prod" || normalized == "production"
-            },
-        )
+/// Takes the same explicit `--profile` value as the rest of CLI resolution and
+/// runs it through [`effective_profile`], so the rollback guard agrees with the
+/// databases the command will actually target: `AUTUMN_ENV` (preferred), then
+/// legacy `AUTUMN_PROFILE`, then the explicit flag, then the release build-mode
+/// signal (`AUTUMN_IS_DEBUG=0`). Pass `None` to test the env/build-mode signals
+/// alone.
+fn is_production_profile(explicit: Option<&str>) -> bool {
+    // Delegate to the shared effective-profile resolution (env precedence +
+    // explicit `--profile` + build-mode signal) so the rollback guard and config
+    // resolution agree on which profile (and thus which databases) is targeted.
+    effective_profile(explicit)
+        .as_deref()
+        .is_some_and(is_production_profile_name)
 }
 
 /// Whether an applied user migration has a usable `down.sql` on disk.
@@ -966,13 +989,12 @@ fn run_down(
     target: &MigrateTarget,
     profile: Option<&str>,
 ) {
-    // 1. Production guard.  Check the explicit `--profile` arg first (highest
-    //    priority), then fall back to the env-based `is_production_profile()`
-    //    which reads `AUTUMN_ENV` / `AUTUMN_PROFILE` / `AUTUMN_IS_DEBUG`.
-    let is_prod = profile.map_or_else(is_production_profile, |p| {
-        let p = p.trim().to_lowercase();
-        p == "prod" || p == "production"
-    });
+    // 1. Production guard. Derive prod-ness from the SAME effective profile the
+    //    rollback will target (env precedence + build-mode + explicit flag), so
+    //    e.g. an `AUTUMN_ENV=prod` overlay still trips the guard even when an
+    //    explicit `--profile dev` is passed, and the guard can't be bypassed by
+    //    resolving prod URLs without `--yes-i-mean-prod`.
+    let is_prod = is_production_profile(profile);
     if is_prod && !args.yes_i_mean_prod {
         eprintln!("\u{2717} Production profile detected.");
         eprintln!("  Rolling back migrations in production requires explicit confirmation.");
@@ -1509,28 +1531,28 @@ mod tests {
     #[test]
     fn is_production_profile_detects_prod() {
         temp_env::with_var("AUTUMN_ENV", Some("prod"), || {
-            assert!(is_production_profile());
+            assert!(is_production_profile(None));
         });
     }
 
     #[test]
     fn is_production_profile_detects_production() {
         temp_env::with_var("AUTUMN_ENV", Some("production"), || {
-            assert!(is_production_profile());
+            assert!(is_production_profile(None));
         });
     }
 
     #[test]
     fn is_production_profile_case_insensitive() {
         temp_env::with_var("AUTUMN_ENV", Some("PROD"), || {
-            assert!(is_production_profile());
+            assert!(is_production_profile(None));
         });
     }
 
     #[test]
     fn is_production_profile_false_for_dev() {
         temp_env::with_var("AUTUMN_ENV", Some("dev"), || {
-            assert!(!is_production_profile());
+            assert!(!is_production_profile(None));
         });
     }
 
@@ -1539,7 +1561,7 @@ mod tests {
         temp_env::with_vars(
             [("AUTUMN_ENV", None), ("AUTUMN_PROFILE", Some("production"))],
             || {
-                assert!(is_production_profile());
+                assert!(is_production_profile(None));
             },
         );
     }
@@ -1554,7 +1576,7 @@ mod tests {
                 ("AUTUMN_PROFILE", Some("prod")),
             ],
             || {
-                assert!(is_production_profile());
+                assert!(is_production_profile(None));
             },
         );
     }
@@ -1570,7 +1592,7 @@ mod tests {
                 ("AUTUMN_IS_DEBUG", Some("0")),
             ],
             || {
-                assert!(is_production_profile());
+                assert!(is_production_profile(None));
             },
         );
     }
@@ -1584,7 +1606,7 @@ mod tests {
                 ("AUTUMN_IS_DEBUG", Some("1")),
             ],
             || {
-                assert!(!is_production_profile());
+                assert!(!is_production_profile(None));
             },
         );
     }
@@ -1599,7 +1621,7 @@ mod tests {
                 ("AUTUMN_IS_DEBUG", Some("0")),
             ],
             || {
-                assert!(!is_production_profile());
+                assert!(!is_production_profile(None));
             },
         );
     }

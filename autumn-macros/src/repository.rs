@@ -7395,6 +7395,9 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 async fn restore(&self, id: i64) -> ::autumn_web::AutumnResult<()> {
                     use ::autumn_web::reexports::diesel::prelude::*;
                     use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                    // §1d: restore is a write; reject cross-shard across_tenants
+                    // (per-shard ids are ambiguous, like delete/purge).
+                    #cross_shard_write_guard
                     #tenant_id_setup
                     let mut conn = self.__autumn_acquire_conn().await?;
                     let query = #table_ident::table.find(id);
@@ -7421,6 +7424,9 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 async fn purge(&self, id: i64) -> ::autumn_web::AutumnResult<()> {
                     use ::autumn_web::reexports::diesel::prelude::*;
                     use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                    // §1d: purge is a hard delete; reject cross-shard across_tenants
+                    // (per-shard ids are ambiguous and could purge another tenant's row).
+                    #cross_shard_write_guard
                     #tenant_id_setup
                     let mut conn = self.__autumn_acquire_conn().await?;
                     let query = #table_ident::table.find(id);
