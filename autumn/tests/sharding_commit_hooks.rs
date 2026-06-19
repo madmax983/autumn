@@ -19,6 +19,12 @@
 
 #[cfg(all(feature = "db", feature = "test-support"))]
 mod sharding_commit_hook_tests {
+    // The #[repository(commit_hooks = true)] expansion builds the idempotency
+    // discriminator with a `let mut x = None; if let Some(..) = .. { x = .. }`
+    // sequence. This is the first real (non-trybuild) test target to exercise
+    // that codegen under clippy, so allow the generated-code idiom here.
+    #![allow(clippy::useless_let_if_seq)]
+
     use autumn_web::config::ShardConfig;
     use autumn_web::prelude::*;
     use autumn_web::test::{TestApp, TestDb};
@@ -110,8 +116,8 @@ mod sharding_commit_hook_tests {
 
     /// Establish the current tenant from an `X-Tenant` header for the whole
     /// request. `with_tenant` sets the `CURRENT_TENANT` task-local, which both
-    /// the sharding extractor (shard routing key) and the tenant_scoped
-    /// repository (tenant_id stamping) read — no `[tenancy]` config needed.
+    /// the sharding extractor (shard routing key) and the `tenant_scoped`
+    /// repository (`tenant_id` stamping) read — no `[tenancy]` config needed.
     async fn inject_tenant(
         request: axum::extract::Request,
         next: axum::middleware::Next,
