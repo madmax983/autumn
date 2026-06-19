@@ -602,16 +602,41 @@ fn is_production_profile_name(profile: &str) -> bool {
     normalized == "prod" || normalized == "production"
 }
 
-/// Profile name spellings (in precedence order) to probe for both inline
-/// `[profile.<name>]` sections and `autumn-<name>.toml` overlay files, mirroring
-/// `autumn_web::config`'s alias handling so `prod`/`production` and
-/// `dev`/`development` are interchangeable. Matching is case-insensitive; custom
-/// profile names are used verbatim.
+/// Profile name spellings to probe for inline `[profile.<name>]` sections,
+/// mirroring `autumn_web::config::profile_lookup_names`'s alias handling so
+/// `prod`/`production` and `dev`/`development` are interchangeable. Matching is
+/// case-insensitive; custom profile names are used verbatim.
 fn profile_lookup_names(profile: &str) -> Vec<String> {
     match profile.trim().to_ascii_lowercase().as_str() {
         "prod" | "production" => vec!["production".to_owned(), "prod".to_owned()],
         "dev" | "development" => vec!["development".to_owned(), "dev".to_owned()],
         _ => vec![profile.trim().to_owned()],
+    }
+}
+
+/// Overlay-FILE lookup names, **selected-spelling first** — mirrors the runtime
+/// `autumn_web::config::profile_override_file_lookup_names`. Only one overlay
+/// file is loaded (the first that exists), so when both `autumn-prod.toml` and
+/// `autumn-production.toml` are present the operator's selected `--profile`
+/// spelling wins, resolving the same file the running app would.
+fn profile_file_lookup_names(profile: &str) -> Vec<String> {
+    let trimmed = profile.trim();
+    match trimmed.to_ascii_lowercase().as_str() {
+        "prod" | "production" => {
+            if trimmed.eq_ignore_ascii_case("production") {
+                vec!["production".to_owned(), "prod".to_owned()]
+            } else {
+                vec!["prod".to_owned(), "production".to_owned()]
+            }
+        }
+        "dev" | "development" => {
+            if trimmed.eq_ignore_ascii_case("development") {
+                vec!["development".to_owned(), "dev".to_owned()]
+            } else {
+                vec!["dev".to_owned(), "development".to_owned()]
+            }
+        }
+        _ => vec![trimmed.to_owned()],
     }
 }
 
@@ -664,9 +689,12 @@ fn read_autumn_toml_table_with_profile_in(
 
     // Probe overlay files across canonical alias spellings (e.g. the operator
     // sets `AUTUMN_ENV=production` but the file is the common `autumn-prod.toml`)
-    // and load the first that exists, mirroring the runtime loader's lookup.
+    // and load the first that exists. File lookup prefers the *selected* spelling
+    // (mirroring the runtime `profile_override_file_lookup_names`), so a repo with
+    // both `autumn-prod.toml` and `autumn-production.toml` resolves the file the
+    // app would under the same profile.
     let lookup_names = profile_lookup_names(profile);
-    let overlay = lookup_names
+    let overlay = profile_file_lookup_names(profile)
         .iter()
         .find_map(|name| read_table(&dir.join(format!("autumn-{name}.toml"))));
     if base.is_none() && overlay.is_none() {
@@ -1603,6 +1631,26 @@ mod tests {
                 assert_eq!(effective_profile(None), "prod");
             },
         );
+    }
+
+    #[test]
+    fn profile_file_lookup_prefers_selected_spelling() {
+        // Overlay file probe order prefers the spelling the operator selected.
+        assert_eq!(
+            profile_file_lookup_names("prod"),
+            vec!["prod", "production"]
+        );
+        assert_eq!(
+            profile_file_lookup_names("production"),
+            vec!["production", "prod"]
+        );
+        assert_eq!(profile_file_lookup_names("dev"), vec!["dev", "development"]);
+        assert_eq!(
+            profile_file_lookup_names("development"),
+            vec!["development", "dev"]
+        );
+        // Custom profiles are used verbatim.
+        assert_eq!(profile_file_lookup_names("staging"), vec!["staging"]);
     }
 
     // ── is_production_profile ─────────────────────────────────────────────────
