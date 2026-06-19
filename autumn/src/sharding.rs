@@ -843,6 +843,13 @@ impl ShardSet {
     /// when it returns the owned, `'static` future), so the futures can run
     /// concurrently without borrowing the [`ShardSet`].
     ///
+    /// Concurrency is bounded at [`FAN_OUT_CONCURRENCY`] so a cross-tenant admin
+    /// read does not check out a connection from every shard at once (which
+    /// could spike load or exhaust connection limits on large fleets), matching
+    /// the public [`Shards::each_shard`] pipeline. Results are returned in
+    /// completion order; callers merge them order-independently (concat / sum /
+    /// any). Fails the whole call on the first shard error.
+    ///
     /// This is a framework-internal primitive used by generated repository
     /// code.  It is `pub` so that downstream crates can call it from
     /// `#[repository]`-generated `impl` blocks, but it is not part of the
@@ -854,8 +861,24 @@ impl ShardSet {
         Fut: std::future::Future<Output = Result<T, crate::AutumnError>> + Send + 'static,
         F: Fn(&Shard) -> Fut + Send + Sync,
     {
-        let futs: Vec<_> = self.inner.shards.iter().map(f).collect();
-        futures::future::try_join_all(futs).await
+        use futures::StreamExt as _;
+
+        let mut results: Vec<T> = Vec::with_capacity(self.inner.shards.len());
+        let mut in_flight: futures::stream::FuturesUnordered<Fut> =
+            futures::stream::FuturesUnordered::new();
+
+        for shard in self.inner.shards.iter() {
+            if in_flight.len() >= FAN_OUT_CONCURRENCY
+                && let Some(result) = in_flight.next().await
+            {
+                results.push(result?);
+            }
+            in_flight.push(f(shard));
+        }
+        while let Some(result) = in_flight.next().await {
+            results.push(result?);
+        }
+        Ok(results)
     }
 }
 
