@@ -4355,7 +4355,7 @@ pub struct TenancyConfig {
 
     /// JWT secret key used to verify the JWT signature.
     #[serde(default)]
-    pub jwt_secret: Option<String>,
+    pub jwt_secret: Option<secrecy::SecretString>,
 
     /// Expected JWT issuer to validate.
     #[serde(default)]
