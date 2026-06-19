@@ -911,7 +911,15 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     #idempotency_field
                     across_tenants: true,
                     __autumn_shards: ::core::option::Option::None,
-                    __autumn_read_route: __shard.read_route(),
+                    // Honor the shard's read routing (replica / fail-closed),
+                    // but preserve an explicit parent primary-read override
+                    // (`primary_reads` or `on_primary()`) so cross-shard
+                    // read-your-writes is not silently sent to replicas (#1d).
+                    __autumn_read_route: match self.__autumn_read_route {
+                        ::autumn_web::repository::ReadRoute::Primary =>
+                            ::autumn_web::repository::ReadRoute::Primary,
+                        _ => __shard.read_route(),
+                    },
                     __autumn_statement_timeout_ms: self.__autumn_statement_timeout_ms,
                     __autumn_slow_threshold: self.__autumn_slow_threshold,
                     __autumn_route: self.__autumn_route.clone(),
