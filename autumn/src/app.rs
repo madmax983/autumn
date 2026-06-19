@@ -234,6 +234,7 @@ pub struct RegisteredApiVersions(pub Vec<ApiVersion>);
 ///         .await;
 /// }
 /// ```
+#[allow(clippy::struct_excessive_bools)]
 pub struct AppBuilder {
     pub(crate) routes: Vec<Route>,
     /// Registered API versions.

@@ -262,7 +262,7 @@ impl std::fmt::Debug for DirectoryShardRouter {
             .field("ttl", &self.ttl)
             .field(
                 "cached_keys",
-                &self.cache.read().map(|c| c.len()).unwrap_or(0),
+                &self.cache.read().map_or(0, |c| c.len()),
             )
             .finish_non_exhaustive()
     }
