@@ -1660,7 +1660,7 @@ fn build_request(
         let Value::Object(map) = query else {
             return Err("`query` must be a JSON object".to_owned());
         };
-        let mut pairs: Vec<(String, String)> = Vec::new();
+        let mut pairs: Vec<(&str, std::borrow::Cow<'_, str>)> = Vec::with_capacity(map.len());
         for (key, value) in map {
             match value {
                 // Form/explode semantics: an array field expands to repeated
@@ -1668,10 +1668,10 @@ fn build_request(
                 // tool schema advertises — not a single `tags=["a","b"]`.
                 Value::Array(items) => {
                     for item in items {
-                        pairs.push((key.clone(), query_scalar(item)));
+                        pairs.push((key.as_str(), query_scalar(item)));
                     }
                 }
-                other => pairs.push((key.clone(), query_scalar(other))),
+                other => pairs.push((key.as_str(), query_scalar(other))),
             }
         }
         if !pairs.is_empty() {
@@ -1736,10 +1736,10 @@ fn build_request(
 
 /// Render a single query-argument value as a string for the query string.
 /// Strings pass through unquoted; other scalars use their JSON text.
-fn query_scalar(value: &Value) -> String {
+fn query_scalar(value: &Value) -> std::borrow::Cow<'_, str> {
     match value {
-        Value::String(s) => s.clone(),
-        other => other.to_string(),
+        Value::String(s) => std::borrow::Cow::Borrowed(s.as_str()),
+        other => std::borrow::Cow::Owned(other.to_string()),
     }
 }
 
