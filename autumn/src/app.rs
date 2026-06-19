@@ -5212,30 +5212,33 @@ async fn setup_database(
     }
     .map_err(|e| format!("Failed to create database pool: {e}"))?;
 
-    // Resolve the shard router: an explicit `with_shard_router` wins; otherwise
-    // `directory_shard_router` opts into the control-DB directory router (bound
-    // to the just-built control primary pool); otherwise the hash router.
-    let use_directory_router = directory_shard_router || config.database.directory_shard_router;
-    let router: Arc<dyn crate::sharding::ShardRouter> = match shard_router {
-        Some(explicit) => explicit,
-        None if use_directory_router => {
-            let control_primary = topology
-                .as_ref()
-                .map(crate::db::DatabaseTopology::primary)
-                .ok_or_else(|| {
-                    "directory_shard_router is enabled but no control database is configured. \
-                     The directory router needs a control `database.primary_url`/`url` to read \
-                     the tenant→shard directory. Set one, or disable directory routing to use \
-                     the hash router."
-                        .to_owned()
-                })?;
-            Arc::new(crate::sharding::DirectoryShardRouter::new(
-                control_primary.clone(),
-            ))
-        }
-        None => Arc::new(crate::sharding::HashShardRouter),
-    };
     let shards = if config.database.has_shards() {
+        // Resolve the shard router: an explicit `with_shard_router` wins;
+        // otherwise `directory_shard_router` opts into the control-DB directory
+        // router (bound to the just-built control primary pool); otherwise the
+        // hash router. Only resolved when shards exist — the directory flag is
+        // documented as having no effect without `[[database.shards]]`, so a
+        // shardless profile that leaves it enabled must not fail startup.
+        let use_directory_router = directory_shard_router || config.database.directory_shard_router;
+        let router: Arc<dyn crate::sharding::ShardRouter> = match shard_router {
+            Some(explicit) => explicit,
+            None if use_directory_router => {
+                let control_primary = topology
+                    .as_ref()
+                    .map(crate::db::DatabaseTopology::primary)
+                    .ok_or_else(|| {
+                        "directory_shard_router is enabled but no control database is configured. \
+                         The directory router needs a control `database.primary_url`/`url` to read \
+                         the tenant→shard directory. Set one, or disable directory routing to use \
+                         the hash router."
+                            .to_owned()
+                    })?;
+                Arc::new(crate::sharding::DirectoryShardRouter::new(
+                    control_primary.clone(),
+                ))
+            }
+            None => Arc::new(crate::sharding::HashShardRouter),
+        };
         let set = match shard_provider {
             Some(factory) => {
                 let topologies = factory(config.database.clone())
