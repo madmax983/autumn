@@ -867,7 +867,7 @@ impl ShardSet {
         let mut in_flight: futures::stream::FuturesUnordered<Fut> =
             futures::stream::FuturesUnordered::new();
 
-        for shard in self.inner.shards.iter() {
+        for shard in &self.inner.shards {
             if in_flight.len() >= FAN_OUT_CONCURRENCY
                 && let Some(result) = in_flight.next().await
             {
