@@ -7582,6 +7582,11 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         let dispatch = quote! {
             if self.across_tenants {
                 if let ::core::option::Option::Some(ref __shards) = self.__autumn_shards {
+                    // Release the routed-shard read connection acquired by the
+                    // trait method before fanning out: holding it while
+                    // re-acquiring from every shard (including this one)
+                    // deadlocks pools sized to one connection (#1d).
+                    ::core::mem::drop(conn);
                     let __vecs = __shards.fan_out_shards(|__shard| {
                         let __sub = self.__autumn_for_shard(__shard);
                         async move { __sub.__autumn_find_all_one_shard().await }
@@ -7616,6 +7621,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         let dispatch = quote! {
             if self.across_tenants {
                 if let ::core::option::Option::Some(ref __shards) = self.__autumn_shards {
+                    ::core::mem::drop(conn);
                     let __found = __shards.fan_out_shards(|__shard| {
                         let __sub = self.__autumn_for_shard(__shard);
                         async move { __sub.__autumn_find_by_id_one_shard(id).await }
@@ -7683,6 +7689,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         let dispatch = quote! {
             if self.across_tenants {
                 if let ::core::option::Option::Some(ref __shards) = self.__autumn_shards {
+                    ::core::mem::drop(conn);
                     let __counts = __shards.fan_out_shards(|__shard| {
                         let __sub = self.__autumn_for_shard(__shard);
                         async move { __sub.__autumn_count_one_shard().await }
@@ -7756,6 +7763,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         let dispatch = quote! {
             if self.across_tenants {
                 if let ::core::option::Option::Some(ref __shards) = self.__autumn_shards {
+                    ::core::mem::drop(conn);
                     let __results = __shards.fan_out_shards(|__shard| {
                         let __sub = self.__autumn_for_shard(__shard);
                         async move { __sub.__autumn_exists_by_id_one_shard(id).await }
