@@ -157,3 +157,213 @@ fn is_trusted_proxy(ip: IpAddr, trusted_proxies: &[TrustedProxy]) -> bool {
         .iter()
         .any(|trusted_proxy| trusted_proxy.contains(ip))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::Request;
+    use std::str::FromStr;
+
+    #[test]
+    fn test_trusted_proxy_parse() {
+        assert_eq!(
+            TrustedProxy::parse("192.168.1.1/24"),
+            Some(TrustedProxy {
+                network: IpAddr::from_str("192.168.1.1").unwrap(),
+                prefix_len: 24,
+            })
+        );
+
+        assert_eq!(
+            TrustedProxy::parse("10.0.0.1"),
+            Some(TrustedProxy {
+                network: IpAddr::from_str("10.0.0.1").unwrap(),
+                prefix_len: 32,
+            })
+        );
+
+        assert_eq!(
+            TrustedProxy::parse("2001:db8::1/64"),
+            Some(TrustedProxy {
+                network: IpAddr::from_str("2001:db8::1").unwrap(),
+                prefix_len: 64,
+            })
+        );
+
+        assert_eq!(
+            TrustedProxy::parse("2001:db8::1"),
+            Some(TrustedProxy {
+                network: IpAddr::from_str("2001:db8::1").unwrap(),
+                prefix_len: 128,
+            })
+        );
+
+        assert_eq!(TrustedProxy::parse(""), None);
+        assert_eq!(TrustedProxy::parse("invalid"), None);
+        assert_eq!(TrustedProxy::parse("10.0.0.1/invalid"), None);
+        assert_eq!(TrustedProxy::parse("10.0.0.1/33"), None); // > 32 for IPv4
+        assert_eq!(TrustedProxy::parse("2001:db8::1/129"), None); // > 128 for IPv6
+    }
+
+    #[test]
+    fn test_trusted_proxy_contains() {
+        let proxy_ipv4 = TrustedProxy::parse("192.168.1.0/24").unwrap();
+        assert!(proxy_ipv4.contains(IpAddr::from_str("192.168.1.100").unwrap()));
+        assert!(!proxy_ipv4.contains(IpAddr::from_str("192.168.2.1").unwrap()));
+        assert!(!proxy_ipv4.contains(IpAddr::from_str("2001:db8::1").unwrap()));
+
+        let proxy_ipv6 = TrustedProxy::parse("2001:db8::/64").unwrap();
+        assert!(proxy_ipv6.contains(IpAddr::from_str("2001:db8::1").unwrap()));
+        assert!(!proxy_ipv6.contains(IpAddr::from_str("2001:db9::1").unwrap()));
+        assert!(!proxy_ipv6.contains(IpAddr::from_str("192.168.1.1").unwrap()));
+
+        let proxy_zero_prefix = TrustedProxy::parse("0.0.0.0/0").unwrap();
+        assert!(proxy_zero_prefix.contains(IpAddr::from_str("8.8.8.8").unwrap()));
+        assert!(!proxy_zero_prefix.contains(IpAddr::from_str("2001:db8::1").unwrap()));
+
+        let proxy_v6_zero_prefix = TrustedProxy::parse("::/0").unwrap();
+        assert!(proxy_v6_zero_prefix.contains(IpAddr::from_str("2001:db8::1").unwrap()));
+        assert!(!proxy_v6_zero_prefix.contains(IpAddr::from_str("8.8.8.8").unwrap()));
+
+        let proxy_exact = TrustedProxy::parse("10.0.0.1").unwrap();
+        assert!(proxy_exact.contains(IpAddr::from_str("10.0.0.1").unwrap()));
+        assert!(!proxy_exact.contains(IpAddr::from_str("10.0.0.2").unwrap()));
+    }
+
+    #[test]
+    fn test_client_ip_from_x_forwarded_for_no_proxies_configured() {
+        let proxies = [];
+        assert_eq!(
+            client_ip_from_x_forwarded_for("1.1.1.1", None, &proxies, false),
+            Some(IpAddr::from_str("1.1.1.1").unwrap())
+        );
+
+        assert_eq!(
+            client_ip_from_x_forwarded_for("2.2.2.2, 1.1.1.1", None, &proxies, false),
+            Some(IpAddr::from_str("1.1.1.1").unwrap())
+        );
+
+        let peer_ip = Some(IpAddr::from_str("1.1.1.1").unwrap());
+        assert_eq!(
+            client_ip_from_x_forwarded_for("2.2.2.2, 1.1.1.1", peer_ip, &proxies, false),
+            Some(IpAddr::from_str("2.2.2.2").unwrap())
+        );
+
+        let peer_ip = Some(IpAddr::from_str("1.1.1.1").unwrap());
+        assert_eq!(
+            client_ip_from_x_forwarded_for("3.3.3.3, 2.2.2.2, 1.1.1.1", peer_ip, &proxies, false),
+            Some(IpAddr::from_str("2.2.2.2").unwrap())
+        );
+
+        assert_eq!(
+            client_ip_from_x_forwarded_for("invalid", None, &proxies, false),
+            None
+        );
+    }
+
+    #[test]
+    fn test_client_ip_from_x_forwarded_for_with_proxies_configured() {
+        let proxies = [TrustedProxy::parse("10.0.0.0/8").unwrap()];
+
+        assert_eq!(
+            client_ip_from_x_forwarded_for("1.1.1.1", None, &proxies, true),
+            Some(IpAddr::from_str("1.1.1.1").unwrap())
+        );
+
+        assert_eq!(
+            client_ip_from_x_forwarded_for("2.2.2.2, 10.0.0.1", None, &proxies, true),
+            Some(IpAddr::from_str("2.2.2.2").unwrap())
+        );
+
+        assert_eq!(
+            client_ip_from_x_forwarded_for("10.0.0.2, 10.0.0.1", None, &proxies, true),
+            None
+        );
+
+        assert_eq!(
+            client_ip_from_x_forwarded_for("1.1.1.1, invalid, 10.0.0.1", None, &proxies, true),
+            Some(IpAddr::from_str("1.1.1.1").unwrap()) // Unparsable IPs are skipped, returns first parsable untrusted IP
+        );
+    }
+
+    #[test]
+    fn test_extract_client_ip() {
+        let proxies = [TrustedProxy::parse("10.0.0.1").unwrap()];
+
+        // No headers, fallback to peer IP
+        let mut req = Request::new(());
+        req.extensions_mut().insert(ConnectInfo(SocketAddr::new(
+            IpAddr::from_str("192.168.1.1").unwrap(),
+            80,
+        )));
+        assert_eq!(
+            extract_client_ip(&req, false, &proxies, false),
+            Some(IpAddr::from_str("192.168.1.1").unwrap())
+        );
+
+        // Trust forwarded headers, but peer not trusted (proxies configured)
+        let mut req = Request::new(());
+        req.extensions_mut().insert(ConnectInfo(SocketAddr::new(
+            IpAddr::from_str("192.168.1.1").unwrap(),
+            80,
+        )));
+        req.headers_mut()
+            .insert("x-forwarded-for", "8.8.8.8".parse().unwrap());
+        assert_eq!(
+            extract_client_ip(&req, true, &proxies, true),
+            Some(IpAddr::from_str("192.168.1.1").unwrap())
+        );
+
+        // Trust forwarded headers, peer is trusted
+        let mut req = Request::new(());
+        req.extensions_mut().insert(ConnectInfo(SocketAddr::new(
+            IpAddr::from_str("10.0.0.1").unwrap(),
+            80,
+        )));
+        req.headers_mut()
+            .insert("x-forwarded-for", "8.8.8.8".parse().unwrap());
+        assert_eq!(
+            extract_client_ip(&req, true, &proxies, true),
+            Some(IpAddr::from_str("8.8.8.8").unwrap())
+        );
+
+        // Trust forwarded headers, peer is trusted, X-Real-IP used
+        let mut req = Request::new(());
+        req.extensions_mut().insert(ConnectInfo(SocketAddr::new(
+            IpAddr::from_str("10.0.0.1").unwrap(),
+            80,
+        )));
+        req.headers_mut()
+            .insert("x-real-ip", "8.8.8.8".parse().unwrap());
+        assert_eq!(
+            extract_client_ip(&req, true, &proxies, true),
+            Some(IpAddr::from_str("8.8.8.8").unwrap())
+        );
+
+        // Multiple X-Forwarded-For headers
+        let mut req = Request::new(());
+        req.extensions_mut().insert(ConnectInfo(SocketAddr::new(
+            IpAddr::from_str("10.0.0.1").unwrap(),
+            80,
+        )));
+        req.headers_mut()
+            .append("x-forwarded-for", "8.8.8.8".parse().unwrap());
+        req.headers_mut()
+            .append("x-forwarded-for", "10.0.0.2".parse().unwrap());
+        assert_eq!(
+            extract_client_ip(&req, true, &proxies, true),
+            Some(IpAddr::from_str("10.0.0.2").unwrap()) // 10.0.0.2 is the first untrusted from the right
+        );
+
+        // SocketAddr fallback
+        let mut req = Request::new(());
+        req.extensions_mut().insert(SocketAddr::new(
+            IpAddr::from_str("192.168.1.1").unwrap(),
+            80,
+        ));
+        assert_eq!(
+            extract_client_ip(&req, false, &proxies, false),
+            Some(IpAddr::from_str("192.168.1.1").unwrap())
+        );
+    }
+}
