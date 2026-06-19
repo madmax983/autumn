@@ -154,10 +154,14 @@ fn start(opts: &ServeOptions) -> i32 {
     }
 }
 
-/// Base command for the app binary, binding the Unix socket via config env.
-fn base_command(binary: &Path, socket: &Path) -> Command {
+/// Base command for the app binary: bind the Unix socket via config env, and
+/// (for managed-Postgres apps) point the bundled cluster at a persistent dir.
+fn base_command(binary: &Path, paths: &RuntimePaths, opts: &ServeOptions) -> Command {
     let mut cmd = Command::new(binary);
-    cmd.env("AUTUMN_SERVER__UNIX_SOCKET", socket);
+    cmd.env("AUTUMN_SERVER__UNIX_SOCKET", paths.socket_file());
+    if opts.bundled_pg {
+        cmd.env("AUTUMN_MANAGED_PG_DATA_DIR", paths.pg_data_dir());
+    }
     cmd
 }
 
@@ -165,7 +169,7 @@ fn base_command(binary: &Path, socket: &Path) -> Command {
 /// the child directly (shared process group) and triggers its graceful drain.
 fn run_foreground(binary: &Path, paths: &RuntimePaths, opts: &ServeOptions) -> i32 {
     let socket = paths.socket_file();
-    let mut child = match base_command(binary, &socket).spawn() {
+    let mut child = match base_command(binary, paths, opts).spawn() {
         Ok(child) => child,
         Err(e) => {
             eprintln!("\u{2717} Failed to start {}: {e}", binary.display());
@@ -212,7 +216,7 @@ fn spawn_daemon(binary: &Path, paths: &RuntimePaths, opts: &ServeOptions) -> i32
         }
     };
 
-    let mut cmd = base_command(binary, &socket);
+    let mut cmd = base_command(binary, paths, opts);
     cmd.stdin(std::process::Stdio::null())
         .stdout(log)
         .stderr(log_err);

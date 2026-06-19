@@ -38,6 +38,8 @@ pub enum PathsError {
 pub struct RuntimePaths {
     /// PID lockfile, Unix socket, and address-discovery file live here.
     runtime: PathBuf,
+    /// Managed-Postgres cluster data dir is rooted here.
+    data: PathBuf,
     /// Daemon log files are written here.
     logs: PathBuf,
 }
@@ -67,12 +69,17 @@ impl RuntimePaths {
         let runtime = dirs
             .runtime_dir()
             .map_or_else(|| dirs.data_dir().join("run"), Path::to_path_buf);
+        let data = dirs.data_dir().to_path_buf();
         // Prefer the XDG state dir for logs on Linux; otherwise nest under data.
         let logs = dirs
             .state_dir()
             .map_or_else(|| dirs.data_dir().join("logs"), |s| s.join("logs"));
 
-        Ok(Self { runtime, logs })
+        Ok(Self {
+            runtime,
+            data,
+            logs,
+        })
     }
 
     /// Construct paths rooted at `base/<project>` without touching the
@@ -82,6 +89,7 @@ impl RuntimePaths {
         let root = base.join(project);
         Self {
             runtime: root.clone(),
+            data: root.clone(),
             logs: root,
         }
     }
@@ -102,6 +110,12 @@ impl RuntimePaths {
     #[must_use]
     pub fn addr_file(&self) -> PathBuf {
         self.runtime.join("serve.addr")
+    }
+
+    /// Managed-Postgres cluster data directory (`<data>/pg`).
+    #[must_use]
+    pub fn pg_data_dir(&self) -> PathBuf {
+        self.data.join("pg")
     }
 
     /// Daemon log file path (`<logs>/serve.log`).
@@ -132,6 +146,7 @@ mod tests {
         assert_eq!(paths.pid_file(), Path::new("/var/run/demo/serve.pid"));
         assert_eq!(paths.socket_file(), Path::new("/var/run/demo/serve.sock"));
         assert_eq!(paths.addr_file(), Path::new("/var/run/demo/serve.addr"));
+        assert_eq!(paths.pg_data_dir(), Path::new("/var/run/demo/pg"));
         assert_eq!(paths.log_file(), Path::new("/var/run/demo/serve.log"));
     }
 

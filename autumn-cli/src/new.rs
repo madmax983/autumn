@@ -57,6 +57,9 @@ pub fn run(name: &str, opts: GenerateOptions) {
 }
 
 /// Optional toggles applied to project generation.
+// Independent on/off scaffolding toggles; a bitflags/enum here would be less
+// clear than named booleans at the (few) call sites.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
 pub struct GenerateOptions {
     /// Scaffold the optional i18n module (`i18n/en.ftl`, `[i18n]` block,
@@ -125,7 +128,10 @@ pub fn generate_with(name: &str, parent_dir: &Path, opts: GenerateOptions) -> Re
     } else {
         render(templates::MAIN_RS)
     };
-    if opts.with_daemon && !opts.with_bundled_pg {
+    if opts.with_bundled_pg {
+        // Managed-Postgres daemon: keep migrations, install the pool provider.
+        main_rs = inject_managed_pg(&main_rs);
+    } else if opts.with_daemon {
         // DB-free daemon: the `migrate` module is db-gated, so drop migrations.
         main_rs = strip_migrations(&main_rs);
     }
@@ -253,6 +259,24 @@ fn print_scaffold_summary(name: &str, opts: GenerateOptions) {
     }
 }
 
+/// Inject a managed-Postgres pool provider plus a shutdown hook into a
+/// generated `main.rs` so the bundled cluster is supervised by the daemon.
+fn inject_managed_pg(main_rs: &str) -> String {
+    main_rs.replace(
+        "    autumn_web::app()\n",
+        "    let pg = autumn_web::managed_pg::ManagedPostgresPoolProvider::new();\n\
+         \x20   let pg_shutdown = pg.clone();\n\
+         \x20   autumn_web::app()\n\
+         \x20       .with_pool_provider(pg)\n\
+         \x20       .on_shutdown(move || {\n\
+         \x20           let pg = pg_shutdown.clone();\n\
+         \x20           async move {\n\
+         \x20               pg.stop().await;\n\
+         \x20           }\n\
+         \x20       })\n",
+    )
+}
+
 /// Remove the diesel-migrations wiring from a generated `main.rs` so a DB-free
 /// app compiles without the db-gated `migrate` module.
 fn strip_migrations(main_rs: &str) -> String {
@@ -308,6 +332,10 @@ fn render_cargo_toml(
     }
 
     let mut features = Vec::new();
+    if opts.with_bundled_pg {
+        // Single-binary mode: embed Postgres in the executable.
+        features.push("managed-pg-bundled");
+    }
     if opts.with_i18n {
         features.push("i18n");
     }
@@ -696,6 +724,51 @@ mod tests {
         generate_with("daemon-cfg-app", tmp.path(), daemon_opts()).unwrap();
         let toml = fs::read_to_string(tmp.path().join("daemon-cfg-app/autumn.toml")).unwrap();
         assert!(toml.contains("autumn serve"));
+    }
+
+    fn bundled_pg_opts() -> GenerateOptions {
+        GenerateOptions {
+            with_bundled_pg: true,
+            with_daemon: true,
+            ..GenerateOptions::default()
+        }
+    }
+
+    #[test]
+    fn bundled_pg_starter_enables_managed_feature_and_keeps_db() {
+        let tmp = TempDir::new().unwrap();
+        generate_with("pg-app", tmp.path(), bundled_pg_opts()).unwrap();
+        let cargo = fs::read_to_string(tmp.path().join("pg-app/Cargo.toml")).unwrap();
+        assert!(
+            cargo.contains("managed-pg-bundled"),
+            "bundled starter must enable managed-pg-bundled: {cargo}"
+        );
+        assert!(
+            !cargo.contains("default-features = false"),
+            "bundled starter keeps the database (default features on)"
+        );
+    }
+
+    #[test]
+    fn bundled_pg_main_installs_provider_and_shutdown_hook() {
+        let tmp = TempDir::new().unwrap();
+        generate_with("pg-main-app", tmp.path(), bundled_pg_opts()).unwrap();
+        let main = fs::read_to_string(tmp.path().join("pg-main-app/src/main.rs")).unwrap();
+        assert!(main.contains("ManagedPostgresPoolProvider"));
+        assert!(main.contains(".with_pool_provider("));
+        assert!(main.contains(".on_shutdown("));
+        // Database present: migrations kept.
+        assert!(main.contains(".migrations("));
+    }
+
+    #[test]
+    fn default_generation_has_no_managed_pg() {
+        let tmp = TempDir::new().unwrap();
+        generate("plain2-app", tmp.path()).unwrap();
+        let main = fs::read_to_string(tmp.path().join("plain2-app/src/main.rs")).unwrap();
+        assert!(!main.contains("with_pool_provider"));
+        let cargo = fs::read_to_string(tmp.path().join("plain2-app/Cargo.toml")).unwrap();
+        assert!(!cargo.contains("managed-pg"));
     }
 
     #[test]
