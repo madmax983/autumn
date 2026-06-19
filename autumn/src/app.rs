@@ -5189,6 +5189,64 @@ struct DatabaseBootstrap {
     replica_migration_check: Option<(String, String)>,
 }
 
+/// Build the `ShardSet` for a sharded app (or `None` when no `[[database.shards]]`
+/// are configured). Resolves the shard router first: an explicit
+/// `with_shard_router` wins; otherwise `directory_routing_enabled` opts into the
+/// control-DB directory router (bound to the just-built control primary pool);
+/// otherwise the hash router. The directory flag is documented as having no
+/// effect without shards, so a shardless profile that leaves it enabled must not
+/// fail startup — hence the early `None` return.
+#[cfg(feature = "db")]
+async fn resolve_shard_set(
+    config: &AutumnConfig,
+    shard_router: Option<Arc<dyn crate::sharding::ShardRouter>>,
+    shard_provider: Option<ShardProviderFactory>,
+    directory_routing_enabled: bool,
+    topology: Option<&crate::db::DatabaseTopology>,
+) -> Result<Option<crate::sharding::ShardSet>, String> {
+    if !config.database.has_shards() {
+        return Ok(None);
+    }
+    let router: Arc<dyn crate::sharding::ShardRouter> = match shard_router {
+        Some(explicit) => explicit,
+        None if directory_routing_enabled => {
+            let control_primary = topology
+                .map(crate::db::DatabaseTopology::primary)
+                .ok_or_else(|| {
+                    "directory_shard_router is enabled but no control database is configured. \
+                     The directory router needs a control `database.primary_url`/`url` to read \
+                     the tenant→shard directory. Set one, or disable directory routing to use \
+                     the hash router."
+                        .to_owned()
+                })?;
+            // Bound directory lookups with the configured database statement
+            // timeout (capped to Postgres' i32 millisecond range).
+            let timeout_ms = config.database.statement_timeout.map_or(0, |d| {
+                u64::try_from(d.as_millis())
+                    .unwrap_or(i32::MAX as u64)
+                    .min(i32::MAX as u64)
+            });
+            Arc::new(
+                crate::sharding::DirectoryShardRouter::new(control_primary.clone())
+                    .with_statement_timeout_ms(timeout_ms),
+            )
+        }
+        None => Arc::new(crate::sharding::HashShardRouter),
+    };
+    let set = match shard_provider {
+        Some(factory) => {
+            let topologies = factory(config.database.clone())
+                .await
+                .map_err(|e| format!("Failed to create shard pools: {e}"))?;
+            crate::sharding::build_shard_set(&config.database, topologies, router)
+        }
+        None => crate::sharding::create_shard_set(&config.database, router)
+            .map(|set| set.expect("has_shards() checked above")),
+    }
+    .map_err(|e| format!("Failed to configure shards: {e}"))?;
+    Ok(Some(set))
+}
+
 #[cfg(feature = "db")]
 async fn setup_database(
     config: &AutumnConfig,
@@ -5224,56 +5282,15 @@ async fn setup_database(
     }
     .map_err(|e| format!("Failed to create database pool: {e}"))?;
 
-    let shards = if config.database.has_shards() {
-        // Resolve the shard router: an explicit `with_shard_router` wins;
-        // otherwise `directory_shard_router` opts into the control-DB directory
-        // router (bound to the just-built control primary pool); otherwise the
-        // hash router. Only resolved when shards exist — the directory flag is
-        // documented as having no effect without `[[database.shards]]`, so a
-        // shardless profile that leaves it enabled must not fail startup.
-        let use_directory_router = directory_shard_router || config.database.directory_shard_router;
-        let router: Arc<dyn crate::sharding::ShardRouter> = match shard_router {
-            Some(explicit) => explicit,
-            None if use_directory_router => {
-                let control_primary = topology
-                    .as_ref()
-                    .map(crate::db::DatabaseTopology::primary)
-                    .ok_or_else(|| {
-                        "directory_shard_router is enabled but no control database is configured. \
-                         The directory router needs a control `database.primary_url`/`url` to read \
-                         the tenant→shard directory. Set one, or disable directory routing to use \
-                         the hash router."
-                            .to_owned()
-                    })?;
-                // Bound directory lookups with the configured database
-                // statement timeout (capped to Postgres' i32 millisecond range).
-                let timeout_ms = config.database.statement_timeout.map_or(0, |d| {
-                    u64::try_from(d.as_millis())
-                        .unwrap_or(i32::MAX as u64)
-                        .min(i32::MAX as u64)
-                });
-                Arc::new(
-                    crate::sharding::DirectoryShardRouter::new(control_primary.clone())
-                        .with_statement_timeout_ms(timeout_ms),
-                )
-            }
-            None => Arc::new(crate::sharding::HashShardRouter),
-        };
-        let set = match shard_provider {
-            Some(factory) => {
-                let topologies = factory(config.database.clone())
-                    .await
-                    .map_err(|e| format!("Failed to create shard pools: {e}"))?;
-                crate::sharding::build_shard_set(&config.database, topologies, router)
-            }
-            None => crate::sharding::create_shard_set(&config.database, router)
-                .map(|set| set.expect("has_shards() checked above")),
-        }
-        .map_err(|e| format!("Failed to configure shards: {e}"))?;
-        Some(set)
-    } else {
-        None
-    };
+    let use_directory_router = directory_shard_router || config.database.directory_shard_router;
+    let shards = resolve_shard_set(
+        config,
+        shard_router,
+        shard_provider,
+        use_directory_router,
+        topology.as_ref(),
+    )
+    .await?;
 
     // Skip migrations when the provider opted out of a database (returned
     // `Ok(None)`) — even if `database.url` is configured. Custom providers
