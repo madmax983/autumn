@@ -250,12 +250,14 @@ pub struct DirectoryShardRouter {
 /// the directory table.
 pub const DEFAULT_DIRECTORY_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// The `_autumn_shard_directory` table migration, embedded as a standalone set
-/// so the app can auto-create it at startup when directory routing is enabled
-/// (the `migrations/` copy is applied by `autumn migrate` for the control
-/// plane; this mirror lets auto-migrate deployments create the table without a
-/// manual migrate). The migration is `CREATE TABLE IF NOT EXISTS`, so applying
-/// it from either set is idempotent. Keep both copies in sync.
+/// The `_autumn_shard_directory` table migration as a standalone embedded set.
+///
+/// Embedded separately so the app can auto-create the table at startup when
+/// directory routing is enabled (the `migrations/` copy is applied by
+/// `autumn migrate` for the control plane; this mirror lets auto-migrate
+/// deployments create the table without a manual migrate). The migration is
+/// `CREATE TABLE IF NOT EXISTS`, so applying it from either set is idempotent.
+/// Keep both copies in sync.
 #[cfg(feature = "db")]
 pub const SHARD_DIRECTORY_MIGRATIONS: diesel_migrations::EmbeddedMigrations =
     diesel_migrations::embed_migrations!("shard_directory_migrations");
