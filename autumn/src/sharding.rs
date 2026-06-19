@@ -280,6 +280,28 @@ struct ShardNameRow {
     shard_name: String,
 }
 
+/// Default poll interval for the directory invalidation listener.
+///
+/// Used by [`DirectoryShardRouter::spawn_invalidation_listener`]. Shorter than
+/// [`DEFAULT_DIRECTORY_CACHE_TTL`] so a re-pin is picked up well before the TTL
+/// would have expired the entry anyway.
+pub const DEFAULT_DIRECTORY_INVALIDATION_POLL_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(5);
+
+/// SQL the invalidation listener polls each cycle: the distinct tenant keys whose
+/// directory rows changed since the cursor timestamp (written by the
+/// `autumn_shard_directory_notify` trigger, so operator SQL writes are caught
+/// too). Re-invalidating a key is idempotent, so the cursor uses a lookback
+/// overlap rather than an exact high-water mark.
+const DIRECTORY_CHANGES_POLL_SQL: &str = "SELECT DISTINCT tenant_key FROM \
+     _autumn_shard_directory_changes WHERE changed_at > to_timestamp($1)";
+
+#[derive(diesel::QueryableByName)]
+struct DirectoryChangeKeyRow {
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    tenant_key: String,
+}
+
 impl std::fmt::Debug for DirectoryShardRouter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DirectoryShardRouter")
@@ -344,6 +366,67 @@ impl DirectoryShardRouter {
         if let Ok(mut cache) = self.cache.write() {
             cache.clear();
         }
+    }
+
+    /// Spawn a background thread that polls the `_autumn_shard_directory_changes`
+    /// log on the control database and invalidates this router's cached pin for
+    /// every tenant whose directory row changed — including writes made on other
+    /// replicas or directly via operator SQL (the change log is populated by a
+    /// trigger). Without it the cache only refreshes when the TTL expires; with
+    /// it a re-pin during a slot move is picked up within `poll_interval`.
+    ///
+    /// `control_url` is the control database URL backing this router's control
+    /// pool. The thread runs for the life of the process; the returned handle can
+    /// be detached. The framework spawns this automatically when directory
+    /// routing is enabled via the built-in path.
+    #[must_use]
+    pub fn spawn_invalidation_listener(
+        router: Arc<Self>,
+        control_url: String,
+        poll_interval: std::time::Duration,
+    ) -> std::thread::JoinHandle<()> {
+        use diesel::Connection as _;
+        use diesel::RunQueryDsl as _;
+
+        std::thread::spawn(move || {
+            // Timestamp cursor with a lookback overlap. A sequence-id cursor
+            // (id > last_id) is unsafe: ids are allocated before commit, so a
+            // slow transaction can commit after a later one and be skipped. The
+            // overlap re-reads a few seconds each cycle; re-invalidating a key is
+            // idempotent. (Same approach as the feature-flag listener.)
+            const OVERLAP_SECS: i64 = 5;
+            let now_secs = || {
+                i64::try_from(
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs(),
+                )
+                .unwrap_or(i64::MAX)
+            };
+            // Start in the past so we don't replay the whole log: the cache
+            // starts empty and repopulates lazily, so only post-startup changes
+            // matter.
+            let mut last_polled_secs = now_secs() - OVERLAP_SECS;
+
+            loop {
+                std::thread::sleep(poll_interval);
+                // Advance the horizon before the query so writes landing during
+                // the query are caught next cycle.
+                let new_horizon = now_secs() - OVERLAP_SECS;
+                if let Ok(mut conn) = diesel::PgConnection::establish(&control_url) {
+                    let rows: Vec<DirectoryChangeKeyRow> =
+                        diesel::sql_query(DIRECTORY_CHANGES_POLL_SQL)
+                            .bind::<diesel::sql_types::BigInt, _>(last_polled_secs)
+                            .load(&mut conn)
+                            .unwrap_or_default();
+                    for row in rows {
+                        router.invalidate(&row.tenant_key);
+                    }
+                }
+                last_polled_secs = new_horizon;
+            }
+        })
     }
 
     fn cache_get(&self, key: &str) -> Option<ShardId> {
@@ -1904,6 +1987,23 @@ async fn resolve_shard_key(
 mod tests {
     use super::*;
     use crate::config::{ShardConfig, SlotSpec};
+
+    #[test]
+    fn directory_invalidation_poll_sql_and_interval_are_sane() {
+        // The poller reads the trigger-populated change log on a timestamp
+        // cursor (not a sequence id, which could skip slow-committing rows).
+        assert_eq!(
+            DIRECTORY_CHANGES_POLL_SQL,
+            "SELECT DISTINCT tenant_key FROM _autumn_shard_directory_changes \
+             WHERE changed_at > to_timestamp($1)"
+        );
+        // The poll interval must be shorter than the cache TTL, otherwise the
+        // TTL would already have expired the entry before the listener acted.
+        assert!(
+            DEFAULT_DIRECTORY_INVALIDATION_POLL_INTERVAL < DEFAULT_DIRECTORY_CACHE_TTL,
+            "poll interval should beat the TTL"
+        );
+    }
 
     fn shard_config(name: &str) -> ShardConfig {
         ShardConfig {

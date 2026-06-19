@@ -5196,12 +5196,18 @@ struct DatabaseBootstrap {
 /// otherwise the hash router. The directory flag is documented as having no
 /// effect without shards, so a shardless profile that leaves it enabled must not
 /// fail startup — hence the early `None` return.
+///
+/// `spawn_directory_listener` gates the directory-router cache-invalidation
+/// listener: it opens control-DB connections, so it is spawned only at real
+/// runtime, never during a static build (`autumn build`) which must not touch
+/// the database.
 #[cfg(feature = "db")]
 async fn resolve_shard_set(
     config: &AutumnConfig,
     shard_router: Option<Arc<dyn crate::sharding::ShardRouter>>,
     shard_provider: Option<ShardProviderFactory>,
     directory_routing_enabled: bool,
+    spawn_directory_listener: bool,
     topology: Option<&crate::db::DatabaseTopology>,
 ) -> Result<Option<crate::sharding::ShardSet>, String> {
     if !config.database.has_shards() {
@@ -5226,10 +5232,26 @@ async fn resolve_shard_set(
                     .unwrap_or(i32::MAX as u64)
                     .min(i32::MAX as u64)
             });
-            Arc::new(
+            let dir_router = Arc::new(
                 crate::sharding::DirectoryShardRouter::new(control_primary.clone())
                     .with_statement_timeout_ms(timeout_ms),
-            )
+            );
+            // Spawn the cache-invalidation listener on the control DB so a re-pin
+            // (e.g. during a slot move) evicts cached tenant→shard mappings fleet-
+            // wide within seconds rather than waiting out the TTL. Skipped during
+            // a static build (no DB access); needs the control URL, without one we
+            // silently fall back to TTL-only refresh.
+            if let Some(control_url) = spawn_directory_listener
+                .then(|| config.database.effective_primary_url())
+                .flatten()
+            {
+                let _ = crate::sharding::DirectoryShardRouter::spawn_invalidation_listener(
+                    Arc::clone(&dir_router),
+                    control_url.to_owned(),
+                    crate::sharding::DEFAULT_DIRECTORY_INVALIDATION_POLL_INTERVAL,
+                );
+            }
+            dir_router
         }
         None => Arc::new(crate::sharding::HashShardRouter),
     };
@@ -5283,11 +5305,15 @@ async fn setup_database(
     .map_err(|e| format!("Failed to create database pool: {e}"))?;
 
     let use_directory_router = directory_shard_router || config.database.directory_shard_router;
+    // Spawn the directory invalidation listener only at real runtime — a static
+    // build must not open control-DB connections.
+    let runtime_boot = hook_queue_migration_mode == RepositoryCommitHookQueueMigrationMode::Runtime;
     let shards = resolve_shard_set(
         config,
         shard_router,
         shard_provider,
         use_directory_router,
+        runtime_boot,
         topology.as_ref(),
     )
     .await?;

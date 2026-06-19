@@ -296,13 +296,24 @@ to the hash router for any tenant without a row:
 autumn_web::app().with_directory_shard_router()
 ```
 
-Pin a tenant by inserting a row and invalidating the cache entry:
+Pin a tenant by inserting (or updating) a row:
 
 ```sql
 INSERT INTO _autumn_shard_directory (tenant_key, shard_name)
 VALUES ('whale-corp', 'whale')
 ON CONFLICT (tenant_key) DO UPDATE SET shard_name = EXCLUDED.shard_name;
 ```
+
+You don't need to invalidate the cache by hand. A trigger on the directory
+table logs every change (including this raw SQL write), and the built-in path
+spawns a background listener that polls the log and evicts the affected
+tenant's cached mapping on **every** replica within seconds — so a re-pin
+during a slot move takes effect well before the cache TTL (default 30s) would
+expire it. The TTL remains the backstop if the control DB is briefly
+unreachable. (Building your own `DirectoryShardRouter` and installing it via
+`with_shard_router` instead? Call
+`DirectoryShardRouter::spawn_invalidation_listener(..)` yourself, or rely on
+the TTL.)
 
 The directory is the routing complement to the slot-move runbook below: move
 the data, pin the tenant to its new shard, and unpinned tenants keep hashing
