@@ -5434,8 +5434,7 @@ fn migrations_with_repository_framework_migrations(
     // enabled, so an auto-migrate deployment doesn't hit a missing-relation
     // error on the first routed request (the control-plane `migrations/` copy
     // is otherwise only applied by `autumn migrate`).
-    if directory_router_required
-        && !migration_sets_include(&migrations, SHARD_DIRECTORY_MIGRATION)
+    if directory_router_required && !migration_sets_include(&migrations, SHARD_DIRECTORY_MIGRATION)
     {
         migrations.push(crate::sharding::SHARD_DIRECTORY_MIGRATIONS);
     }
