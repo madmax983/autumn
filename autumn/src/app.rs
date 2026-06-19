@@ -5240,9 +5240,17 @@ async fn setup_database(
                          the hash router."
                             .to_owned()
                     })?;
-                Arc::new(crate::sharding::DirectoryShardRouter::new(
-                    control_primary.clone(),
-                ))
+                // Bound directory lookups with the configured database
+                // statement timeout (capped to Postgres' i32 millisecond range).
+                let timeout_ms = config.database.statement_timeout.map_or(0, |d| {
+                    u64::try_from(d.as_millis())
+                        .unwrap_or(i32::MAX as u64)
+                        .min(i32::MAX as u64)
+                });
+                Arc::new(
+                    crate::sharding::DirectoryShardRouter::new(control_primary.clone())
+                        .with_statement_timeout_ms(timeout_ms),
+                )
             }
             None => Arc::new(crate::sharding::HashShardRouter),
         };

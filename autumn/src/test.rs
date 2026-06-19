@@ -1062,9 +1062,17 @@ impl TestApp {
         #[cfg(feature = "db")]
         let shard_router: std::sync::Arc<dyn crate::sharding::ShardRouter> =
             match (self.config.database.directory_shard_router, &pool) {
-                (true, Some(control_pool)) => std::sync::Arc::new(
-                    crate::sharding::DirectoryShardRouter::new(control_pool.clone()),
-                ),
+                (true, Some(control_pool)) => {
+                    let timeout_ms = self.config.database.statement_timeout.map_or(0, |d| {
+                        u64::try_from(d.as_millis())
+                            .unwrap_or(i32::MAX as u64)
+                            .min(i32::MAX as u64)
+                    });
+                    std::sync::Arc::new(
+                        crate::sharding::DirectoryShardRouter::new(control_pool.clone())
+                            .with_statement_timeout_ms(timeout_ms),
+                    )
+                }
                 _ => std::sync::Arc::new(crate::sharding::HashShardRouter),
             };
 

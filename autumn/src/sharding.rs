@@ -244,6 +244,12 @@ pub struct DirectoryShardRouter {
     fallback: Arc<dyn ShardRouter>,
     cache: std::sync::RwLock<HashMap<String, DirectoryCacheEntry>>,
     ttl: std::time::Duration,
+    /// `statement_timeout` (ms) applied to the control-plane directory lookup so
+    /// a stuck control query / lock on `_autumn_shard_directory` fails within
+    /// the configured timeout instead of hanging every tenant-routed request.
+    /// `0` disables it. The router checks out a raw pooled connection (no
+    /// request context), so the timeout is set explicitly here.
+    statement_timeout_ms: u64,
 }
 
 /// Default time a resolved tenant→shard mapping is cached before re-reading
@@ -303,7 +309,18 @@ impl DirectoryShardRouter {
             fallback,
             cache: std::sync::RwLock::new(HashMap::new()),
             ttl: DEFAULT_DIRECTORY_CACHE_TTL,
+            statement_timeout_ms: 0,
         }
+    }
+
+    /// Bound the control-plane directory lookup with `statement_timeout`
+    /// (milliseconds); `0` disables it. Typically the app's configured database
+    /// statement timeout, so a stuck control query fails fast instead of hanging
+    /// tenant routing.
+    #[must_use]
+    pub const fn with_statement_timeout_ms(mut self, statement_timeout_ms: u64) -> Self {
+        self.statement_timeout_ms = statement_timeout_ms;
+        self
     }
 
     /// Override the cache TTL.
@@ -365,6 +382,22 @@ impl DirectoryShardRouter {
                 "DirectoryShardRouter could not acquire a control connection: {e}"
             ))
         })?;
+
+        // Bound the lookup so a stuck control query / lock doesn't hang routing.
+        // The raw pooled checkout above does not apply request/global timeouts.
+        if self.statement_timeout_ms > 0 {
+            diesel::sql_query(format!(
+                "SET statement_timeout = {}",
+                self.statement_timeout_ms
+            ))
+            .execute(&mut conn)
+            .await
+            .map_err(|e| {
+                AutumnError::service_unavailable_msg(format!(
+                    "DirectoryShardRouter could not set statement_timeout: {e}"
+                ))
+            })?;
+        }
 
         let row = diesel::sql_query(
             "SELECT shard_name FROM _autumn_shard_directory WHERE tenant_key = $1",
