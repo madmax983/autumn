@@ -37,6 +37,7 @@ toml = "1.1"
 url = "2.5.8"
 
 tempfile = "3"
+directories = "6.0.0"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

@@ -17,7 +17,10 @@ mod maintenance;
 mod migrate;
 mod monitor;
 mod new;
+mod paths;
 mod plugin_check;
+mod process;
+mod serve;
 mod release;
 mod routes;
 mod seed;
@@ -80,6 +83,30 @@ enum Commands {
         /// Log all registered routes, tasks, middleware, and config at startup
         #[arg(long)]
         show_config: bool,
+    },
+    /// Run the app as a production (non-watch) server, optionally as a daemon.
+    ///
+    /// Unlike `autumn dev`, `serve` does not watch files or hot-reload. With
+    /// `--daemon` it backgrounds the server under a PID lockfile and binds a
+    /// Unix domain socket under a platform runtime dir; `stop`, `status`, and
+    /// `restart` manage that daemon.
+    Serve {
+        /// Lifecycle action (omit to start in the foreground / with --daemon).
+        #[command(subcommand)]
+        action: Option<ServeCommands>,
+        /// Run in the background as a managed daemon.
+        #[arg(long)]
+        daemon: bool,
+        /// Build and run in release mode (optimized production binary).
+        #[arg(long)]
+        release: bool,
+        /// Bundled/managed-Postgres build (implies --daemon). Recorded in the
+        /// address file; the app must be built with the managed-pg feature.
+        #[arg(long = "bundled-pg")]
+        bundled_pg: bool,
+        /// Package to run (for workspaces)
+        #[arg(short, long)]
+        package: Option<String>,
     },
     /// Download and configure external tools (Tailwind CSS)
     Setup {
@@ -576,6 +603,17 @@ enum CredentialsCommands {
         #[arg(long)]
         reveal: bool,
     },
+}
+
+/// Lifecycle subcommands for `autumn serve`.
+#[derive(Subcommand)]
+enum ServeCommands {
+    /// Stop the running daemon (graceful drain, then force-kill on timeout).
+    Stop,
+    /// Report whether the daemon is running and where it is reachable.
+    Status,
+    /// Stop the daemon (if running) and start it again in the background.
+    Restart,
 }
 
 /// Subcommands for `autumn migrate`.
@@ -1338,6 +1376,29 @@ fn run_command(command: Commands) {
             package,
             show_config,
         } => dev::run(package.as_deref(), show_config),
+        Commands::Serve {
+            action,
+            daemon,
+            release,
+            bundled_pg,
+            package,
+        } => {
+            let action = action.map(|a| match a {
+                ServeCommands::Stop => serve::ServeAction::Stop,
+                ServeCommands::Status => serve::ServeAction::Status,
+                ServeCommands::Restart => serve::ServeAction::Restart,
+            });
+            serve::run(
+                action,
+                &serve::ServeOptions {
+                    package,
+                    // --bundled-pg implies --daemon.
+                    daemon: daemon || bundled_pg,
+                    release,
+                    bundled_pg,
+                },
+            );
+        }
         Commands::Migrate {
             action,
             with_maintenance,
@@ -2164,6 +2225,73 @@ mod tests {
                 show_config: false
             }
         ));
+    }
+
+    #[test]
+    fn serve_parses_daemon_flag() {
+        let cli = Cli::try_parse_from(["autumn", "serve", "--daemon"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Serve {
+                action: None,
+                daemon: true,
+                bundled_pg: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn serve_stop_subcommand_parses() {
+        let cli = Cli::try_parse_from(["autumn", "serve", "stop"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Serve {
+                action: Some(ServeCommands::Stop),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn serve_status_parses() {
+        let cli = Cli::try_parse_from(["autumn", "serve", "status"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Serve {
+                action: Some(ServeCommands::Status),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn serve_restart_parses() {
+        let cli = Cli::try_parse_from(["autumn", "serve", "restart"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Serve {
+                action: Some(ServeCommands::Restart),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn serve_parses_bundled_pg_and_release() {
+        let cli =
+            Cli::try_parse_from(["autumn", "serve", "--bundled-pg", "--release"]).unwrap();
+        match cli.command {
+            Commands::Serve {
+                bundled_pg,
+                release,
+                ..
+            } => {
+                assert!(bundled_pg);
+                assert!(release);
+            }
+            _ => panic!("expected Serve command"),
+        }
     }
 
     #[test]
