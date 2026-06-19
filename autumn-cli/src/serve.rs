@@ -203,7 +203,7 @@ fn project_identity(package: Option<&str>) -> String {
                 .and_then(|d| d.file_name().map(|n| n.to_string_lossy().into_owned()))
                 .unwrap_or_else(|| "autumn-app".to_owned())
         });
-    format!("{name}-{}", project_dir_hash())
+    format!("{name}-{}", project_dir_hash(package))
 }
 
 /// Read `[package].name` from the `Cargo.toml` in the current directory.
@@ -219,11 +219,20 @@ fn read_package_name() -> Option<String> {
 
 /// A short, stable hash of the absolute project directory, distinguishing
 /// same-named projects in different locations.
-fn project_dir_hash() -> String {
+///
+/// For a workspace member selected with `-p`, hash the member's manifest dir so
+/// the runtime namespace is identical whether the lifecycle command is run from
+/// the workspace root or the member directory (otherwise `start -p api` and
+/// `stop -p api` from different CWDs would target different daemons). Falls back
+/// to the canonicalized CWD when no package is given or its manifest dir can't
+/// be resolved.
+fn project_dir_hash(package: Option<&str>) -> String {
     use std::hash::{Hash, Hasher};
-    let dir = std::env::current_dir()
-        .and_then(std::fs::canonicalize)
-        .unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let dir = package
+        .and_then(crate::dev::find_manifest_dir)
+        .or_else(|| std::env::current_dir().ok())
+        .and_then(|d| std::fs::canonicalize(&d).ok().or(Some(d)))
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     dir.hash(&mut hasher);
     format!("{:08x}", hasher.finish() & 0xffff_ffff)

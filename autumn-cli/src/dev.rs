@@ -885,6 +885,20 @@ fn cargo_metadata() -> serde_json::Value {
     serde_json::from_slice(&output.stdout).expect("parse cargo metadata")
 }
 
+/// Best-effort `cargo metadata`: returns `None` instead of exiting when the
+/// workspace manifests are missing/invalid. Used by lifecycle paths (e.g.
+/// `autumn serve stop`) that must keep working even with a broken `Cargo.toml`.
+fn try_cargo_metadata() -> Option<serde_json::Value> {
+    let output = Command::new("cargo")
+        .args(["metadata", "--format-version=1", "--no-deps"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    serde_json::from_slice(&output.stdout).ok()
+}
+
 /// Directory containing a workspace member's `Cargo.toml`, resolved via
 /// `cargo metadata`.
 ///
@@ -892,11 +906,12 @@ fn cargo_metadata() -> serde_json::Value {
 /// the app with the workspace-root CWD, so the app's config loader (which falls
 /// back to CWD when `AUTUMN_MANIFEST_DIR` is unset) skips the member's
 /// `autumn.toml`/profile and asset dirs. Callers use this to point the child at
-/// the member's directory. Returns `None` if metadata can't be read or the
-/// package isn't found.
+/// the member's directory. Best-effort: returns `None` if metadata can't be read
+/// or the package isn't found, so lifecycle commands never fail solely because
+/// `cargo metadata` does.
 #[must_use]
 pub fn find_manifest_dir(package: &str) -> Option<PathBuf> {
-    let metadata = cargo_metadata();
+    let metadata = try_cargo_metadata()?;
     metadata["packages"].as_array()?.iter().find_map(|pkg| {
         if pkg["name"].as_str() == Some(package) {
             Path::new(pkg["manifest_path"].as_str()?)
