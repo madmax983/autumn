@@ -19,7 +19,18 @@
 //! Usage:
 //!   move_slot --from <SRC_URL> --to <DST_URL> --tenant <KEY> [--tenant <KEY> ...] [--confirm]
 //!
-//! Example (docker-compose stack; move tenant "acme" from shard0 → shard1):
+//! Example (docker-compose stack; move tenant "acme" from shard0 → shard1).
+//! Run WITHOUT `--confirm` first: this copies and verifies but leaves the
+//! source rows in place, so traffic still routing to shard0 keeps reading and
+//! writing them.
+//!   cargo run --bin move_slot -- \
+//!     --from postgres://autumn:autumn@localhost:5443/bookmarks_shard0 \
+//!     --to   postgres://autumn:autumn@localhost:5444/bookmarks_shard1 \
+//!     --tenant acme
+//!
+//! Only AFTER you have cut the slot/route over to shard1 (edit `autumn.toml`
+//! or the tenant directory and redeploy) re-run the same command with
+//! `--confirm` to delete the now-orphaned rows from the source shard:
 //!   cargo run --bin move_slot -- \
 //!     --from postgres://autumn:autumn@localhost:5443/bookmarks_shard0 \
 //!     --to   postgres://autumn:autumn@localhost:5444/bookmarks_shard1 \

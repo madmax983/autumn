@@ -411,15 +411,23 @@ impl DirectoryShardRouter {
 
             loop {
                 std::thread::sleep(poll_interval);
-                // Advance the horizon before the query so writes landing during
-                // the query are caught next cycle.
+                // Compute the next horizon before the query so writes landing
+                // during the query are caught next cycle. Only adopt it if this
+                // poll actually succeeds (below).
                 let new_horizon = now_secs() - OVERLAP_SECS;
-                if let Ok(mut conn) = diesel::PgConnection::establish(&control_url) {
-                    let rows: Vec<DirectoryChangeKeyRow> =
-                        diesel::sql_query(DIRECTORY_CHANGES_POLL_SQL)
-                            .bind::<diesel::sql_types::BigInt, _>(last_polled_secs)
-                            .load(&mut conn)
-                            .unwrap_or_default();
+                // A poll "succeeds" only if both the control connection and the
+                // query land; `None` means connect or query failed.
+                let rows =
+                    diesel::PgConnection::establish(&control_url)
+                        .ok()
+                        .and_then(|mut conn| {
+                            diesel::sql_query(DIRECTORY_CHANGES_POLL_SQL)
+                                .bind::<diesel::sql_types::BigInt, _>(last_polled_secs)
+                                .load::<DirectoryChangeKeyRow>(&mut conn)
+                                .ok()
+                        });
+                let polled_ok = rows.is_some();
+                if let Some(rows) = rows {
                     for row in rows {
                         router.invalidate(&row.tenant_key);
                     }
@@ -427,18 +435,25 @@ impl DirectoryShardRouter {
                 // Reclaim entries that expired but were never looked up again
                 // (lazy eviction in `cache_get` only fires on re-observation).
                 router.sweep_expired();
-                last_polled_secs = new_horizon;
+                // Advance the cursor only after a successful poll. On a control
+                // connection or query failure, keep the previous cursor so
+                // changes committed during the failed interval are re-read next
+                // cycle instead of being skipped (which would strand a stale pin
+                // until TTL expiry — e.g. a replica routing to the old shard
+                // across a re-pin).
+                if polled_ok {
+                    last_polled_secs = new_horizon;
+                }
             }
         })
     }
 
     fn cache_get(&self, key: &str) -> Option<ShardId> {
+        let now = std::time::Instant::now();
         {
             let cache = self.cache.read().ok()?;
             match cache.get(key) {
-                Some(entry) if entry.expires_at > std::time::Instant::now() => {
-                    return Some(entry.shard);
-                }
+                Some(entry) if entry.expires_at > now => return Some(entry.shard),
                 // Miss, or present-but-expired: fall through. `None` is returned
                 // either way; an expired entry is additionally evicted below so a
                 // long-running process doesn't retain every pinned tenant it has
@@ -447,14 +462,12 @@ impl DirectoryShardRouter {
                 None => return None,
             }
         }
-        // Re-check under the write lock so we don't drop a fresh entry written by
-        // `cache_put` between releasing the read lock and taking the write lock.
-        if let Ok(mut cache) = self.cache.write() {
-            if let Some(entry) = cache.get(key) {
-                if entry.expires_at <= std::time::Instant::now() {
-                    cache.remove(key);
-                }
-            }
+        // Evict the expired entry under the write lock. Re-check expiry (against
+        // the same `now`) so we don't drop a fresh entry written by `cache_put`
+        // between releasing the read lock and taking the write lock.
+        let mut cache = self.cache.write().ok()?;
+        if cache.get(key).is_some_and(|entry| entry.expires_at <= now) {
+            cache.remove(key);
         }
         None
     }

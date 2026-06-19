@@ -5292,8 +5292,8 @@ async fn setup_database(
     // directory table is never consulted. Gate the migration on the same
     // condition so an explicit-router app doesn't create `_autumn_shard_directory`
     // (or warn about a pending directory migration) for a table it won't use.
-    let use_directory_router =
-        shard_router.is_none() && (directory_shard_router || config.database.directory_shard_router);
+    let use_directory_router = shard_router.is_none()
+        && (directory_shard_router || config.database.directory_shard_router);
     // The tenant→shard directory table is a CONTROL-plane table: create it at
     // startup only when directory routing is active (and shards exist), and
     // only on the control target — not via the shared list above, which is also
