@@ -2952,13 +2952,58 @@ impl AppBuilder {
         // 7. Bind and initialize pre-serve runtime dependencies. Once those
         // are ready, start listening before startup hooks finish so `/startup`
         // can honestly report startup progress.
-        let addr = format!("{}:{}", config.server.host, config.server.port);
-        let listener = tokio::net::TcpListener::bind(&addr)
-            .await
-            .unwrap_or_else(|e| {
-                tracing::error!(addr = %addr, "Failed to bind: {e}");
+        // Bind the configured transport. A `server.unix_socket` path selects a
+        // Unix domain socket (local daemon mode); otherwise bind TCP on
+        // `host:port` as before. `bound_desc` is the human/log description and
+        // `unix_socket_cleanup` is the socket path to unlink on clean exit
+        // (axum does not remove it for us).
+        let (bound_listener, bound_desc, unix_socket_cleanup): (
+            BoundListener,
+            String,
+            Option<std::path::PathBuf>,
+        ) = if let Some(socket_path) = config.server.unix_socket.as_deref() {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let path = std::path::Path::new(socket_path);
+                if let Err(e) = prepare_unix_socket_path(path) {
+                    tracing::error!(socket = %socket_path, "Failed to prepare unix socket: {e}");
+                    std::process::exit(1);
+                }
+                let listener = tokio::net::UnixListener::bind(path).unwrap_or_else(|e| {
+                    tracing::error!(socket = %socket_path, "Failed to bind unix socket: {e}");
+                    std::process::exit(1);
+                });
+                // Local-daemon socket: owner-only access.
+                if let Err(e) =
+                    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+                {
+                    tracing::warn!(socket = %socket_path, "Failed to set unix socket permissions: {e}");
+                }
+                (
+                    BoundListener::Unix(listener),
+                    format!("unix:{socket_path}"),
+                    Some(path.to_path_buf()),
+                )
+            }
+            #[cfg(not(unix))]
+            {
+                tracing::error!(
+                    "server.unix_socket is only supported on Unix platforms; \
+                     unset it or use server.host/server.port"
+                );
                 std::process::exit(1);
-            });
+            }
+        } else {
+            let addr = format!("{}:{}", config.server.host, config.server.port);
+            let listener = tokio::net::TcpListener::bind(&addr)
+                .await
+                .unwrap_or_else(|e| {
+                    tracing::error!(addr = %addr, "Failed to bind: {e}");
+                    std::process::exit(1);
+                });
+            (BoundListener::Tcp(listener), addr, None)
+        };
 
         let shutdown_timeout = config.server.shutdown_timeout_secs;
         let prestop_grace = config.server.prestop_grace_secs;
@@ -3005,7 +3050,7 @@ impl AppBuilder {
             });
         }
 
-        tracing::info!(addr = %addr, "Listening");
+        tracing::info!(bound = %bound_desc, "Listening");
 
         let server_shutdown_wait = server_shutdown.clone();
         // Wrap the built router with the HTML form method-override layer at
@@ -3028,17 +3073,41 @@ impl AppBuilder {
             &crate::security::TrustedProxiesLayer::from_config(&config.security.trusted_proxies),
             after_method,
         );
-        let make_service =
-            axum::ServiceExt::<axum::extract::Request>::into_make_service_with_connect_info::<
-                std::net::SocketAddr,
-            >(service);
-        let server_task = tokio::spawn(async move {
-            axum::serve(listener, make_service)
-                .with_graceful_shutdown(async move {
-                    server_shutdown_wait.cancelled().await;
+        // Spawn the serve task per transport. The two arms differ only in the
+        // connect-info type baked into the make-service (`SocketAddr` for TCP,
+        // `UdsConnectInfo` for Unix sockets); the graceful-shutdown wiring and
+        // the resulting `JoinHandle<io::Result<()>>` are identical. Handlers
+        // extracting `ConnectInfo<SocketAddr>` are unsupported under a Unix
+        // socket (acceptable: daemon mode is loopback-equivalent and local).
+        let server_task = match bound_listener {
+            BoundListener::Tcp(listener) => {
+                let make_service =
+                    axum::ServiceExt::<axum::extract::Request>::into_make_service_with_connect_info::<
+                        std::net::SocketAddr,
+                    >(service);
+                tokio::spawn(async move {
+                    axum::serve(listener, make_service)
+                        .with_graceful_shutdown(async move {
+                            server_shutdown_wait.cancelled().await;
+                        })
+                        .await
                 })
-                .await
-        });
+            }
+            #[cfg(unix)]
+            BoundListener::Unix(listener) => {
+                let make_service =
+                    axum::ServiceExt::<axum::extract::Request>::into_make_service_with_connect_info::<
+                        UdsConnectInfo,
+                    >(service);
+                tokio::spawn(async move {
+                    axum::serve(listener, make_service)
+                        .with_graceful_shutdown(async move {
+                            server_shutdown_wait.cancelled().await;
+                        })
+                        .await
+                })
+            }
+        };
 
         let shutdown_state = state.clone();
         let shutdown_signal_token = server_shutdown.clone();
@@ -3209,6 +3278,16 @@ impl AppBuilder {
         let hook_budget =
             std::time::Duration::from_secs(shutdown_timeout).saturating_sub(drain_elapsed);
         run_shutdown_hooks_with_timeout(&shutdown_hooks, hook_budget, hook_budget).await;
+
+        // Remove the Unix socket file on clean exit; axum does not unlink it.
+        // (An abnormal force-exit may leave it behind, but the next bind's
+        // `prepare_unix_socket_path` reclaims a stale socket.)
+        #[cfg(unix)]
+        if let Some(path) = &unix_socket_cleanup {
+            let _ = std::fs::remove_file(path);
+        }
+        #[cfg(not(unix))]
+        let _ = &unix_socket_cleanup;
 
         tracing::info!(exit_code = 0, "shutdown: all phases completed cleanly");
     }
@@ -4637,6 +4716,66 @@ fn initialize_job_runtime(
         Ok(())
     } else {
         crate::job::start_runtime(jobs, state, shutdown, config)
+    }
+}
+
+/// A bound network listener for the server, abstracting over the transport.
+///
+/// `run()` binds one of these based on `config.server.unix_socket`: a TCP
+/// listener on `host:port` (the default) or a Unix domain socket (local
+/// daemon mode). The two carry different connect-info types, so the serve
+/// task is spawned per-variant.
+enum BoundListener {
+    /// TCP listener on `host:port`.
+    Tcp(tokio::net::TcpListener),
+    /// Unix domain socket listener (local daemon transport).
+    #[cfg(unix)]
+    Unix(tokio::net::UnixListener),
+}
+
+/// Connection info for a Unix-domain-socket request.
+///
+/// axum's `into_make_service_with_connect_info::<C>` requires `C:
+/// Connected<IncomingStream>`. Unlike TCP there is no peer `SocketAddr` for a
+/// Unix socket, so this carries no data — it exists purely to satisfy the
+/// connect-info bound on the UDS serve path.
+#[cfg(unix)]
+#[derive(Clone, Debug)]
+struct UdsConnectInfo;
+
+#[cfg(unix)]
+impl axum::extract::connect_info::Connected<axum::serve::IncomingStream<'_, tokio::net::UnixListener>>
+    for UdsConnectInfo
+{
+    fn connect_info(
+        _stream: axum::serve::IncomingStream<'_, tokio::net::UnixListener>,
+    ) -> Self {
+        Self
+    }
+}
+
+/// Prepare a Unix-socket path for binding: remove a stale socket left by a
+/// previous run, but refuse to touch a non-socket file (guards against
+/// clobbering a regular file at a misconfigured path). A missing path is fine.
+///
+/// # Errors
+///
+/// Returns an error if the path exists and is not a socket, or if removing the
+/// stale socket fails.
+#[cfg(unix)]
+fn prepare_unix_socket_path(path: &std::path::Path) -> std::io::Result<()> {
+    use std::os::unix::fs::FileTypeExt;
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_socket() => std::fs::remove_file(path),
+        Ok(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!(
+                "refusing to bind unix socket: {} exists and is not a socket",
+                path.display()
+            ),
+        )),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
     }
 }
 
@@ -9604,5 +9743,40 @@ mod tests {
             fast_ran.load(Ordering::SeqCst),
             "fast hook must still run even after slow hook overruns its per-hook budget"
         );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod unix_socket_tests {
+    use super::prepare_unix_socket_path;
+
+    #[test]
+    fn prepare_unix_socket_path_noop_when_absent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("missing.sock");
+        prepare_unix_socket_path(&path).expect("absent path is fine");
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn prepare_unix_socket_path_removes_stale_socket() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("stale.sock");
+        // Bind then drop a real socket to leave a stale socket file behind.
+        let listener = std::os::unix::net::UnixListener::bind(&path).expect("bind socket");
+        drop(listener);
+        assert!(path.exists(), "socket file should exist before prepare");
+        prepare_unix_socket_path(&path).expect("stale socket should be removed");
+        assert!(!path.exists(), "stale socket should be unlinked");
+    }
+
+    #[test]
+    fn prepare_unix_socket_path_errors_on_regular_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("not-a-socket");
+        std::fs::write(&path, b"i am a regular file").expect("write file");
+        let err = prepare_unix_socket_path(&path).expect_err("must refuse a non-socket file");
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        assert!(path.exists(), "regular file must not be removed");
     }
 }
