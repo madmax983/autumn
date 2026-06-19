@@ -434,18 +434,29 @@ pub struct AppliedUserMigration {
     pub dir: Option<std::path::PathBuf>,
 }
 
-/// Versions of the embedded framework migrations (`FRAMEWORK_MIGRATIONS`).
+/// Versions of all embedded framework migrations: the control-plane
+/// [`FRAMEWORK_MIGRATIONS`] plus the shard-required version-history and
+/// commit-hook queue migrations.
 ///
 /// Used to exclude framework-owned migrations from user rollback planning so
 /// the forward-only contract is preserved regardless of which migrations are
-/// applied locally.
+/// applied locally. The shard-required sets must be included too: on a shard
+/// target they are recorded in `__diesel_schema_migrations` but have no user
+/// `down.sql`, so without this exclusion `autumn migrate down --shard` would
+/// plan one of them as a user migration and fail.
 fn framework_migration_versions() -> Result<std::collections::BTreeSet<String>, MigrationError> {
-    let migrations = MigrationSource::<Pg>::migrations(&FRAMEWORK_MIGRATIONS)
-        .map_err(|e| MigrationError::Migration(e.to_string()))?;
-    Ok(migrations
-        .iter()
-        .map(|m| m.name().version().to_string())
-        .collect())
+    let mut versions = std::collections::BTreeSet::new();
+    for migrations in [
+        MigrationSource::<Pg>::migrations(&FRAMEWORK_MIGRATIONS),
+        MigrationSource::<Pg>::migrations(&crate::version_history::VERSION_HISTORY_MIGRATIONS),
+        MigrationSource::<Pg>::migrations(
+            &crate::repository_commit_hooks::REPOSITORY_COMMIT_HOOK_MIGRATIONS,
+        ),
+    ] {
+        let migrations = migrations.map_err(|e| MigrationError::Migration(e.to_string()))?;
+        versions.extend(migrations.iter().map(|m| m.name().version().to_string()));
+    }
+    Ok(versions)
 }
 
 /// Classify the database's applied migrations into user migrations (ascending
@@ -734,13 +745,18 @@ pub fn run_pending_locked(
 /// two migration sets under the migration advisory lock.
 ///
 /// Called by `autumn migrate` when iterating over `[[database.shards]]`
-/// entries, in contrast to [`run_pending_locked`] with [`FRAMEWORK_MIGRATIONS`]
+/// entries, in contrast to [`run_pending`] with [`FRAMEWORK_MIGRATIONS`]
 /// which is used for the control database.
+///
+/// Like [`run_pending`] (the control-database path), this does **not** acquire
+/// the migration advisory lock itself: the caller (`autumn migrate`) already
+/// holds it via [`hold_migration_lock`] for the whole target. Re-acquiring the
+/// session-level advisory lock here on a fresh connection would block on the
+/// caller's own lock until timeout.
 ///
 /// # Errors
 ///
 /// Returns [`MigrationError::Connection`] if the database is unreachable,
-/// [`MigrationError::LockTimeout`] if the advisory lock cannot be acquired,
 /// or [`MigrationError::Migration`] if a migration fails to apply.
 pub fn run_pending_shard_framework_migrations(
     database_url: &str,
@@ -749,19 +765,17 @@ pub fn run_pending_shard_framework_migrations(
     {
         let mut applied: Vec<String> = Vec::new();
 
-        let vh_result = run_pending_locked(
+        let vh_result = run_pending(
             database_url,
             EmbeddedMigrationsRef(&crate::version_history::VERSION_HISTORY_MIGRATIONS),
-            None,
         )?;
         applied.extend(vh_result.applied);
 
-        let ch_result = run_pending_locked(
+        let ch_result = run_pending(
             database_url,
             EmbeddedMigrationsRef(
                 &crate::repository_commit_hooks::REPOSITORY_COMMIT_HOOK_MIGRATIONS,
             ),
-            None,
         )?;
         applied.extend(ch_result.applied);
 
@@ -773,6 +787,44 @@ pub fn run_pending_shard_framework_migrations(
         Ok(MigrationResult {
             applied: Vec::new(),
         })
+    }
+}
+
+/// Names of pending shard-required framework migrations (version-history +
+/// commit-hook queue) on `database_url`.
+///
+/// The status counterpart to [`run_pending_shard_framework_migrations`]: used
+/// by `autumn migrate status --shard ...` so a shard reports only the framework
+/// migrations it actually requires, not the full control-plane
+/// [`FRAMEWORK_MIGRATIONS`] set (which would otherwise always show as pending on
+/// a shard).
+///
+/// # Errors
+///
+/// Returns [`MigrationError::Connection`] if the database is unreachable, or
+/// [`MigrationError::Migration`] if status cannot be determined.
+pub fn pending_shard_framework_migrations(
+    database_url: &str,
+) -> Result<Vec<String>, MigrationError> {
+    #[cfg(feature = "db")]
+    {
+        let mut pending: Vec<String> = Vec::new();
+        pending.extend(pending_migrations(
+            database_url,
+            EmbeddedMigrationsRef(&crate::version_history::VERSION_HISTORY_MIGRATIONS),
+        )?);
+        pending.extend(pending_migrations(
+            database_url,
+            EmbeddedMigrationsRef(
+                &crate::repository_commit_hooks::REPOSITORY_COMMIT_HOOK_MIGRATIONS,
+            ),
+        )?);
+        Ok(pending)
+    }
+    #[cfg(not(feature = "db"))]
+    {
+        let _ = database_url;
+        Ok(Vec::new())
     }
 }
 

@@ -135,7 +135,9 @@ pub fn run(
                 eprintln!("\u{2500}\u{2500} {label} \u{2500}\u{2500}");
                 show_status(url, &migrations_dir);
                 show_rollback_availability(url, &migrations_dir);
-                show_framework_status(url);
+                // Shard targets only require the shard framework migrations, so
+                // report against that set instead of the full control-plane one.
+                show_framework_status(url, label.starts_with("shard:"));
                 eprintln!();
             }
         }
@@ -1184,11 +1186,17 @@ fn show_status(database_url: &str, migrations_dir: &str) {
     show_diesel_migration_status(database_url, Path::new(migrations_dir));
 }
 
-fn show_framework_status(database_url: &str) {
+fn show_framework_status(database_url: &str, is_shard: bool) {
     eprintln!("  Checking Autumn framework migration status...\n");
 
-    match pending_framework_migrations_inner(database_url, autumn_web::migrate::pending_migrations)
-    {
+    // Shard targets require only the shard framework migrations (version
+    // history + commit-hook queue); the control plane requires the full set.
+    let pending = if is_shard {
+        autumn_web::migrate::pending_shard_framework_migrations(database_url)
+    } else {
+        pending_framework_migrations_inner(database_url, autumn_web::migrate::pending_migrations)
+    };
+    match pending {
         Ok(pending) if pending.is_empty() => {
             eprintln!("  Framework migrations are up to date.");
         }
