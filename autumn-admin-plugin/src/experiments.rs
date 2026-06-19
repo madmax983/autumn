@@ -718,6 +718,131 @@ mod tests {
     use super::*;
 
     #[test]
+    fn validate_variants_json_rejects_weight_over_u32_max() {
+        let max_plus_one = u64::from(u32::MAX) + 1;
+        let raw = format!(r#"[{{"name": "a", "weight": {max_plus_one}}}]"#);
+        let result = validate_variants_json(&raw);
+        assert!(matches!(result, Err(AdminError::Validation(msg)) if msg.contains("must not exceed")));
+    }
+
+    #[test]
+    fn validate_variants_json_accepts_weight_u32_max() {
+        let max = u64::from(u32::MAX);
+        let raw = format!(r#"[{{"name": "a", "weight": {max}}}]"#);
+        let result = validate_variants_json(&raw);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn validate_variants_json_rejects_weight_less_than_max() {
+        let max_minus_one = u64::from(u32::MAX) - 1;
+        let raw = format!(r#"[{{"name": "a", "weight": {max_minus_one}}}]"#);
+        let result = validate_variants_json(&raw);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn experiment_row_into_json_has_expected_fields() {
+        let row = ExperimentRow {
+            id: 1,
+            name: "test".to_owned(),
+            description: None,
+            state: "active".to_owned(),
+            variants: Some("[]".to_owned()),
+            winner: None,
+            updated_at: chrono::Utc::now(),
+        };
+        let json = row.into_json();
+        assert_eq!(json["id"], 1);
+        assert_eq!(json["name"], "test");
+        assert_eq!(json["state"], "active");
+        assert_eq!(json["variants"], serde_json::json!("[]"));
+    }
+
+    #[test]
+    fn experiment_detail_row_into_json_has_expected_fields() {
+        let row = ExperimentDetailRow {
+            id: 1,
+            name: "test".to_owned(),
+            description: None,
+            state: "active".to_owned(),
+            variants: Some("[]".to_owned()),
+            winner: None,
+            exclusion_group: Some("group1".to_owned()),
+            updated_at: chrono::Utc::now(),
+        };
+        let json = row.into_json();
+        assert_eq!(json["id"], 1);
+        assert_eq!(json["name"], "test");
+        assert_eq!(json["state"], "active");
+        assert_eq!(json["exclusion_group"], "group1");
+    }
+
+    #[test]
+    fn experiment_row_into_json_test() {
+        let row = ExperimentRow {
+            id: 2,
+            name: "test2".to_owned(),
+            description: None,
+            state: "inactive".to_owned(),
+            variants: Some("[]".to_owned()),
+            winner: None,
+            updated_at: chrono::Utc::now(),
+        };
+        let value = row.into_json();
+        assert_ne!(value, Value::Null);
+    }
+
+    #[test]
+    fn experiment_detail_row_into_json_test() {
+        let row = ExperimentDetailRow {
+            id: 2,
+            name: "test2".to_owned(),
+            description: None,
+            state: "inactive".to_owned(),
+            variants: Some("[]".to_owned()),
+            winner: None,
+            exclusion_group: Some("group1".to_owned()),
+            updated_at: chrono::Utc::now(),
+        };
+        let value = row.into_json();
+        assert_ne!(value, Value::Null);
+    }
+
+    #[test]
+    fn experiment_row_into_json_test_fields() {
+        let row = ExperimentRow {
+            id: 2,
+            name: "test2".to_owned(),
+            description: Some("desc".to_owned()),
+            state: "inactive".to_owned(),
+            variants: Some("[]".to_owned()),
+            winner: Some("a".to_owned()),
+            updated_at: chrono::Utc::now(),
+        };
+        let value = row.into_json();
+        assert_eq!(value["description"], "desc");
+        assert_eq!(value["winner"], "a");
+    }
+
+    #[test]
+    fn experiment_detail_row_into_json_test_fields() {
+        let row = ExperimentDetailRow {
+            id: 2,
+            name: "test2".to_owned(),
+            description: Some("desc".to_owned()),
+            state: "inactive".to_owned(),
+            variants: Some("[]".to_owned()),
+            winner: Some("a".to_owned()),
+            exclusion_group: Some("group1".to_owned()),
+            updated_at: chrono::Utc::now(),
+        };
+        let value = row.into_json();
+        assert_eq!(value["description"], "desc");
+        assert_eq!(value["winner"], "a");
+    }
+
+    #[test]
     fn experiment_admin_model_slug() {
         let model = ExperimentAdminModel;
         assert_eq!(model.slug(), "experiments");

@@ -600,3 +600,73 @@ mod conformance_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::traits::{AdminModel, AdminField, AdminFuture, ListParams, ListResult};
+    use serde_json::Value;
+
+    struct DummyModel;
+    impl AdminModel for DummyModel {
+        fn slug(&self) -> &'static str { "dummy" }
+        fn display_name(&self) -> &'static str { "Dummy" }
+        fn display_name_plural(&self) -> &'static str { "Dummies" }
+        fn fields(&self) -> Vec<AdminField> { vec![] }
+        fn list(
+            &self,
+            _pool: &diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>,
+            _params: ListParams,
+        ) -> AdminFuture<'_, ListResult> {
+            Box::pin(async { Ok(ListResult { records: vec![], total: 0, page: 1, per_page: 25 }) })
+        }
+        fn get(
+            &self,
+            _pool: &diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>,
+            _id: i64,
+        ) -> AdminFuture<'_, Option<Value>> { Box::pin(async { Ok(None) }) }
+        fn create(
+            &self,
+            _pool: &diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>,
+            data: Value,
+        ) -> AdminFuture<'_, Value> { Box::pin(async { Ok(data) }) }
+        fn update(
+            &self,
+            _pool: &diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>,
+            _id: i64,
+            data: Value,
+        ) -> AdminFuture<'_, Value> { Box::pin(async { Ok(data) }) }
+        fn delete(
+            &self,
+            _pool: &diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>,
+            _id: i64,
+        ) -> AdminFuture<'_, ()> { Box::pin(async { Ok(()) }) }
+    }
+
+    #[test]
+    fn test_admin_plugin_builders() {
+        use autumn_web::plugin::Plugin;
+        use autumn_web::runtime_config::{ConfigRegistry, ConfigStore, InMemoryConfigStore};
+
+        let registry = Arc::new(ConfigRegistry::new());
+        let store: Arc<dyn ConfigStore> = Arc::new(InMemoryConfigStore::new());
+        let runtime_config = Arc::new(autumn_web::runtime_config::RuntimeConfigService::new(registry, store));
+        let plugin = AdminPlugin::new()
+            .prefix("/superadmin")
+            .actuator_prefix("/system")
+            .auth_session_key("uid")
+            .require_role(Some("superuser".to_string()))
+            .register(DummyModel)
+            .with_runtime_config(runtime_config);
+
+        assert_eq!(plugin.prefix, "/superadmin");
+        assert_eq!(plugin.actuator_prefix, "/system");
+        assert_eq!(plugin.auth_session_key, "uid");
+        assert_eq!(plugin.require_role, Some("superuser".to_string()));
+        assert_eq!(plugin.registry.model_count(), 1);
+        assert!(plugin.runtime_config.is_some());
+
+        let plugin_default = AdminPlugin::new();
+        assert_eq!(plugin_default.name(), "autumn-admin-plugin");
+    }
+}
