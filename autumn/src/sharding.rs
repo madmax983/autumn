@@ -362,8 +362,8 @@ impl DirectoryShardRouter {
     }
 
     /// Spawn a background task that `LISTEN`s on the control DB's
-    /// [`DIRECTORY_NOTIFY_CHANNEL`] and invalidates this router's cached pin
-    /// whenever a tenant's directory row changes.
+    /// `autumn_shard_directory` notification channel and invalidates this
+    /// router's cached pin whenever a tenant's directory row changes.
     ///
     /// This covers writes made on other replicas or directly via operator SQL
     /// (the channel is fired by a trigger, not app code). Without it the cache

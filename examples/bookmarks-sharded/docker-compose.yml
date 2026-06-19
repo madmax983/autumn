@@ -56,10 +56,21 @@ services:
       - "5443:5432"
     volumes:
       - pgdata-shard-0:/var/lib/postgresql/data
-      # Add a `host replication …` rule to pg_hba.conf so the replica below can
-      # base-backup/stream from this primary (the stock image's generated rules
-      # cover `all` databases but not replication connections).
-      - ./docker/postgres/enable-replication.sh:/docker-entrypoint-initdb.d/10-enable-replication.sh:ro
+    # The stock postgres image only appends `host all all all <method>` to
+    # pg_hba.conf, and pg_hba's `all` database keyword does NOT match
+    # replication connections. Drop an init snippet (run once on a fresh volume,
+    # after initdb, by the entrypoint) that adds a `host replication …` rule so
+    # the shard-0 replica below can base-backup/stream; without it
+    # `pg_basebackup -h postgres-shard-0` is rejected and the replica loops
+    # forever. (`$$` escapes compose interpolation so the container sees `$`.)
+    command:
+      - bash
+      - -c
+      - |
+        set -e
+        echo 'echo "host replication all all scram-sha-256" >> "$$PGDATA/pg_hba.conf"' \
+          > /docker-entrypoint-initdb.d/10-enable-replication.sh
+        exec docker-entrypoint.sh postgres
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U autumn -d bookmarks_shard0"]
       interval: 5s
@@ -71,7 +82,7 @@ services:
   # reads here, writes still go to postgres-shard-0.
   #
   # Built with the stock postgres image: the primary adds a `host replication`
-  # pg_hba rule via its init script (see postgres-shard-0) and the `autumn`
+  # pg_hba rule via its init step (see postgres-shard-0) and the `autumn`
   # superuser carries the REPLICATION privilege, so a one-shot `pg_basebackup -R`
   # clones the primary into an empty data dir and writes the standby/
   # primary_conninfo settings. The volume MUST start empty (a fresh `docker
