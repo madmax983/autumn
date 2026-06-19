@@ -92,7 +92,7 @@ async fn directory_pins_tenant_then_invalidate_falls_back_to_hash() {
         .await
         .expect("hash routes the tenant")
         .id();
-    let other = ShardId(if hash_owner.0 == 0 { 1 } else { 0 });
+    let other = ShardId(usize::from(hash_owner.0 == 0));
     let pinned_name = shards
         .get(other)
         .expect("other shard exists")
@@ -104,13 +104,16 @@ async fn directory_pins_tenant_then_invalidate_falls_back_to_hash() {
     let router = DirectoryShardRouter::new(db.pool());
 
     // 1. Directory hit routes to the pinned (non-hash) shard.
-    let routed = router
+    let resolved = router
         .route(ShardKey::Str(tenant), &shards)
         .await
         .expect("directory routes the tenant");
-    assert_eq!(routed, other, "directory row must override the hash owner");
+    assert_eq!(
+        resolved, other,
+        "directory row must override the hash owner"
+    );
     assert_ne!(
-        routed, hash_owner,
+        resolved, hash_owner,
         "pinned shard differs from the hash owner"
     );
 
