@@ -196,3 +196,35 @@ async fn query_extractor_rejection_returns_non_101() {
         "expected handshake to fail when query extractor rejects"
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn shutdown_aware_handles_shutdown() {
+    let app = TestApp::new().routes(routes![shutdown_aware]).build();
+
+    let state = app.state().clone();
+    let router = app.into_router();
+
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind ephemeral port");
+    let addr = listener.local_addr().expect("local_addr");
+
+    tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+
+    // Give the server a moment to start accepting.
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    let mut stream = connect(addr, "/shutdown-aware").await;
+
+    // Trigger shutdown
+    state.trigger_shutdown_for_test();
+
+    // Wait for the shutdown message
+    let reply = stream.next().await.expect("recv").expect("no error");
+    match reply {
+        TMessage::Text(t) => assert_eq!(t.as_str(), "bye"),
+        other => panic!("unexpected reply: {other:?}"),
+    }
+}
