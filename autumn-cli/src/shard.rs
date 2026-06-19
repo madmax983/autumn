@@ -88,28 +88,40 @@ pub fn run_move_slot(args: &MoveSlotArgs) {
     // re-running with `--confirm` must skip the copy (which would fail on
     // duplicate PKs) and go straight to delete.
     eprintln!("\u{2192} Checking source\u{2026}");
-    let (src_count, src_sum) = snapshot(&from_url, &args.table, &filter);
-    let (dst_count, dst_sum) = snapshot(&to_url, &args.table, &filter);
-
-    let already_synced = src_count == dst_count && src_sum == dst_sum;
-    if already_synced && src_count != "0" {
-        eprintln!("\u{2713} Destination already matches source (previous dry-run); skipping copy.");
-    } else if src_count == "0" {
+    let src_count = psql_scalar(&from_url, &count_sql(&args.table, &filter));
+    if src_count == "0" {
         eprintln!("\u{26A0}\u{FE0F}  No rows found on source shard for the given tenant(s).");
     } else {
-        // ── 2. Copy source → destination ──────────────────────────────────
-        eprintln!("\u{2192} Copying rows\u{2026}");
-        copy_rows(&from_url, &to_url, &args.table, &filter);
+        // Verify by content fingerprint that the destination CONTAINS every
+        // source row, rather than requiring an exact match. After the dry-run
+        // copy and a route flip, new writes for the moved tenant make the
+        // destination a superset of the source; a `--confirm` re-run must then
+        // skip the copy (re-inserting copied PKs would abort) and proceed to
+        // delete the stale source rows.
+        let src_fp = row_fingerprints(&from_url, &args.table, &filter);
+        let dst_fp = row_fingerprints(&to_url, &args.table, &filter);
+        if dest_contains_source(&src_fp, &dst_fp) {
+            eprintln!(
+                "\u{2713} Destination already contains all source rows (previous dry-run); skipping copy."
+            );
+        } else {
+            // ── 2. Copy source → destination ──────────────────────────────
+            eprintln!("\u{2192} Copying rows\u{2026}");
+            copy_rows(&from_url, &to_url, &args.table, &filter);
 
-        // Re-verify after copy.
-        let (dst_count2, dst_sum2) = snapshot(&to_url, &args.table, &filter);
-        eprintln!("   source: count={src_count} checksum={src_sum}");
-        eprintln!("   dest:   count={dst_count2} checksum={dst_sum2}");
-        if src_count != dst_count2 || src_sum != dst_sum2 {
-            fail("verification FAILED: destination does not match source. No rows deleted.");
+            // Re-verify after copy: destination must contain all source rows
+            // (it may legitimately hold additional rows written post-route).
+            let dst_fp2 = row_fingerprints(&to_url, &args.table, &filter);
+            eprintln!("   source rows: {}", src_fp.len());
+            eprintln!("   dest rows:   {}", dst_fp2.len());
+            if !dest_contains_source(&src_fp, &dst_fp2) {
+                fail(
+                    "verification FAILED: destination does not contain all source rows. No rows deleted.",
+                );
+            }
         }
+        eprintln!("\u{2713} Verified: destination contains all source rows.");
     }
-    eprintln!("\u{2713} Verified: destination matches source.");
 
     // ── 2b. Advance the destination PK sequence ───────────────────────────
     // PK values are copied verbatim, so the destination's BIGSERIAL/identity
@@ -234,17 +246,6 @@ fn count_sql(table: &str, filter: &str) -> String {
     format!("SELECT count(*) FROM {qt} WHERE {filter}")
 }
 
-/// id-independent content checksum over whole rows (`to_jsonb`), so it needs no
-/// column knowledge and matches whenever source and destination hold identical
-/// rows.
-fn checksum_sql(table: &str, filter: &str) -> String {
-    let qt = quote_identifier(table);
-    format!(
-        "SELECT COALESCE(md5(string_agg(j, '|' ORDER BY j)), '') \
-         FROM (SELECT to_jsonb(t)::text AS j FROM {qt} t WHERE {filter}) s"
-    )
-}
-
 // NOTE: `SELECT *` preserves column declaration order. Both shards are expected
 // to have identical schemas (Autumn migrations run in order on all shards), so
 // the order will match. If you have added columns manually outside the migration
@@ -281,10 +282,13 @@ fn delete_sql(table: &str, filter: &str) -> String {
 fn reset_sequence_sql(table: &str, id_column: &str) -> String {
     let qt = quote_identifier(table);
     let qcol = quote_identifier(id_column);
-    // pg_get_serial_sequence resolves the quoted identifier form (handles
-    // schema-qualified and case-sensitive names); max() uses the same.
-    let tbl_lit = qt.replace('\'', "''");
-    let col_lit = qcol.replace('\'', "''");
+    // pg_get_serial_sequence takes the *raw* table and column name as string
+    // literals, not quoted identifiers: the column argument is treated as a
+    // literal column name (a double-quoted `"id"` would be looked up verbatim
+    // and return NULL, making the reset a silent no-op). Pass the unquoted
+    // names; `max()`/`FROM` below still use the quoted identifiers.
+    let tbl_lit = table.replace('\'', "''");
+    let col_lit = id_column.replace('\'', "''");
     format!(
         "DO $$ DECLARE seq text := pg_get_serial_sequence('{tbl_lit}', '{col_lit}'); mx bigint; \
          BEGIN IF seq IS NOT NULL THEN SELECT max({qcol}) INTO mx FROM {qt}; \
@@ -342,11 +346,34 @@ fn psql_scalar(url: &str, sql: &str) -> String {
     String::from_utf8_lossy(&out.stdout).trim().to_owned()
 }
 
-fn snapshot(url: &str, table: &str, filter: &str) -> (String, String) {
-    (
-        psql_scalar(url, &count_sql(table, filter)),
-        psql_scalar(url, &checksum_sql(table, filter)),
-    )
+/// Per-row content fingerprints (one `md5(to_jsonb(row))` per matching row,
+/// sorted) for the filtered set. Used to recognize a destination that is a
+/// *superset* of the source so a post-route `--confirm` re-run skips the copy
+/// instead of aborting on already-copied primary keys.
+fn row_fingerprints(url: &str, table: &str, filter: &str) -> Vec<String> {
+    let qt = quote_identifier(table);
+    let sql = format!("SELECT md5(to_jsonb(t)::text) FROM {qt} t WHERE {filter} ORDER BY 1");
+    let out = psql_scalar(url, &sql);
+    if out.is_empty() {
+        return Vec::new();
+    }
+    out.lines().map(str::to_owned).collect()
+}
+
+/// Whether `dst` contains every fingerprint in `src`, counting multiplicity —
+/// i.e. the destination holds (at least) all of the source's rows.
+fn dest_contains_source(src: &[String], dst: &[String]) -> bool {
+    let mut available: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for f in dst {
+        *available.entry(f.as_str()).or_default() += 1;
+    }
+    for f in src {
+        match available.get_mut(f.as_str()) {
+            Some(n) if *n > 0 => *n -= 1,
+            _ => return false,
+        }
+    }
+    true
 }
 
 fn run_psql(url: &str, args: &[&str]) {
@@ -418,7 +445,6 @@ mod tests {
             count_sql("bookmarks", &f),
             "SELECT count(*) FROM \"bookmarks\" WHERE \"tenant_id\" = ANY(ARRAY['acme']::text[])"
         );
-        assert!(checksum_sql("bookmarks", &f).contains("to_jsonb(t)"));
         assert_eq!(
             delete_sql("bookmarks", &f),
             "DELETE FROM \"bookmarks\" WHERE \"tenant_id\" = ANY(ARRAY['acme']::text[])"
@@ -445,11 +471,13 @@ mod tests {
     #[test]
     fn reset_sequence_sql_quotes_and_guards() {
         let sql = reset_sequence_sql("bookmarks", "id");
-        // Quoted identifiers passed to pg_get_serial_sequence and max().
+        // Raw (unquoted) names passed to pg_get_serial_sequence; a quoted
+        // "id" would be taken literally and return NULL (silent no-op).
         assert!(
-            sql.contains("pg_get_serial_sequence('\"bookmarks\"', '\"id\"')"),
+            sql.contains("pg_get_serial_sequence('bookmarks', 'id')"),
             "{sql}"
         );
+        // max()/FROM still use quoted identifiers.
         assert!(
             sql.contains("SELECT max(\"id\") INTO mx FROM \"bookmarks\""),
             "{sql}"
@@ -461,10 +489,11 @@ mod tests {
             "{sql}"
         );
 
-        // Schema-qualified table quotes each part.
+        // Schema-qualified table passes the raw dotted name to
+        // pg_get_serial_sequence and quotes each part for max()/FROM.
         let sql = reset_sequence_sql("public.bookmarks", "id");
         assert!(
-            sql.contains("pg_get_serial_sequence('\"public\".\"bookmarks\"', '\"id\"')"),
+            sql.contains("pg_get_serial_sequence('public.bookmarks', 'id')"),
             "{sql}"
         );
     }
