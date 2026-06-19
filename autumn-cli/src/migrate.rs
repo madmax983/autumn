@@ -150,7 +150,20 @@ fn resolve_targets(target: &MigrateTarget, profile: Option<&str>) -> Vec<(String
     // when a profile is selected, so control and shard URLs both resolve from
     // the same effective configuration. Environment overrides still win over
     // the merged file (handled inside the `_from_sources` helpers).
-    let config_table = read_autumn_toml_table_with_profile(profile);
+    //
+    // When no profile is given explicitly (via `--profile` / `AUTUMN_PROFILE`),
+    // fall back to `AUTUMN_ENV` — the framework's preferred profile selector —
+    // so `autumn migrate` resolves the same overlay the app itself would use.
+    let env_profile;
+    let effective_profile = if profile.is_some() {
+        profile
+    } else {
+        env_profile = std::env::var("AUTUMN_ENV")
+            .ok()
+            .filter(|v| !v.trim().is_empty());
+        env_profile.as_deref()
+    };
+    let config_table = read_autumn_toml_table_with_profile(effective_profile);
     let control =
         resolve_primary_database_url_from_sources(|key| std::env::var(key), config_table.as_ref());
     let shards =
@@ -903,8 +916,16 @@ fn run_down(
     target: &MigrateTarget,
     profile: Option<&str>,
 ) {
-    // 1. Production guard
-    if is_production_profile() && !args.yes_i_mean_prod {
+    // 1. Production guard.  Check the explicit `--profile` arg first (highest
+    //    priority), then fall back to the env-based `is_production_profile()`
+    //    which reads `AUTUMN_ENV` / `AUTUMN_PROFILE` / `AUTUMN_IS_DEBUG`.
+    let is_prod = profile
+        .map(|p| {
+            let p = p.trim().to_lowercase();
+            p == "prod" || p == "production"
+        })
+        .unwrap_or_else(is_production_profile);
+    if is_prod && !args.yes_i_mean_prod {
         eprintln!("\u{2717} Production profile detected.");
         eprintln!("  Rolling back migrations in production requires explicit confirmation.");
         eprintln!("  Re-run with --yes-i-mean-prod to proceed.");

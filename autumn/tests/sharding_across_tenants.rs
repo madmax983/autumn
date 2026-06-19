@@ -9,7 +9,7 @@
 //!  - The generated fan-out code path is reachable (no infinite recursion risk)
 //!    because `with_pool_untracked` always produces `__autumn_shards: None`.
 //!
-//! No live database or real ShardSet is required — pools are created lazily
+//! No live database or real `ShardSet` is required — pools are created lazily
 //! by deadpool and the tests only inspect struct-level fields.
 
 #![cfg(feature = "db")]

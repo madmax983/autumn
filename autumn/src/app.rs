@@ -1629,7 +1629,7 @@ impl AppBuilder {
     /// precedence over this flag.
     #[cfg(feature = "db")]
     #[must_use]
-    pub fn with_directory_shard_router(mut self) -> Self {
+    pub const fn with_directory_shard_router(mut self) -> Self {
         self.directory_shard_router = true;
         self
     }
@@ -5218,17 +5218,18 @@ async fn setup_database(
     let router: Arc<dyn crate::sharding::ShardRouter> = match shard_router {
         Some(explicit) => explicit,
         None if use_directory_router => {
-            match topology.as_ref().map(crate::db::DatabaseTopology::primary) {
-                Some(control_primary) => Arc::new(crate::sharding::DirectoryShardRouter::new(
+            if let Some(control_primary) =
+                topology.as_ref().map(crate::db::DatabaseTopology::primary)
+            {
+                Arc::new(crate::sharding::DirectoryShardRouter::new(
                     control_primary.clone(),
-                )),
-                None => {
-                    tracing::warn!(
-                        "directory_shard_router is enabled but no control database is \
-                         configured; falling back to the hash router"
-                    );
-                    Arc::new(crate::sharding::HashShardRouter)
-                }
+                ))
+            } else {
+                tracing::warn!(
+                    "directory_shard_router is enabled but no control database is \
+                     configured; falling back to the hash router"
+                );
+                Arc::new(crate::sharding::HashShardRouter)
             }
         }
         None => Arc::new(crate::sharding::HashShardRouter),

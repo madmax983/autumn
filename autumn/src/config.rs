@@ -3321,7 +3321,7 @@ pub struct DatabaseConfig {
 ///
 /// Pure so the boundary condition is unit-testable without booting an app.
 /// A `threshold` of `0` disables the warning entirely.
-pub(crate) fn should_warn_total_connections(total: usize, threshold: usize) -> bool {
+pub(crate) const fn should_warn_total_connections(total: usize, threshold: usize) -> bool {
     threshold != 0 && total >= threshold
 }
 

@@ -293,7 +293,7 @@ impl DirectoryShardRouter {
 
     /// Override the cache TTL.
     #[must_use]
-    pub fn with_cache_ttl(mut self, ttl: std::time::Duration) -> Self {
+    pub const fn with_cache_ttl(mut self, ttl: std::time::Duration) -> Self {
         self.ttl = ttl;
         self
     }
@@ -317,7 +317,9 @@ impl DirectoryShardRouter {
     fn cache_get(&self, key: &str) -> Option<ShardId> {
         let cache = self.cache.read().ok()?;
         let entry = cache.get(key)?;
-        (entry.expires_at > std::time::Instant::now()).then_some(entry.shard)
+        let result = (entry.expires_at > std::time::Instant::now()).then_some(entry.shard);
+        drop(cache);
+        result
     }
 
     fn cache_put(&self, key: String, shard: ShardId) {
@@ -782,8 +784,7 @@ impl ShardSet {
     pub fn owns_key<'k>(&self, shard_id: ShardId, key: impl Into<ShardKey<'k>>) -> bool {
         let slot = self.slot_for_key(key);
         self.shard_for_slot(slot)
-            .map(|s| s.id() == shard_id)
-            .unwrap_or(false)
+            .is_some_and(|s| s.id() == shard_id)
     }
 
     /// All logical slots assigned to the shard at index `shard_id`.
@@ -791,7 +792,7 @@ impl ShardSet {
     /// Returns `None` when the id is out of range.
     #[must_use]
     pub fn slots_for_shard(&self, shard_id: ShardId) -> Option<&[u16]> {
-        self.inner.shards.get(shard_id.0).map(|s| s.slots())
+        self.inner.shards.get(shard_id.0).map(Shard::slots)
     }
 
     /// Partition string `keys` by their owning shard based on hash-slot assignment.
@@ -2067,16 +2068,18 @@ mod tests {
         let set = shard_set(&["a", "b"]);
         let keys = ["hooli", "a", "tenant-1"]; // tenant-1 → 12427 → shard b
         let map = set.partition_by_shard(keys.iter().copied());
-        let shard_a_keys = map.get(&ShardId(0)).map(Vec::as_slice).unwrap_or(&[]);
-        let shard_b_keys = map.get(&ShardId(1)).map(Vec::as_slice).unwrap_or(&[]);
-        assert!(shard_a_keys.contains(&"hooli"), "hooli must go to shard a");
-        assert!(shard_b_keys.contains(&"a"), "key 'a' must go to shard b");
+        #[allow(clippy::similar_names)]
+        let keys_on_a = map.get(&ShardId(0)).map_or(&[][..], Vec::as_slice);
+        #[allow(clippy::similar_names)]
+        let keys_on_b = map.get(&ShardId(1)).map_or(&[][..], Vec::as_slice);
+        assert!(keys_on_a.contains(&"hooli"), "hooli must go to shard a");
+        assert!(keys_on_b.contains(&"a"), "key 'a' must go to shard b");
         assert!(
-            shard_b_keys.contains(&"tenant-1"),
+            keys_on_b.contains(&"tenant-1"),
             "tenant-1 (slot 12427) must go to shard b"
         );
         assert_eq!(
-            shard_a_keys.len() + shard_b_keys.len(),
+            keys_on_a.len() + keys_on_b.len(),
             keys.len(),
             "no key dropped"
         );

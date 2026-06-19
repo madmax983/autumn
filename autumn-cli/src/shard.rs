@@ -67,18 +67,32 @@ pub fn run_move_slot(args: &MoveSlotArgs) {
         args.to
     );
 
-    // ── 1. Copy source → destination ──────────────────────────────────────
-    eprintln!("\u{2192} Copying rows\u{2026}");
-    copy_rows(&from_url, &to_url, &args.table, &filter);
-
-    // ── 2. Verify counts + content checksum ───────────────────────────────
-    eprintln!("\u{2192} Verifying\u{2026}");
+    // ── 1. Snapshot source and destination ────────────────────────────────
+    // Verify first so re-runs with `--confirm` are idempotent: if the dry-run
+    // already copied the rows to the destination and the slot was then flipped,
+    // re-running with `--confirm` must skip the copy (which would fail on
+    // duplicate PKs) and go straight to delete.
+    eprintln!("\u{2192} Checking source\u{2026}");
     let (src_count, src_sum) = snapshot(&from_url, &args.table, &filter);
     let (dst_count, dst_sum) = snapshot(&to_url, &args.table, &filter);
-    eprintln!("   source: count={src_count} checksum={src_sum}");
-    eprintln!("   dest:   count={dst_count} checksum={dst_sum}");
-    if src_count != dst_count || src_sum != dst_sum {
-        fail("verification FAILED: destination does not match source. No rows deleted.");
+
+    let already_synced = src_count == dst_count && src_sum == dst_sum;
+    if already_synced && src_count != "0" {
+        eprintln!("\u{2713} Destination already matches source (previous dry-run); skipping copy.");
+    } else if src_count == "0" {
+        eprintln!("\u{26A0}\u{FE0F}  No rows found on source shard for the given tenant(s).");
+    } else {
+        // ── 2. Copy source → destination ──────────────────────────────────
+        eprintln!("\u{2192} Copying rows\u{2026}");
+        copy_rows(&from_url, &to_url, &args.table, &filter);
+
+        // Re-verify after copy.
+        let (dst_count2, dst_sum2) = snapshot(&to_url, &args.table, &filter);
+        eprintln!("   source: count={src_count} checksum={src_sum}");
+        eprintln!("   dest:   count={dst_count2} checksum={dst_sum2}");
+        if src_count != dst_count2 || src_sum != dst_sum2 {
+            fail("verification FAILED: destination does not match source. No rows deleted.");
+        }
     }
     eprintln!("\u{2713} Verified: destination matches source.");
 
