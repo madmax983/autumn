@@ -424,17 +424,50 @@ impl DirectoryShardRouter {
                         router.invalidate(&row.tenant_key);
                     }
                 }
+                // Reclaim entries that expired but were never looked up again
+                // (lazy eviction in `cache_get` only fires on re-observation).
+                router.sweep_expired();
                 last_polled_secs = new_horizon;
             }
         })
     }
 
     fn cache_get(&self, key: &str) -> Option<ShardId> {
-        let cache = self.cache.read().ok()?;
-        let entry = cache.get(key)?;
-        let result = (entry.expires_at > std::time::Instant::now()).then_some(entry.shard);
-        drop(cache);
-        result
+        {
+            let cache = self.cache.read().ok()?;
+            match cache.get(key) {
+                Some(entry) if entry.expires_at > std::time::Instant::now() => {
+                    return Some(entry.shard);
+                }
+                // Miss, or present-but-expired: fall through. `None` is returned
+                // either way; an expired entry is additionally evicted below so a
+                // long-running process doesn't retain every pinned tenant it has
+                // ever looked up (the TTL bounds staleness, not memory).
+                Some(_) => {}
+                None => return None,
+            }
+        }
+        // Re-check under the write lock so we don't drop a fresh entry written by
+        // `cache_put` between releasing the read lock and taking the write lock.
+        if let Ok(mut cache) = self.cache.write() {
+            if let Some(entry) = cache.get(key) {
+                if entry.expires_at <= std::time::Instant::now() {
+                    cache.remove(key);
+                }
+            }
+        }
+        None
+    }
+
+    /// Drop every expired entry from the cache. Lazy eviction in `cache_get`
+    /// only reclaims keys that are looked up again; this bounds memory for
+    /// pinned tenants that are never re-observed. Called periodically by the
+    /// invalidation listener.
+    fn sweep_expired(&self) {
+        if let Ok(mut cache) = self.cache.write() {
+            let now = std::time::Instant::now();
+            cache.retain(|_, entry| entry.expires_at > now);
+        }
     }
 
     fn cache_put(&self, key: String, shard: ShardId) {

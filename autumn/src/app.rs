@@ -5285,15 +5285,24 @@ async fn setup_database(
         crate::version_history::has_versioned_repository_descriptors(),
         hook_queue_migration_mode,
     );
+    // Directory routing is only actually active when the app did NOT supply an
+    // explicit shard router: an explicit `with_shard_router(...)` takes
+    // precedence over `directory_shard_router` in `resolve_shard_set`, so in
+    // that case the `DirectoryShardRouter` is never constructed and the
+    // directory table is never consulted. Gate the migration on the same
+    // condition so an explicit-router app doesn't create `_autumn_shard_directory`
+    // (or warn about a pending directory migration) for a table it won't use.
+    let use_directory_router =
+        shard_router.is_none() && (directory_shard_router || config.database.directory_shard_router);
     // The tenant→shard directory table is a CONTROL-plane table: create it at
-    // startup only when directory routing is enabled (and shards exist), and
+    // startup only when directory routing is active (and shards exist), and
     // only on the control target — not via the shared list above, which is also
     // applied to every shard. Like the other runtime framework migrations, it is
     // suppressed during a static build (`autumn build`, AUTUMN_BUILD_STATIC=1):
     // the build only renders assets and must not touch the database, so it must
     // not create `_autumn_shard_directory`.
     let directory_migration_required = directory_migration_is_required(
-        directory_shard_router || config.database.directory_shard_router,
+        use_directory_router,
         config.database.has_shards(),
         hook_queue_migration_mode,
     );
@@ -5304,7 +5313,6 @@ async fn setup_database(
     }
     .map_err(|e| format!("Failed to create database pool: {e}"))?;
 
-    let use_directory_router = directory_shard_router || config.database.directory_shard_router;
     // Spawn the directory invalidation listener only at real runtime — a static
     // build must not open control-DB connections.
     let runtime_boot = hook_queue_migration_mode == RepositoryCommitHookQueueMigrationMode::Runtime;
