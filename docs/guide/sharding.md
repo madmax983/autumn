@@ -356,14 +356,21 @@ cargo run --bin move_slot -- \
   --to   postgres://autumn:autumn@localhost:5444/bookmarks_shard1 \
   --tenant acme
 
-# Flip the slot in autumn.toml and deploy, then delete the stale source rows:
+# Re-route acme to the destination, then delete the stale source rows:
 cargo run --bin move_slot -- --from … --to … --tenant acme --confirm
 ```
 
-The script never edits the slot map — copy and verify, cut the slot over in
-`autumn.toml`, then delete. Pinning relocated tenants explicitly (rather than
-relying on the slot move alone) is what the
-[`DirectoryShardRouter`](#custom-routing-and-whale-tenants) is for.
+The script never edits routing — copy and verify, re-route the tenant, then
+delete.
+
+> **⚠️ A hash slot is shared by every key that hashes to it.** This tool copies
+> only the rows of the tenant key(s) you name. If you move a *single* tenant and
+> then remap its slot in `autumn.toml`, every co-tenant in that slot is rerouted
+> to the destination too — but their rows were never copied, so their data
+> effectively disappears. To move one tenant, pin it with the
+> [`DirectoryShardRouter`](#custom-routing-and-whale-tenants)
+> (`database.directory_shard_router = true`) instead of remapping a slot. Only
+> remap a hash slot when you have copied **every** key in that slot.
 
 ### `autumn shard move-slot`
 
@@ -376,16 +383,18 @@ that resolves `--from` / `--to` by their configured shard names (honoring
 autumn shard move-slot --from shard0 --to shard1 \
   --table bookmarks --tenant acme
 
-# Flip acme's slot to shard1 in autumn.toml and deploy, then delete the
-# stale source rows:
+# Re-route acme to shard1 (pin it in the directory router) and deploy, then
+# delete the stale source rows:
 autumn shard move-slot --from shard0 --to shard1 \
   --table bookmarks --tenant acme --confirm
 ```
 
 It copies every column (so references to a moved row stay valid), verifies row
 counts and a `to_jsonb` content checksum on both shards, and only deletes from
-the source with `--confirm`. Like the example, it never edits the slot map.
-Requires the `psql` client on `PATH`.
+the source with `--confirm`. Like the example, it never edits routing — and the
+same hash-slot caveat applies: to move a single tenant, pin it with the
+`DirectoryShardRouter` rather than remapping a shared slot. Requires the `psql`
+client on `PATH`.
 
 ## Testing
 

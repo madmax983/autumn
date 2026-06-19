@@ -5219,19 +5219,19 @@ async fn setup_database(
     let router: Arc<dyn crate::sharding::ShardRouter> = match shard_router {
         Some(explicit) => explicit,
         None if use_directory_router => {
-            if let Some(control_primary) =
-                topology.as_ref().map(crate::db::DatabaseTopology::primary)
-            {
-                Arc::new(crate::sharding::DirectoryShardRouter::new(
-                    control_primary.clone(),
-                ))
-            } else {
-                tracing::warn!(
-                    "directory_shard_router is enabled but no control database is \
-                     configured; falling back to the hash router"
-                );
-                Arc::new(crate::sharding::HashShardRouter)
-            }
+            let control_primary = topology
+                .as_ref()
+                .map(crate::db::DatabaseTopology::primary)
+                .ok_or_else(|| {
+                    "directory_shard_router is enabled but no control database is configured. \
+                     The directory router needs a control `database.primary_url`/`url` to read \
+                     the tenant→shard directory. Set one, or disable directory routing to use \
+                     the hash router."
+                        .to_owned()
+                })?;
+            Arc::new(crate::sharding::DirectoryShardRouter::new(
+                control_primary.clone(),
+            ))
         }
         None => Arc::new(crate::sharding::HashShardRouter),
     };

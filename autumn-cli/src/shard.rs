@@ -11,11 +11,21 @@
 //!      match on both shards),
 //!   3. deletes the source rows only with `--confirm`, after verification.
 //!
-//! It **never** edits the slot map — copy and verify, cut the slot over in
-//! `autumn.toml`, then re-run with `--confirm` to delete. All columns
-//! (including the primary key) are copied, so references that point at a moved
-//! row stay valid across the move; this assumes the usual `BIGSERIAL`/explicit
-//! PKs rather than `GENERATED ALWAYS AS IDENTITY`.
+//! It **never** edits routing — copy and verify, re-route the moved tenant(s),
+//! then re-run with `--confirm` to delete. All columns (including the primary
+//! key) are copied, so references that point at a moved row stay valid across
+//! the move; this assumes the usual `BIGSERIAL`/explicit PKs rather than
+//! `GENERATED ALWAYS AS IDENTITY`.
+//!
+//! **Per-tenant moves and hash slots:** this tool copies the rows of the
+//! *specific* tenant key(s) you name. Under the default `HashShardRouter`, a
+//! slot is shared by every key that hashes to it, so remapping a slot in
+//! `autumn.toml` reroutes *all* of those co-tenants — not just the one you
+//! copied — and any co-tenant whose rows you did not move would lose data. To
+//! move a single tenant, use the `DirectoryShardRouter`
+//! (`database.directory_shard_router = true`) and pin that tenant to the
+//! destination. Only remap a hash slot when you have copied **every** key in
+//! that slot.
 //!
 //! Row movement uses `psql`'s `\copy` over a pipe (the same "shell out to the
 //! standard Postgres tool" approach `autumn migrate` takes with `diesel`).
@@ -103,9 +113,15 @@ pub fn run_move_slot(args: &MoveSlotArgs) {
     if !args.confirm {
         eprintln!(
             "\u{2713} Copy verified but source rows were KEPT (no --confirm).\n  \
-             Next: move these tenants' slot(s) to {:?} in autumn.toml and deploy,\n  \
-             then re-run with --confirm to delete the stale source rows.",
-            args.to
+             Next, route these tenant(s) to {:?}, then re-run with --confirm to\n  \
+             delete the stale source rows.\n  \
+             \u{26A0}\u{FE0F}  Routing: prefer the directory router \
+             (database.directory_shard_router = true) and pin each moved tenant\n  \
+             to {:?}. Do NOT simply remap a hash slot in autumn.toml unless you\n  \
+             copied EVERY tenant key in that slot — a slot is shared by all keys\n  \
+             that hash to it, so flipping it reroutes co-tenants you did not copy\n  \
+             and their rows would be lost.",
+            args.to, args.to
         );
         return;
     }
@@ -119,8 +135,10 @@ pub fn run_move_slot(args: &MoveSlotArgs) {
         ],
     );
     eprintln!(
-        "\u{2713} Done. Source rows removed; shard {:?} now owns these tenants.\n  \
-         Ensure the slot map in autumn.toml routes them to {:?}.",
+        "\u{2713} Done. Source rows removed; shard {:?} now owns these tenant(s).\n  \
+         Confirm routing sends them to {:?}: pin each tenant in the directory\n  \
+         router, or (hash routing only) ensure every key in the moved slot was\n  \
+         copied — a shared slot must move as a whole or co-tenants lose data.",
         args.to, args.to
     );
 }
