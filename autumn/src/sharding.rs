@@ -1728,6 +1728,21 @@ impl ShardRepositorySeed {
     }
 }
 
+/// Re-tag a fan-out sub-repo's route label with the shard executing the query.
+///
+/// Keeps per-shard DB metrics and slow-query logs attributed to the shard that
+/// actually runs the query rather than the originally-routed shard. The parent
+/// label is `"<key> shard=<orig>"` (see [`ShardRepositorySeed::from_ctx`]); this
+/// swaps the `shard=` tag for `shard_name` while preserving the base route key.
+/// Returns `None` when the parent had no label (no `MatchedPath`), so unlabelled
+/// repos stay unlabelled.
+#[must_use]
+pub fn reshard_route_label(parent: Option<&str>, shard_name: &str) -> Option<String> {
+    let parent = parent?;
+    let base = parent.rsplit_once(" shard=").map_or(parent, |(key, _)| key);
+    Some(format!("{base} shard={shard_name}"))
+}
+
 /// Tenant-routed shard connection extractor.
 ///
 /// Resolves the routing key automatically and checks out a connection to
@@ -2777,6 +2792,23 @@ mod tests {
             seed.route.as_deref(),
             Some("GET /test shard=shard0"),
             "route tagged with shard name"
+        );
+    }
+
+    #[test]
+    fn reshard_route_label_retags_with_target_shard() {
+        // Fan-out sub-repo on shard2 must report under shard2, not the
+        // originally-routed shard0, so per-shard metrics stay accurate.
+        assert_eq!(
+            reshard_route_label(Some("GET /admin shard=shard0"), "shard2").as_deref(),
+            Some("GET /admin shard=shard2"),
+        );
+        // No parent label (no MatchedPath) stays unlabelled.
+        assert_eq!(reshard_route_label(None, "shard2"), None);
+        // A label without a shard tag still gets tagged for the target shard.
+        assert_eq!(
+            reshard_route_label(Some("GET /admin"), "shard2").as_deref(),
+            Some("GET /admin shard=shard2"),
         );
     }
 

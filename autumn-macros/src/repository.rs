@@ -969,7 +969,13 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     },
                     __autumn_statement_timeout_ms: self.__autumn_statement_timeout_ms,
                     __autumn_slow_threshold: self.__autumn_slow_threshold,
-                    __autumn_route: self.__autumn_route.clone(),
+                    // Re-tag the route label with this shard so per-shard DB
+                    // metrics and slow-query logs attribute fan-out work to the
+                    // shard executing it, not the originally-routed shard.
+                    __autumn_route: ::autumn_web::sharding::reshard_route_label(
+                        self.__autumn_route.as_deref(),
+                        __shard.name(),
+                    ),
                 }
             }
         }
