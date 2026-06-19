@@ -156,14 +156,27 @@ pub fn run_move_slot(args: &MoveSlotArgs) {
         );
         return;
     }
+    delete_source_and_report(&from_url, &args, &filter, &verified_src_entries);
+}
+
+/// `--confirm` path: delete the verified source rows and report the outcome.
+/// Fails (non-zero exit) if any moved-tenant rows remain on the source — the
+/// fingerprint-guarded delete preserves rows changed/added during the cutover
+/// window, and the source must not be treated as emptied while they linger.
+fn delete_source_and_report(from_url: &str, args: &MoveSlotArgs, filter: &str, entries: &[String]) {
     eprintln!("\u{2192} Deleting rows from source (--confirm)\u{2026}");
-    delete_source_rows_by_id(
-        &from_url,
-        &args.table,
-        &args.id_column,
-        &filter,
-        &verified_src_entries,
-    );
+    let remaining =
+        delete_source_rows_by_id(from_url, &args.table, &args.id_column, filter, entries);
+    if remaining != "0" {
+        fail(&format!(
+            "{remaining} moved-tenant row(s) still remain on source shard {:?} after delete.\n  \
+             These changed during the cutover window (or were written after the snapshot) and\n  \
+             were preserved to avoid losing uncopied data. Route the affected tenant(s) to {:?},\n  \
+             then re-run this move with --confirm to copy and remove the stragglers. Do NOT\n  \
+             decommission the source shard until this reports 0 rows remaining.",
+            args.from, args.to
+        ));
+    }
     eprintln!(
         "\u{2713} Done. Source rows removed; shard {:?} now owns these tenant(s).\n  \
          Confirm routing sends them to {:?}: pin each tenant in the directory\n  \
@@ -185,18 +198,23 @@ pub fn run_move_slot(args: &MoveSlotArgs) {
 /// preserved: the delete matches on the live row's reconstructed `md5(row)|id`,
 /// which no longer equals the staged entry once its content changed — so its
 /// uncopied new contents are never dropped.
+///
+/// Returns the number of moved-tenant rows still on the source after the delete
+/// (as the raw `count(*)` string): `"0"` means the source is clean, anything else
+/// means rows were intentionally preserved and the source must not yet be treated
+/// as emptied.
 fn delete_source_rows_by_id(
     from_url: &str,
     table: &str,
     id_column: &str,
     filter: &str,
     entries: &[String],
-) {
+) -> String {
     use std::io::Write as _;
 
     if entries.is_empty() {
         eprintln!("  No verified source rows for these tenant(s); nothing deleted.");
-        return;
+        return psql_scalar(from_url, &count_sql(table, filter));
     }
     // Stream the snapshot entries into a temp table over stdin and delete by
     // joining against it, all in one transaction. This avoids building one giant
@@ -236,6 +254,14 @@ fn delete_source_rows_by_id(
     if !status.success() {
         fail("source delete failed (see psql output above).");
     }
+
+    // The fingerprint-guarded delete intentionally preserves any moved-tenant row
+    // that changed in the cutover window (its current md5 no longer matches the
+    // staged entry) or was inserted after the snapshot. Re-count what remains so
+    // the caller never reports a clean "source removed" while live moved-tenant
+    // rows still sit on the source — which would let an operator decommission it
+    // and lose those rows.
+    psql_scalar(from_url, &count_sql(table, filter))
 }
 
 /// Resolve `--from` / `--to` shard names to their primary URLs through the same

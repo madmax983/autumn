@@ -1104,9 +1104,22 @@ fn run_down(
     // control DB (or an earlier shard) has already been rolled back — which
     // would leave control and shards at different schema versions. Each target
     // re-validates under its own lock in run_down_target as well.
-    for (label, url) in &targets {
-        preflight_rollback_target(args, url, dir, label);
-    }
+    let plans: Vec<(String, Vec<String>)> = targets
+        .iter()
+        .map(|(label, url)| {
+            (
+                label.clone(),
+                preflight_rollback_target(args, url, dir, label),
+            )
+        })
+        .collect();
+
+    // A multi-target `down` must revert the SAME version list on every target.
+    // If they diverge (e.g. a shard lagged behind control after a partial
+    // migrate), refuse rather than roll back different versions per target.
+    // Scoping with --shard / --control-only resolves to a single target, so this
+    // never blocks an intentional single-target rollback.
+    reject_divergent_rollback_plans(&plans);
 
     // Targets are reverted in order; each plans + executes under its own
     // advisory lock. To roll a single database back in isolation, scope the
@@ -1200,8 +1213,14 @@ fn check_rollback_plan_revertable(applied: &[AppliedUserMigration], plan: &[Stri
 
 /// Up-front (read-only, no lock) preflight of one target's rollback plan, run
 /// for every target before any is mutated. Exits on a plan that cannot be
-/// reverted, naming the target.
-fn preflight_rollback_target(args: &DownArgs, database_url: &str, dir: &Path, label: &str) {
+/// reverted, naming the target. Returns the planned version list so the caller
+/// can compare plans across targets before mutating any of them.
+fn preflight_rollback_target(
+    args: &DownArgs,
+    database_url: &str,
+    dir: &Path,
+    label: &str,
+) -> Vec<String> {
     use autumn_web::migrate::applied_user_migrations;
 
     let applied = applied_user_migrations(database_url, dir).unwrap_or_else(|e| {
@@ -1210,6 +1229,52 @@ fn preflight_rollback_target(args: &DownArgs, database_url: &str, dir: &Path, la
     });
     let plan = build_rollback_plan(args, &applied);
     check_rollback_plan_revertable(&applied, &plan);
+    plan
+}
+
+/// Whether the targets' rollback plans diverge — i.e. not every target would
+/// revert the exact same ordered version list. Plans are computed from each
+/// target's own applied history, so divergence means a `down` would revert
+/// different versions per target.
+fn rollback_plans_diverge(plans: &[(String, Vec<String>)]) -> bool {
+    match plans.first() {
+        Some((_, first)) => plans.iter().any(|(_, plan)| plan != first),
+        None => false,
+    }
+}
+
+/// Refuse a multi-target rollback when the targets' plans diverge.
+///
+/// `down` computes each target's plan from that target's own applied history, so
+/// if a previous multi-target `migrate` failed partway (leaving, say, control at
+/// `A+B` but a shard at only `A`), a `--steps`/`--to` rollback would revert
+/// different versions per target — e.g. `B` on control but `A` on a lagging shard
+/// — leaving the fleet at mismatched schemas or dropping a still-needed
+/// migration's objects from a shard. Require the operator to reconcile and scope
+/// the command (`--shard`/`--control-only`) rather than diverge further.
+fn reject_divergent_rollback_plans(plans: &[(String, Vec<String>)]) {
+    if !rollback_plans_diverge(plans) {
+        return;
+    }
+    eprintln!("\u{2717} Refusing to roll back: target rollback plans diverge.");
+    eprintln!(
+        "  Each target's plan is computed from its own applied history, and they differ \u{2014}\n  \
+         likely because a previous multi-target migrate failed partway. Rolling back now\n  \
+         would leave targets at different schema versions (or drop a migration's objects\n  \
+         from a lagging target while keeping them on others)."
+    );
+    for (label, plan) in plans {
+        if plan.is_empty() {
+            eprintln!("    \u{2022} {label}: nothing to roll back");
+        } else {
+            eprintln!("    \u{2022} {label}: {}", plan.join(", "));
+        }
+    }
+    eprintln!(
+        "  Reconcile the targets first (`autumn migrate status` per target), then re-run\n  \
+         scoped with --shard <name> or --control-only to roll back one target at a time."
+    );
+    std::process::exit(1);
 }
 
 /// Roll back the planned user migrations on a single target database, under the
@@ -1843,6 +1908,42 @@ mod tests {
             name: format!("{version}_m"),
             dir: Some(std::path::PathBuf::from(format!("migrations/{version}_m"))),
         }
+    }
+
+    #[test]
+    fn rollback_plans_diverge_detects_mismatched_targets() {
+        let plan = |label: &str, versions: &[&str]| {
+            (
+                label.to_owned(),
+                versions.iter().map(|v| (*v).to_owned()).collect::<Vec<_>>(),
+            )
+        };
+
+        // Identical plans across targets: a healthy uniform rollback.
+        assert!(!rollback_plans_diverge(&[
+            plan("control", &["20260102000000"]),
+            plan("shard:s0", &["20260102000000"]),
+        ]));
+
+        // A lagging shard whose newest applied differs reverts a different
+        // version — must be flagged.
+        assert!(rollback_plans_diverge(&[
+            plan("control", &["20260102000000"]),
+            plan("shard:s0", &["20260101000000"]),
+        ]));
+
+        // A target that has nothing to roll back while others do also diverges.
+        assert!(rollback_plans_diverge(&[
+            plan("control", &["20260102000000"]),
+            plan("shard:s0", &[]),
+        ]));
+
+        // A single target (scoped with --shard / --control-only) never diverges.
+        assert!(!rollback_plans_diverge(&[plan(
+            "shard:s0",
+            &["20260102000000"]
+        )]));
+        assert!(!rollback_plans_diverge(&[]));
     }
 
     #[test]
