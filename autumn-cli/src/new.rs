@@ -34,6 +34,10 @@ pub enum NewError {
     #[error("directory '{0}' already exists")]
     AlreadyExists(String),
 
+    /// The requested option combination is not supported.
+    #[error("incompatible options: {0}")]
+    IncompatibleOptions(String),
+
     /// Filesystem error during project creation.
     #[error("failed to create project: {0}")]
     Io(#[from] std::io::Error),
@@ -85,6 +89,18 @@ pub fn generate(name: &str, parent_dir: &Path) -> Result<(), NewError> {
 /// Generate a new Autumn project under `parent_dir/name`, honouring `opts`.
 pub fn generate_with(name: &str, parent_dir: &Path, opts: GenerateOptions) -> Result<(), NewError> {
     validate_name(name)?;
+
+    // The DB-free daemon starter builds with no database, so a seed binary
+    // (which needs `autumn_web::seed::SeedContext` and the `db` feature) cannot
+    // compile. Reject the combination rather than scaffolding a broken project.
+    if opts.with_daemon && !opts.with_bundled_pg && opts.with_seed {
+        return Err(NewError::IncompatibleOptions(
+            "--daemon scaffolds a database-free app, so --with-seed is not \
+             supported (seeding requires a database; use --bundled-pg for a \
+             daemon with a managed Postgres)"
+                .to_owned(),
+        ));
+    }
 
     let project_dir = parent_dir.join(name);
     if project_dir.exists() {
@@ -691,6 +707,24 @@ mod tests {
     }
 
     #[test]
+    fn daemon_with_seed_is_rejected() {
+        let tmp = TempDir::new().unwrap();
+        let err = generate_with(
+            "daemon-seed-app",
+            tmp.path(),
+            GenerateOptions {
+                with_daemon: true,
+                with_seed: true,
+                ..GenerateOptions::default()
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, NewError::IncompatibleOptions(_)));
+        // Nothing should be scaffolded on rejection.
+        assert!(!tmp.path().join("daemon-seed-app").exists());
+    }
+
+    #[test]
     fn daemon_starter_omits_db_feature() {
         let tmp = TempDir::new().unwrap();
         generate_with("daemon-app", tmp.path(), daemon_opts()).unwrap();
@@ -699,7 +733,10 @@ mod tests {
             cargo.contains("default-features = false"),
             "daemon starter must disable default features (drop db): {cargo}"
         );
-        assert!(!cargo.contains("\"db\""), "daemon starter must not enable db");
+        assert!(
+            !cargo.contains("\"db\""),
+            "daemon starter must not enable db"
+        );
         assert!(
             !cargo.contains("diesel_migrations"),
             "daemon starter must not depend on diesel_migrations"
@@ -711,7 +748,10 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         generate_with("daemon-main-app", tmp.path(), daemon_opts()).unwrap();
         let main = fs::read_to_string(tmp.path().join("daemon-main-app/src/main.rs")).unwrap();
-        assert!(!main.contains(".migrations("), "daemon main must not call .migrations()");
+        assert!(
+            !main.contains(".migrations("),
+            "daemon main must not call .migrations()"
+        );
         assert!(
             !main.contains("embed_migrations"),
             "daemon main must not embed migrations"

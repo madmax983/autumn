@@ -101,8 +101,14 @@ pub fn acquire_pidfile(path: &Path, pid: u32) -> Result<(), AcquireError> {
                         return Err(AcquireError::AlreadyRunning(existing));
                     }
                     // Stale or unparseable: reclaim and retry the exclusive create.
+                    // A concurrent deletion (NotFound) is fine — the next
+                    // iteration's `create_new` will win.
                     PidState::Stale | PidState::Free if attempt == 0 => {
-                        std::fs::remove_file(path).map_err(AcquireError::Io)?;
+                        if let Err(err) = std::fs::remove_file(path)
+                            && err.kind() != std::io::ErrorKind::NotFound
+                        {
+                            return Err(AcquireError::Io(err));
+                        }
                     }
                     _ => return Err(AcquireError::Io(e)),
                 }
@@ -158,8 +164,11 @@ pub fn is_process_alive(_pid: u32) -> bool {
 pub fn signal_terminate(pid: u32) -> std::io::Result<()> {
     let p = validate_pid_for_kill(pid)
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid pid"))?;
-    nix::sys::signal::kill(nix::unistd::Pid::from_raw(p), nix::sys::signal::Signal::SIGTERM)
-        .map_err(|e| std::io::Error::other(e.to_string()))
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(p),
+        nix::sys::signal::Signal::SIGTERM,
+    )
+    .map_err(|e| std::io::Error::other(e.to_string()))
 }
 
 /// Force-kill `pid` with `SIGKILL`.

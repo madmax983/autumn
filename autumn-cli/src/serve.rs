@@ -41,8 +41,15 @@ pub struct ServeOptions {
 
 /// How long to wait for a freshly-spawned daemon to become reachable.
 const READY_TIMEOUT: Duration = Duration::from_secs(30);
-/// How long to wait for a graceful stop before force-killing.
-const STOP_TIMEOUT: Duration = Duration::from_secs(35);
+/// Readiness budget when managed Postgres must provision on first boot
+/// (download/extract + `initdb` can take well over the default before the app
+/// binds its socket).
+const READY_TIMEOUT_MANAGED_PG: Duration = Duration::from_secs(300);
+/// Extra seconds added to the app's configured shutdown budget before a
+/// graceful `stop` escalates to `SIGKILL`.
+const STOP_GRACE_BUFFER: Duration = Duration::from_secs(5);
+/// Fallback stop budget when the app's shutdown config can't be read.
+const DEFAULT_STOP_TIMEOUT: Duration = Duration::from_secs(40);
 
 /// Contents of the address-discovery file (`serve.addr`): how a client reaches
 /// the running daemon. Serialized as TOML.
@@ -85,7 +92,13 @@ pub fn run(action: Option<ServeAction>, opts: &ServeOptions) {
         Some(ServeAction::Status) => status(opts),
         Some(ServeAction::Restart) => {
             let _ = stop(opts);
-            start(opts)
+            // `restart` is a daemon-lifecycle command: always relaunch in the
+            // background, even if `--daemon` wasn't repeated on the command line.
+            let daemon_opts = ServeOptions {
+                daemon: true,
+                ..opts.clone()
+            };
+            start(&daemon_opts)
         }
     };
     std::process::exit(code);
@@ -100,25 +113,47 @@ fn resolve_paths(package: Option<&str>) -> RuntimePaths {
     })
 }
 
-/// Derive a stable project identity for namespacing runtime dirs: the explicit
-/// package, else the current crate's `[package].name`, else the cwd dir name.
+/// Derive a stable project identity for namespacing runtime dirs.
+///
+/// The base name is the explicit package, else the current crate's
+/// `[package].name`, else the cwd dir name. A short hash of the absolute
+/// project directory is appended so two unrelated checkouts that share a
+/// package name (e.g. two clones both named `api`) never collide on the same
+/// pidfile / socket / managed-Postgres data dir.
 fn project_identity(package: Option<&str>) -> String {
-    if let Some(pkg) = package {
-        return pkg.to_owned();
-    }
-    if let Ok(contents) = std::fs::read_to_string("Cargo.toml")
-        && let Ok(table) = toml::from_str::<toml::Table>(&contents)
-        && let Some(name) = table
-            .get("package")
-            .and_then(|p| p.get("name"))
-            .and_then(toml::Value::as_str)
-    {
-        return name.to_owned();
-    }
-    std::env::current_dir()
-        .ok()
-        .and_then(|d| d.file_name().map(|n| n.to_string_lossy().into_owned()))
-        .unwrap_or_else(|| "autumn-app".to_owned())
+    let name = package
+        .map(ToOwned::to_owned)
+        .or_else(read_package_name)
+        .unwrap_or_else(|| {
+            std::env::current_dir()
+                .ok()
+                .and_then(|d| d.file_name().map(|n| n.to_string_lossy().into_owned()))
+                .unwrap_or_else(|| "autumn-app".to_owned())
+        });
+    format!("{name}-{}", project_dir_hash())
+}
+
+/// Read `[package].name` from the `Cargo.toml` in the current directory.
+fn read_package_name() -> Option<String> {
+    let contents = std::fs::read_to_string("Cargo.toml").ok()?;
+    let table = toml::from_str::<toml::Table>(&contents).ok()?;
+    table
+        .get("package")
+        .and_then(|p| p.get("name"))
+        .and_then(toml::Value::as_str)
+        .map(ToOwned::to_owned)
+}
+
+/// A short, stable hash of the absolute project directory, distinguishing
+/// same-named projects in different locations.
+fn project_dir_hash() -> String {
+    use std::hash::{Hash, Hasher};
+    let dir = std::env::current_dir()
+        .and_then(std::fs::canonicalize)
+        .unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    dir.hash(&mut hasher);
+    format!("{:08x}", hasher.finish() & 0xffff_ffff)
 }
 
 /// Build, then start the server (foreground or daemon). Returns the exit code.
@@ -158,6 +193,9 @@ fn start(opts: &ServeOptions) -> i32 {
 /// (for managed-Postgres apps) point the bundled cluster at a persistent dir.
 fn base_command(binary: &Path, paths: &RuntimePaths, opts: &ServeOptions) -> Command {
     let mut cmd = Command::new(binary);
+    // Unix-socket binding is Unix-only; on other platforms the app rejects the
+    // setting and exits, so leave it unset there (the app binds TCP instead).
+    #[cfg(unix)]
     cmd.env("AUTUMN_SERVER__UNIX_SOCKET", paths.socket_file());
     if opts.bundled_pg {
         cmd.env("AUTUMN_MANAGED_PG_DATA_DIR", paths.pg_data_dir());
@@ -194,7 +232,10 @@ fn run_foreground(binary: &Path, paths: &RuntimePaths, opts: &ServeOptions) -> i
 
     let status = child.wait();
     cleanup(paths, &socket);
-    status.ok().and_then(|s| s.code()).unwrap_or(0)
+    // Propagate the child's exit code. A signal death (`code()` is `None`) or a
+    // failed `wait` is an abnormal exit, so report non-zero — supervisors and
+    // scripts must not see a crash as success.
+    status.map_or(1, |s| s.code().unwrap_or(1))
 }
 
 /// Spawn the server detached into the background and supervise readiness.
@@ -204,7 +245,10 @@ fn spawn_daemon(binary: &Path, paths: &RuntimePaths, opts: &ServeOptions) -> i32
     let log = match std::fs::File::create(&log_path) {
         Ok(f) => f,
         Err(e) => {
-            eprintln!("autumn serve: cannot open log file {}: {e}", log_path.display());
+            eprintln!(
+                "autumn serve: cannot open log file {}: {e}",
+                log_path.display()
+            );
             return 1;
         }
     };
@@ -222,7 +266,7 @@ fn spawn_daemon(binary: &Path, paths: &RuntimePaths, opts: &ServeOptions) -> i32
         .stderr(log_err);
     detach(&mut cmd);
 
-    let child = match cmd.spawn() {
+    let mut child = match cmd.spawn() {
         Ok(child) => child,
         Err(e) => {
             eprintln!("\u{2717} Failed to start daemon: {e}");
@@ -230,29 +274,39 @@ fn spawn_daemon(binary: &Path, paths: &RuntimePaths, opts: &ServeOptions) -> i32
         }
     };
     let pid = child.id();
-    // Drop the handle without waiting; on Unix the detached child keeps running
-    // and is reparented to init when this supervisor exits.
-    drop(child);
 
     match process::acquire_pidfile(&paths.pid_file(), pid) {
         Ok(()) => {}
         Err(AcquireError::AlreadyRunning(existing)) => {
             eprintln!("autumn serve: already running (pid {existing}).");
-            process::stop_pid(pid, Duration::from_secs(5));
+            let _ = child.kill();
+            let _ = child.wait();
             return 1;
         }
         Err(AcquireError::Io(e)) => {
             eprintln!("autumn serve: cannot write pidfile: {e}");
-            process::stop_pid(pid, Duration::from_secs(5));
+            let _ = child.kill();
+            let _ = child.wait();
             return 1;
         }
     }
 
-    if wait_for_ready(&socket, pid, READY_TIMEOUT) {
+    let ready_timeout = if opts.bundled_pg {
+        READY_TIMEOUT_MANAGED_PG
+    } else {
+        READY_TIMEOUT
+    };
+    if wait_for_ready(&socket, &mut child, ready_timeout) {
         write_addr_file(paths, pid, &socket, opts.bundled_pg);
-        println!("autumn serve: started (pid {pid}) on unix:{}", socket.display());
+        println!(
+            "autumn serve: started (pid {pid}) on unix:{}",
+            socket.display()
+        );
         println!("  address file: {}", paths.addr_file().display());
         println!("  logs: {}", log_path.display());
+        // Detach: leave the running child to be reparented to init on exit.
+        // (Dropping the handle does not signal or reap the live process.)
+        drop(child);
         0
     } else {
         eprintln!(
@@ -260,7 +314,8 @@ fn spawn_daemon(binary: &Path, paths: &RuntimePaths, opts: &ServeOptions) -> i32
             READY_TIMEOUT.as_secs(),
             log_path.display()
         );
-        process::stop_pid(pid, Duration::from_secs(5));
+        let _ = child.kill();
+        let _ = child.wait();
         cleanup(paths, &socket);
         1
     }
@@ -313,16 +368,29 @@ fn detach(cmd: &mut Command) {
 #[cfg(not(any(unix, windows)))]
 fn detach(_cmd: &mut Command) {}
 
-/// Poll until the socket appears (daemon is reachable) or the process dies /
-/// the timeout elapses.
-fn wait_for_ready(socket: &Path, pid: u32, timeout: Duration) -> bool {
+/// Poll until the daemon is actually accepting connections on `socket`, or the
+/// child exits/crashes, or the timeout elapses.
+///
+/// We probe with an actual `UnixStream::connect` rather than checking path
+/// existence: a stale socket left by a crashed previous daemon exists on disk
+/// but refuses connections, so existence alone would report a false ready.
+/// `child.try_wait()` detects a child that died during startup (a zombie keeps
+/// `kill(pid, 0)` alive, which would otherwise hang the full timeout).
+fn wait_for_ready(socket: &Path, child: &mut std::process::Child, timeout: Duration) -> bool {
     let start = std::time::Instant::now();
     loop {
+        #[cfg(unix)]
+        if std::os::unix::net::UnixStream::connect(socket).is_ok() {
+            return true;
+        }
+        #[cfg(not(unix))]
         if socket.exists() {
             return true;
         }
-        if !process::is_process_alive(pid) {
-            return false;
+        match child.try_wait() {
+            // Child exited/crashed before binding — fail fast.
+            Ok(Some(_)) | Err(_) => return false,
+            Ok(None) => {}
         }
         if start.elapsed() >= timeout {
             return false;
@@ -369,10 +437,40 @@ fn stop(opts: &ServeOptions) -> i32 {
         return 0;
     }
 
-    process::stop_pid(pid, STOP_TIMEOUT);
+    process::stop_pid(pid, stop_timeout());
     cleanup(&paths, &socket);
     println!("autumn serve: stopped");
     0
+}
+
+/// Graceful-stop budget before escalating to `SIGKILL`, derived from the app's
+/// own `[server]` shutdown config (`prestop_grace_secs` plus
+/// `shutdown_timeout_secs` plus a small buffer) so we never cut off a drain the
+/// server is configured to allow. Falls back to a sane default when
+/// `autumn.toml` is absent or unreadable.
+fn stop_timeout() -> Duration {
+    #[derive(serde::Deserialize)]
+    struct ServerSlice {
+        prestop_grace_secs: Option<u64>,
+        shutdown_timeout_secs: Option<u64>,
+    }
+    #[derive(serde::Deserialize)]
+    struct TomlSlice {
+        server: Option<ServerSlice>,
+    }
+    let Ok(contents) = std::fs::read_to_string("autumn.toml") else {
+        return DEFAULT_STOP_TIMEOUT;
+    };
+    let Ok(slice) = toml::from_str::<TomlSlice>(&contents) else {
+        return DEFAULT_STOP_TIMEOUT;
+    };
+    let server = slice.server.unwrap_or(ServerSlice {
+        prestop_grace_secs: None,
+        shutdown_timeout_secs: None,
+    });
+    let budget =
+        server.prestop_grace_secs.unwrap_or(5) + server.shutdown_timeout_secs.unwrap_or(30);
+    Duration::from_secs(budget) + STOP_GRACE_BUFFER
 }
 
 /// Report daemon status. Exit code 0 = running, 3 = stopped.
@@ -386,10 +484,7 @@ fn status(opts: &ServeOptions) -> i32 {
         let address = std::fs::read_to_string(paths.addr_file())
             .ok()
             .and_then(|s| AddrFile::parse(&s).ok())
-            .map_or_else(
-                || paths.socket_file().display().to_string(),
-                |a| a.address,
-            );
+            .map_or_else(|| paths.socket_file().display().to_string(), |a| a.address);
         println!("autumn serve: running (pid {pid}) on unix:{address}");
         0
     } else {
@@ -447,6 +542,10 @@ mod tests {
 
     #[test]
     fn project_identity_prefers_explicit_package() {
-        assert_eq!(project_identity(Some("my-svc")), "my-svc");
+        let id = project_identity(Some("my-svc"));
+        // Base name from the explicit package, plus a project-dir hash suffix
+        // so unrelated checkouts with the same package name don't collide.
+        assert!(id.starts_with("my-svc-"), "got {id}");
+        assert!(id.len() > "my-svc-".len());
     }
 }

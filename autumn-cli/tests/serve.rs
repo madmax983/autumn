@@ -17,8 +17,7 @@ use std::time::Duration;
 
 fn patch_generated_cargo_toml(project_dir: &Path) {
     let cargo_toml_path = project_dir.join("Cargo.toml");
-    let mut content =
-        std::fs::read_to_string(&cargo_toml_path).expect("read generated Cargo.toml");
+    let mut content = std::fs::read_to_string(&cargo_toml_path).expect("read generated Cargo.toml");
     let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("workspace root");
@@ -78,9 +77,17 @@ fn serve_daemon_start_status_stop_over_unix_socket() {
         String::from_utf8_lossy(&out.stderr),
     );
 
-    let socket = runtime.path().join("svc").join("serve.sock");
-    let pidfile = runtime.path().join("svc").join("serve.pid");
-    let addrfile = runtime.path().join("svc").join("serve.addr");
+    // The runtime subdir is namespaced as `<project>-<dir-hash>`; discover it
+    // rather than hard-coding the hash.
+    let proj_dir = std::fs::read_dir(runtime.path())
+        .expect("read runtime dir")
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .find(|p| p.is_dir())
+        .expect("a project runtime dir under AUTUMN_RUNTIME_DIR");
+    let socket = proj_dir.join("serve.sock");
+    let pidfile = proj_dir.join("serve.pid");
+    let addrfile = proj_dir.join("serve.addr");
     assert!(socket.exists(), "socket should exist after start");
     assert!(pidfile.exists(), "pidfile should exist after start");
     assert!(addrfile.exists(), "address file should exist after start");

@@ -4744,12 +4744,12 @@ enum BoundListener {
 struct UdsConnectInfo;
 
 #[cfg(unix)]
-impl axum::extract::connect_info::Connected<axum::serve::IncomingStream<'_, tokio::net::UnixListener>>
-    for UdsConnectInfo
+impl
+    axum::extract::connect_info::Connected<
+        axum::serve::IncomingStream<'_, tokio::net::UnixListener>,
+    > for UdsConnectInfo
 {
-    fn connect_info(
-        _stream: axum::serve::IncomingStream<'_, tokio::net::UnixListener>,
-    ) -> Self {
+    fn connect_info(_stream: axum::serve::IncomingStream<'_, tokio::net::UnixListener>) -> Self {
         Self
     }
 }

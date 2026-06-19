@@ -20,10 +20,10 @@ mod new;
 mod paths;
 mod plugin_check;
 mod process;
-mod serve;
 mod release;
 mod routes;
 mod seed;
+mod serve;
 mod setup;
 mod task;
 mod token;
@@ -2292,8 +2292,7 @@ mod tests {
 
     #[test]
     fn serve_parses_bundled_pg_and_release() {
-        let cli =
-            Cli::try_parse_from(["autumn", "serve", "--bundled-pg", "--release"]).unwrap();
+        let cli = Cli::try_parse_from(["autumn", "serve", "--bundled-pg", "--release"]).unwrap();
         match cli.command {
             Commands::Serve {
                 bundled_pg,

@@ -6009,7 +6009,10 @@ path = "/healthz"
             "#,
         )
         .expect("config with server.unix_socket should parse");
-        assert_eq!(config.server.unix_socket.as_deref(), Some("/tmp/autumn.sock"));
+        assert_eq!(
+            config.server.unix_socket.as_deref(),
+            Some("/tmp/autumn.sock")
+        );
     }
 
     // ── Log env override tests ───────────────────────────────────

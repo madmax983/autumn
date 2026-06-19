@@ -91,6 +91,15 @@ impl ManagedPostgresPoolProvider {
 
     /// Provision (if needed) and start the cluster, returning its connection URL.
     async fn ensure_running(&self) -> Result<String, postgresql_embedded::Error> {
+        // Already started (e.g. a second pool, or repeated calls): reuse the
+        // running instance instead of trying to start a second server on the
+        // same — now locked — data dir.
+        if let Ok(guard) = self.instance.lock()
+            && let Some(pg) = guard.as_ref()
+        {
+            return Ok(pg.settings().url(MANAGED_DB_NAME));
+        }
+
         let mut settings = Settings::new();
         settings.data_dir.clone_from(&self.data_dir);
         settings.version = self.version.clone();
@@ -118,11 +127,7 @@ impl ManagedPostgresPoolProvider {
     /// Stop the supervised Postgres child. Wire this to the daemon's
     /// `on_shutdown` so the cluster shuts down with the app.
     pub async fn stop(&self) {
-        let taken = self
-            .instance
-            .lock()
-            .ok()
-            .and_then(|mut guard| guard.take());
+        let taken = self.instance.lock().ok().and_then(|mut guard| guard.take());
         if let Some(pg) = taken
             && let Err(e) = pg.stop().await
         {
@@ -168,6 +173,11 @@ fn default_data_dir() -> PathBuf {
     }
     if let Some(home) = std::env::var_os("HOME") {
         return PathBuf::from(home).join(".local/share/autumn/pg");
+    }
+    // Windows (where HOME is usually unset): use a persistent app-data dir
+    // rather than the volatile temp dir, which is cleared on reboot.
+    if let Some(local_appdata) = std::env::var_os("LOCALAPPDATA") {
+        return PathBuf::from(local_appdata).join("autumn").join("pg");
     }
     std::env::temp_dir().join("autumn").join("pg")
 }
