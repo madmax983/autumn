@@ -2016,17 +2016,17 @@ mod tests {
 
     #[tokio::test]
     async fn hash_and_verify_password() {
-        let hash = hash_password("test_password").await.unwrap();
+        let hash = hash_password("test_password").await.expect("should not fail");
         assert!(hash.starts_with("$2b$"));
-        assert!(verify_password("test_password", &hash).await.unwrap());
-        assert!(!verify_password("wrong_password", &hash).await.unwrap());
+        assert!(verify_password("test_password", &hash).await.expect("should not fail"));
+        assert!(!verify_password("wrong_password", &hash).await.expect("should not fail"));
     }
 
     #[tokio::test]
     async fn verify_invalid_hash_returns_false() {
         let result = verify_password("test", "not-a-valid-hash").await;
         assert!(result.is_ok());
-        assert!(!result.unwrap());
+        assert!(!result.expect("should not fail"));
     }
 
     #[tokio::test]
@@ -2034,19 +2034,19 @@ mod tests {
         // Test short hash
         let result = verify_password("test", "short").await;
         assert!(result.is_ok());
-        assert!(!result.unwrap());
+        assert!(!result.expect("should not fail"));
 
         // Test hash with correct length but not starting with $
         let bad_prefix = "a".repeat(60);
         let result = verify_password("test", &bad_prefix).await;
         assert!(result.is_ok());
-        assert!(!result.unwrap());
+        assert!(!result.expect("should not fail"));
 
         // Test hash with incorrect length but starting with $
         let bad_length = "$2b$12$short";
         let result = verify_password("test", bad_length).await;
         assert!(result.is_ok());
-        assert!(!result.unwrap());
+        assert!(!result.expect("should not fail"));
     }
 
     #[test]
@@ -2095,8 +2095,8 @@ mod tests {
             redirect_uri = "http://localhost:3000/auth/github/callback"
             "#,
         )
-        .unwrap();
-        let provider = cfg.auth.oauth2.providers.get("github").unwrap();
+        .expect("should not fail");
+        let provider = cfg.auth.oauth2.providers.get("github").expect("should not fail");
         assert_eq!(provider.client_id, "cid");
         assert_eq!(provider.scope, "");
         assert!(provider.issuer.is_none());
@@ -2121,7 +2121,7 @@ mod tests {
         };
         let url = oauth2_authorize_url(&session, "github", &provider)
             .await
-            .unwrap();
+            .expect("should not fail");
         assert!(url.contains("response_type=code"));
         assert!(session.get("oauth2:github:state").await.is_some());
         assert!(session.get("oauth2:github:nonce").await.is_some());
@@ -2145,7 +2145,7 @@ mod tests {
         };
         let url = oauth2_authorize_url(&session, "github", &provider)
             .await
-            .unwrap();
+            .expect("should not fail");
         assert!(!url.contains("scope="));
     }
 
@@ -2177,7 +2177,7 @@ mod tests {
             Some("application/x-www-form-urlencoded"),
             "access_token=abc123&token_type=bearer&id_token=xyz789&extra_field=ignored",
         )
-        .unwrap();
+        .expect("should not fail");
         assert_eq!(token.access_token, "abc123");
         assert_eq!(token.token_type.as_deref(), Some("bearer"));
         assert_eq!(token.id_token.as_deref(), Some("xyz789"));
@@ -2198,7 +2198,7 @@ mod tests {
     #[test]
     fn extract_subject_allows_userinfo_id_fallback() {
         let claims = serde_json::json!({ "id": 42 });
-        let subject = extract_subject(&claims, IdentitySource::UserInfo).unwrap();
+        let subject = extract_subject(&claims, IdentitySource::UserInfo).expect("should not fail");
         assert_eq!(subject, "42");
     }
 
@@ -2319,10 +2319,10 @@ mod tests {
                 http::Request::builder()
                     .uri("/")
                     .body(Body::empty())
-                    .unwrap(),
+                    .expect("should not fail"),
             )
             .await
-            .unwrap();
+            .expect("should not fail");
 
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
@@ -2396,16 +2396,16 @@ mod tests {
                 http::Request::builder()
                     .uri("/")
                     .body(Body::empty())
-                    .unwrap(),
+                    .expect("should not fail"),
             )
             .await
-            .unwrap();
+            .expect("should not fail");
 
         assert_eq!(response.status(), StatusCode::OK);
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
-            .unwrap();
-        assert_eq!(std::str::from_utf8(&body).unwrap(), "alice");
+            .expect("should not fail");
+        assert_eq!(std::str::from_utf8(&body).expect("should not fail"), "alice");
     }
 
     #[tokio::test]
@@ -2466,10 +2466,10 @@ mod tests {
                 http::Request::builder()
                     .uri("/protected")
                     .body(Body::empty())
-                    .unwrap(),
+                    .expect("should not fail"),
             )
             .await
-            .unwrap();
+            .expect("should not fail");
 
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
@@ -2595,10 +2595,10 @@ mod tests {
                 http::Request::builder()
                     .uri("/")
                     .body(Body::empty())
-                    .unwrap(),
+                    .expect("should not fail"),
             )
             .await
-            .unwrap();
+            .expect("should not fail");
 
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
@@ -2626,7 +2626,7 @@ mod tests {
                 std::collections::HashMap::from([("user_id".into(), "42".into())]),
             )
             .await
-            .unwrap();
+            .expect("should not fail");
 
         let state = AppState {
             extensions: std::sync::Arc::new(std::sync::RwLock::new(
@@ -2673,16 +2673,16 @@ mod tests {
                     .uri("/")
                     .header(COOKIE, "autumn.sid=sess1")
                     .body(Body::empty())
-                    .unwrap(),
+                    .expect("should not fail"),
             )
             .await
-            .unwrap();
+            .expect("should not fail");
 
         assert_eq!(response.status(), StatusCode::OK);
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
-            .unwrap();
-        assert_eq!(std::str::from_utf8(&body).unwrap(), "secret");
+            .expect("should not fail");
+        assert_eq!(std::str::from_utf8(&body).expect("should not fail"), "secret");
     }
 
     #[tokio::test]
@@ -2711,7 +2711,7 @@ mod tests {
                 ]),
             )
             .await
-            .unwrap();
+            .expect("should not fail");
 
         let state = AppState {
             extensions: std::sync::Arc::new(std::sync::RwLock::new(
@@ -2758,16 +2758,16 @@ mod tests {
                     .uri("/account")
                     .header(COOKIE, "autumn.sid=sess1")
                     .body(Body::empty())
-                    .unwrap(),
+                    .expect("should not fail"),
             )
             .await
-            .unwrap();
+            .expect("should not fail");
 
         assert_eq!(response.status(), StatusCode::OK);
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
-            .unwrap();
-        assert_eq!(std::str::from_utf8(&body).unwrap(), "account");
+            .expect("should not fail");
+        assert_eq!(std::str::from_utf8(&body).expect("should not fail"), "account");
     }
 
     #[tokio::test]
@@ -2796,7 +2796,7 @@ mod tests {
                 ]),
             )
             .await
-            .unwrap();
+            .expect("should not fail");
 
         let state = AppState {
             extensions: std::sync::Arc::new(std::sync::RwLock::new(
@@ -2843,10 +2843,10 @@ mod tests {
                     .uri("/")
                     .header(COOKIE, "autumn.sid=sess1")
                     .body(Body::empty())
-                    .unwrap(),
+                    .expect("should not fail"),
             )
             .await
-            .unwrap();
+            .expect("should not fail");
 
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
@@ -2877,7 +2877,7 @@ mod tests {
                 ]),
             )
             .await
-            .unwrap();
+            .expect("should not fail");
 
         let state = AppState {
             extensions: std::sync::Arc::new(std::sync::RwLock::new(
@@ -2924,16 +2924,16 @@ mod tests {
                     .uri("/")
                     .header(COOKIE, "autumn.sid=sess1")
                     .body(Body::empty())
-                    .unwrap(),
+                    .expect("should not fail"),
             )
             .await
-            .unwrap();
+            .expect("should not fail");
 
         assert_eq!(response.status(), StatusCode::OK);
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
-            .unwrap();
-        assert_eq!(std::str::from_utf8(&body).unwrap(), "content");
+            .expect("should not fail");
+        assert_eq!(std::str::from_utf8(&body).expect("should not fail"), "content");
     }
 
     #[tokio::test]
@@ -2951,7 +2951,7 @@ mod tests {
         // Pre-populate a session with user_id
         let mut session_data = std::collections::HashMap::new();
         session_data.insert("user_id".into(), "42".into());
-        store.save("valid-session", session_data).await.unwrap();
+        store.save("valid-session", session_data).await.expect("should not fail");
 
         let state = AppState {
             extensions: std::sync::Arc::new(std::sync::RwLock::new(
@@ -2999,16 +2999,16 @@ mod tests {
                     .uri("/protected")
                     .header(COOKIE, "autumn.sid=valid-session")
                     .body(Body::empty())
-                    .unwrap(),
+                    .expect("should not fail"),
             )
             .await
-            .unwrap();
+            .expect("should not fail");
 
         assert_eq!(response.status(), StatusCode::OK);
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
-            .unwrap();
-        assert_eq!(std::str::from_utf8(&body).unwrap(), "secret");
+            .expect("should not fail");
+        assert_eq!(std::str::from_utf8(&body).expect("should not fail"), "secret");
     }
 
     #[tokio::test]
@@ -3076,8 +3076,8 @@ mod tests {
         assert_eq!(response.status(), axum::http::StatusCode::UNAUTHORIZED);
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
-            .unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            .expect("should not fail");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("should not fail");
         assert_eq!(json["status"], 401);
         assert_eq!(json["detail"], "authentication required");
         assert_eq!(json["code"], "autumn.unauthorized");
@@ -3164,11 +3164,11 @@ mod tests {
 
         // Invalid prefix
         let result = super::verify_password(&test_input, "invalid_hash_string").await;
-        assert!(result.is_err() || !result.unwrap());
+        assert!(result.is_err() || !result.expect("should not fail"));
 
         // Truncated hash
         let result2 = super::verify_password(&test_input, "$2b$04$").await;
-        assert!(result2.is_err() || !result2.unwrap());
+        assert!(result2.is_err() || !result2.expect("should not fail"));
     }
 }
 
@@ -3342,8 +3342,8 @@ mod api_token_tests {
     #[tokio::test]
     async fn in_memory_store_issue_returns_unique_tokens() {
         let store = InMemoryApiTokenStore::default();
-        let t1 = store.issue("user:1").await.unwrap();
-        let t2 = store.issue("user:1").await.unwrap();
+        let t1 = store.issue("user:1").await.expect("should not fail");
+        let t2 = store.issue("user:1").await.expect("should not fail");
         assert_ne!(t1, t2, "each issued token must be unique");
         assert!(t1.len() >= 32, "token must have sufficient entropy");
     }
@@ -3351,53 +3351,53 @@ mod api_token_tests {
     #[tokio::test]
     async fn in_memory_store_verify_returns_principal_for_valid_token() {
         let store = InMemoryApiTokenStore::default();
-        let raw = store.issue("user:42").await.unwrap();
-        let principal = store.verify(&raw).await.unwrap();
+        let raw = store.issue("user:42").await.expect("should not fail");
+        let principal = store.verify(&raw).await.expect("should not fail");
         assert_eq!(principal, Some("user:42".to_owned()));
     }
 
     #[tokio::test]
     async fn in_memory_store_verify_returns_none_for_unknown_token() {
         let store = InMemoryApiTokenStore::default();
-        let result = store.verify("not_a_real_token").await.unwrap();
+        let result = store.verify("not_a_real_token").await.expect("should not fail");
         assert_eq!(result, None);
     }
 
     #[tokio::test]
     async fn in_memory_store_revoke_invalidates_token() {
         let store = InMemoryApiTokenStore::default();
-        let raw = store.issue("user:7").await.unwrap();
+        let raw = store.issue("user:7").await.expect("should not fail");
         assert_eq!(
-            store.verify(&raw).await.unwrap(),
+            store.verify(&raw).await.expect("should not fail"),
             Some("user:7".to_owned()),
             "token must be valid before revoking"
         );
-        store.revoke(&raw).await.unwrap();
-        assert_eq!(store.verify(&raw).await.unwrap(), None);
+        store.revoke(&raw).await.expect("should not fail");
+        assert_eq!(store.verify(&raw).await.expect("should not fail"), None);
     }
 
     #[tokio::test]
     async fn in_memory_store_raw_token_not_stored_verbatim() {
         let store = InMemoryApiTokenStore::default();
-        let raw = store.issue("user:1").await.unwrap();
+        let raw = store.issue("user:1").await.expect("should not fail");
         // Appending a character changes the hash → lookup must return None.
         let tampered = format!("{raw}x");
-        assert_eq!(store.verify(&tampered).await.unwrap(), None);
+        assert_eq!(store.verify(&tampered).await.expect("should not fail"), None);
     }
 
     #[tokio::test]
     async fn issue_api_token_helper_issues_verifiable_token() {
         let store = InMemoryApiTokenStore::default();
-        let raw = issue_api_token(&store, "user:5").await.unwrap();
-        assert_eq!(store.verify(&raw).await.unwrap(), Some("user:5".to_owned()));
+        let raw = issue_api_token(&store, "user:5").await.expect("should not fail");
+        assert_eq!(store.verify(&raw).await.expect("should not fail"), Some("user:5".to_owned()));
     }
 
     #[tokio::test]
     async fn revoke_api_token_helper_revokes_token() {
         let store = InMemoryApiTokenStore::default();
-        let raw = store.issue("user:6").await.unwrap();
-        revoke_api_token(&store, &raw).await.unwrap();
-        assert_eq!(store.verify(&raw).await.unwrap(), None);
+        let raw = store.issue("user:6").await.expect("should not fail");
+        revoke_api_token(&store, &raw).await.expect("should not fail");
+        assert_eq!(store.verify(&raw).await.expect("should not fail"), None);
     }
 
     // ── RequireApiToken middleware ───────────────────────────────────────────
@@ -3417,10 +3417,10 @@ mod api_token_tests {
                 http::Request::builder()
                     .uri("/")
                     .body(Body::empty())
-                    .unwrap(),
+                    .expect("should not fail"),
             )
             .await
-            .unwrap();
+            .expect("should not fail");
 
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
@@ -3441,10 +3441,10 @@ mod api_token_tests {
                     .uri("/")
                     .header(http::header::AUTHORIZATION, "Basic dXNlcjpwYXNz")
                     .body(Body::empty())
-                    .unwrap(),
+                    .expect("should not fail"),
             )
             .await
-            .unwrap();
+            .expect("should not fail");
 
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
@@ -3465,10 +3465,10 @@ mod api_token_tests {
                     .uri("/")
                     .header(http::header::AUTHORIZATION, "Bearer unknown_token_xyz")
                     .body(Body::empty())
-                    .unwrap(),
+                    .expect("should not fail"),
             )
             .await
-            .unwrap();
+            .expect("should not fail");
 
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
@@ -3489,10 +3489,10 @@ mod api_token_tests {
                     .uri("/")
                     .header(http::header::AUTHORIZATION, "Bearer valid_client_token")
                     .body(Body::empty())
-                    .unwrap(),
+                    .expect("should not fail"),
             )
             .await
-            .unwrap();
+            .expect("should not fail");
 
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(
@@ -3505,8 +3505,8 @@ mod api_token_tests {
 
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
-            .unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            .expect("should not fail");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("should not fail");
         assert_eq!(json["status"], 503);
         assert_eq!(json["code"], "autumn.service_unavailable");
         assert_eq!(json["detail"], "api token store unavailable");
@@ -3518,7 +3518,7 @@ mod api_token_tests {
         use tower::ServiceExt;
 
         let store = Arc::new(InMemoryApiTokenStore::default());
-        let raw = store.issue("user:1").await.unwrap();
+        let raw = store.issue("user:1").await.expect("should not fail");
         let app = axum::Router::new()
             .route("/", axum::routing::get(|| async { "ok" }))
             .layer(RequireApiToken::new(Arc::clone(&store)));
@@ -3529,10 +3529,10 @@ mod api_token_tests {
                     .uri("/")
                     .header(http::header::AUTHORIZATION, format!("Bearer {raw}"))
                     .body(Body::empty())
-                    .unwrap(),
+                    .expect("should not fail"),
             )
             .await
-            .unwrap();
+            .expect("should not fail");
 
         assert_eq!(response.status(), StatusCode::OK);
     }
@@ -3543,7 +3543,7 @@ mod api_token_tests {
         use tower::ServiceExt;
 
         let store = Arc::new(InMemoryApiTokenStore::default());
-        let raw = store.issue("user:1").await.unwrap();
+        let raw = store.issue("user:1").await.expect("should not fail");
 
         for scheme in ["bearer", "bEaReR"] {
             let app = axum::Router::new()
@@ -3556,10 +3556,10 @@ mod api_token_tests {
                         .uri("/")
                         .header(http::header::AUTHORIZATION, format!("{scheme} {raw}"))
                         .body(Body::empty())
-                        .unwrap(),
+                        .expect("should not fail"),
                 )
                 .await
-                .unwrap();
+                .expect("should not fail");
 
             assert_eq!(response.status(), StatusCode::OK, "scheme {scheme}");
         }
@@ -3571,8 +3571,8 @@ mod api_token_tests {
         use tower::ServiceExt;
 
         let store = Arc::new(InMemoryApiTokenStore::default());
-        let raw = store.issue("user:1").await.unwrap();
-        store.revoke(&raw).await.unwrap();
+        let raw = store.issue("user:1").await.expect("should not fail");
+        store.revoke(&raw).await.expect("should not fail");
         let app = axum::Router::new()
             .route("/", axum::routing::get(|| async { "ok" }))
             .layer(RequireApiToken::new(Arc::clone(&store)));
@@ -3583,10 +3583,10 @@ mod api_token_tests {
                     .uri("/")
                     .header(http::header::AUTHORIZATION, format!("Bearer {raw}"))
                     .body(Body::empty())
-                    .unwrap(),
+                    .expect("should not fail"),
             )
             .await
-            .unwrap();
+            .expect("should not fail");
 
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
@@ -3606,10 +3606,10 @@ mod api_token_tests {
                 http::Request::builder()
                     .uri("/")
                     .body(Body::empty())
-                    .unwrap(),
+                    .expect("should not fail"),
             )
             .await
-            .unwrap();
+            .expect("should not fail");
 
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
         assert_eq!(
@@ -3621,8 +3621,8 @@ mod api_token_tests {
         );
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
-            .unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            .expect("should not fail");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("should not fail");
         assert_eq!(json["status"], 401);
         assert_eq!(json["code"], "autumn.unauthorized");
         assert!(json["detail"].as_str().is_some());
@@ -3645,10 +3645,10 @@ mod api_token_tests {
                 http::Request::builder()
                     .uri("/api/private")
                     .body(Body::empty())
-                    .unwrap(),
+                    .expect("should not fail"),
             )
             .await
-            .unwrap();
+            .expect("should not fail");
 
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
         let request_id = response
@@ -3659,8 +3659,8 @@ mod api_token_tests {
             .to_owned();
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
-            .unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            .expect("should not fail");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("should not fail");
         assert_eq!(json["request_id"], request_id);
         assert_eq!(json["instance"], "/api/private");
     }
@@ -3677,7 +3677,7 @@ mod api_token_tests {
         }
 
         let store = Arc::new(InMemoryApiTokenStore::default());
-        let raw = store.issue("user:99").await.unwrap();
+        let raw = store.issue("user:99").await.expect("should not fail");
         let app = axum::Router::new()
             .route("/", axum::routing::get(handler))
             .layer(RequireApiToken::new(Arc::clone(&store)));
@@ -3688,16 +3688,16 @@ mod api_token_tests {
                     .uri("/")
                     .header(http::header::AUTHORIZATION, format!("Bearer {raw}"))
                     .body(Body::empty())
-                    .unwrap(),
+                    .expect("should not fail"),
             )
             .await
-            .unwrap();
+            .expect("should not fail");
 
         assert_eq!(response.status(), StatusCode::OK);
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
-            .unwrap();
-        assert_eq!(std::str::from_utf8(&body).unwrap(), "user:99");
+            .expect("should not fail");
+        assert_eq!(std::str::from_utf8(&body).expect("should not fail"), "user:99");
     }
 
     #[tokio::test]
@@ -3716,10 +3716,10 @@ mod api_token_tests {
                 http::Request::builder()
                     .uri("/")
                     .body(Body::empty())
-                    .unwrap(),
+                    .expect("should not fail"),
             )
             .await
-            .unwrap();
+            .expect("should not fail");
 
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
@@ -3738,7 +3738,7 @@ mod api_token_tests {
         }
 
         let store = Arc::new(InMemoryApiTokenStore::default());
-        let raw = store.issue("api_user").await.unwrap();
+        let raw = store.issue("api_user").await.expect("should not fail");
 
         let session_store = MemoryStore::new();
         session_store
@@ -3747,7 +3747,7 @@ mod api_token_tests {
                 std::collections::HashMap::from([("user_id".into(), "session_user".into())]),
             )
             .await
-            .unwrap();
+            .expect("should not fail");
 
         let app = axum::Router::new()
             .route(
@@ -3762,16 +3762,16 @@ mod api_token_tests {
                     .uri("/api")
                     .header(http::header::AUTHORIZATION, format!("Bearer {raw}"))
                     .body(Body::empty())
-                    .unwrap(),
+                    .expect("should not fail"),
             )
             .await
-            .unwrap();
+            .expect("should not fail");
 
         assert_eq!(response.status(), StatusCode::OK);
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
-            .unwrap();
-        assert_eq!(std::str::from_utf8(&body).unwrap(), "api_user");
+            .expect("should not fail");
+        assert_eq!(std::str::from_utf8(&body).expect("should not fail"), "api_user");
     }
 
     // ── poll_ready propagation ───────────────────────────────────────────────

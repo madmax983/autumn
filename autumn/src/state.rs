@@ -854,7 +854,7 @@ mod tests {
             pool_size: 5,
             ..Default::default()
         };
-        let pool = db::create_pool(&config).unwrap().unwrap();
+        let pool = db::create_pool(&config).expect("should not fail").expect("should not fail");
         let state = AppState::for_test().with_pool(pool);
         let debug = format!("{state:?}");
         assert!(debug.contains("Pool(max=5)"));
@@ -873,8 +873,8 @@ mod tests {
             pool_size: 2,
             ..Default::default()
         };
-        let primary = db::create_pool(&primary_config).unwrap().unwrap();
-        let replica = db::create_pool(&replica_config).unwrap().unwrap();
+        let primary = db::create_pool(&primary_config).expect("should not fail").expect("should not fail");
+        let replica = db::create_pool(&replica_config).expect("should not fail").expect("should not fail");
 
         let state = AppState::for_test()
             .with_pool(primary)
@@ -905,8 +905,8 @@ mod tests {
             pool_size: 2,
             ..Default::default()
         };
-        let primary = db::create_pool(&primary_config).unwrap().unwrap();
-        let replica = db::create_pool(&replica_config).unwrap().unwrap();
+        let primary = db::create_pool(&primary_config).expect("should not fail").expect("should not fail");
+        let replica = db::create_pool(&replica_config).expect("should not fail").expect("should not fail");
 
         let state = AppState::for_test()
             .with_pool(primary)
@@ -941,8 +941,8 @@ mod tests {
             pool_size: 2,
             ..Default::default()
         };
-        let primary = db::create_pool(&primary_config).unwrap().unwrap();
-        let replica = db::create_pool(&replica_config).unwrap().unwrap();
+        let primary = db::create_pool(&primary_config).expect("should not fail").expect("should not fail");
+        let replica = db::create_pool(&replica_config).expect("should not fail").expect("should not fail");
 
         let state = AppState::for_test()
             .with_pool(primary)
@@ -970,8 +970,8 @@ mod tests {
             pool_size: 2,
             ..Default::default()
         };
-        let primary = db::create_pool(&primary_config).unwrap().unwrap();
-        let replica = db::create_pool(&replica_config).unwrap().unwrap();
+        let primary = db::create_pool(&primary_config).expect("should not fail").expect("should not fail");
+        let replica = db::create_pool(&replica_config).expect("should not fail").expect("should not fail");
 
         let state = AppState::for_test()
             .with_pool(primary)

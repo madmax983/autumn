@@ -459,7 +459,12 @@ impl MemoryIdempotencyStore {
 impl IdempotencyStore for MemoryIdempotencyStore {
     fn get(&self, key: &str) -> Option<IdempotencyEntry> {
         // Release the read lock immediately after cloning.
-        let entry = self.entries.read().unwrap().get(key).cloned();
+        let entry = self
+            .entries
+            .read()
+            .expect("should not fail")
+            .get(key)
+            .cloned();
         entry.filter(|e| e.expires_at > Instant::now())
     }
 
@@ -469,7 +474,7 @@ impl IdempotencyStore for MemoryIdempotencyStore {
             body_hash,
             expires_at: Instant::now() + ttl,
         };
-        let mut entries = self.entries.write().unwrap();
+        let mut entries = self.entries.write().expect("should not fail");
         entries.insert(key.to_owned(), entry);
         // Periodically evict expired entries to bound memory growth for
         // long-running processes. O(N) scan is amortised over every 128 writes.
@@ -486,7 +491,7 @@ impl IdempotencyStore for MemoryIdempotencyStore {
 
     fn try_lock_owned(&self, key: &str, owner: &str, lock_ttl: Duration) -> bool {
         let now = Instant::now();
-        let mut in_flight = self.in_flight.write().unwrap();
+        let mut in_flight = self.in_flight.write().expect("should not fail");
         // Check only the requested key's active in-flight marker.
         if let Some(lock) = in_flight.get(key)
             && lock.expires_at > now
@@ -511,11 +516,11 @@ impl IdempotencyStore for MemoryIdempotencyStore {
     }
 
     fn unlock(&self, key: &str) {
-        self.in_flight.write().unwrap().remove(key);
+        self.in_flight.write().expect("should not fail").remove(key);
     }
 
     fn unlock_owned(&self, key: &str, owner: &str) {
-        let mut in_flight = self.in_flight.write().unwrap();
+        let mut in_flight = self.in_flight.write().expect("should not fail");
         if in_flight
             .get(key)
             .is_some_and(|lock| lock.owner.as_str() == owner)
@@ -1059,7 +1064,7 @@ fn request_body_too_large_response() -> Response<Body> {
         .body(Body::from(
             "request body too large for idempotency middleware",
         ))
-        .unwrap()
+        .expect("should not fail")
 }
 
 fn in_flight_conflict_response() -> Response<Body> {
@@ -1070,7 +1075,7 @@ fn in_flight_conflict_response() -> Response<Body> {
             "a request with this idempotency key is already being processed; \
              retry after 1 second",
         ))
-        .unwrap()
+        .expect("should not fail")
 }
 
 fn replay_requires_inner_stop_response() -> Response<Body> {
@@ -1079,14 +1084,14 @@ fn replay_requires_inner_stop_response() -> Response<Body> {
         .body(Body::from(
             "idempotency replay requires an inner replay stop for this route",
         ))
-        .unwrap()
+        .expect("should not fail")
 }
 
 pub(crate) fn persistence_failed_response() -> Response<Body> {
     Response::builder()
         .status(StatusCode::SERVICE_UNAVAILABLE)
         .body(Body::from("idempotency persistence unavailable"))
-        .unwrap()
+        .expect("should not fail")
 }
 
 struct PreparedIdempotencyRequest {
@@ -1707,7 +1712,7 @@ where
         return Ok(Response::builder()
             .status(StatusCode::UNPROCESSABLE_ENTITY)
             .body(Body::from("idempotency key reused with different payload"))
-            .unwrap());
+            .expect("should not fail"));
     }
 
     if fail_closed_on_replay {
@@ -1749,7 +1754,7 @@ fn response_from_record(record: IdempotencyRecord) -> Response<Body> {
     builder
         .header(X_IDEMPOTENT_REPLAYED, "true")
         .body(Body::from(record.body))
-        .unwrap()
+        .expect("should not fail")
 }
 
 #[cfg(test)]
