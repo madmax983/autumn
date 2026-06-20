@@ -69,6 +69,13 @@ pub struct AddrFile {
     /// files written before this field existed.
     #[serde(default)]
     pub release: bool,
+    /// The graceful-drain budget (`prestop_grace_secs + shutdown_timeout_secs`)
+    /// resolved from the daemon's *own* environment and profile at start time.
+    /// `stop` uses this as the authoritative budget so it never derives one from
+    /// the (possibly different) `stop` invocation's environment. `None` for
+    /// address files written before this field existed.
+    #[serde(default)]
+    pub stop_budget_secs: Option<u64>,
 }
 
 impl AddrFile {
@@ -289,9 +296,12 @@ fn start_daemon(opts: &ServeOptions) -> i32 {
         return 1;
     }
 
-    // Reject a second start while a live daemon holds the lock.
+    // Reject a second start while a live daemon holds the lock. Use the
+    // socket-confirmed identity check so a stale pidfile whose PID was reused by
+    // an unrelated process (notably on macOS, where start time isn't available)
+    // doesn't block a legitimate start.
     if let Some(rec) = process::read_pidfile(&paths.pid_file())
-        && process::is_record_alive(&rec)
+        && confirmed_running(&rec, &paths.socket_file())
     {
         eprintln!(
             "autumn serve: already running (pid {}). \
@@ -504,7 +514,7 @@ fn spawn_daemon(binary: &Path, paths: &RuntimePaths, opts: &ServeOptions) -> i32
         READY_TIMEOUT
     };
     if wait_for_ready(&socket, &mut child, ready_timeout) {
-        if let Err(e) = write_addr_file(paths, pid, &socket, opts.bundled_pg, opts.release) {
+        if let Err(e) = write_addr_file(paths, pid, &socket, opts) {
             // Without the discovery file the daemon is unreachable to clients;
             // treat it like the pidfile failure — stop the child and fail.
             eprintln!(
@@ -609,8 +619,7 @@ fn write_addr_file(
     paths: &RuntimePaths,
     pid: u32,
     socket: &Path,
-    managed_pg: bool,
-    release: bool,
+    opts: &ServeOptions,
 ) -> std::io::Result<()> {
     let addr = AddrFile {
         pid,
@@ -619,8 +628,11 @@ fn write_addr_file(
         started_at: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_secs()),
-        managed_pg,
-        release,
+        managed_pg: opts.bundled_pg,
+        release: opts.release,
+        // Resolve the budget now, from the daemon's own env/profile, so `stop`
+        // doesn't have to (and can't) reconstruct it from a different shell.
+        stop_budget_secs: Some(resolved_stop_budget_secs(opts)),
     };
     let path = paths.addr_file();
     std::fs::write(&path, addr.to_toml())?;
@@ -646,47 +658,73 @@ fn stop(opts: &ServeOptions) -> i32 {
         return 0;
     }
 
-    // A daemon started with `--release` runs the `prod` profile (the app's
-    // build-mode detection), which `stop` can't otherwise observe; recover it
-    // from the address file so the budget honors prod shutdown settings.
-    let recorded_release = read_addr_file(&paths).is_some_and(|a| a.release);
-    process::stop_pid(rec.pid, stop_timeout(opts, recorded_release));
+    // Prefer the budget the daemon recorded at start (resolved from its own
+    // env/profile); fall back to recomputing it (release flag + config) only for
+    // daemons started before that field was recorded.
+    let addr = read_addr_file(&paths);
+    let recorded_release = addr.as_ref().is_some_and(|a| a.release);
+    let recorded_budget = addr.as_ref().and_then(|a| a.stop_budget_secs);
+    process::stop_pid(
+        rec.pid,
+        stop_timeout(opts, recorded_release, recorded_budget),
+    );
     cleanup(&paths, &socket);
     println!("autumn serve: stopped");
     0
 }
 
-/// Graceful-stop budget before escalating to `SIGKILL`, derived from the app's
-/// own `[server]` shutdown config (`prestop_grace_secs` plus
-/// `shutdown_timeout_secs` plus a small buffer) so we never cut off a drain the
-/// server is configured to allow.
+/// Graceful-stop budget before escalating to `SIGKILL`.
 ///
-/// Mirrors the app's layering for these two keys: base `autumn.toml`
-/// ← `[profile.<name>]` ← `autumn-<profile>.toml` ← `AUTUMN_SERVER__*` env. The
-/// active profile is taken from `AUTUMN_ENV`/`AUTUMN_PROFILE`, else inferred as
-/// `prod` when the daemon was started with `--release` (matching the app's
-/// build-mode detection, recovered from the address file). Env overrides — read
-/// identically by the daemon — always apply. Config is read from the same
-/// directory the daemon used (a `-p` member's manifest dir, else the current
-/// directory).
-fn stop_timeout(opts: &ServeOptions, recorded_release: bool) -> Duration {
+/// Prefers `recorded_budget` — the drain budget the daemon resolved from its own
+/// environment and profile at start and persisted in the address file — so a
+/// `stop` from a different shell can't derive a shorter budget from its own env.
+/// For daemons started before that field existed, falls back to recomputing it
+/// here: base `autumn.toml` ← `[profile.<name>]` ← `autumn-<profile>.toml`
+/// ← `AUTUMN_SERVER__*`, with the profile taken from `AUTUMN_ENV`/`AUTUMN_PROFILE`
+/// else inferred (`prod` for a release daemon, else `dev`). A small buffer is
+/// added on top of the configured drain.
+fn stop_timeout(
+    opts: &ServeOptions,
+    recorded_release: bool,
+    recorded_budget: Option<u64>,
+) -> Duration {
+    if let Some(secs) = recorded_budget {
+        return Duration::from_secs(secs) + STOP_GRACE_BUFFER;
+    }
     let base_dir = opts
         .package
         .as_deref()
         .and_then(crate::dev::find_manifest_dir)
         .unwrap_or_else(|| std::path::PathBuf::from("."));
-    // With no explicit profile env, the daemon still ran a profile via the app's
-    // build-mode detection — `prod` for a release build, else `dev` — so mirror
-    // it to pick up `[profile.<name>]`/`autumn-<profile>.toml` shutdown settings.
-    let profile = env_profile().unwrap_or_else(|| {
-        if recorded_release {
+    let profile = effective_profile(recorded_release);
+    let (prestop, shutdown) = resolve_shutdown_budget(&base_dir, Some(&profile));
+    Duration::from_secs(prestop + shutdown) + STOP_GRACE_BUFFER
+}
+
+/// The drain budget (`prestop_grace_secs + shutdown_timeout_secs`) resolved from
+/// the *current* (daemon's) environment and profile. Called at start so the
+/// value persisted in the address file reflects the daemon's own settings.
+fn resolved_stop_budget_secs(opts: &ServeOptions) -> u64 {
+    let base_dir = opts
+        .package
+        .as_deref()
+        .and_then(crate::dev::find_manifest_dir)
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let profile = effective_profile(opts.release);
+    let (prestop, shutdown) = resolve_shutdown_budget(&base_dir, Some(&profile));
+    prestop + shutdown
+}
+
+/// The active profile: an explicit `AUTUMN_ENV`/`AUTUMN_PROFILE`, else the app's
+/// build-mode default (`prod` for a release build, else `dev`).
+fn effective_profile(release: bool) -> String {
+    env_profile().unwrap_or_else(|| {
+        if release {
             "prod".to_owned()
         } else {
             "dev".to_owned()
         }
-    });
-    let (prestop, shutdown) = resolve_shutdown_budget(&base_dir, Some(&profile));
-    Duration::from_secs(prestop + shutdown) + STOP_GRACE_BUFFER
+    })
 }
 
 /// The active profile selector from the environment (`AUTUMN_ENV`, then the
@@ -870,6 +908,7 @@ mod tests {
             started_at: 1_700_000_000,
             managed_pg,
             release: false,
+            stop_budget_secs: Some(35),
         }
     }
 
@@ -916,9 +955,19 @@ mod tests {
             "started_at",
             "managed_pg",
             "release",
+            "stop_budget_secs",
         ] {
             assert!(table.contains_key(key), "missing key {key}");
         }
+    }
+
+    #[test]
+    fn addr_file_stop_budget_defaults_none_for_legacy_files() {
+        // Files written before the field omit it; parsing must default to None.
+        let legacy = "pid = 7\ntransport = \"unix\"\naddress = \"/tmp/s.sock\"\n\
+                      started_at = 1700000000\nmanaged_pg = false\nrelease = false\n";
+        let parsed = AddrFile::parse(legacy).expect("parse legacy addr file");
+        assert_eq!(parsed.stop_budget_secs, None);
     }
 
     #[test]

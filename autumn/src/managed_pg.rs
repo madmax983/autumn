@@ -264,6 +264,15 @@ impl ManagedPostgresPoolProvider {
         }
         if let Ok(mut f) = options.open(&password_file) {
             use std::io::Write;
+            // `mode(0o600)` only applies when the file is newly created; an
+            // existing empty/permissive file (interrupted first boot, manual
+            // `touch`) keeps its old mode, so tighten it before writing the
+            // superuser password.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = f.set_permissions(std::fs::Permissions::from_mode(0o600));
+            }
             let _ = f.write_all(password.as_bytes());
         }
         (password, password_file)
@@ -360,12 +369,21 @@ fn default_data_dir() -> PathBuf {
 }
 
 /// A per-project namespace component for the fallback data dir, derived from the
-/// app's manifest dir (compile-time `AUTUMN_MANIFEST_DIR`, else CWD) hashed with
-/// SHA-256. Stable across runs and toolchains so an app keeps finding its
-/// cluster.
+/// app's manifest dir hashed with SHA-256. Stable across runs and toolchains so
+/// an app keeps finding its cluster.
+///
+/// `#[autumn_web::main]` records the compile-time manifest dir via
+/// `__set_macro_context` (not an exported env var), so resolve it through
+/// [`config::OsEnv`], which surfaces that baked value for `AUTUMN_MANIFEST_DIR` —
+/// otherwise installed binaries run from a common working dir would all hash the
+/// same CWD and share one cluster. Falls back to the CWD only when no manifest
+/// context exists.
 fn project_data_namespace() -> String {
+    use crate::config::Env;
     use sha2::{Digest, Sha256};
-    let base = std::env::var_os("AUTUMN_MANIFEST_DIR")
+    let base = crate::config::OsEnv
+        .var("AUTUMN_MANIFEST_DIR")
+        .ok()
         .map(PathBuf::from)
         .or_else(|| std::env::current_dir().ok())
         .and_then(|d| std::fs::canonicalize(&d).ok().or(Some(d)))
