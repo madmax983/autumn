@@ -25,6 +25,7 @@ mod routes;
 mod seed;
 mod serve;
 mod setup;
+mod shard;
 mod task;
 mod token;
 mod webhook;
@@ -139,7 +140,16 @@ enum Commands {
         /// skipping any configured shards.
         #[arg(long)]
         control_only: bool,
+        /// Resolve database URLs through a profile overlay: deep-merge
+        /// `autumn-<profile>.toml` over `autumn.toml` before reading the
+        /// control and shard URLs. When omitted, the profile is selected from
+        /// `AUTUMN_ENV` (preferred) or the legacy `AUTUMN_PROFILE`, matching the
+        /// app's runtime precedence — so env vars are not overridden by this flag.
+        #[arg(long, value_name = "PROFILE")]
+        profile: Option<String>,
     },
+    /// Shard operations (e.g. moving a tenant's data between shards)
+    Shard(ShardCommands),
     /// Live monitoring dashboard for a running Autumn application
     Monitor {
         /// URL of the running Autumn application
@@ -687,6 +697,63 @@ enum MigrateCommands {
         /// before touching the database.
         #[arg(long)]
         yes_i_mean_prod: bool,
+    },
+}
+
+/// Subcommands for `autumn shard`.
+#[derive(clap::Args)]
+struct ShardCommands {
+    #[command(subcommand)]
+    command: ShardSubcommand,
+}
+
+#[derive(Subcommand)]
+enum ShardSubcommand {
+    /// Move a set of tenants' rows from one configured shard to another.
+    ///
+    /// Resolves --from / --to by their `[[database.shards]]` names (honoring
+    /// --profile and env, like `autumn migrate`), copies the rows, verifies
+    /// counts + a content checksum, and deletes the source rows only with
+    /// --confirm. It never edits routing — copy & verify, re-route the tenant
+    /// (pin it in the directory router), then re-run with --confirm to delete.
+    ///
+    /// # Example
+    ///
+    ///   autumn shard move-slot --from shard0 --to shard1 \
+    ///     --table bookmarks --tenant acme
+    ///   # …pin acme to shard1 (directory router), deploy, then:
+    ///   autumn shard move-slot --from shard0 --to shard1 \
+    ///     --table bookmarks --tenant acme --confirm
+    #[command(verbatim_doc_comment)]
+    MoveSlot {
+        /// Source shard name (a `[[database.shards]]` entry).
+        #[arg(long, value_name = "SHARD")]
+        from: String,
+        /// Destination shard name.
+        #[arg(long, value_name = "SHARD")]
+        to: String,
+        /// Table holding the tenant data to move.
+        #[arg(long, value_name = "TABLE")]
+        table: String,
+        /// Column holding the tenant/routing key. Default: `tenant_id`.
+        #[arg(long, value_name = "COLUMN", default_value = "tenant_id")]
+        key_column: String,
+        /// Primary-key column whose `BIGSERIAL`/identity sequence is advanced on
+        /// the destination after the copy (PK values are copied as-is).
+        /// Default: `id`.
+        #[arg(long, value_name = "COLUMN", default_value = "id")]
+        id_column: String,
+        /// Tenant key to move (repeat for several).
+        #[arg(long = "tenant", value_name = "KEY", required = true)]
+        tenants: Vec<String>,
+        /// Delete the source rows after a successful, verified copy.
+        #[arg(long)]
+        confirm: bool,
+        /// Resolve shard URLs through a profile overlay (like `autumn migrate`).
+        /// When omitted, the profile is selected from `AUTUMN_ENV` (preferred)
+        /// or the legacy `AUTUMN_PROFILE`, matching the app's runtime precedence.
+        #[arg(long, value_name = "PROFILE")]
+        profile: Option<String>,
     },
 }
 
@@ -1415,6 +1482,7 @@ fn run_command(command: Commands) {
             with_maintenance,
             shard,
             control_only,
+            profile,
         } => {
             let action = match action {
                 Some(MigrateCommands::Status) => migrate::MigrateAction::Status,
@@ -1435,8 +1503,29 @@ fn run_command(command: Commands) {
                 (None, true) => migrate::MigrateTarget::ControlOnly,
                 (None, false) => migrate::MigrateTarget::All,
             };
-            migrate::run(&action, with_maintenance, &target);
+            migrate::run(&action, with_maintenance, &target, profile.as_deref());
         }
+        Commands::Shard(cmd) => match cmd.command {
+            ShardSubcommand::MoveSlot {
+                from,
+                to,
+                table,
+                key_column,
+                id_column,
+                tenants,
+                confirm,
+                profile,
+            } => shard::run_move_slot(&shard::MoveSlotArgs {
+                from,
+                to,
+                table,
+                key_column,
+                id_column,
+                tenants,
+                confirm,
+                profile,
+            }),
+        },
         Commands::Maintenance(cmd) => match cmd {
             MaintenanceCommands::On {
                 message,
@@ -3701,6 +3790,63 @@ mod tests {
     #[test]
     fn parse_maintenance_without_subcommand_is_error() {
         assert!(Cli::try_parse_from(["autumn", "maintenance"]).is_err());
+    }
+
+    #[test]
+    fn parse_shard_move_slot() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "shard",
+            "move-slot",
+            "--from",
+            "shard0",
+            "--to",
+            "shard1",
+            "--table",
+            "bookmarks",
+            "--tenant",
+            "acme",
+            "--tenant",
+            "globex",
+            "--confirm",
+        ])
+        .unwrap();
+        let Commands::Shard(cmd) = cli.command else {
+            panic!("expected shard");
+        };
+        let ShardSubcommand::MoveSlot {
+            from,
+            to,
+            table,
+            key_column,
+            tenants,
+            confirm,
+            ..
+        } = cmd.command;
+        assert_eq!(from, "shard0");
+        assert_eq!(to, "shard1");
+        assert_eq!(table, "bookmarks");
+        assert_eq!(key_column, "tenant_id"); // default
+        assert_eq!(tenants, vec!["acme".to_owned(), "globex".to_owned()]);
+        assert!(confirm);
+    }
+
+    #[test]
+    fn parse_shard_move_slot_requires_tenant() {
+        assert!(
+            Cli::try_parse_from([
+                "autumn",
+                "shard",
+                "move-slot",
+                "--from",
+                "shard0",
+                "--to",
+                "shard1",
+                "--table",
+                "bookmarks",
+            ])
+            .is_err()
+        );
     }
 
     #[test]

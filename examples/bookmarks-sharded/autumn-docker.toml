@@ -12,6 +12,11 @@ primary_url = "postgres://autumn:autumn@postgres-control:5432/bookmarks_control"
 [[database.shards]]
 name = "shard0"
 primary_url = "postgres://autumn:autumn@postgres-shard-0:5432/bookmarks_shard0"
+# Streaming read replica (see postgres-shard-0-replica in docker-compose.yml).
+# `ShardedReadDb` and SELECT routing on `ShardedDb` read from here; writes
+# stay on the primary above. Only shard 0 has a replica configured, so shard 1
+# transparently reads from its own primary.
+replica_url = "postgres://autumn:autumn@postgres-shard-0-replica:5432/bookmarks_shard0"
 slots = ["0-8191"]
 
 [[database.shards]]

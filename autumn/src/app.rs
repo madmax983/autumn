@@ -95,6 +95,8 @@ pub fn app() -> AppBuilder {
         shard_provider_factory: None,
         #[cfg(feature = "db")]
         shard_router: None,
+        #[cfg(feature = "db")]
+        directory_shard_router: false,
         telemetry_provider: None,
         session_store: None,
         #[cfg(feature = "ws")]
@@ -232,6 +234,7 @@ pub struct RegisteredApiVersions(pub Vec<ApiVersion>);
 ///         .await;
 /// }
 /// ```
+#[allow(clippy::struct_excessive_bools)]
 pub struct AppBuilder {
     pub(crate) routes: Vec<Route>,
     /// Registered API versions.
@@ -284,6 +287,10 @@ pub struct AppBuilder {
     /// is used.
     #[cfg(feature = "db")]
     shard_router: Option<Arc<dyn crate::sharding::ShardRouter>>,
+    /// Builder opt-in for the control-DB [`DirectoryShardRouter`](crate::sharding::DirectoryShardRouter),
+    /// applied to `config.database.directory_shard_router` at build time.
+    #[cfg(feature = "db")]
+    directory_shard_router: bool,
     /// Custom telemetry provider (tier-1 subsystem replacement). When `None`,
     /// the default [`TracingOtlpTelemetryProvider`](crate::telemetry::TracingOtlpTelemetryProvider) runs.
     telemetry_provider: Option<Box<dyn crate::telemetry::TelemetryProvider>>,
@@ -1611,6 +1618,23 @@ impl AppBuilder {
         self
     }
 
+    /// Route tenants through the control-plane `_autumn_shard_directory` table
+    /// via a [`DirectoryShardRouter`](crate::sharding::DirectoryShardRouter).
+    ///
+    /// The router is bound to the control primary pool at build time. Tenants
+    /// with a directory row are pinned to the named shard; everyone else falls
+    /// back to the slot-hash router. Apply the framework migrations to the
+    /// control database (`autumn migrate`) so `_autumn_shard_directory` exists.
+    ///
+    /// An explicit [`with_shard_router`](Self::with_shard_router) takes
+    /// precedence over this flag.
+    #[cfg(feature = "db")]
+    #[must_use]
+    pub const fn with_directory_shard_router(mut self) -> Self {
+        self.directory_shard_router = true;
+        self
+    }
+
     /// Install a custom [`TelemetryProvider`](crate::telemetry::TelemetryProvider),
     /// replacing the default `tracing-subscriber + OTLP` initializer.
     ///
@@ -2431,6 +2455,8 @@ impl AppBuilder {
             shard_provider_factory,
             #[cfg(feature = "db")]
             shard_router,
+            #[cfg(feature = "db")]
+            directory_shard_router,
             telemetry_provider,
             session_store,
             #[cfg(feature = "ws")]
@@ -2572,6 +2598,7 @@ impl AppBuilder {
             pool_provider_factory,
             shard_provider_factory,
             shard_router,
+            directory_shard_router,
             RepositoryCommitHookQueueMigrationMode::Runtime,
         )
         .await
@@ -2599,14 +2626,32 @@ impl AppBuilder {
                 topology.primary().status().max_size
                     + topology.replica().map_or(0, |p| p.status().max_size)
             });
+            let total_max_connections = control_max_connections + shard_max_connections;
             tracing::info!(
                 primary_max_connections = config.database.effective_primary_pool_size(),
                 replica_configured = config.database.replica_url.is_some(),
                 replica_max_connections = config.database.effective_replica_pool_size(),
                 shard_count = shards.as_ref().map_or(0, crate::sharding::ShardSet::len),
-                total_max_connections = control_max_connections + shard_max_connections,
+                total_max_connections,
                 "Database topology configured"
             );
+            // Pool sizes multiply across shards; warn before the aggregate
+            // silently exhausts Postgres's server-side `max_connections`.
+            let warn_threshold = config.database.max_connections_warn_threshold;
+            if crate::config::should_warn_total_connections(total_max_connections, warn_threshold) {
+                tracing::warn!(
+                    total_max_connections,
+                    warn_threshold,
+                    "Aggregate database connection count is high: the control \
+                     topology and all shard pools together may open \
+                     {total_max_connections} connections (warn threshold \
+                     {warn_threshold}). Ensure each Postgres server's \
+                     max_connections (plus headroom for migrations and \
+                     psql) exceeds the pools that target it, or lower \
+                     database.pool_size. Set \
+                     database.max_connections_warn_threshold = 0 to silence."
+                );
+            }
         } else {
             tracing::info!("Database not configured");
         }
@@ -3376,6 +3421,8 @@ impl AppBuilder {
             shard_provider_factory,
             #[cfg(feature = "db")]
             shard_router,
+            #[cfg(feature = "db")]
+            directory_shard_router,
             telemetry_provider,
             session_store,
             #[cfg(feature = "ws")]
@@ -3526,6 +3573,7 @@ impl AppBuilder {
             pool_provider_factory,
             shard_provider_factory,
             shard_router,
+            directory_shard_router,
             RepositoryCommitHookQueueMigrationMode::StaticBuild,
         )
         .await
@@ -3916,6 +3964,8 @@ impl AppBuilder {
             shard_provider_factory,
             #[cfg(feature = "db")]
             shard_router,
+            #[cfg(feature = "db")]
+            directory_shard_router,
             telemetry_provider,
             session_store,
             #[cfg(feature = "ws")]
@@ -3997,6 +4047,7 @@ impl AppBuilder {
             pool_provider_factory,
             shard_provider_factory,
             shard_router,
+            directory_shard_router,
             RepositoryCommitHookQueueMigrationMode::Runtime,
         )
         .await
@@ -5379,6 +5430,128 @@ struct DatabaseBootstrap {
     replica_migration_check: Option<(String, String)>,
 }
 
+/// Build the `ShardSet` for a sharded app (or `None` when no `[[database.shards]]`
+/// are configured). Resolves the shard router first: an explicit
+/// `with_shard_router` wins; otherwise `directory_routing_enabled` opts into the
+/// control-DB directory router (bound to the just-built control primary pool);
+/// otherwise the hash router. The directory flag is documented as having no
+/// effect without shards, so a shardless profile that leaves it enabled must not
+/// fail startup — hence the early `None` return.
+///
+/// `spawn_directory_listener` gates the directory-router cache-invalidation
+/// listener: it opens control-DB connections, so it is spawned only at real
+/// runtime, never during a static build (`autumn build`) which must not touch
+/// the database.
+#[cfg(feature = "db")]
+async fn resolve_shard_set(
+    config: &AutumnConfig,
+    shard_router: Option<Arc<dyn crate::sharding::ShardRouter>>,
+    shard_provider: Option<ShardProviderFactory>,
+    directory_routing_enabled: bool,
+    spawn_directory_listener: bool,
+    topology: Option<&crate::db::DatabaseTopology>,
+) -> Result<Option<crate::sharding::ShardSet>, String> {
+    if !config.database.has_shards() {
+        return Ok(None);
+    }
+    let router: Arc<dyn crate::sharding::ShardRouter> = match shard_router {
+        Some(explicit) => explicit,
+        None if directory_routing_enabled => {
+            let control_primary = topology
+                .map(crate::db::DatabaseTopology::primary)
+                .ok_or_else(|| {
+                    "directory_shard_router is enabled but no control database is configured. \
+                     The directory router needs a control `database.primary_url`/`url` to read \
+                     the tenant→shard directory. Set one, or disable directory routing to use \
+                     the hash router."
+                        .to_owned()
+                })?;
+            // Directory routing resolves the tenant→shard key by checking out a
+            // *second* control connection during extraction. A handler that
+            // already holds `Db` (or another control checkout) before extracting
+            // `ShardedDb` / a sharded repository would then deadlock on a control
+            // pool sized to 1 — the first checkout cannot be released until the
+            // handler runs. Require at least 2 control connections so these
+            // mixed control+tenant handlers always make progress.
+            let control_max = control_primary.status().max_size;
+            if control_max < 2 {
+                return Err(format!(
+                    "directory_shard_router requires a control database pool of at least 2 \
+                     connections, but the configured maximum is {control_max}. Directory \
+                     routing checks out a second control connection during extraction to \
+                     resolve the tenant→shard key, which deadlocks a pool sized to 1 when a \
+                     handler already holds a control connection (e.g. `Db` + `ShardedDb`). \
+                     Increase the control pool size (database.pool.max_size), or disable \
+                     directory routing to use the hash router."
+                ));
+            }
+            // Bound directory lookups with the configured database statement
+            // timeout (capped to Postgres' i32 millisecond range).
+            let timeout_ms = config.database.statement_timeout.map_or(0, |d| {
+                u64::try_from(d.as_millis())
+                    .unwrap_or(i32::MAX as u64)
+                    .min(i32::MAX as u64)
+            });
+            let dir_router = Arc::new(
+                crate::sharding::DirectoryShardRouter::new(control_primary.clone())
+                    .with_statement_timeout_ms(timeout_ms),
+            );
+            // Spawn the cache-invalidation listener on the control DB so a re-pin
+            // (e.g. during a slot move) evicts cached tenant→shard mappings fleet-
+            // wide the moment it commits (LISTEN/NOTIFY) rather than waiting out
+            // the TTL. Skipped during a static build (no DB access); needs the
+            // control URL, without one we silently fall back to TTL-only refresh.
+            if spawn_directory_listener {
+                if let Some(control_url) = config.database.effective_primary_url() {
+                    // Detach: the listener runs for the life of the process;
+                    // dropping the JoinHandle leaves the task running rather than
+                    // aborting it.
+                    drop(
+                        crate::sharding::DirectoryShardRouter::spawn_invalidation_listener(
+                            Arc::clone(&dir_router),
+                            control_url.to_owned(),
+                            crate::sharding::DEFAULT_DIRECTORY_INVALIDATION_SWEEP_INTERVAL,
+                        ),
+                    );
+                } else {
+                    // Directory routing is active but there is no control URL to
+                    // open a dedicated LISTEN connection — e.g. a custom
+                    // `DatabasePoolProvider` supplied the control pool without
+                    // `database.primary_url`/`url`. The router still serves
+                    // lookups from the provided pool, but re-pins won't be
+                    // invalidated fleet-wide on commit; they only take effect
+                    // after the cache TTL expires. Warn rather than fall back
+                    // silently so operators relying on the directory for slot
+                    // moves can configure a control URL (or accept TTL-only
+                    // refresh) deliberately.
+                    tracing::warn!(
+                        "directory shard routing is enabled but no control database URL is \
+                         configured (database.primary_url/url is unset, e.g. a custom \
+                         DatabasePoolProvider supplied the control pool); the cache-\
+                         invalidation LISTEN/NOTIFY task cannot be started, so directory \
+                         re-pins will only take effect after the cache TTL expires rather \
+                         than fleet-wide on commit"
+                    );
+                }
+            }
+            dir_router
+        }
+        None => Arc::new(crate::sharding::HashShardRouter),
+    };
+    let set = match shard_provider {
+        Some(factory) => {
+            let topologies = factory(config.database.clone())
+                .await
+                .map_err(|e| format!("Failed to create shard pools: {e}"))?;
+            crate::sharding::build_shard_set(&config.database, topologies, router)
+        }
+        None => crate::sharding::create_shard_set(&config.database, router)
+            .map(|set| set.expect("has_shards() checked above")),
+    }
+    .map_err(|e| format!("Failed to configure shards: {e}"))?;
+    Ok(Some(set))
+}
+
 #[cfg(feature = "db")]
 async fn setup_database(
     config: &AutumnConfig,
@@ -5386,12 +5559,34 @@ async fn setup_database(
     pool_provider: Option<PoolProviderFactory>,
     shard_provider: Option<ShardProviderFactory>,
     shard_router: Option<Arc<dyn crate::sharding::ShardRouter>>,
+    directory_shard_router: bool,
     hook_queue_migration_mode: RepositoryCommitHookQueueMigrationMode,
 ) -> Result<DatabaseBootstrap, String> {
     let migrations = migrations_with_repository_framework_migrations(
         migrations,
         crate::repository_commit_hooks::has_repository_commit_hook_descriptors(),
         crate::version_history::has_versioned_repository_descriptors(),
+        hook_queue_migration_mode,
+    );
+    // Directory routing is only actually active when the app did NOT supply an
+    // explicit shard router: an explicit `with_shard_router(...)` takes
+    // precedence over `directory_shard_router` in `resolve_shard_set`, so in
+    // that case the `DirectoryShardRouter` is never constructed and the
+    // directory table is never consulted. Gate the migration on the same
+    // condition so an explicit-router app doesn't create `_autumn_shard_directory`
+    // (or warn about a pending directory migration) for a table it won't use.
+    let use_directory_router = shard_router.is_none()
+        && (directory_shard_router || config.database.directory_shard_router);
+    // The tenant→shard directory table is a CONTROL-plane table: create it at
+    // startup only when directory routing is active (and shards exist), and
+    // only on the control target — not via the shared list above, which is also
+    // applied to every shard. Like the other runtime framework migrations, it is
+    // suppressed during a static build (`autumn build`, AUTUMN_BUILD_STATIC=1):
+    // the build only renders assets and must not touch the database, so it must
+    // not create `_autumn_shard_directory`.
+    let directory_migration_required = directory_migration_is_required(
+        use_directory_router,
+        config.database.has_shards(),
         hook_queue_migration_mode,
     );
     let check_replica_migrations = !migrations.is_empty();
@@ -5401,23 +5596,18 @@ async fn setup_database(
     }
     .map_err(|e| format!("Failed to create database pool: {e}"))?;
 
-    let router = shard_router.unwrap_or_else(|| Arc::new(crate::sharding::HashShardRouter));
-    let shards = if config.database.has_shards() {
-        let set = match shard_provider {
-            Some(factory) => {
-                let topologies = factory(config.database.clone())
-                    .await
-                    .map_err(|e| format!("Failed to create shard pools: {e}"))?;
-                crate::sharding::build_shard_set(&config.database, topologies, router)
-            }
-            None => crate::sharding::create_shard_set(&config.database, router)
-                .map(|set| set.expect("has_shards() checked above")),
-        }
-        .map_err(|e| format!("Failed to configure shards: {e}"))?;
-        Some(set)
-    } else {
-        None
-    };
+    // Spawn the directory invalidation listener only at real runtime — a static
+    // build must not open control-DB connections.
+    let runtime_boot = hook_queue_migration_mode == RepositoryCommitHookQueueMigrationMode::Runtime;
+    let shards = resolve_shard_set(
+        config,
+        shard_router,
+        shard_provider,
+        use_directory_router,
+        runtime_boot,
+        topology.as_ref(),
+    )
+    .await?;
 
     // Skip migrations when the provider opted out of a database (returned
     // `Ok(None)`) — even if `database.url` is configured. Custom providers
@@ -5437,6 +5627,7 @@ async fn setup_database(
         shards.is_some(),
         provider_migration_url,
         migrations,
+        directory_migration_required,
     )
     .await;
 
@@ -5491,6 +5682,7 @@ async fn run_startup_migrations(
     shards_configured: bool,
     provider_migration_url: Option<String>,
     migrations: Vec<crate::migrate::EmbeddedMigrations>,
+    directory_migration_required: bool,
 ) {
     let control_url = if control_configured {
         // Prefer a provider-resolved URL (e.g. managed Postgres, whose socket
@@ -5526,9 +5718,29 @@ async fn run_startup_migrations(
                     "control",
                 );
             }
+            // The shard directory table lives on the control plane only, so it
+            // is applied here and never to the per-shard targets below.
+            if directory_migration_required {
+                crate::migrate::auto_migrate(
+                    &url,
+                    profile.as_deref(),
+                    auto_in_prod,
+                    &crate::sharding::SHARD_DIRECTORY_MIGRATIONS,
+                    "control",
+                );
+            }
         }
+        // Shards hold tenant data, not the control-plane schema. If the app
+        // registered the full control `FRAMEWORK_MIGRATIONS` set (as some
+        // examples do), skip it for shard targets — otherwise startup would
+        // create the control tables on every shard and (with auto-migrate off)
+        // keep reporting them as pending, even though `autumn migrate --shard`
+        // applies only the shard-required framework migrations.
         for (target, url) in &shard_targets {
-            for mig in &migrations {
+            for mig in migrations
+                .iter()
+                .filter(|mig| !migration_set_is_control_framework(mig))
+            {
                 crate::migrate::auto_migrate(url, profile.as_deref(), auto_in_prod, mig, target);
             }
         }
@@ -5590,6 +5802,23 @@ const REPOSITORY_COMMIT_HOOK_QUEUE_MIGRATION: &str =
 #[cfg(feature = "db")]
 const VERSION_HISTORY_MIGRATION: &str = "20260526000000_create_version_history";
 
+/// Whether startup should create the control-plane `_autumn_shard_directory`
+/// table. It is required only when directory routing is enabled AND shards are
+/// configured AND we are in a real runtime boot — never during a static build
+/// (`autumn build`, `AUTUMN_BUILD_STATIC=1`), which renders assets and must not
+/// touch the database, mirroring how the other runtime framework migrations are
+/// suppressed in [`migrations_with_repository_framework_migrations`].
+#[cfg(feature = "db")]
+const fn directory_migration_is_required(
+    directory_routing_enabled: bool,
+    has_shards: bool,
+    mode: RepositoryCommitHookQueueMigrationMode,
+) -> bool {
+    directory_routing_enabled
+        && has_shards
+        && matches!(mode, RepositoryCommitHookQueueMigrationMode::Runtime)
+}
+
 #[cfg(feature = "db")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RepositoryCommitHookQueueMigrationMode {
@@ -5606,37 +5835,87 @@ fn migrations_with_repository_framework_migrations(
 ) -> Vec<crate::migrate::EmbeddedMigrations> {
     if hook_queue_required
         && mode == RepositoryCommitHookQueueMigrationMode::Runtime
-        && !migration_sets_include(&migrations, REPOSITORY_COMMIT_HOOK_QUEUE_MIGRATION)
+        && !shard_applied_sets_include(&migrations, REPOSITORY_COMMIT_HOOK_QUEUE_MIGRATION)
     {
         migrations.push(crate::repository_commit_hooks::REPOSITORY_COMMIT_HOOK_MIGRATIONS);
     }
     if version_history_required
         && mode == RepositoryCommitHookQueueMigrationMode::Runtime
-        && !migration_sets_include(&migrations, VERSION_HISTORY_MIGRATION)
+        && !shard_applied_sets_include(&migrations, VERSION_HISTORY_MIGRATION)
     {
         migrations.push(crate::version_history::VERSION_HISTORY_MIGRATIONS);
     }
     migrations
 }
 
+/// Whether `migration_name` is already present in a set that shard targets will
+/// actually apply — i.e. a *non*-control-framework set.
+///
+/// The full control [`FRAMEWORK_MIGRATIONS`](crate::migrate::FRAMEWORK_MIGRATIONS)
+/// set is deliberately excluded: `run_startup_migrations` strips it from shard
+/// targets, so a migration present *only* inside it never reaches the shards. If
+/// de-duplication counted it, a sharded app that registers `FRAMEWORK_MIGRATIONS`
+/// (and uses commit hooks / versioning) would skip appending the standalone
+/// shard-required set yet have the control set filtered out on shards — leaving
+/// shards without `_autumn_repository_commit_hook_queue` / `_autumn_version_history`.
+/// Matching only shard-applied sets ensures the standalone set is appended
+/// whenever the shards would otherwise be missing it. Re-applying it to the
+/// control target is harmless: it shares the migration version already recorded
+/// by the control framework set, so Diesel skips it there.
 #[cfg(feature = "db")]
-fn migration_sets_include(
+fn shard_applied_sets_include(
     migrations: &[crate::migrate::EmbeddedMigrations],
     migration_name: &str,
 ) -> bool {
     use diesel::migration::{Migration, MigrationSource as _};
     use diesel::pg::Pg;
 
-    migrations.iter().any(|source| {
-        let Ok(source_migrations): Result<Vec<Box<dyn Migration<Pg>>>, _> = source.migrations()
-        else {
-            return false;
-        };
+    migrations
+        .iter()
+        .filter(|set| !migration_set_is_control_framework(set))
+        .any(|source| {
+            let Ok(source_migrations): Result<Vec<Box<dyn Migration<Pg>>>, _> = source.migrations()
+            else {
+                return false;
+            };
 
-        source_migrations
-            .iter()
-            .any(|migration| migration.name().to_string() == migration_name)
-    })
+            source_migrations
+                .iter()
+                .any(|migration| migration.name().to_string() == migration_name)
+        })
+}
+
+/// Whether a migration set is the control-plane
+/// [`FRAMEWORK_MIGRATIONS`](crate::migrate::FRAMEWORK_MIGRATIONS), so it can be
+/// skipped on shard targets.
+///
+/// Identified by containing a *control-only* migration — one in
+/// `FRAMEWORK_MIGRATIONS` but not in the shard-required version-history /
+/// commit-hook sets. Those two sets' migrations are duplicated into the control
+/// `migrations/` directory, so a plain name overlap would also (wrongly) match
+/// the standalone `VERSION_HISTORY_MIGRATIONS` / `REPOSITORY_COMMIT_HOOK_MIGRATIONS`
+/// sets and strip them from shards.
+#[cfg(feature = "db")]
+fn migration_set_is_control_framework(set: &crate::migrate::EmbeddedMigrations) -> bool {
+    use diesel::migration::{Migration, MigrationSource as _};
+    use diesel::pg::Pg;
+
+    fn names(set: &crate::migrate::EmbeddedMigrations) -> std::collections::HashSet<String> {
+        let migrations: Vec<Box<dyn Migration<Pg>>> = set.migrations().unwrap_or_default();
+        migrations.iter().map(|m| m.name().to_string()).collect()
+    }
+
+    let mut control_only = names(&crate::migrate::FRAMEWORK_MIGRATIONS);
+    for shard_required in [
+        &crate::version_history::VERSION_HISTORY_MIGRATIONS,
+        &crate::repository_commit_hooks::REPOSITORY_COMMIT_HOOK_MIGRATIONS,
+    ] {
+        for name in names(shard_required) {
+            control_only.remove(&name);
+        }
+    }
+
+    names(set).iter().any(|name| control_only.contains(name))
 }
 
 #[cfg(feature = "db")]
@@ -6800,6 +7079,7 @@ mod tests {
             pool_provider_factory,
             None,
             None,
+            false,
             RepositoryCommitHookQueueMigrationMode::Runtime,
         )
         .await
@@ -6870,6 +7150,7 @@ mod tests {
             None,
             None,
             None,
+            false,
             RepositoryCommitHookQueueMigrationMode::Runtime,
         )
         .await
@@ -6956,6 +7237,7 @@ mod tests {
             pool_provider_factory,
             shard_provider_factory,
             None,
+            false,
             RepositoryCommitHookQueueMigrationMode::Runtime,
         )
         .await
@@ -7156,6 +7438,23 @@ mod tests {
 
     #[cfg(feature = "db")]
     #[test]
+    fn directory_migration_required_only_at_runtime_with_shards_and_routing() {
+        use RepositoryCommitHookQueueMigrationMode::{Runtime, StaticBuild};
+
+        // The happy path: routing on, shards present, real runtime boot.
+        assert!(directory_migration_is_required(true, true, Runtime));
+
+        // A static build must never create the directory table, even with
+        // routing enabled and shards configured.
+        assert!(!directory_migration_is_required(true, true, StaticBuild));
+
+        // Routing disabled, or no shards, means no directory table at all.
+        assert!(!directory_migration_is_required(false, true, Runtime));
+        assert!(!directory_migration_is_required(true, false, Runtime));
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
     fn unhooked_apps_do_not_auto_add_hook_queue_framework_migration() {
         let migrations = migrations_with_repository_framework_migrations(
             Vec::new(),
@@ -7183,6 +7482,72 @@ mod tests {
             })
             .map(|migration| migration.name().to_string())
             .collect()
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn control_framework_filter_skips_control_but_keeps_shard_required_sets() {
+        // The full control set is skipped on shards...
+        assert!(migration_set_is_control_framework(
+            &crate::migrate::FRAMEWORK_MIGRATIONS
+        ));
+        // ...but the standalone shard-required sets are kept (not flagged),
+        // even though their migrations are duplicated into the control
+        // `migrations/` directory.
+        assert!(!migration_set_is_control_framework(
+            &crate::version_history::VERSION_HISTORY_MIGRATIONS
+        ));
+        assert!(!migration_set_is_control_framework(
+            &crate::repository_commit_hooks::REPOSITORY_COMMIT_HOOK_MIGRATIONS
+        ));
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn sharded_app_with_full_framework_still_gets_shard_required_sets() {
+        use diesel::migration::{Migration, MigrationSource as _};
+        use diesel::pg::Pg;
+
+        // A sharded app that registers the full control FRAMEWORK_MIGRATIONS and
+        // also uses commit hooks + versioning. The hook-queue / version-history
+        // migrations are present *inside* the control set, but that set is
+        // stripped from shard targets by `migration_set_is_control_framework`, so
+        // the standalone shard-required sets must still be appended — otherwise
+        // shards never get those tables.
+        let migrations = migrations_with_repository_framework_migrations(
+            vec![crate::migrate::FRAMEWORK_MIGRATIONS],
+            true,
+            true,
+            RepositoryCommitHookQueueMigrationMode::Runtime,
+        );
+
+        // The migration names the shard apply loop will actually run: every set
+        // that is not the control framework set (which gets stripped on shards).
+        let shard_names: Vec<String> = migrations
+            .iter()
+            .filter(|set| !migration_set_is_control_framework(set))
+            .flat_map(|set| {
+                let ms: Vec<Box<dyn Migration<Pg>>> = set.migrations().unwrap_or_default();
+                ms.into_iter()
+                    .map(|m| m.name().to_string())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+
+        assert!(
+            shard_names
+                .iter()
+                .any(|name| name == REPOSITORY_COMMIT_HOOK_QUEUE_MIGRATION),
+            "shards must receive the commit-hook queue migration even when the full \
+             control framework set is also registered: {shard_names:?}"
+        );
+        assert!(
+            shard_names
+                .iter()
+                .any(|name| name == VERSION_HISTORY_MIGRATION),
+            "shards must receive the version-history migration even when the full \
+             control framework set is also registered: {shard_names:?}"
+        );
     }
 
     #[cfg(feature = "db")]
