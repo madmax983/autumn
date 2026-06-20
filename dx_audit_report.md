@@ -23,10 +23,11 @@
 - Confirmed that the `curl -v http://localhost:3000/missing` request responds with HTTP 404 and `content-length: 0` despite having framework error page middleware.
 - Confirmed the macro compiler error by intentionally misspelling a route in `routes![]`.
 - The `README Run` works as intended, provided you don't make any errors.
+
+
 # DX Audit Report: `autumn dev` Hot Reloading
 
-## 1. EXPERIENCE
-
+## 1. 🔍 EXPERIENCE - The Walkthrough
 Following the Quickstart guide in `README.md`:
 
 ```bash
@@ -39,19 +40,19 @@ autumn dev
 
 The server started up successfully, watching for file changes.
 
-## 2. STUMBLE
+## 2. 🚧 STUMBLE - The Friction Points
 
 While the default project structure works well, what happens if I want to organize my templates into a separate directory, like `src/views/`?
 
 I created a file `src/views/index.html` and modified it while `autumn dev` was running. However, the server did not detect the change and trigger a rebuild/reload. I expected it to pick up changes in `src/` or common template directories.
 
-## 3. REPORT
+## 3. 📢 REPORT - The Complaint
 
 The `autumn dev` command currently only watches specific directories for changes: `src`, `static`, `templates`, and `migrations`.
 
 If a developer decides to put their HTML templates in a different directory (e.g., `views`, which is a common convention in web frameworks), `autumn dev` will silently ignore changes to those files. This leads to a frustrating developer experience where the browser doesn't reflect the latest changes, and the developer might assume their code is broken or the dev server has crashed.
 
-## 4. VERIFY
+## 4. 🧪 VERIFY - The "idiot proofing"
 
 To make the developer experience more robust ("idiot-proofing"):
 
@@ -116,3 +117,21 @@ To make the developer experience more robust ("idiot-proofing"):
 
 ## 4. 🧪 VERIFY - The "idiot proofing"
 - Confirmed that Axum's `IntoResponse` trait is not implemented for `i32`, `i64`, or other plain numbers out-of-the-box, meaning they cannot be returned directly from route handlers without manually converting them to strings or JSON first.
+
+# 🗣️ Echo: DX Audit for Returning Primitives
+
+## 1. 🔍 EXPERIENCE - The Walkthrough
+- Wanted to fix the friction point where returning primitive types like `i32` completely crashes the compiler when returning them directly from an axum route handler.
+- Attempted to implement `Primitive(T)` and add it to `autumn/src/primitive.rs` that implements `IntoResponse` for `T: Display`.
+- Exposed `Primitive` in the `prelude.rs` so that `Primitive(42)` can be used seamlessly.
+
+## 2. 🚧 STUMBLE - The Friction Points
+- **Slang Check**: Users should just use the `Primitive(T)` instead of diving deep into trait bounds of the web framework.
+- **Error Check**: If users don't wrap their values, they get trait bound errors.
+
+## 3. 📢 REPORT - The Complaint
+- "I just want to return an integer without a 20-line compiler dump! Luckily, with the `Primitive(T)` wrapper, the user won't encounter this anymore!"
+
+## 4. 🧪 VERIFY - The "idiot proofing"
+- Verified that compiling an app that returns `Primitive(42)` builds successfully without any Axum trait bound errors.
+- Verified that the `Primitive<T>` solves the main complaint highlighted in the DX Audit of route handlers.
