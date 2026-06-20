@@ -189,6 +189,21 @@ pub fn generate_with(name: &str, parent_dir: &Path, opts: GenerateOptions) -> Re
              # daemon with `autumn serve --daemon` (no Postgres required).\n",
         );
     }
+    if opts.with_bundled_pg {
+        // The managed cluster is private to this daemon and has no URL outside
+        // the provider, so `autumn migrate` can't reach it and `--release` runs
+        // under the `prod` profile (where migrations are otherwise only logged).
+        // Apply embedded migrations automatically so a fresh release data dir
+        // doesn't come up with missing tables.
+        autumn_toml.push_str(
+            "\n# Managed local Postgres (`autumn serve --bundled-pg`): the cluster is\n\
+             # owned by the daemon, so apply embedded migrations automatically even\n\
+             # under the production profile (a fresh data dir would otherwise start\n\
+             # with no tables).\n\
+             [database]\n\
+             auto_migrate_in_production = true\n",
+        );
+    }
     fs::write(project_dir.join("autumn.toml"), autumn_toml)?;
     fs::write(
         project_dir.join("Dockerfile"),
@@ -828,6 +843,21 @@ mod tests {
             !cargo.contains("default-features = false"),
             "bundled starter keeps the database (default features on)"
         );
+    }
+
+    #[test]
+    fn bundled_pg_autumn_toml_enables_auto_migrate_in_production() {
+        let tmp = TempDir::new().unwrap();
+        generate_with("pg-cfg-app", tmp.path(), bundled_pg_opts()).unwrap();
+        let toml = fs::read_to_string(tmp.path().join("pg-cfg-app/autumn.toml")).unwrap();
+        // A `--release` daemon runs under the prod profile and the managed DB is
+        // unreachable to `autumn migrate`, so migrations must apply automatically.
+        assert!(
+            toml.contains("[database]") && toml.contains("auto_migrate_in_production = true"),
+            "bundled starter must auto-migrate in production: {toml}"
+        );
+        // Still valid TOML (no duplicate tables with the commented template).
+        toml::from_str::<toml::Table>(&toml).expect("generated autumn.toml parses");
     }
 
     #[test]

@@ -242,7 +242,12 @@ fn socket_identity_matches(socket: &Path, pid: u32) -> bool {
 /// as macOS — the PID alone is ambiguous, so require the daemon's socket to have
 /// a live listener: an unrelated process that reused the PID would not be
 /// listening there. This stops `status`/`stop` from acting on a reused PID.
-fn confirmed_running(rec: &process::PidRecord, socket: &Path) -> bool {
+///
+/// `startup_in_progress` (the startup lock still exists) covers the boot window:
+/// the pidfile is written before the app binds its socket, so on macOS/BSD a
+/// live PID with no listener yet would otherwise be misread as a dead stale
+/// pidfile and removed mid-startup.
+fn confirmed_running(rec: &process::PidRecord, socket: &Path, startup_in_progress: bool) -> bool {
     if !process::is_process_alive(rec.pid) {
         return false;
     }
@@ -252,9 +257,11 @@ fn confirmed_running(rec: &process::PidRecord, socket: &Path) -> bool {
         // time is stale even if some daemon happens to be listening.
         (Some(recorded), Some(current)) => recorded == current,
         // Identity unknown (no recorded start time, or a platform like macOS
-        // that can't report one): confirm the PID actually owns the socket
-        // (SO_PEERCRED on Linux, else liveness), so a reused PID isn't accepted.
-        _ => socket_identity_matches(socket, rec.pid),
+        // that can't report one): a start still in progress means the live PID
+        // is our daemon binding its socket; otherwise confirm the PID actually
+        // owns the socket (SO_PEERCRED on Linux, else liveness) so a reused PID
+        // isn't accepted.
+        _ => startup_in_progress || socket_identity_matches(socket, rec.pid),
     }
 }
 
@@ -290,35 +297,35 @@ fn resolve_paths(package: Option<&str>) -> RuntimePaths {
     })
 }
 
-/// Derive a stable project identity for namespacing runtime dirs.
-///
-/// The base name is the explicit package, else the current crate's
-/// `[package].name`, else the cwd dir name. A short hash of the absolute
-/// project directory is appended so two unrelated checkouts that share a
-/// package name (e.g. two clones both named `api`) never collide on the same
-/// pidfile / socket / managed-Postgres data dir.
-fn project_identity(package: Option<&str>) -> String {
-    let name = package
-        .map(ToOwned::to_owned)
-        .or_else(read_package_name)
-        .unwrap_or_else(|| {
-            std::env::current_dir()
-                .ok()
-                .and_then(|d| d.file_name().map(|n| n.to_string_lossy().into_owned()))
-                .unwrap_or_else(|| "autumn-app".to_owned())
-        });
-    format!("{name}-{}", project_dir_hash(package))
+/// The transient startup lock `launch_daemon_child` holds (with its own pid)
+/// from spawn until the daemon is ready. Its presence marks a start in progress.
+fn start_lock_path(paths: &RuntimePaths) -> PathBuf {
+    paths.pid_file().with_file_name("serve.startlock")
 }
 
-/// Read `[package].name` from the `Cargo.toml` in the current directory.
-fn read_package_name() -> Option<String> {
-    let contents = std::fs::read_to_string("Cargo.toml").ok()?;
-    let table = toml::from_str::<toml::Table>(&contents).ok()?;
-    table
-        .get("package")
-        .and_then(|p| p.get("name"))
-        .and_then(toml::Value::as_str)
-        .map(ToOwned::to_owned)
+/// Derive a stable project identity for namespacing runtime dirs.
+///
+/// The base name is the explicit `-p` package, else the project directory's
+/// name. A short hash of the (workspace-anchored) project directory is appended
+/// so two unrelated checkouts that share a name never collide on the same
+/// pidfile / socket / managed-Postgres data dir.
+///
+/// The name is deliberately **manifest-independent**: it never reads
+/// `Cargo.toml`'s `[package].name`, so a daemon's namespace stays the same even
+/// if the manifest later becomes temporarily unparseable/unreadable (which would
+/// otherwise flip the name and make `status`/`stop` target a different, empty
+/// namespace).
+fn project_identity(package: Option<&str>) -> String {
+    let name = package.map_or_else(
+        || {
+            canonical_cwd().file_name().map_or_else(
+                || "autumn-app".to_owned(),
+                |n| n.to_string_lossy().into_owned(),
+            )
+        },
+        ToOwned::to_owned,
+    );
+    format!("{name}-{}", project_dir_hash(package))
 }
 
 /// A short, stable hash distinguishing same-named projects in different
@@ -413,7 +420,7 @@ fn start_daemon(opts: &ServeOptions) -> i32 {
     // an unrelated process (notably on macOS, where start time isn't available)
     // doesn't block a legitimate start.
     if let Some(rec) = process::read_pidfile(&paths.pid_file())
-        && confirmed_running(&rec, &paths.socket_file())
+        && confirmed_running(&rec, &paths.socket_file(), start_lock_path(&paths).exists())
     {
         eprintln!(
             "autumn serve: already running (pid {}). \
@@ -597,7 +604,7 @@ fn launch_daemon_child(
     // Separate startup lock (claimed with our own pid) so two concurrent starts
     // can't both spawn — but it is NOT the pidfile, so a concurrent `stop`/
     // `status` during startup never signals the launcher.
-    let start_lock = paths.pid_file().with_file_name("serve.startlock");
+    let start_lock = start_lock_path(paths);
     match process::acquire_pidfile(&start_lock, std::process::id()) {
         Ok(()) => {}
         Err(AcquireError::AlreadyRunning(existing)) => {
@@ -872,7 +879,7 @@ fn stop(opts: &ServeOptions) -> i32 {
     // cluster it launched can still be alive (Postgres `setsid`s out of the
     // daemon's process group, so it survives the app's crash/kill).
     let addr = read_addr_file(&paths);
-    if !confirmed_running(&rec, &socket) {
+    if !confirmed_running(&rec, &socket, start_lock_path(&paths).exists()) {
         // The daemon is gone, but if it owned a managed cluster reap that too —
         // otherwise a crash before `stop` leaves Postgres holding the data
         // dir/port until manual cleanup. Reap when the address file says managed
@@ -1122,7 +1129,7 @@ fn status(opts: &ServeOptions) -> i32 {
         println!("autumn serve: stopped");
         return 3;
     };
-    if confirmed_running(&rec, &socket) {
+    if confirmed_running(&rec, &socket, start_lock_path(&paths).exists()) {
         let address =
             read_addr_file(&paths).map_or_else(|| socket.display().to_string(), |a| a.address);
         println!("autumn serve: running (pid {}) on unix:{address}", rec.pid);
@@ -1441,7 +1448,24 @@ mod tests {
         };
         assert!(!confirmed_running(
             &rec,
-            std::path::Path::new("/nonexistent/serve.sock")
+            std::path::Path::new("/nonexistent/serve.sock"),
+            false,
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn confirmed_running_true_while_startup_in_progress() {
+        // During boot the pidfile exists before the socket binds; a live PID with
+        // the startup lock present must read as running (not a dead stale lock).
+        let rec = process::PidRecord {
+            pid: std::process::id(),
+            start_time: None,
+        };
+        assert!(confirmed_running(
+            &rec,
+            std::path::Path::new("/nonexistent/serve.sock"),
+            true,
         ));
     }
 
@@ -1456,7 +1480,8 @@ mod tests {
         };
         assert!(confirmed_running(
             &rec,
-            std::path::Path::new("/nonexistent/serve.sock")
+            std::path::Path::new("/nonexistent/serve.sock"),
+            false,
         ));
     }
 
