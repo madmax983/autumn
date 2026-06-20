@@ -176,13 +176,22 @@ async fn db_reset_runs_drop_create_migrate_and_skips_seed() {
     assert!(stderr.contains("reset: drop"), "stderr: {stderr}");
     assert!(stderr.contains("reset: create"), "stderr: {stderr}");
     assert!(stderr.contains("reset: migrate"), "stderr: {stderr}");
-    assert!(stderr.contains("skipping the seed step"), "stderr: {stderr}");
-    assert!(stderr.contains("Database reset complete"), "stderr: {stderr}");
+    assert!(
+        stderr.contains("skipping the seed step"),
+        "stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("Database reset complete"),
+        "stderr: {stderr}"
+    );
 
     // Running it a second time proves the full round-trip is repeatable
     // (drop now actually drops the populated DB, then re-creates + migrates).
     let (_, stderr) = run_autumn_ok(dir, &["db", "reset"], &envs);
-    assert!(stderr.contains("Database reset complete"), "stderr: {stderr}");
+    assert!(
+        stderr.contains("Database reset complete"),
+        "stderr: {stderr}"
+    );
 }
 
 #[tokio::test]

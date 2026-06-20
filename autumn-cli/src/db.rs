@@ -96,7 +96,12 @@ pub fn run(command: &DbCommand, profile: Option<&str>) {
 /// `autumn db create` — create the configured database, idempotently.
 fn create(profile: Option<&str>) -> Result<(), DbError> {
     let url = resolve_url(profile)?;
-    let MaintenanceTarget { db_name, maintenance_url, host, port } = maintenance_target(&url)?;
+    let MaintenanceTarget {
+        db_name,
+        maintenance_url,
+        host,
+        port,
+    } = maintenance_target(&url)?;
     let mut conn = connect(&maintenance_url, &host, port, &db_name)?;
 
     if database_exists(&mut conn, &db_name)? {
@@ -116,7 +121,12 @@ fn drop(profile: Option<&str>, force: bool) -> Result<(), DbError> {
     guard_destructive(&resolved, force)?;
 
     let url = resolve_url(profile)?;
-    let MaintenanceTarget { db_name, maintenance_url, host, port } = maintenance_target(&url)?;
+    let MaintenanceTarget {
+        db_name,
+        maintenance_url,
+        host,
+        port,
+    } = maintenance_target(&url)?;
     let mut conn = connect(&maintenance_url, &host, port, &db_name)?;
 
     if !database_exists(&mut conn, &db_name)? {
@@ -152,7 +162,9 @@ fn reset(profile: Option<&str>, force: bool) -> Result<(), DbError> {
         eprintln!("  \u{2139} No src/bin/seed.rs found \u{2014} skipping the seed step.");
     }
 
-    eprintln!("\n\u{2713} Database reset complete (drop \u{2192} create \u{2192} migrate \u{2192} seed).");
+    eprintln!(
+        "\n\u{2713} Database reset complete (drop \u{2192} create \u{2192} migrate \u{2192} seed)."
+    );
     Ok(())
 }
 
@@ -176,7 +188,9 @@ fn run_step(name: &str, args: &[&str], profile: Option<&str>) -> Result<(), DbEr
         Err(DbError::Sql(format!(
             "reset failed at the {name:?} step (`autumn {}` exited {}).",
             args.join(" "),
-            status.code().map_or_else(|| "with a signal".to_owned(), |c| format!("with code {c}")),
+            status
+                .code()
+                .map_or_else(|| "with a signal".to_owned(), |c| format!("with code {c}")),
         )))
     }
 }
@@ -199,14 +213,19 @@ fn guard_destructive(profile: &str, force: bool) -> Result<(), DbError> {
     if force || is_safe_destructive_profile(profile) {
         Ok(())
     } else {
-        Err(DbError::ProductionRefused { profile: profile.to_owned() })
+        Err(DbError::ProductionRefused {
+            profile: profile.to_owned(),
+        })
     }
 }
 
 /// Whether a profile is one the destructive ops may run against without
 /// `--force` (the local-development profiles `dev`/`test`).
 fn is_safe_destructive_profile(profile: &str) -> bool {
-    matches!(profile.trim().to_ascii_lowercase().as_str(), "dev" | "development" | "test")
+    matches!(
+        profile.trim().to_ascii_lowercase().as_str(),
+        "dev" | "development" | "test"
+    )
 }
 
 /// The parsed pieces needed to issue `CREATE`/`DROP DATABASE` from the server's
@@ -244,7 +263,12 @@ fn maintenance_target(url: &str) -> Result<MaintenanceTarget, DbError> {
 
     let mut maintenance = parsed;
     maintenance.set_path("/postgres");
-    Ok(MaintenanceTarget { db_name, maintenance_url: maintenance.to_string(), host, port })
+    Ok(MaintenanceTarget {
+        db_name,
+        maintenance_url: maintenance.to_string(),
+        host,
+        port,
+    })
 }
 
 /// Establish a synchronous Postgres connection to the maintenance database,
@@ -374,7 +398,10 @@ mod tests {
     #[test]
     fn guard_allows_dev_and_test_without_force() {
         for profile in ["dev", "development", "DEV", "test", "Test"] {
-            assert!(guard_destructive(profile, false).is_ok(), "{profile} should be allowed");
+            assert!(
+                guard_destructive(profile, false).is_ok(),
+                "{profile} should be allowed"
+            );
         }
     }
 
@@ -382,10 +409,16 @@ mod tests {
     fn guard_refuses_prod_and_custom_without_force() {
         for profile in ["prod", "production", "staging", "anything-else"] {
             assert!(
-                matches!(guard_destructive(profile, false), Err(DbError::ProductionRefused { .. })),
+                matches!(
+                    guard_destructive(profile, false),
+                    Err(DbError::ProductionRefused { .. })
+                ),
                 "{profile} should be refused without --force"
             );
-            assert!(guard_destructive(profile, true).is_ok(), "{profile} should pass with --force");
+            assert!(
+                guard_destructive(profile, true).is_ok(),
+                "{profile} should pass with --force"
+            );
         }
     }
 
@@ -403,7 +436,9 @@ mod tests {
         assert!(rendered.contains("my_app"));
 
         // The production-refusal message names the profile but no URL.
-        let refused = DbError::ProductionRefused { profile: "prod".to_owned() };
+        let refused = DbError::ProductionRefused {
+            profile: "prod".to_owned(),
+        };
         assert!(refused.to_string().contains("prod"));
         assert!(!refused.to_string().contains("postgres://"));
     }
