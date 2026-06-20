@@ -935,7 +935,7 @@ impl std::ops::DerefMut for Db {
 pub(crate) struct DbCheckoutParams<'a> {
     /// Pool to check the connection out of.
     pub pool: &'a Pool<AsyncPgConnection>,
-    /// Role label surfaced to [`DbConnectionInterceptor`]s, e.g. `"primary"`
+    /// Role label surfaced to [`crate::interceptor::DbConnectionInterceptor`]s, e.g. `"primary"`
     /// or `"shard:<name>:primary"`.
     pub pool_name: &'a str,
     /// Shard name recorded on the `db.connection` span, when routed.

@@ -540,7 +540,7 @@ fn already_degraded<S: ProvideProbeState>(state: &S) -> bool {
     !probes.is_startup_complete() || probes.is_shutting_down() || !dependency_readiness(state).0
 }
 
-/// Run all readiness-group [`HealthIndicator`]s and return `false` if any are
+/// Run all readiness-group [`crate::actuator::HealthIndicator`]s and return `false` if any are
 /// `Down` or `OutOfService`.
 async fn check_readiness_indicators<S: ProvideProbeState + Sync>(state: &S) -> bool {
     let Some(registry) = state.health_indicator_registry() else {
