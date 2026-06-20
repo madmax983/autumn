@@ -165,6 +165,16 @@ impl ManagedPostgresPoolProvider {
         }
     }
 
+    /// Directory the bundled/downloaded Postgres binaries are extracted to, kept
+    /// under the managed data root (the data dir's parent) so it never depends on
+    /// `$HOME`.
+    fn installation_dir(&self) -> PathBuf {
+        self.data_dir
+            .parent()
+            .unwrap_or(&self.data_dir)
+            .join("postgresql")
+    }
+
     /// Provision (if needed) and start the cluster, returning its connection URL.
     async fn ensure_running(&self) -> Result<String, postgresql_embedded::Error> {
         // Already started (e.g. a second pool, or repeated calls): reuse the
@@ -178,6 +188,11 @@ impl ManagedPostgresPoolProvider {
 
         let mut settings = Settings::new();
         settings.data_dir.clone_from(&self.data_dir);
+        // Extract the Postgres binaries under the managed data root rather than
+        // `Settings::new()`'s `$HOME/.theseus` default, which may be unset or
+        // unwritable under launchd/systemd/container supervisors and would fail
+        // before `initdb` even when the CLI-provided data dir is valid.
+        settings.installation_dir = self.installation_dir();
         settings.version = self.version.clone();
         // Persistent cluster tied to the daemon, not a throwaway temp dir.
         settings.temporary = false;
