@@ -348,7 +348,7 @@ fn extract_path_params(pattern: &str, uri_path: &str) -> serde_json::Value {
     serde_json::Value::Object(map)
 }
 
-/// Convert an inspector [`QueryRecord`] to the overlay's [`SqlQueryInfo`].
+/// Convert an inspector [`crate::inspector::QueryRecord`] to the overlay's [`crate::error_pages::dev_badge::SqlQueryInfo`].
 fn query_record_to_sql_info(
     r: &crate::inspector::QueryRecord,
 ) -> crate::error_pages::dev_badge::SqlQueryInfo {

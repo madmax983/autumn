@@ -265,9 +265,9 @@ pub struct TestApp {
     /// to [`crate::time::TickingClock`] at runtime.
     clock_as_any: Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>,
     api_versions: Vec<crate::app::ApiVersion>,
-    /// Plugin-contributed metrics sources registered via [`AppBuilder::metrics_source`].
+    /// Plugin-contributed metrics sources registered via [`crate::app::AppBuilder::metrics_source`].
     metrics_sources: Vec<(String, std::sync::Arc<dyn crate::actuator::MetricsSource>)>,
-    /// Plugin-contributed health indicators registered via [`AppBuilder::health_indicator`].
+    /// Plugin-contributed health indicators registered via [`crate::app::AppBuilder::health_indicator`].
     health_indicators: Vec<(
         String,
         crate::actuator::IndicatorGroup,

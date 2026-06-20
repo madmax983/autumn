@@ -171,7 +171,7 @@ type PoolProviderFactory = Box<
             >,
         > + Send,
 >;
-/// Captured [`DatabasePoolProvider::create_shard_topology`] calls: builds
+/// Captured [`crate::db::DatabasePoolProvider::create_shard_topology`] calls: builds
 /// one topology per configured shard, in declaration order.
 #[cfg(feature = "db")]
 type ShardProviderFactory = Box<
@@ -1758,8 +1758,8 @@ impl AppBuilder {
     /// chain reporters; each receives every event. When none are registered,
     /// the built-in [`LogReporter`](crate::reporting::LogReporter) is used.
     ///
-    /// Mirrors [`with_blob_store`](Self::with_blob_store) /
-    /// [`with_cache_backend`](Self::with_cache_backend).
+    /// Mirrors `with_blob_store` /
+    /// `with_cache_backend`.
     ///
     /// # Examples
     ///

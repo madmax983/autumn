@@ -1,8 +1,8 @@
 //! Request-scoped log context middleware.
 //!
-//! Establishes an always-on [`LogContext`](crate::log::context::LogContext) for
+//! Establishes an always-on [`LogContext`] for
 //! every HTTP request, seeded with the request's `request_id` (read from the
-//! [`RequestId`](crate::middleware::RequestId) extension installed by
+//! [`RequestId`] extension installed by
 //! [`RequestIdLayer`](crate::middleware::RequestIdLayer)). The request is then
 //! driven inside both that task-local context and a `tracing` span carrying
 //! `request_id`/`user_id`/`tenant_id`, so every event emitted during the
