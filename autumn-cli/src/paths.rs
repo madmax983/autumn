@@ -92,7 +92,16 @@ impl RuntimePaths {
     /// determined for the current user.
     pub fn resolve(project: &str) -> Result<Self, PathsError> {
         if let Some(base) = std::env::var_os(RUNTIME_DIR_ENV) {
-            return Ok(Self::from_base(Path::new(&base), project));
+            // Make a relative override absolute (against the launcher's CWD) so
+            // the socket/pidfile paths handed to the child resolve identically
+            // even though `base_command` runs the child from the package's
+            // manifest dir.
+            let base = PathBuf::from(base);
+            let base = match (base.is_absolute(), std::env::current_dir()) {
+                (false, Ok(cwd)) => cwd.join(&base),
+                _ => base,
+            };
+            return Ok(Self::from_base(&base, project));
         }
 
         let dirs = directories::ProjectDirs::from(QUALIFIER, ORGANIZATION, project)

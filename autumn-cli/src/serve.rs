@@ -206,12 +206,16 @@ fn confirmed_running(rec: &process::PidRecord, socket: &Path) -> bool {
     if !process::is_process_alive(rec.pid) {
         return false;
     }
-    if let (Some(recorded), Some(current)) = (rec.start_time, process::process_start_time(rec.pid))
-        && recorded == current
-    {
-        return true;
+    match (rec.start_time, process::process_start_time(rec.pid)) {
+        // Identity is known on both sides (Linux): trust the comparison and do
+        // *not* fall back to the socket — a reused PID with a different start
+        // time is stale even if some daemon happens to be listening.
+        (Some(recorded), Some(current)) => recorded == current,
+        // Identity unknown (no recorded start time, or a platform like macOS
+        // that can't report one): use the live socket as a best-effort check, so
+        // a reused PID that isn't actually serving here is treated as stale.
+        _ => socket_is_live(socket),
     }
-    socket_is_live(socket)
 }
 
 /// Resolve the daemon PID for lifecycle commands. Prefers the authoritative
