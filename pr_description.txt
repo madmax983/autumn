@@ -1,0 +1,12 @@
+🤖 Sentinel: Improve test coverage for AutumnError
+
+🧬 Mutants Found: 38 surviving mutants initially listed in `autumn/src/error.rs` (using `--list` as `cargo mutants` verification timed out).
+🎯 Tests Added/Strengthened:
+  - `circuit_breaker_error_maps_to_503`: Asserted that mapping a circuit breaker `Error` via `From` correctly yields `503 Service Unavailable`.
+  - `circuit_breaker_error_into_response_maps_to_503`: Asserted that Axum's `into_response` mapping handles database statement timeout mappings correctly.
+  - `query_canceled_into_response_maps_to_503_for_other_patterns`: Checked various forms of the "query canceled" and "statement timeout" errors.
+  - `non_conflict_response_has_no_hx_trigger_header`: Asserted that the `HX-Trigger` header is omitted for errors that are NOT `409 Conflict`.
+  - `cache_idempotency_response_extension_is_set` / `cache_idempotency_response_extension_is_not_set_by_default`: Asserted the presence and absence of the idempotency response extensions.
+⚠️ Suspected Bugs: None.
+📊 Kill Rate: Unable to calculate exact percentage as `cargo mutants` times out on verification, but all targeted gaps are now covered with passing unit tests.
+🔗 Havoc Interaction: None.
