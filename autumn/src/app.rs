@@ -3327,9 +3327,8 @@ impl AppBuilder {
         #[cfg(unix)]
         if let Some((path, dev, ino)) = &unix_socket_cleanup {
             use std::os::unix::fs::MetadataExt;
-            let still_ours = std::fs::metadata(path)
-                .map(|m| m.dev() == *dev && m.ino() == *ino)
-                .unwrap_or(false);
+            let still_ours =
+                std::fs::metadata(path).is_ok_and(|m| m.dev() == *dev && m.ino() == *ino);
             if still_ours {
                 let _ = std::fs::remove_file(path);
             }
