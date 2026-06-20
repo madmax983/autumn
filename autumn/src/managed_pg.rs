@@ -340,6 +340,28 @@ impl DatabasePoolProvider for ManagedPostgresPoolProvider {
         };
         Ok(Some(crate::db::DatabaseTopology::from_pools(primary, None)))
     }
+
+    async fn create_shard_topology(
+        &self,
+        _shard: &crate::config::ShardConfig,
+        _defaults: &DatabaseConfig,
+    ) -> Result<crate::db::DatabaseTopology, PoolError> {
+        // The managed cluster is a single local Postgres; it can't back the
+        // separate per-shard databases `[[database.shards]]` requires. The trait
+        // default would point each shard at its external URL while the control
+        // plane and migrations use the managed DB — a silent split. Fail fast
+        // with a clear diagnostic instead (matching `create_pool`'s fatal-boot
+        // handling).
+        tracing::error!(
+            "managed Postgres does not support [[database.shards]]; remove the \
+             shard configuration or use an external database"
+        );
+        eprintln!(
+            "autumn: managed Postgres (--bundled-pg) does not support \
+             [[database.shards]]. Remove shard config or use an external database."
+        );
+        std::process::exit(1);
+    }
 }
 
 /// Resolve the cluster data dir: the `AUTUMN_MANAGED_PG_DATA_DIR` override

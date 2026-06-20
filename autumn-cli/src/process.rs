@@ -179,6 +179,21 @@ pub fn acquire_pidfile(path: &Path, pid: u32) -> Result<(), AcquireError> {
     )))
 }
 
+/// Overwrite an already-held pidfile with a new owner's pid and start time.
+///
+/// Used when a launcher first reserves the lock with its own pid (via
+/// [`acquire_pidfile`]) and then, after spawning the daemon child, records the
+/// child's pid. The caller must already hold the lock; this is a plain overwrite,
+/// not an exclusive create.
+///
+/// # Errors
+///
+/// Returns the I/O error if the file cannot be written.
+pub fn rewrite_pidfile(path: &Path, pid: u32) -> std::io::Result<()> {
+    let start = process_start_time(pid).unwrap_or(0);
+    std::fs::write(path, format!("{pid} {start}\n"))
+}
+
 /// Validate a raw PID for use with `kill(2)`: positive and representable.
 #[cfg(unix)]
 #[must_use]

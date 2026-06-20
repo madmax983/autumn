@@ -37,6 +37,11 @@ pub struct ServeOptions {
     pub release: bool,
     /// Recorded in the address file; set when the app bundles managed Postgres.
     pub bundled_pg: bool,
+    /// Profile to force on the spawned app via `AUTUMN_ENV`. `None` for a normal
+    /// start (the child inherits the shell's environment); set by `restart` to
+    /// restore the original daemon's profile when the restart shell doesn't have
+    /// one.
+    pub profile: Option<String>,
 }
 
 /// How long to wait for a freshly-spawned daemon to become reachable.
@@ -76,6 +81,11 @@ pub struct AddrFile {
     /// address files written before this field existed.
     #[serde(default)]
     pub stop_budget_secs: Option<u64>,
+    /// The explicit profile (`AUTUMN_ENV`/`AUTUMN_PROFILE`) the daemon was
+    /// started with, recorded so `restart` can restore it. `None` when the daemon
+    /// relied on the build-mode default (or for older address files).
+    #[serde(default)]
+    pub profile: Option<String>,
 }
 
 impl AddrFile {
@@ -140,11 +150,17 @@ fn run_unix(action: Option<ServeAction>, opts: &ServeOptions) -> i32 {
             let running = running_daemon_addr(opts.package.as_deref());
             let keep_managed = opts.bundled_pg || running.as_ref().is_some_and(|a| a.managed_pg);
             let keep_release = opts.release || running.as_ref().is_some_and(|a| a.release);
+            // Preserve the original daemon's profile: prefer one set on *this*
+            // restart's environment, else restore what the running daemon
+            // recorded, so a bare `restart` doesn't silently fall back to `dev`.
+            let keep_profile =
+                env_profile().or_else(|| running.as_ref().and_then(|a| a.profile.clone()));
             let _ = stop(opts);
             let daemon_opts = ServeOptions {
                 daemon: true,
                 bundled_pg: keep_managed,
                 release: keep_release,
+                profile: keep_profile,
                 ..opts.clone()
             };
             start(&daemon_opts)
@@ -379,6 +395,12 @@ fn base_command(binary: &Path, paths: Option<&RuntimePaths>, opts: &ServeOptions
     {
         cmd.env("AUTUMN_MANAGED_PG_DATA_DIR", paths.pg_data_dir());
     }
+    // Restore an explicit profile (set by `restart`) so the relaunched daemon
+    // loads the same config as the original even when the restart shell didn't
+    // set `AUTUMN_ENV`.
+    if let Some(profile) = &opts.profile {
+        cmd.env("AUTUMN_ENV", profile);
+    }
     cmd
 }
 
@@ -456,6 +478,21 @@ fn spawn_daemon(binary: &Path, paths: &RuntimePaths, opts: &ServeOptions) -> i32
         return 1;
     }
 
+    // Reserve the daemon lock *before* spawning, claiming it with our own pid, so
+    // two concurrent `autumn serve --daemon` invocations can't both launch a
+    // child that races to bind the socket. The child's pid replaces ours below.
+    match process::acquire_pidfile(&paths.pid_file(), std::process::id()) {
+        Ok(()) => {}
+        Err(AcquireError::AlreadyRunning(existing)) => {
+            eprintln!("autumn serve: already running (pid {existing}).");
+            return 1;
+        }
+        Err(AcquireError::Io(e)) => {
+            eprintln!("autumn serve: cannot write pidfile: {e}");
+            return 1;
+        }
+    }
+
     let log_path = paths.log_file();
     let log = match create_private_log(&log_path) {
         Ok(f) => f,
@@ -464,6 +501,7 @@ fn spawn_daemon(binary: &Path, paths: &RuntimePaths, opts: &ServeOptions) -> i32
                 "autumn serve: cannot open log file {}: {e}",
                 log_path.display()
             );
+            cleanup(paths, &socket);
             return 1;
         }
     };
@@ -471,6 +509,7 @@ fn spawn_daemon(binary: &Path, paths: &RuntimePaths, opts: &ServeOptions) -> i32
         Ok(f) => f,
         Err(e) => {
             eprintln!("autumn serve: cannot duplicate log handle: {e}");
+            cleanup(paths, &socket);
             return 1;
         }
     };
@@ -485,27 +524,20 @@ fn spawn_daemon(binary: &Path, paths: &RuntimePaths, opts: &ServeOptions) -> i32
         Ok(child) => child,
         Err(e) => {
             eprintln!("\u{2717} Failed to start daemon: {e}");
+            cleanup(paths, &socket);
             return 1;
         }
     };
     let pid = child.id();
 
-    match process::acquire_pidfile(&paths.pid_file(), pid) {
-        Ok(()) => {}
-        Err(AcquireError::AlreadyRunning(existing)) => {
-            eprintln!("autumn serve: already running (pid {existing}).");
-            let _ = child.kill();
-            process::force_kill_group(pid);
-            let _ = child.wait();
-            return 1;
-        }
-        Err(AcquireError::Io(e)) => {
-            eprintln!("autumn serve: cannot write pidfile: {e}");
-            let _ = child.kill();
-            process::force_kill_group(pid);
-            let _ = child.wait();
-            return 1;
-        }
+    // Hand the reserved lock to the spawned child (its pid + start time).
+    if let Err(e) = process::rewrite_pidfile(&paths.pid_file(), pid) {
+        eprintln!("autumn serve: cannot update pidfile: {e}");
+        let _ = child.kill();
+        process::force_kill_group(pid);
+        let _ = child.wait();
+        cleanup(paths, &socket);
+        return 1;
     }
 
     let ready_timeout = if opts.bundled_pg {
@@ -633,6 +665,9 @@ fn write_addr_file(
         // Resolve the budget now, from the daemon's own env/profile, so `stop`
         // doesn't have to (and can't) reconstruct it from a different shell.
         stop_budget_secs: Some(resolved_stop_budget_secs(opts)),
+        // Record the explicit profile (a `restart` override, else this shell's
+        // env) so a later `restart` can restore it.
+        profile: opts.profile.clone().or_else(env_profile),
     };
     let path = paths.addr_file();
     std::fs::write(&path, addr.to_toml())?;
@@ -696,7 +731,7 @@ fn stop_timeout(
         .as_deref()
         .and_then(crate::dev::find_manifest_dir)
         .unwrap_or_else(|| std::path::PathBuf::from("."));
-    let profile = effective_profile(recorded_release);
+    let profile = effective_profile(None, recorded_release);
     let (prestop, shutdown) = resolve_shutdown_budget(&base_dir, Some(&profile));
     Duration::from_secs(prestop + shutdown) + STOP_GRACE_BUFFER
 }
@@ -710,21 +745,25 @@ fn resolved_stop_budget_secs(opts: &ServeOptions) -> u64 {
         .as_deref()
         .and_then(crate::dev::find_manifest_dir)
         .unwrap_or_else(|| std::path::PathBuf::from("."));
-    let profile = effective_profile(opts.release);
+    let profile = effective_profile(opts.profile.as_deref(), opts.release);
     let (prestop, shutdown) = resolve_shutdown_budget(&base_dir, Some(&profile));
     prestop + shutdown
 }
 
-/// The active profile: an explicit `AUTUMN_ENV`/`AUTUMN_PROFILE`, else the app's
-/// build-mode default (`prod` for a release build, else `dev`).
-fn effective_profile(release: bool) -> String {
-    env_profile().unwrap_or_else(|| {
-        if release {
-            "prod".to_owned()
-        } else {
-            "dev".to_owned()
-        }
-    })
+/// The active profile: an explicit override (`profile_override`, e.g. a `restart`
+/// restoration), then the environment (`AUTUMN_ENV`/`AUTUMN_PROFILE`), then the
+/// app's build-mode default (`prod` for a release build, else `dev`).
+fn effective_profile(profile_override: Option<&str>, release: bool) -> String {
+    profile_override
+        .map(ToOwned::to_owned)
+        .or_else(env_profile)
+        .unwrap_or_else(|| {
+            if release {
+                "prod".to_owned()
+            } else {
+                "dev".to_owned()
+            }
+        })
 }
 
 /// The active profile selector from the environment (`AUTUMN_ENV`, then the
@@ -909,6 +948,7 @@ mod tests {
             managed_pg,
             release: false,
             stop_budget_secs: Some(35),
+            profile: Some("dev".to_owned()),
         }
     }
 
@@ -956,6 +996,7 @@ mod tests {
             "managed_pg",
             "release",
             "stop_budget_secs",
+            "profile",
         ] {
             assert!(table.contains_key(key), "missing key {key}");
         }
@@ -1092,6 +1133,26 @@ mod tests {
         temp_env::with_vars(clear_shutdown_env(), || {
             assert_eq!(resolve_shutdown_budget(dir.path(), Some("prod")).1, 111);
         });
+    }
+
+    #[test]
+    fn effective_profile_prefers_override_then_env_then_build_mode() {
+        temp_env::with_vars(
+            [("AUTUMN_ENV", None::<&str>), ("AUTUMN_PROFILE", None)],
+            || {
+                assert_eq!(effective_profile(Some("staging"), false), "staging");
+                assert_eq!(effective_profile(None, true), "prod");
+                assert_eq!(effective_profile(None, false), "dev");
+            },
+        );
+        temp_env::with_vars(
+            [("AUTUMN_ENV", Some("qa")), ("AUTUMN_PROFILE", None::<&str>)],
+            || {
+                // Env beats the build-mode default; an explicit override beats env.
+                assert_eq!(effective_profile(None, true), "qa");
+                assert_eq!(effective_profile(Some("explicit"), true), "explicit");
+            },
+        );
     }
 
     #[cfg(unix)]

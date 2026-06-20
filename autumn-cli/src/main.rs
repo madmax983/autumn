@@ -1404,6 +1404,9 @@ fn run_command(command: Commands) {
                     daemon: daemon || bundled_pg,
                     release,
                     bundled_pg,
+                    // Normal start: the child inherits this shell's env. Only
+                    // `restart` sets this, to restore a lost profile.
+                    profile: None,
                 },
             );
         }
