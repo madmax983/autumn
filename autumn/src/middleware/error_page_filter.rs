@@ -39,11 +39,20 @@ impl ExceptionFilter for ErrorPageFilter {
             return response;
         }
 
-        // Preserve the correlation id that `RequestIdLayer` stamped on the
-        // original response — `build_html_response` constructs a fresh response,
-        // so without this the rebuilt HTML error page would drop `X-Request-Id`
-        // and operators couldn't tie the page to their logs.
-        let request_id_header = response.headers().get("x-request-id").cloned();
+        // Preserve the headers already attached to the error response —
+        // `build_html_response` constructs a fresh response, so without this the
+        // rebuilt HTML error page would drop them. Two matter in particular:
+        //   * `X-Request-Id` (stamped by `RequestIdLayer`) — operators need it to
+        //     tie the page to their logs.
+        //   * CORS headers mirrored onto a timeout 503 by the request-timeout
+        //     middleware (`ProblemDetailsFilter` preserves these too). A
+        //     cross-origin HTML/HTMX request that times out would otherwise see an
+        //     opaque CORS failure instead of the styled error page.
+        // `Content-Type`/`Content-Length` are excluded because the HTML response
+        // sets its own.
+        let mut preserved_headers = response.headers().clone();
+        preserved_headers.remove(axum::http::header::CONTENT_TYPE);
+        preserved_headers.remove(axum::http::header::CONTENT_LENGTH);
 
         let ctx = Self::build_error_context(error, &response, self.is_dev);
         let mut html_body =
@@ -55,9 +64,7 @@ impl ExceptionFilter for ErrorPageFilter {
         }
 
         let mut html = Self::build_html_response(error, html_body);
-        if let Some(request_id) = request_id_header {
-            html.headers_mut().insert("x-request-id", request_id);
-        }
+        html.headers_mut().extend(preserved_headers);
         html
     }
 }
@@ -795,6 +802,69 @@ mod tests {
             body_str.contains("Page not found"),
             "should contain not found message"
         );
+    }
+
+    #[tokio::test]
+    async fn html_error_page_preserves_mirrored_cors_and_request_id_headers() {
+        // A timeout 503 reaches the error-page filter already carrying the
+        // mirrored CORS headers and the request id, marked as wanting HTML.
+        // The HTML rebuild must not drop them, or a cross-origin browser/HTMX
+        // client sees an opaque CORS failure instead of the styled page.
+        let renderer = error_pages::default_renderer();
+        let filter = ErrorPageFilter {
+            renderer,
+            is_dev: false,
+            parameter_filter: crate::log::filter::ParameterFilter::default(),
+        };
+
+        let error = AutumnErrorInfo {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            message: "request deadline exceeded".into(),
+            details: None,
+            problem_type: None,
+            backtrace_string: None,
+        };
+
+        let mut original =
+            (StatusCode::SERVICE_UNAVAILABLE, "json body").into_response();
+        original.headers_mut().insert(
+            "access-control-allow-origin",
+            http::HeaderValue::from_static("https://app.example.com"),
+        );
+        original.headers_mut().insert(
+            "access-control-allow-credentials",
+            http::HeaderValue::from_static("true"),
+        );
+        original
+            .headers_mut()
+            .insert("x-request-id", http::HeaderValue::from_static("req-123"));
+        original.extensions_mut().insert(WantsHtml(true));
+
+        let response = filter.filter(&error, original);
+
+        assert_eq!(
+            response.headers()["access-control-allow-origin"],
+            "https://app.example.com",
+            "mirrored CORS origin must survive the HTML rebuild"
+        );
+        assert_eq!(
+            response.headers()["access-control-allow-credentials"],
+            "true",
+            "mirrored CORS credentials flag must survive the HTML rebuild"
+        );
+        assert_eq!(
+            response.headers()["x-request-id"], "req-123",
+            "request id must survive the HTML rebuild"
+        );
+        assert_eq!(
+            response.headers()[axum::http::header::CONTENT_TYPE],
+            "text/html; charset=utf-8"
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_str = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body_str.contains("<!DOCTYPE html>"), "should be HTML");
     }
 
     #[tokio::test]
