@@ -195,6 +195,29 @@ fn socket_is_live(_path: &Path) -> bool {
     false
 }
 
+/// The PID of the process listening on the Unix socket at `path`, via
+/// `SO_PEERCRED`. `None` when it can't be determined — not connectable, or a
+/// platform without a peer-PID syscall (macOS/BSD).
+#[cfg(target_os = "linux")]
+fn socket_owner_pid(path: &Path) -> Option<u32> {
+    let stream = std::os::unix::net::UnixStream::connect(path).ok()?;
+    let cred =
+        nix::sys::socket::getsockopt(&stream, nix::sys::socket::sockopt::PeerCredentials).ok()?;
+    u32::try_from(cred.pid()).ok()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn socket_owner_pid(_path: &Path) -> Option<u32> {
+    None
+}
+
+/// Best-effort check that the daemon serving on `socket` is `pid`: a definitive
+/// `SO_PEERCRED` match on Linux, otherwise socket liveness (so a reused PID that
+/// is genuinely not the listener is rejected where the kernel can tell us).
+fn socket_identity_matches(socket: &Path, pid: u32) -> bool {
+    socket_owner_pid(socket).map_or_else(|| socket_is_live(socket), |owner| owner == pid)
+}
+
 /// Whether `rec` identifies our live daemon, guarding against PID reuse.
 ///
 /// A recorded start time that matches the live process is conclusive (Linux).
@@ -212,9 +235,9 @@ fn confirmed_running(rec: &process::PidRecord, socket: &Path) -> bool {
         // time is stale even if some daemon happens to be listening.
         (Some(recorded), Some(current)) => recorded == current,
         // Identity unknown (no recorded start time, or a platform like macOS
-        // that can't report one): use the live socket as a best-effort check, so
-        // a reused PID that isn't actually serving here is treated as stale.
-        _ => socket_is_live(socket),
+        // that can't report one): confirm the PID actually owns the socket
+        // (SO_PEERCRED on Linux, else liveness), so a reused PID isn't accepted.
+        _ => socket_identity_matches(socket, rec.pid),
     }
 }
 
@@ -228,7 +251,9 @@ fn lifecycle_target(paths: &RuntimePaths, socket: &Path) -> Option<process::PidR
         return Some(rec);
     }
     let addr = read_addr_file(paths)?;
-    socket_is_live(socket).then_some(process::PidRecord {
+    // Trust the address-file PID only if it actually owns the socket (so a reused
+    // PID isn't signalled); where peer-PID is unavailable, fall back to liveness.
+    socket_identity_matches(socket, addr.pid).then_some(process::PidRecord {
         pid: addr.pid,
         start_time: None,
     })
@@ -462,60 +487,65 @@ fn create_private_log(path: &Path) -> std::io::Result<std::fs::File> {
     Ok(file)
 }
 
-/// Spawn the server detached into the background and supervise readiness.
-fn spawn_daemon(binary: &Path, paths: &RuntimePaths, opts: &ServeOptions) -> i32 {
-    let socket = paths.socket_file();
-
+/// Launch the detached daemon child and record its pidfile, under a separate
+/// startup lock. Returns the running child, or `Err(exit_code)` on failure
+/// (after cleaning up). The pidfile only ever holds the child's pid, so
+/// concurrent lifecycle commands never see the launcher.
+fn launch_daemon_child(
+    binary: &Path,
+    paths: &RuntimePaths,
+    opts: &ServeOptions,
+    socket: &Path,
+) -> Result<std::process::Child, i32> {
     // A live listener already owning the socket means a daemon is serving here
-    // even if the pidfile is missing or stale. Our child would fail to bind (the
-    // app refuses to clobber a live socket), but readiness probes `connect` and
-    // would otherwise latch onto the *pre-existing* listener and report the
-    // just-spawned child "ready". Detect that here and refuse, mirroring the
-    // pidfile guard.
+    // even if the pidfile is missing or stale; refuse so readiness can't latch
+    // onto the pre-existing listener (mirrors the pidfile guard).
     #[cfg(unix)]
-    if std::os::unix::net::UnixStream::connect(&socket).is_ok() {
+    if std::os::unix::net::UnixStream::connect(socket).is_ok() {
         eprintln!(
             "autumn serve: already running (a live server owns {}). \
              Use `autumn serve stop` or `autumn serve restart`.",
             socket.display()
         );
-        return 1;
+        return Err(1);
     }
 
-    // Reserve the daemon lock *before* spawning, claiming it with our own pid, so
-    // two concurrent `autumn serve --daemon` invocations can't both launch a
-    // child that races to bind the socket. The child's pid replaces ours below.
-    match process::acquire_pidfile(&paths.pid_file(), std::process::id()) {
+    // Separate startup lock (claimed with our own pid) so two concurrent starts
+    // can't both spawn — but it is NOT the pidfile, so a concurrent `stop`/
+    // `status` during startup never signals the launcher.
+    let start_lock = paths.pid_file().with_file_name("serve.startlock");
+    match process::acquire_pidfile(&start_lock, std::process::id()) {
         Ok(()) => {}
         Err(AcquireError::AlreadyRunning(existing)) => {
-            eprintln!("autumn serve: already running (pid {existing}).");
-            return 1;
+            eprintln!("autumn serve: another `autumn serve` is starting (pid {existing}).");
+            return Err(1);
         }
         Err(AcquireError::Io(e)) => {
-            eprintln!("autumn serve: cannot write pidfile: {e}");
-            return 1;
+            eprintln!("autumn serve: cannot take startup lock: {e}");
+            return Err(1);
         }
     }
+    let release_lock = || {
+        let _ = std::fs::remove_file(&start_lock);
+    };
 
-    let log_path = paths.log_file();
-    let log = match create_private_log(&log_path) {
+    let log = match create_private_log(&paths.log_file()) {
         Ok(f) => f,
         Err(e) => {
             eprintln!(
                 "autumn serve: cannot open log file {}: {e}",
-                log_path.display()
+                paths.log_file().display()
             );
-            cleanup(paths, &socket);
-            return 1;
+            release_lock();
+            cleanup(paths, socket);
+            return Err(1);
         }
     };
-    let log_err = match log.try_clone() {
-        Ok(f) => f,
-        Err(e) => {
-            eprintln!("autumn serve: cannot duplicate log handle: {e}");
-            cleanup(paths, &socket);
-            return 1;
-        }
+    let Ok(log_err) = log.try_clone() else {
+        eprintln!("autumn serve: cannot duplicate log handle");
+        release_lock();
+        cleanup(paths, socket);
+        return Err(1);
     };
 
     let mut cmd = base_command(binary, Some(paths), opts);
@@ -528,21 +558,41 @@ fn spawn_daemon(binary: &Path, paths: &RuntimePaths, opts: &ServeOptions) -> i32
         Ok(child) => child,
         Err(e) => {
             eprintln!("\u{2717} Failed to start daemon: {e}");
-            cleanup(paths, &socket);
-            return 1;
+            release_lock();
+            cleanup(paths, socket);
+            return Err(1);
         }
     };
     let pid = child.id();
 
-    // Hand the reserved lock to the spawned child (its pid + start time).
-    if let Err(e) = process::rewrite_pidfile(&paths.pid_file(), pid) {
-        eprintln!("autumn serve: cannot update pidfile: {e}");
+    // Record the real pidfile (child's pid), then drop the startup lock.
+    if let Err(e) = process::acquire_pidfile(&paths.pid_file(), pid) {
+        match e {
+            AcquireError::AlreadyRunning(existing) => {
+                eprintln!("autumn serve: already running (pid {existing}).");
+            }
+            AcquireError::Io(e) => eprintln!("autumn serve: cannot write pidfile: {e}"),
+        }
         let _ = child.kill();
         process::force_kill_group(pid);
         let _ = child.wait();
-        cleanup(paths, &socket);
-        return 1;
+        release_lock();
+        cleanup(paths, socket);
+        return Err(1);
     }
+    release_lock();
+    Ok(child)
+}
+
+/// Spawn the server detached into the background and supervise readiness.
+fn spawn_daemon(binary: &Path, paths: &RuntimePaths, opts: &ServeOptions) -> i32 {
+    let socket = paths.socket_file();
+    let mut child = match launch_daemon_child(binary, paths, opts, &socket) {
+        Ok(child) => child,
+        Err(code) => return code,
+    };
+    let pid = child.id();
+    let log_path = paths.log_file();
 
     let ready_timeout = if opts.bundled_pg {
         READY_TIMEOUT_MANAGED_PG
