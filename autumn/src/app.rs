@@ -4894,18 +4894,39 @@ fn prepare_unix_socket_path(path: &std::path::Path) -> std::io::Result<()> {
     use std::os::unix::fs::FileTypeExt;
     match std::fs::symlink_metadata(path) {
         Ok(meta) if meta.file_type().is_socket() => {
-            // A successful connect means another process is listening here.
-            if std::os::unix::net::UnixStream::connect(path).is_ok() {
-                return Err(std::io::Error::new(
+            match std::os::unix::net::UnixStream::connect(path) {
+                // A successful connect means another process is listening here.
+                Ok(_) => Err(std::io::Error::new(
                     std::io::ErrorKind::AddrInUse,
                     format!(
                         "refusing to bind unix socket: {} is already in use by a \
                          live listener",
                         path.display()
                     ),
-                ));
+                )),
+                // `ECONNREFUSED` (no listener) — or the path vanishing — means the
+                // socket is stale; reclaim it.
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+                    ) =>
+                {
+                    std::fs::remove_file(path)
+                }
+                // `EACCES`/`EPERM` (or any other error): the socket may be a live,
+                // operator-managed listener whose mode/ACL denies us. Connecting
+                // failed, but liveness is unproven — refuse rather than clobber a
+                // possibly-live service.
+                Err(e) => Err(std::io::Error::new(
+                    std::io::ErrorKind::AddrInUse,
+                    format!(
+                        "refusing to bind unix socket: cannot determine whether {} \
+                         is live ({e}); not removing it",
+                        path.display()
+                    ),
+                )),
             }
-            std::fs::remove_file(path)
         }
         Ok(_) => Err(std::io::Error::new(
             std::io::ErrorKind::AlreadyExists,

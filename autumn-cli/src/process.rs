@@ -80,6 +80,25 @@ pub fn read_pidfile(path: &Path) -> Option<PidRecord> {
     Some(PidRecord { pid, start_time })
 }
 
+/// The command name of `pid` (Linux `/proc/<pid>/comm`), when the platform
+/// exposes it. Returns `None` elsewhere, where callers fall back to weaker
+/// identity checks. Used to confirm a recorded PID still belongs to the expected
+/// program before signalling it, guarding against PID reuse.
+#[must_use]
+pub fn process_command_name(pid: u32) -> Option<String> {
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_to_string(format!("/proc/{pid}/comm"))
+            .ok()
+            .map(|s| s.trim().to_owned())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
 /// The kernel-reported start time of `pid`, when the platform exposes it.
 ///
 /// Linux reads field 22 (`starttime`, jiffies since boot) of

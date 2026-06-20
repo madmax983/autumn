@@ -798,13 +798,18 @@ enum ProbeOutcome {
 /// Issue a minimal HTTP/1.1 request over the daemon's Unix socket and classify
 /// the response by status line.
 ///
-/// Autumn mounts a startup barrier that returns `503 Service Unavailable` for
-/// every path until startup completes; we deliberately request a path that is
-/// not a real route nor a health probe, so before completion we see the
-/// barrier's 503 and after completion a cheap `404` (no side effects, no DB
-/// hit). A reply that can't be parsed as HTTP is treated as `Ready` so a daemon
-/// that for any reason isn't speaking the barrier still falls back to socket
-/// liveness rather than hanging until timeout.
+/// We probe the default startup probe path (`/startup`): it returns `200` once
+/// the app has finished startup (`mark_startup_complete`) and `503` before. We
+/// use the probe path rather than an arbitrary route on purpose — both the
+/// startup barrier *and* maintenance mode bypass the configured health/startup
+/// paths, so an app that booted successfully while maintenance mode is active
+/// still answers `200` here (an arbitrary path would keep returning maintenance
+/// `503` and falsely look "still starting"). Apps that remap `startup_path`
+/// fall back to the barrier: before completion the barrier 503s `/startup`,
+/// after completion it 404s — both correctly classified by the 503 rule below.
+/// A reply that can't be parsed as HTTP is treated as `Ready` so a daemon that
+/// for any reason isn't speaking HTTP still falls back to socket liveness rather
+/// than hanging until timeout.
 #[cfg(unix)]
 fn probe_startup_over_socket(socket: &Path) -> ProbeOutcome {
     use std::io::{Read, Write};
@@ -815,7 +820,7 @@ fn probe_startup_over_socket(socket: &Path) -> ProbeOutcome {
     };
     let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
-    let request = "GET /.autumn-serve-readiness HTTP/1.1\r\n\
+    let request = "GET /startup HTTP/1.1\r\n\
          Host: localhost\r\n\
          Connection: close\r\n\r\n";
     if stream.write_all(request.as_bytes()).is_err() {
@@ -956,9 +961,18 @@ fn reap_managed_postgres(paths: &RuntimePaths) {
     else {
         return;
     };
-    if process::is_process_alive(pid) {
-        process::stop_postmaster(pid, Duration::from_secs(10));
+    if !process::is_process_alive(pid) {
+        return;
     }
+    // Guard against PID reuse: a `postmaster.pid` left behind by a crashed or
+    // `SIGKILL`ed cluster keeps its old PID, which the OS may have recycled for
+    // an unrelated process. Where the platform reports it, require the live
+    // process to actually be `postgres` before signalling it; if we can't tell
+    // (non-Linux), fall back to liveness alone.
+    if process::process_command_name(pid).is_some_and(|name| name != "postgres") {
+        return;
+    }
+    process::stop_postmaster(pid, Duration::from_secs(10));
 }
 
 /// Graceful-stop budget before escalating to `SIGKILL`.
