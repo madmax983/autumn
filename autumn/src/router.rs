@@ -2232,6 +2232,17 @@ fn apply_middleware(
     //   MethodOverride → RateLimit → CSRF → CORS → handler
     // `mirror_cors = true`: this layer is outside `CorsLayer` (CORS is applied
     // earlier, hence inner), so its timeout 503 must carry CORS headers itself.
+    //
+    // KNOWN LIMITATION (session store I/O is not bounded): `Session` sits outside
+    // this layer (see order above), so `store.load` runs before the timer starts
+    // and `store.save`/`destroy` after it completes. A stalled session backend can
+    // therefore tie up a worker despite `request_timeout_ms`. This placement is
+    // deliberate: the timer is kept inner to `RequestId` so a timeout 503 (and its
+    // warn log) carries `X-Request-Id` for log correlation — moving it outside
+    // `Session` would also move it outside `RequestId` and lose that. Operators
+    // who need to bound session-store I/O should configure a store-level deadline
+    // (e.g. the Redis command/connection timeout); a cancelled inbound request
+    // cannot abort an already-issued store call regardless of layer order.
     router = apply_request_timeout_middleware(
         router,
         config,
