@@ -3025,6 +3025,10 @@ impl AppBuilder {
 
         if let Err(error) = initialize_job_runtime(jobs, &state, &server_shutdown, &config.jobs) {
             tracing::error!(error = %error, "job runtime initialization failed");
+            // Post-DB failure: `process::exit` skips `on_shutdown`, so stop any
+            // managed Postgres before bailing.
+            #[cfg(feature = "managed-pg")]
+            crate::managed_pg::emergency_stop_async().await;
             std::process::exit(1);
         }
 
@@ -3249,6 +3253,9 @@ impl AppBuilder {
             tracing::error!(error = %error, "startup hook failed");
             server_shutdown.cancel();
             server_task.abort();
+            // `process::exit` skips `on_shutdown`; stop any managed Postgres.
+            #[cfg(feature = "managed-pg")]
+            crate::managed_pg::emergency_stop_async().await;
             std::process::exit(1);
         }
 
@@ -3264,6 +3271,9 @@ impl AppBuilder {
                     tracing::error!(error = %err, "scheduled task runtime initialization failed");
                     server_shutdown.cancel();
                     server_task.abort();
+                    // `process::exit` skips `on_shutdown`; stop any managed Postgres.
+                    #[cfg(feature = "managed-pg")]
+                    crate::managed_pg::emergency_stop_async().await;
                     std::process::exit(1);
                 }
             }

@@ -208,7 +208,7 @@ impl RuntimePaths {
 /// binding the daemon's control socket in an attacker-controlled location.
 #[cfg(unix)]
 fn harden_private_dir(dir: &Path) -> std::io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
     let meta = std::fs::symlink_metadata(dir)?;
     if !meta.file_type().is_dir() {
         return Err(std::io::Error::new(
@@ -219,8 +219,19 @@ fn harden_private_dir(dir: &Path) -> std::io::Result<()> {
             ),
         ));
     }
-    // `chmod` fails with EPERM when another user owns the directory, aborting
-    // startup instead of trusting it.
+    // Reject a directory owned by another user. Relying on `chmod` to fail isn't
+    // enough: a privileged (root) launch can `chmod` an attacker-pre-created dir
+    // to `0700` while it stays owned/traversable by that user, so check `st_uid`
+    // against the effective uid explicitly.
+    if meta.uid() != nix::unistd::geteuid().as_raw() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "refusing to use {} for the daemon socket: not owned by the current user",
+                dir.display()
+            ),
+        ));
+    }
     std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
 }
 

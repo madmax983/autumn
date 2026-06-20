@@ -11,7 +11,7 @@
 use crate::paths::RuntimePaths;
 use crate::process::{self, AcquireError};
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
@@ -488,15 +488,17 @@ fn create_private_log(path: &Path) -> std::io::Result<std::fs::File> {
 }
 
 /// Launch the detached daemon child and record its pidfile, under a separate
-/// startup lock. Returns the running child, or `Err(exit_code)` on failure
-/// (after cleaning up). The pidfile only ever holds the child's pid, so
-/// concurrent lifecycle commands never see the launcher.
+/// startup lock. On success returns the running child plus the still-held
+/// startup-lock path (the caller releases it only once the daemon is ready, so a
+/// concurrent start can't race in during readiness). `Err(exit_code)` on failure
+/// (after cleaning up and releasing the lock). The pidfile only ever holds the
+/// child's pid, so concurrent lifecycle commands never see the launcher.
 fn launch_daemon_child(
     binary: &Path,
     paths: &RuntimePaths,
     opts: &ServeOptions,
     socket: &Path,
-) -> Result<std::process::Child, i32> {
+) -> Result<(std::process::Child, PathBuf), i32> {
     // A live listener already owning the socket means a daemon is serving here
     // even if the pidfile is missing or stale; refuse so readiness can't latch
     // onto the pre-existing listener (mirrors the pidfile guard).
@@ -525,10 +527,6 @@ fn launch_daemon_child(
             return Err(1);
         }
     }
-    let release_lock = || {
-        let _ = std::fs::remove_file(&start_lock);
-    };
-
     let log = match create_private_log(&paths.log_file()) {
         Ok(f) => f,
         Err(e) => {
@@ -536,14 +534,14 @@ fn launch_daemon_child(
                 "autumn serve: cannot open log file {}: {e}",
                 paths.log_file().display()
             );
-            release_lock();
+            let _ = std::fs::remove_file(&start_lock);
             cleanup(paths, socket);
             return Err(1);
         }
     };
     let Ok(log_err) = log.try_clone() else {
         eprintln!("autumn serve: cannot duplicate log handle");
-        release_lock();
+        let _ = std::fs::remove_file(&start_lock);
         cleanup(paths, socket);
         return Err(1);
     };
@@ -558,14 +556,16 @@ fn launch_daemon_child(
         Ok(child) => child,
         Err(e) => {
             eprintln!("\u{2717} Failed to start daemon: {e}");
-            release_lock();
+            let _ = std::fs::remove_file(&start_lock);
             cleanup(paths, socket);
             return Err(1);
         }
     };
     let pid = child.id();
 
-    // Record the real pidfile (child's pid), then drop the startup lock.
+    // Record the real pidfile (child's pid). Keep the startup lock held — the
+    // caller releases it only after the daemon is ready, so a concurrent start
+    // can't spawn a second child while this one is still binding.
     if let Err(e) = process::acquire_pidfile(&paths.pid_file(), pid) {
         match e {
             AcquireError::AlreadyRunning(existing) => {
@@ -576,23 +576,27 @@ fn launch_daemon_child(
         let _ = child.kill();
         process::force_kill_group(pid);
         let _ = child.wait();
-        release_lock();
+        let _ = std::fs::remove_file(&start_lock);
         cleanup(paths, socket);
         return Err(1);
     }
-    release_lock();
-    Ok(child)
+    Ok((child, start_lock))
 }
 
 /// Spawn the server detached into the background and supervise readiness.
 fn spawn_daemon(binary: &Path, paths: &RuntimePaths, opts: &ServeOptions) -> i32 {
     let socket = paths.socket_file();
-    let mut child = match launch_daemon_child(binary, paths, opts, &socket) {
-        Ok(child) => child,
+    let (mut child, start_lock) = match launch_daemon_child(binary, paths, opts, &socket) {
+        Ok(launched) => launched,
         Err(code) => return code,
     };
     let pid = child.id();
     let log_path = paths.log_file();
+    // The startup lock is held until the daemon is ready, then released here on
+    // every path so a concurrent start can't race in during the bind window.
+    let release_lock = || {
+        let _ = std::fs::remove_file(&start_lock);
+    };
 
     let ready_timeout = if opts.bundled_pg {
         READY_TIMEOUT_MANAGED_PG
@@ -610,9 +614,11 @@ fn spawn_daemon(binary: &Path, paths: &RuntimePaths, opts: &ServeOptions) -> i32
             let _ = child.kill();
             process::force_kill_group(pid);
             let _ = child.wait();
+            release_lock();
             cleanup(paths, &socket);
             return 1;
         }
+        release_lock();
         println!(
             "autumn serve: started (pid {pid}) on unix:{}",
             socket.display()
@@ -635,6 +641,7 @@ fn spawn_daemon(binary: &Path, paths: &RuntimePaths, opts: &ServeOptions) -> i32
         let _ = child.kill();
         process::force_kill_group(pid);
         let _ = child.wait();
+        release_lock();
         cleanup(paths, &socket);
         1
     }
