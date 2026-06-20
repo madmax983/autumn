@@ -22,6 +22,11 @@ pub const RUNTIME_DIR_ENV: &str = "AUTUMN_RUNTIME_DIR";
 const QUALIFIER: &str = "dev";
 const ORGANIZATION: &str = "autumn";
 
+/// Conservative cap on a Unix-domain socket path length. The kernel `sun_path`
+/// limit is 104 bytes on macOS and 108 on Linux (including the NUL); staying
+/// well under it leaves margin and keeps the check portable.
+const MAX_UNIX_SOCKET_PATH: usize = 100;
+
 /// Errors resolving platform directories.
 #[derive(Debug, thiserror::Error)]
 pub enum PathsError {
@@ -36,12 +41,42 @@ pub enum PathsError {
 /// paths were resolved from the OS or constructed from a test base.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimePaths {
-    /// PID lockfile, Unix socket, and address-discovery file live here.
+    /// PID lockfile and address-discovery file live here.
     runtime: PathBuf,
     /// Managed-Postgres cluster data dir is rooted here.
     data: PathBuf,
     /// Daemon log files are written here.
     logs: PathBuf,
+    /// Unix socket path. Normally `<runtime>/serve.sock`, but a short fallback
+    /// under a private runtime root when the natural path would exceed the OS
+    /// `sun_path` limit (e.g. macOS, long usernames/package names).
+    socket: PathBuf,
+}
+
+/// The socket path for `runtime`/`project`: `<runtime>/serve.sock` when that
+/// fits the `sun_path` limit, otherwise a short, stable, per-project path under
+/// a private runtime root (`$XDG_RUNTIME_DIR`, else the per-user temp dir).
+fn resolve_socket_path(runtime: &Path, project: &str) -> PathBuf {
+    let natural = runtime.join("serve.sock");
+    if natural.as_os_str().len() <= MAX_UNIX_SOCKET_PATH {
+        return natural;
+    }
+    short_socket_root()
+        .join(format!("autumn-{}", short_project_id(project)))
+        .join("s.sock")
+}
+
+/// A short, stable id for `project` (first 4 bytes of SHA-256, 8 hex chars) used
+/// to keep the fallback socket dir unique per project but tiny.
+fn short_project_id(project: &str) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(&Sha256::digest(project.as_bytes())[..4])
+}
+
+/// Private, short base dir for the fallback socket: `$XDG_RUNTIME_DIR` when set
+/// (Linux), else the per-user temp dir (`$TMPDIR` on macOS is per-user-private).
+fn short_socket_root() -> PathBuf {
+    std::env::var_os("XDG_RUNTIME_DIR").map_or_else(std::env::temp_dir, PathBuf::from)
 }
 
 impl RuntimePaths {
@@ -75,10 +110,12 @@ impl RuntimePaths {
             .state_dir()
             .map_or_else(|| dirs.data_dir().join("logs"), |s| s.join("logs"));
 
+        let socket = resolve_socket_path(&runtime, project);
         Ok(Self {
             runtime,
             data,
             logs,
+            socket,
         })
     }
 
@@ -87,10 +124,12 @@ impl RuntimePaths {
     #[must_use]
     pub fn from_base(base: &Path, project: &str) -> Self {
         let root = base.join(project);
+        let socket = resolve_socket_path(&root, project);
         Self {
             runtime: root.clone(),
             data: root.clone(),
             logs: root,
+            socket,
         }
     }
 
@@ -100,10 +139,11 @@ impl RuntimePaths {
         self.runtime.join("serve.pid")
     }
 
-    /// Unix domain socket path (`<runtime>/serve.sock`).
+    /// Unix domain socket path (`<runtime>/serve.sock`, or a short fallback when
+    /// that would exceed the OS `sun_path` limit).
     #[must_use]
     pub fn socket_file(&self) -> PathBuf {
-        self.runtime.join("serve.sock")
+        self.socket.clone()
     }
 
     /// Address-discovery file path (`<runtime>/serve.addr`).
@@ -139,6 +179,19 @@ impl RuntimePaths {
         std::fs::create_dir_all(&self.runtime)?;
         std::fs::create_dir_all(&self.logs)?;
         std::fs::create_dir_all(&self.data)?;
+        // The socket may live in a short fallback dir distinct from `runtime`
+        // (under a shared temp root), so ensure its parent exists and is
+        // owner-only — others must not be able to plant entries there.
+        if let Some(parent) = self.socket.parent()
+            && parent != self.runtime
+        {
+            std::fs::create_dir_all(parent)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+            }
+        }
         Ok(())
     }
 }
@@ -155,6 +208,35 @@ mod tests {
         assert_eq!(paths.addr_file(), Path::new("/var/run/demo/serve.addr"));
         assert_eq!(paths.pg_data_dir(), Path::new("/var/run/demo/pg"));
         assert_eq!(paths.log_file(), Path::new("/var/run/demo/serve.log"));
+    }
+
+    #[test]
+    fn socket_uses_natural_path_when_short() {
+        let paths = RuntimePaths::from_base(Path::new("/var/run"), "demo");
+        assert_eq!(paths.socket_file(), Path::new("/var/run/demo/serve.sock"));
+        assert!(paths.socket_file().as_os_str().len() <= MAX_UNIX_SOCKET_PATH);
+    }
+
+    #[test]
+    fn socket_falls_back_to_short_path_when_runtime_too_long() {
+        // A base long enough to push `<runtime>/serve.sock` past the limit.
+        let long_base = format!("/{}", "longsegment".repeat(12)); // ~133 chars
+        // Force the temp-dir root so the short path is deterministic/short.
+        temp_env::with_var("XDG_RUNTIME_DIR", None::<&str>, || {
+            let paths = RuntimePaths::from_base(Path::new(&long_base), "proj");
+            let sock = paths.socket_file();
+            assert!(
+                sock.as_os_str().len() <= MAX_UNIX_SOCKET_PATH,
+                "socket path still too long ({} bytes): {}",
+                sock.as_os_str().len(),
+                sock.display()
+            );
+            // It is *not* the (too-long) natural path …
+            assert_ne!(sock, Path::new(&long_base).join("proj").join("serve.sock"));
+            // … while pidfile/addr stay in the long runtime dir (no length limit).
+            assert!(paths.pid_file().starts_with(&long_base));
+            assert!(paths.addr_file().starts_with(&long_base));
+        });
     }
 
     // Uses a Unix-style absolute base; `/tmp/...` is not absolute on Windows

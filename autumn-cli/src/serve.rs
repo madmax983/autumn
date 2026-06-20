@@ -145,13 +145,66 @@ fn run_unix(action: Option<ServeAction>, opts: &ServeOptions) -> i32 {
     }
 }
 
+/// Parse the address file under `paths`, if present and well-formed.
+fn read_addr_file(paths: &RuntimePaths) -> Option<AddrFile> {
+    std::fs::read_to_string(paths.addr_file())
+        .ok()
+        .and_then(|s| AddrFile::parse(&s).ok())
+}
+
 /// The currently-recorded daemon's address file, if present and parseable.
 /// Best-effort: `None` if anything can't be read.
 fn running_daemon_addr(package: Option<&str>) -> Option<AddrFile> {
     let paths = RuntimePaths::resolve(&project_identity(package)).ok()?;
-    std::fs::read_to_string(paths.addr_file())
-        .ok()
-        .and_then(|s| AddrFile::parse(&s).ok())
+    read_addr_file(&paths)
+}
+
+/// Whether a Unix socket at `path` has a live listener (a `connect` succeeds).
+/// Used as a portable daemon-identity check where the OS can't verify a recorded
+/// process start time (e.g. macOS).
+#[cfg(unix)]
+fn socket_is_live(path: &Path) -> bool {
+    std::os::unix::net::UnixStream::connect(path).is_ok()
+}
+
+#[cfg(not(unix))]
+fn socket_is_live(_path: &Path) -> bool {
+    false
+}
+
+/// Whether `rec` identifies our live daemon, guarding against PID reuse.
+///
+/// A recorded start time that matches the live process is conclusive (Linux).
+/// Otherwise — no recorded start time, or a platform that can't report one such
+/// as macOS — the PID alone is ambiguous, so require the daemon's socket to have
+/// a live listener: an unrelated process that reused the PID would not be
+/// listening there. This stops `status`/`stop` from acting on a reused PID.
+fn confirmed_running(rec: &process::PidRecord, socket: &Path) -> bool {
+    if !process::is_process_alive(rec.pid) {
+        return false;
+    }
+    if let (Some(recorded), Some(current)) = (rec.start_time, process::process_start_time(rec.pid))
+        && recorded == current
+    {
+        return true;
+    }
+    socket_is_live(socket)
+}
+
+/// Resolve the daemon PID for lifecycle commands. Prefers the authoritative
+/// pidfile (which carries a start time for PID-reuse detection); if it is
+/// missing or corrupt, falls back to the address file's PID — but only when a
+/// live listener confirms a daemon is still serving on the socket, so a removed
+/// pidfile doesn't leave the daemon unstoppable.
+fn lifecycle_target(paths: &RuntimePaths, socket: &Path) -> Option<process::PidRecord> {
+    if let Some(rec) = process::read_pidfile(&paths.pid_file()) {
+        return Some(rec);
+    }
+    let addr = read_addr_file(paths)?;
+    socket_is_live(socket).then_some(process::PidRecord {
+        pid: addr.pid,
+        start_time: None,
+    })
 }
 
 /// Resolve the project's runtime paths, exiting on failure.
@@ -583,12 +636,12 @@ fn write_addr_file(
 fn stop(opts: &ServeOptions) -> i32 {
     let paths = resolve_paths(opts.package.as_deref());
     let socket = paths.socket_file();
-    let Some(rec) = process::read_pidfile(&paths.pid_file()) else {
+    let Some(rec) = lifecycle_target(&paths, &socket) else {
         println!("autumn serve: not running");
         return 0;
     };
-    if !process::is_record_alive(&rec) {
-        println!("autumn serve: not running (removed stale pidfile)");
+    if !confirmed_running(&rec, &socket) {
+        println!("autumn serve: not running (removed stale files)");
         cleanup(&paths, &socket);
         return 0;
     }
@@ -596,7 +649,7 @@ fn stop(opts: &ServeOptions) -> i32 {
     // A daemon started with `--release` runs the `prod` profile (the app's
     // build-mode detection), which `stop` can't otherwise observe; recover it
     // from the address file so the budget honors prod shutdown settings.
-    let recorded_release = running_daemon_addr(opts.package.as_deref()).is_some_and(|a| a.release);
+    let recorded_release = read_addr_file(&paths).is_some_and(|a| a.release);
     process::stop_pid(rec.pid, stop_timeout(opts, recorded_release));
     cleanup(&paths, &socket);
     println!("autumn serve: stopped");
@@ -750,15 +803,14 @@ fn env_u64(key: &str) -> Option<u64> {
 /// Report daemon status. Exit code 0 = running, 3 = stopped.
 fn status(opts: &ServeOptions) -> i32 {
     let paths = resolve_paths(opts.package.as_deref());
-    let Some(rec) = process::read_pidfile(&paths.pid_file()) else {
+    let socket = paths.socket_file();
+    let Some(rec) = lifecycle_target(&paths, &socket) else {
         println!("autumn serve: stopped");
         return 3;
     };
-    if process::is_record_alive(&rec) {
-        let address = std::fs::read_to_string(paths.addr_file())
-            .ok()
-            .and_then(|s| AddrFile::parse(&s).ok())
-            .map_or_else(|| paths.socket_file().display().to_string(), |a| a.address);
+    if confirmed_running(&rec, &socket) {
+        let address =
+            read_addr_file(&paths).map_or_else(|| socket.display().to_string(), |a| a.address);
         println!("autumn serve: running (pid {}) on unix:{address}", rec.pid);
         0
     } else {
@@ -991,5 +1043,55 @@ mod tests {
         temp_env::with_vars(clear_shutdown_env(), || {
             assert_eq!(resolve_shutdown_budget(dir.path(), Some("prod")).1, 111);
         });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn confirmed_running_false_for_dead_pid() {
+        let rec = process::PidRecord {
+            pid: 2_147_483_640,
+            start_time: None,
+        };
+        assert!(!confirmed_running(
+            &rec,
+            std::path::Path::new("/nonexistent/serve.sock")
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn confirmed_running_true_for_self_via_start_time() {
+        // A matching start time is conclusive without needing a live socket.
+        let pid = std::process::id();
+        let rec = process::PidRecord {
+            pid,
+            start_time: process::process_start_time(pid),
+        };
+        assert!(confirmed_running(
+            &rec,
+            std::path::Path::new("/nonexistent/serve.sock")
+        ));
+    }
+
+    #[test]
+    fn lifecycle_target_prefers_pidfile() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = RuntimePaths::from_base(dir.path(), "p");
+        paths.ensure_dirs().expect("dirs");
+        std::fs::write(paths.pid_file(), "4242 0\n").expect("write pid");
+        let rec = lifecycle_target(&paths, &paths.socket_file()).expect("target");
+        assert_eq!(rec.pid, 4242);
+    }
+
+    #[test]
+    fn lifecycle_target_addr_fallback_requires_live_socket() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = RuntimePaths::from_base(dir.path(), "p");
+        paths.ensure_dirs().expect("dirs");
+        // Address file present, pidfile absent, and no live listener on the
+        // socket: we must not treat the recorded PID as the daemon.
+        let addr = sample("unix", &paths.socket_file().display().to_string(), false);
+        std::fs::write(paths.addr_file(), addr.to_toml()).expect("write addr");
+        assert!(lifecycle_target(&paths, &paths.socket_file()).is_none());
     }
 }
