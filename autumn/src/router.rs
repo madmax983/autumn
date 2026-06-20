@@ -633,11 +633,25 @@ fn build_router_pre_state(
         // layer from `apply_middleware`. Route-level overrides do not apply to
         // the fixed mount path, so an empty override table is passed (the layer
         // is a no-op when the global timeout is disabled).
+        //
+        // KNOWN LIMITATION (tools/call vs per-route timeout): this envelope timer
+        // wraps the whole POST, including the in-process `tools/call` dispatch
+        // replay, with the global default deadline. The dispatch clone carries
+        // its own per-route timeout layer, but it is *inner* to this one, so a
+        // tool whose route declares `timeout = "off"` or a longer `timeout_ms`
+        // is still capped at the global default when invoked via MCP (it runs
+        // unbounded / longer over a direct HTTP call). Honoring the per-route
+        // policy here would require propagating the dispatched route's timeout
+        // out to this single fixed-path endpoint, which has no per-route
+        // distinction at the layer level; the global deadline is kept as a
+        // safety bound instead. `mirror_cors = false`: the 503 already flows out
+        // through this router's own (outer) `CorsLayer` from `apply_mcp_cors_layer`.
         mcp_router = apply_request_timeout_middleware(
             mcp_router,
             config,
             state.metrics.clone(),
             std::sync::Arc::new(std::collections::HashMap::new()),
+            false,
         );
         // Gate the envelope under maintenance mode, mirroring the layer
         // `apply_middleware` installs for direct routes. The `/mcp` router is
@@ -1917,18 +1931,28 @@ fn build_route_timeout_table(
 /// page for browsers — never a raw tower `BoxError`).
 ///
 /// Streaming responses are exempt by construction: the deadline bounds the time
-/// to produce the response head, not the duration of body streaming, so SSE,
-/// long-poll, and chunked responses are never interrupted. WebSocket upgrades
-/// are additionally marked [`RouteTimeout::Disabled`](crate::route::RouteTimeout)
-/// by the `#[ws]` macro.
+/// to produce the response head, not the duration of body streaming, so SSE and
+/// chunked responses are never interrupted once the head is sent. Long-poll
+/// handlers, which block *before* returning the head, are bound by the deadline
+/// and must opt out via `timeout = "off"`. WebSocket upgrades are additionally
+/// marked [`RouteTimeout::Disabled`](crate::route::RouteTimeout) by the `#[ws]`
+/// macro.
 ///
 /// The layer is a no-op (zero overhead) when the global timeout is disabled and
 /// no route declares an `Override`.
+///
+/// `mirror_cors` makes a synthesized 503 carry the CORS response headers a
+/// normal response would. Set it for the main ingress stack, where this layer
+/// sits *outside* `CorsLayer` (see the order in `apply_middleware`) so the 503
+/// never flows back through it; leave it off for the `/mcp` envelope, whose
+/// timeout is applied *inner* to its `CorsLayer` and whose 503 is therefore
+/// already CORS-readable.
 fn apply_request_timeout_middleware(
     router: axum::Router<AppState>,
     config: &AutumnConfig,
     metrics: crate::middleware::MetricsCollector,
     route_timeouts: RouteTimeoutTable,
+    mirror_cors: bool,
 ) -> axum::Router<AppState> {
     let global = config
         .server
@@ -1949,8 +1973,19 @@ fn apply_request_timeout_middleware(
             "Inbound request timeout enabled"
         );
     }
+    // Snapshot the CORS config once iff we must mirror it onto timeout 503s and
+    // any origin is configured (otherwise `CorsLayer` itself is absent).
+    let cors = (mirror_cors && !config.cors.allowed_origins.is_empty())
+        .then(|| std::sync::Arc::new(config.cors.clone()));
     router.layer(axum::middleware::from_fn(move |req, next| {
-        request_timeout_handler(req, next, global, route_timeouts.clone(), metrics.clone())
+        request_timeout_handler(
+            req,
+            next,
+            global,
+            route_timeouts.clone(),
+            metrics.clone(),
+            cors.clone(),
+        )
     }))
 }
 
@@ -1960,6 +1995,7 @@ async fn request_timeout_handler(
     global: Option<std::time::Duration>,
     route_timeouts: RouteTimeoutTable,
     metrics: crate::middleware::MetricsCollector,
+    cors: Option<std::sync::Arc<crate::config::CorsConfig>>,
 ) -> axum::response::Response {
     // Resolve the effective deadline from the matched route template + method,
     // using borrowed lookups so exempt/disabled routes allocate nothing.
@@ -1989,6 +2025,12 @@ async fn request_timeout_handler(
         .extensions()
         .get::<crate::middleware::RequestId>()
         .cloned();
+    // Capture the request Origin before `req` is consumed so a timeout 503 can
+    // mirror the CORS headers `CorsLayer` would have added (only when mirroring
+    // is enabled — see `apply_request_timeout_middleware`).
+    let cors_origin = cors
+        .as_ref()
+        .and_then(|_| req.headers().get(http::header::ORIGIN).cloned());
     let start = std::time::Instant::now();
     match tokio::time::timeout(duration, next.run(req)).await {
         Ok(response) => response,
@@ -2009,10 +2051,19 @@ async fn request_timeout_handler(
             // Return a 503 via the standard error type so the exception-filter
             // and error-page stack negotiate JSON vs HTML and enrich with the
             // request id — no manual Problem Details assembly, no raw BoxError.
-            crate::error::AutumnError::service_unavailable(RequestDeadlineExceeded {
-                timeout_ms: u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
-            })
-            .into_response()
+            let mut response =
+                crate::error::AutumnError::service_unavailable(RequestDeadlineExceeded {
+                    timeout_ms: u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
+                })
+                .into_response();
+            // This layer is outside `CorsLayer` in the main stack, so the 503
+            // never passes back through it; mirror the CORS headers ourselves so
+            // cross-origin browser clients can read the Problem Details body
+            // instead of seeing an opaque CORS failure.
+            if let Some(cors) = cors.as_deref() {
+                apply_cors_headers_to_timeout_response(cors, cors_origin.as_ref(), &mut response);
+            }
+            response
         }
     }
 }
@@ -2179,8 +2230,15 @@ fn apply_middleware(
     //   Session → SecurityHeaders → RequestId → LogContext → AccessLog-primary →
     //   Timeout → [user layers] → Tenancy → BodyLimit/UploadConfig →
     //   MethodOverride → RateLimit → CSRF → CORS → handler
-    router =
-        apply_request_timeout_middleware(router, config, state.metrics.clone(), route_timeouts);
+    // `mirror_cors = true`: this layer is outside `CorsLayer` (CORS is applied
+    // earlier, hence inner), so its timeout 503 must carry CORS headers itself.
+    router = apply_request_timeout_middleware(
+        router,
+        config,
+        state.metrics.clone(),
+        route_timeouts,
+        true,
+    );
 
     // Error-reporting + panic-catch layer. Placed inner to `RequestIdLayer`
     // (so the request id is available when a handler panics) and outer to the
@@ -2863,6 +2921,57 @@ pub fn build_cors_layer(cors: &crate::config::CorsConfig) -> tower_http::cors::C
         .allow_headers(headers)
         .allow_credentials(cors.allow_credentials)
         .max_age(std::time::Duration::from_secs(cors.max_age_secs))
+}
+
+/// Mirror onto a timeout-generated 503 the CORS response headers `CorsLayer`
+/// would add to a normal (non-preflight) response.
+///
+/// In the main ingress stack the per-request timeout layer sits *outside*
+/// `CorsLayer` (see the layer order in `apply_middleware`), so a 503 it
+/// synthesizes on expiry never flows back through `CorsLayer`. Without this a
+/// cross-origin browser client sees an opaque CORS failure instead of the
+/// documented Problem Details 503. Only the simple-response subset is needed:
+/// the resolved `Access-Control-Allow-Origin` (with `Vary: origin` when it is
+/// reflected) and `Access-Control-Allow-Credentials`. Preflight (OPTIONS)
+/// requests are answered by `CorsLayer` directly and never reach the timer.
+fn apply_cors_headers_to_timeout_response(
+    cors: &crate::config::CorsConfig,
+    origin: Option<&http::HeaderValue>,
+    response: &mut axum::response::Response,
+) {
+    use http::header;
+    let allow_any = cors.allowed_origins.iter().any(|o| o == "*");
+    let allow_origin = if allow_any {
+        Some(http::HeaderValue::from_static("*"))
+    } else {
+        // Echo the request Origin iff it is in the configured allowlist, exactly
+        // as `CorsLayer` does for a reflected origin.
+        origin.and_then(|value| {
+            let value_str = value.to_str().ok()?;
+            cors.allowed_origins
+                .iter()
+                .any(|allowed| allowed == value_str)
+                .then(|| value.clone())
+        })
+    };
+    let Some(allow_origin) = allow_origin else {
+        // Origin missing or not allowed: a real `CorsLayer` would add nothing.
+        return;
+    };
+    let headers = response.headers_mut();
+    headers.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, allow_origin);
+    if !allow_any {
+        // A reflected origin makes the response origin-dependent; mirror the
+        // `Vary: origin` `CorsLayer` adds so shared caches don't serve it to a
+        // different origin.
+        headers.insert(header::VARY, http::HeaderValue::from_static("origin"));
+    }
+    if cors.allow_credentials {
+        headers.insert(
+            header::ACCESS_CONTROL_ALLOW_CREDENTIALS,
+            http::HeaderValue::from_static("true"),
+        );
+    }
 }
 
 /// Set `Cache-Control` headers for static assets based on whether the path is
@@ -4924,6 +5033,7 @@ mod trusted_host_tests {
             &config,
             state.metrics.clone(),
             no_route_timeouts(),
+            false,
         )
         .layer(RequestIdLayer)
         .with_state(state);
@@ -4967,6 +5077,7 @@ mod trusted_host_tests {
             &config,
             state.metrics.clone(),
             no_route_timeouts(),
+            false,
         )
         .layer(RequestIdLayer)
         .with_state(state.clone());
@@ -4980,6 +5091,118 @@ mod trusted_host_tests {
         assert_eq!(
             snap.http.request_timeouts_total, 1,
             "autumn_request_timeouts_total must be incremented on timeout"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn request_timeout_503_mirrors_cors_headers() {
+        let mut config = AutumnConfig::default();
+        config.server.timeouts.request_timeout_ms = Some(100);
+        // CORS is configured with a concrete allowlist (the reflected-origin path).
+        config.cors.allowed_origins = vec!["https://app.example.com".to_owned()];
+        config.cors.allow_credentials = true;
+
+        let state = crate::state::AppState::for_test();
+        let router: axum::Router<AppState> = axum::Router::new().route(
+            "/slow",
+            axum::routing::get(|| async {
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                "ok"
+            }),
+        );
+
+        // `mirror_cors = true`, matching the main ingress stack where the timeout
+        // layer is outside `CorsLayer` and the 503 would otherwise be opaque.
+        let router = apply_request_timeout_middleware(
+            router,
+            &config,
+            state.metrics.clone(),
+            no_route_timeouts(),
+            true,
+        )
+        .layer(RequestIdLayer)
+        .with_state(state);
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/slow")
+                    .header("origin", "https://app.example.com")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response
+                .headers()
+                .get("access-control-allow-origin")
+                .and_then(|v| v.to_str().ok()),
+            Some("https://app.example.com"),
+            "an allowed origin must be reflected on the timeout 503 so browsers can read it"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("access-control-allow-credentials")
+                .and_then(|v| v.to_str().ok()),
+            Some("true"),
+            "credentials flag must be mirrored when configured"
+        );
+        assert!(
+            response.headers().get_all("vary").iter().any(|v| v
+                .to_str()
+                .map(|s| s.eq_ignore_ascii_case("origin"))
+                .unwrap_or(false)),
+            "a reflected origin must carry Vary: origin"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn request_timeout_503_omits_cors_for_disallowed_origin() {
+        let mut config = AutumnConfig::default();
+        config.server.timeouts.request_timeout_ms = Some(100);
+        config.cors.allowed_origins = vec!["https://app.example.com".to_owned()];
+
+        let state = crate::state::AppState::for_test();
+        let router: axum::Router<AppState> = axum::Router::new().route(
+            "/slow",
+            axum::routing::get(|| async {
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                "ok"
+            }),
+        );
+
+        let router = apply_request_timeout_middleware(
+            router,
+            &config,
+            state.metrics.clone(),
+            no_route_timeouts(),
+            true,
+        )
+        .layer(RequestIdLayer)
+        .with_state(state);
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/slow")
+                    .header("origin", "https://evil.example.com")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            response
+                .headers()
+                .get("access-control-allow-origin")
+                .is_none(),
+            "a disallowed origin must not be reflected, mirroring CorsLayer"
         );
     }
 
@@ -5002,6 +5225,7 @@ mod trusted_host_tests {
             &config,
             state.metrics.clone(),
             no_route_timeouts(),
+            false,
         )
         .layer(RequestIdLayer)
         .with_state(state);
@@ -5039,6 +5263,7 @@ mod trusted_host_tests {
             &config,
             state.metrics.clone(),
             no_route_timeouts(),
+            false,
         )
         .with_state(state);
 
@@ -5064,6 +5289,7 @@ mod trusted_host_tests {
             &config,
             state.metrics.clone(),
             no_route_timeouts(),
+            false,
         )
         .with_state(state);
 
@@ -5097,6 +5323,7 @@ mod trusted_host_tests {
             &config,
             state.metrics.clone(),
             no_route_timeouts(),
+            false,
         )
         .with_state(state);
 
@@ -5130,7 +5357,7 @@ mod trusted_host_tests {
             crate::route::RouteTimeout::Override(std::time::Duration::from_secs(10)),
         );
         let router =
-            apply_request_timeout_middleware(router, &config, state.metrics.clone(), table)
+            apply_request_timeout_middleware(router, &config, state.metrics.clone(), table, false)
                 .with_state(state);
 
         let response = router
@@ -5167,7 +5394,7 @@ mod trusted_host_tests {
 
         let table = get_route_timeouts("/stream", crate::route::RouteTimeout::Disabled);
         let router =
-            apply_request_timeout_middleware(router, &config, state.metrics.clone(), table)
+            apply_request_timeout_middleware(router, &config, state.metrics.clone(), table, false)
                 .with_state(state.clone());
 
         let response = router
@@ -5207,7 +5434,7 @@ mod trusted_host_tests {
             crate::route::RouteTimeout::Override(std::time::Duration::from_millis(100)),
         );
         let router =
-            apply_request_timeout_middleware(router, &config, state.metrics.clone(), table)
+            apply_request_timeout_middleware(router, &config, state.metrics.clone(), table, false)
                 .with_state(state);
 
         let response = router

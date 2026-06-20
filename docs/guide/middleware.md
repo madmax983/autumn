@@ -36,9 +36,14 @@ A timeout emits structured telemetry — a `request_timeouts_total` counter plus
 ### What the deadline covers
 
 The deadline bounds the time to produce the **response head**, not the duration
-of body streaming. So **SSE, long-poll, and chunked/streaming responses are
-exempt** — they are never interrupted mid-stream. WebSocket upgrades (`#[ws]`)
-are exempt automatically.
+of body streaming. So **SSE and chunked/streaming responses are exempt** — once
+the head is sent, the body is never interrupted mid-stream. WebSocket upgrades
+(`#[ws]`) are exempt automatically.
+
+**Long-poll handlers are the exception**: because they block *before* returning
+the response head (waiting for an event), that wait counts against the deadline
+and the request will 503 once it elapses. Give such routes an explicit
+`timeout = "off"` (see below) if a poll may legitimately outlast the deadline.
 
 ### Per-route overrides
 
