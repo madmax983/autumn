@@ -789,6 +789,16 @@ fn wait_for_ready(ready_file: &Path, child: &mut std::process::Child, timeout: D
     }
 }
 
+/// The graceful-drain budget (seconds) the daemon wrote into its readiness file
+/// — its own resolved `prestop_grace_secs + shutdown_timeout_secs`, reflecting
+/// any custom `with_config_loader` the CLI can't see. `None` if the file is
+/// absent or doesn't parse (e.g. an app predating the readiness protocol).
+fn child_reported_budget(paths: &RuntimePaths) -> Option<u64> {
+    std::fs::read_to_string(paths.ready_file())
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+}
+
 /// Write the address-discovery file with `0600` permissions.
 ///
 /// # Errors
@@ -811,9 +821,14 @@ fn write_addr_file(
             .map_or(0, |d| d.as_secs()),
         managed_pg: opts.bundled_pg,
         release: opts.release,
-        // Resolve the budget now, from the daemon's own env/profile, so `stop`
-        // doesn't have to (and can't) reconstruct it from a different shell.
-        stop_budget_secs: Some(resolved_stop_budget_secs(opts)),
+        // Prefer the budget the child reported in its readiness file (its own
+        // *resolved* config, including any custom `with_config_loader`); fall
+        // back to reconstructing it from the daemon's env/profile only if the
+        // child didn't report one. Either way `stop` reads it from here so it
+        // never re-derives a budget from a different shell.
+        stop_budget_secs: Some(
+            child_reported_budget(paths).unwrap_or_else(|| resolved_stop_budget_secs(opts)),
+        ),
         // Record the explicit profile (a `restart` override, else this shell's
         // env) so a later `restart` can restore it.
         profile: opts.profile.clone().or_else(env_profile),
@@ -1439,5 +1454,19 @@ mod tests {
         let addr = sample("unix", &paths.socket_file().display().to_string(), false);
         std::fs::write(paths.addr_file(), addr.to_toml()).expect("write addr");
         assert!(lifecycle_target(&paths, &paths.socket_file()).is_none());
+    }
+
+    #[test]
+    fn child_reported_budget_reads_ready_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = RuntimePaths::from_base(dir.path(), "p");
+        paths.ensure_dirs().expect("dirs");
+        // Absent file → no reported budget (CLI falls back to its own resolve).
+        assert_eq!(child_reported_budget(&paths), None);
+        std::fs::write(paths.ready_file(), "42").expect("write ready");
+        assert_eq!(child_reported_budget(&paths), Some(42));
+        // Non-numeric content is ignored rather than misread.
+        std::fs::write(paths.ready_file(), "not-a-number").expect("write ready");
+        assert_eq!(child_reported_budget(&paths), None);
     }
 }

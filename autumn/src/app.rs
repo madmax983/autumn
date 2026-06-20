@@ -3330,7 +3330,12 @@ impl AppBuilder {
                 }
             }
             state.probes().mark_startup_complete();
-            signal_serve_ready();
+            signal_serve_ready(
+                config
+                    .server
+                    .prestop_grace_secs
+                    .saturating_add(config.server.shutdown_timeout_secs),
+            );
         }
 
         // Signal the drain phase. The watchdog checks the flag for the common
@@ -4889,11 +4894,17 @@ async fn stamp_loopback_connect_info(
 /// middleware (the startup barrier, maintenance mode, rate limiting, or custom
 /// health paths, which an HTTP readiness probe would all have to thread).
 ///
+/// The file's contents are the app's *resolved* graceful-drain budget in seconds
+/// (`prestop_grace_secs + shutdown_timeout_secs`). The supervisor records this so
+/// `autumn serve stop` waits for the budget the app will actually drain for —
+/// even when a custom `with_config_loader` set it — instead of reconstructing it
+/// from TOML/env and risking a premature `SIGKILL`.
+///
 /// Best-effort: a write failure only delays readiness detection until the
 /// supervisor's timeout, and a non-daemon run leaves the variable unset (no-op).
 ///
 /// [`mark_startup_complete`]: crate::probe::ProbeState::mark_startup_complete
-fn signal_serve_ready() {
+fn signal_serve_ready(drain_budget_secs: u64) {
     let Some(path) = std::env::var_os("AUTUMN_SERVE_READY_FILE") else {
         return;
     };
@@ -4901,7 +4912,7 @@ fn signal_serve_ready() {
         return;
     }
     let path = std::path::PathBuf::from(path);
-    if let Err(e) = std::fs::write(&path, std::process::id().to_string()) {
+    if let Err(e) = std::fs::write(&path, drain_budget_secs.to_string()) {
         tracing::warn!(error = %e, path = %path.display(),
             "could not write serve readiness file");
     }
