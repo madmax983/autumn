@@ -5423,7 +5423,22 @@ async fn setup_database(
     // `Ok(None)`) — even if `database.url` is configured. Custom providers
     // signal "this app runs without a DB" by returning None; running
     // migrations against the URL anyway would defeat the opt-out.
-    run_startup_migrations(config, topology.is_some(), shards.is_some(), migrations).await;
+    //
+    // A provider may also resolve its primary URL at runtime (managed Postgres)
+    // and carry it on the topology; prefer it so migrations target the pool that
+    // was actually built rather than a stale/absent configured URL.
+    let provider_migration_url = topology
+        .as_ref()
+        .and_then(|t| t.migration_url())
+        .map(str::to_owned);
+    run_startup_migrations(
+        config,
+        topology.is_some(),
+        shards.is_some(),
+        provider_migration_url,
+        migrations,
+    )
+    .await;
 
     let (replica_readiness, replica_migration_check) = if topology
         .as_ref()
@@ -5474,21 +5489,17 @@ async fn run_startup_migrations(
     config: &AutumnConfig,
     control_configured: bool,
     shards_configured: bool,
+    provider_migration_url: Option<String>,
     migrations: Vec<crate::migrate::EmbeddedMigrations>,
 ) {
-    // Managed Postgres has no `primary_url` in config — its URL is resolved at
-    // runtime, so fall back to whatever a managed provider published.
-    #[cfg(feature = "managed-pg")]
-    let managed_fallback = crate::managed_pg::resolved_primary_url();
-    #[cfg(not(feature = "managed-pg"))]
-    let managed_fallback: Option<String> = None;
     let control_url = if control_configured {
-        // Prefer the managed cluster's URL whenever a managed provider published
-        // one: the runtime pool is built from it, so embedded startup migrations
-        // must target it — even if a stale `database.url`/`primary_url` is still
-        // configured (e.g. an existing app adopting the provider). Fall back to
-        // the configured URL when no managed provider is active.
-        managed_fallback.or_else(|| config.database.effective_primary_url().map(str::to_owned))
+        // Prefer a provider-resolved URL (e.g. managed Postgres, whose socket
+        // URL isn't in config) carried on the topology: the runtime pool is
+        // built from it, so embedded startup migrations must target it — even if
+        // a stale `database.url`/`primary_url` is still configured (an existing
+        // app adopting the provider). Fall back to the configured URL otherwise.
+        provider_migration_url
+            .or_else(|| config.database.effective_primary_url().map(str::to_owned))
     } else {
         None
     };

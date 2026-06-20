@@ -42,13 +42,6 @@ pub const MANAGED_PG_DATA_DIR_ENV: &str = "AUTUMN_MANAGED_PG_DATA_DIR";
 /// How long to allow each `initdb`/`start` step before surfacing a diagnostic.
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// The managed primary URL, published by the provider once the cluster is up so
-/// `run_startup_migrations` can target it (the app's config has no
-/// `primary_url`). Last-writer-wins rather than set-once: if a second managed
-/// app boots in the same process (integration tests, or after stopping one and
-/// starting another), its migrations must target *its* cluster, not the first.
-static RESOLVED_PRIMARY_URL: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
-
 /// The managed provider that most recently started a cluster this process,
 /// retained so abnormal boot-failure paths can stop the supervised child even
 /// though they bypass `on_shutdown`. Last-writer-wins for the same reason.
@@ -88,13 +81,6 @@ pub(crate) async fn emergency_stop_async() {
     if let Some(provider) = provider {
         provider.stop().await;
     }
-}
-
-/// The managed-Postgres primary URL resolved at boot, if a managed provider has
-/// started its cluster this process. Used by the migration runner.
-#[must_use]
-pub(crate) fn resolved_primary_url() -> Option<String> {
-    RESOLVED_PRIMARY_URL.lock().ok().and_then(|g| g.clone())
 }
 
 /// Generate a random 24-character alphanumeric password for the managed cluster.
@@ -215,12 +201,6 @@ impl ManagedPostgresPoolProvider {
         }
         let url = pg.settings().url(MANAGED_DB_NAME);
 
-        // Publish the resolved URL so `run_startup_migrations` can target the
-        // managed database (the user's `autumn.toml` has no `primary_url`).
-        if let Ok(mut g) = RESOLVED_PRIMARY_URL.lock() {
-            *g = Some(url.clone());
-        }
-
         // Retain the handle so the child keeps running after this returns.
         if let Ok(mut guard) = self.instance.lock() {
             *guard = Some(pg);
@@ -302,12 +282,10 @@ impl ManagedPostgresPoolProvider {
         {
             tracing::warn!(error = %e, "failed to stop managed Postgres cleanly");
         }
-        // Clear the process-global publications so a later app in the same
-        // process (integration tests) doesn't run migrations against this
-        // now-stopped cluster's URL or try to emergency-stop a dead handle.
-        if let Ok(mut g) = RESOLVED_PRIMARY_URL.lock() {
-            *g = None;
-        }
+        // Clear the emergency-stop registration so a later app in the same
+        // process (integration tests) doesn't try to emergency-stop this
+        // now-dead handle. The resolved URL is carried on the per-app topology,
+        // so there is no process-global URL to clear.
         if let Ok(mut g) = EMERGENCY_PROVIDER.lock() {
             *g = None;
         }
@@ -353,7 +331,18 @@ impl DatabasePoolProvider for ManagedPostgresPoolProvider {
         let Some(primary) = self.create_pool(config).await? else {
             return Ok(None);
         };
-        Ok(Some(crate::db::DatabaseTopology::from_pools(primary, None)))
+        // After `create_pool`, the cluster is running; read its URL from the
+        // retained handle and carry it on the topology so startup migrations
+        // target this managed cluster — per-app, with no process-global.
+        let migration_url = self
+            .instance
+            .lock()
+            .ok()
+            .and_then(|guard| guard.as_ref().map(|pg| pg.settings().url(MANAGED_DB_NAME)));
+        Ok(Some(
+            crate::db::DatabaseTopology::from_pools(primary, None)
+                .with_migration_url(migration_url),
+        ))
     }
 
     async fn create_shard_topology(
