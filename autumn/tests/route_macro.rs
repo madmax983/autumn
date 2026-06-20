@@ -249,3 +249,17 @@ fn multi_path_params_route_preserves_pattern() {
     assert_eq!(route.path, "/posts/{year}/{slug}");
     assert_eq!(route.method, http::Method::GET);
 }
+
+#[test]
+fn fully_qualified_primitive_return_type_compiles_with_route_macro() {
+    #[autumn_web::get("/foo")]
+    #[allow(clippy::unused_async)]
+    async fn fully_qualified_int_route() -> std::primitive::i32 {
+        42
+    }
+
+    assert_eq!(
+        __autumn_route_info_fully_qualified_int_route().name,
+        "fully_qualified_int_route"
+    );
+}
