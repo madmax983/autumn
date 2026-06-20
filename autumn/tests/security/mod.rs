@@ -14,3 +14,4 @@ pub mod maintenance;
 pub mod rate_limit_xff_bypass;
 pub mod session_exhaustion;
 pub mod session_fixation;
+pub mod ses_forgery;
