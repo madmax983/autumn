@@ -5262,8 +5262,7 @@ mod trusted_host_tests {
 
     #[test]
     fn build_route_timeout_table_normalizes_method_aliases() {
-        let override_10s =
-            crate::route::RouteTimeout::Override(std::time::Duration::from_secs(10));
+        let override_10s = crate::route::RouteTimeout::Override(std::time::Duration::from_secs(10));
         let routes = vec![
             // A GET handler also serves HEAD in axum.
             timeout_route(http::Method::GET, "/export", override_10s),
@@ -5298,7 +5297,8 @@ mod trusted_host_tests {
             "a WS override must be keyed under the GET the upgrade arrives as"
         );
         assert!(
-            live.get(&http::Method::from_bytes(b"WS").unwrap()).is_none(),
+            live.get(&http::Method::from_bytes(b"WS").unwrap())
+                .is_none(),
             "the synthetic WS method is never seen at lookup time"
         );
 
