@@ -124,6 +124,10 @@ pub use crate::error::{AutumnError, AutumnResult};
 /// Pagination primitives — offset and cursor extractors and wrappers.
 pub use crate::pagination::{CursorPage, CursorRequest, Page, PageRequest};
 
+// ── Data ────────────────────────────────────────────────────────
+#[cfg(feature = "csv")]
+pub use crate::data::csv::{CsvResponse, CsvSchema};
+
 // ── Validation ──────────────────────────────────────────────────
 /// Auto-validating extractor and proof-of-validation newtype.
 pub use crate::validation::{Valid, ValidateExt, Validated};
