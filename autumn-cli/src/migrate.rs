@@ -2328,6 +2328,44 @@ replica_url = "postgres://replica:5432/app"
         assert_eq!(url, "postgres://primary:5432/app");
     }
 
+    #[test]
+    fn resolve_primary_url_reads_env_for_active_profile() {
+        // `resolve_primary_url` is the convenience entry the `autumn db`
+        // commands use; it must resolve the same primary URL `autumn migrate`
+        // would for the active profile. The env var wins over any file layer.
+        temp_env::with_vars(
+            [
+                ("AUTUMN_ENV", Some("dev")),
+                (
+                    "AUTUMN_DATABASE__PRIMARY_URL",
+                    Some("postgres://primary:5432/app"),
+                ),
+            ],
+            || {
+                assert_eq!(
+                    resolve_primary_url(None).as_deref(),
+                    Some("postgres://primary:5432/app")
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn resolve_primary_url_none_when_unset() {
+        // No env URL and no autumn.toml in the test's working directory → None,
+        // leaving the caller to report the missing-URL error.
+        temp_env::with_vars(
+            [
+                ("AUTUMN_DATABASE__PRIMARY_URL", None::<&str>),
+                ("AUTUMN_DATABASE__URL", None),
+                ("DATABASE_URL", None),
+            ],
+            || {
+                assert!(resolve_primary_url(Some("dev")).is_none());
+            },
+        );
+    }
+
     // ── build_targets ──────────────────────────────────────────────────────
 
     fn two_shards() -> Vec<(String, String)> {

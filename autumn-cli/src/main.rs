@@ -642,6 +642,18 @@ enum DbCommands {
     },
 }
 
+impl DbCommands {
+    /// Translate the parsed CLI subcommand into the `db` module's command and
+    /// the optional profile override the connection should be resolved under.
+    fn into_command(self) -> (db::DbCommand, Option<String>) {
+        match self {
+            Self::Create { profile } => (db::DbCommand::Create, profile),
+            Self::Drop { profile, force } => (db::DbCommand::Drop { force }, profile),
+            Self::Reset { profile, force } => (db::DbCommand::Reset { force }, profile),
+        }
+    }
+}
+
 /// Subcommands for `autumn migrate`.
 #[derive(Subcommand)]
 enum MigrateCommands {
@@ -1488,11 +1500,7 @@ fn run_command(command: Commands) {
             migrate::run(&action, with_maintenance, &target, profile.as_deref());
         }
         Commands::Db(cmd) => {
-            let (command, profile) = match cmd {
-                DbCommands::Create { profile } => (db::DbCommand::Create, profile),
-                DbCommands::Drop { profile, force } => (db::DbCommand::Drop { force }, profile),
-                DbCommands::Reset { profile, force } => (db::DbCommand::Reset { force }, profile),
-            };
+            let (command, profile) = cmd.into_command();
             db::run(&command, profile.as_deref());
         }
         Commands::Shard(cmd) => match cmd.command {
@@ -2669,60 +2677,82 @@ mod tests {
     #[test]
     fn parse_db_create() {
         let cli = Cli::try_parse_from(["autumn", "db", "create"]).unwrap();
-        match cli.command {
-            Commands::Db(DbCommands::Create { profile }) => assert!(profile.is_none()),
-            _ => panic!("expected Db(Create) command"),
-        }
+        assert!(matches!(
+            cli.command,
+            Commands::Db(DbCommands::Create { profile: None })
+        ));
     }
 
     #[test]
     fn parse_db_create_with_profile() {
         let cli = Cli::try_parse_from(["autumn", "db", "create", "--profile", "test"]).unwrap();
-        match cli.command {
-            Commands::Db(DbCommands::Create { profile }) => {
-                assert_eq!(profile.as_deref(), Some("test"));
-            }
-            _ => panic!("expected Db(Create) command"),
-        }
+        assert!(matches!(
+            cli.command,
+            Commands::Db(DbCommands::Create { profile: Some(p) }) if p == "test"
+        ));
     }
 
     #[test]
     fn parse_db_drop_defaults_force_false() {
         let cli = Cli::try_parse_from(["autumn", "db", "drop"]).unwrap();
-        match cli.command {
-            Commands::Db(DbCommands::Drop { profile, force }) => {
-                assert!(profile.is_none());
-                assert!(!force);
-            }
-            _ => panic!("expected Db(Drop) command"),
-        }
+        assert!(matches!(
+            cli.command,
+            Commands::Db(DbCommands::Drop {
+                profile: None,
+                force: false
+            })
+        ));
     }
 
     #[test]
     fn parse_db_drop_with_force() {
         let cli = Cli::try_parse_from(["autumn", "db", "drop", "--force"]).unwrap();
-        match cli.command {
-            Commands::Db(DbCommands::Drop { force, .. }) => assert!(force),
-            _ => panic!("expected Db(Drop) command"),
-        }
+        assert!(matches!(
+            cli.command,
+            Commands::Db(DbCommands::Drop { force: true, .. })
+        ));
     }
 
     #[test]
     fn parse_db_reset_with_profile_and_force() {
         let cli =
             Cli::try_parse_from(["autumn", "db", "reset", "--profile", "prod", "--force"]).unwrap();
-        match cli.command {
-            Commands::Db(DbCommands::Reset { profile, force }) => {
-                assert_eq!(profile.as_deref(), Some("prod"));
-                assert!(force);
-            }
-            _ => panic!("expected Db(Reset) command"),
-        }
+        assert!(matches!(
+            cli.command,
+            Commands::Db(DbCommands::Reset {
+                profile: Some(p),
+                force: true
+            }) if p == "prod"
+        ));
     }
 
     #[test]
     fn parse_db_without_subcommand_is_error() {
         assert!(Cli::try_parse_from(["autumn", "db"]).is_err());
+    }
+
+    #[test]
+    fn db_into_command_maps_every_variant() {
+        assert!(matches!(
+            DbCommands::Create { profile: None }.into_command(),
+            (db::DbCommand::Create, None)
+        ));
+        assert!(matches!(
+            DbCommands::Drop {
+                profile: Some("dev".to_owned()),
+                force: true,
+            }
+            .into_command(),
+            (db::DbCommand::Drop { force: true }, Some(p)) if p == "dev"
+        ));
+        assert!(matches!(
+            DbCommands::Reset {
+                profile: None,
+                force: false,
+            }
+            .into_command(),
+            (db::DbCommand::Reset { force: false }, None)
+        ));
     }
 
     // ── autumn seed tests ──────────────────────────────────────────────────
