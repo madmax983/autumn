@@ -148,7 +148,15 @@ fn run_unix(action: Option<ServeAction>, opts: &ServeOptions) -> i32 {
             // the optimized binary, and the matching profile defaults. Always
             // relaunch in the background.
             let running = running_daemon_addr(opts.package.as_deref());
-            let keep_managed = opts.bundled_pg || running.as_ref().is_some_and(|a| a.managed_pg);
+            // Recover managed-PG mode even when the address file is missing or
+            // corrupt: an initialized cluster in the project data dir means this
+            // project runs `--bundled-pg`. Without this a bare `restart` after a
+            // crash would relaunch without `AUTUMN_MANAGED_PG_DATA_DIR`/the long
+            // readiness budget and the app's provider would fall back to a
+            // different data dir.
+            let keep_managed = opts.bundled_pg
+                || running.as_ref().is_some_and(|a| a.managed_pg)
+                || managed_cluster_present(opts.package.as_deref());
             let keep_release = opts.release || running.as_ref().is_some_and(|a| a.release);
             // Preserve the original daemon's profile: prefer one set on *this*
             // restart's environment, else restore what the running daemon
@@ -180,6 +188,15 @@ fn read_addr_file(paths: &RuntimePaths) -> Option<AddrFile> {
 fn running_daemon_addr(package: Option<&str>) -> Option<AddrFile> {
     let paths = RuntimePaths::resolve(&project_identity(package)).ok()?;
     read_addr_file(&paths)
+}
+
+/// Whether an initialized managed-Postgres cluster already exists for this
+/// project — its data dir has a `PG_VERSION` (present in every `PostgreSQL` data
+/// directory after `initdb`). Used by `restart` to recover `--bundled-pg` mode
+/// when the address file is gone.
+fn managed_cluster_present(package: Option<&str>) -> bool {
+    RuntimePaths::resolve(&project_identity(package))
+        .is_ok_and(|p| p.pg_data_dir().join("PG_VERSION").exists())
 }
 
 /// Whether a Unix socket at `path` has a live listener (a `connect` succeeds).
@@ -877,6 +894,15 @@ fn stop(opts: &ServeOptions) -> i32 {
     let recorded_release = addr.as_ref().is_some_and(|a| a.release);
     let recorded_budget = addr.as_ref().and_then(|a| a.stop_budget_secs);
     process::stop_record(&rec, stop_timeout(opts, recorded_release, recorded_budget));
+    // A concurrent `start` can reclaim the now-stale pidfile and bring up a
+    // successor (even a new managed cluster on the same data dir) while we were
+    // draining the old daemon. If the pidfile no longer records the pid we just
+    // stopped, that successor owns this namespace — leave its Postgres and its
+    // pid/addr/ready files alone instead of reaping/removing them.
+    if process::read_pidfile(&paths.pid_file()).is_some_and(|r| r.pid != rec.pid) {
+        println!("autumn serve: stopped (a newer daemon has since started)");
+        return 0;
+    }
     // For a managed-Postgres daemon, reap the cluster too: the app's `on_shutdown`
     // hook can be cancelled when its drain budget is exhausted (or skipped on a
     // forced exit), and Postgres `setsid`s itself so a process-group kill won't

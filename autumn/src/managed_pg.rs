@@ -209,8 +209,14 @@ impl ManagedPostgresPoolProvider {
         // when the data dir is not already initialized.
         pg.setup().await?;
         pg.start().await?;
-        if !pg.database_exists(MANAGED_DB_NAME).await? {
-            pg.create_database(MANAGED_DB_NAME).await?;
+        // The post-start database checks can still fail (auth, bootstrap-DB
+        // connection, etc.). The server is already running by now, so stop it
+        // before propagating — `create_pool` turns this error into
+        // `process::exit(1)`, which skips `Drop`/`on_shutdown` and would
+        // otherwise orphan the postmaster on the data dir/port.
+        if let Err(e) = Self::ensure_app_database(&pg).await {
+            let _ = pg.stop().await;
+            return Err(e);
         }
         let url = pg.settings().url(MANAGED_DB_NAME);
 
@@ -228,6 +234,16 @@ impl ManagedPostgresPoolProvider {
         }
 
         Ok(url)
+    }
+
+    /// Ensure the application database exists in the running cluster. Separated
+    /// so [`ensure_running`](Self::ensure_running) can stop the server if any of
+    /// these post-start checks fail.
+    async fn ensure_app_database(pg: &PostgreSQL) -> Result<(), postgresql_embedded::Error> {
+        if !pg.database_exists(MANAGED_DB_NAME).await? {
+            pg.create_database(MANAGED_DB_NAME).await?;
+        }
+        Ok(())
     }
 
     /// Stable superuser password + password-file path persisted alongside the
