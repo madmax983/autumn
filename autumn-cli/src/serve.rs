@@ -148,15 +148,17 @@ fn run_unix(action: Option<ServeAction>, opts: &ServeOptions) -> i32 {
             // the optimized binary, and the matching profile defaults. Always
             // relaunch in the background.
             let running = running_daemon_addr(opts.package.as_deref());
-            // Recover managed-PG mode even when the address file is missing or
-            // corrupt: an initialized cluster in the project data dir means this
-            // project runs `--bundled-pg`. Without this a bare `restart` after a
-            // crash would relaunch without `AUTUMN_MANAGED_PG_DATA_DIR`/the long
-            // readiness budget and the app's provider would fall back to a
-            // different data dir.
+            // Recover managed-PG mode. A parseable address file is authoritative
+            // (respect an explicit `managed_pg = false` even if a `pg/PG_VERSION`
+            // from a prior bundled run still lingers). Only when there is no
+            // usable address file do we infer managed mode from an initialized
+            // cluster in the project data dir, so a bare `restart` after a crash
+            // keeps `AUTUMN_MANAGED_PG_DATA_DIR`/the long readiness budget.
             let keep_managed = opts.bundled_pg
-                || running.as_ref().is_some_and(|a| a.managed_pg)
-                || managed_cluster_present(opts.package.as_deref());
+                || running.as_ref().map_or_else(
+                    || managed_cluster_present(opts.package.as_deref()),
+                    |a| a.managed_pg,
+                );
             let keep_release = opts.release || running.as_ref().is_some_and(|a| a.release);
             // Preserve the original daemon's profile: prefer one set on *this*
             // restart's environment, else restore what the running daemon
@@ -298,9 +300,18 @@ fn resolve_paths(package: Option<&str>) -> RuntimePaths {
 }
 
 /// The transient startup lock `launch_daemon_child` holds (with its own pid)
-/// from spawn until the daemon is ready. Its presence marks a start in progress.
+/// from spawn until the daemon is ready.
 fn start_lock_path(paths: &RuntimePaths) -> PathBuf {
     paths.pid_file().with_file_name("serve.startlock")
+}
+
+/// Whether a daemon start is genuinely in progress: the startup lock exists
+/// *and* the launcher that wrote it is still alive. Validating the recorded
+/// launcher (not mere file existence) means a `serve.startlock` left by a killed
+/// launcher isn't mistaken for an in-flight boot — which would otherwise let
+/// `confirmed_running` trust a reused PID without a socket-ownership check.
+fn startup_in_progress(paths: &RuntimePaths) -> bool {
+    process::read_pidfile(&start_lock_path(paths)).is_some_and(|rec| process::is_record_alive(&rec))
 }
 
 /// Derive a stable project identity for namespacing runtime dirs.
@@ -420,7 +431,7 @@ fn start_daemon(opts: &ServeOptions) -> i32 {
     // an unrelated process (notably on macOS, where start time isn't available)
     // doesn't block a legitimate start.
     if let Some(rec) = process::read_pidfile(&paths.pid_file())
-        && confirmed_running(&rec, &paths.socket_file(), start_lock_path(&paths).exists())
+        && confirmed_running(&rec, &paths.socket_file(), startup_in_progress(&paths))
     {
         eprintln!(
             "autumn serve: already running (pid {}). \
@@ -879,7 +890,7 @@ fn stop(opts: &ServeOptions) -> i32 {
     // cluster it launched can still be alive (Postgres `setsid`s out of the
     // daemon's process group, so it survives the app's crash/kill).
     let addr = read_addr_file(&paths);
-    if !confirmed_running(&rec, &socket, start_lock_path(&paths).exists()) {
+    if !confirmed_running(&rec, &socket, startup_in_progress(&paths)) {
         // The daemon is gone, but if it owned a managed cluster reap that too —
         // otherwise a crash before `stop` leaves Postgres holding the data
         // dir/port until manual cleanup. Reap when the address file says managed
@@ -1129,7 +1140,7 @@ fn status(opts: &ServeOptions) -> i32 {
         println!("autumn serve: stopped");
         return 3;
     };
-    if confirmed_running(&rec, &socket, start_lock_path(&paths).exists()) {
+    if confirmed_running(&rec, &socket, startup_in_progress(&paths)) {
         let address =
             read_addr_file(&paths).map_or_else(|| socket.display().to_string(), |a| a.address);
         println!("autumn serve: running (pid {}) on unix:{address}", rec.pid);

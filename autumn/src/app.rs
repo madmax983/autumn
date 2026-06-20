@@ -3029,11 +3029,20 @@ impl AppBuilder {
                         std::process::exit(1);
                     }
                 };
-                // Local-daemon socket: owner-only access.
+                // Local-daemon socket: owner-only access. Fail *closed* — a
+                // user-configured `server.unix_socket` may sit in a shared
+                // directory, so if we cannot enforce `0600` (chmod error, an ACL
+                // /filesystem that rejects it), refuse to serve rather than
+                // expose a world-reachable control socket. Remove the socket we
+                // just bound so nothing keeps listening on it.
                 if let Err(e) =
                     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
                 {
-                    tracing::warn!(socket = %socket_path, "Failed to set unix socket permissions: {e}");
+                    tracing::error!(socket = %socket_path, "Failed to enforce owner-only permissions on unix socket: {e}");
+                    let _ = std::fs::remove_file(path);
+                    #[cfg(feature = "managed-pg")]
+                    crate::managed_pg::emergency_stop_async().await;
+                    std::process::exit(1);
                 }
                 // Capture the bound socket's identity so a later successor that
                 // rebinds the same path isn't unlinked by our shutdown.
@@ -3671,6 +3680,7 @@ impl AppBuilder {
         )
         .unwrap_or_else(|error| {
             eprintln!("Failed to configure mailer: {error}");
+            build_mode_exit_stop_pg();
             std::process::exit(1);
         });
         #[cfg(feature = "mail")]
@@ -3736,6 +3746,7 @@ impl AppBuilder {
         )
         .unwrap_or_else(|error| {
             eprintln!("Failed to build router: {error}");
+            build_mode_exit_stop_pg();
             std::process::exit(1);
         });
 
@@ -3753,6 +3764,7 @@ impl AppBuilder {
             }
             Err(e) => {
                 eprintln!("\n  \u{2717} Static build failed: {e}");
+                build_mode_exit_stop_pg();
                 std::process::exit(1);
             }
         }
@@ -3827,6 +3839,12 @@ impl AppBuilder {
                 }
             }
         }
+
+        // Build finished: stop the managed Postgres child `setup_database` may
+        // have started. Build mode discards the app's `on_shutdown` hooks, so
+        // without this even a *successful* `autumn build` would leak the cluster.
+        #[cfg(feature = "managed-pg")]
+        crate::managed_pg::emergency_stop_async().await;
     }
 
     /// Dump the application's route listing as JSON and exit.
@@ -4225,6 +4243,23 @@ impl AppBuilder {
 
 pub(crate) fn is_static_build_mode() -> bool {
     std::env::var("AUTUMN_BUILD_STATIC").as_deref() == Ok("1")
+}
+
+/// Stop a managed Postgres child from a synchronous `process::exit` path in
+/// static-build mode. Build mode never runs `on_shutdown` and `process::exit`
+/// skips `Drop`, so a managed cluster started by `setup_database` would
+/// otherwise be orphaned on the data dir/port.
+///
+/// These call sites run on a Tokio worker thread; the (blocking, own-runtime)
+/// `emergency_stop` would panic if entered there, so run it on a fresh thread
+/// with no ambient runtime. No-op unless the `managed-pg` feature is active.
+// The body is empty without `managed-pg` (so it can't be `const` with it).
+#[allow(clippy::missing_const_for_fn)]
+fn build_mode_exit_stop_pg() {
+    #[cfg(feature = "managed-pg")]
+    {
+        let _ = std::thread::spawn(crate::managed_pg::emergency_stop).join();
+    }
 }
 
 pub(crate) fn is_dump_routes_mode() -> bool {
