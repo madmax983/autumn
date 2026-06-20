@@ -291,6 +291,32 @@ pub fn stop_pid(pid: u32, timeout: Duration) {
     }
 }
 
+/// Stop a managed Postgres postmaster `pid`: request a "fast" shutdown (SIGINT —
+/// roll back active transactions and exit), then escalate to `SIGKILL` if it
+/// doesn't exit within `timeout`.
+///
+/// Used by `autumn serve stop` to reap a managed cluster a daemon left running
+/// (its `on_shutdown` hook timed out, or it was force-killed). Postgres `setsid`s
+/// itself, so it isn't in the daemon's process group; this signals it directly
+/// via the pid recorded in `postmaster.pid`. Safe for an abandoned cluster with
+/// no remaining clients.
+#[cfg(unix)]
+pub fn stop_postmaster(pid: u32, timeout: Duration) {
+    if let Some(p) = validate_pid_for_kill(pid) {
+        let _ = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(p),
+            nix::sys::signal::Signal::SIGINT,
+        );
+    }
+    if !wait_for_pid_exit(pid, timeout) {
+        force_kill(pid);
+    }
+}
+
+/// Non-Unix fallback.
+#[cfg(not(unix))]
+pub fn stop_postmaster(_pid: u32, _timeout: Duration) {}
+
 /// Non-Unix fallback: no graceful-signal mechanism in this MVP.
 #[cfg(not(unix))]
 pub fn stop_pid(_pid: u32, _timeout: Duration) {}

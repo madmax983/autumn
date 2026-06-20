@@ -2955,12 +2955,13 @@ impl AppBuilder {
         // Bind the configured transport. A `server.unix_socket` path selects a
         // Unix domain socket (local daemon mode); otherwise bind TCP on
         // `host:port` as before. `bound_desc` is the human/log description and
-        // `unix_socket_cleanup` is the socket path to unlink on clean exit
-        // (axum does not remove it for us).
+        // `unix_socket_cleanup` is the socket to unlink on clean exit (axum does
+        // not remove it for us), as `(path, dev, inode)` so cleanup can confirm
+        // the file is still the one *this* process bound before removing it.
         let (bound_listener, bound_desc, unix_socket_cleanup): (
             BoundListener,
             String,
-            Option<std::path::PathBuf>,
+            Option<(std::path::PathBuf, u64, u64)>,
         ) = if let Some(socket_path) = config.server.unix_socket.as_deref() {
             #[cfg(unix)]
             {
@@ -2989,10 +2990,16 @@ impl AppBuilder {
                 {
                     tracing::warn!(socket = %socket_path, "Failed to set unix socket permissions: {e}");
                 }
+                // Capture the bound socket's identity so a later successor that
+                // rebinds the same path isn't unlinked by our shutdown.
+                let (dev, ino) = {
+                    use std::os::unix::fs::MetadataExt;
+                    std::fs::metadata(path).map_or((0, 0), |m| (m.dev(), m.ino()))
+                };
                 (
                     BoundListener::Unix(listener),
                     format!("unix:{socket_path}"),
-                    Some(path.to_path_buf()),
+                    Some((path.to_path_buf(), dev, ino)),
                 )
             }
             #[cfg(not(unix))]
@@ -3313,10 +3320,19 @@ impl AppBuilder {
 
         // Remove the Unix socket file on clean exit; axum does not unlink it.
         // (An abnormal force-exit may leave it behind, but the next bind's
-        // `prepare_unix_socket_path` reclaims a stale socket.)
+        // `prepare_unix_socket_path` reclaims a stale socket.) Only unlink if the
+        // socket is still the one we bound — a successor that rebound the same
+        // path after we closed has a different inode, and removing it would make
+        // the new server unreachable.
         #[cfg(unix)]
-        if let Some(path) = &unix_socket_cleanup {
-            let _ = std::fs::remove_file(path);
+        if let Some((path, dev, ino)) = &unix_socket_cleanup {
+            use std::os::unix::fs::MetadataExt;
+            let still_ours = std::fs::metadata(path)
+                .map(|m| m.dev() == *dev && m.ino() == *ino)
+                .unwrap_or(false);
+            if still_ours {
+                let _ = std::fs::remove_file(path);
+            }
         }
         #[cfg(not(unix))]
         let _ = &unix_socket_cleanup;

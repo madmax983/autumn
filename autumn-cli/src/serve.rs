@@ -764,9 +764,34 @@ fn stop(opts: &ServeOptions) -> i32 {
         rec.pid,
         stop_timeout(opts, recorded_release, recorded_budget),
     );
+    // For a managed-Postgres daemon, reap the cluster too: the app's `on_shutdown`
+    // hook can be cancelled when its drain budget is exhausted (or skipped on a
+    // forced exit), and Postgres `setsid`s itself so a process-group kill won't
+    // reach it. Stop it directly via its `postmaster.pid` so it doesn't keep
+    // holding the data dir/port after `stop` reports success.
+    if addr.as_ref().is_some_and(|a| a.managed_pg) {
+        reap_managed_postgres(&paths);
+    }
     cleanup(&paths, &socket);
     println!("autumn serve: stopped");
     0
+}
+
+/// Reap a managed Postgres cluster the daemon may have left running. Reads the
+/// postmaster pid from the data dir's `postmaster.pid` and, if it's still alive,
+/// requests a fast shutdown and escalates. No-op when the cluster already
+/// stopped cleanly (pidfile absent or the postmaster is gone).
+fn reap_managed_postgres(paths: &RuntimePaths) {
+    let pidfile = paths.pg_data_dir().join("postmaster.pid");
+    let Some(pid) = std::fs::read_to_string(&pidfile)
+        .ok()
+        .and_then(|s| s.lines().next()?.trim().parse::<u32>().ok())
+    else {
+        return;
+    };
+    if process::is_process_alive(pid) {
+        process::stop_postmaster(pid, Duration::from_secs(10));
+    }
 }
 
 /// Graceful-stop budget before escalating to `SIGKILL`.
