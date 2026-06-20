@@ -607,11 +607,11 @@ pub fn sign_upload_legacy(
     let mut mac =
         <Hmac<Sha256> as Mac>::new_from_slice(key_bytes).expect("HMAC accepts any key length");
     mac.update(b"upload:");
+    mac.update(&(blob_key.len() as u64).to_be_bytes());
     mac.update(blob_key.as_bytes());
-    mac.update(b":");
+    mac.update(&(content_type.len() as u64).to_be_bytes());
     mac.update(content_type.as_bytes());
-    mac.update(b":");
-    mac.update(expires_at.to_string().as_bytes());
+    mac.update(&expires_at.to_be_bytes());
     hex(mac.finalize().into_bytes())
 }
 
