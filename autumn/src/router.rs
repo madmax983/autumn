@@ -5152,10 +5152,11 @@ mod trusted_host_tests {
             "credentials flag must be mirrored when configured"
         );
         assert!(
-            response.headers().get_all("vary").iter().any(|v| v
-                .to_str()
-                .map(|s| s.eq_ignore_ascii_case("origin"))
-                .unwrap_or(false)),
+            response
+                .headers()
+                .get_all("vary")
+                .iter()
+                .any(|v| v.to_str().is_ok_and(|s| s.eq_ignore_ascii_case("origin"))),
             "a reflected origin must carry Vary: origin"
         );
     }
