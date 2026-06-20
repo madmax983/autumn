@@ -39,6 +39,12 @@ impl ExceptionFilter for ErrorPageFilter {
             return response;
         }
 
+        // Preserve the correlation id that `RequestIdLayer` stamped on the
+        // original response — `build_html_response` constructs a fresh response,
+        // so without this the rebuilt HTML error page would drop `X-Request-Id`
+        // and operators couldn't tie the page to their logs.
+        let request_id_header = response.headers().get("x-request-id").cloned();
+
         let ctx = Self::build_error_context(error, &response, self.is_dev);
         let mut html_body =
             error_pages::render_error_page(self.renderer.as_ref(), error.status, &ctx)
@@ -48,7 +54,11 @@ impl ExceptionFilter for ErrorPageFilter {
             self.inject_dev_badge(&mut html_body, error, &ctx, &response);
         }
 
-        Self::build_html_response(error, html_body)
+        let mut html = Self::build_html_response(error, html_body);
+        if let Some(request_id) = request_id_header {
+            html.headers_mut().insert("x-request-id", request_id);
+        }
+        html
     }
 }
 

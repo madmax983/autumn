@@ -15,7 +15,7 @@ use std::time::Duration;
 use autumn_web::config::AutumnConfig;
 use autumn_web::sse::{Event, Sse};
 use autumn_web::test::TestApp;
-use autumn_web::{get, routes};
+use autumn_web::{get, post, routes};
 use futures::stream::Stream;
 
 /// Build a config with a tight global request deadline (in ms).
@@ -50,6 +50,20 @@ async fn export() -> &'static str {
 async fn longpoll() -> &'static str {
     tokio::time::sleep(Duration::from_millis(200)).await;
     "eventually"
+}
+
+// Two methods sharing one path template: the GET is exempt, the POST inherits
+// the global deadline — proving overrides are method-specific, not path-wide.
+#[get("/items", timeout = "off")]
+async fn items_list() -> &'static str {
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    "list"
+}
+
+#[post("/items")]
+async fn items_create() -> &'static str {
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    "created"
 }
 
 // SSE route: returns immediately, then streams events past the deadline (AC3).
@@ -109,11 +123,33 @@ async fn slow_handler_renders_html_error_page_for_browser() {
 
     resp.assert_status(503);
     resp.assert_header_contains("content-type", "text/html");
+    // The correlation id must survive the HTML rebuild so operators can tie the
+    // error page to their logs.
+    assert!(
+        resp.header("x-request-id").is_some(),
+        "HTML timeout page must preserve the X-Request-Id header"
+    );
     let body = resp.text();
     assert!(
         body.contains("<!DOCTYPE html") || body.contains("<html"),
         "browser clients must receive the HTML error page, got: {body}"
     );
+}
+
+// ── Codex #5: per-route overrides are method-specific, not path-wide ──────
+
+#[tokio::test]
+async fn timeout_override_is_method_specific() {
+    let client = TestApp::new()
+        .routes(routes![items_list, items_create])
+        .config(with_global_timeout(50))
+        .build();
+
+    // GET /items is exempt (`timeout = "off"`) → its 200ms work completes.
+    client.get("/items").send().await.assert_status(200);
+    // POST /items shares the template but inherits the 50ms global → 503.
+    // The GET's exemption must NOT bleed onto the POST handler.
+    client.post("/items").send().await.assert_status(503);
 }
 
 // ── AC4: per-route override extends the deadline ─────────────────────────

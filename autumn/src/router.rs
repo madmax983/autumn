@@ -1798,11 +1798,19 @@ fn build_maintenance_layer(
 }
 
 /// Per-route timeout lookup table, keyed by the fully-qualified route template
-/// (matching [`axum::extract::MatchedPath`]). Built once at router-assembly time
+/// (matching [`axum::extract::MatchedPath`]) and then by HTTP method, so an
+/// override on one handler never bleeds onto sibling methods sharing the path
+/// (e.g. `GET /items` vs `POST /items`). The nested layout also lets the
+/// middleware resolve the deadline from a borrowed `&str` + `&Method`, avoiding
+/// any allocation on exempt/disabled routes. Built once at router-assembly time
 /// from each [`Route`]'s `timeout` field and shared (cheaply cloned) into the
 /// global timeout middleware.
-type RouteTimeoutTable =
-    std::sync::Arc<std::collections::HashMap<String, crate::route::RouteTimeout>>;
+type RouteTimeoutTable = std::sync::Arc<
+    std::collections::HashMap<
+        String,
+        std::collections::HashMap<http::Method, crate::route::RouteTimeout>,
+    >,
+>;
 
 /// Error surfaced as the cause of the `503` when an inbound request exceeds its
 /// wall-clock deadline. Carried into [`crate::error::AutumnError::service_unavailable`]
@@ -1832,30 +1840,33 @@ fn build_route_timeout_table(
     route_list: &[Route],
     scoped_groups: &[ScopedGroup],
 ) -> RouteTimeoutTable {
-    let mut table: std::collections::HashMap<String, crate::route::RouteTimeout> =
-        std::collections::HashMap::new();
-    let mut insert = |key: String, timeout: crate::route::RouteTimeout| {
+    let mut table: std::collections::HashMap<
+        String,
+        std::collections::HashMap<http::Method, crate::route::RouteTimeout>,
+    > = std::collections::HashMap::new();
+    let mut insert = |path: String, method: &http::Method, timeout: crate::route::RouteTimeout| {
+        // `Inherit` carries no override, so it never needs a table entry.
         if matches!(timeout, crate::route::RouteTimeout::Inherit) {
             return;
         }
-        // Multiple methods can share a path; a non-inherit override on any of
-        // them applies to the template. Disabled wins over Override so a route
-        // explicitly opted out stays exempt.
+        // Key by (path, method) so an override on one handler never bleeds onto
+        // sibling methods that share the template. A single method+path is
+        // unique across the router, so `insert` cannot lose a competing entry.
         table
-            .entry(key)
-            .and_modify(|existing| {
-                if matches!(timeout, crate::route::RouteTimeout::Disabled) {
-                    *existing = timeout;
-                }
-            })
-            .or_insert(timeout);
+            .entry(path)
+            .or_default()
+            .insert(method.clone(), timeout);
     };
     for route in route_list {
-        insert(route.path.to_owned(), route.timeout);
+        insert(route.path.to_owned(), &route.method, route.timeout);
     }
     for group in scoped_groups {
         for route in &group.routes {
-            insert(join_nested_path(&group.prefix, route.path), route.timeout);
+            insert(
+                join_nested_path(&group.prefix, route.path),
+                &route.method,
+                route.timeout,
+            );
         }
     }
     std::sync::Arc::new(table)
@@ -1892,6 +1903,7 @@ fn apply_request_timeout_middleware(
         .map(std::time::Duration::from_millis);
     let has_override = route_timeouts
         .values()
+        .flat_map(std::collections::HashMap::values)
         .any(|t| matches!(t, crate::route::RouteTimeout::Override(_)));
     if global.is_none() && !has_override {
         return router;
@@ -1914,14 +1926,15 @@ async fn request_timeout_handler(
     route_timeouts: RouteTimeoutTable,
     metrics: crate::middleware::MetricsCollector,
 ) -> axum::response::Response {
-    // Resolve the effective deadline from the matched route template.
-    let matched_path = req
+    // Resolve the effective deadline from the matched route template + method,
+    // using borrowed lookups so exempt/disabled routes allocate nothing.
+    let matched_path_ref = req
         .extensions()
         .get::<axum::extract::MatchedPath>()
-        .map(|m| m.as_str().to_owned());
-    let route_timeout = matched_path
-        .as_deref()
+        .map(axum::extract::MatchedPath::as_str);
+    let route_timeout = matched_path_ref
         .and_then(|p| route_timeouts.get(p))
+        .and_then(|by_method| by_method.get(req.method()))
         .copied()
         .unwrap_or(crate::route::RouteTimeout::Inherit);
     let deadline = match route_timeout {
@@ -1930,10 +1943,13 @@ async fn request_timeout_handler(
         crate::route::RouteTimeout::Inherit => global,
     };
     let Some(duration) = deadline else {
-        // Exempt (disabled route, or global off with a non-Override route).
+        // Exempt (disabled route, or global off with a non-Override route) —
+        // no allocation on this hot path.
         return next.run(req).await;
     };
 
+    // A deadline is active: now it's worth owning the path for the warn log.
+    let matched_path = matched_path_ref.map(ToOwned::to_owned);
     let request_id = req
         .extensions()
         .get::<crate::middleware::RequestId>()
@@ -4842,6 +4858,16 @@ mod trusted_host_tests {
         std::sync::Arc::new(std::collections::HashMap::new())
     }
 
+    /// Build a single-entry override table for `GET <path>` (the method the
+    /// unit-test routers below register).
+    fn get_route_timeouts(path: &str, timeout: crate::route::RouteTimeout) -> RouteTimeoutTable {
+        let mut by_method = std::collections::HashMap::new();
+        by_method.insert(http::Method::GET, timeout);
+        let mut table = std::collections::HashMap::new();
+        table.insert(path.to_owned(), by_method);
+        std::sync::Arc::new(table)
+    }
+
     #[tokio::test(start_paused = true)]
     async fn request_timeout_returns_503_when_exceeded() {
         let mut config = AutumnConfig::default();
@@ -5064,18 +5090,13 @@ mod trusted_host_tests {
             }),
         );
 
-        let mut table = std::collections::HashMap::new();
-        table.insert(
-            "/export".to_owned(),
+        let table = get_route_timeouts(
+            "/export",
             crate::route::RouteTimeout::Override(std::time::Duration::from_secs(10)),
         );
-        let router = apply_request_timeout_middleware(
-            router,
-            &config,
-            state.metrics.clone(),
-            std::sync::Arc::new(table),
-        )
-        .with_state(state);
+        let router =
+            apply_request_timeout_middleware(router, &config, state.metrics.clone(), table)
+                .with_state(state);
 
         let response = router
             .oneshot(
@@ -5109,15 +5130,10 @@ mod trusted_host_tests {
             }),
         );
 
-        let mut table = std::collections::HashMap::new();
-        table.insert("/stream".to_owned(), crate::route::RouteTimeout::Disabled);
-        let router = apply_request_timeout_middleware(
-            router,
-            &config,
-            state.metrics.clone(),
-            std::sync::Arc::new(table),
-        )
-        .with_state(state.clone());
+        let table = get_route_timeouts("/stream", crate::route::RouteTimeout::Disabled);
+        let router =
+            apply_request_timeout_middleware(router, &config, state.metrics.clone(), table)
+                .with_state(state.clone());
 
         let response = router
             .oneshot(
@@ -5151,18 +5167,13 @@ mod trusted_host_tests {
             }),
         );
 
-        let mut table = std::collections::HashMap::new();
-        table.insert(
-            "/export".to_owned(),
+        let table = get_route_timeouts(
+            "/export",
             crate::route::RouteTimeout::Override(std::time::Duration::from_millis(100)),
         );
-        let router = apply_request_timeout_middleware(
-            router,
-            &config,
-            state.metrics.clone(),
-            std::sync::Arc::new(table),
-        )
-        .with_state(state);
+        let router =
+            apply_request_timeout_middleware(router, &config, state.metrics.clone(), table)
+                .with_state(state);
 
         let response = router
             .oneshot(
