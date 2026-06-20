@@ -427,17 +427,20 @@ fn check_duplicate_registration(plugin_name: &str, routes: &[RouteInfo]) -> Chec
     }
 }
 
+/// ⚡ Bolt: Optimization - Pre-allocates a string buffer based on the input path length to avoid intermediate Vec allocations and string concatenation during route segment normalization.
 fn normalize_path_for_collision(path: &str) -> String {
-    path.split('/')
-        .map(|seg| {
-            if seg.starts_with('{') && seg.ends_with('}') {
-                "{}"
-            } else {
-                seg
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("/")
+    let mut normalized = String::with_capacity(path.len());
+    for (i, seg) in path.split('/').enumerate() {
+        if i > 0 {
+            normalized.push('/');
+        }
+        if seg.starts_with('{') && seg.ends_with('}') {
+            normalized.push_str("{}");
+        } else {
+            normalized.push_str(seg);
+        }
+    }
+    normalized
 }
 
 fn check_collisions(routes: &[RouteInfo]) -> CheckResult {
