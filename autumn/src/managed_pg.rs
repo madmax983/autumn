@@ -360,6 +360,10 @@ impl DatabasePoolProvider for ManagedPostgresPoolProvider {
             "autumn: managed Postgres (--bundled-pg) does not support \
              [[database.shards]]. Remove shard config or use an external database."
         );
+        // `setup_database` already started the cluster via `create_topology`;
+        // `process::exit` skips `on_shutdown`, so stop the child first to avoid
+        // orphaning it on the data dir/port.
+        self.stop().await;
         std::process::exit(1);
     }
 }

@@ -179,21 +179,40 @@ impl RuntimePaths {
         std::fs::create_dir_all(&self.runtime)?;
         std::fs::create_dir_all(&self.logs)?;
         std::fs::create_dir_all(&self.data)?;
-        // The socket may live in a short fallback dir distinct from `runtime`
-        // (under a shared temp root), so ensure its parent exists and is
-        // owner-only — others must not be able to plant entries there.
-        if let Some(parent) = self.socket.parent()
-            && parent != self.runtime
-        {
-            std::fs::create_dir_all(parent)?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
-            }
-        }
+        // Harden the directory the control socket is bound in (the runtime dir,
+        // or a short fallback under a shared temp root). Making it `0700` *before*
+        // the app binds means no other local user can reach the socket during the
+        // brief window where `UnixListener::bind` leaves it world-accessible.
+        let socket_parent = self.socket.parent().unwrap_or(self.runtime.as_path());
+        std::fs::create_dir_all(socket_parent)?;
+        #[cfg(unix)]
+        harden_private_dir(socket_parent)?;
         Ok(())
     }
+}
+
+/// Enforce that `dir` is a real, owner-only (`0700`) directory.
+///
+/// Rejects a symlink (which a local user could repoint) and — by treating a
+/// failed `chmod` as fatal rather than ignoring it — a directory owned by
+/// another user, e.g. one pre-created in a shared temp root. This prevents
+/// binding the daemon's control socket in an attacker-controlled location.
+#[cfg(unix)]
+fn harden_private_dir(dir: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let meta = std::fs::symlink_metadata(dir)?;
+    if !meta.file_type().is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!(
+                "refusing to use {} for the daemon socket: not a directory",
+                dir.display()
+            ),
+        ));
+    }
+    // `chmod` fails with EPERM when another user owns the directory, aborting
+    // startup instead of trusting it.
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
 }
 
 #[cfg(test)]
@@ -215,6 +234,29 @@ mod tests {
         let paths = RuntimePaths::from_base(Path::new("/var/run"), "demo");
         assert_eq!(paths.socket_file(), Path::new("/var/run/demo/serve.sock"));
         assert!(paths.socket_file().as_os_str().len() <= MAX_UNIX_SOCKET_PATH);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_dirs_makes_socket_parent_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = RuntimePaths::from_base(dir.path(), "p");
+        paths.ensure_dirs().expect("ensure_dirs");
+        let parent = paths.socket_file().parent().unwrap().to_path_buf();
+        let mode = std::fs::metadata(&parent).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700, "socket dir must be owner-only");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn harden_private_dir_rejects_symlink() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target = dir.path().join("real");
+        std::fs::create_dir(&target).unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(harden_private_dir(&link).is_err());
     }
 
     #[test]
