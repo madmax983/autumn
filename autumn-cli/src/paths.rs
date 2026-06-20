@@ -161,6 +161,14 @@ impl RuntimePaths {
         self.runtime.join("serve.addr")
     }
 
+    /// Readiness-signal file (`<runtime>/serve.ready`). The daemon creates it
+    /// after `mark_startup_complete()`; the supervisor polls for it to detect
+    /// true startup completion without probing HTTP.
+    #[must_use]
+    pub fn ready_file(&self) -> PathBuf {
+        self.runtime.join("serve.ready")
+    }
+
     /// Managed-Postgres cluster data directory (`<data>/pg`).
     #[must_use]
     pub fn pg_data_dir(&self) -> PathBuf {

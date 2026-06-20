@@ -3330,6 +3330,7 @@ impl AppBuilder {
                 }
             }
             state.probes().mark_startup_complete();
+            signal_serve_ready();
         }
 
         // Signal the drain phase. The watchdog checks the flag for the common
@@ -4877,6 +4878,33 @@ async fn stamp_loopback_connect_info(
             .insert(axum::extract::ConnectInfo(loopback));
     }
     next.run(req).await
+}
+
+/// Signal `autumn serve --daemon`'s supervisor that startup is complete.
+///
+/// The CLI passes a path via `AUTUMN_SERVE_READY_FILE` and polls for it; we
+/// create it here, immediately after [`mark_startup_complete`], so the
+/// supervisor's notion of "ready" means the socket is bound and serving *and*
+/// startup hooks/migrations have finished — with no dependence on the app's HTTP
+/// middleware (the startup barrier, maintenance mode, rate limiting, or custom
+/// health paths, which an HTTP readiness probe would all have to thread).
+///
+/// Best-effort: a write failure only delays readiness detection until the
+/// supervisor's timeout, and a non-daemon run leaves the variable unset (no-op).
+///
+/// [`mark_startup_complete`]: crate::probe::ProbeState::mark_startup_complete
+fn signal_serve_ready() {
+    let Some(path) = std::env::var_os("AUTUMN_SERVE_READY_FILE") else {
+        return;
+    };
+    if path.is_empty() {
+        return;
+    }
+    let path = std::path::PathBuf::from(path);
+    if let Err(e) = std::fs::write(&path, std::process::id().to_string()) {
+        tracing::warn!(error = %e, path = %path.display(),
+            "could not write serve readiness file");
+    }
 }
 
 /// Prepare a Unix-socket path for binding: remove a *stale* socket left by a

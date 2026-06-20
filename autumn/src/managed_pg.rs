@@ -114,7 +114,13 @@ fn generate_password() -> String {
 #[derive(Clone)]
 pub struct ManagedPostgresPoolProvider {
     data_dir: PathBuf,
-    version: VersionReq,
+    /// Explicit version requirement, or `None` to use `postgresql_embedded`'s
+    /// own default. The default is what makes `managed-pg-bundled` work offline:
+    /// `Settings::new()` resolves to the *exact* embedded archive version under
+    /// the `bundled` feature (and `*` otherwise). Overriding it with a non-exact
+    /// `*` would force `setup()` to resolve the version from the network even
+    /// when an archive is compiled into the binary.
+    version: Option<VersionReq>,
     instance: Arc<Mutex<Option<PostgreSQL>>>,
 }
 
@@ -146,7 +152,9 @@ impl ManagedPostgresPoolProvider {
     pub fn with_data_dir(data_dir: PathBuf) -> Self {
         Self {
             data_dir,
-            version: postgresql_embedded::LATEST.clone(),
+            // Use `postgresql_embedded`'s default so a bundled build pins to its
+            // embedded archive version (offline, exact) instead of `*`.
+            version: None,
             instance: Arc::new(Mutex::new(None)),
         }
     }
@@ -179,7 +187,12 @@ impl ManagedPostgresPoolProvider {
         // unwritable under launchd/systemd/container supervisors and would fail
         // before `initdb` even when the CLI-provided data dir is valid.
         settings.installation_dir = self.installation_dir();
-        settings.version = self.version.clone();
+        // Only override the default version when one was explicitly requested;
+        // otherwise keep `Settings::new()`'s default so a `managed-pg-bundled`
+        // build uses its exact embedded archive version (no network resolution).
+        if let Some(version) = &self.version {
+            settings.version = version.clone();
+        }
         // Persistent cluster tied to the daemon, not a throwaway temp dir.
         settings.temporary = false;
         settings.timeout = Some(STARTUP_TIMEOUT);
