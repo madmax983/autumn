@@ -24,6 +24,7 @@ mod seed;
 mod setup;
 mod shard;
 mod task;
+mod task_tui;
 mod token;
 mod webhook;
 /// Subcommands for `autumn check`.
@@ -181,6 +182,9 @@ enum Commands {
         /// List registered tasks instead of running one.
         #[arg(long)]
         list: bool,
+        /// Open an interactive TUI to select and run tasks.
+        #[arg(long)]
+        ui: bool,
         /// Task name to run.
         name: Option<String>,
         /// Arguments forwarded to the task, e.g. `--user-id 42`.
@@ -1544,6 +1548,7 @@ fn run_command(command: Commands) {
             bin,
             profile,
             list,
+            ui,
             name,
             args,
         } => run_task_command(
@@ -1551,6 +1556,7 @@ fn run_command(command: Commands) {
             bin.as_deref(),
             &profile,
             list,
+            ui,
             name.as_deref(),
             &args,
         ),
@@ -1751,6 +1757,7 @@ fn run_task_command(
     bin: Option<&str>,
     profile: &str,
     list: bool,
+    ui: bool,
     name: Option<&str>,
     args: &[String],
 ) {
@@ -1759,6 +1766,7 @@ fn run_task_command(
         bin,
         profile,
         list,
+        ui,
         name,
         args,
     });
@@ -2667,6 +2675,7 @@ mod tests {
                 name,
                 args,
                 list,
+                ui: _,
                 profile,
                 package,
                 bin,
@@ -2698,6 +2707,7 @@ mod tests {
             Commands::Task {
                 name,
                 list,
+                ui: _,
                 package,
                 bin,
                 ..
@@ -2716,7 +2726,12 @@ mod tests {
         let cli =
             Cli::try_parse_from(["autumn", "task", "--profile", "prod", "cleanup-user"]).unwrap();
         match cli.command {
-            Commands::Task { profile, name, .. } => {
+            Commands::Task {
+                profile,
+                name,
+                ui: _,
+                ..
+            } => {
                 assert_eq!(profile, "prod");
                 assert_eq!(name.as_deref(), Some("cleanup-user"));
             }
