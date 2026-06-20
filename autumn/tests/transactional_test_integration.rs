@@ -6,6 +6,7 @@
 
 #[cfg(all(feature = "db", feature = "test-support"))]
 mod transactional_tests {
+    use autumn_web::config::ShardConfig;
     use autumn_web::prelude::*;
     use autumn_web::test::{TestApp, TestDb};
     use diesel::prelude::*;
@@ -204,5 +205,126 @@ mod transactional_tests {
             0,
             "after_commit callback should be suppressed in transactional test mode"
         );
+    }
+
+    // ── Sharded transactional isolation (§2) ───────────────────
+
+    /// Insert a row through the routed shard's primary pool. Under a
+    /// transactional `TestApp`, this write lands in the shard pool's
+    /// rolled-back test transaction.
+    #[post("/shard-items")]
+    async fn create_item_on_shard(
+        mut db: ShardedDb,
+        Json(new_item): Json<NewItem>,
+    ) -> AutumnResult<(axum::http::StatusCode, Json<Item>)> {
+        let item = diesel::insert_into(transactional_items::table)
+            .values(&new_item)
+            .returning(Item::as_returning())
+            .get_result(&mut *db)
+            .await?;
+        Ok((axum::http::StatusCode::CREATED, Json(item)))
+    }
+
+    /// Read rows back through the routed shard's pool.
+    #[get("/shard-items")]
+    async fn list_items_on_shard(mut db: ShardedDb) -> AutumnResult<Json<Vec<Item>>> {
+        let items = transactional_items::table
+            .select(Item::as_select())
+            .load(&mut *db)
+            .await?;
+        Ok(Json(items))
+    }
+
+    /// Inject the shard routing key from an `X-Shard-Key` header so the
+    /// sharding extractors can route without a full `[tenancy]` setup.
+    async fn inject_shard_key(
+        mut request: axum::extract::Request,
+        next: axum::middleware::Next,
+    ) -> axum::response::Response {
+        if let Some(key) = request
+            .headers()
+            .get("X-Shard-Key")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned)
+        {
+            request
+                .extensions_mut()
+                .insert(autumn_web::prelude::ShardKeyOverride(key));
+        }
+        next.run(request).await
+    }
+
+    /// A transactional `TestApp` with `[[database.shards]]` rolls back writes
+    /// routed to a shard's primary pool, exactly like the control pool. Phase 1
+    /// inserts via `ShardedDb`; phase 2 (a fresh client) sees an empty table,
+    /// proving the shard transaction was rolled back on client drop.
+    #[tokio::test]
+    #[ignore = "requires Docker (testcontainers)"]
+    async fn test_sharded_transactional_isolation() {
+        let db = TestDb::shared().await;
+        setup_table(db).await;
+
+        // One shard pointing at the shared container; the transactional shard
+        // pool wraps it in a rolled-back test transaction (max_size 1).
+        let shard = ShardConfig {
+            name: "shard0".to_owned(),
+            primary_url: db.url().to_owned(),
+            ..Default::default()
+        };
+
+        // --- Phase 1: insert through the shard, observe it within the test ---
+        {
+            let client = TestApp::new()
+                .routes(routes![create_item_on_shard, list_items_on_shard])
+                .layer(axum::middleware::from_fn(inject_shard_key))
+                .with_transactional_db(db.url())
+                .with_shards(vec![shard.clone()])
+                .build();
+
+            client
+                .get("/shard-items")
+                .header("X-Shard-Key", "tenant-1")
+                .send()
+                .await
+                .assert_ok()
+                .assert_body_eq("[]");
+
+            client
+                .post("/shard-items")
+                .header("X-Shard-Key", "tenant-1")
+                .json(&serde_json::json!({"name": "Sharded Item"}))
+                .send()
+                .await
+                .assert_status(201);
+
+            client
+                .get("/shard-items")
+                .header("X-Shard-Key", "tenant-1")
+                .send()
+                .await
+                .assert_ok()
+                .assert_json::<Vec<serde_json::Value>, _>(|items| {
+                    assert_eq!(items.len(), 1);
+                    assert_eq!(items[0]["name"], "Sharded Item");
+                });
+        }
+
+        // --- Phase 2: a fresh transactional client sees an empty shard ---
+        {
+            let client = TestApp::new()
+                .routes(routes![list_items_on_shard])
+                .layer(axum::middleware::from_fn(inject_shard_key))
+                .with_transactional_db(db.url())
+                .with_shards(vec![shard])
+                .build();
+
+            client
+                .get("/shard-items")
+                .header("X-Shard-Key", "tenant-1")
+                .send()
+                .await
+                .assert_ok()
+                .assert_body_eq("[]");
+        }
     }
 }

@@ -108,6 +108,12 @@ struct RepoConfig {
     /// replica is configured (#971). Use for read-after-write-sensitive
     /// aggregates that cannot tolerate replication lag.
     primary_reads: bool,
+    /// When `true`, the generated `FromRequestParts` resolves the tenant → shard
+    /// automatically so handlers can extract the repository directly without a
+    /// [`ShardedDb`] extractor. Requires shards to be configured in `[[database.shards]]`.
+    /// Works with `tenant_scoped` for per-tenant routing and `across_tenants` for
+    /// cross-shard fan-out reads. (issue #1209)
+    sharded: bool,
 }
 
 #[allow(clippy::too_many_lines)]
@@ -128,6 +134,7 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
     let mut versioned = false;
     let mut no_versioned_record_impl = false;
     let mut primary_reads = false;
+    let mut sharded = false;
 
     syn::meta::parser(|meta| {
         // `hooks = Ident` must be checked before the catch-all model_name case,
@@ -186,12 +193,15 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
         } else if meta.path.is_ident("primary_reads") {
             primary_reads = true;
             Ok(())
+        } else if meta.path.is_ident("sharded") {
+            sharded = true;
+            Ok(())
         } else if meta.path.get_ident().is_some() && model_name.is_none() {
             model_name = Some(meta.path.get_ident().unwrap().clone());
             Ok(())
         } else {
             Err(meta.error(
-                "expected model name, table = \"...\", hooks = Type, commit_hooks = true, api = \"/path\", policy = Type, scope = Type, cursor_key = field, cursor_key_type = Type, soft_delete, tenant_scoped, no_upsert_trait, searchable, versioned = true, no_versioned_record_impl, or primary_reads",
+                "expected model name, table = \"...\", hooks = Type, commit_hooks = true, api = \"/path\", policy = Type, scope = Type, cursor_key = field, cursor_key_type = Type, soft_delete, tenant_scoped, no_upsert_trait, searchable, versioned = true, no_versioned_record_impl, primary_reads, or sharded",
             ))
         }
     })
@@ -228,6 +238,7 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
         versioned,
         no_versioned_record_impl,
         primary_reads,
+        sharded,
     })
 }
 
@@ -603,6 +614,29 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     // Parse derived query methods from trait body
     let mut derived_trait_methods = Vec::new();
     let mut derived_impl_methods = Vec::new();
+    // §1d: per-shard helpers for derived read methods that fan out under
+    // across_tenants. Emitted into the inherent impl (a trait impl cannot hold
+    // non-trait members), so kept in a separate list.
+    let mut derived_one_shard_helpers = Vec::new();
+
+    // §1d: cross-shard reject for derived *write* methods (delete_by_*). Writes
+    // cannot be fanned out (no cross-shard transaction), so reject under
+    // across_tenants on a sharded repo instead of silently hitting one shard.
+    // Empty (zero-cost) unless sharded.
+    let derived_cross_shard_write_guard = if config.sharded && config.tenant_scoped {
+        quote! {
+            if self.across_tenants && self.__autumn_shards.is_some() {
+                return ::core::result::Result::Err(
+                    ::autumn_web::AutumnError::bad_request_msg(
+                        "cross-shard derived writes are not supported: across_tenants() cannot be \
+                         used for mutation on a sharded repository"
+                    )
+                );
+            }
+        }
+    } else {
+        quote! {}
+    };
 
     for item in &trait_def.items {
         if let TraitItem::Fn(method) = item {
@@ -656,6 +690,35 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
                 let params = &user_params;
 
+                // Bare parameter names, for forwarding to the per-shard helper.
+                let param_idents: Vec<Ident> = method
+                    .sig
+                    .inputs
+                    .iter()
+                    .filter_map(|arg| {
+                        let syn::FnArg::Typed(pat_type) = arg else {
+                            return None;
+                        };
+                        let syn::Pat::Ident(pat_ident) = pat_type.pat.as_ref() else {
+                            return None;
+                        };
+                        Some(pat_ident.ident.clone())
+                    })
+                    .collect();
+
+                // A borrowed (reference) parameter can't be cloned into an owned,
+                // `'static` value for the per-shard fan-out futures (cloning a
+                // `&str` yields a `&str`), so cross-shard fan-out of such a derived
+                // read would not compile. Reject it instead, with guidance to use
+                // an owned parameter type.
+                let has_borrowed_param = method.sig.inputs.iter().any(|arg| {
+                    matches!(
+                        arg,
+                        syn::FnArg::Typed(pat_type)
+                            if matches!(pat_type.ty.as_ref(), syn::Type::Reference(_))
+                    )
+                });
+
                 let body = generate_derived_query(
                     &query,
                     &table_ident,
@@ -669,13 +732,78 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     fn #fn_ident(&self, #(#params),*) -> impl ::std::future::Future<Output = ::autumn_web::AutumnResult<#return_type>> + Send;
                 });
 
-                derived_impl_methods.push(quote! {
-                    async fn #fn_ident(&self, #(#params),*) -> ::autumn_web::AutumnResult<#return_type> {
-                        use ::autumn_web::reexports::diesel::prelude::*;
-                        use ::autumn_web::reexports::diesel_async::RunQueryDsl;
-                        #body
-                    }
-                });
+                // §1d: under across_tenants on a sharded repo, fan out read-prefix
+                // derived methods (find/count/exists) across all shards and merge;
+                // reject write-prefix ones (delete). Non-sharded repos keep the
+                // plain body (zero-cost).
+                let is_read_prefix = matches!(query.prefix.as_str(), "find" | "count" | "exists");
+                if config.sharded && config.tenant_scoped && is_read_prefix && has_borrowed_param {
+                    // Borrowed-param derived read on a sharded repo: can't fan out
+                    // ('static futures need owned params), so reject cross-shard.
+                    let method_name = fn_ident.to_string();
+                    let msg = format!(
+                        "cross-shard {method_name} is not supported: across_tenants() cannot fan \
+                         out a derived query with a borrowed parameter; declare the parameter as \
+                         an owned type (e.g. String) to enable fan-out, or query a specific shard"
+                    );
+                    derived_impl_methods.push(quote! {
+                        async fn #fn_ident(&self, #(#params),*) -> ::autumn_web::AutumnResult<#return_type> {
+                            use ::autumn_web::reexports::diesel::prelude::*;
+                            use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                            if self.across_tenants && self.__autumn_shards.is_some() {
+                                return ::core::result::Result::Err(
+                                    ::autumn_web::AutumnError::bad_request_msg(#msg)
+                                );
+                            }
+                            #body
+                        }
+                    });
+                } else if config.sharded && config.tenant_scoped && is_read_prefix {
+                    let one_shard_ident = format_ident!("__autumn_{}_one_shard", fn_ident);
+                    let merge = match query.prefix.as_str() {
+                        "find" => quote! { __results.into_iter().flatten().collect() },
+                        "count" => quote! { __results.into_iter().sum() },
+                        // "exists"
+                        _ => quote! { __results.into_iter().any(|__b| __b) },
+                    };
+                    derived_one_shard_helpers.push(quote! {
+                        #[doc(hidden)]
+                        async fn #one_shard_ident(&self, #(#params),*) -> ::autumn_web::AutumnResult<#return_type> {
+                            use ::autumn_web::reexports::diesel::prelude::*;
+                            use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                            #body
+                        }
+                    });
+                    derived_impl_methods.push(quote! {
+                        async fn #fn_ident(&self, #(#params),*) -> ::autumn_web::AutumnResult<#return_type> {
+                            use ::autumn_web::reexports::diesel::prelude::*;
+                            use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                            if self.across_tenants {
+                                if let ::core::option::Option::Some(ref __shards) = self.__autumn_shards {
+                                    // Params are cloned once per shard (the fan-out closure is
+                                    // `Fn`); allow it for `Copy` params too (e.g. an i64 filter).
+                                    #[allow(clippy::clone_on_copy)]
+                                    let __results = __shards.fan_out_shards(|__shard| {
+                                        let __sub = self.__autumn_for_shard(__shard);
+                                        #(let #param_idents = ::core::clone::Clone::clone(&#param_idents);)*
+                                        async move { __sub.#one_shard_ident(#(#param_idents),*).await }
+                                    }).await?;
+                                    return ::core::result::Result::Ok(#merge);
+                                }
+                            }
+                            #body
+                        }
+                    });
+                } else {
+                    derived_impl_methods.push(quote! {
+                        async fn #fn_ident(&self, #(#params),*) -> ::autumn_web::AutumnResult<#return_type> {
+                            use ::autumn_web::reexports::diesel::prelude::*;
+                            use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                            #derived_cross_shard_write_guard
+                            #body
+                        }
+                    });
+                }
             }
         }
     }
@@ -708,6 +836,51 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         quote! {}
     };
 
+    // `__autumn_shards` carries the full ShardSet for cross-shard fan-out
+    // under `across_tenants()`. Only present when `sharded = true`; `None`
+    // in constructors that lack request context (from_shard, with_pool_untracked).
+    let shards_struct_field = if config.sharded {
+        quote! {
+            #[doc(hidden)]
+            __autumn_shards: ::core::option::Option<::autumn_web::sharding::ShardSet>,
+        }
+    } else {
+        quote! {}
+    };
+
+    let shards_clone_field = if config.sharded {
+        quote! { __autumn_shards: self.__autumn_shards.clone(), }
+    } else {
+        quote! {}
+    };
+
+    // The non-sharded extractor and shard-unaware constructors always use None.
+    let shards_none_field = if config.sharded {
+        quote! { __autumn_shards: ::core::option::Option::None, }
+    } else {
+        quote! {}
+    };
+
+    // The self-routing sharded extractor populates this from the resolved ShardSet.
+    let shards_some_field = if config.sharded {
+        quote! { __autumn_shards: ::core::option::Option::Some(__shard_set), }
+    } else {
+        quote! {}
+    };
+
+    // `from_shard(&ShardedDb)` carries the ShardSet from the ShardedDb so that
+    // `across_tenants()` on a from_shard-built repo fans out / guards writes
+    // exactly like the extractor path (it is the standard sharded constructor).
+    let shards_from_db_field = if config.sharded {
+        quote! {
+            __autumn_shards: ::core::option::Option::Some(
+                ::core::clone::Clone::clone(db.__autumn_shard_set()),
+            ),
+        }
+    } else {
+        quote! {}
+    };
+
     let across_tenants_method = if config.tenant_scoped {
         if let Some(hooks_ident) = &config.hooks_type {
             let idempotency_clone_field = if commit_hooks_enabled {
@@ -727,6 +900,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         hooks: <#hooks_ident as ::autumn_web::hooks::RepositoryHooksClone>::autumn_clone(&self.hooks),
                         #idempotency_clone_field
                         across_tenants: true,
+                        #shards_clone_field
                         __autumn_read_route: self.__autumn_read_route.clone(),
                         __autumn_statement_timeout_ms: self.__autumn_statement_timeout_ms,
                         __autumn_slow_threshold: self.__autumn_slow_threshold,
@@ -743,11 +917,65 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     Self {
                         pool: self.pool.clone(),
                         across_tenants: true,
+                        #shards_clone_field
                         __autumn_read_route: self.__autumn_read_route.clone(),
                         __autumn_statement_timeout_ms: self.__autumn_statement_timeout_ms,
                         __autumn_slow_threshold: self.__autumn_slow_threshold,
                         __autumn_route: self.__autumn_route.clone(),
                     }
+                }
+            }
+        }
+    } else {
+        quote! {}
+    };
+
+    // §1d: build a per-shard sub-repo for cross-shard read fan-out. Mirrors
+    // `across_tenants()` but routes to a specific shard: pool = that shard's
+    // primary, read route = that shard's `read_route()` (so replica routing /
+    // fail-closed is honored, not silently forced to primary), and
+    // `__autumn_shards = None` to stop recursion. The parent's statement timeout
+    // and slow-query threshold are preserved so a fan-out scan respects the same
+    // limits as an ordinary generated read. Only emitted for sharded +
+    // tenant_scoped repos (the only ones that fan out).
+    let for_shard_method = if config.sharded && config.tenant_scoped {
+        let hooks_field = config.hooks_type.as_ref().map(|hooks_ident| {
+            quote! {
+                hooks: <#hooks_ident as ::autumn_web::hooks::RepositoryHooksClone>::autumn_clone(&self.hooks),
+            }
+        });
+        let idempotency_field = if commit_hooks_enabled {
+            quote! { idempotency: self.idempotency.clone(), }
+        } else {
+            quote! {}
+        };
+        quote! {
+            #[doc(hidden)]
+            fn __autumn_for_shard(&self, __shard: &::autumn_web::sharding::Shard) -> Self {
+                Self {
+                    pool: ::core::clone::Clone::clone(__shard.primary_pool()),
+                    #hooks_field
+                    #idempotency_field
+                    across_tenants: true,
+                    __autumn_shards: ::core::option::Option::None,
+                    // Honor the shard's read routing (replica / fail-closed),
+                    // but preserve an explicit parent primary-read override
+                    // (`primary_reads` or `on_primary()`) so cross-shard
+                    // read-your-writes is not silently sent to replicas (#1d).
+                    __autumn_read_route: match self.__autumn_read_route {
+                        ::autumn_web::repository::ReadRoute::Primary =>
+                            ::autumn_web::repository::ReadRoute::Primary,
+                        _ => __shard.read_route(),
+                    },
+                    __autumn_statement_timeout_ms: self.__autumn_statement_timeout_ms,
+                    __autumn_slow_threshold: self.__autumn_slow_threshold,
+                    // Re-tag the route label with this shard so per-shard DB
+                    // metrics and slow-query logs attribute fan-out work to the
+                    // shard executing it, not the originally-routed shard.
+                    __autumn_route: ::autumn_web::sharding::reshard_route_label(
+                        self.__autumn_route.as_deref(),
+                        __shard.name(),
+                    ),
                 }
             }
         }
@@ -799,6 +1027,23 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         quote! { self.across_tenants }
     } else {
         quote! { false }
+    };
+
+    // §1d: cross-shard reject for preload. Empty unless sharded + tenant_scoped.
+    let preload_cross_shard_guard = if config.sharded && config.tenant_scoped {
+        quote! {
+            if self.across_tenants && self.__autumn_shards.is_some() {
+                return ::core::result::Result::Err(
+                    ::autumn_web::AutumnError::bad_request_msg(
+                        "cross-shard preload is not supported: \
+                         associations cannot be loaded from a single routed \
+                         connection across shards; preload per shard instead"
+                    )
+                );
+            }
+        }
+    } else {
+        quote! {}
     };
 
     let with_pool_method = {
@@ -868,6 +1113,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     #hooks_field
                     #idempotency_field
                     #tenant_init_field
+                    #shards_from_db_field
                     __autumn_read_route: #from_shard_read_route,
                     __autumn_statement_timeout_ms: __seed.statement_timeout_ms,
                     __autumn_slow_threshold: __seed.slow_query_threshold,
@@ -900,6 +1146,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     #hooks_field
                     #idempotency_field
                     #tenant_init_field
+                    #shards_none_field
                     __autumn_read_route: ::autumn_web::repository::ReadRoute::Primary,
                     __autumn_statement_timeout_ms: 0,
                     __autumn_slow_threshold: ::std::time::Duration::from_millis(500),
@@ -963,6 +1210,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             hooks: #hooks_ident,
             #idempotency_struct_field
             #tenant_struct_field
+            #shards_struct_field
             /// Read-routing snapshot for generated read-only methods (#971).
             __autumn_read_route: ::autumn_web::repository::ReadRoute,
             /// Statement timeout to apply on every connection checkout (ms). 0 = no limit.
@@ -981,6 +1229,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         hooks: <#hooks_ident as ::autumn_web::hooks::RepositoryHooksClone>::autumn_clone(&self.hooks),
                         #idempotency_clone_field
                         #tenant_clone_field
+                        #shards_clone_field
                         __autumn_read_route: self.__autumn_read_route.clone(),
                         __autumn_statement_timeout_ms: self.__autumn_statement_timeout_ms,
                         __autumn_slow_threshold: self.__autumn_slow_threshold,
@@ -1021,6 +1270,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         .get::<::autumn_web::idempotency::IdempotencyContext>()
                         .cloned(),
                     #tenant_init_field
+                    #shards_none_field
                     __autumn_read_route,
                     __autumn_statement_timeout_ms: __autumn_timeout_ms,
                     __autumn_slow_threshold,
@@ -1034,6 +1284,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     pool,
                     hooks: <#hooks_ident as ::autumn_web::hooks::RepositoryHooksDefault>::autumn_default(),
                     #tenant_init_field
+                    #shards_none_field
                     __autumn_read_route,
                     __autumn_statement_timeout_ms: __autumn_timeout_ms,
                     __autumn_slow_threshold,
@@ -3866,20 +4117,26 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
             let delete_returning_expr = if config.soft_delete {
                 if config.tenant_scoped {
+                    // Braces required: this fragment is assigned with
+                    // `let chunk_deleted_ids = #delete_returning_expr` in the
+                    // versioned path, so the leading `let query` must be inside
+                    // a block expression.
                     quote! {
-                        let query = #table_ident::table.filter(#table_ident::id.eq_any(chunk)).filter(#table_ident::deleted_at.is_null());
-                        if let ::core::option::Option::Some(t) = tenant_id {
-                            ::autumn_web::reexports::diesel::update(query.filter(#table_ident::tenant_id.eq(t)))
-                                .set(#table_ident::deleted_at.eq(::core::option::Option::Some(__now)))
-                                .returning(#table_ident::id)
-                                .get_results::<i64>(conn)
-                                .await
-                        } else {
-                            ::autumn_web::reexports::diesel::update(query)
-                                .set(#table_ident::deleted_at.eq(::core::option::Option::Some(__now)))
-                                .returning(#table_ident::id)
-                                .get_results::<i64>(conn)
-                                .await
+                        {
+                            let query = #table_ident::table.filter(#table_ident::id.eq_any(chunk)).filter(#table_ident::deleted_at.is_null());
+                            if let ::core::option::Option::Some(t) = tenant_id {
+                                ::autumn_web::reexports::diesel::update(query.filter(#table_ident::tenant_id.eq(t)))
+                                    .set(#table_ident::deleted_at.eq(::core::option::Option::Some(__now)))
+                                    .returning(#table_ident::id)
+                                    .get_results::<i64>(conn)
+                                    .await
+                            } else {
+                                ::autumn_web::reexports::diesel::update(query)
+                                    .set(#table_ident::deleted_at.eq(::core::option::Option::Some(__now)))
+                                    .returning(#table_ident::id)
+                                    .get_results::<i64>(conn)
+                                    .await
+                            }
                         }
                     }
                 } else {
@@ -3894,17 +4151,19 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             } else {
                 if config.tenant_scoped {
                     quote! {
-                        let query = #table_ident::table.filter(#table_ident::id.eq_any(chunk));
-                        if let ::core::option::Option::Some(t) = tenant_id {
-                            ::autumn_web::reexports::diesel::delete(query.filter(#table_ident::tenant_id.eq(t)))
-                                .returning(#table_ident::id)
-                                .get_results::<i64>(conn)
-                                .await
-                        } else {
-                            ::autumn_web::reexports::diesel::delete(query)
-                                .returning(#table_ident::id)
-                                .get_results::<i64>(conn)
-                                .await
+                        {
+                            let query = #table_ident::table.filter(#table_ident::id.eq_any(chunk));
+                            if let ::core::option::Option::Some(t) = tenant_id {
+                                ::autumn_web::reexports::diesel::delete(query.filter(#table_ident::tenant_id.eq(t)))
+                                    .returning(#table_ident::id)
+                                    .get_results::<i64>(conn)
+                                    .await
+                            } else {
+                                ::autumn_web::reexports::diesel::delete(query)
+                                    .returning(#table_ident::id)
+                                    .get_results::<i64>(conn)
+                                    .await
+                            }
                         }
                     }
                 } else {
@@ -4075,6 +4334,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 ::autumn_web::reexports::diesel_async::AsyncPgConnection,
             >,
             #tenant_struct_field
+            #shards_struct_field
             /// Read-routing snapshot for generated read-only methods (#971).
             __autumn_read_route: ::autumn_web::repository::ReadRoute,
             /// Statement timeout to apply on every connection checkout (ms). 0 = no limit.
@@ -4091,6 +4351,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     Self {
                         pool: self.pool.clone(),
                         #tenant_clone_field
+                        #shards_clone_field
                         __autumn_read_route: self.__autumn_read_route.clone(),
                         __autumn_statement_timeout_ms: self.__autumn_statement_timeout_ms,
                         __autumn_slow_threshold: self.__autumn_slow_threshold,
@@ -4124,6 +4385,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             Ok(#pg_name {
                 pool,
                 #tenant_init_field
+                #shards_none_field
                 __autumn_read_route,
                 __autumn_statement_timeout_ms: __autumn_timeout_ms,
                 __autumn_slow_threshold,
@@ -5900,6 +6162,60 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         )
     };
 
+    // §1d: cross-shard write guard.  When `sharded + tenant_scoped`, writes
+    // that arrive with `across_tenants = true` AND `__autumn_shards.is_some()`
+    // cannot be safely fanned-out (no cross-shard transaction semantics), so we
+    // return a clear error instead of silently hitting only one shard. Shared
+    // by the core write bodies below and the `upsert_many` body further down.
+    let cross_shard_write_guard = if config.sharded && config.tenant_scoped {
+        quote! {
+            if self.across_tenants {
+                if self.__autumn_shards.is_some() {
+                    return ::core::result::Result::Err(
+                        ::autumn_web::AutumnError::bad_request_msg(
+                            "cross-shard writes are not supported: \
+                             across_tenants() cannot be used for mutation \
+                             on a sharded repository"
+                        )
+                    );
+                }
+            }
+        }
+    } else {
+        quote! {}
+    };
+
+    let (
+        save_body,
+        update_body,
+        delete_body,
+        save_many_body,
+        save_many_skip_invalid_body,
+        update_many_body,
+        delete_many_body,
+    ) = if config.sharded && config.tenant_scoped {
+        let write_guard = &cross_shard_write_guard;
+        (
+            quote! { #write_guard #save_body },
+            quote! { #write_guard #update_body },
+            quote! { #write_guard #delete_body },
+            quote! { #write_guard #save_many_body },
+            quote! { #write_guard #save_many_skip_invalid_body },
+            quote! { #write_guard #update_many_body },
+            quote! { #write_guard #delete_many_body },
+        )
+    } else {
+        (
+            save_body,
+            update_body,
+            delete_body,
+            save_many_body,
+            save_many_skip_invalid_body,
+            update_many_body,
+            delete_many_body,
+        )
+    };
+
     let route_hook_registration = if commit_hooks_enabled {
         quote! { #pg_name::__autumn_register_repository_commit_hooks(); }
     } else {
@@ -5934,12 +6250,32 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             -> impl ::std::future::Future<Output = ::autumn_web::AutumnResult<::autumn_web::pagination::Page<#model_name>>> + Send;
     };
 
+    // §1d: cross-shard paginate guard token stream (empty when not sharded).
+    let page_cross_shard_guard = if config.sharded && config.tenant_scoped {
+        quote! {
+            if self.across_tenants {
+                if self.__autumn_shards.is_some() {
+                    return ::core::result::Result::Err(
+                        ::autumn_web::AutumnError::bad_request_msg(
+                            "cross-shard pagination is not supported: \
+                             use find_all() with across_tenants() on a \
+                             sharded repository instead"
+                        )
+                    );
+                }
+            }
+        }
+    } else {
+        quote! {}
+    };
+
     let pagination_impl_method = if config.tenant_scoped {
         quote! {
             async fn page(
                 &self,
                 req: &::autumn_web::pagination::PageRequest,
             ) -> ::autumn_web::AutumnResult<::autumn_web::pagination::Page<#model_name>> {
+                #page_cross_shard_guard
                 use ::autumn_web::reexports::diesel::prelude::*;
                 use ::autumn_web::reexports::diesel_async::RunQueryDsl;
                 let tenant_id = if self.across_tenants {
@@ -6066,6 +6402,25 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             fn cursor_page(&self, req: &::autumn_web::pagination::CursorRequest)
                 -> impl ::std::future::Future<Output = ::autumn_web::AutumnResult<::autumn_web::pagination::CursorPage<#model_name>>> + Send;
         };
+        // §1d: cross-shard cursor_page guard (empty when not sharded).
+        let cursor_cross_shard_guard = if config.sharded && config.tenant_scoped {
+            quote! {
+                if self.across_tenants {
+                    if self.__autumn_shards.is_some() {
+                        return ::core::result::Result::Err(
+                            ::autumn_web::AutumnError::bad_request_msg(
+                                "cross-shard cursor pagination is not supported: \
+                                 use find_all() with across_tenants() on a \
+                                 sharded repository instead"
+                            )
+                        );
+                    }
+                }
+            }
+        } else {
+            quote! {}
+        };
+
         let impl_method = if let Some(ref key_type) = config.cursor_key_type {
             // Full two-part keyset filter ΓÇö always correct regardless of whether
             // cursor_key and id are monotonically correlated.
@@ -6074,6 +6429,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     &self,
                     req: &::autumn_web::pagination::CursorRequest,
                 ) -> ::autumn_web::AutumnResult<::autumn_web::pagination::CursorPage<#model_name>> {
+                    #cursor_cross_shard_guard
                     use ::autumn_web::reexports::diesel::prelude::*;
                     use ::autumn_web::reexports::diesel_async::RunQueryDsl;
                     let mut conn = self.__autumn_acquire_read_conn().await?;
@@ -6117,6 +6473,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     &self,
                     req: &::autumn_web::pagination::CursorRequest,
                 ) -> ::autumn_web::AutumnResult<::autumn_web::pagination::CursorPage<#model_name>> {
+                    #cursor_cross_shard_guard
                     use ::autumn_web::reexports::diesel::prelude::*;
                     use ::autumn_web::reexports::diesel_async::RunQueryDsl;
                     let mut conn = self.__autumn_acquire_read_conn().await?;
@@ -6991,6 +7348,90 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         quote! {}
     };
 
+    // §1d: cross-shard fan-out / reject fragments for the soft-delete readers.
+    // `with_deleted` / `only_deleted` are unpaginated `Vec`-returning reads, so
+    // under `across_tenants()` on a sharded repo they fan out across every shard
+    // and concatenate the per-shard results (via inherent one-shard helpers, the
+    // same pattern as `find_all`). `page_only_deleted` is paginated and a naive
+    // fan-out would produce wrong page boundaries / totals, so it rejects (like
+    // `page`). All fragments are empty (zero-cost) unless sharded + tenant_scoped.
+    let mut soft_delete_one_shard_helpers: Vec<proc_macro2::TokenStream> = Vec::new();
+    let (with_deleted_fan_out, only_deleted_fan_out, page_only_deleted_cross_shard_guard) =
+        if config.soft_delete && config.sharded && config.tenant_scoped {
+            let with_deleted_fan_out = quote! {
+                if self.across_tenants {
+                    if let ::core::option::Option::Some(ref __shards) = self.__autumn_shards {
+                        let __vecs = __shards.fan_out_shards(|__shard| {
+                            let __sub = self.__autumn_for_shard(__shard);
+                            async move { __sub.__autumn_with_deleted_one_shard().await }
+                        }).await?;
+                        return ::core::result::Result::Ok(
+                            __vecs.into_iter().flatten().collect()
+                        );
+                    }
+                }
+            };
+            let only_deleted_fan_out = quote! {
+                if self.across_tenants {
+                    if let ::core::option::Option::Some(ref __shards) = self.__autumn_shards {
+                        let __vecs = __shards.fan_out_shards(|__shard| {
+                            let __sub = self.__autumn_for_shard(__shard);
+                            async move { __sub.__autumn_only_deleted_one_shard().await }
+                        }).await?;
+                        return ::core::result::Result::Ok(
+                            __vecs.into_iter().flatten().collect()
+                        );
+                    }
+                }
+            };
+            let page_only_deleted_cross_shard_guard = quote! {
+                if self.across_tenants && self.__autumn_shards.is_some() {
+                    return ::core::result::Result::Err(
+                        ::autumn_web::AutumnError::bad_request_msg(
+                            "cross-shard page_only_deleted is not supported: \
+                             across_tenants() fans out unpaginated reads only; \
+                             page a specific shard instead"
+                        )
+                    );
+                }
+            };
+            // The per-shard helpers re-run the single-shard body. The
+            // sub-repo built by `__autumn_for_shard` has across_tenants = true
+            // and __autumn_shards = None, so its tenant_id resolves to None and
+            // the body loads every (deleted) row on that shard.
+            soft_delete_one_shard_helpers.push(quote! {
+                #[doc(hidden)]
+                async fn __autumn_with_deleted_one_shard(&self) -> ::autumn_web::AutumnResult<::std::vec::Vec<#model_name>> {
+                    use ::autumn_web::reexports::diesel::prelude::*;
+                    use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                    let mut conn = self.__autumn_acquire_read_conn().await?;
+                    #table_ident::table
+                        .load::<#model_name>(&mut conn)
+                        .await
+                        .map_err(::autumn_web::AutumnError::from)
+                }
+
+                #[doc(hidden)]
+                async fn __autumn_only_deleted_one_shard(&self) -> ::autumn_web::AutumnResult<::std::vec::Vec<#model_name>> {
+                    use ::autumn_web::reexports::diesel::prelude::*;
+                    use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                    let mut conn = self.__autumn_acquire_read_conn().await?;
+                    #table_ident::table
+                        .filter(#table_ident::deleted_at.is_not_null())
+                        .load::<#model_name>(&mut conn)
+                        .await
+                        .map_err(::autumn_web::AutumnError::from)
+                }
+            });
+            (
+                with_deleted_fan_out,
+                only_deleted_fan_out,
+                page_only_deleted_cross_shard_guard,
+            )
+        } else {
+            (quote! {}, quote! {}, quote! {})
+        };
+
     let soft_delete_impl_methods = if config.soft_delete {
         if config.tenant_scoped {
             let tenant_id_setup = quote! {
@@ -7007,6 +7448,9 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 async fn restore(&self, id: i64) -> ::autumn_web::AutumnResult<()> {
                     use ::autumn_web::reexports::diesel::prelude::*;
                     use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                    // §1d: restore is a write; reject cross-shard across_tenants
+                    // (per-shard ids are ambiguous, like delete/purge).
+                    #cross_shard_write_guard
                     #tenant_id_setup
                     let mut conn = self.__autumn_acquire_conn().await?;
                     let query = #table_ident::table.find(id);
@@ -7033,6 +7477,9 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 async fn purge(&self, id: i64) -> ::autumn_web::AutumnResult<()> {
                     use ::autumn_web::reexports::diesel::prelude::*;
                     use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                    // §1d: purge is a hard delete; reject cross-shard across_tenants
+                    // (per-shard ids are ambiguous and could purge another tenant's row).
+                    #cross_shard_write_guard
                     #tenant_id_setup
                     let mut conn = self.__autumn_acquire_conn().await?;
                     let query = #table_ident::table.find(id);
@@ -7057,6 +7504,10 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 async fn with_deleted(&self) -> ::autumn_web::AutumnResult<Vec<#model_name>> {
                     use ::autumn_web::reexports::diesel::prelude::*;
                     use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                    // §1d: fan out across all shards under across_tenants. The
+                    // dispatch runs before acquiring a routed connection so no
+                    // drop is needed (see the find_all deadlock rule).
+                    #with_deleted_fan_out
                     #tenant_id_setup
                     let mut conn = self.__autumn_acquire_read_conn().await?;
                     let query = #table_ident::table;
@@ -7075,6 +7526,8 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 async fn only_deleted(&self) -> ::autumn_web::AutumnResult<Vec<#model_name>> {
                     use ::autumn_web::reexports::diesel::prelude::*;
                     use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                    // §1d: fan out across all shards under across_tenants.
+                    #only_deleted_fan_out
                     #tenant_id_setup
                     let mut conn = self.__autumn_acquire_read_conn().await?;
                     let query = #table_ident::table.filter(#table_ident::deleted_at.is_not_null());
@@ -7096,6 +7549,9 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 ) -> ::autumn_web::AutumnResult<::autumn_web::pagination::Page<#model_name>> {
                     use ::autumn_web::reexports::diesel::prelude::*;
                     use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                    // §1d: paginated reads cannot fan out (page/total would be
+                    // wrong across shards); reject under cross-shard access.
+                    #page_only_deleted_cross_shard_guard
                     #tenant_id_setup
                     let mut conn = self.__autumn_acquire_read_conn().await?;
                     let query = #table_ident::table.filter(#table_ident::deleted_at.is_not_null());
@@ -7294,6 +7750,100 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     };
 
+    // §1d: when sharded + tenant_scoped, fan out across all shards concurrently
+    // for across_tenants reads.  Uses ShardSet::fan_out_shards for concurrent
+    // execution.  The sub-repo is built with `__autumn_for_shard`, which honors
+    // each shard's read routing and the parent request context and sets
+    // `__autumn_shards = None`, preventing recursion.
+    // §1d: fan out `find_all` across all shards for `across_tenants()`. The
+    // per-shard work runs through the inherent `__autumn_find_all_one_shard`
+    // helper (emitted below) rather than the trait method, so `find_all`'s
+    // RPITIT future never transitively names its own opaque type — which would
+    // make its `Send` auto-trait unprovable once hooks/versioning add captured
+    // state to the future.
+    let (find_all_impl, find_all_one_shard_helper) = if config.sharded && config.tenant_scoped {
+        let base = find_all_impl;
+        let dispatch = quote! {
+            // Dispatch the cross-shard fan-out BEFORE acquiring any connection:
+            // no routed-shard connection is held here, so a dead parent replica
+            // or exhausted parent pool can't fail the fan-out. Each shard's own
+            // read route/fallback is chosen by `__autumn_for_shard` (#1d).
+            if self.across_tenants {
+                if let ::core::option::Option::Some(ref __shards) = self.__autumn_shards {
+                    let __vecs = __shards.fan_out_shards(|__shard| {
+                        let __sub = self.__autumn_for_shard(__shard);
+                        async move { __sub.__autumn_find_all_one_shard().await }
+                    }).await?;
+                    return ::core::result::Result::Ok(
+                        __vecs.into_iter().flatten().collect()
+                    );
+                }
+            }
+            let mut conn = self.__autumn_acquire_read_conn().await?;
+            #base
+        };
+        let helper = quote! {
+            #[doc(hidden)]
+            async fn __autumn_find_all_one_shard(&self) -> ::autumn_web::AutumnResult<::std::vec::Vec<#model_name>> {
+                use ::autumn_web::reexports::diesel::prelude::*;
+                use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                let mut conn = self.__autumn_acquire_read_conn().await?;
+                #base
+            }
+        };
+        (dispatch, helper)
+    } else {
+        (find_all_impl, quote! {})
+    };
+
+    // §1d: fan out `find_by_id` across all shards for `across_tenants()`,
+    // returning the first shard that has the row (ids are unique within a
+    // shard). Without this, a cross-tenant `find_by_id` would only consult the
+    // originally-routed shard and report rows on other shards as missing.
+    let (find_by_id_impl, find_by_id_one_shard_helper) = if config.sharded && config.tenant_scoped {
+        let base = find_by_id_impl;
+        let dispatch = quote! {
+            // Fan out before acquiring a parent-shard connection (see find_all).
+            if self.across_tenants {
+                if let ::core::option::Option::Some(ref __shards) = self.__autumn_shards {
+                    let __found = __shards.fan_out_shards(|__shard| {
+                        let __sub = self.__autumn_for_shard(__shard);
+                        async move { __sub.__autumn_find_by_id_one_shard(id).await }
+                    }).await?;
+                    // Ids are unique only within a shard: with per-shard
+                    // sequences two shards can hold the same id, so a match on
+                    // more than one shard is ambiguous. Reject rather than
+                    // silently returning whichever shard sorts first (#1d).
+                    let mut __hits = __found.into_iter().flatten();
+                    let __first = __hits.next();
+                    if __hits.next().is_some() {
+                        return ::core::result::Result::Err(
+                            ::autumn_web::AutumnError::internal_server_error_msg(
+                                "ambiguous cross-shard find_by_id: id matched rows on \
+                                 multiple shards; query a specific shard instead"
+                            )
+                        );
+                    }
+                    return ::core::result::Result::Ok(__first);
+                }
+            }
+            let mut conn = self.__autumn_acquire_read_conn().await?;
+            #base
+        };
+        let helper = quote! {
+            #[doc(hidden)]
+            async fn __autumn_find_by_id_one_shard(&self, id: i64) -> ::autumn_web::AutumnResult<::core::option::Option<#model_name>> {
+                use ::autumn_web::reexports::diesel::prelude::*;
+                use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                let mut conn = self.__autumn_acquire_read_conn().await?;
+                #base
+            }
+        };
+        (dispatch, helper)
+    } else {
+        (find_by_id_impl, quote! {})
+    };
+
     let count_impl = if config.tenant_scoped {
         quote! {
             let tenant_id = if self.across_tenants {
@@ -7329,6 +7879,36 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 .await
                 .map_err(::autumn_web::AutumnError::from)
         }
+    };
+
+    let (count_impl, count_one_shard_helper) = if config.sharded && config.tenant_scoped {
+        let base = count_impl;
+        let dispatch = quote! {
+            // Fan out before acquiring a parent-shard connection (see find_all).
+            if self.across_tenants {
+                if let ::core::option::Option::Some(ref __shards) = self.__autumn_shards {
+                    let __counts = __shards.fan_out_shards(|__shard| {
+                        let __sub = self.__autumn_for_shard(__shard);
+                        async move { __sub.__autumn_count_one_shard().await }
+                    }).await?;
+                    return ::core::result::Result::Ok(__counts.into_iter().sum());
+                }
+            }
+            let mut conn = self.__autumn_acquire_read_conn().await?;
+            #base
+        };
+        let helper = quote! {
+            #[doc(hidden)]
+            async fn __autumn_count_one_shard(&self) -> ::autumn_web::AutumnResult<i64> {
+                use ::autumn_web::reexports::diesel::prelude::*;
+                use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                let mut conn = self.__autumn_acquire_read_conn().await?;
+                #base
+            }
+        };
+        (dispatch, helper)
+    } else {
+        (count_impl, quote! {})
     };
 
     let exists_by_id_impl = if config.tenant_scoped {
@@ -7374,6 +7954,38 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     };
 
+    let (exists_by_id_impl, exists_by_id_one_shard_helper) = if config.sharded
+        && config.tenant_scoped
+    {
+        let base = exists_by_id_impl;
+        let dispatch = quote! {
+            // Fan out before acquiring a parent-shard connection (see find_all).
+            if self.across_tenants {
+                if let ::core::option::Option::Some(ref __shards) = self.__autumn_shards {
+                    let __results = __shards.fan_out_shards(|__shard| {
+                        let __sub = self.__autumn_for_shard(__shard);
+                        async move { __sub.__autumn_exists_by_id_one_shard(id).await }
+                    }).await?;
+                    return ::core::result::Result::Ok(__results.into_iter().any(|b| b));
+                }
+            }
+            let mut conn = self.__autumn_acquire_read_conn().await?;
+            #base
+        };
+        let helper = quote! {
+            #[doc(hidden)]
+            async fn __autumn_exists_by_id_one_shard(&self, id: i64) -> ::autumn_web::AutumnResult<bool> {
+                use ::autumn_web::reexports::diesel::prelude::*;
+                use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                let mut conn = self.__autumn_acquire_read_conn().await?;
+                #base
+            }
+        };
+        (dispatch, helper)
+    } else {
+        (exists_by_id_impl, quote! {})
+    };
+
     let upsert_many_trait_method = if config.hooks_type.is_none() && !config.no_upsert_trait {
         quote! {
             fn upsert_many(&self, records: &[#model_name]) -> impl ::std::future::Future<Output = ::autumn_web::AutumnResult<Vec<#model_name>>> + Send
@@ -7398,6 +8010,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             where
                 #model_name: ::autumn_web::reexports::diesel::Insertable<#table_ident::table>
             {
+                #cross_shard_write_guard
                 #upsert_many_body
             }
         }
@@ -7456,7 +8069,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         quote! {}
     };
 
-    let search_impl_methods = if config.searchable {
+    let (search_impl_methods, search_one_shard_helpers) = if config.searchable {
         let tenant_id_setup = if config.tenant_scoped {
             quote! {
                 let tenant_id = if self.across_tenants {
@@ -7473,11 +8086,50 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             }
         };
 
-        quote! {
-            async fn search(&self, query: &str) -> ::autumn_web::AutumnResult<Vec<#model_name>> {
-                use ::autumn_web::reexports::diesel::prelude::*;
-                use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+        // §1d: under across_tenants on a sharded repo the `Vec`-returning
+        // `search` fans out across every shard and concatenates results (ranking
+        // is per-shard; the merged order is the per-shard ranking concatenated).
+        // The paginated `search_page` rejects, since merging ranked pages across
+        // shards would produce wrong page boundaries / totals.
+        let search_fan_out = if config.sharded && config.tenant_scoped {
+            quote! {
+                if self.across_tenants {
+                    if let ::core::option::Option::Some(ref __shards) = self.__autumn_shards {
+                        let __q = ::std::string::ToString::to_string(query);
+                        let __vecs = __shards.fan_out_shards(|__shard| {
+                            let __sub = self.__autumn_for_shard(__shard);
+                            let __q = ::core::clone::Clone::clone(&__q);
+                            async move { __sub.__autumn_search_one_shard(&__q).await }
+                        }).await?;
+                        return ::core::result::Result::Ok(
+                            __vecs.into_iter().flatten().collect()
+                        );
+                    }
+                }
+            }
+        } else {
+            quote! {}
+        };
+        let search_page_cross_shard_guard = if config.sharded && config.tenant_scoped {
+            quote! {
+                if self.across_tenants && self.__autumn_shards.is_some() {
+                    return ::core::result::Result::Err(
+                        ::autumn_web::AutumnError::bad_request_msg(
+                            "cross-shard search_page is not supported: \
+                             across_tenants() fans out unpaginated reads only; \
+                             page a specific shard instead"
+                        )
+                    );
+                }
+            }
+        } else {
+            quote! {}
+        };
 
+        // The single-shard `search` body, shared by the trait method (as the
+        // fan-out fallthrough) and the inherent `__autumn_search_one_shard`
+        // helper, so the SQL is defined exactly once.
+        let search_body = quote! {
                 if query.trim().is_empty() {
                     return Ok(Vec::new());
                 }
@@ -7552,6 +8204,30 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     .collect();
 
                 Ok(sorted_records)
+        };
+
+        // The inherent per-shard helper for `search`, emitted into the inherent
+        // impl block (a trait impl cannot hold non-trait methods).
+        let search_one_shard_helpers = if config.sharded && config.tenant_scoped {
+            quote! {
+                #[doc(hidden)]
+                async fn __autumn_search_one_shard(&self, query: &str) -> ::autumn_web::AutumnResult<::std::vec::Vec<#model_name>> {
+                    use ::autumn_web::reexports::diesel::prelude::*;
+                    use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                    #search_body
+                }
+            }
+        } else {
+            quote! {}
+        };
+
+        let search_methods = quote! {
+            async fn search(&self, query: &str) -> ::autumn_web::AutumnResult<Vec<#model_name>> {
+                use ::autumn_web::reexports::diesel::prelude::*;
+                use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                // §1d: fan out across all shards under across_tenants.
+                #search_fan_out
+                #search_body
             }
 
             async fn search_page(
@@ -7561,6 +8237,8 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             ) -> ::autumn_web::AutumnResult<::autumn_web::pagination::Page<#model_name>> {
                 use ::autumn_web::reexports::diesel::prelude::*;
                 use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+                // §1d: paginated search cannot fan out; reject cross-shard.
+                #search_page_cross_shard_guard
 
                 if query.trim().is_empty() {
                     return Ok(::autumn_web::pagination::Page::new(Vec::new(), 0, req));
@@ -7692,9 +8370,10 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
                 Ok(::autumn_web::pagination::Page::new(sorted_records, total, req))
             }
-        }
+        };
+        (search_methods, search_one_shard_helpers)
     } else {
-        quote! {}
+        (quote! {}, quote! {})
     };
 
     let upsert_set_ext_impl = quote! {};
@@ -7788,6 +8467,24 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     };
 
+    // §1d: cross-shard reject for version_history (keyed by a single, per-shard
+    // -ambiguous record_id and paginated). Empty unless sharded + tenant_scoped.
+    let version_history_cross_shard_guard = if config.sharded && config.tenant_scoped {
+        quote! {
+            if self.across_tenants && self.__autumn_shards.is_some() {
+                return ::core::result::Result::Err(
+                    ::autumn_web::AutumnError::bad_request_msg(
+                        "cross-shard version_history is not supported: \
+                         record ids are unique only within a shard; \
+                         query a specific shard instead"
+                    )
+                );
+            }
+        }
+    } else {
+        quote! {}
+    };
+
     let versioned_history_impl = if config.versioned {
         quote! {
             impl #pg_name {
@@ -7805,6 +8502,13 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     filter: ::autumn_web::version_history::VersionFilter,
                 ) -> ::autumn_web::AutumnResult<::autumn_web::version_history::VersionPage> {
                     use ::autumn_web::reexports::diesel_async::RunQueryDsl as _;
+
+                    // §1d: version_history is keyed by a single `record_id` and
+                    // is paginated; per-shard ids are ambiguous (per-shard
+                    // sequences can mint the same id on multiple shards) and a
+                    // naive page merge would be wrong. Reject under cross-shard
+                    // access rather than silently consulting one shard.
+                    #version_history_cross_shard_guard
 
                     // Private helper struct that can be deserialized from a raw SQL row.
                     #[derive(::autumn_web::reexports::diesel::QueryableByName)]
@@ -7965,6 +8669,147 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     // - Uses diesel-async RunQueryDsl for async .load()/.first() etc.
     // - Table/New/Update types must be in scope where the macro is invoked
     //   (the user brings them in via `use crate::models::*` or similar)
+
+    // §1209: when `sharded`, the extractor resolves tenant → shard via the
+    // framework's __autumn_resolve_repo_seed helper instead of pulling the
+    // control pool from AppState. The sharded extractor requires `mut parts`
+    // so it can call resolve_shard_key (which may extract from request headers).
+    let from_request_parts_impl = if config.sharded {
+        // Build the idempotency init for the sharded path (reads from `_parts`
+        // directly, since the seed doesn't carry it).
+        let sharded_idempotency_init = if commit_hooks_enabled {
+            quote! {
+                idempotency: _parts
+                    .extensions
+                    .get::<::autumn_web::idempotency::IdempotencyContext>()
+                    .cloned(),
+            }
+        } else {
+            quote! {}
+        };
+        let sharded_hooks_init = config.hooks_type.as_ref().map_or_else(
+            || quote! {},
+            |hooks_ident| quote! {
+                hooks: <#hooks_ident as ::autumn_web::hooks::RepositoryHooksDefault>::autumn_default(),
+            },
+        );
+        let sharded_register_hooks = if commit_hooks_enabled {
+            quote! { #pg_name::__autumn_register_repository_commit_hooks(); }
+        } else {
+            quote! {}
+        };
+        let sharded_read_route = if config.primary_reads {
+            quote! { ::autumn_web::repository::ReadRoute::Primary }
+        } else {
+            quote! { ::core::clone::Clone::clone(&__seed.read_route) }
+        };
+        quote! {
+            impl ::autumn_web::reexports::axum::extract::FromRequestParts<::autumn_web::AppState> for #pg_name {
+                type Rejection = ::autumn_web::AutumnError;
+
+                async fn from_request_parts(
+                    _parts: &mut ::autumn_web::reexports::http::request::Parts,
+                    state: &::autumn_web::AppState,
+                ) -> Result<Self, Self::Rejection> {
+                    #sharded_register_hooks
+                    let (__seed, __shard_set) =
+                        ::autumn_web::sharding::__autumn_resolve_repo_seed(_parts, state).await?;
+                    ::core::result::Result::Ok(Self {
+                        pool: ::core::clone::Clone::clone(&__seed.pool),
+                        #sharded_hooks_init
+                        #sharded_idempotency_init
+                        #tenant_init_field
+                        #shards_some_field
+                        __autumn_read_route: #sharded_read_route,
+                        __autumn_statement_timeout_ms: __seed.statement_timeout_ms,
+                        __autumn_slow_threshold: __seed.slow_query_threshold,
+                        __autumn_route: ::core::clone::Clone::clone(&__seed.route),
+                    })
+                }
+            }
+        }
+    } else {
+        quote! {
+            // Extractor: pull pool from AppState (same pattern as Db extractor)
+            impl ::autumn_web::reexports::axum::extract::FromRequestParts<::autumn_web::AppState> for #pg_name {
+                type Rejection = ::autumn_web::AutumnError;
+
+                async fn from_request_parts(
+                    _parts: &mut ::autumn_web::reexports::http::request::Parts,
+                    state: &::autumn_web::AppState,
+                ) -> Result<Self, Self::Rejection> {
+                    let pool = state.pool()
+                        .ok_or_else(|| ::autumn_web::AutumnError::service_unavailable_msg("No database pool configured"))?
+                        .clone();
+                    #extractor_init
+                }
+            }
+        }
+    };
+
+    // For tenant-scoped sharded repos, implement `CrossShardRepository` so the
+    // `CrossShard<Self>` extractor can build an across_tenants() fan-out repo
+    // for admin endpoints that have no tenant to route on. Mirrors the routed
+    // extractor's field init, but seeds tenant-free (across_tenants: true, no
+    // idempotency context — cross-shard writes are rejected anyway).
+    let cross_shard_repository_impl = if config.sharded && config.tenant_scoped {
+        let register_hooks = if commit_hooks_enabled {
+            quote! { #pg_name::__autumn_register_repository_commit_hooks(); }
+        } else {
+            quote! {}
+        };
+        let hooks_init = config.hooks_type.as_ref().map_or_else(
+            || quote! {},
+            |hooks_ident| quote! {
+                hooks: <#hooks_ident as ::autumn_web::hooks::RepositoryHooksDefault>::autumn_default(),
+            },
+        );
+        let idempotency_init = if commit_hooks_enabled {
+            quote! { idempotency: ::core::option::Option::None, }
+        } else {
+            quote! {}
+        };
+        let cross_read_route = if config.primary_reads {
+            quote! { ::autumn_web::repository::ReadRoute::Primary }
+        } else {
+            quote! { ::core::clone::Clone::clone(&__seed.read_route) }
+        };
+        quote! {
+            impl ::autumn_web::sharding::CrossShardRepository for #pg_name {
+                fn __autumn_from_cross_shard(
+                    __seed: ::autumn_web::sharding::ShardRepositorySeed,
+                    __set: ::autumn_web::sharding::ShardSet,
+                ) -> Self {
+                    #register_hooks
+                    Self {
+                        pool: ::core::clone::Clone::clone(&__seed.pool),
+                        #hooks_init
+                        #idempotency_init
+                        across_tenants: true,
+                        __autumn_shards: ::core::option::Option::Some(__set),
+                        __autumn_read_route: #cross_read_route,
+                        __autumn_statement_timeout_ms: __seed.statement_timeout_ms,
+                        __autumn_slow_threshold: __seed.slow_query_threshold,
+                        __autumn_route: ::core::clone::Clone::clone(&__seed.route),
+                    }
+                }
+            }
+        }
+    } else {
+        quote! {}
+    };
+
+    // For sharded + tenant_scoped repos, the cross-shard read dispatch acquires
+    // its own read connection lazily inside the single-shard branch, so a dead
+    // parent replica or exhausted parent pool can't fail the fan-out before
+    // per-shard routing chooses each shard's own read route/fallback. Other
+    // configs acquire up front in the trait method as before.
+    let read_conn_acquire = if config.sharded && config.tenant_scoped {
+        quote! {}
+    } else {
+        quote! { let mut conn = self.__autumn_acquire_read_conn().await?; }
+    };
+
     quote! {
         /// Generated repository trait with CRUD + derived queries.
         #vis trait #trait_name: Send + Sync {
@@ -7992,20 +8837,9 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             #struct_fields
         }
 
-        // Extractor: pull pool from AppState (same pattern as Db extractor)
-        impl ::autumn_web::reexports::axum::extract::FromRequestParts<::autumn_web::AppState> for #pg_name {
-            type Rejection = ::autumn_web::AutumnError;
+        #from_request_parts_impl
 
-            async fn from_request_parts(
-                _parts: &mut ::autumn_web::reexports::http::request::Parts,
-                state: &::autumn_web::AppState,
-            ) -> Result<Self, Self::Rejection> {
-                let pool = state.pool()
-                    .ok_or_else(|| ::autumn_web::AutumnError::service_unavailable_msg("No database pool configured"))?
-                    .clone();
-                #extractor_init
-            }
-        }
+        #cross_shard_repository_impl
 
         #clone_impl
 
@@ -8013,14 +8847,14 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             async fn find_by_id(&self, id: i64) -> ::autumn_web::AutumnResult<Option<#model_name>> {
                 use ::autumn_web::reexports::diesel::prelude::*;
                 use ::autumn_web::reexports::diesel_async::RunQueryDsl;
-                let mut conn = self.__autumn_acquire_read_conn().await?;
+                #read_conn_acquire
                 #find_by_id_impl
             }
 
             async fn find_all(&self) -> ::autumn_web::AutumnResult<Vec<#model_name>> {
                 use ::autumn_web::reexports::diesel::prelude::*;
                 use ::autumn_web::reexports::diesel_async::RunQueryDsl;
-                let mut conn = self.__autumn_acquire_read_conn().await?;
+                #read_conn_acquire
                 #find_all_impl
             }
 
@@ -8039,14 +8873,14 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             async fn count(&self) -> ::autumn_web::AutumnResult<i64> {
                 use ::autumn_web::reexports::diesel::prelude::*;
                 use ::autumn_web::reexports::diesel_async::RunQueryDsl;
-                let mut conn = self.__autumn_acquire_read_conn().await?;
+                #read_conn_acquire
                 #count_impl
             }
 
             async fn exists_by_id(&self, id: i64) -> ::autumn_web::AutumnResult<bool> {
                 use ::autumn_web::reexports::diesel::prelude::*;
                 use ::autumn_web::reexports::diesel_async::RunQueryDsl;
-                let mut conn = self.__autumn_acquire_read_conn().await?;
+                #read_conn_acquire
                 #exists_by_id_impl
             }
 
@@ -8077,6 +8911,14 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
         impl #pg_name {
             #across_tenants_method
+            #for_shard_method
+            #find_all_one_shard_helper
+            #find_by_id_one_shard_helper
+            #count_one_shard_helper
+            #exists_by_id_one_shard_helper
+            #(#derived_one_shard_helpers)*
+            #(#soft_delete_one_shard_helpers)*
+            #search_one_shard_helpers
             #with_pool_method
             #hook_support_methods
 
@@ -8152,6 +8994,10 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 if records.is_empty() {
                     return ::core::result::Result::Ok(::std::vec::Vec::new());
                 }
+                // §1d: a cross-shard result set cannot be preloaded from a
+                // single routed connection (associations may live on any
+                // shard). Reject under across_tenants on a sharded repo.
+                #preload_cross_shard_guard
                 let mut conn = self.__autumn_acquire_read_conn().await?;
                 let mut wrapped: ::std::vec::Vec<
                     ::autumn_web::preload::Preloaded<__Model>
@@ -8311,6 +9157,12 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 use ::autumn_web::reexports::diesel_async::RunQueryDsl;
                 use ::autumn_web::reexports::diesel_async::AsyncConnection;
                 use ::autumn_web::reexports::scoped_futures::ScopedFutureExt as _;
+
+                // with_lock is a write (SELECT ... FOR UPDATE + mutation): reject
+                // cross-shard across_tenants(). It locks only the routed shard and
+                // drops tenant scoping, so a per-shard-reused id could lock/mutate
+                // another tenant's row.
+                #cross_shard_write_guard
 
                 let mut conn = self.__autumn_acquire_conn().await?;
                 conn.transaction::<T, ::autumn_web::AutumnError, _>(|conn| {
@@ -9815,6 +10667,410 @@ mod tests {
         assert!(
             generated.contains("save"),
             "non-versioned repository must still generate save"
+        );
+    }
+
+    #[test]
+    fn parse_repo_args_sharded_flag() {
+        let tokens: proc_macro2::TokenStream = "Post, tenant_scoped, sharded".parse().unwrap();
+        let config = parse_repo_args(tokens).unwrap();
+        assert_eq!(config.model_name.to_string(), "Post");
+        assert!(config.sharded, "sharded attribute must be set");
+        assert!(config.tenant_scoped, "tenant_scoped must also be set");
+    }
+
+    #[test]
+    fn parse_repo_args_sharded_defaults_off() {
+        let tokens: proc_macro2::TokenStream = "Post".parse().unwrap();
+        let config = parse_repo_args(tokens).unwrap();
+        assert!(!config.sharded, "sharded must default to false");
+    }
+
+    #[test]
+    fn parse_repo_args_sharded_alone() {
+        // `sharded` without `tenant_scoped` is allowed — routing uses
+        // ShardKeyOverride or the tenancy config.
+        let tokens: proc_macro2::TokenStream = "Post, sharded".parse().unwrap();
+        let config = parse_repo_args(tokens).unwrap();
+        assert!(config.sharded);
+        assert!(!config.tenant_scoped);
+    }
+
+    // ── §1d: sharded + tenant_scoped across_tenants fan-out ────────
+
+    #[test]
+    fn sharded_tenant_scoped_find_all_contains_fan_out_guard() {
+        let generated = repository_macro(
+            quote! { Post, tenant_scoped, sharded },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        // The fan-out guard iterates __shards
+        assert!(
+            generated.contains("__shards"),
+            "sharded+tenant_scoped find_all must contain fan-out guard over __shards: {generated}"
+        );
+        // It must build a per-shard sub-repo via __autumn_for_shard, which
+        // honors that shard's read routing and the parent request context
+        // (rather than with_pool_untracked, which forces primary + resets the
+        // timeout).
+        assert!(
+            generated.contains("__autumn_for_shard"),
+            "fan-out guard must build sub-repo via __autumn_for_shard: {generated}"
+        );
+    }
+
+    #[test]
+    fn sharded_for_shard_helper_honors_read_route_and_timeout() {
+        let generated = repository_macro(
+            quote! { Post, tenant_scoped, sharded },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        // __autumn_for_shard must source pool + read route from the shard and
+        // carry the parent's statement timeout / slow threshold.
+        assert!(
+            generated.contains("fn __autumn_for_shard"),
+            "must emit the __autumn_for_shard helper: {generated}"
+        );
+        assert!(
+            generated.contains("__shard . read_route ()")
+                || generated.contains("__shard.read_route()"),
+            "sub-repo must adopt the shard's read_route: {generated}"
+        );
+        assert!(
+            generated
+                .contains("__autumn_statement_timeout_ms : self . __autumn_statement_timeout_ms")
+                || generated
+                    .contains("__autumn_statement_timeout_ms: self.__autumn_statement_timeout_ms"),
+            "sub-repo must preserve the parent statement timeout: {generated}"
+        );
+    }
+
+    #[test]
+    fn sharded_tenant_scoped_find_by_id_fans_out() {
+        let generated = repository_macro(
+            quote! { Post, tenant_scoped, sharded },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("__autumn_find_by_id_one_shard"),
+            "sharded+tenant_scoped find_by_id must fan out via a one-shard helper: {generated}"
+        );
+    }
+
+    #[test]
+    fn sharded_tenant_scoped_derived_read_fans_out() {
+        let generated = repository_macro(
+            quote! { Post, tenant_scoped, sharded },
+            quote! {
+                pub trait PostRepository {
+                    async fn find_by_title(&self, title: String) -> Vec<Post>;
+                }
+            },
+        )
+        .to_string();
+
+        // A derived read fans out via a generated one-shard helper rather than
+        // hitting only the originally-routed shard.
+        assert!(
+            generated.contains("__autumn_find_by_title_one_shard"),
+            "derived read must fan out via a one-shard helper: {generated}"
+        );
+    }
+
+    #[test]
+    fn sharded_tenant_scoped_derived_read_with_borrowed_param_rejects() {
+        let generated = repository_macro(
+            quote! { Post, tenant_scoped, sharded },
+            quote! {
+                pub trait PostRepository {
+                    async fn find_by_title(&self, title: &str) -> Vec<Post>;
+                }
+            },
+        )
+        .to_string();
+
+        // A borrowed param can't be cloned into an owned 'static value for the
+        // fan-out futures, so it must reject cross-shard rather than emit a
+        // one-shard helper (which would not compile).
+        assert!(
+            !generated.contains("__autumn_find_by_title_one_shard"),
+            "borrowed-param derived read must not fan out: {generated}"
+        );
+        assert!(
+            generated.contains("cross-shard find_by_title is not supported"),
+            "borrowed-param derived read must reject cross-shard: {generated}"
+        );
+    }
+
+    #[test]
+    fn sharded_tenant_scoped_derived_write_rejects_cross_shard() {
+        let generated = repository_macro(
+            quote! { Post, tenant_scoped, sharded },
+            quote! {
+                pub trait PostRepository {
+                    async fn delete_by_title(&self, title: String);
+                }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("cross-shard derived writes are not supported"),
+            "derived write on a sharded across_tenants repo must reject: {generated}"
+        );
+    }
+
+    #[test]
+    fn sharded_fan_out_calls_inherent_one_shard_helpers_not_trait_methods() {
+        // Regression: the fan-out must route through inherent
+        // `__autumn_*_one_shard` helpers rather than recursively calling the
+        // RPITIT trait methods, or the read futures' `Send` auto-trait becomes
+        // unprovable once hooks/versioning add captured state (issue #1209 §1d).
+        let generated = repository_macro(
+            quote! { Post, tenant_scoped, sharded, versioned = true, hooks = PostHooks },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        for helper in [
+            "__autumn_find_all_one_shard",
+            "__autumn_count_one_shard",
+            "__autumn_exists_by_id_one_shard",
+        ] {
+            assert!(
+                generated.contains(helper),
+                "fan-out must define and call the inherent helper {helper}: {generated}"
+            );
+        }
+    }
+
+    #[test]
+    fn versioned_tenant_scoped_delete_many_chunk_is_a_block_expression() {
+        // Regression: the chunked delete in the versioned path is assigned with
+        // `let chunk_deleted_ids = <expr>`, so the tenant-scoped
+        // `delete_returning_expr` must be a braced block — otherwise it emits
+        // `let chunk_deleted_ids = let query = ...` (issue #1209 §1e).
+        let generated = repository_macro(
+            quote! { Post, tenant_scoped, versioned = true, hooks = PostHooks },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("let chunk_deleted_ids = {"),
+            "versioned+tenant_scoped delete_many must wrap the chunk expression in a block: {generated}"
+        );
+        assert!(
+            !generated.contains("let chunk_deleted_ids = let "),
+            "versioned+tenant_scoped delete_many must not emit `let x = let y` : {generated}"
+        );
+    }
+
+    #[test]
+    fn sharded_tenant_scoped_count_contains_fan_out_guard() {
+        let generated = repository_macro(
+            quote! { Post, tenant_scoped, sharded },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        let count_pos = generated
+            .find("async fn count")
+            .expect("count must be generated");
+        let section = &generated[count_pos..count_pos + 600];
+        assert!(
+            section.contains("__shards"),
+            "sharded+tenant_scoped count must fan out across shards: {section}"
+        );
+    }
+
+    #[test]
+    fn sharded_tenant_scoped_exists_by_id_contains_fan_out_guard() {
+        let generated = repository_macro(
+            quote! { Post, tenant_scoped, sharded },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        let pos = generated
+            .find("async fn exists_by_id")
+            .expect("exists_by_id must be generated");
+        let section = &generated[pos..pos + 800];
+        assert!(
+            section.contains("__shards"),
+            "sharded+tenant_scoped exists_by_id must fan out across shards: {section}"
+        );
+    }
+
+    #[test]
+    fn sharded_tenant_scoped_write_methods_have_cross_shard_guard() {
+        let generated = repository_macro(
+            quote! { Post, tenant_scoped, sharded },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        // The error message for cross-shard writes must appear in generated code
+        assert!(
+            generated.contains("cross-shard writes are not supported"),
+            "sharded+tenant_scoped write methods must include cross-shard write guard: {generated}"
+        );
+    }
+
+    #[test]
+    fn sharded_tenant_scoped_page_has_cross_shard_guard() {
+        let generated = repository_macro(
+            quote! { Post, tenant_scoped, sharded },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        let page_pos = generated
+            .find("async fn page")
+            .expect("page must be generated");
+        let section = &generated[page_pos..page_pos + 600];
+        assert!(
+            section.contains("cross-shard pagination is not supported"),
+            "sharded+tenant_scoped page() must include cross-shard pagination guard: {section}"
+        );
+    }
+
+    #[test]
+    fn non_sharded_tenant_scoped_has_no_fan_out_guard() {
+        // Non-sharded repos must NOT have the shard fan-out code
+        let generated = repository_macro(
+            quote! { Post, tenant_scoped },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        assert!(
+            !generated.contains("cross-shard writes are not supported"),
+            "non-sharded repo must not contain cross-shard write guard: {generated}"
+        );
+        assert!(
+            !generated.contains("cross-shard pagination is not supported"),
+            "non-sharded repo must not contain cross-shard pagination guard: {generated}"
+        );
+    }
+
+    // ── §1d: cross-shard soft-delete / search / version_history / preload ──
+
+    #[test]
+    fn sharded_tenant_scoped_soft_delete_readers_fan_out_and_reject() {
+        let generated = repository_macro(
+            quote! { Post, tenant_scoped, sharded, soft_delete },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        // with_deleted / only_deleted fan out via inherent one-shard helpers.
+        assert!(
+            generated.contains("__autumn_with_deleted_one_shard"),
+            "with_deleted must fan out via a one-shard helper: {generated}"
+        );
+        assert!(
+            generated.contains("__autumn_only_deleted_one_shard"),
+            "only_deleted must fan out via a one-shard helper: {generated}"
+        );
+        // page_only_deleted is paginated and must reject cross-shard.
+        assert!(
+            generated.contains("cross-shard page_only_deleted is not supported"),
+            "page_only_deleted must reject cross-shard: {generated}"
+        );
+    }
+
+    #[test]
+    fn sharded_tenant_scoped_search_fans_out_and_search_page_rejects() {
+        let generated = repository_macro(
+            quote! { Post, tenant_scoped, sharded, searchable },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        // search (Vec-returning) fans out via an inherent one-shard helper.
+        assert!(
+            generated.contains("__autumn_search_one_shard"),
+            "search must fan out via a one-shard helper: {generated}"
+        );
+        // search_page is paginated and must reject cross-shard.
+        assert!(
+            generated.contains("cross-shard search_page is not supported"),
+            "search_page must reject cross-shard: {generated}"
+        );
+    }
+
+    #[test]
+    fn sharded_tenant_scoped_version_history_rejects_cross_shard() {
+        let generated = repository_macro(
+            quote! { Post, tenant_scoped, sharded, versioned = true },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        // version_history is keyed by a single (per-shard ambiguous) record_id
+        // and is paginated, so it rejects rather than fanning out.
+        assert!(
+            generated.contains("cross-shard version_history is not supported"),
+            "version_history must reject cross-shard: {generated}"
+        );
+    }
+
+    #[test]
+    fn sharded_tenant_scoped_preload_rejects_cross_shard() {
+        let generated = repository_macro(
+            quote! { Post, tenant_scoped, sharded },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        // preload cannot load associations from a single routed connection
+        // across shards, so it rejects cross-shard.
+        assert!(
+            generated.contains("cross-shard preload is not supported"),
+            "preload must reject cross-shard: {generated}"
+        );
+    }
+
+    #[test]
+    fn non_sharded_soft_delete_readers_have_no_fan_out() {
+        // Non-sharded soft_delete repos keep the plain readers (no helpers,
+        // no reject messages).
+        let generated = repository_macro(
+            quote! { Post, tenant_scoped, soft_delete },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        assert!(
+            !generated.contains("__autumn_with_deleted_one_shard"),
+            "non-sharded with_deleted must not emit a one-shard helper: {generated}"
+        );
+        assert!(
+            !generated.contains("cross-shard page_only_deleted is not supported"),
+            "non-sharded page_only_deleted must not reject cross-shard: {generated}"
+        );
+    }
+
+    #[test]
+    fn sharded_without_tenant_scoped_has_no_write_guard() {
+        // `sharded` alone (no `tenant_scoped`) means no across_tenants(), so
+        // the write guard is also not generated.
+        let generated = repository_macro(
+            quote! { Post, sharded },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+
+        assert!(
+            !generated.contains("cross-shard writes are not supported"),
+            "sharded-only repo must not contain cross-shard write guard: {generated}"
         );
     }
 }

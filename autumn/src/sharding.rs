@@ -183,6 +183,24 @@ pub trait ShardRouter: Send + Sync + 'static {
     ) -> futures::future::BoxFuture<'a, Result<ShardId, AutumnError>>;
 }
 
+/// `Arc<R>` routes through its inner router. This lets a caller build a single
+/// `Arc<DirectoryShardRouter>`, share one clone with
+/// [`DirectoryShardRouter::spawn_invalidation_listener`] (which takes an
+/// `Arc<Self>`) and install another clone via `AppBuilder::with_shard_router` —
+/// both then read and invalidate the **same** cache. Without it the
+/// manually-installed router
+/// and the listener would hold separate caches, so directory re-pins would stay
+/// stale until the TTL despite the documented manual-listener path.
+impl<R: ShardRouter + ?Sized> ShardRouter for Arc<R> {
+    fn route<'a>(
+        &'a self,
+        key: ShardKey<'a>,
+        shards: &'a ShardSet,
+    ) -> futures::future::BoxFuture<'a, Result<ShardId, AutumnError>> {
+        (**self).route(key, shards)
+    }
+}
+
 /// Default router: key → logical slot (deterministic hash) → shard
 /// (configured slot map).
 #[derive(Debug, Default, Clone, Copy)]
@@ -208,6 +226,369 @@ impl ShardRouter for HashShardRouter {
                     ))
                 }),
         ))
+    }
+}
+
+/// A [`ShardRouter`] that consults an explicit `_autumn_shard_directory`
+/// table on the control database, falling back to the hash router for any
+/// tenant without a directory row.
+///
+/// This is the routing half of "move a tenant to a specific shard": a row in
+/// `_autumn_shard_directory(tenant_key, shard_name)` pins that tenant to a
+/// named shard regardless of where the slot hash would place it. Tenants with
+/// no row route by [`HashShardRouter`], so the directory only needs entries
+/// for relocated/"whale" tenants.
+///
+/// Directory **hits** (a real pin) are cached for
+/// [`DEFAULT_DIRECTORY_CACHE_TTL`] so steady-state routing of pinned tenants
+/// issues no control-DB query. **Misses are not cached** — an unpinned tenant
+/// re-reads the directory on every route. This keeps the move workflow safe:
+/// once an operator inserts a directory row, no other process can keep routing
+/// that tenant to its old hash shard from a stale cached miss (there is no
+/// cross-process invalidation), so `move-slot --confirm` won't delete rows that
+/// late writes landed on the source. After changing a directory row, call
+/// [`invalidate`](Self::invalidate) for that key so the next route re-reads it.
+/// (NOTIFY-based cross-process invalidation is a planned follow-up; today the
+/// TTL bounds hit staleness and `invalidate` clears the local entry
+/// immediately.)
+///
+/// Install with
+/// [`AppBuilder::with_directory_shard_router`](crate::app::AppBuilder::with_directory_shard_router).
+///
+/// Only string keys are looked up in the directory (tenants are strings);
+/// numeric/byte keys route straight through the fallback.
+pub struct DirectoryShardRouter {
+    control_pool: Pool<AsyncPgConnection>,
+    fallback: Arc<dyn ShardRouter>,
+    cache: std::sync::RwLock<HashMap<String, DirectoryCacheEntry>>,
+    ttl: std::time::Duration,
+    /// `statement_timeout` (ms) applied to the control-plane directory lookup so
+    /// a stuck control query / lock on `_autumn_shard_directory` fails within
+    /// the configured timeout instead of hanging every tenant-routed request.
+    /// `0` disables it. The router checks out a raw pooled connection (no
+    /// request context), so the timeout is set explicitly here.
+    statement_timeout_ms: u64,
+}
+
+/// Default time a resolved tenant→shard mapping is cached before re-reading
+/// the directory table.
+pub const DEFAULT_DIRECTORY_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The `_autumn_shard_directory` table migration as a standalone embedded set.
+///
+/// Embedded separately so the app can auto-create the table at startup when
+/// directory routing is enabled (the `migrations/` copy is applied by
+/// `autumn migrate` for the control plane; this mirror lets auto-migrate
+/// deployments create the table without a manual migrate). The migration is
+/// `CREATE TABLE IF NOT EXISTS`, so applying it from either set is idempotent.
+/// Keep both copies in sync.
+#[cfg(feature = "db")]
+pub const SHARD_DIRECTORY_MIGRATIONS: diesel_migrations::EmbeddedMigrations =
+    diesel_migrations::embed_migrations!("shard_directory_migrations");
+
+#[derive(Clone, Copy)]
+struct DirectoryCacheEntry {
+    shard: ShardId,
+    expires_at: std::time::Instant,
+}
+
+#[derive(diesel::QueryableByName)]
+struct ShardNameRow {
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    shard_name: String,
+}
+
+/// Postgres `LISTEN`/`NOTIFY` channel the directory trigger fires on. The
+/// invalidation listener subscribes to it; the trigger
+/// (`autumn_notify_shard_directory_change`, in the shard-directory migration)
+/// must `pg_notify` the same channel. Keep the two in sync.
+const DIRECTORY_NOTIFY_CHANNEL: &str = "autumn_shard_directory";
+
+/// How often the invalidation listener wakes while idle to sweep expired cache
+/// entries and notice a dropped LISTEN connection.
+///
+/// Invalidation delivery itself is event-driven — a `NOTIFY` delivered at
+/// commit — so this only bounds idle housekeeping; kept well under
+/// [`DEFAULT_DIRECTORY_CACHE_TTL`].
+pub const DEFAULT_DIRECTORY_INVALIDATION_SWEEP_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(5);
+
+impl std::fmt::Debug for DirectoryShardRouter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DirectoryShardRouter")
+            .field("ttl", &self.ttl)
+            .field("cached_keys", &self.cache.read().map_or(0, |c| c.len()))
+            .finish_non_exhaustive()
+    }
+}
+
+impl DirectoryShardRouter {
+    /// Build a directory router over the given control pool, falling back to
+    /// [`HashShardRouter`] and using [`DEFAULT_DIRECTORY_CACHE_TTL`].
+    #[must_use]
+    pub fn new(control_pool: Pool<AsyncPgConnection>) -> Self {
+        Self::with_fallback(control_pool, Arc::new(HashShardRouter))
+    }
+
+    /// Build a directory router with an explicit fallback router and the
+    /// default cache TTL.
+    #[must_use]
+    pub fn with_fallback(
+        control_pool: Pool<AsyncPgConnection>,
+        fallback: Arc<dyn ShardRouter>,
+    ) -> Self {
+        Self {
+            control_pool,
+            fallback,
+            cache: std::sync::RwLock::new(HashMap::new()),
+            ttl: DEFAULT_DIRECTORY_CACHE_TTL,
+            statement_timeout_ms: 0,
+        }
+    }
+
+    /// Bound the control-plane directory lookup with `statement_timeout`
+    /// (milliseconds); `0` disables it. Typically the app's configured database
+    /// statement timeout, so a stuck control query fails fast instead of hanging
+    /// tenant routing.
+    #[must_use]
+    pub const fn with_statement_timeout_ms(mut self, statement_timeout_ms: u64) -> Self {
+        self.statement_timeout_ms = statement_timeout_ms;
+        self
+    }
+
+    /// Override the cache TTL.
+    #[must_use]
+    pub const fn with_cache_ttl(mut self, ttl: std::time::Duration) -> Self {
+        self.ttl = ttl;
+        self
+    }
+
+    /// Drop the cached mapping for `tenant_key`, forcing the next route to
+    /// re-read the directory. Call this after inserting, updating, or deleting
+    /// that tenant's directory row.
+    pub fn invalidate(&self, tenant_key: &str) {
+        if let Ok(mut cache) = self.cache.write() {
+            cache.remove(tenant_key);
+        }
+    }
+
+    /// Drop every cached mapping.
+    pub fn invalidate_all(&self) {
+        if let Ok(mut cache) = self.cache.write() {
+            cache.clear();
+        }
+    }
+
+    /// Spawn a background task that `LISTEN`s on the control DB's
+    /// `autumn_shard_directory` notification channel and invalidates this
+    /// router's cached pin whenever a tenant's directory row changes.
+    ///
+    /// This covers writes made on other replicas or directly via operator SQL
+    /// (the channel is fired by a trigger, not app code). Without it the cache
+    /// only refreshes when the TTL expires; with it a re-pin during a slot move
+    /// is picked up the moment it commits.
+    ///
+    /// Postgres delivers `NOTIFY` at **commit** (never before), so the
+    /// invalidation arrives exactly when the new mapping becomes visible: a
+    /// slow-committing re-pin cannot be skipped the way a timestamp-cursor poll
+    /// could. The cache TTL stays the backstop for any window where the LISTEN
+    /// connection is down.
+    ///
+    /// `control_url` is the control database URL backing this router's control
+    /// pool. Must be called from within a Tokio runtime; the returned handle can
+    /// be detached, and the task runs for the life of the process. The framework
+    /// spawns this automatically when directory routing is enabled via the
+    /// built-in path. `sweep_interval` only bounds idle housekeeping (see
+    /// [`DEFAULT_DIRECTORY_INVALIDATION_SWEEP_INTERVAL`]).
+    #[must_use]
+    pub fn spawn_invalidation_listener(
+        router: Arc<Self>,
+        control_url: String,
+        sweep_interval: std::time::Duration,
+    ) -> tokio::task::JoinHandle<()> {
+        use diesel_async::{AsyncConnection as _, RunQueryDsl as _};
+        use futures::StreamExt as _;
+
+        tokio::spawn(async move {
+            loop {
+                // (Re)connect and subscribe. On any failure back off for one
+                // sweep interval and retry; the cache TTL backstops staleness
+                // while we're disconnected.
+                let Ok(mut conn) = AsyncPgConnection::establish(&control_url).await else {
+                    tokio::time::sleep(sweep_interval).await;
+                    continue;
+                };
+                if diesel::sql_query(format!("LISTEN {DIRECTORY_NOTIFY_CHANNEL}"))
+                    .execute(&mut conn)
+                    .await
+                    .is_err()
+                {
+                    tokio::time::sleep(sweep_interval).await;
+                    continue;
+                }
+                // A re-pin may have committed between losing the previous
+                // connection and (re)subscribing; those NOTIFYs are gone, so drop
+                // the whole cache and let it repopulate lazily from the directory.
+                router.invalidate_all();
+
+                // Drain notifications until the stream errors or ends, then fall
+                // through to the outer loop and reconnect. Each idle
+                // `sweep_interval` we reclaim expired entries that were never
+                // looked up again (lazy eviction in `cache_get` only fires on
+                // re-observation).
+                let mut notifications = std::pin::pin!(conn.notifications_stream());
+                loop {
+                    match tokio::time::timeout(sweep_interval, notifications.next()).await {
+                        Ok(Some(Ok(notification))) => router.invalidate(&notification.payload),
+                        Ok(Some(Err(_)) | None) => break,
+                        Err(_elapsed) => router.sweep_expired(),
+                    }
+                }
+            }
+        })
+    }
+
+    fn cache_get(&self, key: &str) -> Option<ShardId> {
+        let now = std::time::Instant::now();
+        {
+            let cache = self.cache.read().ok()?;
+            match cache.get(key) {
+                Some(entry) if entry.expires_at > now => return Some(entry.shard),
+                // Miss, or present-but-expired: fall through. `None` is returned
+                // either way; an expired entry is additionally evicted below so a
+                // long-running process doesn't retain every pinned tenant it has
+                // ever looked up (the TTL bounds staleness, not memory).
+                Some(_) => {}
+                None => return None,
+            }
+        }
+        // Evict the expired entry under the write lock. Re-check expiry (against
+        // the same `now`) so we don't drop a fresh entry written by `cache_put`
+        // between releasing the read lock and taking the write lock.
+        let mut cache = self.cache.write().ok()?;
+        if cache.get(key).is_some_and(|entry| entry.expires_at <= now) {
+            cache.remove(key);
+        }
+        None
+    }
+
+    /// Drop every expired entry from the cache. Lazy eviction in `cache_get`
+    /// only reclaims keys that are looked up again; this bounds memory for
+    /// pinned tenants that are never re-observed. Called periodically by the
+    /// invalidation listener.
+    fn sweep_expired(&self) {
+        if let Ok(mut cache) = self.cache.write() {
+            let now = std::time::Instant::now();
+            cache.retain(|_, entry| entry.expires_at > now);
+        }
+    }
+
+    fn cache_put(&self, key: String, shard: ShardId) {
+        if let Ok(mut cache) = self.cache.write() {
+            cache.insert(
+                key,
+                DirectoryCacheEntry {
+                    shard,
+                    expires_at: std::time::Instant::now() + self.ttl,
+                },
+            );
+        }
+    }
+
+    /// Look up a tenant key in the directory table. Returns the resolved
+    /// `ShardId` on a directory hit, or `None` when the tenant has no row
+    /// (the caller then falls back to the hash router).
+    async fn lookup_directory(
+        &self,
+        key: &str,
+        shards: &ShardSet,
+    ) -> Result<Option<ShardId>, AutumnError> {
+        use diesel::OptionalExtension as _;
+        use diesel_async::RunQueryDsl;
+
+        let mut conn = self.control_pool.get().await.map_err(|e| {
+            AutumnError::service_unavailable_msg(format!(
+                "DirectoryShardRouter could not acquire a control connection: {e}"
+            ))
+        })?;
+
+        // Bound the lookup so a stuck control query / lock doesn't hang routing.
+        // Always issued (even for 0 = disabled) because the raw pooled checkout
+        // can return a connection carrying a shorter route-specific timeout set
+        // by a prior `Db`/repository checkout; mirror the normal checkout path,
+        // which always sets `statement_timeout`.
+        diesel::sql_query(format!(
+            "SET statement_timeout = {}",
+            self.statement_timeout_ms
+        ))
+        .execute(&mut conn)
+        .await
+        .map_err(|e| {
+            AutumnError::service_unavailable_msg(format!(
+                "DirectoryShardRouter could not set statement_timeout: {e}"
+            ))
+        })?;
+
+        let row = diesel::sql_query(
+            "SELECT shard_name FROM _autumn_shard_directory WHERE tenant_key = $1",
+        )
+        .bind::<diesel::sql_types::Text, _>(key)
+        .get_result::<ShardNameRow>(&mut conn)
+        .await
+        .optional()
+        .map_err(|e| {
+            AutumnError::service_unavailable_msg(format!(
+                "DirectoryShardRouter directory lookup failed: {e}"
+            ))
+        })?;
+
+        let Some(row) = row else {
+            return Ok(None);
+        };
+
+        let shard = shards.by_name(&row.shard_name).ok_or_else(|| {
+            AutumnError::service_unavailable_msg(format!(
+                "shard directory pins tenant {key:?} to unknown shard {:?}",
+                row.shard_name
+            ))
+        })?;
+        Ok(Some(shard.id()))
+    }
+}
+
+impl ShardRouter for DirectoryShardRouter {
+    fn route<'a>(
+        &'a self,
+        key: ShardKey<'a>,
+        shards: &'a ShardSet,
+    ) -> futures::future::BoxFuture<'a, Result<ShardId, AutumnError>> {
+        Box::pin(async move {
+            // Only string keys participate in the directory (tenants are
+            // strings); numeric/byte keys route straight through the fallback.
+            let ShardKey::Str(key_str) = key else {
+                return self.fallback.route(key, shards).await;
+            };
+
+            if let Some(cached) = self.cache_get(key_str) {
+                return Ok(cached);
+            }
+
+            // Only cache real directory hits. A miss routes through the hash
+            // fallback WITHOUT caching: during a tenant move the operator
+            // inserts a directory row, and a cached miss on another process
+            // (e.g. a replica) would keep routing that tenant to its old hash
+            // shard until the TTL expired — there is no cross-process
+            // invalidation — and `move-slot --confirm` could then delete rows
+            // those stale writes had landed on the source. Re-querying unpinned
+            // tenants each route is the safe default.
+            match self.lookup_directory(key_str, shards).await? {
+                Some(shard) => {
+                    self.cache_put(key_str.to_owned(), shard);
+                    Ok(shard)
+                }
+                None => self.fallback.route(key, shards).await,
+            }
+        })
     }
 }
 
@@ -579,6 +960,109 @@ impl ShardSet {
             })
             .sum()
     }
+
+    /// Whether `key` is owned by the shard at the given index in declaration order.
+    ///
+    /// Uses the hash-based slot assignment, **not** the installed router (which
+    /// may override routing for individual tenants via a directory). Use this for
+    /// tooling / slot-move scripts where you need to verify ownership without
+    /// issuing an async router call.
+    #[must_use]
+    pub fn owns_key<'k>(&self, shard_id: ShardId, key: impl Into<ShardKey<'k>>) -> bool {
+        let slot = self.slot_for_key(key);
+        self.shard_for_slot(slot)
+            .is_some_and(|s| s.id() == shard_id)
+    }
+
+    /// All logical slots assigned to the shard at index `shard_id`.
+    ///
+    /// Returns `None` when the id is out of range.
+    #[must_use]
+    pub fn slots_for_shard(&self, shard_id: ShardId) -> Option<&[u16]> {
+        self.inner.shards.get(shard_id.0).map(Shard::slots)
+    }
+
+    /// Partition string `keys` by their owning shard based on hash-slot assignment.
+    ///
+    /// Keys are grouped in declaration order; the returned map may have fewer
+    /// entries than `self.len()` when some shards own none of the given keys.
+    /// Useful for slot-move tooling that needs to issue `WHERE tenant_id = ANY($1)`
+    /// per destination shard.
+    #[must_use]
+    pub fn partition_by_shard<'k>(
+        &self,
+        keys: impl IntoIterator<Item = &'k str>,
+    ) -> std::collections::HashMap<ShardId, Vec<&'k str>> {
+        let mut map: std::collections::HashMap<ShardId, Vec<&'k str>> =
+            std::collections::HashMap::new();
+        for key in keys {
+            let slot = self.slot_for_key(key);
+            if let Some(shard) = self.shard_for_slot(slot) {
+                map.entry(shard.id()).or_default().push(key);
+            }
+        }
+        map
+    }
+
+    /// Fan out a closure over every shard concurrently, collecting one result
+    /// per shard.  Fails the whole call if **any** shard errors.
+    ///
+    /// Intended for cross-shard read fan-out from `across_tenants()` reads on
+    /// `#[repository(tenant_scoped, sharded)]` repositories.  The closure
+    /// receives each [`Shard`] so it can build a sub-repo that honors that
+    /// shard's read routing (replica/primary/fail-closed) and the parent
+    /// request context; the sub-repo must set `__autumn_shards = None` so
+    /// recursion is impossible.
+    ///
+    /// The closure is invoked synchronously per shard (the `&Shard` borrow ends
+    /// when it returns the owned, `'static` future), so the futures can run
+    /// concurrently without borrowing the [`ShardSet`].
+    ///
+    /// Concurrency is bounded at [`FAN_OUT_CONCURRENCY`] so a cross-tenant admin
+    /// read does not check out a connection from every shard at once (which
+    /// could spike load or exhaust connection limits on large fleets), matching
+    /// the public [`Shards::each_shard`] pipeline. Results are returned in shard
+    /// **declaration order** (not completion order), so order-dependent merges
+    /// such as `search`'s per-shard ranking concatenation are deterministic.
+    /// Fails the whole call on the first shard error.
+    ///
+    /// This is a framework-internal primitive used by generated repository
+    /// code.  It is `pub` so that downstream crates can call it from
+    /// `#[repository]`-generated `impl` blocks, but it is not part of the
+    /// stable public API.
+    #[doc(hidden)]
+    pub async fn fan_out_shards<T, Fut, F>(&self, f: F) -> Result<Vec<T>, crate::AutumnError>
+    where
+        T: Send + 'static,
+        Fut: std::future::Future<Output = Result<T, crate::AutumnError>> + Send + 'static,
+        F: Fn(&Shard) -> Fut + Send + Sync,
+    {
+        use futures::StreamExt as _;
+
+        // Results are placed by shard index so declaration order is preserved
+        // even though `FuturesUnordered` yields them in completion order.
+        let mut slots: Vec<Option<T>> = (0..self.inner.shards.len()).map(|_| None).collect();
+        let mut in_flight = futures::stream::FuturesUnordered::new();
+
+        for (idx, shard) in self.inner.shards.iter().enumerate() {
+            if in_flight.len() >= FAN_OUT_CONCURRENCY
+                && let Some((i, result)) = in_flight.next().await
+            {
+                slots[i] = Some(result?);
+            }
+            let fut = f(shard);
+            in_flight.push(async move { (idx, fut.await) });
+        }
+        while let Some((i, result)) = in_flight.next().await {
+            slots[i] = Some(result?);
+        }
+        // Every shard pushed exactly one future and all were drained above, so
+        // on the success path every slot is filled.
+        Ok(slots
+            .into_iter()
+            .map(|slot| slot.expect("every shard produced a result"))
+            .collect())
+    }
 }
 
 impl std::fmt::Debug for ShardSet {
@@ -645,6 +1129,78 @@ pub fn create_shard_set(
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
+    build_shard_set(config, topologies, router).map(Some)
+}
+
+/// Build a [`ShardSet`] where every shard primary pool uses `max_size(1)` and
+/// wraps each connection in a test transaction that is rolled back when the
+/// connection is returned.
+///
+/// This mirrors the transactional control-pool logic in `TestApp` so that
+/// shard repositories in integration tests see rolled-back state between test
+/// runs.
+///
+/// **Deadlock caveat:** with `max_size(1)` a handler that checks out the same
+/// shard connection twice in a single request will deadlock (same as the
+/// control pool).  Use a separate non-transactional shard set when a test
+/// requires concurrent shard checkouts.
+///
+/// # Errors
+///
+/// Returns [`ShardSetBuildError`] when no shards are configured, any pool
+/// cannot be built, or the slot map is invalid.
+pub fn create_shard_set_transactional(
+    config: &DatabaseConfig,
+    router: Arc<dyn ShardRouter>,
+) -> Result<Option<ShardSet>, ShardSetBuildError> {
+    if !config.has_shards() {
+        return Ok(None);
+    }
+
+    let timeout = std::time::Duration::from_secs(config.connect_timeout_secs);
+
+    let topologies = config
+        .shards
+        .iter()
+        .map(|shard| {
+            let manager = diesel_async::pooled_connection::AsyncDieselConnectionManager::<
+                diesel_async::AsyncPgConnection,
+            >::new(&shard.primary_url);
+            let pool = Pool::builder(manager)
+                .max_size(1)
+                .wait_timeout(Some(timeout))
+                .create_timeout(Some(timeout))
+                .runtime(deadpool::Runtime::Tokio1)
+                .post_create(deadpool::managed::Hook::async_fn(
+                    |conn: &mut diesel_async::AsyncPgConnection, _| {
+                        Box::pin(async move {
+                            use diesel_async::AsyncConnection as _;
+                            use diesel_async::RunQueryDsl as _;
+                            conn.begin_test_transaction().await.map_err(|e| {
+                                deadpool::managed::HookError::Backend(
+                                    diesel_async::pooled_connection::PoolError::QueryError(e),
+                                )
+                            })?;
+                            diesel::sql_query("SET autumn.test_transaction_started = 'true'")
+                                .execute(conn)
+                                .await
+                                .map_err(|e| {
+                                    deadpool::managed::HookError::Backend(
+                                        diesel_async::pooled_connection::PoolError::QueryError(e),
+                                    )
+                                })?;
+                            Ok(())
+                        })
+                    },
+                ))
+                .build()
+                .map_err(|source| ShardSetBuildError::Pool {
+                    shard: shard.name.clone(),
+                    source,
+                })?;
+            Ok(crate::db::DatabaseTopology::primary_only(pool))
+        })
+        .collect::<Result<Vec<_>, ShardSetBuildError>>()?;
     build_shard_set(config, topologies, router).map(Some)
 }
 
@@ -725,14 +1281,17 @@ pub fn build_shard_set(
 /// Framework health indicator registered per shard as `db:shard:<name>`.
 ///
 /// Mirrors the control topology's lifecycle: on every readiness probe it
-/// snapshots the primary pool, live-checks replica connectivity, and
-/// re-runs the migration parity comparison, feeding the shard's runtime
-/// state (which gates [`Shard::read_pool`]).
+/// live-checks primary and replica connectivity and re-runs the migration
+/// parity comparison, feeding the shard's runtime state (which gates
+/// [`Shard::read_pool`]). A shard whose primary is unreachable reports `Down`
+/// even when a replica can still serve reads, since writes and primary reads
+/// would fail.
 ///
-/// Reports `Down` — gating `/ready` — only when the shard's replica is
-/// unready **and** its `replica_fallback` is `fail_readiness`; a
-/// `primary`-fallback shard degrades to primary reads and stays `Up`
-/// with the replica state in its details.
+/// Reports `Down` — gating `/ready` — when the shard primary is unreachable,
+/// or when the shard's replica is unready **and** its `replica_fallback` is
+/// `fail_readiness`. A `primary`-fallback shard with a reachable primary
+/// degrades to primary reads and stays `Up` with the replica state in its
+/// details.
 pub(crate) struct ShardHealthIndicator {
     shard: Shard,
 }
@@ -806,9 +1365,34 @@ impl crate::actuator::HealthIndicator for ShardHealthIndicator {
                 }
             }
 
-            // `read_pool()` is `None` exactly when the replica is unready
-            // under `fail_readiness` — the only state that gates `/ready`.
-            let output = if self.shard.read_pool().is_some() {
+            // Live-check the shard primary. `read_pool()` alone is not enough:
+            // a primary-only shard's `read_pool()` always returns the primary
+            // pool (so it is `Some` even when the primary is down), and a
+            // replicated shard's `read_pool()` can be `Some` via a healthy
+            // replica while the primary is unreachable — yet all shard writes
+            // and primary reads would fail at request time. Probe the primary
+            // (like the replica connectivity check above) and gate `/ready` on
+            // it so load balancers stop routing to an instance that cannot
+            // reach a shard primary.
+            let primary_ok = match self.shard.primary_pool().get().await {
+                Ok(conn) => {
+                    drop(conn);
+                    true
+                }
+                Err(error) => {
+                    details.insert(
+                        "primary_detail".to_owned(),
+                        serde_json::json!(format!("primary connection failed: {error}")),
+                    );
+                    false
+                }
+            };
+            details.insert("primary_ready".to_owned(), serde_json::json!(primary_ok));
+
+            // `read_pool()` is `None` exactly when the replica is unready under
+            // `fail_readiness`. Report `Up` only when the primary is reachable
+            // *and* a read pool is available; either failing gates `/ready`.
+            let output = if primary_ok && self.shard.read_pool().is_some() {
                 crate::actuator::HealthCheckOutput::up()
             } else {
                 crate::actuator::HealthCheckOutput::down()
@@ -897,6 +1481,90 @@ fn no_shards_configured() -> AutumnError {
         "No shards configured: declare [[database.shards]] in autumn.toml \
          (see docs/guide/sharding.md)",
     )
+}
+
+/// Build a tenant-free repository seed for cross-shard admin reads.
+///
+/// Unlike [`__autumn_resolve_repo_seed`], this resolves no tenant key. It seeds
+/// from the first configured shard (its primary pool and read route) so the
+/// pre-fan-out connection the trait methods acquire succeeds, then strips the
+/// shard tag from the route label — the fan-out re-tags each per-shard query
+/// with the shard actually executing it (see [`reshard_route_label`]).
+fn cross_shard_seed(
+    set: &ShardSet,
+    ctx: &crate::db::RequestDbContext,
+) -> Result<ShardRepositorySeed, AutumnError> {
+    let shard = set.iter().next().ok_or_else(no_shards_configured)?;
+    let mut seed =
+        ShardRepositorySeed::from_ctx(shard.primary_pool(), ctx, shard.name(), shard.read_route());
+    seed.route.clone_from(&ctx.route_key);
+    Ok(seed)
+}
+
+/// Marks a repository built for tenant-free cross-shard reads.
+///
+/// Implemented by the `#[repository(tenant_scoped, sharded)]` macro and used by
+/// [`CrossShard`] to construct the repository from a [`ShardSet`] without
+/// resolving a tenant. Not intended to be implemented by hand.
+pub trait CrossShardRepository: Sized {
+    /// Construct the repository in `across_tenants()` mode from a tenant-free
+    /// seed and the full shard set.
+    #[doc(hidden)]
+    fn __autumn_from_cross_shard(seed: ShardRepositorySeed, set: ShardSet) -> Self;
+}
+
+/// Axum extractor for tenant-free cross-shard reads on a
+/// `#[repository(tenant_scoped, sharded)]` repository.
+///
+/// Cross-tenant admin endpoints normally have no tenant header or task-local, so
+/// the standard repository extractor — which resolves a tenant to route to a
+/// single shard — rejects them during extraction. `CrossShard<R>` instead loads
+/// the full [`ShardSet`] without a tenant and yields a repository already in
+/// `across_tenants()` mode: reads fan out across every
+/// shard, while writes are rejected (cross-shard writes are unsupported).
+///
+/// ```ignore
+/// async fn admin_list(
+///     CrossShard(repo): CrossShard<PgBookmarkRepository>,
+/// ) -> AutumnResult<Json<Vec<Bookmark>>> {
+///     // fans out across all shards
+///     Ok(Json(repo.find_all().await?))
+/// }
+/// ```
+pub struct CrossShard<R>(pub R);
+
+impl<R> std::ops::Deref for CrossShard<R> {
+    type Target = R;
+    fn deref(&self) -> &R {
+        &self.0
+    }
+}
+
+impl<R> std::ops::DerefMut for CrossShard<R> {
+    fn deref_mut(&mut self) -> &mut R {
+        &mut self.0
+    }
+}
+
+impl<S, R> axum::extract::FromRequestParts<S> for CrossShard<R>
+where
+    S: crate::db::DbState + Send + Sync,
+    R: CrossShardRepository,
+{
+    type Rejection = AutumnError;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        // Load the shard set without resolving a tenant (the whole point), then
+        // seed from it and build the repo in across_tenants() fan-out mode.
+        let shards =
+            <Shards as axum::extract::FromRequestParts<S>>::from_request_parts(parts, state)
+                .await?;
+        let seed = cross_shard_seed(&shards.set, &shards.ctx)?;
+        Ok(Self(R::__autumn_from_cross_shard(seed, shards.set)))
+    }
 }
 
 /// How many shards `each_shard` queries concurrently.
@@ -1162,6 +1830,21 @@ impl ShardRepositorySeed {
     }
 }
 
+/// Re-tag a fan-out sub-repo's route label with the shard executing the query.
+///
+/// Keeps per-shard DB metrics and slow-query logs attributed to the shard that
+/// actually runs the query rather than the originally-routed shard. The parent
+/// label is `"<key> shard=<orig>"` (see `ShardRepositorySeed::from_ctx`); this
+/// swaps the `shard=` tag for `shard_name` while preserving the base route key.
+/// Returns `None` when the parent had no label (no `MatchedPath`), so unlabelled
+/// repos stay unlabelled.
+#[must_use]
+pub fn reshard_route_label(parent: Option<&str>, shard_name: &str) -> Option<String> {
+    let parent = parent?;
+    let base = parent.rsplit_once(" shard=").map_or(parent, |(key, _)| key);
+    Some(format!("{base} shard={shard_name}"))
+}
+
 /// Tenant-routed shard connection extractor.
 ///
 /// Resolves the routing key automatically and checks out a connection to
@@ -1194,6 +1877,10 @@ pub struct ShardedDb {
     shard_name: Arc<str>,
     shard_id: ShardId,
     repo_seed: ShardRepositorySeed,
+    // The full shard set, so `Repo::from_shard(&db).across_tenants()` can fan
+    // out across shards exactly like the generated extractor path (cheap to
+    // clone — `ShardSet` is `Arc`-backed).
+    shards: ShardSet,
 }
 
 impl ShardedDb {
@@ -1249,6 +1936,14 @@ impl ShardedDb {
     pub const fn __autumn_repository_seed(&self) -> &ShardRepositorySeed {
         &self.repo_seed
     }
+
+    /// The full shard set, so `from_shard`-built repositories can fan out under
+    /// `across_tenants()`. Internal ABI; not a stable public API.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn __autumn_shard_set(&self) -> &ShardSet {
+        &self.shards
+    }
 }
 
 impl std::ops::Deref for ShardedDb {
@@ -1270,6 +1965,35 @@ impl AsMut<crate::db::Db> for ShardedDb {
     }
 }
 
+/// Internal ABI for generated `#[repository(sharded)]` extractors.
+///
+/// Resolves the tenant→shard routing from a request, builds the
+/// [`ShardRepositorySeed`] that carries the shard's pool and observability
+/// context, and returns a cheap clone of the [`ShardSet`] for cross-shard
+/// fan-out. Unlike [`ShardedDb::from_request_parts`] it does **not** check
+/// out a connection, so generated repositories can acquire their own lazily.
+#[doc(hidden)]
+pub async fn __autumn_resolve_repo_seed(
+    parts: &mut axum::http::request::Parts,
+    state: &crate::AppState,
+) -> Result<(ShardRepositorySeed, ShardSet), AutumnError> {
+    let shards = <Shards as axum::extract::FromRequestParts<crate::AppState>>::from_request_parts(
+        parts, state,
+    )
+    .await?;
+    let key = resolve_shard_key(parts, state).await?;
+    let shard = shards.set.route(&key).await?;
+    let shard_name = Arc::clone(&shard.name);
+    let seed = ShardRepositorySeed::from_ctx(
+        shard.primary_pool(),
+        &shards.ctx,
+        &shard_name,
+        shard.read_route(),
+    );
+    let set = shards.set.clone();
+    Ok((seed, set))
+}
+
 impl axum::extract::FromRequestParts<crate::AppState> for ShardedDb {
     type Rejection = AutumnError;
 
@@ -1289,12 +2013,14 @@ impl axum::extract::FromRequestParts<crate::AppState> for ShardedDb {
             &shard_name,
             shard.read_route(),
         );
+        let shard_set = shards.set.clone();
         let db = shards.checkout_primary(shard).await?;
         Ok(Self {
             db,
             shard_name,
             shard_id,
             repo_seed,
+            shards: shard_set,
         })
     }
 }
@@ -1434,6 +2160,22 @@ async fn resolve_shard_key(
 mod tests {
     use super::*;
     use crate::config::{ShardConfig, SlotSpec};
+
+    #[test]
+    fn directory_invalidation_channel_and_interval_are_sane() {
+        // The listener LISTENs on the same channel the migration's trigger
+        // fires via `pg_notify`. If these drift, invalidations are never
+        // delivered.
+        assert_eq!(DIRECTORY_NOTIFY_CHANNEL, "autumn_shard_directory");
+        // The idle sweep interval must be shorter than the cache TTL so a
+        // never-re-observed expired entry is reclaimed before the TTL would
+        // have done so anyway (delivery of an actual invalidation is immediate,
+        // independent of this interval).
+        assert!(
+            DEFAULT_DIRECTORY_INVALIDATION_SWEEP_INTERVAL < DEFAULT_DIRECTORY_CACHE_TTL,
+            "sweep interval should beat the TTL"
+        );
+    }
 
     fn shard_config(name: &str) -> ShardConfig {
         ShardConfig {
@@ -1600,6 +2342,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn arc_shard_router_delegates_to_inner() {
+        // `Arc<R>: ShardRouter` is what lets a custom DirectoryShardRouter be
+        // shared between routing (`with_shard_router`) and its invalidation
+        // listener (`spawn_invalidation_listener`, which needs `Arc<Self>`).
+        // Install one through a ShardSet and confirm routing flows to the inner
+        // router rather than failing the trait bound.
+        let config = sharded_config(&["a", "b"]);
+        let set = create_shard_set(&config, Arc::new(Arc::new(HashShardRouter)))
+            .expect("build")
+            .expect("configured");
+        let first = set.route("tenant-42").await.expect("route");
+        let again = set.route("tenant-42").await.expect("route");
+        assert_eq!(
+            first.id(),
+            again.id(),
+            "Arc<R> routes deterministically through its inner router"
+        );
+    }
+
+    #[tokio::test]
     async fn moving_a_slot_in_config_moves_only_that_slot() {
         // "Reshard" by reassigning slots 12288-16383 from shard b to a new
         // shard c: keys in slots 0-12287 must not move.
@@ -1656,6 +2418,66 @@ mod tests {
         assert_eq!(
             set.get(ShardId(1)).expect("b").slots(),
             (8192..16384).collect::<Vec<u16>>()
+        );
+    }
+
+    // §3 slot-move helpers
+    #[test]
+    fn owns_key_agrees_with_route() {
+        // shard a owns slots 0-8191, shard b owns 8192-16383.
+        // "hooli" → slot 3974 → shard a (ShardId(0)).
+        // "a"     → slot 11404 → shard b (ShardId(1)).
+        let set = shard_set(&["a", "b"]);
+        assert!(
+            set.owns_key(ShardId(0), "hooli"),
+            "hooli (slot 3974) must be shard a"
+        );
+        assert!(
+            !set.owns_key(ShardId(1), "hooli"),
+            "hooli must not be shard b"
+        );
+        assert!(
+            set.owns_key(ShardId(1), "a"),
+            "key 'a' (slot 11404) must be shard b"
+        );
+        assert!(
+            !set.owns_key(ShardId(0), "a"),
+            "key 'a' must not be shard a"
+        );
+    }
+
+    #[test]
+    fn slots_for_shard_returns_correct_slice() {
+        let set = shard_set(&["a", "b"]);
+        let a_slots = set.slots_for_shard(ShardId(0)).expect("shard a exists");
+        let b_slots = set.slots_for_shard(ShardId(1)).expect("shard b exists");
+        assert_eq!(a_slots.len(), 8192);
+        assert_eq!(b_slots.len(), 8192);
+        assert!(a_slots.iter().all(|&s| s < 8192));
+        assert!(b_slots.iter().all(|&s| s >= 8192));
+        assert!(set.slots_for_shard(ShardId(9)).is_none());
+    }
+
+    #[test]
+    fn partition_by_shard_groups_golden_keys() {
+        // Using the golden-vector keys: "hooli"→3974 (shard a), "a"→11404 (shard b).
+        let set = shard_set(&["a", "b"]);
+        let keys = ["hooli", "a", "tenant-1"]; // tenant-1 → 12427 → shard b
+        let map = set.partition_by_shard(keys.iter().copied());
+        #[allow(clippy::similar_names)]
+        let keys_on_a = map.get(&ShardId(0)).map_or(&[][..], Vec::as_slice);
+        #[allow(clippy::similar_names)]
+        let keys_on_b = map.get(&ShardId(1)).map_or(&[][..], Vec::as_slice);
+        assert!(keys_on_a.contains(&"hooli"), "hooli must go to shard a");
+        assert!(keys_on_b.contains(&"a"), "key 'a' must go to shard b");
+        assert!(
+            keys_on_b.contains(&"tenant-1"),
+            "tenant-1 (slot 12427) must go to shard b"
+        );
+        assert_eq!(
+            keys_on_a.len() + keys_on_b.len(),
+            keys.len(),
+            "no key dropped"
         );
     }
 
@@ -2003,18 +2825,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shard_indicator_stays_up_for_primary_fallback_replica() {
+    async fn shard_indicator_reports_down_when_primary_unreachable() {
         use crate::actuator::HealthIndicator as _;
 
+        // `ReplicaFallback::Primary` would normally let a dead replica degrade
+        // to primary reads and stay Up — but here the primary is also
+        // unreachable, so the primary connectivity gate must force Down: an
+        // instance that cannot reach the shard primary fails all writes and
+        // primary reads, so `/ready` must not stay green. (The healthy-primary
+        // + dead-replica fallback path needs a live primary and is exercised by
+        // the `read_pool`/`read_route` fallback tests above, not the indicator.)
         let shard = shard_with_unreachable_replica(ReplicaFallback::Primary);
         let indicator = ShardHealthIndicator::new(shard);
         let output = indicator.check().await;
 
         assert!(
-            output.status.is_healthy(),
-            "primary fallback degrades to primary reads and must stay Up"
+            !output.status.is_healthy(),
+            "unreachable primary must report Down even under primary fallback"
         );
-        assert_eq!(output.details["replica_ready"], serde_json::json!(false));
+        assert_eq!(output.details["primary_ready"], serde_json::json!(false));
+        assert!(output.details.contains_key("primary_detail"));
     }
 
     #[tokio::test]
@@ -2084,6 +2914,56 @@ mod tests {
             seed.route.as_deref(),
             Some("GET /test shard=shard0"),
             "route tagged with shard name"
+        );
+    }
+
+    #[test]
+    fn reshard_route_label_retags_with_target_shard() {
+        // Fan-out sub-repo on shard2 must report under shard2, not the
+        // originally-routed shard0, so per-shard metrics stay accurate.
+        assert_eq!(
+            reshard_route_label(Some("GET /admin shard=shard0"), "shard2").as_deref(),
+            Some("GET /admin shard=shard2"),
+        );
+        // No parent label (no MatchedPath) stays unlabelled.
+        assert_eq!(reshard_route_label(None, "shard2"), None);
+        // A label without a shard tag still gets tagged for the target shard.
+        assert_eq!(
+            reshard_route_label(Some("GET /admin"), "shard2").as_deref(),
+            Some("GET /admin shard=shard2"),
+        );
+    }
+
+    #[test]
+    fn cross_shard_wrapper_derefs_to_inner() {
+        let mut w = CrossShard(7i32);
+        assert_eq!(*w, 7); // Deref
+        *w = 9; // DerefMut
+        assert_eq!(w.0, 9);
+    }
+
+    #[test]
+    fn cross_shard_seed_is_tenant_free_and_untagged() {
+        // No tenant is resolved; the seed is built straight from the set so an
+        // admin CrossShard<R> extractor can construct the repo without a header.
+        let set = shard_set(&["shard0", "shard1"]);
+        let ctx = crate::db::RequestDbContext {
+            statement_timeout: Some(std::time::Duration::from_millis(1500)),
+            route_key: Some("GET /admin".to_owned()),
+            metrics: None,
+            slow_query_threshold: std::time::Duration::from_millis(250),
+            interceptors: Vec::new(),
+        };
+        let seed = cross_shard_seed(&set, &ctx).expect("seed");
+        // The route carries only the base key — the fan-out re-tags it per
+        // executing shard via reshard_route_label, so it must NOT be pre-tagged
+        // with the seed shard.
+        assert_eq!(seed.route.as_deref(), Some("GET /admin"));
+        assert!(!seed.route.as_deref().unwrap().contains("shard="));
+        assert_eq!(seed.statement_timeout_ms, 1500);
+        assert_eq!(
+            seed.slow_query_threshold,
+            std::time::Duration::from_millis(250)
         );
     }
 

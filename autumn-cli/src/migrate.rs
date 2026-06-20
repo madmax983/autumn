@@ -89,7 +89,12 @@ pub enum MigrateTarget {
 }
 
 /// Run the migrate command.
-pub fn run(action: &MigrateAction, with_maintenance: bool, target: &MigrateTarget) {
+pub fn run(
+    action: &MigrateAction,
+    with_maintenance: bool,
+    target: &MigrateTarget,
+    profile: Option<&str>,
+) {
     eprintln!("\u{1F342} autumn migrate\n");
 
     match action {
@@ -99,14 +104,15 @@ pub fn run(action: &MigrateAction, with_maintenance: bool, target: &MigrateTarge
             return;
         }
         MigrateAction::Down(args) => {
-            run_down(args, with_maintenance, target);
+            run_down(args, with_maintenance, target, profile);
             return;
         }
         _ => {}
     }
 
-    // 1. Resolve migration target databases from autumn.toml + env
-    let targets = resolve_targets(target);
+    // 1. Resolve migration target databases from autumn.toml (+ profile
+    //    overlay) + env
+    let targets = resolve_targets(target, profile);
 
     // 2. Resolve migrations directory
     let migrations_dir = resolve_migrations_dir();
@@ -129,7 +135,9 @@ pub fn run(action: &MigrateAction, with_maintenance: bool, target: &MigrateTarge
                 eprintln!("\u{2500}\u{2500} {label} \u{2500}\u{2500}");
                 show_status(url, &migrations_dir);
                 show_rollback_availability(url, &migrations_dir);
-                show_framework_status(url);
+                // Shard targets only require the shard framework migrations, so
+                // report against that set instead of the full control-plane one.
+                show_framework_status(url, label.starts_with("shard:"));
                 eprintln!();
             }
         }
@@ -139,9 +147,21 @@ pub fn run(action: &MigrateAction, with_maintenance: bool, target: &MigrateTarge
 
 /// Resolve the `(label, database_url)` pairs the command operates on,
 /// in apply order (control first, then shards in declaration order).
-fn resolve_targets(target: &MigrateTarget) -> Vec<(String, String)> {
-    let control = try_resolve_database_url();
-    let shards = resolve_shard_database_urls();
+fn resolve_targets(target: &MigrateTarget, profile: Option<&str>) -> Vec<(String, String)> {
+    // Read autumn.toml once, deep-merging the `autumn-<profile>.toml` overlay
+    // when a profile is selected, so control and shard URLs both resolve from
+    // the same effective configuration. Environment overrides still win over
+    // the merged file (handled inside the `_from_sources` helpers).
+    //
+    // When no profile is given explicitly (via `--profile` / `AUTUMN_PROFILE`),
+    // fall back to `AUTUMN_ENV` — the framework's preferred profile selector —
+    // so `autumn migrate` resolves the same overlay the app itself would use.
+    let effective = effective_profile(profile);
+    let config_table = read_autumn_toml_table_with_profile(Some(&effective));
+    let control =
+        resolve_primary_database_url_from_sources(|key| std::env::var(key), config_table.as_ref());
+    let shards =
+        resolve_shard_database_urls_from_sources(|key| std::env::var(key), config_table.as_ref());
     match build_targets(control, shards, target) {
         Ok(targets) => targets,
         Err(message) => {
@@ -190,9 +210,28 @@ fn build_targets(
             for (name, url) in shards {
                 targets.push((format!("shard:{name}"), url));
             }
+            reject_duplicate_target_urls(&targets)?;
             Ok(targets)
         }
     }
+}
+
+/// Reject distinct target labels that resolve to the same database URL (e.g.
+/// profile/env overrides mapping `control` and a shard to one DB). Without this,
+/// a multi-target `migrate down` would roll the shared database back once per
+/// label, reverting more migrations than requested.
+fn reject_duplicate_target_urls(targets: &[(String, String)]) -> Result<(), String> {
+    let mut seen: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
+    for (label, url) in targets {
+        if let Some(prev) = seen.insert(url.as_str(), label.as_str()) {
+            return Err(format!(
+                "\u{2717} Targets {prev:?} and {label:?} resolve to the same database URL. \
+                 Check profile / AUTUMN_DATABASE__* overrides; migrating or rolling back the \
+                 same database under two labels would apply/revert it twice."
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Apply migrations to every target in order, failing fast with a
@@ -201,7 +240,11 @@ fn run_all_targets(targets: &[(String, String)], migrations_dir: &str, with_main
     let mut completed: Vec<&str> = Vec::new();
     for (label, url) in targets {
         eprintln!("\u{2500}\u{2500} Migrating {label} \u{2500}\u{2500}");
-        if run_single_target(url, migrations_dir) {
+        // Labels starting with "shard:" are shard targets; they receive only
+        // the shard-required framework migrations (version history + commit
+        // hook queue), not the full control-plane schema.
+        let is_shard = label.starts_with("shard:");
+        if run_single_target(url, migrations_dir, is_shard) {
             completed.push(label);
             eprintln!();
         } else {
@@ -268,7 +311,11 @@ fn disable_maintenance_after_migrate() {
 
 /// Apply app + framework migrations to one database. Returns whether
 /// everything succeeded; the caller decides how to fail.
-fn run_single_target(database_url: &str, migrations_dir: &str) -> bool {
+///
+/// When `is_shard` is `true`, applies only the shard-required framework
+/// migrations (version history + commit-hook queue) instead of the full
+/// control-plane `FRAMEWORK_MIGRATIONS` set.
+fn run_single_target(database_url: &str, migrations_dir: &str, is_shard: bool) -> bool {
     use autumn_web::migrate::{DEFAULT_LOCK_WAIT_TIMEOUT, hold_migration_lock};
 
     // Acquire this target database's Postgres advisory lock before reading
@@ -322,7 +369,11 @@ fn run_single_target(database_url: &str, migrations_dir: &str) -> bool {
         }
     }
 
-    run_framework_migrations(database_url)
+    if is_shard {
+        run_shard_framework_migrations(database_url)
+    } else {
+        run_framework_migrations(database_url)
+    }
 }
 
 /// Print the safety findings for one migration direction (`up.sql`/`down.sql`).
@@ -507,13 +558,6 @@ fn resolve_database_url() -> String {
     resolve_database_url_with_env(|key| std::env::var(key))
 }
 
-/// Like [`resolve_database_url`], but returns `None` instead of exiting
-/// when no control URL is configured (valid for shard-only deployments).
-fn try_resolve_database_url() -> Option<String> {
-    let config_table = read_autumn_toml_table();
-    resolve_primary_database_url_from_sources(|key| std::env::var(key), config_table.as_ref())
-}
-
 fn resolve_database_url_with_env<F>(env_var: F) -> String
 where
     F: Fn(&str) -> Result<String, std::env::VarError>,
@@ -538,6 +582,184 @@ fn read_autumn_toml_table() -> Option<toml::Table> {
     std::fs::read_to_string(config_path)
         .ok()
         .and_then(|contents| toml::from_str::<toml::Table>(&contents).ok())
+}
+
+/// The profile actually in effect for CLI config resolution, mirroring the
+/// runtime loader's precedence (`autumn_web::config::resolve_profile_input`) so
+/// the CLI resolves the same overlay/URLs the running app would: `AUTUMN_ENV`
+/// (preferred), then legacy `AUTUMN_PROFILE`, then an explicit `--profile` flag,
+/// then release build-mode (`AUTUMN_IS_DEBUG=0` resolves to `prod`), and finally
+/// `dev` — the runtime's default — so a local `autumn migrate` applies the same
+/// `[profile.dev]` / `autumn-dev.toml` overlay the app would rather than the
+/// bare base config.
+///
+/// `explicit` must be the real `--profile` flag value only — the clap arg no
+/// longer auto-fills it from `AUTUMN_PROFILE`, so env vars keep their documented
+/// precedence over the flag. Always resolves to a profile (worst case `"dev"`).
+pub fn effective_profile(explicit: Option<&str>) -> String {
+    let read = |key: &str| std::env::var(key).ok().filter(|v| !v.trim().is_empty());
+    read("AUTUMN_ENV")
+        .or_else(|| read("AUTUMN_PROFILE"))
+        .or_else(|| {
+            explicit
+                .map(str::trim)
+                .filter(|p| !p.is_empty())
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| {
+            if std::env::var("AUTUMN_IS_DEBUG").ok().as_deref() == Some("0") {
+                "prod".to_owned()
+            } else {
+                "dev".to_owned()
+            }
+        })
+}
+
+/// Whether a resolved profile name is production (`prod`/`production`).
+fn is_production_profile_name(profile: &str) -> bool {
+    let normalized = profile.trim().to_ascii_lowercase();
+    normalized == "prod" || normalized == "production"
+}
+
+/// Profile name spellings to probe for inline `[profile.<name>]` sections,
+/// mirroring `autumn_web::config::profile_lookup_names`'s alias handling so
+/// `prod`/`production` and `dev`/`development` are interchangeable. Matching is
+/// case-insensitive; custom profile names are used verbatim.
+fn profile_lookup_names(profile: &str) -> Vec<String> {
+    match profile.trim().to_ascii_lowercase().as_str() {
+        "prod" | "production" => vec!["production".to_owned(), "prod".to_owned()],
+        "dev" | "development" => vec!["development".to_owned(), "dev".to_owned()],
+        _ => vec![profile.trim().to_owned()],
+    }
+}
+
+/// Overlay-FILE lookup names, **selected-spelling first** — mirrors the runtime
+/// `autumn_web::config::profile_override_file_lookup_names`. Only one overlay
+/// file is loaded (the first that exists), so when both `autumn-prod.toml` and
+/// `autumn-production.toml` are present the operator's selected `--profile`
+/// spelling wins, resolving the same file the running app would.
+fn profile_file_lookup_names(profile: &str) -> Vec<String> {
+    let trimmed = profile.trim();
+    match trimmed.to_ascii_lowercase().as_str() {
+        "prod" | "production" => {
+            if trimmed.eq_ignore_ascii_case("production") {
+                vec!["production".to_owned(), "prod".to_owned()]
+            } else {
+                vec!["prod".to_owned(), "production".to_owned()]
+            }
+        }
+        "dev" | "development" => {
+            if trimmed.eq_ignore_ascii_case("development") {
+                vec!["development".to_owned(), "dev".to_owned()]
+            } else {
+                vec!["dev".to_owned(), "development".to_owned()]
+            }
+        }
+        _ => vec![trimmed.to_owned()],
+    }
+}
+
+/// Read `autumn.toml`, layering profile overrides the same way the runtime
+/// loader does (see `autumn/src/config.rs`):
+///
+///   `autumn.toml` ← `[profile.{name}]` (inline) ← `autumn-{profile}.toml`
+///
+/// so `autumn migrate --profile prod` resolves the same control + shard URLs
+/// the running app would under that profile — whether the deployment keeps
+/// production URLs in an inline `[profile.prod.database]` section or a separate
+/// `autumn-prod.toml` file. With no profile (or no overrides), the base table
+/// is returned unchanged.
+pub fn read_autumn_toml_table_with_profile(profile: Option<&str>) -> Option<toml::Table> {
+    read_autumn_toml_table_with_profile_in(Path::new("."), profile)
+}
+
+/// Directory-parameterized core of [`read_autumn_toml_table_with_profile`],
+/// separated so the overlay-merge behavior is unit-testable without mutating
+/// the process-global current directory.
+fn read_autumn_toml_table_with_profile_in(
+    dir: &Path,
+    profile: Option<&str>,
+) -> Option<toml::Table> {
+    // An absent file is a no-op (fall back to the next layer), but a file that
+    // EXISTS yet can't be read or parsed is a hard error — silently ignoring it
+    // would resolve different URLs than the running app (which the runtime
+    // loader rejects), risking migrations/row-moves against the wrong database.
+    let read_table = |path: &Path| -> Option<toml::Table> {
+        if !path.exists() {
+            return None;
+        }
+        let contents = std::fs::read_to_string(path).unwrap_or_else(|e| {
+            eprintln!("\u{2717} Failed to read {}: {e}", path.display());
+            std::process::exit(1);
+        });
+        match toml::from_str::<toml::Table>(&contents) {
+            Ok(table) => Some(table),
+            Err(e) => {
+                eprintln!("\u{2717} Failed to parse {}: {e}", path.display());
+                std::process::exit(1);
+            }
+        }
+    };
+
+    let base = read_table(&dir.join("autumn.toml"));
+    let Some(profile) = profile.filter(|p| !p.is_empty()) else {
+        return base;
+    };
+
+    // Probe overlay files across canonical alias spellings (e.g. the operator
+    // sets `AUTUMN_ENV=production` but the file is the common `autumn-prod.toml`)
+    // and load the first that exists. File lookup prefers the *selected* spelling
+    // (mirroring the runtime `profile_override_file_lookup_names`), so a repo with
+    // both `autumn-prod.toml` and `autumn-production.toml` resolves the file the
+    // app would under the same profile.
+    let lookup_names = profile_lookup_names(profile);
+    let overlay = profile_file_lookup_names(profile)
+        .iter()
+        .find_map(|name| read_table(&dir.join(format!("autumn-{name}.toml"))));
+    if base.is_none() && overlay.is_none() {
+        return None;
+    }
+    let mut merged = base.unwrap_or_default();
+
+    // Layer the inline `[profile.<name>]` section(s) from autumn.toml on top of
+    // the base, matching the runtime loader's precedence. Co-located profile
+    // config (e.g. `[profile.prod.database]`) must be honored, not just a
+    // separate `autumn-<profile>.toml` file.
+    for name in &lookup_names {
+        if let Some(inline) = merged
+            .get("profile")
+            .and_then(toml::Value::as_table)
+            .and_then(|profiles| profiles.get(name))
+            .and_then(toml::Value::as_table)
+            .cloned()
+        {
+            deep_merge_toml(&mut merged, inline);
+        }
+    }
+
+    // Finally, the legacy `autumn-<profile>.toml` overlay wins over both.
+    if let Some(overlay) = overlay {
+        deep_merge_toml(&mut merged, overlay);
+    }
+
+    Some(merged)
+}
+
+/// Deep-merge `overlay` into `base`: nested tables are merged recursively,
+/// every other value (scalars, arrays) in `overlay` replaces the matching key
+/// in `base`. Keys present only in `base` are preserved. This matches the
+/// framework's profile-overlay merge semantics (`autumn/src/config.rs`).
+fn deep_merge_toml(base: &mut toml::Table, overlay: toml::Table) {
+    for (key, overlay_val) in overlay {
+        match (base.get_mut(&key), overlay_val) {
+            (Some(toml::Value::Table(base_child)), toml::Value::Table(overlay_child)) => {
+                deep_merge_toml(base_child, overlay_child);
+            }
+            (_, overlay_val) => {
+                base.insert(key, overlay_val);
+            }
+        }
+    }
 }
 
 fn resolve_primary_database_url_from_sources<F>(
@@ -579,19 +801,7 @@ where
 /// `AUTUMN_DATABASE__SHARDS__{i}__NAME` / `__PRIMARY_URL` override entry
 /// `i` of the TOML declaration (or append a new entry when both are set
 /// for the next free index); probing stops at the first absent index.
-fn resolve_shard_database_urls() -> Vec<(String, String)> {
-    resolve_shard_database_urls_with_env(|key| std::env::var(key))
-}
-
-fn resolve_shard_database_urls_with_env<F>(env_var: F) -> Vec<(String, String)>
-where
-    F: Fn(&str) -> Result<String, std::env::VarError>,
-{
-    let config_table = read_autumn_toml_table();
-    resolve_shard_database_urls_from_sources(env_var, config_table.as_ref())
-}
-
-fn resolve_shard_database_urls_from_sources<F>(
+pub fn resolve_shard_database_urls_from_sources<F>(
     env_var: F,
     table: Option<&toml::Table>,
 ) -> Vec<(String, String)>
@@ -606,13 +816,38 @@ where
         .and_then(|database| database.get("shards"))
         .and_then(toml::Value::as_array)
         .map(|entries| {
+            // Fail fast on a malformed `[[database.shards]]` entry rather than
+            // silently dropping it: the runtime config loader rejects the same
+            // config, so skipping a misspelled shard here would let `autumn
+            // migrate` "succeed" while leaving that shard unmigrated.
             entries
                 .iter()
-                .filter_map(toml::Value::as_table)
-                .filter_map(|shard| {
-                    let name = shard.get("name").and_then(toml::Value::as_str)?;
-                    let url = shard.get("primary_url").and_then(toml::Value::as_str)?;
-                    Some((name.to_owned(), url.to_owned()))
+                .enumerate()
+                .map(|(i, entry)| {
+                    let shard = entry.as_table().unwrap_or_else(|| {
+                        eprintln!("\u{2717} [[database.shards]] entry {i} is not a table.");
+                        std::process::exit(1);
+                    });
+                    let name = shard
+                        .get("name")
+                        .and_then(toml::Value::as_str)
+                        .unwrap_or_else(|| {
+                            eprintln!(
+                                "\u{2717} [[database.shards]] entry {i} is missing a string `name`."
+                            );
+                            std::process::exit(1);
+                        });
+                    let url = shard
+                        .get("primary_url")
+                        .and_then(toml::Value::as_str)
+                        .unwrap_or_else(|| {
+                            eprintln!(
+                                "\u{2717} [[database.shards]] entry {i} ({name:?}) is missing a \
+                                 string `primary_url`."
+                            );
+                            std::process::exit(1);
+                        });
+                    (name.to_owned(), url.to_owned())
                 })
                 .collect()
         })
@@ -633,6 +868,20 @@ where
         }
         if let Ok(url) = env_var(&url_var) {
             shards[i].1 = url;
+        }
+    }
+
+    // Reject duplicate shard names (the runtime config validator does too), so
+    // `--shard foo` / `move-slot --from foo` can't silently resolve only the
+    // first of two entries and target a different shard set than the app.
+    let mut seen = std::collections::HashSet::new();
+    for (name, _) in &shards {
+        if !seen.insert(name.as_str()) {
+            eprintln!(
+                "\u{2717} Duplicate shard name {name:?} in [[database.shards]] / \
+                 AUTUMN_DATABASE__SHARDS__* — shard names must be unique."
+            );
+            std::process::exit(1);
         }
     }
 
@@ -699,29 +948,62 @@ where
     run_pending(database_url, FRAMEWORK_MIGRATIONS)
 }
 
-/// True iff the active profile resolves to `prod`/`production`.
+/// Apply only the shard-required framework migrations to a shard target.
 ///
-/// Mirrors `autumn_web::config::resolve_profile`'s precedence: `AUTUMN_ENV`
-/// (preferred) then `AUTUMN_PROFILE` (legacy alias), normalising case and
-/// whitespace. When neither is set, fall back to the build-mode signal —
-/// `AUTUMN_IS_DEBUG=0` (set by `#[autumn_web::main]` in release builds) resolves
-/// to prod — so a release deployment that relies on that signal still trips the
-/// rollback guard. (The `--profile` CLI flag that `resolve_profile` also honours
-/// is not a recognised `migrate down` argument, so it cannot reach here.)
-fn is_production_profile() -> bool {
-    // Treat an empty/whitespace value as absent (matching `autumn_web::config`)
-    // so the next signal in the precedence chain is still consulted.
-    let read = |key: &str| std::env::var(key).ok().filter(|v| !v.trim().is_empty());
-    read("AUTUMN_ENV")
-        .or_else(|| read("AUTUMN_PROFILE"))
-        .map_or_else(
-            // No explicit profile: fall back to the build-mode signal.
-            || std::env::var("AUTUMN_IS_DEBUG").ok().as_deref() == Some("0"),
-            |profile| {
-                let normalized = profile.trim().to_lowercase();
-                normalized == "prod" || normalized == "production"
-            },
-        )
+/// Shards need version-history and commit-hook queue tables but do **not**
+/// host the full control-plane schema (API tokens, sessions, job queues, …).
+/// In production this delegates to
+/// [`autumn_web::migrate::run_pending_shard_framework_migrations`]; the inner
+/// helper takes a closure so the dispatch can be tested without a live database.
+fn run_shard_framework_migrations(database_url: &str) -> bool {
+    eprintln!("  Running pending Autumn shard framework migrations...\n");
+
+    match run_shard_framework_migrations_inner(
+        database_url,
+        autumn_web::migrate::run_pending_shard_framework_migrations,
+    ) {
+        Ok(result) if result.applied.is_empty() => {
+            eprintln!("\n\u{2713} Shard framework migrations are up to date.");
+            true
+        }
+        Ok(result) => {
+            for migration in &result.applied {
+                eprintln!("  Applied {migration}");
+            }
+            eprintln!("\n\u{2713} Shard framework migrations applied successfully.");
+            true
+        }
+        Err(e) => {
+            eprintln!("\n\u{2717} Shard framework migration failed: {e}");
+            false
+        }
+    }
+}
+
+fn run_shard_framework_migrations_inner<F>(
+    database_url: &str,
+    run_shard: F,
+) -> Result<MigrationResult, MigrationError>
+where
+    F: FnOnce(&str) -> Result<MigrationResult, MigrationError>,
+{
+    run_shard(database_url)
+}
+
+/// True iff the [effective profile](effective_profile) resolves to
+/// `prod`/`production`.
+///
+/// Takes the same explicit `--profile` value as the rest of CLI resolution and
+/// runs it through [`effective_profile`], so the rollback guard agrees with the
+/// databases the command will actually target: `AUTUMN_ENV` (preferred), then
+/// legacy `AUTUMN_PROFILE`, then the explicit flag, then the release build-mode
+/// signal (`AUTUMN_IS_DEBUG=0`). Pass `None` to test the env/build-mode signals
+/// alone.
+fn is_production_profile(explicit: Option<&str>) -> bool {
+    // Delegate to the shared effective-profile resolution (env precedence +
+    // explicit `--profile` + build-mode signal) so the rollback guard and config
+    // resolution agree on which profile (and thus which databases) is targeted.
+    is_production_profile_name(&effective_profile(explicit))
 }
 
 /// Whether an applied user migration has a usable `down.sql` on disk.
@@ -790,9 +1072,19 @@ fn build_rollback_plan(args: &DownArgs, applied: &[AppliedUserMigration]) -> Vec
 }
 
 /// Run `autumn migrate down`.
-fn run_down(args: &DownArgs, with_maintenance: bool, target: &MigrateTarget) {
-    // 1. Production guard
-    if is_production_profile() && !args.yes_i_mean_prod {
+fn run_down(
+    args: &DownArgs,
+    with_maintenance: bool,
+    target: &MigrateTarget,
+    profile: Option<&str>,
+) {
+    // 1. Production guard. Derive prod-ness from the SAME effective profile the
+    //    rollback will target (env precedence + build-mode + explicit flag), so
+    //    e.g. an `AUTUMN_ENV=prod` overlay still trips the guard even when an
+    //    explicit `--profile dev` is passed, and the guard can't be bypassed by
+    //    resolving prod URLs without `--yes-i-mean-prod`.
+    let is_prod = is_production_profile(profile);
+    if is_prod && !args.yes_i_mean_prod {
         eprintln!("\u{2717} Production profile detected.");
         eprintln!("  Rolling back migrations in production requires explicit confirmation.");
         eprintln!("  Re-run with --yes-i-mean-prod to proceed.");
@@ -802,18 +1094,36 @@ fn run_down(args: &DownArgs, with_maintenance: bool, target: &MigrateTarget) {
     // 2. Resolve target databases (control + shards / a single shard /
     //    control-only) and the migrations dir. `down` honors --shard /
     //    --control-only exactly like `migrate run`.
-    let targets = resolve_targets(target);
+    let targets = resolve_targets(target, profile);
     let migrations_dir = resolve_migrations_dir();
     let dir = Path::new(&migrations_dir);
 
-    // Multi-target rollbacks are fail-fast and applied in order, matching the
-    // forward `migrate run`: each target is reverted before the next is
-    // planned. If a later target fails (a runtime down.sql error, or shards at
-    // divergent migration states), earlier targets are already rolled back —
-    // re-running `down` then plans from each target's current state. To roll a
-    // single database back in isolation, scope the command with --shard /
-    // --control-only. (Missing/empty down.sql is caught by preflight before any
-    // mutation, since all targets share one migrations dir.)
+    // Preflight EVERY target before mutating any of them: build and validate
+    // each target's rollback plan (down.sql present, CONCURRENTLY opt-out) up
+    // front, so a divergent shard whose plan can't be reverted fails before the
+    // control DB (or an earlier shard) has already been rolled back — which
+    // would leave control and shards at different schema versions. Each target
+    // re-validates under its own lock in run_down_target as well.
+    let plans: Vec<(String, Vec<String>)> = targets
+        .iter()
+        .map(|(label, url)| {
+            (
+                label.clone(),
+                preflight_rollback_target(args, url, dir, label),
+            )
+        })
+        .collect();
+
+    // A multi-target `down` must revert the SAME version list on every target.
+    // If they diverge (e.g. a shard lagged behind control after a partial
+    // migrate), refuse rather than roll back different versions per target.
+    // Scoping with --shard / --control-only resolves to a single target, so this
+    // never blocks an intentional single-target rollback.
+    reject_divergent_rollback_plans(&plans);
+
+    // Targets are reverted in order; each plans + executes under its own
+    // advisory lock. To roll a single database back in isolation, scope the
+    // command with --shard / --control-only.
     //
     // Maintenance mode is a global flag, so enable it at most once (the first
     // time any target actually has work) and disable it after all targets
@@ -822,11 +1132,18 @@ fn run_down(args: &DownArgs, with_maintenance: bool, target: &MigrateTarget) {
     let mut total_reverted = 0usize;
     let multi = targets.len() > 1;
 
-    for (label, url) in &targets {
+    for ((label, url), (_, preflighted_plan)) in targets.iter().zip(plans.iter()) {
         if multi {
             eprintln!("\u{2500}\u{2500} Rolling back {label} \u{2500}\u{2500}");
         }
-        match run_down_target(args, url, dir, with_maintenance, &mut maintenance_enabled) {
+        match run_down_target(
+            args,
+            url,
+            dir,
+            with_maintenance,
+            &mut maintenance_enabled,
+            preflighted_plan,
+        ) {
             Ok(n) => {
                 total_reverted += n;
                 if multi {
@@ -854,6 +1171,119 @@ fn run_down(args: &DownArgs, with_maintenance: bool, target: &MigrateTarget) {
     }
 }
 
+/// Validate that every planned rollback migration can be reverted: it must have
+/// an executable `down.sql`, and a `CONCURRENTLY` index revert must opt out of
+/// the per-migration transaction. Prints the offending migrations and exits the
+/// process on failure (before any schema is mutated).
+fn check_rollback_plan_revertable(applied: &[AppliedUserMigration], plan: &[String]) {
+    let missing: Vec<&str> = plan
+        .iter()
+        .filter_map(|version| {
+            let m = applied.iter().find(|m| &m.version == version)?;
+            (!has_revertable_down_sql(m)).then_some(m.name.as_str())
+        })
+        .collect();
+    if !missing.is_empty() {
+        eprintln!(
+            "\u{2717} The following migration(s) have no executable down.sql and cannot be reverted:"
+        );
+        for name in &missing {
+            eprintln!("    \u{2022} {name}");
+        }
+        eprintln!("  Add a down.sql to each migration before running `autumn migrate down`.");
+        std::process::exit(1);
+    }
+
+    let needs_opt_out: Vec<&str> = plan
+        .iter()
+        .filter_map(|version| {
+            let m = applied.iter().find(|m| &m.version == version)?;
+            down_sql_concurrent_without_opt_out(m).then_some(m.name.as_str())
+        })
+        .collect();
+    if !needs_opt_out.is_empty() {
+        eprintln!(
+            "\u{2717} The following migration(s) revert a `CONCURRENTLY` index but do not set \
+             `run_in_transaction = false` and cannot be reverted safely:"
+        );
+        for name in &needs_opt_out {
+            eprintln!("    \u{2022} {name}");
+        }
+        eprintln!(
+            "  `PostgreSQL` rejects `CONCURRENTLY` index operations inside a transaction, so \
+             the revert would fail partway through. Add `run_in_transaction = false` to each \
+             migration's metadata.toml before running `autumn migrate down`."
+        );
+        std::process::exit(1);
+    }
+}
+
+/// Up-front (read-only, no lock) preflight of one target's rollback plan, run
+/// for every target before any is mutated. Exits on a plan that cannot be
+/// reverted, naming the target. Returns the planned version list so the caller
+/// can compare plans across targets before mutating any of them.
+fn preflight_rollback_target(
+    args: &DownArgs,
+    database_url: &str,
+    dir: &Path,
+    label: &str,
+) -> Vec<String> {
+    use autumn_web::migrate::applied_user_migrations;
+
+    let applied = applied_user_migrations(database_url, dir).unwrap_or_else(|e| {
+        eprintln!("\u{2717} Could not preflight rollback for {label}: {e}");
+        std::process::exit(1);
+    });
+    let plan = build_rollback_plan(args, &applied);
+    check_rollback_plan_revertable(&applied, &plan);
+    plan
+}
+
+/// Whether the targets' rollback plans diverge — i.e. not every target would
+/// revert the exact same ordered version list. Plans are computed from each
+/// target's own applied history, so divergence means a `down` would revert
+/// different versions per target.
+fn rollback_plans_diverge(plans: &[(String, Vec<String>)]) -> bool {
+    match plans.first() {
+        Some((_, first)) => plans.iter().any(|(_, plan)| plan != first),
+        None => false,
+    }
+}
+
+/// Refuse a multi-target rollback when the targets' plans diverge.
+///
+/// `down` computes each target's plan from that target's own applied history, so
+/// if a previous multi-target `migrate` failed partway (leaving, say, control at
+/// `A+B` but a shard at only `A`), a `--steps`/`--to` rollback would revert
+/// different versions per target — e.g. `B` on control but `A` on a lagging shard
+/// — leaving the fleet at mismatched schemas or dropping a still-needed
+/// migration's objects from a shard. Require the operator to reconcile and scope
+/// the command (`--shard`/`--control-only`) rather than diverge further.
+fn reject_divergent_rollback_plans(plans: &[(String, Vec<String>)]) {
+    if !rollback_plans_diverge(plans) {
+        return;
+    }
+    eprintln!("\u{2717} Refusing to roll back: target rollback plans diverge.");
+    eprintln!(
+        "  Each target's plan is computed from its own applied history, and they differ \u{2014}\n  \
+         likely because a previous multi-target migrate failed partway. Rolling back now\n  \
+         would leave targets at different schema versions (or drop a migration's objects\n  \
+         from a lagging target while keeping them on others)."
+    );
+    for (label, plan) in plans {
+        if plan.is_empty() {
+            eprintln!("    \u{2022} {label}: nothing to roll back");
+        } else {
+            eprintln!("    \u{2022} {label}: {}", plan.join(", "));
+        }
+    }
+    eprintln!(
+        "  Reconcile the targets first (`autumn migrate status` per target), then re-run\n  \
+         scoped with --shard <name> or --control-only to roll back one target at a time."
+    );
+    std::process::exit(1);
+}
+
 /// Roll back the planned user migrations on a single target database, under the
 /// migration advisory lock. Returns the number of migrations reverted.
 ///
@@ -862,14 +1292,23 @@ fn run_down(args: &DownArgs, with_maintenance: bool, target: &MigrateTarget) {
 /// stale between read and execute (e.g. two concurrent `down` runs).
 /// `maintenance_enabled` is shared across targets so maintenance mode is
 /// enabled at most once, the first time any target has work to do.
+///
+/// `preflighted_plan` is the version list computed for this target during the
+/// up-front (unlocked) preflight, which the cross-target divergence check
+/// verified was uniform across all targets. Under the lock we recompute the plan
+/// and compare: if a concurrent migrate/down changed this target's applied
+/// history since preflight, the plans differ and we abort *before mutating this
+/// target* — otherwise a multi-target rollback could revert a different version
+/// list here than on the targets already rolled back, diverging the fleet.
 fn run_down_target(
     args: &DownArgs,
     database_url: &str,
     dir: &Path,
     with_maintenance: bool,
     maintenance_enabled: &mut bool,
+    preflighted_plan: &[String],
 ) -> Result<usize, autumn_web::migrate::MigrationError> {
-    use autumn_web::migrate::revert_user_migrations_locked;
+    use autumn_web::migrate::{MigrationError, revert_user_migrations_locked};
 
     revert_user_migrations_locked(
         database_url,
@@ -877,61 +1316,32 @@ fn run_down_target(
         None,
         |applied| {
             let plan = build_rollback_plan(args, applied);
+
+            // Recheck under the lock that this target's plan still matches what
+            // preflight saw (and verified uniform across targets). A concurrent
+            // migrate/down may have changed the applied history in the window
+            // between preflight and acquiring this lock; rolling back a now-
+            // different version list would diverge this target from the ones
+            // already reverted.
+            if plan != preflighted_plan {
+                return Err(MigrationError::Migration(format!(
+                    "rollback plan for this target changed under the lock since preflight \
+                     (a concurrent migrate/down likely altered its applied history). \
+                     Preflighted [{}] but now [{}]. Aborting before mutating this target; \
+                     re-run `autumn migrate down` once migrations are quiesced.",
+                    preflighted_plan.join(", "),
+                    plan.join(", "),
+                )));
+            }
+
             if plan.is_empty() {
                 eprintln!("  \u{2713} Nothing to roll back.");
                 return Ok(plan);
             }
 
-            // Preflight: every planned migration must have an executable
-            // down.sql. Applied-but-missing-locally migrations (dir = None) are
-            // surfaced here by name rather than silently skipped.
-            let missing: Vec<&str> = plan
-                .iter()
-                .filter_map(|version| {
-                    let m = applied.iter().find(|m| &m.version == version)?;
-                    (!has_revertable_down_sql(m)).then_some(m.name.as_str())
-                })
-                .collect();
-            if !missing.is_empty() {
-                eprintln!(
-                    "\u{2717} The following migration(s) have no executable down.sql and cannot be reverted:"
-                );
-                for name in &missing {
-                    eprintln!("    \u{2022} {name}");
-                }
-                eprintln!(
-                    "  Add a down.sql to each migration before running `autumn migrate down`."
-                );
-                std::process::exit(1);
-            }
-
-            // Preflight: a down.sql running `CONCURRENTLY` index ops without
-            // `run_in_transaction = false` will fail inside Diesel's
-            // per-migration transaction. In a multi-step plan that failure lands
-            // after earlier (newer) reverts have already committed, so refuse
-            // the whole plan up front rather than leave a partial rollback.
-            let needs_opt_out: Vec<&str> = plan
-                .iter()
-                .filter_map(|version| {
-                    let m = applied.iter().find(|m| &m.version == version)?;
-                    down_sql_concurrent_without_opt_out(m).then_some(m.name.as_str())
-                })
-                .collect();
-            if !needs_opt_out.is_empty() {
-                eprintln!(
-                    "\u{2717} The following migration(s) revert a `CONCURRENTLY` index but do not set \
-                     `run_in_transaction = false` and cannot be reverted safely:"
-                );
-                for name in &needs_opt_out {
-                    eprintln!("    \u{2022} {name}");
-                }
-                eprintln!(
-                    "  `PostgreSQL` rejects `CONCURRENTLY` index operations inside a transaction, so \
-                     the revert would fail partway through. Add `run_in_transaction = false` to each \
-                     migration's metadata.toml before running `autumn migrate down`."
-                );
-                std::process::exit(1);
-            }
+            // Re-validate under the lock (defense-in-depth against the plan
+            // going stale between the up-front preflight and here).
+            check_rollback_plan_revertable(applied, &plan);
 
             // Preflight passed: enable maintenance mode (if requested and not
             // already enabled for an earlier target) before we mutate schema,
@@ -1005,11 +1415,17 @@ fn show_status(database_url: &str, migrations_dir: &str) {
     show_diesel_migration_status(database_url, Path::new(migrations_dir));
 }
 
-fn show_framework_status(database_url: &str) {
+fn show_framework_status(database_url: &str, is_shard: bool) {
     eprintln!("  Checking Autumn framework migration status...\n");
 
-    match pending_framework_migrations_inner(database_url, autumn_web::migrate::pending_migrations)
-    {
+    // Shard targets require only the shard framework migrations (version
+    // history + commit-hook queue); the control plane requires the full set.
+    let pending = if is_shard {
+        autumn_web::migrate::pending_shard_framework_migrations(database_url)
+    } else {
+        pending_framework_migrations_inner(database_url, autumn_web::migrate::pending_migrations)
+    };
+    match pending {
         Ok(pending) if pending.is_empty() => {
             eprintln!("  Framework migrations are up to date.");
         }
@@ -1317,33 +1733,129 @@ mod tests {
         );
     }
 
+    // ── effective_profile ─────────────────────────────────────────────────────
+
+    #[test]
+    fn effective_profile_prefers_autumn_env_over_legacy_and_flag() {
+        temp_env::with_vars(
+            [
+                ("AUTUMN_ENV", Some("prod")),
+                ("AUTUMN_PROFILE", Some("dev")),
+                ("AUTUMN_IS_DEBUG", None),
+            ],
+            || {
+                // AUTUMN_ENV wins over a stale legacy AUTUMN_PROFILE and an
+                // explicit --profile flag, mirroring the runtime loader.
+                assert_eq!(effective_profile(Some("staging")), "prod");
+            },
+        );
+    }
+
+    #[test]
+    fn effective_profile_uses_legacy_when_no_autumn_env() {
+        temp_env::with_vars(
+            [
+                ("AUTUMN_ENV", None),
+                ("AUTUMN_PROFILE", Some("prod")),
+                ("AUTUMN_IS_DEBUG", None),
+            ],
+            || {
+                assert_eq!(effective_profile(None), "prod");
+            },
+        );
+    }
+
+    #[test]
+    fn effective_profile_uses_explicit_flag_when_no_env() {
+        temp_env::with_vars(
+            [
+                ("AUTUMN_ENV", None::<&str>),
+                ("AUTUMN_PROFILE", None),
+                ("AUTUMN_IS_DEBUG", None),
+            ],
+            || {
+                assert_eq!(effective_profile(Some("staging")), "staging");
+            },
+        );
+    }
+
+    #[test]
+    fn effective_profile_defaults_to_dev() {
+        temp_env::with_vars(
+            [
+                ("AUTUMN_ENV", None::<&str>),
+                ("AUTUMN_PROFILE", None),
+                ("AUTUMN_IS_DEBUG", None),
+            ],
+            || {
+                // No env, no flag, debug build → dev (the runtime default), so the
+                // CLI applies the same [profile.dev]/autumn-dev.toml overlay.
+                assert_eq!(effective_profile(None), "dev");
+            },
+        );
+    }
+
+    #[test]
+    fn effective_profile_release_mode_defaults_to_prod() {
+        temp_env::with_vars(
+            [
+                ("AUTUMN_ENV", None),
+                ("AUTUMN_PROFILE", None),
+                ("AUTUMN_IS_DEBUG", Some("0")),
+            ],
+            || {
+                assert_eq!(effective_profile(None), "prod");
+            },
+        );
+    }
+
+    #[test]
+    fn profile_file_lookup_prefers_selected_spelling() {
+        // Overlay file probe order prefers the spelling the operator selected.
+        assert_eq!(
+            profile_file_lookup_names("prod"),
+            vec!["prod", "production"]
+        );
+        assert_eq!(
+            profile_file_lookup_names("production"),
+            vec!["production", "prod"]
+        );
+        assert_eq!(profile_file_lookup_names("dev"), vec!["dev", "development"]);
+        assert_eq!(
+            profile_file_lookup_names("development"),
+            vec!["development", "dev"]
+        );
+        // Custom profiles are used verbatim.
+        assert_eq!(profile_file_lookup_names("staging"), vec!["staging"]);
+    }
+
     // ── is_production_profile ─────────────────────────────────────────────────
 
     #[test]
     fn is_production_profile_detects_prod() {
         temp_env::with_var("AUTUMN_ENV", Some("prod"), || {
-            assert!(is_production_profile());
+            assert!(is_production_profile(None));
         });
     }
 
     #[test]
     fn is_production_profile_detects_production() {
         temp_env::with_var("AUTUMN_ENV", Some("production"), || {
-            assert!(is_production_profile());
+            assert!(is_production_profile(None));
         });
     }
 
     #[test]
     fn is_production_profile_case_insensitive() {
         temp_env::with_var("AUTUMN_ENV", Some("PROD"), || {
-            assert!(is_production_profile());
+            assert!(is_production_profile(None));
         });
     }
 
     #[test]
     fn is_production_profile_false_for_dev() {
         temp_env::with_var("AUTUMN_ENV", Some("dev"), || {
-            assert!(!is_production_profile());
+            assert!(!is_production_profile(None));
         });
     }
 
@@ -1352,7 +1864,7 @@ mod tests {
         temp_env::with_vars(
             [("AUTUMN_ENV", None), ("AUTUMN_PROFILE", Some("production"))],
             || {
-                assert!(is_production_profile());
+                assert!(is_production_profile(None));
             },
         );
     }
@@ -1367,7 +1879,7 @@ mod tests {
                 ("AUTUMN_PROFILE", Some("prod")),
             ],
             || {
-                assert!(is_production_profile());
+                assert!(is_production_profile(None));
             },
         );
     }
@@ -1383,7 +1895,7 @@ mod tests {
                 ("AUTUMN_IS_DEBUG", Some("0")),
             ],
             || {
-                assert!(is_production_profile());
+                assert!(is_production_profile(None));
             },
         );
     }
@@ -1397,7 +1909,7 @@ mod tests {
                 ("AUTUMN_IS_DEBUG", Some("1")),
             ],
             || {
-                assert!(!is_production_profile());
+                assert!(!is_production_profile(None));
             },
         );
     }
@@ -1412,7 +1924,7 @@ mod tests {
                 ("AUTUMN_IS_DEBUG", Some("0")),
             ],
             || {
-                assert!(!is_production_profile());
+                assert!(!is_production_profile(None));
             },
         );
     }
@@ -1430,6 +1942,42 @@ mod tests {
             name: format!("{version}_m"),
             dir: Some(std::path::PathBuf::from(format!("migrations/{version}_m"))),
         }
+    }
+
+    #[test]
+    fn rollback_plans_diverge_detects_mismatched_targets() {
+        let plan = |label: &str, versions: &[&str]| {
+            (
+                label.to_owned(),
+                versions.iter().map(|v| (*v).to_owned()).collect::<Vec<_>>(),
+            )
+        };
+
+        // Identical plans across targets: a healthy uniform rollback.
+        assert!(!rollback_plans_diverge(&[
+            plan("control", &["20260102000000"]),
+            plan("shard:s0", &["20260102000000"]),
+        ]));
+
+        // A lagging shard whose newest applied differs reverts a different
+        // version — must be flagged.
+        assert!(rollback_plans_diverge(&[
+            plan("control", &["20260102000000"]),
+            plan("shard:s0", &["20260101000000"]),
+        ]));
+
+        // A target that has nothing to roll back while others do also diverges.
+        assert!(rollback_plans_diverge(&[
+            plan("control", &["20260102000000"]),
+            plan("shard:s0", &[]),
+        ]));
+
+        // A single target (scoped with --shard / --control-only) never diverges.
+        assert!(!rollback_plans_diverge(&[plan(
+            "shard:s0",
+            &["20260102000000"]
+        )]));
+        assert!(!rollback_plans_diverge(&[]));
     }
 
     #[test]
@@ -1615,6 +2163,64 @@ mod tests {
         assert!(called);
         assert_eq!(
             pending,
+            vec!["20260512000000_create_api_tokens".to_string()]
+        );
+    }
+
+    // ── Shard-specific framework migrations (§5a) ──────────────────────────────
+    //
+    // Shards hold tenant data and need only the version-history and
+    // commit-hook queue tables — not the full control-plane schema (API tokens,
+    // sessions, jobs, …).  `run_shard_framework_migrations_inner` is the
+    // testable core; in production it delegates to
+    // `autumn_web::migrate::run_pending_shard_framework_migrations`.
+
+    #[test]
+    fn shard_target_applies_only_shard_framework_migrations() {
+        let mut called = false;
+
+        let result =
+            run_shard_framework_migrations_inner("postgres://shard0/app", |database_url| {
+                assert_eq!(database_url, "postgres://shard0/app");
+                called = true;
+                Ok(autumn_web::migrate::MigrationResult {
+                    applied: vec![
+                        "vh_migration".to_string(),
+                        "commit_hook_migration".to_string(),
+                    ],
+                })
+            })
+            .unwrap();
+
+        assert!(called, "shard framework migration helper must be called");
+        assert_eq!(
+            result.applied,
+            vec!["vh_migration", "commit_hook_migration"]
+        );
+    }
+
+    #[test]
+    fn control_target_still_uses_full_framework_migrations() {
+        let mut called_with_url = String::new();
+        let mut called = false;
+
+        let result =
+            run_framework_migrations_inner("postgres://control/app", |database_url, _embedded| {
+                called_with_url = database_url.to_owned();
+                called = true;
+                Ok(autumn_web::migrate::MigrationResult {
+                    applied: vec!["20260512000000_create_api_tokens".to_string()],
+                })
+            })
+            .unwrap();
+
+        assert!(
+            called,
+            "run_framework_migrations_inner must call the closure"
+        );
+        assert_eq!(called_with_url, "postgres://control/app");
+        assert_eq!(
+            result.applied,
             vec!["20260512000000_create_api_tokens".to_string()]
         );
     }
@@ -1861,6 +2467,188 @@ primary_url = "postgres://toml:5432/app"
     #[test]
     fn shard_urls_empty_without_shards() {
         assert!(resolve_shard_database_urls_from_sources(no_env, None).is_empty());
+    }
+
+    // ── deep_merge_toml / profile overlay ──────────────────────────────────
+
+    #[test]
+    fn deep_merge_toml_overlay_scalar_wins() {
+        let mut base = toml::from_str::<toml::Table>(
+            r#"
+[database]
+primary_url = "postgres://base:5432/app"
+pool_size = 5
+"#,
+        )
+        .unwrap();
+        let overlay = toml::from_str::<toml::Table>(
+            r#"
+[database]
+primary_url = "postgres://prod:5432/app"
+"#,
+        )
+        .unwrap();
+
+        deep_merge_toml(&mut base, overlay);
+
+        let database = base
+            .get("database")
+            .and_then(toml::Value::as_table)
+            .unwrap();
+        // Overlay scalar replaces the base value...
+        assert_eq!(
+            database.get("primary_url").and_then(toml::Value::as_str),
+            Some("postgres://prod:5432/app")
+        );
+        // ...while base-only keys in the same table are preserved.
+        assert_eq!(
+            database.get("pool_size").and_then(toml::Value::as_integer),
+            Some(5)
+        );
+    }
+
+    #[test]
+    fn deep_merge_toml_arrays_replaced_wholesale() {
+        // Shard arrays must be replaced, not concatenated, so a profile can
+        // point at an entirely different set of shard databases.
+        let mut base = toml::from_str::<toml::Table>(
+            r#"
+[[database.shards]]
+name = "s0"
+primary_url = "postgres://base-s0:5432/app"
+"#,
+        )
+        .unwrap();
+        let overlay = toml::from_str::<toml::Table>(
+            r#"
+[[database.shards]]
+name = "s0"
+primary_url = "postgres://prod-s0:5432/app"
+"#,
+        )
+        .unwrap();
+
+        deep_merge_toml(&mut base, overlay);
+
+        let shards = resolve_shard_database_urls_from_sources(no_env, Some(&base));
+        assert_eq!(
+            shards,
+            vec![("s0".to_owned(), "postgres://prod-s0:5432/app".to_owned())]
+        );
+    }
+
+    #[test]
+    fn profile_overlay_overrides_shard_url() {
+        // End-to-end through the file loader: a base autumn.toml plus an
+        // autumn-prod.toml overlay; --profile prod resolves the prod URLs.
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join("autumn.toml"),
+            r#"
+[database]
+primary_url = "postgres://base-control:5432/app"
+
+[[database.shards]]
+name = "s0"
+primary_url = "postgres://base-s0:5432/app"
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("autumn-prod.toml"),
+            r#"
+[database]
+primary_url = "postgres://prod-control:5432/app"
+
+[[database.shards]]
+name = "s0"
+primary_url = "postgres://prod-s0:5432/app"
+"#,
+        )
+        .unwrap();
+
+        let with_profile = read_autumn_toml_table_with_profile_in(tmp.path(), Some("prod"));
+        let without_profile = read_autumn_toml_table_with_profile_in(tmp.path(), None);
+
+        let merged = with_profile.unwrap();
+        assert_eq!(
+            resolve_primary_database_url_from_sources(no_env, Some(&merged)).as_deref(),
+            Some("postgres://prod-control:5432/app")
+        );
+        assert_eq!(
+            resolve_shard_database_urls_from_sources(no_env, Some(&merged)),
+            vec![("s0".to_owned(), "postgres://prod-s0:5432/app".to_owned())]
+        );
+
+        // Without a profile, the base file is returned unchanged.
+        let base = without_profile.unwrap();
+        assert_eq!(
+            resolve_primary_database_url_from_sources(no_env, Some(&base)).as_deref(),
+            Some("postgres://base-control:5432/app")
+        );
+    }
+
+    #[test]
+    fn overlay_file_resolved_via_profile_alias() {
+        // Operator selects `production`, but the overlay file uses the common
+        // `autumn-prod.toml` spelling — the alias must still resolve it, just
+        // like the runtime loader.
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join("autumn.toml"),
+            "[database]\nprimary_url = \"postgres://base:5432/app\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("autumn-prod.toml"),
+            "[database]\nprimary_url = \"postgres://prod:5432/app\"\n",
+        )
+        .unwrap();
+
+        let merged =
+            read_autumn_toml_table_with_profile_in(tmp.path(), Some("production")).unwrap();
+        assert_eq!(
+            resolve_primary_database_url_from_sources(no_env, Some(&merged)).as_deref(),
+            Some("postgres://prod:5432/app")
+        );
+    }
+
+    #[test]
+    fn inline_profile_section_overrides_base_url() {
+        // A deployment that keeps prod URLs in an inline `[profile.prod.*]`
+        // section of autumn.toml (no separate autumn-prod.toml) must still
+        // resolve the prod URLs under `--profile prod`, matching the runtime
+        // loader. `production` is honored as an alias for `prod`.
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join("autumn.toml"),
+            r#"
+[database]
+primary_url = "postgres://base-control:5432/app"
+
+[[database.shards]]
+name = "s0"
+primary_url = "postgres://base-s0:5432/app"
+
+[profile.production.database]
+primary_url = "postgres://prod-control:5432/app"
+
+[[profile.production.database.shards]]
+name = "s0"
+primary_url = "postgres://prod-s0:5432/app"
+"#,
+        )
+        .unwrap();
+
+        let merged = read_autumn_toml_table_with_profile_in(tmp.path(), Some("prod")).unwrap();
+        assert_eq!(
+            resolve_primary_database_url_from_sources(no_env, Some(&merged)).as_deref(),
+            Some("postgres://prod-control:5432/app")
+        );
+        assert_eq!(
+            resolve_shard_database_urls_from_sources(no_env, Some(&merged)),
+            vec![("s0".to_owned(), "postgres://prod-s0:5432/app".to_owned())]
+        );
     }
 
     // ── check_concurrent_index_transaction_opt_out ────────────────────────

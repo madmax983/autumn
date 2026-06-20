@@ -900,6 +900,36 @@ impl TestApp {
         self
     }
 
+    /// Configure the application's horizontal shards programmatically, as if
+    /// they were declared via `[[database.shards]]` in `autumn.toml`.
+    ///
+    /// This is the escape hatch for tests that spin up shard databases at
+    /// runtime (e.g. one Postgres container per shard) and need to point the
+    /// app at them without writing a config file. Combine with
+    /// [`transactional`](Self::transactional) to get rolled-back shard writes.
+    ///
+    /// ```rust,no_run
+    /// use autumn_web::test::TestApp;
+    /// use autumn_web::config::ShardConfig;
+    ///
+    /// # fn example(shard0: String, shard1: String) {
+    /// let client = TestApp::new()
+    ///     .with_transactional_db("postgres://localhost/control")
+    ///     .with_shards(vec![
+    ///         ShardConfig { name: "shard0".into(), primary_url: shard0, ..Default::default() },
+    ///         ShardConfig { name: "shard1".into(), primary_url: shard1, ..Default::default() },
+    ///     ])
+    ///     .build();
+    /// # let _ = client;
+    /// # }
+    /// ```
+    #[cfg(feature = "db")]
+    #[must_use]
+    pub fn with_shards(mut self, shards: Vec<crate::config::ShardConfig>) -> Self {
+        self.config.database.shards = shards;
+        self
+    }
+
     /// Register a canned HTTP response for outbound requests made via the
     /// [`Client`](crate::http_client::Client) extractor during this test.
     ///
@@ -1023,6 +1053,35 @@ impl TestApp {
             (self.pool, self.replica_pool, self.db_interceptor)
         };
 
+        // Mirror production router selection (see `setup_database`): when the
+        // test config enables directory routing, build a `DirectoryShardRouter`
+        // over the control pool so tests that pin tenants in
+        // `_autumn_shard_directory` route the same way production would.
+        #[cfg(feature = "db")]
+        let shard_router: std::sync::Arc<dyn crate::sharding::ShardRouter> =
+            match (self.config.database.directory_shard_router, &pool) {
+                (true, Some(control_pool)) => {
+                    let timeout_ms = self.config.database.statement_timeout.map_or(0, |d| {
+                        u64::try_from(d.as_millis())
+                            .unwrap_or(i32::MAX as u64)
+                            .min(i32::MAX as u64)
+                    });
+                    std::sync::Arc::new(
+                        crate::sharding::DirectoryShardRouter::new(control_pool.clone())
+                            .with_statement_timeout_ms(timeout_ms),
+                    )
+                }
+                // Production `setup_database` errors here (the directory router
+                // needs a control DB), so fail the test app the same way rather
+                // than silently routing by hash and passing a test the deployed
+                // app would fail.
+                (true, None) => panic!(
+                    "directory_shard_router is enabled but TestApp has no control database pool; \
+                     configure a control pool (with_db) or disable directory routing"
+                ),
+                (false, _) => std::sync::Arc::new(crate::sharding::HashShardRouter),
+            };
+
         let probes = crate::probe::ProbeState::ready_for_test();
         #[cfg(feature = "ws")]
         let test_channels = crate::channels::Channels::new(32);
@@ -1037,15 +1096,24 @@ impl TestApp {
             replica_pool,
             // Build the shard set from the test config so handlers using
             // the sharding extractors behave as they would in production.
-            // Pools are lazy, so this needs no running databases. Note the
-            // transactional test interceptor wraps only the control pool:
-            // shard checkouts in tests are not rolled back.
+            // Pools are lazy, so this needs no running databases.
+            //
+            // Under transactional isolation each shard primary pool is built
+            // with `max_size(1)` and a `begin_test_transaction` hook (mirroring
+            // the control pool above) so writes routed to a shard are rolled
+            // back at the end of the test — the same isolation the control pool
+            // gets. Replicas are skipped; all shard reads run on the primary.
             #[cfg(feature = "db")]
-            shards: crate::sharding::create_shard_set(
-                &self.config.database,
-                std::sync::Arc::new(crate::sharding::HashShardRouter),
-            )
-            .expect("test shard pools should build from config"),
+            shards: if self.transactional {
+                crate::sharding::create_shard_set_transactional(
+                    &self.config.database,
+                    shard_router.clone(),
+                )
+                .expect("transactional test shard pools should build from config")
+            } else {
+                crate::sharding::create_shard_set(&self.config.database, shard_router.clone())
+                    .expect("test shard pools should build from config")
+            },
             profile: self.config.profile.clone(),
             started_at: std::time::Instant::now(),
             health_detailed: self.config.health.detailed,

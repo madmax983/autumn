@@ -142,6 +142,10 @@ fn compile_pass_tests() {
     // shard_key model attribute (requires db feature)
     #[cfg(feature = "db")]
     t.pass("tests/compile-pass/model_shard_key.rs");
+
+    // Sharded repository: self-routing FromRequestParts (requires db feature)
+    #[cfg(feature = "db")]
+    t.pass("tests/compile-pass/repository_sharded.rs");
 }
 
 #[cfg(feature = "db")]
