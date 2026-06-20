@@ -3680,7 +3680,7 @@ impl AppBuilder {
         )
         .unwrap_or_else(|error| {
             eprintln!("Failed to configure mailer: {error}");
-            build_mode_exit_stop_pg();
+            exit_stop_managed_pg();
             std::process::exit(1);
         });
         #[cfg(feature = "mail")]
@@ -3746,7 +3746,7 @@ impl AppBuilder {
         )
         .unwrap_or_else(|error| {
             eprintln!("Failed to build router: {error}");
-            build_mode_exit_stop_pg();
+            exit_stop_managed_pg();
             std::process::exit(1);
         });
 
@@ -3764,7 +3764,7 @@ impl AppBuilder {
             }
             Err(e) => {
                 eprintln!("\n  \u{2717} Static build failed: {e}");
-                build_mode_exit_stop_pg();
+                exit_stop_managed_pg();
                 std::process::exit(1);
             }
         }
@@ -4157,6 +4157,7 @@ impl AppBuilder {
         )
         .unwrap_or_else(|error| {
             eprintln!("Failed to configure mailer: {error}");
+            exit_stop_managed_pg();
             std::process::exit(1);
         });
 
@@ -4174,6 +4175,8 @@ impl AppBuilder {
         let task_shutdown = tokio_util::sync::CancellationToken::new();
         if let Err(error) = initialize_job_runtime(jobs, &state, &task_shutdown, &config.jobs) {
             eprintln!("job runtime initialization failed: {error}");
+            #[cfg(feature = "managed-pg")]
+            crate::managed_pg::emergency_stop_async().await;
             std::process::exit(1);
         }
 
@@ -4199,6 +4202,8 @@ impl AppBuilder {
         if let Err(error) = run_startup_hooks(&startup_hooks, state.clone()).await {
             eprintln!("startup hook failed: {error}");
             task_shutdown.cancel();
+            #[cfg(feature = "managed-pg")]
+            crate::managed_pg::emergency_stop_async().await;
             std::process::exit(1);
         }
         state.probes().mark_startup_complete();
@@ -4245,17 +4250,18 @@ pub(crate) fn is_static_build_mode() -> bool {
     std::env::var("AUTUMN_BUILD_STATIC").as_deref() == Ok("1")
 }
 
-/// Stop a managed Postgres child from a synchronous `process::exit` path in
-/// static-build mode. Build mode never runs `on_shutdown` and `process::exit`
-/// skips `Drop`, so a managed cluster started by `setup_database` would
-/// otherwise be orphaned on the data dir/port.
+/// Stop a managed Postgres child from a synchronous `process::exit` path in a
+/// non-server entrypoint (static build, one-off task). Those modes don't run
+/// `on_shutdown` before their failure exits, and `process::exit` skips `Drop`,
+/// so a managed cluster started by `setup_database` would otherwise be orphaned
+/// on the data dir/port.
 ///
 /// These call sites run on a Tokio worker thread; the (blocking, own-runtime)
 /// `emergency_stop` would panic if entered there, so run it on a fresh thread
 /// with no ambient runtime. No-op unless the `managed-pg` feature is active.
 // The body is empty without `managed-pg` (so it can't be `const` with it).
 #[allow(clippy::missing_const_for_fn)]
-fn build_mode_exit_stop_pg() {
+fn exit_stop_managed_pg() {
     #[cfg(feature = "managed-pg")]
     {
         let _ = std::thread::spawn(crate::managed_pg::emergency_stop).join();
