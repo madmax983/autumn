@@ -616,7 +616,7 @@ pub fn effective_profile(explicit: Option<&str>) -> String {
 }
 
 /// Whether a resolved profile name is production (`prod`/`production`).
-fn is_production_profile_name(profile: &str) -> bool {
+pub fn is_production_profile_name(profile: &str) -> bool {
     let normalized = profile.trim().to_ascii_lowercase();
     normalized == "prod" || normalized == "production"
 }
@@ -762,7 +762,19 @@ fn deep_merge_toml(base: &mut toml::Table, overlay: toml::Table) {
     }
 }
 
-fn resolve_primary_database_url_from_sources<F>(
+/// Resolve the primary/write database URL for the given profile using the
+/// exact same layering as `autumn migrate` (defaults → `autumn.toml` →
+/// `autumn-{profile}.toml` → `AUTUMN_*` / `DATABASE_URL` / `primary_url`).
+///
+/// Returns `None` when no URL can be resolved, leaving the caller to decide how
+/// to report the failure (the `autumn db` commands surface their own message).
+pub fn resolve_primary_url(profile: Option<&str>) -> Option<String> {
+    let effective = effective_profile(profile);
+    let config_table = read_autumn_toml_table_with_profile(Some(&effective));
+    resolve_primary_database_url_from_sources(|key| std::env::var(key), config_table.as_ref())
+}
+
+pub fn resolve_primary_database_url_from_sources<F>(
     env_var: F,
     table: Option<&toml::Table>,
 ) -> Option<String>

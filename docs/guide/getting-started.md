@@ -319,21 +319,20 @@ async fn list_items(Query(params): Query<Pagination>) -> String {
 
 Autumn uses [Diesel](https://diesel.rs/) with
 [diesel-async](https://github.com/weiznich/diesel_async) and
-[deadpool](https://docs.rs/deadpool) for async Postgres connections.
+[deadpool](https://docs.rs/deadpool) for async Postgres connections. Autumn
+drives Diesel for you — the steps below stand up and migrate the database using
+`autumn` commands end to end.
 
 ### 1. Install the Diesel CLI
+
+`autumn migrate` shells out to the Diesel CLI to apply migrations, so install it
+once:
 
 ```bash
 cargo install diesel_cli --no-default-features --features postgres
 ```
 
-### 2. Create a database
-
-```bash
-createdb my_app
-```
-
-### 3. Configure the connection
+### 2. Configure the connection
 
 Edit `autumn.toml` and uncomment the `[database]` section:
 
@@ -370,14 +369,25 @@ export AUTUMN_DATABASE__PRIMARY_URL="postgres://localhost/my_app"
 
 (Note the double underscore `__` separating section from field.)
 
+### 3. Create the database
+
+```bash
+autumn db create
+```
+
+`autumn db create` reads the connection you just configured and creates the
+database on its server. It is idempotent — run it again and it simply reports
+that the database already exists. (Need a clean slate while iterating on your
+schema? See `autumn db reset` below.)
+
 ### 4. Create a migration
 
 ```bash
-diesel setup --database-url postgres://localhost/my_app
-diesel migration generate create_todos
+autumn generate migration CreateTodos
 ```
 
-Edit the generated `up.sql`:
+This emits a timestamped migration directory under `migrations/` with `up.sql`
+and `down.sql` files. Edit the generated `up.sql`:
 
 ```sql
 CREATE TABLE todos (
@@ -397,11 +407,16 @@ DROP TABLE todos;
 Run it:
 
 ```bash
-diesel migration run --database-url postgres://localhost/my_app
+autumn migrate
 ```
 
-This also generates `src/schema.rs` with Diesel's table macro. If it doesn't
-appear, run `diesel print-schema > src/schema.rs`.
+`autumn migrate` applies every pending migration to the primary database and
+regenerates `src/schema.rs` with Diesel's table macro.
+
+> **Tip — reset the dev database.** While iterating on your schema, run
+> `autumn db reset` to drop, recreate, migrate, and (when a `src/bin/seed.rs`
+> exists) seed the database in a single step. It refuses to run against a
+> production profile unless you pass `--force`.
 
 ---
 
