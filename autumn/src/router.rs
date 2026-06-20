@@ -621,6 +621,24 @@ fn build_router_pre_state(
         };
         let mut mcp_router =
             crate::mcp::build_mcp_router(&mount_path, tools, dispatch, wiring, endpoint_layer);
+        // Bound the envelope's own metadata/auth work (initialize, tools/list,
+        // and the `secure_mcp` auth rejections that never reach the dispatch
+        // clone) by the global inbound deadline. The `/mcp` router is merged
+        // after `apply_middleware`, so the timeout layer installed there does
+        // NOT wrap it; without this the prod global deadline would not bound
+        // this surface. Applied innermost of the envelope's added layers so a
+        // timeout 503 still flows out through the rate-limit, security-header,
+        // and CORS layers below (and stays CORS-readable). The `tools/call`
+        // replay is already bounded — the dispatch clone carries the timeout
+        // layer from `apply_middleware`. Route-level overrides do not apply to
+        // the fixed mount path, so an empty override table is passed (the layer
+        // is a no-op when the global timeout is disabled).
+        mcp_router = apply_request_timeout_middleware(
+            mcp_router,
+            config,
+            state.metrics.clone(),
+            std::sync::Arc::new(std::collections::HashMap::new()),
+        );
         // Gate the envelope under maintenance mode, mirroring the layer
         // `apply_middleware` installs for direct routes. The `/mcp` router is
         // merged after that layer, so without this `initialize`/`tools/list`
@@ -1849,13 +1867,30 @@ fn build_route_timeout_table(
         if matches!(timeout, crate::route::RouteTimeout::Inherit) {
             return;
         }
-        // Key by (path, method) so an override on one handler never bleeds onto
-        // sibling methods that share the template. A single method+path is
-        // unique across the router, so `insert` cannot lose a competing entry.
-        table
-            .entry(path)
-            .or_default()
-            .insert(method.clone(), timeout);
+        // Key by (path, *effective request method*) so an override on one handler
+        // never bleeds onto sibling methods that share the template, while still
+        // resolving when the request reaches the handler through a method alias.
+        // `request_timeout_handler` looks up `req.method()`, which differs from
+        // the declared method in two cases:
+        //   - axum serves `HEAD` through a `#[get]` handler, so a GET override
+        //     must also cover HEAD.
+        //   - `#[ws]` records the synthetic `WS` method but mounts a `GET`
+        //     handler, so the upgrade (and its auth work) arrives as GET.
+        // Each (effective method, path) pair is still unique across the router, so
+        // `insert` cannot lose a competing entry.
+        let by_method = table.entry(path).or_default();
+        match method.as_str() {
+            "WS" => {
+                by_method.insert(http::Method::GET, timeout);
+            }
+            _ if *method == http::Method::GET => {
+                by_method.insert(http::Method::GET, timeout);
+                by_method.insert(http::Method::HEAD, timeout);
+            }
+            _ => {
+                by_method.insert(method.clone(), timeout);
+            }
+        }
     };
     for route in route_list {
         insert(route.path.to_owned(), &route.method, route.timeout);
@@ -5199,6 +5234,78 @@ mod trusted_host_tests {
         // assert the no-route base case yields a zero-overhead empty table.
         let table = build_route_timeout_table(&[], &[]);
         assert!(table.is_empty(), "no routes ⇒ empty override table");
+    }
+
+    /// Build a minimal `Route` carrying just the fields `build_route_timeout_table`
+    /// reads (method, path, timeout); the handler is a no-op.
+    fn timeout_route(
+        method: http::Method,
+        path: &'static str,
+        timeout: crate::route::RouteTimeout,
+    ) -> Route {
+        async fn noop() -> &'static str {
+            "ok"
+        }
+        Route {
+            method,
+            path,
+            handler: axum::routing::get(noop),
+            name: "noop",
+            api_doc: crate::openapi::ApiDoc::default(),
+            repository: None,
+            idempotency: crate::route::RouteIdempotency::Direct,
+            timeout,
+            api_version: None,
+            sunset_opt_out: false,
+        }
+    }
+
+    #[test]
+    fn build_route_timeout_table_normalizes_method_aliases() {
+        let override_10s =
+            crate::route::RouteTimeout::Override(std::time::Duration::from_secs(10));
+        let routes = vec![
+            // A GET handler also serves HEAD in axum.
+            timeout_route(http::Method::GET, "/export", override_10s),
+            // A `#[ws]` route records the synthetic `WS` method but the upgrade
+            // arrives as GET.
+            timeout_route(
+                http::Method::from_bytes(b"WS").unwrap(),
+                "/live",
+                crate::route::RouteTimeout::Disabled,
+            ),
+            // A non-aliased method keys only itself.
+            timeout_route(http::Method::POST, "/submit", override_10s),
+        ];
+
+        let table = build_route_timeout_table(&routes, &[]);
+
+        // GET override is reachable via both GET and HEAD.
+        let export = table.get("/export").expect("/export keyed");
+        assert_eq!(export.get(&http::Method::GET), Some(&override_10s));
+        assert_eq!(
+            export.get(&http::Method::HEAD),
+            Some(&override_10s),
+            "a GET override must also cover the HEAD alias axum serves"
+        );
+
+        // WS override is reachable via the GET the upgrade actually uses, and is
+        // NOT left under the synthetic `WS` method the lookup never sees.
+        let live = table.get("/live").expect("/live keyed");
+        assert_eq!(
+            live.get(&http::Method::GET),
+            Some(&crate::route::RouteTimeout::Disabled),
+            "a WS override must be keyed under the GET the upgrade arrives as"
+        );
+        assert!(
+            live.get(&http::Method::from_bytes(b"WS").unwrap()).is_none(),
+            "the synthetic WS method is never seen at lookup time"
+        );
+
+        // A non-aliased method keys only itself — no HEAD bleed.
+        let submit = table.get("/submit").expect("/submit keyed");
+        assert_eq!(submit.get(&http::Method::POST), Some(&override_10s));
+        assert!(submit.get(&http::Method::HEAD).is_none());
     }
 
     // ----------------------------------------------------------------------
