@@ -2960,10 +2960,18 @@ impl AutumnConfig {
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct RequestTimeoutsConfig {
     /// Maximum time in milliseconds allowed for a complete request-response
-    /// cycle. When exceeded the framework returns `408 Request Timeout` with
-    /// a Problem Details body. `None` (default) or `0` disables the timeout.
+    /// cycle. When exceeded the framework returns `503 Service Unavailable`
+    /// rendered as Problem Details JSON for API clients (and the standard error
+    /// page for browser requests). `None` (default) or `0` disables the timeout.
     ///
-    /// Configured via `AUTUMN_SERVER__TIMEOUTS__REQUEST_TIMEOUT_MS`.
+    /// The deadline bounds the time to produce the response head, so streaming
+    /// responses (SSE, long-poll, chunked bodies) and WebSocket upgrades are not
+    /// interrupted. Per-route overrides are available via the route macro
+    /// (`#[get("/slow", timeout_ms = 120000)]` or `timeout = "off"`).
+    ///
+    /// The `prod` profile smart-defaults this to `30000` (30s); `dev` and custom
+    /// profiles leave it disabled. Configured via
+    /// `AUTUMN_SERVER__TIMEOUTS__REQUEST_TIMEOUT_MS`.
     #[serde(default)]
     pub request_timeout_ms: Option<u64>,
 }

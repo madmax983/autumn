@@ -12,9 +12,58 @@ and the common recipes.
 
 ---
 
-## Quick start
+## Built-in request timeout
 
-Apply a Tower timeout layer to every route in the app:
+You do **not** need a tower layer for a per-request deadline — Autumn ships one.
+Set a single config key and a hung handler returns a framework-standard `503`
+(Problem Details JSON for API clients, the HTML error page for browsers) and
+frees its worker, instead of letting one slow request starve the pool:
+
+```toml
+# autumn.toml
+[server.timeouts]
+request_timeout_ms = 30000  # 0 or unset disables the deadline
+```
+
+Override at runtime with `AUTUMN_SERVER__TIMEOUTS__REQUEST_TIMEOUT_MS`. The
+`prod` profile smart-defaults this to `30000` (30s), so a fresh `autumn new` app
+is production-safe with **zero** user-written tower layers; `dev` leaves it off.
+
+A timeout emits structured telemetry — a `request_timeouts_total` counter plus a
+`tracing` warning (target `autumn::timeout`) carrying the `route` template and
+`elapsed_ms` — so you can alert on it.
+
+### What the deadline covers
+
+The deadline bounds the time to produce the **response head**, not the duration
+of body streaming. So **SSE, long-poll, and chunked/streaming responses are
+exempt** — they are never interrupted mid-stream. WebSocket upgrades (`#[ws]`)
+are exempt automatically.
+
+### Per-route overrides
+
+Extend the deadline for known-slow endpoints, or disable it entirely, right on
+the route — no manual tower wiring:
+
+```rust,no_run
+use autumn_web::prelude::*;
+
+// Large report export: allow up to two minutes.
+#[get("/reports/export", timeout_ms = 120000)]
+async fn export() -> &'static str { "…" }
+
+// Intentionally long-lived: exempt from the global deadline.
+#[get("/events", timeout = "off")]
+async fn events() -> &'static str { "…" }
+```
+
+---
+
+## Quick start: any tower layer
+
+When you need something off the beaten path, [`AppBuilder::layer`] drops in any
+standard [`tower::Layer`]. For example, adding a *different* tower layer (here a
+raw `TimeoutLayer`, though for request deadlines prefer the built-in above):
 
 ```rust,no_run
 use std::time::Duration;
@@ -46,7 +95,8 @@ async fn main() {
 
 Tower's `TimeoutLayer` surfaces its own `BoxError` on timeout, while axum
 requires every layer to produce `Infallible`. `HandleErrorLayer` bridges the
-two — it converts any error from the inner layer into an HTTP response.
+two — it converts any error from the inner layer into an HTTP response. (The
+built-in request timeout already handles all of this for you.)
 
 ---
 

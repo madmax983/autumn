@@ -20,6 +20,7 @@ fn test_route_version_fields() {
         },
         repository: None,
         idempotency: autumn_web::RouteIdempotency::default(),
+        timeout: autumn_web::RouteTimeout::Inherit,
     };
 
     assert_eq!(route.api_version, Some("v1"));
@@ -104,6 +105,7 @@ fn test_route_listing_with_version_and_status() {
             api_doc: ApiDoc::default(),
             repository: None,
             idempotency: autumn_web::RouteIdempotency::default(),
+            timeout: autumn_web::RouteTimeout::Inherit,
         },
         autumn_web::Route {
             method: http::Method::GET,
@@ -115,6 +117,7 @@ fn test_route_listing_with_version_and_status() {
             api_doc: ApiDoc::default(),
             repository: None,
             idempotency: autumn_web::RouteIdempotency::default(),
+            timeout: autumn_web::RouteTimeout::Inherit,
         },
         autumn_web::Route {
             method: http::Method::GET,
@@ -126,6 +129,7 @@ fn test_route_listing_with_version_and_status() {
             api_doc: ApiDoc::default(),
             repository: None,
             idempotency: autumn_web::RouteIdempotency::default(),
+            timeout: autumn_web::RouteTimeout::Inherit,
         },
         autumn_web::Route {
             method: http::Method::GET,
@@ -137,6 +141,7 @@ fn test_route_listing_with_version_and_status() {
             api_doc: ApiDoc::default(),
             repository: None,
             idempotency: autumn_web::RouteIdempotency::default(),
+            timeout: autumn_web::RouteTimeout::Inherit,
         },
     ];
 

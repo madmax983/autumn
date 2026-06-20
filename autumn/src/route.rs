@@ -8,6 +8,8 @@
 //! Users do not construct `Route` values directly -- they use the
 //! proc macros and the `routes![]` collection macro.
 
+use std::time::Duration;
+
 use axum::routing::MethodRouter;
 use http::Method;
 
@@ -83,6 +85,27 @@ pub enum RouteIdempotency {
     ReplayThroughInner,
 }
 
+/// Per-route override for the global inbound request timeout
+/// (`[server.timeouts] request_timeout_ms`).
+///
+/// Emitted by the route macros from the `timeout_ms = ...` / `timeout = "off"`
+/// attributes and consulted by the timeout middleware (keyed by the matched
+/// route template). The default, [`RouteTimeout::Inherit`], applies the global
+/// deadline. Long-lived primitives like WebSocket upgrades default to
+/// [`RouteTimeout::Disabled`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RouteTimeout {
+    /// Use the global `request_timeout_ms` deadline (or none if disabled).
+    #[default]
+    Inherit,
+    /// Override the global deadline with a route-specific wall-clock budget,
+    /// for known-slow endpoints (report exports, large uploads).
+    Override(Duration),
+    /// Exempt this route from the global deadline entirely (SSE, WebSocket,
+    /// long-poll, and other intentionally long-lived routes).
+    Disabled,
+}
+
 /// A single route binding an HTTP method + path to an Axum handler.
 ///
 /// Created by the `__autumn_route_info_{name}()` companion functions
@@ -135,4 +158,7 @@ pub struct Route {
 
     /// Idempotency replay behavior for this route.
     pub idempotency: RouteIdempotency,
+
+    /// Per-route override for the global inbound request timeout.
+    pub timeout: RouteTimeout,
 }

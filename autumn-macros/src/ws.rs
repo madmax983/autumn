@@ -154,6 +154,9 @@ pub fn ws_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 },
                 repository: ::core::option::Option::None,
                 idempotency: ::autumn_web::RouteIdempotency::Direct,
+                // WebSocket upgrades are long-lived by nature — exempt from the
+                // global inbound request timeout by default.
+                timeout: ::autumn_web::RouteTimeout::Disabled,
                 api_version: ::core::option::Option::None,
                 sunset_opt_out: false,
             }

@@ -437,6 +437,10 @@ fn build_router_pre_state(
         None
     };
 
+    // Build the per-route timeout override table before `route_list` and the
+    // scoped groups are consumed by the mounting steps below.
+    let route_timeouts = build_route_timeout_table(&route_list, &ctx.scoped_groups);
+
     let idempotency_layers = build_idempotency_layers(config, state)?;
     // Both `.layer(..)` custom layers and `.static_gate(..)` gate layers are
     // opaque app layers for idempotency: an auth/tenant layer in either slot
@@ -506,6 +510,7 @@ fn build_router_pre_state(
         ctx.custom_layers,
         ctx.error_page_renderer,
         ctx.session_store,
+        route_timeouts,
     )?;
 
     if dev_reload_enabled {
@@ -1792,67 +1797,171 @@ fn build_maintenance_layer(
         .with_probe_paths(bypass_paths)
 }
 
-/// Apply a per-request-cycle timeout when `config.server.timeouts.request_timeout_ms`
-/// is set and non-zero.
+/// Per-route timeout lookup table, keyed by the fully-qualified route template
+/// (matching [`axum::extract::MatchedPath`]). Built once at router-assembly time
+/// from each [`Route`]'s `timeout` field and shared (cheaply cloned) into the
+/// global timeout middleware.
+type RouteTimeoutTable =
+    std::sync::Arc<std::collections::HashMap<String, crate::route::RouteTimeout>>;
+
+/// Error surfaced as the cause of the `503` when an inbound request exceeds its
+/// wall-clock deadline. Carried into [`crate::error::AutumnError::service_unavailable`]
+/// so the response flows through the standard Problem Details / error-page stack
+/// (JSON for API clients, HTML for browsers) instead of a raw tower `BoxError`.
+#[derive(Debug)]
+struct RequestDeadlineExceeded {
+    timeout_ms: u64,
+}
+
+impl std::fmt::Display for RequestDeadlineExceeded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the server did not produce a response within the configured {}ms deadline",
+            self.timeout_ms
+        )
+    }
+}
+
+impl std::error::Error for RequestDeadlineExceeded {}
+
+/// Build the per-route timeout override table from the top-level routes and any
+/// scoped (prefixed) groups. Group routes are keyed by their nested template so
+/// the runtime lookup matches [`axum::extract::MatchedPath`].
+fn build_route_timeout_table(
+    route_list: &[Route],
+    scoped_groups: &[ScopedGroup],
+) -> RouteTimeoutTable {
+    let mut table: std::collections::HashMap<String, crate::route::RouteTimeout> =
+        std::collections::HashMap::new();
+    let mut insert = |key: String, timeout: crate::route::RouteTimeout| {
+        if matches!(timeout, crate::route::RouteTimeout::Inherit) {
+            return;
+        }
+        // Multiple methods can share a path; a non-inherit override on any of
+        // them applies to the template. Disabled wins over Override so a route
+        // explicitly opted out stays exempt.
+        table
+            .entry(key)
+            .and_modify(|existing| {
+                if matches!(timeout, crate::route::RouteTimeout::Disabled) {
+                    *existing = timeout;
+                }
+            })
+            .or_insert(timeout);
+    };
+    for route in route_list {
+        insert(route.path.to_owned(), route.timeout);
+    }
+    for group in scoped_groups {
+        for route in &group.routes {
+            insert(join_nested_path(&group.prefix, route.path), route.timeout);
+        }
+    }
+    std::sync::Arc::new(table)
+}
+
+/// Apply the built-in inbound request timeout.
 ///
-/// The middleware is inserted inner to [`RequestIdLayer`] so the request ID is
-/// available in the warning log and 408 response body. The layer is a no-op when
-/// the timeout is disabled, preserving zero overhead for unconfigured deployments.
+/// A single global layer enforces `config.server.timeouts.request_timeout_ms`
+/// (the `prod` profile smart-defaults this to 30s) as a per-request wall-clock
+/// deadline, with per-route overrides resolved from `route_timeouts` via the
+/// matched route template. On expiry the handler returns a framework-standard
+/// `503 Service Unavailable` (Problem Details JSON for API clients, the error
+/// page for browsers — never a raw tower `BoxError`).
+///
+/// Streaming responses are exempt by construction: the deadline bounds the time
+/// to produce the response head, not the duration of body streaming, so SSE,
+/// long-poll, and chunked responses are never interrupted. WebSocket upgrades
+/// are additionally marked [`RouteTimeout::Disabled`](crate::route::RouteTimeout)
+/// by the `#[ws]` macro.
+///
+/// The layer is a no-op (zero overhead) when the global timeout is disabled and
+/// no route declares an `Override`.
 fn apply_request_timeout_middleware(
     router: axum::Router<AppState>,
     config: &AutumnConfig,
     metrics: crate::middleware::MetricsCollector,
+    route_timeouts: RouteTimeoutTable,
 ) -> axum::Router<AppState> {
-    let timeout_ms = match config.server.timeouts.request_timeout_ms {
-        Some(ms) if ms > 0 => ms,
-        _ => return router,
-    };
-    let duration = std::time::Duration::from_millis(timeout_ms);
-    let is_dev = matches!(
-        config.profile.as_deref(),
-        Some("dev" | "development") | None
-    );
-    tracing::info!(timeout_ms, "Per-request timeout enabled");
+    let global = config
+        .server
+        .timeouts
+        .request_timeout_ms
+        .filter(|ms| *ms > 0)
+        .map(std::time::Duration::from_millis);
+    let has_override = route_timeouts
+        .values()
+        .any(|t| matches!(t, crate::route::RouteTimeout::Override(_)));
+    if global.is_none() && !has_override {
+        return router;
+    }
+    if let Some(duration) = global {
+        tracing::info!(
+            timeout_ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
+            "Inbound request timeout enabled"
+        );
+    }
     router.layer(axum::middleware::from_fn(move |req, next| {
-        request_timeout_handler(req, next, duration, metrics.clone(), is_dev)
+        request_timeout_handler(req, next, global, route_timeouts.clone(), metrics.clone())
     }))
 }
 
 async fn request_timeout_handler(
     req: axum::extract::Request,
     next: axum::middleware::Next,
-    duration: std::time::Duration,
+    global: Option<std::time::Duration>,
+    route_timeouts: RouteTimeoutTable,
     metrics: crate::middleware::MetricsCollector,
-    is_dev: bool,
 ) -> axum::response::Response {
+    // Resolve the effective deadline from the matched route template.
+    let matched_path = req
+        .extensions()
+        .get::<axum::extract::MatchedPath>()
+        .map(|m| m.as_str().to_owned());
+    let route_timeout = matched_path
+        .as_deref()
+        .and_then(|p| route_timeouts.get(p))
+        .copied()
+        .unwrap_or(crate::route::RouteTimeout::Inherit);
+    let deadline = match route_timeout {
+        crate::route::RouteTimeout::Disabled => None,
+        crate::route::RouteTimeout::Override(d) => Some(d),
+        crate::route::RouteTimeout::Inherit => global,
+    };
+    let Some(duration) = deadline else {
+        // Exempt (disabled route, or global off with a non-Override route).
+        return next.run(req).await;
+    };
+
     let request_id = req
         .extensions()
         .get::<crate::middleware::RequestId>()
         .cloned();
+    let start = std::time::Instant::now();
     match tokio::time::timeout(duration, next.run(req)).await {
         Ok(response) => response,
         Err(_elapsed) => {
-            if let Some(ref rid) = request_id {
-                tracing::warn!(request_id = %rid, "Request timed out");
-            } else {
-                tracing::warn!("Request timed out");
-            }
-            metrics.record_request_timeout();
-            let body = crate::error::problem_details_json_string(
-                http::StatusCode::REQUEST_TIMEOUT,
-                "The server did not receive a complete request within the allowed time",
-                None,
-                None,
-                request_id.as_ref().map(ToString::to_string),
-                None,
-                is_dev,
+            let elapsed_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+            let route = matched_path.as_deref().unwrap_or("<unmatched>");
+            // Structured telemetry: route template + elapsed time so operators
+            // can alert on the (already-counted) timeout event.
+            tracing::warn!(
+                target: "autumn::timeout",
+                route = route,
+                elapsed_ms = elapsed_ms,
+                timeout_ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
+                request_id = request_id.as_ref().map(ToString::to_string),
+                "inbound request exceeded deadline"
             );
-            (
-                http::StatusCode::REQUEST_TIMEOUT,
-                [(http::header::CONTENT_TYPE, "application/problem+json")],
-                body,
-            )
-                .into_response()
+            metrics.record_request_timeout();
+            // Return a 503 via the standard error type so the exception-filter
+            // and error-page stack negotiate JSON vs HTML and enrich with the
+            // request id — no manual Problem Details assembly, no raw BoxError.
+            crate::error::AutumnError::service_unavailable(RequestDeadlineExceeded {
+                timeout_ms: u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
+            })
+            .into_response()
         }
     }
 }
@@ -1924,6 +2033,7 @@ fn apply_middleware(
     custom_layers: Vec<crate::app::CustomLayerRegistration>,
     error_page_renderer: Option<SharedRenderer>,
     session_store: Option<Arc<dyn crate::session::BoxedSessionStore>>,
+    route_timeouts: RouteTimeoutTable,
 ) -> Result<axum::Router<AppState>, RouterBuildError> {
     // 404 fallback handler for unmatched routes must be registered BEFORE global middleware
     // so that unmatched routes are still protected by rate limiting, CSRF, CORS, etc.
@@ -2018,7 +2128,8 @@ fn apply_middleware(
     //   Session → SecurityHeaders → RequestId → LogContext → AccessLog-primary →
     //   Timeout → [user layers] → Tenancy → BodyLimit/UploadConfig →
     //   MethodOverride → RateLimit → CSRF → CORS → handler
-    router = apply_request_timeout_middleware(router, config, state.metrics.clone());
+    router =
+        apply_request_timeout_middleware(router, config, state.metrics.clone(), route_timeouts);
 
     // Error-reporting + panic-catch layer. Placed inner to `RequestIdLayer`
     // (so the request id is available when a handler panics) and outer to the
@@ -3617,6 +3728,7 @@ mod tests {
                 },
                 repository: None,
                 idempotency: crate::route::RouteIdempotency::Direct,
+                timeout: crate::route::RouteTimeout::Inherit,
                 api_version: None,
                 sunset_opt_out: false,
             }],
@@ -3691,6 +3803,7 @@ mod tests {
             },
             repository: None,
             idempotency: crate::route::RouteIdempotency::Direct,
+            timeout: crate::route::RouteTimeout::Inherit,
             api_version: None,
             sunset_opt_out: false,
         };
@@ -3757,6 +3870,7 @@ mod tests {
             },
             repository: None,
             idempotency: crate::route::RouteIdempotency::Direct,
+            timeout: crate::route::RouteTimeout::Inherit,
             api_version: None,
             sunset_opt_out: false,
         };
@@ -3929,6 +4043,7 @@ mod tests {
             },
             repository: None,
             idempotency: crate::route::RouteIdempotency::Direct,
+            timeout: crate::route::RouteTimeout::Inherit,
             api_version: None,
             sunset_opt_out: false,
         };
@@ -4004,6 +4119,7 @@ mod tests {
             },
             repository: None,
             idempotency: crate::route::RouteIdempotency::Direct,
+            timeout: crate::route::RouteTimeout::Inherit,
             api_version: None,
             sunset_opt_out: false,
         };
@@ -4719,10 +4835,15 @@ mod trusted_host_tests {
         assert_eq!(response.status(), StatusCode::OK);
     }
 
-    // ── Per-request timeout (AC: 408 on timeout, metrics, WARN log) ──────────
+    // ── Per-request timeout (AC: 503 on timeout, metrics, WARN log) ──────────
+
+    /// Empty per-route override table (no route-level overrides).
+    fn no_route_timeouts() -> RouteTimeoutTable {
+        std::sync::Arc::new(std::collections::HashMap::new())
+    }
 
     #[tokio::test(start_paused = true)]
-    async fn request_timeout_returns_408_when_exceeded() {
+    async fn request_timeout_returns_503_when_exceeded() {
         let mut config = AutumnConfig::default();
         config.server.timeouts.request_timeout_ms = Some(100);
 
@@ -4737,9 +4858,14 @@ mod trusted_host_tests {
         );
 
         // Place timeout inner to RequestIdLayer (matches apply_middleware ordering).
-        let router = apply_request_timeout_middleware(router, &config, state.metrics.clone())
-            .layer(RequestIdLayer)
-            .with_state(state);
+        let router = apply_request_timeout_middleware(
+            router,
+            &config,
+            state.metrics.clone(),
+            no_route_timeouts(),
+        )
+        .layer(RequestIdLayer)
+        .with_state(state);
 
         let response = router
             .oneshot(Request::builder().uri("/slow").body(Body::empty()).unwrap())
@@ -4748,8 +4874,8 @@ mod trusted_host_tests {
 
         assert_eq!(
             response.status(),
-            StatusCode::REQUEST_TIMEOUT,
-            "a slow handler must trigger 408"
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a slow handler must trigger 503"
         );
         assert_eq!(
             response
@@ -4775,9 +4901,14 @@ mod trusted_host_tests {
             }),
         );
 
-        let router = apply_request_timeout_middleware(router, &config, state.metrics.clone())
-            .layer(RequestIdLayer)
-            .with_state(state.clone());
+        let router = apply_request_timeout_middleware(
+            router,
+            &config,
+            state.metrics.clone(),
+            no_route_timeouts(),
+        )
+        .layer(RequestIdLayer)
+        .with_state(state.clone());
 
         router
             .oneshot(Request::builder().uri("/slow").body(Body::empty()).unwrap())
@@ -4792,7 +4923,7 @@ mod trusted_host_tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn request_timeout_response_includes_request_id() {
+    async fn request_timeout_response_includes_request_id_header() {
         let mut config = AutumnConfig::default();
         config.server.timeouts.request_timeout_ms = Some(100);
 
@@ -4805,28 +4936,33 @@ mod trusted_host_tests {
             }),
         );
 
-        let router = apply_request_timeout_middleware(router, &config, state.metrics.clone())
-            .layer(RequestIdLayer)
-            .with_state(state);
+        let router = apply_request_timeout_middleware(
+            router,
+            &config,
+            state.metrics.clone(),
+            no_route_timeouts(),
+        )
+        .layer(RequestIdLayer)
+        .with_state(state);
 
         let response = router
             .oneshot(Request::builder().uri("/slow").body(Body::empty()).unwrap())
             .await
             .unwrap();
 
-        assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         // X-Request-Id is added by RequestIdLayer on the egress path.
         assert!(
             response.headers().contains_key("x-request-id"),
-            "408 response must carry the X-Request-Id header"
+            "503 response must carry the X-Request-Id header"
         );
 
-        // The body must be valid JSON with a request_id field.
+        // The body must be a well-formed Problem Details document.
         let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .unwrap();
         let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
-        assert_eq!(body["status"], 408);
+        assert_eq!(body["status"], 503);
     }
 
     #[tokio::test]
@@ -4837,8 +4973,13 @@ mod trusted_host_tests {
         let router: axum::Router<AppState> =
             axum::Router::new().route("/fast", axum::routing::get(|| async { "pong" }));
 
-        let router = apply_request_timeout_middleware(router, &config, state.metrics.clone())
-            .with_state(state);
+        let router = apply_request_timeout_middleware(
+            router,
+            &config,
+            state.metrics.clone(),
+            no_route_timeouts(),
+        )
+        .with_state(state);
 
         let response = router
             .oneshot(Request::builder().uri("/fast").body(Body::empty()).unwrap())
@@ -4857,8 +4998,13 @@ mod trusted_host_tests {
         let router: axum::Router<AppState> =
             axum::Router::new().route("/fast", axum::routing::get(|| async { "pong" }));
 
-        let router = apply_request_timeout_middleware(router, &config, state.metrics.clone())
-            .with_state(state);
+        let router = apply_request_timeout_middleware(
+            router,
+            &config,
+            state.metrics.clone(),
+            no_route_timeouts(),
+        )
+        .with_state(state);
 
         let response = router
             .oneshot(Request::builder().uri("/fast").body(Body::empty()).unwrap())
@@ -4868,10 +5014,10 @@ mod trusted_host_tests {
         assert_eq!(response.status(), StatusCode::OK);
     }
 
-    // Exercises the warn!("Request timed out") branch when no RequestIdLayer
-    // is present (no request_id extension), keeping coverage of the else arm.
+    // Exercises the warn branch when no RequestIdLayer is present (no request_id
+    // extension), keeping coverage of the `None` request-id arm.
     #[tokio::test(start_paused = true)]
-    async fn request_timeout_408_without_request_id_layer() {
+    async fn request_timeout_503_without_request_id_layer() {
         let mut config = AutumnConfig::default();
         config.server.timeouts.request_timeout_ms = Some(100);
 
@@ -4885,15 +5031,163 @@ mod trusted_host_tests {
         );
 
         // No RequestIdLayer — exercises the else branch in request_timeout_handler.
-        let router = apply_request_timeout_middleware(router, &config, state.metrics.clone())
-            .with_state(state);
+        let router = apply_request_timeout_middleware(
+            router,
+            &config,
+            state.metrics.clone(),
+            no_route_timeouts(),
+        )
+        .with_state(state);
 
         let response = router
             .oneshot(Request::builder().uri("/slow").body(Body::empty()).unwrap())
             .await
             .unwrap();
 
-        assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    // AC4: a per-route `Override` extends the deadline so a known-slow route
+    // outlives the (smaller) global timeout.
+    #[tokio::test(start_paused = true)]
+    async fn request_timeout_per_route_override_extends_deadline() {
+        let mut config = AutumnConfig::default();
+        config.server.timeouts.request_timeout_ms = Some(100); // tight global
+
+        let state = crate::state::AppState::for_test();
+        let router: axum::Router<AppState> = axum::Router::new().route(
+            "/export",
+            axum::routing::get(|| async {
+                // Longer than the 100ms global, shorter than the 10s override.
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                "report"
+            }),
+        );
+
+        let mut table = std::collections::HashMap::new();
+        table.insert(
+            "/export".to_owned(),
+            crate::route::RouteTimeout::Override(std::time::Duration::from_secs(10)),
+        );
+        let router = apply_request_timeout_middleware(
+            router,
+            &config,
+            state.metrics.clone(),
+            std::sync::Arc::new(table),
+        )
+        .with_state(state);
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/export")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "the override must let the slow route complete past the global deadline"
+        );
+    }
+
+    // AC4: a per-route `Disabled` exempts the route from the global timeout.
+    #[tokio::test(start_paused = true)]
+    async fn request_timeout_per_route_disabled_exempts_route() {
+        let mut config = AutumnConfig::default();
+        config.server.timeouts.request_timeout_ms = Some(100);
+
+        let state = crate::state::AppState::for_test();
+        let router: axum::Router<AppState> = axum::Router::new().route(
+            "/stream",
+            axum::routing::get(|| async {
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                "done"
+            }),
+        );
+
+        let mut table = std::collections::HashMap::new();
+        table.insert("/stream".to_owned(), crate::route::RouteTimeout::Disabled);
+        let router = apply_request_timeout_middleware(
+            router,
+            &config,
+            state.metrics.clone(),
+            std::sync::Arc::new(table),
+        )
+        .with_state(state.clone());
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/stream")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            state.metrics.snapshot().http.request_timeouts_total,
+            0,
+            "an exempt route must not record a timeout"
+        );
+    }
+
+    // AC4: an `Override` enables the layer even when the global timeout is off.
+    #[tokio::test(start_paused = true)]
+    async fn request_timeout_override_active_when_global_disabled() {
+        let config = AutumnConfig::default(); // global timeout disabled (None)
+
+        let state = crate::state::AppState::for_test();
+        let router: axum::Router<AppState> = axum::Router::new().route(
+            "/export",
+            axum::routing::get(|| async {
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                "report"
+            }),
+        );
+
+        let mut table = std::collections::HashMap::new();
+        table.insert(
+            "/export".to_owned(),
+            crate::route::RouteTimeout::Override(std::time::Duration::from_millis(100)),
+        );
+        let router = apply_request_timeout_middleware(
+            router,
+            &config,
+            state.metrics.clone(),
+            std::sync::Arc::new(table),
+        )
+        .with_state(state);
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/export")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a per-route override must be enforced even with the global timeout off"
+        );
+    }
+
+    #[test]
+    fn build_route_timeout_table_is_empty_without_routes() {
+        // End-to-end keying (top-level + nested groups) is covered by the
+        // `request_timeout` integration tests via the macro attribute; here we
+        // assert the no-route base case yields a zero-overhead empty table.
+        let table = build_route_timeout_table(&[], &[]);
+        assert!(table.is_empty(), "no routes ⇒ empty override table");
     }
 
     // ----------------------------------------------------------------------
@@ -5046,6 +5340,7 @@ mod trusted_host_tests {
             },
             repository: None,
             idempotency: crate::route::RouteIdempotency::Direct,
+            timeout: crate::route::RouteTimeout::Inherit,
             api_version: None,
             sunset_opt_out: false,
         };
@@ -5140,6 +5435,7 @@ mod trusted_host_tests {
             },
             repository: None,
             idempotency: crate::route::RouteIdempotency::Direct,
+            timeout: crate::route::RouteTimeout::Inherit,
             api_version: None,
             sunset_opt_out: false,
         };

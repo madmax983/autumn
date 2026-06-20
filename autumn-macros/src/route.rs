@@ -155,6 +155,21 @@ pub fn route_macro(
         |lit| quote! { ::core::option::Option::Some(#lit) },
     );
     let sunset_opt_out_val = route_args.sunset_opt_out;
+    let route_timeout = match route_args.timeout {
+        crate::parse::RouteTimeoutAttr::Inherit => {
+            quote! { ::autumn_web::RouteTimeout::Inherit }
+        }
+        crate::parse::RouteTimeoutAttr::Ms(ms) => {
+            quote! {
+                ::autumn_web::RouteTimeout::Override(
+                    ::core::time::Duration::from_millis(#ms)
+                )
+            }
+        }
+        crate::parse::RouteTimeoutAttr::Disabled => {
+            quote! { ::autumn_web::RouteTimeout::Disabled }
+        }
+    };
     let has_policy_val = has_policy_only(&input_fn);
 
     // ── Path helper ─────────────────────────────────────────────
@@ -193,6 +208,7 @@ pub fn route_macro(
                 },
                 repository: ::core::option::Option::None,
                 idempotency: #route_idempotency,
+                timeout: #route_timeout,
             }
         }
 
@@ -560,6 +576,64 @@ mod tests {
         assert!(
             generated.contains("sunset_opt_out"),
             "should generate sunset_opt_out field: {generated}"
+        );
+    }
+
+    #[test]
+    fn route_macro_defaults_timeout_to_inherit() {
+        let generated = route_macro(
+            "GET",
+            "get",
+            quote! { "/items" },
+            quote! {
+                async fn get_items() -> &'static str { "items" }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("RouteTimeout :: Inherit"),
+            "routes without a timeout attribute must inherit the global deadline: {generated}"
+        );
+    }
+
+    #[test]
+    fn route_macro_parses_timeout_ms_override() {
+        let generated = route_macro(
+            "GET",
+            "get",
+            quote! { "/export", timeout_ms = 120000 },
+            quote! {
+                async fn export() -> &'static str { "report" }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("RouteTimeout :: Override"),
+            "timeout_ms must emit a RouteTimeout::Override: {generated}"
+        );
+        assert!(
+            generated.contains("from_millis") && generated.contains("120000"),
+            "override must carry the configured millisecond budget: {generated}"
+        );
+    }
+
+    #[test]
+    fn route_macro_parses_timeout_off_disabled() {
+        let generated = route_macro(
+            "GET",
+            "get",
+            quote! { "/stream", timeout = "off" },
+            quote! {
+                async fn stream() -> &'static str { "data" }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("RouteTimeout :: Disabled"),
+            "timeout = \"off\" must emit RouteTimeout::Disabled: {generated}"
         );
     }
 }

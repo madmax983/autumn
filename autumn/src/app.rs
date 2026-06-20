@@ -5964,6 +5964,7 @@ mod validate_repository_api_policies_tests {
             api_doc: crate::openapi::ApiDoc::default(),
             repository: meta,
             idempotency: crate::route::RouteIdempotency::Direct,
+            timeout: crate::route::RouteTimeout::Inherit,
             api_version: None,
             sunset_opt_out: false,
         }
@@ -7423,6 +7424,7 @@ mod tests {
             },
             repository: None,
             idempotency: crate::route::RouteIdempotency::Direct,
+            timeout: crate::route::RouteTimeout::Inherit,
             api_version: None,
             sunset_opt_out: false,
         }
@@ -7541,6 +7543,7 @@ mod tests {
                 },
                 repository: None,
                 idempotency: crate::route::RouteIdempotency::Direct,
+                timeout: crate::route::RouteTimeout::Inherit,
                 api_version: None,
                 sunset_opt_out: false,
             }],
@@ -7985,6 +7988,7 @@ mod tests {
             },
             repository: None,
             idempotency: crate::route::RouteIdempotency::Direct,
+            timeout: crate::route::RouteTimeout::Inherit,
             api_version: None,
             sunset_opt_out: false,
         }];
@@ -8055,6 +8059,7 @@ mod tests {
                 },
                 repository: None,
                 idempotency: crate::route::RouteIdempotency::Direct,
+                timeout: crate::route::RouteTimeout::Inherit,
                 api_version: None,
                 sunset_opt_out: false,
             },
@@ -8072,6 +8077,7 @@ mod tests {
                 },
                 repository: None,
                 idempotency: crate::route::RouteIdempotency::Direct,
+                timeout: crate::route::RouteTimeout::Inherit,
                 api_version: None,
                 sunset_opt_out: false,
             },
@@ -8425,6 +8431,7 @@ mod tests {
                     },
                     repository: None,
                     idempotency: crate::route::RouteIdempotency::Direct,
+                    timeout: crate::route::RouteTimeout::Inherit,
                     api_version: None,
                     sunset_opt_out: false,
                 }],
@@ -8482,6 +8489,7 @@ mod tests {
                     },
                     repository: None,
                     idempotency: crate::route::RouteIdempotency::Direct,
+                    timeout: crate::route::RouteTimeout::Inherit,
                     api_version: None,
                     sunset_opt_out: false,
                 }]);
