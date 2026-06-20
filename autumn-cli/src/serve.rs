@@ -613,6 +613,19 @@ fn launch_daemon_child(
     };
     let pid = child.id();
 
+    // The live-socket guard at the top proved no daemon is serving this socket,
+    // and we hold the startup lock, so any existing pidfile is from a daemon
+    // that has already exited. On platforms that don't record a process start
+    // time (macOS/BSD, or an older pidfile), `acquire_pidfile` can't tell that
+    // crashed daemon from an unrelated process that reused its PID, and would
+    // reject the start as `AlreadyRunning` — permanently blocking restart until
+    // the pidfile is deleted by hand. Since the socket is provably dead, clear
+    // such an unverifiable pidfile so the acquire below can reclaim it.
+    #[cfg(unix)]
+    if process::read_pidfile(&paths.pid_file()).is_some_and(|r| r.start_time.is_none()) {
+        let _ = std::fs::remove_file(paths.pid_file());
+    }
+
     // Record the real pidfile (child's pid). Keep the startup lock held — the
     // caller releases it only after the daemon is ready, so a concurrent start
     // can't spawn a second child while this one is still binding.
@@ -664,6 +677,11 @@ fn spawn_daemon(binary: &Path, paths: &RuntimePaths, opts: &ServeOptions) -> i32
             let _ = child.kill();
             process::force_kill_group(pid);
             let _ = child.wait();
+            // Postgres `setsid`s out of the daemon's group, so the group kill
+            // above can't reach it; reap it directly via `postmaster.pid`.
+            if opts.bundled_pg {
+                reap_managed_postgres(paths);
+            }
             release_lock();
             cleanup(paths, &socket);
             return 1;
@@ -686,11 +704,18 @@ fn spawn_daemon(binary: &Path, paths: &RuntimePaths, opts: &ServeOptions) -> i32
             log_path.display()
         );
         // Kill the whole group: a startup that timed out may have spawned
-        // children (e.g. managed Postgres during `--bundled-pg` provisioning)
-        // that `Child::kill()` alone would leave orphaned.
+        // children that `Child::kill()` alone would leave orphaned.
         let _ = child.kill();
         process::force_kill_group(pid);
         let _ = child.wait();
+        // A managed Postgres started during `--bundled-pg` provisioning leaves
+        // the daemon's process group (it `setsid`s itself) and no `serve.addr`
+        // was written for a later `stop` to consult, so the group kill above
+        // can't reach it. Reap it directly via `postmaster.pid` so a readiness
+        // timeout doesn't strand the cluster on the data dir/port.
+        if opts.bundled_pg {
+            reap_managed_postgres(paths);
+        }
         release_lock();
         cleanup(paths, &socket);
         1
@@ -884,7 +909,17 @@ fn stop(opts: &ServeOptions) -> i32 {
         println!("autumn serve: not running");
         return 0;
     };
+    // Read the address file up front: even when the app PID is stale, a managed
+    // cluster it launched can still be alive (Postgres `setsid`s out of the
+    // daemon's process group, so it survives the app's crash/kill).
+    let addr = read_addr_file(&paths);
     if !confirmed_running(&rec, &socket) {
+        // The daemon is gone, but if it owned a managed cluster reap that too —
+        // otherwise a crash before `stop` leaves Postgres holding the data
+        // dir/port until manual cleanup.
+        if addr.as_ref().is_some_and(|a| a.managed_pg) {
+            reap_managed_postgres(&paths);
+        }
         println!("autumn serve: not running (removed stale files)");
         cleanup(&paths, &socket);
         return 0;
@@ -893,13 +928,9 @@ fn stop(opts: &ServeOptions) -> i32 {
     // Prefer the budget the daemon recorded at start (resolved from its own
     // env/profile); fall back to recomputing it (release flag + config) only for
     // daemons started before that field was recorded.
-    let addr = read_addr_file(&paths);
     let recorded_release = addr.as_ref().is_some_and(|a| a.release);
     let recorded_budget = addr.as_ref().and_then(|a| a.stop_budget_secs);
-    process::stop_pid(
-        rec.pid,
-        stop_timeout(opts, recorded_release, recorded_budget),
-    );
+    process::stop_record(&rec, stop_timeout(opts, recorded_release, recorded_budget));
     // For a managed-Postgres daemon, reap the cluster too: the app's `on_shutdown`
     // hook can be cancelled when its drain budget is exhausted (or skipped on a
     // forced exit), and Postgres `setsid`s itself so a process-group kill won't

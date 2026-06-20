@@ -275,19 +275,43 @@ pub fn wait_for_pid_exit(pid: u32, timeout: Duration) -> bool {
     true
 }
 
-/// Gracefully stop `pid`: send `SIGTERM`, wait up to `timeout` for it to drain
-/// and exit, then force-kill if it is still alive.
+/// Identity-aware [`wait_for_pid_exit`]: also returns `true` once the recorded
+/// process is no longer *our* daemon — i.e. it exited, or (on platforms that
+/// record a start time) the PID was reused by an unrelated process. Used before
+/// escalating to `SIGKILL` so a force-kill can never land on a stranger that
+/// happened to inherit the PID during the drain window.
 #[cfg(unix)]
-pub fn stop_pid(pid: u32, timeout: Duration) {
-    let _ = signal_terminate(pid);
-    if !wait_for_pid_exit(pid, timeout) {
-        // The app missed its graceful-drain budget, so its `on_shutdown` hooks
-        // (which stop a managed Postgres child) may not have run. Kill the whole
-        // daemon process group, not just the app PID, so supervised children are
-        // not orphaned holding the data dir/port.
-        force_kill(pid);
-        force_kill_group(pid);
-        let _ = wait_for_pid_exit(pid, Duration::from_secs(5));
+#[must_use]
+pub fn wait_for_record_exit(record: &PidRecord, timeout: Duration) -> bool {
+    let start = std::time::Instant::now();
+    while is_record_alive(record) {
+        if start.elapsed() >= timeout {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    true
+}
+
+/// Gracefully stop the daemon identified by `record`: send `SIGTERM`, wait up to
+/// `timeout` for it to drain and exit, then force-kill if it is still alive.
+///
+/// The wait and the pre-escalation check are identity-aware (start time, when
+/// the platform records it): if the daemon exits and its PID is reused before
+/// the loop observes the exit, the reused process has a different start time and
+/// is treated as already-gone, so the `SIGKILL`/`killpg` escalation is skipped
+/// rather than aimed at an unrelated process.
+#[cfg(unix)]
+pub fn stop_record(record: &PidRecord, timeout: Duration) {
+    let _ = signal_terminate(record.pid);
+    if !wait_for_record_exit(record, timeout) && is_record_alive(record) {
+        // The app missed its graceful-drain budget and is still our daemon, so
+        // its `on_shutdown` hooks (which stop a managed Postgres child) may not
+        // have run. Kill the whole daemon process group, not just the app PID,
+        // so supervised children are not orphaned holding the data dir/port.
+        force_kill(record.pid);
+        force_kill_group(record.pid);
+        let _ = wait_for_record_exit(record, Duration::from_secs(5));
     }
 }
 
@@ -319,7 +343,7 @@ pub fn stop_postmaster(_pid: u32, _timeout: Duration) {}
 
 /// Non-Unix fallback: no graceful-signal mechanism in this MVP.
 #[cfg(not(unix))]
-pub fn stop_pid(_pid: u32, _timeout: Duration) {}
+pub fn stop_record(_record: &PidRecord, _timeout: Duration) {}
 
 /// Wait for a child process with a timeout. Returns `Err(())` if it did not
 /// exit before `timeout` elapsed.
