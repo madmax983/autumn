@@ -6,7 +6,7 @@
 //! liveness probing, atomic lock acquisition with stale-PID reclamation, and
 //! bounded waits for a process to exit.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::process::Child;
 use std::time::Duration;
@@ -142,33 +142,55 @@ pub fn is_record_alive(record: &PidRecord) -> bool {
 /// Atomically acquire the PID lockfile for `pid`, reclaiming a stale lock left
 /// by a crashed previous run.
 ///
-/// Creates the file with `O_EXCL`. If it already exists, the recorded PID is
-/// probed: a live owner yields [`AcquireError::AlreadyRunning`] (the caller
-/// should refuse to start); a dead owner is reclaimed and creation retried once.
+/// The record is written to a private temp file and then **hard-linked** into
+/// place: `link(2)` fails atomically if the target exists (the lock), and a
+/// reader always sees the fully-written record rather than an empty file mid
+/// `create`+`write`. (A bare `create_new` then `write` leaves a window where a
+/// racing acquirer reads an empty lockfile, misclassifies it as free, and lets
+/// both starters spawn.) If the lock already exists, the recorded PID is probed:
+/// a live owner yields [`AcquireError::AlreadyRunning`] (the caller should refuse
+/// to start); a dead/corrupt lock is reclaimed and creation retried once.
 ///
 /// # Errors
 ///
 /// Returns [`AcquireError::AlreadyRunning`] if a live daemon holds the lock, or
 /// [`AcquireError::Io`] on filesystem errors.
 pub fn acquire_pidfile(path: &Path, pid: u32) -> Result<(), AcquireError> {
-    if let Some(parent) = path.parent() {
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
         std::fs::create_dir_all(parent).map_err(AcquireError::Io)?;
     }
+    // Record `<pid> <start_time>` so a later reader can reject a reused PID
+    // (0 = start time unknown on this platform).
+    let start = process_start_time(pid).unwrap_or(0);
+    // A private temp sibling, distinct per source file *and* per launcher pid so
+    // two concurrent acquirers never share one (and a `serve.pid` acquire can't
+    // collide with a `serve.startlock` acquire).
+    let parent = path.parent().filter(|p| !p.as_os_str().is_empty());
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| AcquireError::Io(std::io::Error::other("pidfile path has no file name")))?
+        .to_string_lossy()
+        .into_owned();
+    let temp_name = format!(".{file_name}.tmp.{}", std::process::id());
+    let temp = parent.map_or_else(|| PathBuf::from(&temp_name), |p| p.join(&temp_name));
+    // Clear a leftover temp from a crashed run, then write the full record.
+    let _ = std::fs::remove_file(&temp);
+    if let Err(e) = std::fs::write(&temp, format!("{pid} {start}\n")) {
+        return Err(AcquireError::Io(e));
+    }
+
+    let result = acquire_via_link(&temp, path);
+    let _ = std::fs::remove_file(&temp);
+    result
+}
+
+/// Hard-link `temp` (already holding the full record) into `path` as the lock,
+/// reclaiming a stale/corrupt lock once. Factored out so the temp file is always
+/// cleaned up by the caller regardless of which branch returns.
+fn acquire_via_link(temp: &Path, path: &Path) -> Result<(), AcquireError> {
     for attempt in 0..2 {
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(path)
-        {
-            Ok(mut file) => {
-                use std::io::Write;
-                // Record `<pid> <start_time>` so a later reader can reject a
-                // reused PID (0 = start time unknown on this platform).
-                let start = process_start_time(pid).unwrap_or(0);
-                return file
-                    .write_all(format!("{pid} {start}\n").as_bytes())
-                    .map_err(AcquireError::Io);
-            }
+        match std::fs::hard_link(temp, path) {
+            Ok(()) => return Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                 let recorded = read_pidfile(path);
                 let alive = recorded.as_ref().is_some_and(is_record_alive);
@@ -176,9 +198,11 @@ pub fn acquire_pidfile(path: &Path, pid: u32) -> Result<(), AcquireError> {
                     PidState::Alive(existing) => {
                         return Err(AcquireError::AlreadyRunning(existing));
                     }
-                    // Stale or unparseable: reclaim and retry the exclusive create.
-                    // A concurrent deletion (NotFound) is fine — the next
-                    // iteration's `create_new` will win.
+                    // Stale or corrupt: reclaim and retry the atomic link. The
+                    // link guarantees any existing lock is fully written, so an
+                    // unparseable file here is genuine corruption, not an in-
+                    // flight create. A concurrent deletion (NotFound) is fine —
+                    // the next iteration's `hard_link` will win.
                     PidState::Stale | PidState::Free if attempt == 0 => {
                         if let Err(err) = std::fs::remove_file(path)
                             && err.kind() != std::io::ErrorKind::NotFound

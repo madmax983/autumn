@@ -243,17 +243,22 @@ fn confirmed_running(rec: &process::PidRecord, socket: &Path) -> bool {
 
 /// Resolve the daemon PID for lifecycle commands. Prefers the authoritative
 /// pidfile (which carries a start time for PID-reuse detection); if it is
-/// missing or corrupt, falls back to the address file's PID — but only when a
-/// live listener confirms a daemon is still serving on the socket, so a removed
-/// pidfile doesn't leave the daemon unstoppable.
+/// missing or corrupt, falls back to the address file's PID — but only when the
+/// socket's listener is *definitively* that PID, so a removed pidfile doesn't
+/// leave the daemon unstoppable while never signalling the wrong process.
+///
+/// The address file persists after its daemon dies (until `cleanup`), so its PID
+/// is untrustworthy on its own: it may have been reused. Unlike the pidfile path
+/// in [`confirmed_running`], a bare live-socket probe is *not* enough here —
+/// some unrelated process could own the socket while the recorded PID is a
+/// reused stranger. Require `SO_PEERCRED` proof; where peer-PID is unavailable
+/// (macOS/BSD), report "not running" rather than risk signalling the wrong PID.
 fn lifecycle_target(paths: &RuntimePaths, socket: &Path) -> Option<process::PidRecord> {
     if let Some(rec) = process::read_pidfile(&paths.pid_file()) {
         return Some(rec);
     }
     let addr = read_addr_file(paths)?;
-    // Trust the address-file PID only if it actually owns the socket (so a reused
-    // PID isn't signalled); where peer-PID is unavailable, fall back to liveness.
-    socket_identity_matches(socket, addr.pid).then_some(process::PidRecord {
+    (socket_owner_pid(socket) == Some(addr.pid)).then_some(process::PidRecord {
         pid: addr.pid,
         start_time: None,
     })
@@ -482,6 +487,13 @@ fn base_command(binary: &Path, paths: Option<&RuntimePaths>, opts: &ServeOptions
     // set `AUTUMN_ENV`.
     if let Some(profile) = &opts.profile {
         cmd.env("AUTUMN_ENV", profile);
+    } else if opts.release && env_profile().is_none() {
+        // A `--release` serve is a production run, and `stop`/the address file
+        // already treat release as the `prod` profile. Without this the child's
+        // config loader would default to `dev` (CSRF/HSTS off, ~1s shutdown
+        // budget). Mirror `effective_profile(None, true)`; don't override an
+        // `AUTUMN_ENV`/`AUTUMN_PROFILE` the caller already set.
+        cmd.env("AUTUMN_ENV", "prod");
     }
     cmd
 }
@@ -831,8 +843,12 @@ fn stop(opts: &ServeOptions) -> i32 {
     if !confirmed_running(&rec, &socket) {
         // The daemon is gone, but if it owned a managed cluster reap that too —
         // otherwise a crash before `stop` leaves Postgres holding the data
-        // dir/port until manual cleanup.
-        if addr.as_ref().is_some_and(|a| a.managed_pg) {
+        // dir/port until manual cleanup. Reap when the address file says managed
+        // *or* is absent (a `--bundled-pg` daemon still in `setup_database` may
+        // have started the postmaster before writing `serve.addr`); the reaper
+        // is a no-op when there's no `postmaster.pid`, so this is safe for
+        // non-managed daemons too.
+        if addr.as_ref().is_none_or(|a| a.managed_pg) {
             reap_managed_postgres(&paths);
         }
         println!("autumn serve: not running (removed stale files)");
@@ -850,8 +866,11 @@ fn stop(opts: &ServeOptions) -> i32 {
     // hook can be cancelled when its drain budget is exhausted (or skipped on a
     // forced exit), and Postgres `setsid`s itself so a process-group kill won't
     // reach it. Stop it directly via its `postmaster.pid` so it doesn't keep
-    // holding the data dir/port after `stop` reports success.
-    if addr.as_ref().is_some_and(|a| a.managed_pg) {
+    // holding the data dir/port after `stop` reports success. Reap when the
+    // address file says managed *or* is absent (a daemon stopped mid-boot, before
+    // `serve.addr` was written, can still have a live postmaster); the reaper is
+    // a no-op without a `postmaster.pid`.
+    if addr.as_ref().is_none_or(|a| a.managed_pg) {
         reap_managed_postgres(&paths);
     }
     cleanup(&paths, &socket);
