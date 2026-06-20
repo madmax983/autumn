@@ -299,28 +299,73 @@ fn read_package_name() -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
-/// A short, stable hash of the absolute project directory, distinguishing
-/// same-named projects in different locations.
+/// A short, stable hash distinguishing same-named projects in different
+/// locations.
 ///
-/// For a workspace member selected with `-p`, hash the member's manifest dir so
-/// the runtime namespace is identical whether the lifecycle command is run from
-/// the workspace root or the member directory (otherwise `start -p api` and
-/// `stop -p api` from different CWDs would target different daemons). Falls back
-/// to the canonicalized CWD when no package is given or its manifest dir can't
-/// be resolved.
+/// For a workspace member selected with `-p`, the namespace is anchored to the
+/// workspace root plus the package name, so it is identical whether the
+/// lifecycle command runs from the workspace root or the member directory
+/// (otherwise `start -p api` and `stop -p api` from different CWDs would target
+/// different daemons). Falls back to the canonicalized CWD when no package is
+/// given.
+///
+/// This is deliberately **metadata-free**: it walks the filesystem rather than
+/// spawning `cargo metadata`, so `stop`/`status` resolve the same namespace as
+/// `start` even when the toolchain is slow, offline, or unavailable — and a
+/// daemon started under one resolution is never orphaned by a later one.
 fn project_dir_hash(package: Option<&str>) -> String {
     use sha2::{Digest, Sha256};
-    let dir = package
-        .and_then(crate::dev::find_manifest_dir)
-        .or_else(|| std::env::current_dir().ok())
+    // NUL separates the two fields so no root path / package name pair can be
+    // confused for another (paths cannot contain NUL).
+    let key = package.map_or_else(
+        || canonical_cwd().display().to_string(),
+        |pkg| format!("{}\0{pkg}", identity_root().display()),
+    );
+    // A fixed SHA-256 over the key — `DefaultHasher` is explicitly not stable
+    // across std/toolchain versions, so a CLI upgrade while a daemon is running
+    // must not change the namespace (which would orphan it). First 4 bytes
+    // (8 hex) keep the resulting Unix socket path within `sun_path`.
+    hex::encode(&Sha256::digest(key.as_bytes())[..4])
+}
+
+/// The canonicalized current working directory, falling back to the raw cwd and
+/// finally `"."` so this never fails.
+fn canonical_cwd() -> PathBuf {
+    std::env::current_dir()
+        .ok()
         .and_then(|d| std::fs::canonicalize(&d).ok().or(Some(d)))
-        .unwrap_or_else(|| std::path::PathBuf::from("."));
-    // A fixed SHA-256 over the canonical path — `DefaultHasher` is explicitly
-    // not stable across std/toolchain versions, so a CLI upgrade while a daemon
-    // is running must not change the namespace (which would orphan it). First
-    // 4 bytes (8 hex) keep the resulting Unix socket path within `sun_path`.
-    let digest = Sha256::digest(dir.to_string_lossy().as_bytes());
-    hex::encode(&digest[..4])
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// The directory that anchors a `-p <member>` namespace.
+///
+/// Walks ancestors of the CWD looking for the nearest `Cargo.toml` whose
+/// manifest declares a `[workspace]` table — that workspace root is stable from
+/// anywhere inside the tree. If none is found (a standalone crate), the nearest
+/// ancestor containing any `Cargo.toml` is used; failing that, the CWD itself.
+fn identity_root() -> PathBuf {
+    let cwd = canonical_cwd();
+    workspace_anchor_from(&cwd).unwrap_or(cwd)
+}
+
+/// Pure ancestor walk for [`identity_root`]: returns the workspace root (nearest
+/// ancestor whose `Cargo.toml` has a `[workspace]` table), else the nearest
+/// ancestor containing any `Cargo.toml`, else `None`. Separated from CWD lookup
+/// so it can be unit-tested against a fixture tree.
+fn workspace_anchor_from(start: &Path) -> Option<PathBuf> {
+    let mut nearest_manifest: Option<PathBuf> = None;
+    for dir in start.ancestors() {
+        let Ok(contents) = std::fs::read_to_string(dir.join("Cargo.toml")) else {
+            continue;
+        };
+        if nearest_manifest.is_none() {
+            nearest_manifest = Some(dir.to_path_buf());
+        }
+        if toml::from_str::<toml::Table>(&contents).is_ok_and(|t| t.contains_key("workspace")) {
+            return Some(dir.to_path_buf());
+        }
+    }
+    nearest_manifest
 }
 
 /// Build, then start the server (foreground or daemon). Returns the exit code.
@@ -1104,6 +1149,45 @@ mod tests {
         // so unrelated checkouts with the same package name don't collide.
         assert!(id.starts_with("my-svc-"), "got {id}");
         assert!(id.len() > "my-svc-".len());
+    }
+
+    #[test]
+    fn workspace_anchor_is_stable_from_root_and_member() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = std::fs::canonicalize(tmp.path()).expect("canonicalize root");
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/api\"]\n",
+        )
+        .expect("write workspace manifest");
+        let member = root.join("crates/api");
+        std::fs::create_dir_all(&member).expect("create member dir");
+        std::fs::write(
+            member.join("Cargo.toml"),
+            "[package]\nname = \"api\"\nversion = \"0.1.0\"\n",
+        )
+        .expect("write member manifest");
+
+        // The namespace anchor must be the workspace root whether resolved from
+        // the root or from the member directory, so `start -p api` and
+        // `stop -p api` from different CWDs target the same daemon.
+        assert_eq!(workspace_anchor_from(&root), Some(root.clone()));
+        assert_eq!(workspace_anchor_from(&member), Some(root));
+    }
+
+    #[test]
+    fn workspace_anchor_falls_back_to_nearest_manifest() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = std::fs::canonicalize(tmp.path()).expect("canonicalize root");
+        // A standalone crate with no `[workspace]` table anywhere above.
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"solo\"\nversion = \"0.1.0\"\n",
+        )
+        .expect("write manifest");
+        let nested = root.join("src");
+        std::fs::create_dir_all(&nested).expect("create nested dir");
+        assert_eq!(workspace_anchor_from(&nested), Some(root));
     }
 
     // Env vars touched by these tests; cleared so a polluted outer environment
