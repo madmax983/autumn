@@ -5286,7 +5286,7 @@ async fn load_config_and_telemetry(
 ) -> (AutumnConfig, crate::telemetry::TelemetryGuard) {
     // 1. Load configuration via the installed loader, falling back to the
     //    five-layer TOML + env default.
-    let config = match config_loader {
+    let mut config = match config_loader {
         Some(factory) => factory().await,
         None => crate::config::TomlEnvConfigLoader::new().load().await,
     }
@@ -5294,6 +5294,19 @@ async fn load_config_and_telemetry(
         eprintln!("Failed to load configuration: {e}");
         std::process::exit(1);
     });
+
+    // `autumn serve --daemon` binds the app on a private Unix socket and then
+    // discovers/health-probes it by path. A custom `with_config_loader` can
+    // construct its `ServerConfig` from scratch and silently drop the
+    // `AUTUMN_SERVER__UNIX_SOCKET` env override, leaving the daemon on TCP where
+    // the supervisor can't reach it. The CLI therefore also passes the socket
+    // out-of-band via `AUTUMN_SERVE_FORCE_UNIX_SOCKET`, applied here *after* the
+    // loader runs so no loader can drop it.
+    if let Ok(forced) = std::env::var("AUTUMN_SERVE_FORCE_UNIX_SOCKET")
+        && !forced.is_empty()
+    {
+        config.server.unix_socket = Some(forced);
+    }
 
     // 2. Initialize logging/telemetry via the installed provider, falling
     //    back to the default `tracing-subscriber + OTLP` initializer.

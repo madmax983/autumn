@@ -462,7 +462,12 @@ fn base_command(binary: &Path, paths: Option<&RuntimePaths>, opts: &ServeOptions
     if opts.daemon
         && let Some(paths) = paths
     {
+        // The standard nested-config env var feeds the default loader. We also
+        // set a dedicated out-of-band override the framework re-applies *after*
+        // config loading, so a custom `with_config_loader` that ignores env
+        // can't drop the daemon's socket and strand it on TCP.
         cmd.env("AUTUMN_SERVER__UNIX_SOCKET", paths.socket_file());
+        cmd.env("AUTUMN_SERVE_FORCE_UNIX_SOCKET", paths.socket_file());
     }
     if opts.bundled_pg
         && let Some(paths) = paths
@@ -731,8 +736,14 @@ fn wait_for_ready(socket: &Path, child: &mut std::process::Child, timeout: Durat
             Ok(Some(_)) | Err(_) => return false,
             Ok(None) => {}
         }
+        // The startup barrier 503s every request until the app finishes its
+        // startup hooks/migrations (`mark_startup_complete`). Binding the socket
+        // happens *before* that, so a bare `connect` would report success while
+        // the app is still initializing. Only a non-503 response (barrier
+        // lifted) counts as ready; `StillStarting` (503) and `Unreachable` (not
+        // bound yet) both keep polling until the timeout.
         #[cfg(unix)]
-        if std::os::unix::net::UnixStream::connect(socket).is_ok() {
+        if matches!(probe_startup_over_socket(socket), ProbeOutcome::Ready) {
             return true;
         }
         #[cfg(not(unix))]
@@ -744,6 +755,86 @@ fn wait_for_ready(socket: &Path, child: &mut std::process::Child, timeout: Durat
         }
         std::thread::sleep(Duration::from_millis(100));
     }
+}
+
+/// Result of probing the daemon's startup state over its Unix socket.
+#[cfg(unix)]
+enum ProbeOutcome {
+    /// The socket isn't accepting connections yet (app not bound).
+    Unreachable,
+    /// Connected and the startup barrier is still returning 503.
+    StillStarting,
+    /// Connected and the app responded with a non-503 status — startup is
+    /// complete (or the socket speaks something other than the barrier, in
+    /// which case socket liveness is the best signal available).
+    Ready,
+}
+
+/// Issue a minimal HTTP/1.1 request over the daemon's Unix socket and classify
+/// the response by status line.
+///
+/// Autumn mounts a startup barrier that returns `503 Service Unavailable` for
+/// every path until startup completes; we deliberately request a path that is
+/// not a real route nor a health probe, so before completion we see the
+/// barrier's 503 and after completion a cheap `404` (no side effects, no DB
+/// hit). A reply that can't be parsed as HTTP is treated as `Ready` so a daemon
+/// that for any reason isn't speaking the barrier still falls back to socket
+/// liveness rather than hanging until timeout.
+#[cfg(unix)]
+fn probe_startup_over_socket(socket: &Path) -> ProbeOutcome {
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixStream;
+
+    let Ok(mut stream) = UnixStream::connect(socket) else {
+        return ProbeOutcome::Unreachable;
+    };
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
+    let request = "GET /.autumn-serve-readiness HTTP/1.1\r\n\
+         Host: localhost\r\n\
+         Connection: close\r\n\r\n";
+    if stream.write_all(request.as_bytes()).is_err() {
+        // Connected but the write failed before any response — listener is up
+        // but not serving yet; poll again.
+        return ProbeOutcome::StillStarting;
+    }
+    // The status line is the first line of the response; 64 bytes covers
+    // `HTTP/1.1 NNN <reason>` comfortably without reading the whole body.
+    let mut buf = [0u8; 64];
+    let mut read = 0;
+    while read < buf.len() {
+        match stream.read(&mut buf[read..]) {
+            Ok(n) if n > 0 => {
+                read += n;
+                if buf[..read].contains(&b'\n') {
+                    break;
+                }
+            }
+            // EOF (`Ok(0)`) or a read error: stop with whatever we have.
+            _ => break,
+        }
+    }
+    // 503 is the startup barrier (still initializing); any other status means
+    // it lifted. A `None` (no parseable status line) falls back to socket
+    // liveness so we never hang waiting on a daemon that isn't the barrier.
+    if parse_http_status(&buf[..read]) == Some(503) {
+        ProbeOutcome::StillStarting
+    } else {
+        ProbeOutcome::Ready
+    }
+}
+
+/// Parse the numeric status code out of an HTTP/1.x status line
+/// (`HTTP/1.1 503 ...`). Returns `None` if the bytes don't look like one.
+#[cfg(unix)]
+fn parse_http_status(bytes: &[u8]) -> Option<u16> {
+    let line = std::str::from_utf8(bytes).ok()?;
+    let mut parts = line.split_whitespace();
+    let version = parts.next()?;
+    if !version.starts_with("HTTP/") {
+        return None;
+    }
+    parts.next()?.parse::<u16>().ok()
 }
 
 /// Write the address-discovery file with `0600` permissions.
@@ -1173,6 +1264,22 @@ mod tests {
         // `stop -p api` from different CWDs target the same daemon.
         assert_eq!(workspace_anchor_from(&root), Some(root.clone()));
         assert_eq!(workspace_anchor_from(&member), Some(root));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parse_http_status_reads_status_code() {
+        assert_eq!(
+            parse_http_status(b"HTTP/1.1 503 Service Unavailable\r\n"),
+            Some(503)
+        );
+        assert_eq!(parse_http_status(b"HTTP/1.0 404 Not Found\r\n"), Some(404));
+        assert_eq!(parse_http_status(b"HTTP/1.1 200 OK\r\n"), Some(200));
+        // Non-HTTP / truncated input yields no status so the caller falls back
+        // to socket liveness instead of misreading it as "still starting".
+        assert_eq!(parse_http_status(b"garbage"), None);
+        assert_eq!(parse_http_status(b""), None);
+        assert_eq!(parse_http_status(b"HTTP/1.1 \r\n"), None);
     }
 
     #[test]
