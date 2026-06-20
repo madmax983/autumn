@@ -5466,7 +5466,7 @@ async fn run_startup_migrations(
     };
     let profile = config.profile.clone();
     let auto_in_prod = config.database.auto_migrate_in_production;
-    tokio::task::spawn_blocking(move || {
+    let migration_result = tokio::task::spawn_blocking(move || {
         if let Some(url) = control_url {
             for mig in &migrations {
                 crate::migrate::auto_migrate(
@@ -5484,15 +5484,17 @@ async fn run_startup_migrations(
             }
         }
     })
-    .await
-    .unwrap_or_else(|e| {
+    .await;
+    if let Err(e) = migration_result {
         tracing::error!(error = %e, "Migration task panicked");
         // Same orphan hazard as a migration failure: `process::exit` skips
-        // `on_shutdown`, so stop any managed Postgres before bailing.
+        // `on_shutdown`, so stop any managed Postgres before bailing. We are back
+        // on the Tokio runtime here (after the `spawn_blocking` await), so use the
+        // async stop — the sync `emergency_stop` would panic nesting a runtime.
         #[cfg(feature = "managed-pg")]
-        crate::managed_pg::emergency_stop();
+        crate::managed_pg::emergency_stop_async().await;
         std::process::exit(1);
-    });
+    }
 }
 
 /// Per-shard replica migration parity feeds each shard's runtime state
