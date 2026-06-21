@@ -1478,18 +1478,14 @@ mod tests {
         // to the session layer and stamps `RequestDeadlineCancelled` on its 503).
         let timeout_layer = axum::middleware::from_fn(
             |req: HttpRequest<Body>, next: axum::middleware::Next| async move {
-                match tokio::time::timeout(std::time::Duration::from_millis(50), next.run(req))
+                tokio::time::timeout(std::time::Duration::from_millis(50), next.run(req))
                     .await
-                {
-                    Ok(resp) => resp,
-                    Err(_) => {
-                        use axum::response::IntoResponse;
+                    .unwrap_or_else(|_| {
                         let mut resp = StatusCode::SERVICE_UNAVAILABLE.into_response();
                         resp.extensions_mut()
                             .insert(crate::router::RequestDeadlineCancelled);
                         resp
-                    }
-                }
+                    })
             },
         );
 
