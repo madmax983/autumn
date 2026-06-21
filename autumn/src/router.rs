@@ -1966,9 +1966,11 @@ fn build_route_timeout_table(
 /// to produce the response head, not the duration of body streaming, so SSE and
 /// chunked responses are never interrupted once the head is sent. Long-poll
 /// handlers, which block *before* returning the head, are bound by the deadline
-/// and must opt out via `timeout = "off"`. WebSocket upgrades are additionally
-/// marked [`RouteTimeout::Disabled`](crate::route::RouteTimeout) by the `#[ws]`
-/// macro.
+/// and must opt out via `timeout = "off"`. WebSocket routes inherit the deadline
+/// ([`RouteTimeout::Inherit`](crate::route::RouteTimeout), emitted by `#[ws]`),
+/// so it bounds a hung pre-upgrade handshake but never the established socket —
+/// that future runs on a separate task via `on_upgrade` and is unbounded by
+/// design.
 ///
 /// The layer is a no-op (zero overhead) when the global timeout is disabled and
 /// no route declares an `Override`.

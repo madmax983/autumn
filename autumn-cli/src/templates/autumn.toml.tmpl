@@ -11,8 +11,10 @@ port = 3000
 # starve the pool. On expiry Autumn returns a framework-standard 503 (Problem
 # Details JSON for APIs, the error page for browsers) — no tower wiring needed.
 # The `prod` profile enables 30s automatically; uncomment to set it everywhere.
-# Streaming routes (SSE/WebSocket) are exempt by default, and any route can
-# override with `#[get("/slow", timeout_ms = 120000)]` or `timeout = "off"`.
+# Streaming responses (SSE) are never interrupted (the deadline bounds the
+# response head, not the body), and WebSocket upgrades are bounded only for the
+# handshake, not the live socket. Any route can override with
+# `#[get("/slow", timeout_ms = 120000)]` or `timeout = "off"`.
 # [server.timeouts]
 # request_timeout_ms = 30000  # 0 or unset disables the deadline
 
