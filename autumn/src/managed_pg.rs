@@ -208,17 +208,6 @@ impl ManagedPostgresPoolProvider {
         // `setup` is idempotent: it downloads/extracts and runs `initdb` only
         // when the data dir is not already initialized.
         pg.setup().await?;
-        // A previous process may have been killed after starting Postgres but
-        // before its shutdown hook ran, leaving a postmaster still bound to this
-        // data dir. `postgresql_embedded` does not attach to an existing server,
-        // so `start()` would fail against the locked dir (and direct `cargo run`
-        // managed-PG apps would then fail on every boot until the orphan is
-        // stopped by hand). Stop whatever is bound to the data dir first — a
-        // data-dir `pg_ctl stop`, best-effort: a no-op/`Err` for a merely-stale
-        // `postmaster.pid`, which `start()` then reclaims on its own.
-        if matches!(pg.status(), postgresql_embedded::Status::Started) {
-            let _ = pg.stop().await;
-        }
         pg.start().await?;
         // The post-start database checks can still fail (auth, bootstrap-DB
         // connection, etc.). The server is already running by now, so stop it
@@ -337,6 +326,15 @@ impl DatabasePoolProvider for ManagedPostgresPoolProvider {
         &self,
         config: &DatabaseConfig,
     ) -> Result<Option<Pool<AsyncPgConnection>>, PoolError> {
+        // Reject a sharded config before starting anything. When the provider is
+        // installed only as the *pool* provider (`.with_pool_provider`),
+        // `resolve_shard_set` builds the shards directly from config and never
+        // calls `create_shard_topology`, so its fail-fast is bypassed — without
+        // this check the app would boot with control/migrations on the managed DB
+        // but tenant shards on external URLs.
+        if config.has_shards() {
+            reject_managed_shards();
+        }
         let url = match self.ensure_running().await {
             Ok(url) => url,
             Err(e) => {
@@ -390,26 +388,31 @@ impl DatabasePoolProvider for ManagedPostgresPoolProvider {
         _shard: &crate::config::ShardConfig,
         _defaults: &DatabaseConfig,
     ) -> Result<crate::db::DatabaseTopology, PoolError> {
-        // The managed cluster is a single local Postgres; it can't back the
-        // separate per-shard databases `[[database.shards]]` requires. The trait
-        // default would point each shard at its external URL while the control
-        // plane and migrations use the managed DB — a silent split. Fail fast
-        // with a clear diagnostic instead (matching `create_pool`'s fatal-boot
-        // handling).
-        tracing::error!(
-            "managed Postgres does not support [[database.shards]]; remove the \
-             shard configuration or use an external database"
-        );
-        eprintln!(
-            "autumn: managed Postgres (--bundled-pg) does not support \
-             [[database.shards]]. Remove shard config or use an external database."
-        );
         // `setup_database` already started the cluster via `create_topology`;
         // `process::exit` skips `on_shutdown`, so stop the child first to avoid
-        // orphaning it on the data dir/port.
+        // orphaning it on the data dir/port, then fail fast.
         self.stop().await;
-        std::process::exit(1);
+        reject_managed_shards();
     }
+}
+
+/// Print the "managed Postgres can't back shards" diagnostic and exit.
+///
+/// The managed cluster is a single local Postgres; `[[database.shards]]` needs
+/// separate per-shard databases it can't provide, and silently pointing shards
+/// at their external URLs while control/migrations use the managed DB would be a
+/// split-brain. Shared by the control (`create_pool`) and shard
+/// (`create_shard_topology`) paths.
+fn reject_managed_shards() -> ! {
+    tracing::error!(
+        "managed Postgres does not support [[database.shards]]; remove the \
+         shard configuration or use an external database"
+    );
+    eprintln!(
+        "autumn: managed Postgres (--bundled-pg) does not support \
+         [[database.shards]]. Remove shard config or use an external database."
+    );
+    std::process::exit(1);
 }
 
 /// Resolve the cluster data dir: the `AUTUMN_MANAGED_PG_DATA_DIR` override

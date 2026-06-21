@@ -441,6 +441,15 @@ fn start_daemon(opts: &ServeOptions) -> i32 {
         return 1;
     }
 
+    // No live daemon owns this namespace (checked above), so a managed Postgres
+    // still bound to the data dir is an orphan from a crashed prior daemon —
+    // `postgresql_embedded` won't attach to it and the app's boot would fail.
+    // Reap it here, where the daemon lifecycle is known to be gone, rather than
+    // in the provider (which can't tell an orphan from a live direct-use app).
+    if opts.bundled_pg {
+        reap_managed_postgres(&paths);
+    }
+
     eprintln!("\u{1F342} autumn serve\n");
     if !crate::dev::cargo_build(opts.package.as_deref(), opts.release) {
         eprintln!("\u{2717} Build failed. Fix the errors above and retry.");
