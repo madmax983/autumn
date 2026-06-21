@@ -1176,25 +1176,26 @@ fn cleanup(paths: &RuntimePaths, socket: &Path) {
 #[cfg(unix)]
 fn remove_socket_if_not_live(socket: &Path) {
     use std::os::unix::fs::FileTypeExt;
-    match std::fs::symlink_metadata(socket) {
-        Ok(meta) if meta.file_type().is_socket() => {
-            // Reclaim only a provably-stale socket: a connect refused with no
-            // listener (`ECONNREFUSED`) or whose path vanished (`NotFound`). A
-            // successful connect (live listener) or `EACCES`/`EPERM` (a mode/ACL-
-            // restricted socket whose liveness we can't prove) is left alone,
-            // mirroring the app's bind-path refusal so we never unlink a service
-            // that's still reachable to someone.
-            if std::os::unix::net::UnixStream::connect(socket).is_err_and(|e| {
-                matches!(
-                    e.kind(),
-                    std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
-                )
-            }) {
-                let _ = std::fs::remove_file(socket);
-            }
-        }
-        // Not a socket (or missing): leave it untouched.
-        _ => {}
+    // Not a socket, or missing/unreadable: leave it untouched (never clobber a
+    // regular file we didn't create).
+    let Ok(meta) = std::fs::symlink_metadata(socket) else {
+        return;
+    };
+    if !meta.file_type().is_socket() {
+        return;
+    }
+    // Reclaim only a provably-stale socket: a connect refused with no listener
+    // (`ECONNREFUSED`) or whose path vanished (`NotFound`). A successful connect
+    // (live listener) or `EACCES`/`EPERM` (a mode/ACL-restricted socket whose
+    // liveness we can't prove) is left alone, mirroring the app's bind-path
+    // refusal so we never unlink a service that's still reachable to someone.
+    if std::os::unix::net::UnixStream::connect(socket).is_err_and(|e| {
+        matches!(
+            e.kind(),
+            std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+        )
+    }) {
+        let _ = std::fs::remove_file(socket);
     }
 }
 
