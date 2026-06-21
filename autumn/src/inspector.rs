@@ -224,10 +224,26 @@ pub fn detect_n_plus_one(queries: &[QueryRecord], threshold: usize) -> Option<NP
 
 /// Collapse whitespace and lower-case a SQL string for comparison.
 fn normalize_sql(sql: &str) -> String {
-    sql.split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .to_lowercase()
+    let mut out = String::with_capacity(sql.len());
+    let mut iter = sql.split_whitespace();
+    if let Some(first) = iter.next() {
+        out.push_str(first);
+        for word in iter {
+            out.push(' ');
+            out.push_str(word);
+        }
+    }
+
+    // Normalize to lowercase for consistent deduplication grouping.
+    // ASCII-lowercasing is much faster and handles SQL keywords perfectly.
+    // We fall back to Unicode lowercasing if non-ASCII chars are present
+    // to preserve correctness for international text in query string literals.
+    if out.is_ascii() {
+        out.make_ascii_lowercase();
+    } else {
+        out = out.to_lowercase();
+    }
+    out
 }
 
 // ── Per-request query accumulator ─────────────────────────────────────────────
