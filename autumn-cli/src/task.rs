@@ -39,20 +39,18 @@ pub fn run(opts: &TaskOptions<'_>) {
 /// starting a second postmaster on the daemon's locked data dir. A no-op for
 /// apps that don't use managed Postgres (the env vars are simply unread).
 fn apply_managed_pg_env(cmd: &mut Command, package: Option<&str>) {
+    // The attach URL is CLI→child plumbing, not an operator knob. Clear any
+    // inherited value up front so a stale/foreign one can't override the data dir
+    // (the provider checks the attach URL first) — including when an explicit
+    // `AUTUMN_MANAGED_PG_DATA_DIR` override makes `managed_pg_env` return `None`.
+    // We re-set it only when we discover a live cluster to attach to.
+    cmd.env_remove(crate::serve::MANAGED_PG_ATTACH_URL_ENV);
     let Some(env) = crate::serve::managed_pg_env(package) else {
         return;
     };
     cmd.env(crate::serve::MANAGED_PG_DATA_DIR_ENV, &env.data_dir);
-    match env.attach_url {
-        Some(url) => {
-            cmd.env(crate::serve::MANAGED_PG_ATTACH_URL_ENV, url);
-        }
-        // No live cluster to attach to: clear any inherited attach URL so a stale
-        // or foreign value from the parent environment can't make the child
-        // connect to the wrong (or a dead) database instead of starting its own.
-        None => {
-            cmd.env_remove(crate::serve::MANAGED_PG_ATTACH_URL_ENV);
-        }
+    if let Some(url) = env.attach_url {
+        cmd.env(crate::serve::MANAGED_PG_ATTACH_URL_ENV, url);
     }
 }
 

@@ -52,17 +52,16 @@ pub fn run(debug: bool, package: Option<&str>) {
     // Share the serve daemon's managed-Postgres cluster (and attach to it when
     // live) so the static renderer doesn't try to start a second postmaster on
     // the daemon's locked data dir. A no-op for apps that don't use managed PG.
+    // The attach URL is CLI→child plumbing, not an operator knob. Clear any
+    // inherited value up front (even when an explicit AUTUMN_MANAGED_PG_DATA_DIR
+    // override makes `managed_pg_env` return None) so a stale/foreign value can't
+    // redirect the static renderer to the wrong database; re-set it only when a
+    // live cluster is discovered.
+    cmd.env_remove(crate::serve::MANAGED_PG_ATTACH_URL_ENV);
     if let Some(pg) = crate::serve::managed_pg_env(package) {
         cmd.env(crate::serve::MANAGED_PG_DATA_DIR_ENV, &pg.data_dir);
-        match pg.attach_url {
-            Some(url) => {
-                cmd.env(crate::serve::MANAGED_PG_ATTACH_URL_ENV, url);
-            }
-            // No live cluster: clear any inherited attach URL so a stale/foreign
-            // value can't redirect the static renderer to the wrong database.
-            None => {
-                cmd.env_remove(crate::serve::MANAGED_PG_ATTACH_URL_ENV);
-            }
+        if let Some(url) = pg.attach_url {
+            cmd.env(crate::serve::MANAGED_PG_ATTACH_URL_ENV, url);
         }
     }
     // Mirror cargo's profile selection: dev builds use the dev Autumn profile

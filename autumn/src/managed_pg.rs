@@ -293,16 +293,23 @@ impl ManagedPostgresPoolProvider {
         match options.open(&path) {
             Ok(mut f) => {
                 use std::io::Write;
-                // `mode(0o600)` only applies on create; tighten an existing
-                // (older-build / manually-created) file before writing the URL,
-                // which embeds the cluster superuser password. Best-effort: unlike
-                // the superuser password file (whose mode gates boot), this
-                // published copy is an optimization, so a `chmod` failure (e.g. a
-                // mount without Unix permissions) must not fail the boot.
+                // `mode(0o600)` only applies on create; an existing (older-build /
+                // manually-created / symlinked) file keeps its old, possibly
+                // permissive mode. The URL embeds the cluster superuser password,
+                // so if we can't enforce owner-only we must NOT write it — skip
+                // publishing (it's only an optimization for task/build attach) and
+                // drop the truncated file rather than expose credentials.
                 #[cfg(unix)]
                 {
                     use std::os::unix::fs::PermissionsExt;
-                    let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+                    if std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+                        .is_err()
+                    {
+                        tracing::warn!(path = %path.display(),
+                            "managed Postgres: cannot enforce owner-only mode on the cluster URL file; not publishing");
+                        let _ = std::fs::remove_file(&path);
+                        return;
+                    }
                 }
                 if let Err(e) = f.write_all(url.as_bytes()) {
                     tracing::warn!(error = %e, path = %path.display(),

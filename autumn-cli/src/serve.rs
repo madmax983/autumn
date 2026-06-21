@@ -474,7 +474,13 @@ fn workspace_anchor_from(start: &Path) -> Option<PathBuf> {
             nearest_manifest = Some(dir.to_path_buf());
         }
         match toml::from_str::<toml::Table>(&contents) {
-            Ok(table) if table.contains_key("workspace") => return Some(dir.to_path_buf()),
+            // A nearer transiently-broken workspace root (the one being edited)
+            // takes precedence over an outer valid `[workspace]`: in a nested
+            // checkout the daemon was started under the inner root, so anchoring
+            // to the outer one would make lifecycle commands miss it.
+            Ok(table) if table.contains_key("workspace") => {
+                return broken_workspace_dir.or_else(|| Some(dir.to_path_buf()));
+            }
             // A *transiently-broken* workspace root: unparsable but still carrying
             // the `[workspace]` header. Anchor to this exact dir (the nearest such
             // root), not the topmost manifest in the ancestry — a higher unrelated
@@ -1155,7 +1161,18 @@ fn live_postmaster_pid(data_dir: &Path) -> Option<u32> {
 /// postmaster owns the data dir, requests a fast shutdown and escalates. No-op
 /// when the cluster already stopped cleanly (pidfile absent or postmaster gone).
 fn reap_managed_postgres(paths: &RuntimePaths) {
-    let Some(pid) = live_postmaster_pid(&paths.pg_data_dir()) else {
+    let data_dir = paths.pg_data_dir();
+    // Whether or not a postmaster is still up, drop the published URL: this
+    // reaper bypasses `ManagedPostgresPoolProvider::stop()` (the only path that
+    // normally removes it), so a leftover `.autumn-pg-url` could make a later
+    // `task`/`build` attach to a dead — or, if the port was reused, foreign —
+    // endpoint instead of starting its own cluster.
+    let url_file = data_dir
+        .parent()
+        .unwrap_or(&data_dir)
+        .join(".autumn-pg-url");
+    let _ = std::fs::remove_file(&url_file);
+    let Some(pid) = live_postmaster_pid(&data_dir) else {
         return;
     };
     process::stop_postmaster(pid, Duration::from_secs(10));
@@ -1726,6 +1743,34 @@ mod tests {
         // Anchor must be the broken workspace dir, not the outer manifest above it,
         // or lifecycle commands would target the wrong runtime dir.
         assert_eq!(workspace_anchor_from(&member), Some(ws));
+    }
+
+    #[test]
+    fn workspace_anchor_inner_broken_root_wins_over_outer_valid_workspace() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let outer = std::fs::canonicalize(tmp.path()).expect("canonicalize");
+        // A *valid* outer workspace sits above a transiently-broken inner one.
+        std::fs::write(
+            outer.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"inner\"]\n",
+        )
+        .expect("write outer ws manifest");
+        let inner = outer.join("inner");
+        let member = inner.join("crates/api");
+        std::fs::create_dir_all(&member).expect("create dirs");
+        std::fs::write(
+            inner.join("Cargo.toml"),
+            "[workspace]\nmembers = [\n  \"crates/api\"",
+        )
+        .expect("write broken inner ws manifest");
+        std::fs::write(
+            member.join("Cargo.toml"),
+            "[package]\nname = \"api\"\nversion = \"0.1.0\"\n",
+        )
+        .expect("write member manifest");
+        // The inner (broken) workspace root the daemon was started under wins; the
+        // walk must not return the outer valid workspace.
+        assert_eq!(workspace_anchor_from(&member), Some(inner));
     }
 
     // Env vars touched by these tests; cleared so a polluted outer environment
