@@ -49,6 +49,15 @@ pub fn run(debug: bool, package: Option<&str>) {
 
     let mut cmd = Command::new(&binary);
     cmd.env("AUTUMN_BUILD_STATIC", "1");
+    // Share the serve daemon's managed-Postgres cluster (and attach to it when
+    // live) so the static renderer doesn't try to start a second postmaster on
+    // the daemon's locked data dir. A no-op for apps that don't use managed PG.
+    if let Some(pg) = crate::serve::managed_pg_env(package) {
+        cmd.env(crate::serve::MANAGED_PG_DATA_DIR_ENV, &pg.data_dir);
+        if let Some(url) = pg.attach_url {
+            cmd.env(crate::serve::MANAGED_PG_ATTACH_URL_ENV, url);
+        }
+    }
     // Mirror cargo's profile selection: dev builds use the dev Autumn profile
     // (skips production-only validation), release builds use prod so that
     // prod config overrides (robots.txt, SEO settings, etc.) are applied.

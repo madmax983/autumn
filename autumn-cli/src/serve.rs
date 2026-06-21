@@ -15,6 +15,15 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
+/// Env var the managed-Postgres provider reads to locate its data dir. Mirrors
+/// `autumn_web::managed_pg::MANAGED_PG_DATA_DIR_ENV`; redefined here because the
+/// CLI doesn't build the `managed-pg` feature and so can't reference the const.
+pub const MANAGED_PG_DATA_DIR_ENV: &str = "AUTUMN_MANAGED_PG_DATA_DIR";
+/// Env var that makes the provider *attach* to an already-running cluster at the
+/// given URL instead of starting its own. Mirrors
+/// `autumn_web::managed_pg::MANAGED_PG_ATTACH_URL_ENV`.
+pub const MANAGED_PG_ATTACH_URL_ENV: &str = "AUTUMN_MANAGED_PG_ATTACH_URL";
+
 /// Lifecycle subcommand for `autumn serve`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServeAction {
@@ -592,7 +601,7 @@ fn base_command(binary: &Path, paths: Option<&RuntimePaths>, opts: &ServeOptions
     if opts.bundled_pg
         && let Some(paths) = paths
     {
-        cmd.env("AUTUMN_MANAGED_PG_DATA_DIR", paths.pg_data_dir());
+        cmd.env(MANAGED_PG_DATA_DIR_ENV, paths.pg_data_dir());
     }
     // Restore an explicit profile (set by `restart`) so the relaunched daemon
     // loads the same config as the original even when the restart shell didn't
@@ -1086,44 +1095,93 @@ fn stop(opts: &ServeOptions) -> i32 {
     0
 }
 
-/// Reap a managed Postgres cluster the daemon may have left running. Reads the
-/// postmaster pid from the data dir's `postmaster.pid` and, if it's still alive,
-/// requests a fast shutdown and escalates. No-op when the cluster already
-/// stopped cleanly (pidfile absent or the postmaster is gone).
-fn reap_managed_postgres(paths: &RuntimePaths) {
-    let data_dir = paths.pg_data_dir();
+/// The PID of this cluster's live postmaster, or `None` when none is running.
+///
+/// Reads the data dir's `postmaster.pid` and applies PID-reuse guards: the live
+/// process must actually be `postgres` and (where the platform exposes it) be
+/// `chdir`'d into *this* data dir, since a postmaster `chdir`s to its data dir.
+/// A `postmaster.pid` left by a crashed/`SIGKILL`ed cluster keeps its old PID,
+/// which the OS may have recycled — these checks stop us from mistaking an
+/// unrelated process (or a *different* cluster) for this one.
+fn live_postmaster_pid(data_dir: &Path) -> Option<u32> {
     let pidfile = data_dir.join("postmaster.pid");
-    let Some(pid) = std::fs::read_to_string(&pidfile)
+    let pid = std::fs::read_to_string(&pidfile)
         .ok()
-        .and_then(|s| s.lines().next()?.trim().parse::<u32>().ok())
-    else {
-        return;
-    };
+        .and_then(|s| s.lines().next()?.trim().parse::<u32>().ok())?;
     if !process::is_process_alive(pid) {
-        return;
+        return None;
     }
-    // Guard against PID reuse: a `postmaster.pid` left behind by a crashed or
-    // `SIGKILL`ed cluster keeps its old PID, which the OS may have recycled.
-    // Where the platform reports it, require the live process to actually be
-    // `postgres` before signalling it; if we can't tell (non-Linux), fall back
-    // to liveness alone.
     if process::process_command_name(pid).is_some_and(|name| name != "postgres") {
-        return;
+        return None;
     }
-    // ...and, since the reused PID could be *another* `postgres` cluster, require
-    // its working directory to be this cluster's data dir (a postmaster `chdir`s
-    // to its data dir). Only enforced where `cwd` is observable (Linux); a
-    // mismatch means a different cluster owns the PID, so leave it alone.
     if let Some(cwd) = process::process_cwd(pid) {
         let same_dir = std::fs::canonicalize(&cwd)
             .ok()
-            .zip(std::fs::canonicalize(&data_dir).ok())
+            .zip(std::fs::canonicalize(data_dir).ok())
             .is_some_and(|(live, ours)| live == ours);
         if !same_dir {
-            return;
+            return None;
         }
     }
+    Some(pid)
+}
+
+/// Reap a managed Postgres cluster the daemon may have left running. If a live
+/// postmaster owns the data dir, requests a fast shutdown and escalates. No-op
+/// when the cluster already stopped cleanly (pidfile absent or postmaster gone).
+fn reap_managed_postgres(paths: &RuntimePaths) {
+    let Some(pid) = live_postmaster_pid(&paths.pg_data_dir()) else {
+        return;
+    };
     process::stop_postmaster(pid, Duration::from_secs(10));
+}
+
+/// Managed-Postgres environment for a one-off `autumn task`/`autumn build` run
+/// (see [`managed_pg_env`]).
+pub struct ManagedPgEnv {
+    /// The daemon's cluster data dir, always set so a one-off run and the daemon
+    /// agree on the cluster location.
+    pub data_dir: PathBuf,
+    /// The running cluster's connection URL, set only when a live cluster is
+    /// detected — the run then *attaches* instead of starting its own.
+    pub attach_url: Option<String>,
+}
+
+/// Resolve the managed-Postgres environment for a one-off run of `package` so it
+/// shares the serve daemon's cluster. Returns the daemon's data dir (always) and
+/// the live cluster's published URL (only when a postmaster is actually running
+/// for this project). `None` when the project's runtime paths can't be resolved,
+/// in which case the run falls back to the provider's own per-project default.
+#[must_use]
+pub fn managed_pg_env(package: Option<&str>) -> Option<ManagedPgEnv> {
+    let paths = RuntimePaths::resolve(&project_identity(package)).ok()?;
+    let attach_url = live_managed_pg_url(&paths);
+    Some(ManagedPgEnv {
+        data_dir: paths.pg_data_dir(),
+        attach_url,
+    })
+}
+
+/// The published connection URL of this project's managed cluster, but only when
+/// the cluster is currently running. Combines the live-postmaster check with the
+/// URL file the provider writes next to the data dir.
+fn live_managed_pg_url(paths: &RuntimePaths) -> Option<String> {
+    let data_dir = paths.pg_data_dir();
+    live_postmaster_pid(&data_dir)?;
+    // The provider publishes the URL beside the data dir. Keep this filename in
+    // sync with `autumn_web::managed_pg::PUBLISHED_URL_FILE` (the CLI doesn't
+    // build the `managed-pg` feature, so it can't reference the const).
+    let url_file = data_dir
+        .parent()
+        .unwrap_or(&data_dir)
+        .join(".autumn-pg-url");
+    let contents = std::fs::read_to_string(url_file).ok()?;
+    let trimmed = contents.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_owned())
+    }
 }
 
 /// Graceful-stop budget before escalating to `SIGKILL`.
