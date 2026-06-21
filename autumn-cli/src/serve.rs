@@ -451,7 +451,12 @@ fn start_daemon(opts: &ServeOptions) -> i32 {
     // may already be *provisioning* this cluster (it took `serve.startlock`
     // before writing `serve.pid`), and reaping would kill its postmaster. This
     // losing start will be rejected by the startup-lock acquire below anyway.
-    if opts.bundled_pg && !startup_in_progress(&paths) {
+    //
+    // Also skip while a server is live on the socket: the pidfile-only check
+    // above misses a healthy daemon whose `serve.pid` is missing/corrupt, and
+    // reaping would cut that daemon off from its database before
+    // `launch_daemon_child`'s live-socket guard rejects this start.
+    if opts.bundled_pg && !startup_in_progress(&paths) && !socket_is_live(&paths.socket_file()) {
         reap_managed_postgres(&paths);
     }
 
@@ -908,6 +913,18 @@ fn stop(opts: &ServeOptions) -> i32 {
     // daemon's process group, so it survives the app's crash/kill).
     let addr = read_addr_file(&paths);
     if !confirmed_running(&rec, &socket, startup_in_progress(&paths)) {
+        // A concurrent `autumn serve --daemon` can reclaim this stale pidfile and
+        // bring up a successor between the check above and the cleanup below.
+        // Bail out (touching nothing) if the pidfile no longer records `rec`, a
+        // start is now in progress, or the socket went live — otherwise we'd
+        // delete the successor's state and reap its just-started Postgres.
+        if process::read_pidfile(&paths.pid_file()).is_some_and(|r| r.pid != rec.pid)
+            || startup_in_progress(&paths)
+            || socket_is_live(&socket)
+        {
+            println!("autumn serve: not running (a newer daemon has since started)");
+            return 0;
+        }
         // The daemon is gone, but if it owned a managed cluster reap that too —
         // otherwise a crash before `stop` leaves Postgres holding the data
         // dir/port until manual cleanup. Reap when the address file says managed
