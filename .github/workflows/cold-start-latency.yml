@@ -49,6 +49,11 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
 
+# Minimal token scope: every job only needs to read the repo. Artifact upload
+# and step-summary writes do not require additional permissions.
+permissions:
+  contents: read
+
 jobs:
   # ── Budget table smoke-check (runs on every PR, no build/server) ───────────
   budget-table:
@@ -78,6 +83,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2.7.8
 
       - name: Run dev_loop_bench unit tests
+        # `shell: bash` enables `pipefail` on the runner, so a failing
+        # `cargo test` is not masked by the `tee` in the pipeline.
+        shell: bash
         run: |
           cargo test -p autumn-cli \
             dev_loop_bench \
@@ -102,6 +110,11 @@ jobs:
 
       - name: Run cold-start benchmark
         id: bench
+        # `shell: bash` enables `pipefail`, so a non-zero exit from the
+        # benchmark (scaffold/build failure, server timeout, or a tripped
+        # `--fail-on-regression`) fails the step instead of being swallowed by
+        # the `tee` pipeline.
+        shell: bash
         run: |
           export AUTUMN_BENCH_TIMESTAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           export AUTUMN_BENCH_RUST_VERSION="$(rustc --version)"

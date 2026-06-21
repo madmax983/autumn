@@ -58,11 +58,16 @@ it gets its own budget and gate (issue #977).
 
 **Success metric:** p95 cold start for the no-DB `hello` shape ≤ **60 s** on the
 CI reference runner — matching Autumn's stated "time-from-`cargo new` to first
-served route < 60 s" promise. The first scheduled CI run establishes the
-baseline; subsequent runs gate regressions of **> 20%** against that baseline
-until the absolute budget is comfortably met (same allowance as the warm loop
-above). The database-backed shape is **informational** in this slice and never
-fails the gate.
+served route < 60 s" promise.
+
+The **automated** weekly gate checks the **absolute budget** above (it fails when
+`all_passed` is `false`), exactly mirroring the warm `dev-loop-latency.yml` model.
+The first scheduled run records the baseline number in its uploaded report
+artifact; the **> 20%-over-baseline** allowance — used while a runner is still
+above the absolute budget — is the same documented **release-checklist policy**
+as the warm loop (see [Regression allowance](#regression-allowance)), not a
+separately automated check. The database-backed shape is **informational** in
+this slice and never fails the gate.
 
 ### Cold-start methodology
 

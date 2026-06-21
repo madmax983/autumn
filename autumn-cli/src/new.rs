@@ -114,7 +114,32 @@ fn check_option_combination(opts: GenerateOptions) -> Result<(), NewError> {
 }
 
 /// Generate a new Autumn project under `parent_dir/name`, honouring `opts`.
+///
+/// Prints a human-readable creation summary to stdout. Callers that need clean
+/// stdout (e.g. machine-readable output) should use [`generate_with_quiet`].
 pub fn generate_with(name: &str, parent_dir: &Path, opts: GenerateOptions) -> Result<(), NewError> {
+    generate_inner(name, parent_dir, opts, false)
+}
+
+/// Like [`generate_with`] but suppresses the stdout creation summary.
+///
+/// Used by tooling that emits machine-readable output on stdout (e.g. the
+/// cold-start benchmark with `--json`), where the scaffold summary would
+/// otherwise corrupt the output stream.
+pub fn generate_with_quiet(
+    name: &str,
+    parent_dir: &Path,
+    opts: GenerateOptions,
+) -> Result<(), NewError> {
+    generate_inner(name, parent_dir, opts, true)
+}
+
+fn generate_inner(
+    name: &str,
+    parent_dir: &Path,
+    opts: GenerateOptions,
+    quiet: bool,
+) -> Result<(), NewError> {
     validate_name(name)?;
     check_option_combination(opts)?;
 
@@ -233,7 +258,9 @@ pub fn generate_with(name: &str, parent_dir: &Path, opts: GenerateOptions) -> Re
 
     write_optional_scaffold_files(&project_dir, name, opts, &render)?;
 
-    print_scaffold_summary(name, opts);
+    if !quiet {
+        print_scaffold_summary(name, opts);
+    }
 
     Ok(())
 }

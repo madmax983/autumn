@@ -693,6 +693,22 @@ fn repoint_autumn_web(project_dir: &Path, autumn_web: &Path) -> Result<(), Strin
     Ok(())
 }
 
+/// Pin `[server] port` in the scaffolded `autumn.toml` to `port`.
+///
+/// The template ships `port = 3000`; this rewrites that single line so the
+/// built binary binds the same port the harness polls. A no-op when `port` is
+/// already 3000.
+fn set_server_port(project_dir: &Path, port: u16) -> Result<(), String> {
+    if port == 3000 {
+        return Ok(());
+    }
+    let config = project_dir.join("autumn.toml");
+    let content = std::fs::read_to_string(&config).map_err(|e| format!("read autumn.toml: {e}"))?;
+    let updated = content.replace("port = 3000", &format!("port = {port}"));
+    std::fs::write(&config, updated).map_err(|e| format!("write autumn.toml: {e}"))?;
+    Ok(())
+}
+
 /// Measure a single cold-start journey end-to-end: scaffold a throwaway project,
 /// compile it from a cold target, start it, and time until the first HTTP 200.
 ///
@@ -723,11 +739,23 @@ fn measure_cold_start_once(shape: ColdStartShape) -> Result<u64, String> {
     // (scaffold → first clean compile → boot → first 200) is captured.
     let start = Instant::now();
 
-    crate::new::generate_with(project_name, tmp.path(), opts)
+    // Quiet scaffold: keep stdout clean so `--cold-start --json` emits only the
+    // JSON report.
+    crate::new::generate_with_quiet(project_name, tmp.path(), opts)
         .map_err(|e| format!("autumn new failed: {e}"))?;
     let project_dir = tmp.path().join(project_name);
 
     repoint_autumn_web(&project_dir, &autumn_web)?;
+
+    // Pin the server port into the scaffolded autumn.toml so the binary binds
+    // exactly the port we later poll. Writing the config (rather than relying on
+    // an env-var override) keeps the bound port and the polled port from a single
+    // source of truth. Defaults to the template's 3000.
+    let port = std::env::var("AUTUMN_BENCH_PORT")
+        .ok()
+        .and_then(|p| p.parse::<u16>().ok())
+        .unwrap_or(3000);
+    set_server_port(&project_dir, port)?;
 
     // Cold build into the project's own (empty) target/. Remove any inherited
     // CARGO_TARGET_DIR so we never reuse a warm cache from the parent build.
@@ -742,17 +770,18 @@ fn measure_cold_start_once(shape: ColdStartShape) -> Result<u64, String> {
         return Err("cargo build failed for the scaffolded project".to_string());
     }
 
-    let bin = project_dir.join("target").join("debug").join(project_name);
+    // Binaries carry a platform-specific suffix (`.exe` on Windows, empty
+    // elsewhere) — append it so the path resolves on every OS.
+    let bin = project_dir
+        .join("target")
+        .join("debug")
+        .join(format!("{project_name}{}", std::env::consts::EXE_SUFFIX));
     let mut child = Command::new(&bin)
         .current_dir(&project_dir)
         .spawn()
         .map_err(|e| format!("failed to start the built server binary: {e}"))?;
 
     // Poll the configured root route until the first 200 or the deadline.
-    let port = std::env::var("AUTUMN_BENCH_PORT")
-        .ok()
-        .and_then(|p| p.parse::<u16>().ok())
-        .unwrap_or(3000);
     let url = format!("http://127.0.0.1:{port}/");
     let deadline = start + Duration::from_millis(budget_for(class_for(shape)).max_ms * 2);
     let client = reqwest::blocking::Client::builder()
@@ -809,6 +838,14 @@ pub fn run_cold_start(
     if dry_run {
         print!("{}", format_cold_start_budget_table(include_db));
         return 0;
+    }
+
+    // A measurement run with zero samples would publish an all-zero, "passing"
+    // report without compiling or starting anything. Refuse it so the gate can
+    // never go green on no data.
+    if runs == 0 {
+        eprintln!("Error: --runs must be at least 1 for a cold-start measurement.");
+        return 1;
     }
 
     eprintln!(
@@ -1580,6 +1617,20 @@ mod tests {
     fn run_cold_start_dry_run_returns_zero() {
         assert_eq!(run_cold_start(1, None, false, false, true, false), 0);
         assert_eq!(run_cold_start(1, None, true, false, true, true), 0);
+    }
+
+    #[test]
+    fn run_cold_start_rejects_zero_runs() {
+        // --runs 0 must not publish an all-zero "passing" report without
+        // measuring anything; it returns a non-zero exit instead.
+        let exit = run_cold_start(0, None, false, false, false, false);
+        assert_eq!(exit, 1, "zero runs must be rejected");
+    }
+
+    #[test]
+    fn run_cold_start_dry_run_ignores_zero_runs() {
+        // Dry-run never measures, so runs == 0 is harmless there.
+        assert_eq!(run_cold_start(0, None, false, false, true, false), 0);
     }
 
     // ── live driver (slow: compiles a fresh project) ──────────────────────
