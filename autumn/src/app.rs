@@ -3022,7 +3022,17 @@ impl AppBuilder {
                     crate::managed_pg::emergency_stop_async().await;
                     std::process::exit(1);
                 }
-                let listener = match tokio::net::UnixListener::bind(path) {
+                // Bind under an owner-only umask so the socket is created `0600`
+                // from the start — a plain bind would briefly leave it
+                // group/other-connectable (umask-dependent), and `chmod` afterward
+                // does not revoke a connection already established in that window.
+                // This matters for a user-configured `server.unix_socket` in a
+                // shared dir; the CLI's own socket also sits in a `0700` parent.
+                let prev_umask =
+                    nix::sys::stat::umask(nix::sys::stat::Mode::from_bits_truncate(0o177));
+                let bind_result = tokio::net::UnixListener::bind(path);
+                nix::sys::stat::umask(prev_umask);
+                let listener = match bind_result {
                     Ok(listener) => listener,
                     Err(e) => {
                         tracing::error!(socket = %socket_path, "Failed to bind unix socket: {e}");
@@ -3031,12 +3041,11 @@ impl AppBuilder {
                         std::process::exit(1);
                     }
                 };
-                // Local-daemon socket: owner-only access. Fail *closed* — a
-                // user-configured `server.unix_socket` may sit in a shared
-                // directory, so if we cannot enforce `0600` (chmod error, an ACL
-                // /filesystem that rejects it), refuse to serve rather than
-                // expose a world-reachable control socket. Remove the socket we
-                // just bound so nothing keeps listening on it.
+                // Owner-only access, belt-and-suspenders after the umask bind.
+                // Fail *closed* — if we cannot enforce `0600` (chmod error, an ACL
+                // /filesystem that rejects it), refuse to serve rather than expose
+                // a reachable control socket. Remove the socket we just bound so
+                // nothing keeps listening on it.
                 if let Err(e) =
                     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
                 {
