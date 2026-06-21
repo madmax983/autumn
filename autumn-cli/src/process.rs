@@ -358,20 +358,29 @@ pub fn wait_for_record_exit(record: &PidRecord, timeout: Duration) -> bool {
 /// `timeout` for it to drain and exit, then force-kill if it is still alive.
 /// Returns `true` only if the recorded process is gone afterwards.
 ///
-/// The wait and the pre-escalation check are identity-aware (start time, when
-/// the platform records it): if the daemon exits and its PID is reused before
-/// the loop observes the exit, the reused process has a different start time and
-/// is treated as already-gone, so the `SIGKILL`/`killpg` escalation is skipped
-/// rather than aimed at an unrelated process.
+/// The wait and the pre-escalation check are identity-aware: a recorded start
+/// time (Linux) detects a PID reused mid-drain, and where that's unavailable
+/// (macOS/BSD, or legacy pidfiles) the daemon's `socket` is used as the identity
+/// signal instead — if it no longer has a live listener, the daemon has exited
+/// and the still-"alive" PID belongs to an unrelated reuser, so the
+/// `SIGKILL`/`killpg` escalation is skipped rather than aimed at a stranger.
 ///
 /// A `false` return means the daemon could **not** be stopped — e.g. it is owned
 /// by another user and `kill` returns `EPERM` — so the caller must not delete
 /// its state or report success.
 #[cfg(unix)]
 #[must_use]
-pub fn stop_record(record: &PidRecord, timeout: Duration) -> bool {
+pub fn stop_record(record: &PidRecord, timeout: Duration, socket: &Path) -> bool {
     let _ = signal_terminate(record.pid);
     if wait_for_record_exit(record, timeout) {
+        return true;
+    }
+    // Timed out with the PID still apparently alive. On platforms without a
+    // recorded start time, `is_record_alive` is a bare liveness check that can't
+    // tell our daemon from a process that reused its PID after it exited. Use the
+    // daemon's socket as the identity check: only our daemon listens there, so a
+    // dead socket means it's gone — don't escalate against the reused PID.
+    if record.start_time.is_none() && !socket_has_live_listener(socket) {
         return true;
     }
     if !is_record_alive(record) {
@@ -384,6 +393,15 @@ pub fn stop_record(record: &PidRecord, timeout: Duration) -> bool {
     force_kill(record.pid);
     force_kill_group(record.pid);
     wait_for_record_exit(record, Duration::from_secs(5))
+}
+
+/// Whether a Unix socket at `path` currently has a live listener (a `connect`
+/// succeeds). Used as an identity signal where a process start time isn't
+/// available, since only our daemon listens on its control socket.
+#[cfg(unix)]
+#[must_use]
+fn socket_has_live_listener(path: &Path) -> bool {
+    std::os::unix::net::UnixStream::connect(path).is_ok()
 }
 
 /// Stop a managed Postgres postmaster `pid`: request a "fast" shutdown (SIGINT —
@@ -422,7 +440,7 @@ pub fn stop_postmaster(_pid: u32, _timeout: Duration) {}
 /// Non-Unix fallback: no graceful-signal mechanism in this MVP.
 #[cfg(not(unix))]
 #[must_use]
-pub fn stop_record(_record: &PidRecord, _timeout: Duration) -> bool {
+pub fn stop_record(_record: &PidRecord, _timeout: Duration, _socket: &Path) -> bool {
     false
 }
 

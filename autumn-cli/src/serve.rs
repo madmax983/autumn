@@ -434,8 +434,17 @@ fn identity_root() -> PathBuf {
 /// ancestor whose `Cargo.toml` has a `[workspace]` table), else the nearest
 /// ancestor containing any `Cargo.toml`, else `None`. Separated from CWD lookup
 /// so it can be unit-tested against a fixture tree.
+///
+/// If a `Cargo.toml` above us exists but fails to parse, we can't confirm its
+/// `[workspace]` table, so fall back to the **topmost** manifest dir (the most
+/// likely workspace root) rather than the nearest. This keeps the namespace
+/// stable when the root manifest is *transiently* unparsable while a `-p`
+/// lifecycle command runs from a member — otherwise the anchor would flip from
+/// the root to the member and `status`/`stop` would target a different dir.
 fn workspace_anchor_from(start: &Path) -> Option<PathBuf> {
     let mut nearest_manifest: Option<PathBuf> = None;
+    let mut topmost_manifest: Option<PathBuf> = None;
+    let mut saw_unparsable = false;
     for dir in start.ancestors() {
         let Ok(contents) = std::fs::read_to_string(dir.join("Cargo.toml")) else {
             continue;
@@ -443,11 +452,18 @@ fn workspace_anchor_from(start: &Path) -> Option<PathBuf> {
         if nearest_manifest.is_none() {
             nearest_manifest = Some(dir.to_path_buf());
         }
-        if toml::from_str::<toml::Table>(&contents).is_ok_and(|t| t.contains_key("workspace")) {
-            return Some(dir.to_path_buf());
+        topmost_manifest = Some(dir.to_path_buf());
+        match toml::from_str::<toml::Table>(&contents) {
+            Ok(table) if table.contains_key("workspace") => return Some(dir.to_path_buf()),
+            Ok(_) => {}
+            Err(_) => saw_unparsable = true,
         }
     }
-    nearest_manifest
+    if saw_unparsable {
+        topmost_manifest
+    } else {
+        nearest_manifest
+    }
 }
 
 /// Build, then start the server (foreground or daemon). Returns the exit code.
@@ -1030,7 +1046,11 @@ fn stop(opts: &ServeOptions) -> i32 {
     // daemons started before that field was recorded.
     let recorded_release = addr.as_ref().is_some_and(|a| a.release);
     let recorded_budget = addr.as_ref().and_then(|a| a.stop_budget_secs);
-    if !process::stop_record(&rec, stop_timeout(opts, recorded_release, recorded_budget)) {
+    if !process::stop_record(
+        &rec,
+        stop_timeout(opts, recorded_release, recorded_budget),
+        &socket,
+    ) {
         // The daemon is still alive and we couldn't signal it (e.g. it is owned
         // by another user — `kill` returned `EPERM`). Do NOT remove its state or
         // report success: that would orphan a running daemon and lie to scripts.
@@ -1469,6 +1489,28 @@ mod tests {
         let nested = root.join("src");
         std::fs::create_dir_all(&nested).expect("create nested dir");
         assert_eq!(workspace_anchor_from(&nested), Some(root));
+    }
+
+    #[test]
+    fn workspace_anchor_stable_when_root_manifest_unparsable() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = std::fs::canonicalize(tmp.path()).expect("canonicalize root");
+        // The workspace root manifest is temporarily broken (mid-edit).
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[workspace\nthis is not valid toml",
+        )
+        .expect("write broken root manifest");
+        let member = root.join("crates/api");
+        std::fs::create_dir_all(&member).expect("create member dir");
+        std::fs::write(
+            member.join("Cargo.toml"),
+            "[package]\nname = \"api\"\nversion = \"0.1.0\"\n",
+        )
+        .expect("write member manifest");
+        // The anchor must still be the root (topmost manifest), not the member,
+        // so the namespace doesn't flip while the root manifest is unparsable.
+        assert_eq!(workspace_anchor_from(&member), Some(root));
     }
 
     // Env vars touched by these tests; cleared so a polluted outer environment
