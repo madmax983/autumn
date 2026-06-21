@@ -437,6 +437,10 @@ fn build_router_pre_state(
         None
     };
 
+    // Build the per-route timeout override table before `route_list` and the
+    // scoped groups are consumed by the mounting steps below.
+    let route_timeouts = build_route_timeout_table(&route_list, &ctx.scoped_groups);
+
     let idempotency_layers = build_idempotency_layers(config, state)?;
     // Both `.layer(..)` custom layers and `.static_gate(..)` gate layers are
     // opaque app layers for idempotency: an auth/tenant layer in either slot
@@ -506,6 +510,7 @@ fn build_router_pre_state(
         ctx.custom_layers,
         ctx.error_page_renderer,
         ctx.session_store,
+        route_timeouts,
     )?;
 
     if dev_reload_enabled {
@@ -616,6 +621,12 @@ fn build_router_pre_state(
         };
         let mut mcp_router =
             crate::mcp::build_mcp_router(&mount_path, tools, dispatch, wiring, endpoint_layer);
+        // NOTE: the inbound request-timeout layer for this envelope is applied
+        // further down, *outer* to the rate-limit layer (search for
+        // `apply_request_timeout_middleware` below). It must wrap the limiter so a
+        // stalled Redis rate-limit decision is bounded by `request_timeout_ms`,
+        // matching the main stack where `apply_middleware` installs the timeout
+        // outer to `apply_rate_limit_middleware`.
         // Gate the envelope under maintenance mode, mirroring the layer
         // `apply_middleware` installs for direct routes. The `/mcp` router is
         // merged after that layer, so without this `initialize`/`tools/list`
@@ -659,6 +670,41 @@ fn build_router_pre_state(
         // call does not consume the same per-user bucket a direct request would
         // (the framework only derives `RateLimitPrincipal` from the session).
         mcp_router = apply_rate_limit_middleware(mcp_router, config, state);
+        // Bound the whole envelope — the rate-limit decision (a stalled
+        // Redis-backed limiter would otherwise tie up `/mcp` indefinitely), the
+        // metadata/auth work (initialize, tools/list, and `secure_mcp` auth
+        // rejections that never reach the dispatch clone), and the in-process
+        // `tools/call` dispatch — by the global inbound deadline. The `/mcp`
+        // router is merged after `apply_middleware`, so the timeout layer
+        // installed there does NOT wrap it; without this the prod global deadline
+        // would not bound this surface. Applied here, outer to the rate-limit
+        // layer above (matching the main stack, where `apply_middleware` installs
+        // the timeout outer to `apply_rate_limit_middleware`) but inner to the
+        // security-header and CORS layers below, so a stalled limiter is bounded
+        // while the timeout 503 still flows out through those layers and stays
+        // CORS-readable. Route-level overrides do not apply to the fixed mount
+        // path, so an empty override table is passed (the layer is a no-op when
+        // the global timeout is disabled).
+        //
+        // KNOWN LIMITATION (tools/call vs per-route timeout): this envelope timer
+        // wraps the whole POST, including the in-process `tools/call` dispatch
+        // replay, with the global default deadline. The dispatch clone carries
+        // its own per-route timeout layer, but it is *inner* to this one, so a
+        // tool whose route declares `timeout = "off"` or a longer `timeout_ms`
+        // is still capped at the global default when invoked via MCP (it runs
+        // unbounded / longer over a direct HTTP call). Honoring the per-route
+        // policy here would require propagating the dispatched route's timeout
+        // out to this single fixed-path endpoint, which has no per-route
+        // distinction at the layer level; the global deadline is kept as a
+        // safety bound instead. `mirror_cors = false`: the 503 already flows out
+        // through this router's own (outer) `CorsLayer` from `apply_mcp_cors_layer`.
+        mcp_router = apply_request_timeout_middleware(
+            mcp_router,
+            config,
+            state.metrics.clone(),
+            std::sync::Arc::new(std::collections::HashMap::new()),
+            false,
+        );
         // Security headers (HSTS/CSP/etc.), mirroring the `SecurityHeadersLayer`
         // `apply_middleware` installs for direct routes. The `/mcp` router is
         // merged after that layer, so without this the envelope's responses —
@@ -833,17 +879,27 @@ fn build_openapi_router(
 /// generating a spec whose URLs don't match what axum serves.
 #[allow(dead_code)]
 pub fn join_nested_path(prefix: &str, child: &str) -> String {
-    let prefix_trimmed = prefix.trim_end_matches('/');
     if child == "/" || child.is_empty() {
-        if prefix_trimmed.is_empty() {
+        // axum mounts the root child at the prefix *verbatim*, keeping any
+        // trailing slash: `nest("/api", route("/"))` is served at "/api" while
+        // `nest("/api/", route("/"))` is served at "/api/" — and `MatchedPath`
+        // reports the same string. Preserve the prefix as-is so the per-route
+        // timeout table keys by exactly what the runtime looks up; only the
+        // empty (root) prefix collapses to "/".
+        if prefix.is_empty() {
             "/".to_owned()
         } else {
-            prefix_trimmed.to_owned()
+            prefix.to_owned()
         }
-    } else if child.starts_with('/') {
-        format!("{prefix_trimmed}{child}")
     } else {
-        format!("{prefix_trimmed}/{child}")
+        // Non-root children always join on a single slash, matching axum (e.g.
+        // `nest("/api/", route("/users"))` resolves to "/api/users").
+        let prefix_trimmed = prefix.trim_end_matches('/');
+        if child.starts_with('/') {
+            format!("{prefix_trimmed}{child}")
+        } else {
+            format!("{prefix_trimmed}/{child}")
+        }
     }
 }
 
@@ -1792,67 +1848,272 @@ fn build_maintenance_layer(
         .with_probe_paths(bypass_paths)
 }
 
-/// Apply a per-request-cycle timeout when `config.server.timeouts.request_timeout_ms`
-/// is set and non-zero.
+/// Per-route timeout lookup table, keyed by the fully-qualified route template
+/// (matching [`axum::extract::MatchedPath`]) and then by HTTP method, so an
+/// override on one handler never bleeds onto sibling methods sharing the path
+/// (e.g. `GET /items` vs `POST /items`). The nested layout also lets the
+/// middleware resolve the deadline from a borrowed `&str` + `&Method`, avoiding
+/// any allocation on exempt/disabled routes. Built once at router-assembly time
+/// from each [`Route`]'s `timeout` field and shared (cheaply cloned) into the
+/// global timeout middleware.
+type RouteTimeoutTable = std::sync::Arc<
+    std::collections::HashMap<
+        String,
+        std::collections::HashMap<http::Method, crate::route::RouteTimeout>,
+    >,
+>;
+
+/// Error surfaced as the cause of the `503` when an inbound request exceeds its
+/// wall-clock deadline. Carried into [`crate::error::AutumnError::service_unavailable`]
+/// so the response flows through the standard Problem Details / error-page stack
+/// (JSON for API clients, HTML for browsers) instead of a raw tower `BoxError`.
+#[derive(Debug)]
+struct RequestDeadlineExceeded {
+    timeout_ms: u64,
+}
+
+impl std::fmt::Display for RequestDeadlineExceeded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the server did not produce a response within the configured {}ms deadline",
+            self.timeout_ms
+        )
+    }
+}
+
+impl std::error::Error for RequestDeadlineExceeded {}
+
+/// Response-extension marker stamped on the `503` produced when the inbound
+/// request-timeout deadline cancels the handler future.
 ///
-/// The middleware is inserted inner to [`RequestIdLayer`] so the request ID is
-/// available in the warning log and 408 response body. The layer is a no-op when
-/// the timeout is disabled, preserving zero overhead for unconfigured deployments.
+/// The session layer is applied *outer* to the timeout layer, so when the
+/// deadline fires it observes the (still-shared) `Session` handle as dirty even
+/// though the handler was cancelled mid-flight. Persisting that partial mutation
+/// would commit half-finished state — e.g. a login that set the user id but
+/// never finished — so `SessionService` checks for this marker and skips the
+/// dirty save/destroy when it is present. Only the timeout handler sets it, so
+/// ordinary handler-produced `503`s still persist session changes as before.
+#[derive(Clone, Copy, Debug)]
+pub struct RequestDeadlineCancelled;
+
+/// Build the per-route timeout override table from the top-level routes and any
+/// scoped (prefixed) groups. Group routes are keyed by their nested template so
+/// the runtime lookup matches [`axum::extract::MatchedPath`].
+fn build_route_timeout_table(
+    route_list: &[Route],
+    scoped_groups: &[ScopedGroup],
+) -> RouteTimeoutTable {
+    let mut table: std::collections::HashMap<
+        String,
+        std::collections::HashMap<http::Method, crate::route::RouteTimeout>,
+    > = std::collections::HashMap::new();
+    let mut insert = |path: String, method: &http::Method, timeout: crate::route::RouteTimeout| {
+        // `Inherit` carries no override, so it never needs a table entry.
+        if matches!(timeout, crate::route::RouteTimeout::Inherit) {
+            return;
+        }
+        // Key by (path, *effective request method*) so an override on one handler
+        // never bleeds onto sibling methods that share the template, while still
+        // resolving when the request reaches the handler through a method alias.
+        // `request_timeout_handler` looks up `req.method()`, which differs from
+        // the declared method in two cases:
+        //   - axum serves `HEAD` through a `#[get]` handler, so a GET override
+        //     must also cover HEAD.
+        //   - `#[ws]` records the synthetic `WS` method but mounts a `GET`
+        //     handler, so the upgrade (and its auth work) arrives as GET.
+        // Each (effective method, path) pair is still unique across the router, so
+        // `insert` cannot lose a competing entry.
+        let by_method = table.entry(path).or_default();
+        match method.as_str() {
+            "WS" => {
+                by_method.insert(http::Method::GET, timeout);
+            }
+            _ if *method == http::Method::GET => {
+                by_method.insert(http::Method::GET, timeout);
+                by_method.insert(http::Method::HEAD, timeout);
+            }
+            _ => {
+                by_method.insert(method.clone(), timeout);
+            }
+        }
+    };
+    for route in route_list {
+        insert(route.path.to_owned(), &route.method, route.timeout);
+    }
+    for group in scoped_groups {
+        for route in &group.routes {
+            insert(
+                join_nested_path(&group.prefix, route.path),
+                &route.method,
+                route.timeout,
+            );
+        }
+    }
+    std::sync::Arc::new(table)
+}
+
+/// Apply the built-in inbound request timeout.
+///
+/// A single global layer enforces `config.server.timeouts.request_timeout_ms`
+/// (the `prod` profile smart-defaults this to 30s) as a per-request wall-clock
+/// deadline, with per-route overrides resolved from `route_timeouts` via the
+/// matched route template. On expiry the handler returns a framework-standard
+/// `503 Service Unavailable` (Problem Details JSON for API clients, the error
+/// page for browsers — never a raw tower `BoxError`).
+///
+/// Streaming responses are exempt by construction: the deadline bounds the time
+/// to produce the response head, not the duration of body streaming, so SSE and
+/// chunked responses are never interrupted once the head is sent. Long-poll
+/// handlers, which block *before* returning the head, are bound by the deadline
+/// and must opt out via `timeout = "off"`. WebSocket routes inherit the deadline
+/// ([`RouteTimeout::Inherit`](crate::route::RouteTimeout), emitted by `#[ws]`),
+/// so it bounds a hung pre-upgrade handshake but never the established socket —
+/// that future runs on a separate task via `on_upgrade` and is unbounded by
+/// design.
+///
+/// The layer is a no-op (zero overhead) when the global timeout is disabled and
+/// no route declares an `Override`.
+///
+/// `mirror_cors` makes a synthesized 503 carry the CORS response headers a
+/// normal response would. Set it for the main ingress stack, where this layer
+/// sits *outside* `CorsLayer` (see the order in `apply_middleware`) so the 503
+/// never flows back through it; leave it off for the `/mcp` envelope, whose
+/// timeout is applied *inner* to its `CorsLayer` and whose 503 is therefore
+/// already CORS-readable.
 fn apply_request_timeout_middleware(
     router: axum::Router<AppState>,
     config: &AutumnConfig,
     metrics: crate::middleware::MetricsCollector,
+    route_timeouts: RouteTimeoutTable,
+    mirror_cors: bool,
 ) -> axum::Router<AppState> {
-    let timeout_ms = match config.server.timeouts.request_timeout_ms {
-        Some(ms) if ms > 0 => ms,
-        _ => return router,
-    };
-    let duration = std::time::Duration::from_millis(timeout_ms);
-    let is_dev = matches!(
-        config.profile.as_deref(),
-        Some("dev" | "development") | None
-    );
-    tracing::info!(timeout_ms, "Per-request timeout enabled");
+    let global = config
+        .server
+        .timeouts
+        .request_timeout_ms
+        .filter(|ms| *ms > 0)
+        .map(std::time::Duration::from_millis);
+    let has_override = route_timeouts
+        .values()
+        .flat_map(std::collections::HashMap::values)
+        .any(|t| matches!(t, crate::route::RouteTimeout::Override(_)));
+    if global.is_none() && !has_override {
+        return router;
+    }
+    if let Some(duration) = global {
+        tracing::info!(
+            timeout_ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
+            "Inbound request timeout enabled"
+        );
+    }
+    // Snapshot the CORS config once iff we must mirror it onto timeout 503s and
+    // any origin is configured (otherwise `CorsLayer` itself is absent).
+    let cors = (mirror_cors && !config.cors.allowed_origins.is_empty())
+        .then(|| std::sync::Arc::new(config.cors.clone()));
     router.layer(axum::middleware::from_fn(move |req, next| {
-        request_timeout_handler(req, next, duration, metrics.clone(), is_dev)
+        request_timeout_handler(
+            req,
+            next,
+            global,
+            route_timeouts.clone(),
+            metrics.clone(),
+            cors.clone(),
+        )
     }))
 }
 
 async fn request_timeout_handler(
     req: axum::extract::Request,
     next: axum::middleware::Next,
-    duration: std::time::Duration,
+    global: Option<std::time::Duration>,
+    route_timeouts: RouteTimeoutTable,
     metrics: crate::middleware::MetricsCollector,
-    is_dev: bool,
+    cors: Option<std::sync::Arc<crate::config::CorsConfig>>,
 ) -> axum::response::Response {
+    // Internal `autumn build` / ISR regeneration renders drive a `#[static_get]`
+    // route directly via `oneshot` and tag the request with `RenderDeadlineExempt`
+    // (there is no client connection whose deadline should apply). Skip the
+    // deadline for these; live inbound requests to the same route do not carry
+    // the marker and are bounded normally below.
+    if req
+        .extensions()
+        .get::<crate::static_gen::RenderDeadlineExempt>()
+        .is_some()
+    {
+        return next.run(req).await;
+    }
+
+    // Resolve the effective deadline from the matched route template + method,
+    // using borrowed lookups so exempt/disabled routes allocate nothing.
+    let matched_path_ref = req
+        .extensions()
+        .get::<axum::extract::MatchedPath>()
+        .map(axum::extract::MatchedPath::as_str);
+    let route_timeout = matched_path_ref
+        .and_then(|p| route_timeouts.get(p))
+        .and_then(|by_method| by_method.get(req.method()))
+        .copied()
+        .unwrap_or(crate::route::RouteTimeout::Inherit);
+    let deadline = match route_timeout {
+        crate::route::RouteTimeout::Disabled => None,
+        crate::route::RouteTimeout::Override(d) => Some(d),
+        crate::route::RouteTimeout::Inherit => global,
+    };
+    let Some(duration) = deadline else {
+        // Exempt (disabled route, or global off with a non-Override route) —
+        // no allocation on this hot path.
+        return next.run(req).await;
+    };
+
+    // A deadline is active: now it's worth owning the path for the warn log.
+    let matched_path = matched_path_ref.map(ToOwned::to_owned);
     let request_id = req
         .extensions()
         .get::<crate::middleware::RequestId>()
         .cloned();
+    // Capture the request Origin before `req` is consumed so a timeout 503 can
+    // mirror the CORS headers `CorsLayer` would have added (only when mirroring
+    // is enabled — see `apply_request_timeout_middleware`).
+    let cors_origin = cors
+        .as_ref()
+        .and_then(|_| req.headers().get(http::header::ORIGIN).cloned());
+    let start = std::time::Instant::now();
     match tokio::time::timeout(duration, next.run(req)).await {
         Ok(response) => response,
         Err(_elapsed) => {
-            if let Some(ref rid) = request_id {
-                tracing::warn!(request_id = %rid, "Request timed out");
-            } else {
-                tracing::warn!("Request timed out");
-            }
-            metrics.record_request_timeout();
-            let body = crate::error::problem_details_json_string(
-                http::StatusCode::REQUEST_TIMEOUT,
-                "The server did not receive a complete request within the allowed time",
-                None,
-                None,
-                request_id.as_ref().map(ToString::to_string),
-                None,
-                is_dev,
+            let elapsed_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+            let route = matched_path.as_deref().unwrap_or("<unmatched>");
+            // Structured telemetry: route template + elapsed time so operators
+            // can alert on the (already-counted) timeout event.
+            tracing::warn!(
+                target: "autumn::timeout",
+                route = route,
+                elapsed_ms = elapsed_ms,
+                timeout_ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
+                request_id = request_id.as_ref().map(ToString::to_string),
+                "inbound request exceeded deadline"
             );
-            (
-                http::StatusCode::REQUEST_TIMEOUT,
-                [(http::header::CONTENT_TYPE, "application/problem+json")],
-                body,
-            )
-                .into_response()
+            metrics.record_request_timeout();
+            // Return a 503 via the standard error type so the exception-filter
+            // and error-page stack negotiate JSON vs HTML and enrich with the
+            // request id — no manual Problem Details assembly, no raw BoxError.
+            let mut response =
+                crate::error::AutumnError::service_unavailable(RequestDeadlineExceeded {
+                    timeout_ms: u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
+                })
+                .into_response();
+            // Tag the 503 so the outer session layer skips persisting any partial
+            // session mutation the cancelled handler made before the deadline.
+            response.extensions_mut().insert(RequestDeadlineCancelled);
+            // This layer is outside `CorsLayer` in the main stack, so the 503
+            // never passes back through it; mirror the CORS headers ourselves so
+            // cross-origin browser clients can read the Problem Details body
+            // instead of seeing an opaque CORS failure.
+            if let Some(cors) = cors.as_deref() {
+                apply_cors_headers_to_timeout_response(cors, cors_origin.as_ref(), &mut response);
+            }
+            response
         }
     }
 }
@@ -1924,6 +2185,7 @@ fn apply_middleware(
     custom_layers: Vec<crate::app::CustomLayerRegistration>,
     error_page_renderer: Option<SharedRenderer>,
     session_store: Option<Arc<dyn crate::session::BoxedSessionStore>>,
+    route_timeouts: RouteTimeoutTable,
 ) -> Result<axum::Router<AppState>, RouterBuildError> {
     // 404 fallback handler for unmatched routes must be registered BEFORE global middleware
     // so that unmatched routes are still protected by rate limiting, CSRF, CORS, etc.
@@ -2018,7 +2280,36 @@ fn apply_middleware(
     //   Session → SecurityHeaders → RequestId → LogContext → AccessLog-primary →
     //   Timeout → [user layers] → Tenancy → BodyLimit/UploadConfig →
     //   MethodOverride → RateLimit → CSRF → CORS → handler
-    router = apply_request_timeout_middleware(router, config, state.metrics.clone());
+    // `mirror_cors = true`: this layer is outside `CorsLayer` (CORS is applied
+    // earlier, hence inner), so its timeout 503 must carry CORS headers itself.
+    //
+    // KNOWN LIMITATION (session store I/O is not bounded): `Session` sits outside
+    // this layer (see order above), so `store.load` runs before the timer starts
+    // and `store.save`/`destroy` after it completes. A stalled session backend can
+    // therefore tie up a worker despite `request_timeout_ms`. This placement is
+    // deliberate: the timer is kept inner to `RequestId` so a timeout 503 (and its
+    // warn log) carries `X-Request-Id` for log correlation — moving it outside
+    // `Session` would also move it outside `RequestId` and lose that. Operators
+    // who need to bound session-store I/O should configure a store-level deadline
+    // (e.g. the Redis command/connection timeout); a cancelled inbound request
+    // cannot abort an already-issued store call regardless of layer order.
+    //
+    // The same applies to the edge layers `App::run` wraps around the finished
+    // router at the `axum::serve` boundary (`MethodOverrideLayer`,
+    // `TrustedProxiesLayer`): they sit outside `RequestId` and therefore outside
+    // this timer. In particular `MethodOverrideLayer` buffers an HTML form body
+    // (`axum::body::to_bytes`, capped at `upload.max_request_size_bytes`) before
+    // the inner router runs, so a slow `_method` form upload is not bounded by
+    // `request_timeout_ms`. Moving the timer out there would again lose the
+    // `X-Request-Id` correlation; bound this with a server/proxy read timeout
+    // instead.
+    router = apply_request_timeout_middleware(
+        router,
+        config,
+        state.metrics.clone(),
+        route_timeouts,
+        true,
+    );
 
     // Error-reporting + panic-catch layer. Placed inner to `RequestIdLayer`
     // (so the request id is available when a handler panics) and outer to the
@@ -2380,6 +2671,23 @@ pub fn try_build_router_with_static_inner(
     //   • ISR regeneration uses the inner router (no user layers), ensuring
     //     re-rendered pages are saved as raw HTML rather than pre-transformed.
     //
+    // KNOWN LIMITATION (`request_timeout_ms` does not bound these outer layers):
+    // the per-request timeout lives inside `inner_router` (applied by
+    // `apply_middleware`, inner to `RequestId`). Because `custom_layers` and
+    // `static_gate_layers` are reapplied OUTSIDE the static-first middleware
+    // (below), they — and the static cache lookup itself — run before the timer
+    // starts. So when a `dist` manifest is active, a hung async `static_gate`
+    // (e.g. remote JWT/IdP validation) or custom layer is NOT bounded by
+    // `request_timeout_ms`, unlike the non-static path where the timer wraps the
+    // user layers and tenancy. This is the same trade-off as the documented
+    // session-store and edge-layer (`MethodOverrideLayer`, `TrustedProxiesLayer`)
+    // limitations in `apply_middleware`: pulling the timer out here to cover them
+    // would place it outside `RequestId` (losing `X-Request-Id` on the timeout
+    // 503), double-time dynamic misses, and apply a global deadline to cached
+    // hits that have no route-table entry. Operators who terminate auth/tenant
+    // work in a `static_gate` should bound it with a layer-level or
+    // server/proxy read timeout instead.
+    //
     // Compute the idempotency flag NOW while custom_layers is still populated,
     // then drain it. build_router_pre_state would otherwise see an empty list
     // and incorrectly treat opaque layers as absent when selecting idempotency
@@ -2701,6 +3009,57 @@ pub fn build_cors_layer(cors: &crate::config::CorsConfig) -> tower_http::cors::C
         .allow_headers(headers)
         .allow_credentials(cors.allow_credentials)
         .max_age(std::time::Duration::from_secs(cors.max_age_secs))
+}
+
+/// Mirror onto a timeout-generated 503 the CORS response headers `CorsLayer`
+/// would add to a normal (non-preflight) response.
+///
+/// In the main ingress stack the per-request timeout layer sits *outside*
+/// `CorsLayer` (see the layer order in `apply_middleware`), so a 503 it
+/// synthesizes on expiry never flows back through `CorsLayer`. Without this a
+/// cross-origin browser client sees an opaque CORS failure instead of the
+/// documented Problem Details 503. Only the simple-response subset is needed:
+/// the resolved `Access-Control-Allow-Origin` (with `Vary: origin` when it is
+/// reflected) and `Access-Control-Allow-Credentials`. Preflight (OPTIONS)
+/// requests are answered by `CorsLayer` directly and never reach the timer.
+fn apply_cors_headers_to_timeout_response(
+    cors: &crate::config::CorsConfig,
+    origin: Option<&http::HeaderValue>,
+    response: &mut axum::response::Response,
+) {
+    use http::header;
+    let allow_any = cors.allowed_origins.iter().any(|o| o == "*");
+    let allow_origin = if allow_any {
+        Some(http::HeaderValue::from_static("*"))
+    } else {
+        // Echo the request Origin iff it is in the configured allowlist, exactly
+        // as `CorsLayer` does for a reflected origin.
+        origin.and_then(|value| {
+            let value_str = value.to_str().ok()?;
+            cors.allowed_origins
+                .iter()
+                .any(|allowed| allowed == value_str)
+                .then(|| value.clone())
+        })
+    };
+    let Some(allow_origin) = allow_origin else {
+        // Origin missing or not allowed: a real `CorsLayer` would add nothing.
+        return;
+    };
+    let headers = response.headers_mut();
+    headers.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, allow_origin);
+    if !allow_any {
+        // A reflected origin makes the response origin-dependent; mirror the
+        // `Vary: origin` `CorsLayer` adds so shared caches don't serve it to a
+        // different origin.
+        headers.insert(header::VARY, http::HeaderValue::from_static("origin"));
+    }
+    if cors.allow_credentials {
+        headers.insert(
+            header::ACCESS_CONTROL_ALLOW_CREDENTIALS,
+            http::HeaderValue::from_static("true"),
+        );
+    }
 }
 
 /// Set `Cache-Control` headers for static assets based on whether the path is
@@ -3579,8 +3938,12 @@ mod tests {
         // openapi_json_path("/api") won't match the effective mount
         // point and the collision check is unreliable.
         assert_eq!(super::join_nested_path("/api", "/"), "/api");
-        // Trailing slash on prefix is stripped.
-        assert_eq!(super::join_nested_path("/api/", "/"), "/api");
+        // Trailing slash on the prefix is preserved for the root child:
+        // axum mounts `nest("/api/", route("/"))` at "/api/" and reports
+        // `MatchedPath` as "/api/" (verified by
+        // `join_nested_path_matches_axum_matched_path`), so the joined key
+        // must keep the slash or the runtime lookup misses.
+        assert_eq!(super::join_nested_path("/api/", "/"), "/api/");
         // Normal case: prefix + child.
         assert_eq!(super::join_nested_path("/api", "/users"), "/api/users");
         // Trailing slash on prefix + child starting with slash doesn't
@@ -3589,6 +3952,48 @@ mod tests {
         // Root prefix handles sensibly.
         assert_eq!(super::join_nested_path("", "/"), "/");
         assert_eq!(super::join_nested_path("", "/users"), "/users");
+    }
+
+    /// Pins `join_nested_path` to axum's real `MatchedPath` so the per-route
+    /// timeout table (and the `OpenAPI` collision check) key by exactly the
+    /// string the runtime looks up. The trailing-slash root child is the
+    /// subtle case: `nest("/api/", route("/"))` is served at "/api/", not
+    /// "/api".
+    #[tokio::test]
+    async fn join_nested_path_matches_axum_matched_path() {
+        use axum::routing::get;
+        async fn matched(mp: Option<axum::extract::MatchedPath>) -> String {
+            mp.map(|m| m.as_str().to_owned()).unwrap_or_default()
+        }
+        // (nest prefix, child route, request path that reaches the child)
+        for (prefix, child, req) in [
+            ("/api", "/", "/api"),
+            ("/api/", "/", "/api/"),
+            ("/api", "/users", "/api/users"),
+            ("/api/", "/users", "/api/users"),
+        ] {
+            let sub = axum::Router::new().route(child, get(matched));
+            let app: axum::Router = axum::Router::new().nest(prefix, sub);
+            let resp = tower::ServiceExt::oneshot(
+                app,
+                axum::http::Request::builder()
+                    .uri(req)
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(resp.status(), http::StatusCode::OK, "{prefix} + {child}");
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let axum_matched = String::from_utf8(body.to_vec()).unwrap();
+            assert_eq!(
+                super::join_nested_path(prefix, child),
+                axum_matched,
+                "join_nested_path must equal axum MatchedPath for nest({prefix:?}, {child:?})"
+            );
+        }
     }
 
     #[cfg(feature = "openapi")]
@@ -3617,6 +4022,7 @@ mod tests {
                 },
                 repository: None,
                 idempotency: crate::route::RouteIdempotency::Direct,
+                timeout: crate::route::RouteTimeout::Inherit,
                 api_version: None,
                 sunset_opt_out: false,
             }],
@@ -3691,6 +4097,7 @@ mod tests {
             },
             repository: None,
             idempotency: crate::route::RouteIdempotency::Direct,
+            timeout: crate::route::RouteTimeout::Inherit,
             api_version: None,
             sunset_opt_out: false,
         };
@@ -3757,6 +4164,7 @@ mod tests {
             },
             repository: None,
             idempotency: crate::route::RouteIdempotency::Direct,
+            timeout: crate::route::RouteTimeout::Inherit,
             api_version: None,
             sunset_opt_out: false,
         };
@@ -3929,6 +4337,7 @@ mod tests {
             },
             repository: None,
             idempotency: crate::route::RouteIdempotency::Direct,
+            timeout: crate::route::RouteTimeout::Inherit,
             api_version: None,
             sunset_opt_out: false,
         };
@@ -4004,6 +4413,7 @@ mod tests {
             },
             repository: None,
             idempotency: crate::route::RouteIdempotency::Direct,
+            timeout: crate::route::RouteTimeout::Inherit,
             api_version: None,
             sunset_opt_out: false,
         };
@@ -4719,10 +5129,25 @@ mod trusted_host_tests {
         assert_eq!(response.status(), StatusCode::OK);
     }
 
-    // ── Per-request timeout (AC: 408 on timeout, metrics, WARN log) ──────────
+    // ── Per-request timeout (AC: 503 on timeout, metrics, WARN log) ──────────
+
+    /// Empty per-route override table (no route-level overrides).
+    fn no_route_timeouts() -> RouteTimeoutTable {
+        std::sync::Arc::new(std::collections::HashMap::new())
+    }
+
+    /// Build a single-entry override table for `GET <path>` (the method the
+    /// unit-test routers below register).
+    fn get_route_timeouts(path: &str, timeout: crate::route::RouteTimeout) -> RouteTimeoutTable {
+        let mut by_method = std::collections::HashMap::new();
+        by_method.insert(http::Method::GET, timeout);
+        let mut table = std::collections::HashMap::new();
+        table.insert(path.to_owned(), by_method);
+        std::sync::Arc::new(table)
+    }
 
     #[tokio::test(start_paused = true)]
-    async fn request_timeout_returns_408_when_exceeded() {
+    async fn request_timeout_returns_503_when_exceeded() {
         let mut config = AutumnConfig::default();
         config.server.timeouts.request_timeout_ms = Some(100);
 
@@ -4737,9 +5162,15 @@ mod trusted_host_tests {
         );
 
         // Place timeout inner to RequestIdLayer (matches apply_middleware ordering).
-        let router = apply_request_timeout_middleware(router, &config, state.metrics.clone())
-            .layer(RequestIdLayer)
-            .with_state(state);
+        let router = apply_request_timeout_middleware(
+            router,
+            &config,
+            state.metrics.clone(),
+            no_route_timeouts(),
+            false,
+        )
+        .layer(RequestIdLayer)
+        .with_state(state);
 
         let response = router
             .oneshot(Request::builder().uri("/slow").body(Body::empty()).unwrap())
@@ -4748,8 +5179,8 @@ mod trusted_host_tests {
 
         assert_eq!(
             response.status(),
-            StatusCode::REQUEST_TIMEOUT,
-            "a slow handler must trigger 408"
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a slow handler must trigger 503"
         );
         assert_eq!(
             response
@@ -4775,9 +5206,15 @@ mod trusted_host_tests {
             }),
         );
 
-        let router = apply_request_timeout_middleware(router, &config, state.metrics.clone())
-            .layer(RequestIdLayer)
-            .with_state(state.clone());
+        let router = apply_request_timeout_middleware(
+            router,
+            &config,
+            state.metrics.clone(),
+            no_route_timeouts(),
+            false,
+        )
+        .layer(RequestIdLayer)
+        .with_state(state.clone());
 
         router
             .oneshot(Request::builder().uri("/slow").body(Body::empty()).unwrap())
@@ -4792,7 +5229,177 @@ mod trusted_host_tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn request_timeout_response_includes_request_id() {
+    async fn render_deadline_exempt_marker_skips_timeout() {
+        let mut config = AutumnConfig::default();
+        config.server.timeouts.request_timeout_ms = Some(100);
+
+        let state = crate::state::AppState::for_test();
+        let router: axum::Router<AppState> = axum::Router::new().route(
+            "/slow",
+            axum::routing::get(|| async {
+                // Far longer than the 100ms deadline; the paused clock advances
+                // automatically once the task is otherwise idle.
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                "ok"
+            }),
+        );
+
+        let router = apply_request_timeout_middleware(
+            router,
+            &config,
+            state.metrics.clone(),
+            no_route_timeouts(),
+            false,
+        )
+        .layer(RequestIdLayer)
+        .with_state(state);
+
+        // A live inbound request (no marker) is bounded by the deadline -> 503.
+        let live = router
+            .clone()
+            .oneshot(Request::builder().uri("/slow").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            live.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a live request to a slow handler must still time out"
+        );
+
+        // An internal build/ISR render carrying `RenderDeadlineExempt` is exempt
+        // and runs to completion.
+        let exempt = router
+            .oneshot(
+                Request::builder()
+                    .uri("/slow")
+                    .extension(crate::static_gen::RenderDeadlineExempt)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            exempt.status(),
+            StatusCode::OK,
+            "the build/ISR render marker must exempt the request from the deadline"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn request_timeout_503_mirrors_cors_headers() {
+        let mut config = AutumnConfig::default();
+        config.server.timeouts.request_timeout_ms = Some(100);
+        // CORS is configured with a concrete allowlist (the reflected-origin path).
+        config.cors.allowed_origins = vec!["https://app.example.com".to_owned()];
+        config.cors.allow_credentials = true;
+
+        let state = crate::state::AppState::for_test();
+        let router: axum::Router<AppState> = axum::Router::new().route(
+            "/slow",
+            axum::routing::get(|| async {
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                "ok"
+            }),
+        );
+
+        // `mirror_cors = true`, matching the main ingress stack where the timeout
+        // layer is outside `CorsLayer` and the 503 would otherwise be opaque.
+        let router = apply_request_timeout_middleware(
+            router,
+            &config,
+            state.metrics.clone(),
+            no_route_timeouts(),
+            true,
+        )
+        .layer(RequestIdLayer)
+        .with_state(state);
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/slow")
+                    .header("origin", "https://app.example.com")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response
+                .headers()
+                .get("access-control-allow-origin")
+                .and_then(|v| v.to_str().ok()),
+            Some("https://app.example.com"),
+            "an allowed origin must be reflected on the timeout 503 so browsers can read it"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("access-control-allow-credentials")
+                .and_then(|v| v.to_str().ok()),
+            Some("true"),
+            "credentials flag must be mirrored when configured"
+        );
+        assert!(
+            response
+                .headers()
+                .get_all("vary")
+                .iter()
+                .any(|v| v.to_str().is_ok_and(|s| s.eq_ignore_ascii_case("origin"))),
+            "a reflected origin must carry Vary: origin"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn request_timeout_503_omits_cors_for_disallowed_origin() {
+        let mut config = AutumnConfig::default();
+        config.server.timeouts.request_timeout_ms = Some(100);
+        config.cors.allowed_origins = vec!["https://app.example.com".to_owned()];
+
+        let state = crate::state::AppState::for_test();
+        let router: axum::Router<AppState> = axum::Router::new().route(
+            "/slow",
+            axum::routing::get(|| async {
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                "ok"
+            }),
+        );
+
+        let router = apply_request_timeout_middleware(
+            router,
+            &config,
+            state.metrics.clone(),
+            no_route_timeouts(),
+            true,
+        )
+        .layer(RequestIdLayer)
+        .with_state(state);
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/slow")
+                    .header("origin", "https://evil.example.com")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            response
+                .headers()
+                .get("access-control-allow-origin")
+                .is_none(),
+            "a disallowed origin must not be reflected, mirroring CorsLayer"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn request_timeout_response_includes_request_id_header() {
         let mut config = AutumnConfig::default();
         config.server.timeouts.request_timeout_ms = Some(100);
 
@@ -4805,28 +5412,34 @@ mod trusted_host_tests {
             }),
         );
 
-        let router = apply_request_timeout_middleware(router, &config, state.metrics.clone())
-            .layer(RequestIdLayer)
-            .with_state(state);
+        let router = apply_request_timeout_middleware(
+            router,
+            &config,
+            state.metrics.clone(),
+            no_route_timeouts(),
+            false,
+        )
+        .layer(RequestIdLayer)
+        .with_state(state);
 
         let response = router
             .oneshot(Request::builder().uri("/slow").body(Body::empty()).unwrap())
             .await
             .unwrap();
 
-        assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         // X-Request-Id is added by RequestIdLayer on the egress path.
         assert!(
             response.headers().contains_key("x-request-id"),
-            "408 response must carry the X-Request-Id header"
+            "503 response must carry the X-Request-Id header"
         );
 
-        // The body must be valid JSON with a request_id field.
+        // The body must be a well-formed Problem Details document.
         let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .unwrap();
         let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
-        assert_eq!(body["status"], 408);
+        assert_eq!(body["status"], 503);
     }
 
     #[tokio::test]
@@ -4837,8 +5450,14 @@ mod trusted_host_tests {
         let router: axum::Router<AppState> =
             axum::Router::new().route("/fast", axum::routing::get(|| async { "pong" }));
 
-        let router = apply_request_timeout_middleware(router, &config, state.metrics.clone())
-            .with_state(state);
+        let router = apply_request_timeout_middleware(
+            router,
+            &config,
+            state.metrics.clone(),
+            no_route_timeouts(),
+            false,
+        )
+        .with_state(state);
 
         let response = router
             .oneshot(Request::builder().uri("/fast").body(Body::empty()).unwrap())
@@ -4857,8 +5476,14 @@ mod trusted_host_tests {
         let router: axum::Router<AppState> =
             axum::Router::new().route("/fast", axum::routing::get(|| async { "pong" }));
 
-        let router = apply_request_timeout_middleware(router, &config, state.metrics.clone())
-            .with_state(state);
+        let router = apply_request_timeout_middleware(
+            router,
+            &config,
+            state.metrics.clone(),
+            no_route_timeouts(),
+            false,
+        )
+        .with_state(state);
 
         let response = router
             .oneshot(Request::builder().uri("/fast").body(Body::empty()).unwrap())
@@ -4868,10 +5493,10 @@ mod trusted_host_tests {
         assert_eq!(response.status(), StatusCode::OK);
     }
 
-    // Exercises the warn!("Request timed out") branch when no RequestIdLayer
-    // is present (no request_id extension), keeping coverage of the else arm.
+    // Exercises the warn branch when no RequestIdLayer is present (no request_id
+    // extension), keeping coverage of the `None` request-id arm.
     #[tokio::test(start_paused = true)]
-    async fn request_timeout_408_without_request_id_layer() {
+    async fn request_timeout_503_without_request_id_layer() {
         let mut config = AutumnConfig::default();
         config.server.timeouts.request_timeout_ms = Some(100);
 
@@ -4885,15 +5510,255 @@ mod trusted_host_tests {
         );
 
         // No RequestIdLayer — exercises the else branch in request_timeout_handler.
-        let router = apply_request_timeout_middleware(router, &config, state.metrics.clone())
-            .with_state(state);
+        let router = apply_request_timeout_middleware(
+            router,
+            &config,
+            state.metrics.clone(),
+            no_route_timeouts(),
+            false,
+        )
+        .with_state(state);
 
         let response = router
             .oneshot(Request::builder().uri("/slow").body(Body::empty()).unwrap())
             .await
             .unwrap();
 
-        assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    // AC4: a per-route `Override` extends the deadline so a known-slow route
+    // outlives the (smaller) global timeout.
+    #[tokio::test(start_paused = true)]
+    async fn request_timeout_per_route_override_extends_deadline() {
+        let mut config = AutumnConfig::default();
+        config.server.timeouts.request_timeout_ms = Some(100); // tight global
+
+        let state = crate::state::AppState::for_test();
+        let router: axum::Router<AppState> = axum::Router::new().route(
+            "/export",
+            axum::routing::get(|| async {
+                // Longer than the 100ms global, shorter than the 10s override.
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                "report"
+            }),
+        );
+
+        let table = get_route_timeouts(
+            "/export",
+            crate::route::RouteTimeout::Override(std::time::Duration::from_secs(10)),
+        );
+        let router =
+            apply_request_timeout_middleware(router, &config, state.metrics.clone(), table, false)
+                .with_state(state);
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/export")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "the override must let the slow route complete past the global deadline"
+        );
+    }
+
+    // AC4: a per-route `Disabled` exempts the route from the global timeout.
+    #[tokio::test(start_paused = true)]
+    async fn request_timeout_per_route_disabled_exempts_route() {
+        let mut config = AutumnConfig::default();
+        config.server.timeouts.request_timeout_ms = Some(100);
+
+        let state = crate::state::AppState::for_test();
+        let router: axum::Router<AppState> = axum::Router::new().route(
+            "/stream",
+            axum::routing::get(|| async {
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                "done"
+            }),
+        );
+
+        let table = get_route_timeouts("/stream", crate::route::RouteTimeout::Disabled);
+        let router =
+            apply_request_timeout_middleware(router, &config, state.metrics.clone(), table, false)
+                .with_state(state.clone());
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/stream")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            state.metrics.snapshot().http.request_timeouts_total,
+            0,
+            "an exempt route must not record a timeout"
+        );
+    }
+
+    // AC4: an `Override` enables the layer even when the global timeout is off.
+    #[tokio::test(start_paused = true)]
+    async fn request_timeout_override_active_when_global_disabled() {
+        let config = AutumnConfig::default(); // global timeout disabled (None)
+
+        let state = crate::state::AppState::for_test();
+        let router: axum::Router<AppState> = axum::Router::new().route(
+            "/export",
+            axum::routing::get(|| async {
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                "report"
+            }),
+        );
+
+        let table = get_route_timeouts(
+            "/export",
+            crate::route::RouteTimeout::Override(std::time::Duration::from_millis(100)),
+        );
+        let router =
+            apply_request_timeout_middleware(router, &config, state.metrics.clone(), table, false)
+                .with_state(state);
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/export")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a per-route override must be enforced even with the global timeout off"
+        );
+    }
+
+    #[test]
+    fn build_route_timeout_table_is_empty_without_routes() {
+        // End-to-end keying (top-level + nested groups) is covered by the
+        // `request_timeout` integration tests via the macro attribute; here we
+        // assert the no-route base case yields a zero-overhead empty table.
+        let table = build_route_timeout_table(&[], &[]);
+        assert!(table.is_empty(), "no routes ⇒ empty override table");
+    }
+
+    /// Build a minimal `Route` carrying just the fields `build_route_timeout_table`
+    /// reads (method, path, timeout); the handler is a no-op.
+    fn timeout_route(
+        method: http::Method,
+        path: &'static str,
+        timeout: crate::route::RouteTimeout,
+    ) -> Route {
+        async fn noop() -> &'static str {
+            "ok"
+        }
+        Route {
+            method,
+            path,
+            handler: axum::routing::get(noop),
+            name: "noop",
+            api_doc: crate::openapi::ApiDoc::default(),
+            repository: None,
+            idempotency: crate::route::RouteIdempotency::Direct,
+            timeout,
+            api_version: None,
+            sunset_opt_out: false,
+        }
+    }
+
+    #[test]
+    fn build_route_timeout_table_normalizes_method_aliases() {
+        let override_10s = crate::route::RouteTimeout::Override(std::time::Duration::from_secs(10));
+        let routes = vec![
+            // A GET handler also serves HEAD in axum.
+            timeout_route(http::Method::GET, "/export", override_10s),
+            // A `#[ws]` route records the synthetic `WS` method but the upgrade
+            // arrives as GET.
+            timeout_route(
+                http::Method::from_bytes(b"WS").unwrap(),
+                "/live",
+                crate::route::RouteTimeout::Disabled,
+            ),
+            // A non-aliased method keys only itself.
+            timeout_route(http::Method::POST, "/submit", override_10s),
+        ];
+
+        let table = build_route_timeout_table(&routes, &[]);
+
+        // GET override is reachable via both GET and HEAD.
+        let export = table.get("/export").expect("/export keyed");
+        assert_eq!(export.get(&http::Method::GET), Some(&override_10s));
+        assert_eq!(
+            export.get(&http::Method::HEAD),
+            Some(&override_10s),
+            "a GET override must also cover the HEAD alias axum serves"
+        );
+
+        // WS override is reachable via the GET the upgrade actually uses, and is
+        // NOT left under the synthetic `WS` method the lookup never sees.
+        let live = table.get("/live").expect("/live keyed");
+        assert_eq!(
+            live.get(&http::Method::GET),
+            Some(&crate::route::RouteTimeout::Disabled),
+            "a WS override must be keyed under the GET the upgrade arrives as"
+        );
+        assert!(
+            live.get(&http::Method::from_bytes(b"WS").unwrap())
+                .is_none(),
+            "the synthetic WS method is never seen at lookup time"
+        );
+
+        // A non-aliased method keys only itself — no HEAD bleed.
+        let submit = table.get("/submit").expect("/submit keyed");
+        assert_eq!(submit.get(&http::Method::POST), Some(&override_10s));
+        assert!(submit.get(&http::Method::HEAD).is_none());
+    }
+
+    #[test]
+    fn build_route_timeout_table_keys_scoped_root_by_axum_matched_path() {
+        // A scoped group whose prefix carries a trailing slash mounts its `/`
+        // child at "/api/" in axum (verified by
+        // `join_nested_path_matches_axum_matched_path`), so the override must be
+        // keyed there — not at "/api" — or the runtime `MatchedPath` lookup
+        // misses and the per-route timeout is silently never enforced.
+        let override_5s = crate::route::RouteTimeout::Override(std::time::Duration::from_secs(5));
+        let make_group = |prefix: &str| crate::app::ScopedGroup {
+            prefix: prefix.to_owned(),
+            routes: vec![timeout_route(http::Method::GET, "/", override_5s)],
+            source: crate::route_listing::RouteSource::User,
+            apply_layer: Box::new(|r| r),
+        };
+
+        let table = build_route_timeout_table(&[], &[make_group("/api/")]);
+        assert_eq!(
+            table.get("/api/").and_then(|m| m.get(&http::Method::GET)),
+            Some(&override_5s),
+            "trailing-slash scoped root must key the override at /api/"
+        );
+        assert!(
+            table.get("/api").is_none(),
+            "the stripped /api key would never match the runtime lookup"
+        );
+
+        // The no-trailing-slash form still keys at "/api".
+        let table = build_route_timeout_table(&[], &[make_group("/api")]);
+        assert_eq!(
+            table.get("/api").and_then(|m| m.get(&http::Method::GET)),
+            Some(&override_5s),
+        );
     }
 
     // ----------------------------------------------------------------------
@@ -5046,6 +5911,7 @@ mod trusted_host_tests {
             },
             repository: None,
             idempotency: crate::route::RouteIdempotency::Direct,
+            timeout: crate::route::RouteTimeout::Inherit,
             api_version: None,
             sunset_opt_out: false,
         };
@@ -5140,6 +6006,7 @@ mod trusted_host_tests {
             },
             repository: None,
             idempotency: crate::route::RouteIdempotency::Direct,
+            timeout: crate::route::RouteTimeout::Inherit,
             api_version: None,
             sunset_opt_out: false,
         };

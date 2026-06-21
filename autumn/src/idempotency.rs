@@ -1104,6 +1104,17 @@ struct InFlightLockGuard {
     store: Arc<dyn IdempotencyStore>,
     key: String,
     owner: String,
+    /// When `true`, `drop` releases the in-flight lock. This is set only on
+    /// outcomes we have *observed to completion* (a successful handler response,
+    /// a cache double-check hit, a too-large/streamed body). It deliberately
+    /// defaults to `false` so that if the inner handler future is dropped
+    /// without one of those explicit outcomes — i.e. cancelled by the outer
+    /// request-timeout layer, or unwound by a panic — the lock is left in place
+    /// to expire via the store's in-flight safety TTL instead of being released
+    /// immediately. A mutation may have committed its side effect before the
+    /// cancellation point, so eagerly unlocking would let a retry carrying the
+    /// same `Idempotency-Key` re-execute it; holding the lock fails closed
+    /// (the retry gets an in-flight `409`) until the TTL elapses.
     unlock_on_drop: bool,
 }
 
@@ -1113,15 +1124,19 @@ impl InFlightLockGuard {
             store,
             key,
             owner,
-            unlock_on_drop: true,
+            // Fail closed by default: only the explicit completion paths below
+            // arm the unlock. See the field doc above.
+            unlock_on_drop: false,
         }
     }
 
     fn unlock_now(&mut self) {
-        if self.unlock_on_drop {
-            self.store.unlock_owned(&self.key, &self.owner);
-            self.unlock_on_drop = false;
-        }
+        // Unconditional: this is called only on observed-complete outcomes, and
+        // because the guard now defaults to *not* unlocking on drop, the unlock
+        // must happen here regardless of the current flag value. `unlock_owned`
+        // is owner-checked and idempotent, so a redundant call is harmless.
+        self.store.unlock_owned(&self.key, &self.owner);
+        self.unlock_on_drop = false;
     }
 
     const fn keep_locked_until_ttl(&mut self) {
@@ -1882,6 +1897,49 @@ mod tests {
 
         store.unlock_owned("key", "owner-b");
         assert!(store.try_lock_owned("key", "owner-c", Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn in_flight_guard_holds_lock_when_dropped_without_explicit_unlock() {
+        // Simulates the inner handler future being cancelled (by the outer
+        // request-timeout layer) or unwound by a panic: the guard is dropped
+        // without any of the explicit completion paths calling `unlock_now`.
+        // The lock must stay held so a retry carrying the same Idempotency-Key
+        // cannot re-run a mutation whose side effect may already have committed.
+        let store: Arc<dyn IdempotencyStore> =
+            Arc::new(MemoryIdempotencyStore::new(Duration::from_secs(60)));
+        assert!(store.try_lock_owned("key", "owner-a", Duration::from_secs(60)));
+
+        {
+            let _guard =
+                InFlightLockGuard::new(store.clone(), "key".to_owned(), "owner-a".to_owned());
+            // Dropped here with no explicit unlock — fail closed.
+        }
+
+        assert!(
+            !store.try_lock_owned("key", "owner-b", Duration::from_secs(60)),
+            "a cancelled/panicked handler must leave the in-flight lock held until its TTL"
+        );
+    }
+
+    #[test]
+    fn in_flight_guard_releases_lock_on_explicit_unlock() {
+        // The normal completion paths call `unlock_now`, which must release the
+        // lock immediately so a subsequent distinct request can proceed.
+        let store: Arc<dyn IdempotencyStore> =
+            Arc::new(MemoryIdempotencyStore::new(Duration::from_secs(60)));
+        assert!(store.try_lock_owned("key", "owner-a", Duration::from_secs(60)));
+
+        {
+            let mut guard =
+                InFlightLockGuard::new(store.clone(), "key".to_owned(), "owner-a".to_owned());
+            guard.unlock_now();
+        }
+
+        assert!(
+            store.try_lock_owned("key", "owner-b", Duration::from_secs(60)),
+            "an explicitly unlocked guard must release the in-flight lock"
+        );
     }
 
     #[tokio::test]

@@ -417,6 +417,7 @@ mod tests {
             api_doc: dummy_api_doc(),
             repository: None,
             idempotency: crate::route::RouteIdempotency::Direct,
+            timeout: crate::route::RouteTimeout::Inherit,
             api_version: None,
             sunset_opt_out: false,
         }

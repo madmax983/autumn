@@ -8,6 +8,8 @@
 //! Users do not construct `Route` values directly -- they use the
 //! proc macros and the `routes![]` collection macro.
 
+use std::time::Duration;
+
 use axum::routing::MethodRouter;
 use http::Method;
 
@@ -83,6 +85,38 @@ pub enum RouteIdempotency {
     ReplayThroughInner,
 }
 
+/// Per-route override for the global inbound request timeout
+/// (`[server.timeouts] request_timeout_ms`).
+///
+/// Emitted by the route macros from the `timeout_ms = ...` / `timeout = "off"`
+/// attributes and consulted by the timeout middleware (keyed by the matched
+/// route template). The default, [`RouteTimeout::Inherit`], applies the global
+/// deadline.
+///
+/// WebSocket routes also default to [`RouteTimeout::Inherit`]: the deadline
+/// bounds a hung pre-upgrade handshake (async auth/setup) but never reaches the
+/// established socket, whose future runs on a separate task via `on_upgrade`
+/// and is unbounded by design. SSE and other streaming responses need no
+/// override either — they are exempt *by construction*, because the deadline
+/// only bounds production of the response head, never the body stream. The
+/// [`RouteTimeout::Disabled`] variant is reached solely via `timeout = "off"`,
+/// for routes that intentionally block *before* producing the head (long-poll).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RouteTimeout {
+    /// Use the global `request_timeout_ms` deadline (or none if disabled).
+    #[default]
+    Inherit,
+    /// Override the global deadline with a route-specific wall-clock budget,
+    /// for known-slow endpoints (report exports, large uploads).
+    Override(Duration),
+    /// Exempt this route from the global deadline entirely. Emitted by
+    /// `timeout = "off"` for routes that intentionally block before producing
+    /// the response head, such as long-poll handlers. (SSE/streaming bodies are
+    /// already exempt by construction, and WebSocket handshakes inherit the
+    /// deadline — neither uses this variant by default.)
+    Disabled,
+}
+
 /// A single route binding an HTTP method + path to an Axum handler.
 ///
 /// Created by the `__autumn_route_info_{name}()` companion functions
@@ -135,4 +169,7 @@ pub struct Route {
 
     /// Idempotency replay behavior for this route.
     pub idempotency: RouteIdempotency,
+
+    /// Per-route override for the global inbound request timeout.
+    pub timeout: RouteTimeout,
 }

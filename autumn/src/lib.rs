@@ -190,7 +190,7 @@ pub mod presence;
 #[cfg(feature = "presence")]
 pub use presence::{Presence, PresenceEntry, PresenceEvent, PresenceHandle};
 pub(crate) mod route;
-pub use route::{RepositoryApiMeta, Route, RouteIdempotency};
+pub use route::{RepositoryApiMeta, Route, RouteIdempotency, RouteTimeout};
 /// First-class Markdown rendering with frontmatter parsing and SSG integration.
 ///
 /// Enable with the Cargo feature `markdown`.

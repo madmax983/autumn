@@ -7113,6 +7113,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         scope_check: #list_scope_check_fn,
                     }),
                     idempotency: ::autumn_web::RouteIdempotency::ReplayThroughInner,
+                    timeout: ::autumn_web::RouteTimeout::Inherit,
                     api_version: ::core::option::Option::None,
                     sunset_opt_out: false,
                 }
@@ -7164,6 +7165,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         scope_check: #non_list_scope_check_fn,
                     }),
                     idempotency: ::autumn_web::RouteIdempotency::ReplayThroughInner,
+                    timeout: ::autumn_web::RouteTimeout::Inherit,
                     api_version: ::core::option::Option::None,
                     sunset_opt_out: false,
                 }
@@ -7212,6 +7214,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         scope_check: #non_list_scope_check_fn,
                     }),
                     idempotency: ::autumn_web::RouteIdempotency::ReplayThroughInner,
+                    timeout: ::autumn_web::RouteTimeout::Inherit,
                     api_version: ::core::option::Option::None,
                     sunset_opt_out: false,
                 }
@@ -7262,6 +7265,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         scope_check: #non_list_scope_check_fn,
                     }),
                     idempotency: ::autumn_web::RouteIdempotency::ReplayThroughInner,
+                    timeout: ::autumn_web::RouteTimeout::Inherit,
                     api_version: ::core::option::Option::None,
                     sunset_opt_out: false,
                 }
@@ -7299,6 +7303,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         scope_check: #non_list_scope_check_fn,
                     }),
                     idempotency: ::autumn_web::RouteIdempotency::ReplayThroughInner,
+                    timeout: ::autumn_web::RouteTimeout::Inherit,
                     api_version: ::core::option::Option::None,
                     sunset_opt_out: false,
                 }

@@ -2965,10 +2965,31 @@ impl AutumnConfig {
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct RequestTimeoutsConfig {
     /// Maximum time in milliseconds allowed for a complete request-response
-    /// cycle. When exceeded the framework returns `408 Request Timeout` with
-    /// a Problem Details body. `None` (default) or `0` disables the timeout.
+    /// cycle. When exceeded the framework returns `503 Service Unavailable`
+    /// rendered as Problem Details JSON for API clients (and the standard error
+    /// page for browser requests). `None` (default) or `0` disables the timeout.
     ///
-    /// Configured via `AUTUMN_SERVER__TIMEOUTS__REQUEST_TIMEOUT_MS`.
+    /// The deadline bounds the time to produce the response *head*: once the
+    /// status and headers are sent, the streaming body is not interrupted, so
+    /// SSE, chunked responses, and WebSocket upgrades (all of which emit their
+    /// head promptly and then stream) run unbounded afterward. Long-poll
+    /// handlers are the exception — they intentionally withhold the response
+    /// head while waiting for data, so they *are* subject to this deadline and
+    /// will return `503` if it fires before they respond. Give such routes a
+    /// per-route override via the route macro
+    /// (`#[get("/poll", timeout_ms = 120000)]` or `timeout = "off"`), which is
+    /// also how any other slow route can raise or disable its own deadline.
+    ///
+    /// A second exception applies to *mutating* requests carrying an
+    /// `Idempotency-Key`: the idempotency layer buffers the full response body
+    /// (so the response can be cached and replayed) before the head is returned,
+    /// so those responses are bounded by the deadline even when the handler
+    /// streams them. Give such endpoints a per-route override if they
+    /// legitimately produce slow or large idempotent bodies.
+    ///
+    /// The `prod` profile smart-defaults this to `30000` (30s); `dev` and custom
+    /// profiles leave it disabled. Configured via
+    /// `AUTUMN_SERVER__TIMEOUTS__REQUEST_TIMEOUT_MS`.
     #[serde(default)]
     pub request_timeout_ms: Option<u64>,
 }

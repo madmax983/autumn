@@ -39,6 +39,21 @@ impl ExceptionFilter for ErrorPageFilter {
             return response;
         }
 
+        // Preserve the headers already attached to the error response —
+        // `build_html_response` constructs a fresh response, so without this the
+        // rebuilt HTML error page would drop them. Two matter in particular:
+        //   * `X-Request-Id` (stamped by `RequestIdLayer`) — operators need it to
+        //     tie the page to their logs.
+        //   * CORS headers mirrored onto a timeout 503 by the request-timeout
+        //     middleware (`ProblemDetailsFilter` preserves these too). A
+        //     cross-origin HTML/HTMX request that times out would otherwise see an
+        //     opaque CORS failure instead of the styled error page.
+        // Body-representation headers (`Content-Type`/`Content-Length`/
+        // `Content-Encoding`/...) are dropped because this fresh, uncompressed
+        // HTML body sets its own — see `preserved_error_headers`.
+        let preserved_headers =
+            crate::middleware::exception_filter::preserved_error_headers(&response);
+
         let ctx = Self::build_error_context(error, &response, self.is_dev);
         let mut html_body =
             error_pages::render_error_page(self.renderer.as_ref(), error.status, &ctx)
@@ -48,7 +63,9 @@ impl ExceptionFilter for ErrorPageFilter {
             self.inject_dev_badge(&mut html_body, error, &ctx, &response);
         }
 
-        Self::build_html_response(error, html_body)
+        let mut html = Self::build_html_response(error, html_body);
+        html.headers_mut().extend(preserved_headers);
+        html
     }
 }
 
@@ -784,6 +801,119 @@ mod tests {
         assert!(
             body_str.contains("Page not found"),
             "should contain not found message"
+        );
+    }
+
+    #[tokio::test]
+    async fn html_error_page_preserves_mirrored_cors_and_request_id_headers() {
+        // A timeout 503 reaches the error-page filter already carrying the
+        // mirrored CORS headers and the request id, marked as wanting HTML.
+        // The HTML rebuild must not drop them, or a cross-origin browser/HTMX
+        // client sees an opaque CORS failure instead of the styled page.
+        let renderer = error_pages::default_renderer();
+        let filter = ErrorPageFilter {
+            renderer,
+            is_dev: false,
+            parameter_filter: crate::log::filter::ParameterFilter::default(),
+        };
+
+        let error = AutumnErrorInfo {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            message: "request deadline exceeded".into(),
+            details: None,
+            problem_type: None,
+            backtrace_string: None,
+        };
+
+        let mut original = (StatusCode::SERVICE_UNAVAILABLE, "json body").into_response();
+        original.headers_mut().insert(
+            "access-control-allow-origin",
+            http::HeaderValue::from_static("https://app.example.com"),
+        );
+        original.headers_mut().insert(
+            "access-control-allow-credentials",
+            http::HeaderValue::from_static("true"),
+        );
+        original
+            .headers_mut()
+            .insert("x-request-id", http::HeaderValue::from_static("req-123"));
+        original.extensions_mut().insert(WantsHtml(true));
+
+        let response = filter.filter(&error, original);
+
+        assert_eq!(
+            response.headers()["access-control-allow-origin"],
+            "https://app.example.com",
+            "mirrored CORS origin must survive the HTML rebuild"
+        );
+        assert_eq!(
+            response.headers()["access-control-allow-credentials"],
+            "true",
+            "mirrored CORS credentials flag must survive the HTML rebuild"
+        );
+        assert_eq!(
+            response.headers()["x-request-id"],
+            "req-123",
+            "request id must survive the HTML rebuild"
+        );
+        assert_eq!(
+            response.headers()[axum::http::header::CONTENT_TYPE],
+            "text/html; charset=utf-8"
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_str = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body_str.contains("<!DOCTYPE html>"), "should be HTML");
+    }
+
+    #[tokio::test]
+    async fn html_rebuild_drops_stale_content_encoding() {
+        // An inner response-transforming layer (e.g. a user `CompressionLayer`)
+        // may set `Content-Encoding: gzip` before the exception filter runs. The
+        // rebuilt HTML body is uncompressed, so the stale encoding header must be
+        // dropped or the browser fails to decode the page.
+        let renderer = error_pages::default_renderer();
+        let filter = ErrorPageFilter {
+            renderer,
+            is_dev: false,
+            parameter_filter: crate::log::filter::ParameterFilter::default(),
+        };
+
+        let error = AutumnErrorInfo {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: "boom".into(),
+            details: None,
+            problem_type: None,
+            backtrace_string: None,
+        };
+
+        let mut original = (StatusCode::INTERNAL_SERVER_ERROR, "compressed json").into_response();
+        original.headers_mut().insert(
+            http::header::CONTENT_ENCODING,
+            http::HeaderValue::from_static("gzip"),
+        );
+        original
+            .headers_mut()
+            .insert("x-request-id", http::HeaderValue::from_static("req-9"));
+        original.extensions_mut().insert(WantsHtml(true));
+
+        let response = filter.filter(&error, original);
+
+        assert!(
+            !response
+                .headers()
+                .contains_key(http::header::CONTENT_ENCODING),
+            "stale Content-Encoding must not ride along on the rebuilt HTML body"
+        );
+        assert_eq!(
+            response.headers()["x-request-id"],
+            "req-9",
+            "unrelated headers must still be preserved"
+        );
+        assert_eq!(
+            response.headers()[axum::http::header::CONTENT_TYPE],
+            "text/html; charset=utf-8"
         );
     }
 

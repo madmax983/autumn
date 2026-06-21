@@ -732,6 +732,7 @@ async fn test_manual_route_registered_through_routes_fails_closed_without_replay
         api_doc: autumn_web::openapi::ApiDoc::default(),
         repository: None,
         idempotency: RouteIdempotency::Direct,
+        timeout: autumn_web::RouteTimeout::Inherit,
         api_version: None,
         sunset_opt_out: false,
     };
@@ -777,6 +778,7 @@ async fn test_manual_route_with_openapi_method_fails_closed_without_replay_stop(
         },
         repository: None,
         idempotency: RouteIdempotency::Direct,
+        timeout: autumn_web::RouteTimeout::Inherit,
         api_version: None,
         sunset_opt_out: false,
     };
@@ -815,6 +817,7 @@ async fn test_manual_scoped_route_registered_through_routes_fails_closed_without
         api_doc: autumn_web::openapi::ApiDoc::default(),
         repository: None,
         idempotency: RouteIdempotency::Direct,
+        timeout: autumn_web::RouteTimeout::Inherit,
         api_version: None,
         sunset_opt_out: false,
     };
@@ -1464,6 +1467,7 @@ async fn test_manual_layered_route_can_check_access_before_replay_stop() {
         api_doc: autumn_web::openapi::ApiDoc::default(),
         repository: None,
         idempotency: RouteIdempotency::ReplayThroughInner,
+        timeout: autumn_web::RouteTimeout::Inherit,
         api_version: None,
         sunset_opt_out: false,
     };
@@ -1513,6 +1517,7 @@ async fn test_manual_layered_direct_route_fails_closed_instead_of_stale_replay()
         api_doc: autumn_web::openapi::ApiDoc::default(),
         repository: None,
         idempotency: RouteIdempotency::Direct,
+        timeout: autumn_web::RouteTimeout::Inherit,
         api_version: None,
         sunset_opt_out: false,
     };
@@ -2027,7 +2032,7 @@ async fn test_in_flight_lock_released_after_response() {
 }
 
 #[tokio::test]
-async fn test_in_flight_lock_released_when_request_future_is_cancelled() {
+async fn test_in_flight_lock_held_fail_closed_when_request_future_is_cancelled() {
     use tokio::sync::Notify;
     use tower::ServiceExt;
 
@@ -2066,6 +2071,8 @@ async fn test_in_flight_lock_released_when_request_future_is_cancelled() {
         .unwrap();
     let pending = tokio::spawn(app.clone().oneshot(req1));
     started.notified().await;
+    // Cancel the in-flight request (as the request-timeout layer would when its
+    // deadline fires) before the handler returns and stores its response.
     pending.abort();
     let _ = pending.await;
     never_finish.notify_one();
@@ -2078,13 +2085,22 @@ async fn test_in_flight_lock_released_when_request_future_is_cancelled() {
         .unwrap();
     let resp2 = tokio::time::timeout(Duration::from_millis(200), app.clone().oneshot(req2))
         .await
-        .expect("retry should not hang behind a leaked in-flight lock")
+        .expect("retry should not hang: the held lock returns an immediate 409")
         .expect("retry request should complete");
 
-    assert_ne!(
+    // Fail closed: the cancelled handler may have committed its side effect, so
+    // the in-flight lock must stay held until its TTL. A retry carrying the same
+    // Idempotency-Key gets an in-flight conflict instead of re-running the
+    // mutation.
+    assert_eq!(
         resp2.status(),
         StatusCode::CONFLICT,
-        "cancelling the first request must drop the in-flight lock"
+        "a cancelled request must keep its in-flight lock fail-closed until TTL"
+    );
+    assert_eq!(
+        CALL_COUNT.load(Ordering::SeqCst),
+        1,
+        "the retry must not re-execute the handler while the key is locked"
     );
 }
 

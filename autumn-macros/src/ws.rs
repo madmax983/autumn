@@ -154,6 +154,26 @@ pub fn ws_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 },
                 repository: ::core::option::Option::None,
                 idempotency: ::autumn_web::RouteIdempotency::Direct,
+                // The inbound timeout only wraps production of the upgrade
+                // response head; the live socket future handed to `on_upgrade`
+                // runs on a separate task and is never polled under the deadline.
+                // So `Inherit` bounds a hung pre-upgrade handshake (async auth /
+                // setup) under the global default without ever interrupting an
+                // established WebSocket.
+                //
+                // `#[ws]` intentionally does NOT expose the per-route `timeout_ms`
+                // / `timeout = "off"` attributes that `#[route]` supports (it
+                // parses the path only, via `parse_route_path`). A WebSocket has no
+                // request/response body lifecycle to size a per-route deadline
+                // around: `"off"` would let a stalled handshake pin a worker
+                // indefinitely, and a larger `timeout_ms` cannot extend to the
+                // established socket (that future is unbounded by design, see
+                // above) — it would only widen the handshake window. Handshakes
+                // that need a tighter or looser bound than the global
+                // `request_timeout_ms` should enforce it inside the upgrade
+                // handler (e.g. wrap the async auth/setup in
+                // `tokio::time::timeout`).
+                timeout: ::autumn_web::RouteTimeout::Inherit,
                 api_version: ::core::option::Option::None,
                 sunset_opt_out: false,
             }
