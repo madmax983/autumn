@@ -126,6 +126,7 @@ fn pull(args: &PullArgs) -> Result<(), PullError> {
         PullOptions {
             with_repository: args.with_repository,
             force: args.force,
+            explicit: !args.tables.is_empty(),
         },
     )
     .map_err(PullError::Generate)?;

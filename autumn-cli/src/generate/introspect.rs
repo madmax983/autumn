@@ -87,6 +87,11 @@ pub struct PullOptions {
     /// When set, an existing `schema.rs` `table!` block for a pulled table is
     /// replaced with the freshly introspected one instead of left untouched.
     pub force: bool,
+    /// True when the user named specific tables on the command line. An
+    /// unsupported explicitly-requested table is a hard error; during an
+    /// unscoped pull (every table) an unsupported table is skipped with a notice
+    /// so the supported tables still come through.
+    pub explicit: bool,
 }
 
 /// Compute every filesystem action an `autumn db pull` would perform.
@@ -131,7 +136,21 @@ pub fn plan_pull(
         let snake_name = snake(&resource);
         let pascal_name = pascal(&resource);
 
-        validate_table(table, &resource)?;
+        // A table that can't be turned into compilable Autumn code (no usable
+        // model name, an invalid column identifier, or no `id` BIGINT primary
+        // key) is a hard error when the user asked for it by name, or skipped
+        // with a notice during an unscoped pull so the rest still come through.
+        if let Some(reason) = unsupported_reason(table, &resource) {
+            if options.explicit {
+                return Err(GenerateError::Config(format!(
+                    "cannot pull table '{}': {reason}",
+                    table.table
+                )));
+            }
+            eprintln!("  \u{2139} Skipping table '{}': {reason}", table.table);
+            continue;
+        }
+
         if !seen.insert(snake_name.clone()) {
             return Err(GenerateError::Config(format!(
                 "two pulled tables map to the same model module '{snake_name}' \
@@ -150,25 +169,21 @@ pub fn plan_pull(
         // (c) src/schema.rs table! block
         schema = upsert_schema_block(&schema, &table.table, &table.columns, options.force);
 
-        // (d) optional repository — only when the table follows the Autumn
-        // `id BIGINT` PK convention the repository macro assumes. The generated
-        // CRUD/REST code hardcodes an `i64` column named `id`, so a uuid /
-        // non-`id` / composite PK would emit a repository that cannot compile.
+        // (d) optional repository. `unsupported_reason` already guaranteed the
+        // Autumn `id`/`i64` PK convention the repository macro assumes, so the
+        // emitted trait is always compilable. The real table name is passed
+        // through so the schema import is correct for irregular plurals.
         if options.with_repository {
-            if has_autumn_id_pk(&table.columns) {
-                plan.create(
-                    repos_dir.join(format!("{snake_name}.rs")),
-                    super::scaffold::render_repository_for_pull(&pascal_name, &snake_name),
-                );
-                repos_mod = add_mod_declaration(&repos_mod, &snake_name);
-                emitted_repository = true;
-            } else {
-                eprintln!(
-                    "  \u{2139} Skipping repository for '{}': it has no `id` BIGINT primary key \
-                     (the repository macro requires the Autumn id/i64 convention).",
-                    table.table
-                );
-            }
+            plan.create(
+                repos_dir.join(format!("{snake_name}.rs")),
+                super::scaffold::render_repository_for_pull(
+                    &pascal_name,
+                    &snake_name,
+                    &table.table,
+                ),
+            );
+            repos_mod = add_mod_declaration(&repos_mod, &snake_name);
+            emitted_repository = true;
         }
     }
 
@@ -362,33 +377,37 @@ fn has_autumn_id_pk(columns: &[Column]) -> bool {
 
 /// Validate that an introspected table can be emitted as compilable Autumn code.
 ///
-/// Fails loudly (rather than emitting broken `.rs`) when:
+/// Returns `Some(reason)` when the table cannot be turned into compilable Autumn
+/// code, so the caller can either error (explicit request) or skip (unscoped
+/// pull) rather than emit broken `.rs`. The cases:
 /// - the singularized table name is not a usable Rust module/struct name,
-/// - any column name is not a valid `snake_case` identifier or is a Rust keyword
+/// - a column name is not a valid `snake_case` identifier or is a Rust keyword
 ///   (e.g. a `type` column would produce `pub type: ...`), or
-/// - the table has no primary key (there is no column to annotate `#[id]`).
-fn validate_table(table: &TableSchema, resource: &str) -> Result<(), GenerateError> {
-    super::model::validate_resource_name(resource)?;
+/// - the table does not follow the Autumn `id` `BIGINT` primary-key convention.
+///   The `#[model]` macro references the `id` column directly (upsert/on-conflict
+///   helpers), so a table without a single `id`/`i64` PK cannot compile.
+fn unsupported_reason(table: &TableSchema, resource: &str) -> Option<String> {
+    if super::model::validate_resource_name(resource).is_err() {
+        return Some(format!(
+            "the derived model name '{resource}' is not a valid Rust identifier"
+        ));
+    }
     for col in &table.columns {
         if !super::dsl::is_valid_ident(&col.name) || super::dsl::is_rust_keyword(&col.name) {
-            return Err(GenerateError::InvalidField {
-                token: format!("{}.{}", table.table, col.name),
-                reason: format!(
-                    "column '{}' is not a valid snake_case Rust identifier \
-                     (or is a reserved keyword); rename the column or skip this table",
-                    col.name
-                ),
-            });
+            return Some(format!(
+                "column '{}' is not a valid snake_case Rust identifier (or is a reserved keyword)",
+                col.name
+            ));
         }
     }
-    if !table.columns.iter().any(|c| c.is_pk) {
-        return Err(GenerateError::Config(format!(
-            "table '{}' has no primary key; `db pull` needs one to derive #[id]. \
-             Add a primary key or skip this table.",
-            table.table
-        )));
+    if !has_autumn_id_pk(&table.columns) {
+        return Some(
+            "it lacks the Autumn convention of a single `id` BIGINT (i64) primary key \
+             (the #[model] macro references the `id` column directly)"
+                .to_owned(),
+        );
     }
-    Ok(())
+    None
 }
 
 fn read_or_empty(path: &Path) -> String {
@@ -609,7 +628,7 @@ mod tests {
             &[post_table()],
             PullOptions {
                 with_repository: true,
-                force: false,
+                ..PullOptions::default()
             },
         )
         .unwrap();
@@ -617,6 +636,7 @@ mod tests {
 
         let repo = fs::read_to_string(tmp.path().join("src/repositories/post.rs")).unwrap();
         assert!(repo.contains("#[autumn_web::repository(Post, api = \"/api/posts\")]"));
+        assert!(repo.contains("use crate::schema::posts;"));
         let repo_mod = fs::read_to_string(tmp.path().join("src/repositories/mod.rs")).unwrap();
         assert!(repo_mod.contains("pub mod post;"));
         let main = fs::read_to_string(tmp.path().join("src/main.rs")).unwrap();
@@ -682,7 +702,7 @@ mod tests {
     // ── Fail-loud guards for brownfield edge cases ──────────────────────────
 
     #[test]
-    fn plan_pull_errors_on_table_without_primary_key() {
+    fn plan_pull_errors_on_table_without_primary_key_when_explicit() {
         let tmp = project();
         let no_pk = TableSchema {
             table: "audit_logs".to_owned(),
@@ -691,7 +711,15 @@ mod tests {
                 created_at_col(),
             ],
         };
-        let err = plan_pull(tmp.path(), &[no_pk], PullOptions::default()).unwrap_err();
+        let err = plan_pull(
+            tmp.path(),
+            &[no_pk],
+            PullOptions {
+                explicit: true,
+                ..PullOptions::default()
+            },
+        )
+        .unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("audit_logs"),
@@ -702,7 +730,22 @@ mod tests {
     }
 
     #[test]
-    fn plan_pull_errors_on_invalid_column_identifier() {
+    fn plan_pull_skips_unsupported_table_on_unscoped_pull() {
+        let tmp = project();
+        // A no-PK table during an unscoped pull is skipped (not errored), so
+        // the supported tables alongside it still come through.
+        let no_pk = TableSchema {
+            table: "audit_logs".to_owned(),
+            columns: vec![col("message", FieldKind::String, false, false)],
+        };
+        let plan = plan_pull(tmp.path(), &[no_pk, post_table()], PullOptions::default()).unwrap();
+        plan.execute(Flags::default()).unwrap();
+        assert!(!tmp.path().join("src/models/audit_log.rs").exists());
+        assert!(tmp.path().join("src/models/post.rs").exists());
+    }
+
+    #[test]
+    fn plan_pull_errors_on_invalid_column_identifier_when_explicit() {
         let tmp = project();
         // `type` is a Rust keyword; emitting `pub type: ...` would not compile.
         let bad = TableSchema {
@@ -712,12 +755,18 @@ mod tests {
                 col("type", FieldKind::String, false, false),
             ],
         };
-        let err = plan_pull(tmp.path(), &[bad], PullOptions::default()).unwrap_err();
+        let err = plan_pull(
+            tmp.path(),
+            &[bad],
+            PullOptions {
+                explicit: true,
+                ..PullOptions::default()
+            },
+        )
+        .unwrap_err();
         let msg = err.to_string();
-        assert!(
-            msg.contains("items.type"),
-            "error must name table.column: {msg}"
-        );
+        assert!(msg.contains("items"), "error must name the table: {msg}");
+        assert!(msg.contains("type"), "error must name the column: {msg}");
         assert!(!tmp.path().join("src/models/item.rs").exists());
     }
 
@@ -813,9 +862,11 @@ mod tests {
     }
 
     #[test]
-    fn plan_pull_skips_repository_for_non_id_primary_key() {
+    fn plan_pull_skips_non_id_pk_table_entirely() {
         let tmp = project();
-        // A uuid-keyed table: the repository macro can't compile against it.
+        // A uuid-keyed table cannot be modeled: the `#[model]` macro references
+        // the `id` column directly. On an unscoped pull it is skipped entirely —
+        // neither the model nor the repository is emitted.
         let sessions = TableSchema {
             table: "sessions".to_owned(),
             columns: vec![
@@ -828,17 +879,46 @@ mod tests {
             &[sessions],
             PullOptions {
                 with_repository: true,
-                force: false,
+                ..PullOptions::default()
             },
         )
         .unwrap();
         plan.execute(Flags::default()).unwrap();
-        // Model is still generated; repository is skipped.
-        assert!(tmp.path().join("src/models/session.rs").exists());
+        assert!(!tmp.path().join("src/models/session.rs").exists());
         assert!(!tmp.path().join("src/repositories/session.rs").exists());
-        // With no repository emitted, the repositories module is not wired in.
         let main = fs::read_to_string(tmp.path().join("src/main.rs")).unwrap();
         assert!(!main.contains("mod repositories;"));
+    }
+
+    #[test]
+    fn plan_pull_repository_uses_real_table_name_for_irregular_plural() {
+        let tmp = project();
+        // `statuses` singularizes to `status`; re-pluralizing would yield the
+        // wrong `statuss` schema import. The repo must use the real table name.
+        let statuses = TableSchema {
+            table: "statuses".to_owned(),
+            columns: vec![col("id", FieldKind::I64, false, true), created_at_col()],
+        };
+        let plan = plan_pull(
+            tmp.path(),
+            &[statuses],
+            PullOptions {
+                with_repository: true,
+                ..PullOptions::default()
+            },
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+        let repo = fs::read_to_string(tmp.path().join("src/repositories/status.rs")).unwrap();
+        assert!(
+            repo.contains("use crate::schema::statuses;"),
+            "repo must import the real table module: {repo}"
+        );
+        assert!(
+            repo.contains("api = \"/api/statuses\""),
+            "repo REST mount must use the real table name: {repo}"
+        );
+        assert!(!repo.contains("statuss"), "must not re-pluralize: {repo}");
     }
 
     #[test]
@@ -855,8 +935,8 @@ mod tests {
             tmp.path(),
             &[post_table()],
             PullOptions {
-                with_repository: false,
                 force: true,
+                ..PullOptions::default()
             },
         )
         .unwrap();
