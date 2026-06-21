@@ -424,19 +424,56 @@ pub fn clear_global_event_bus() {
     }
 }
 
+tokio::task_local! {
+    /// The ambient app for the current request or job, used by the free
+    /// [`publish`] so it resolves *this* app rather than the process-global bus.
+    static CURRENT_EVENT_APP: AppState;
+}
+
+/// Run `future` with `state` installed as the ambient app for the free
+/// [`publish`]. Scoped by the request pipeline and the job runtime so a handler,
+/// service, or job that calls `publish` dispatches against its own app —
+/// keeping parallel in-process apps (notably tests) isolated.
+pub(crate) fn scope_event_app<F>(
+    state: AppState,
+    future: F,
+) -> tokio::task::futures::TaskLocalFuture<AppState, F>
+where
+    F: Future,
+{
+    CURRENT_EVENT_APP.scope(state, future)
+}
+
+fn current_event_app() -> Option<AppState> {
+    CURRENT_EVENT_APP.try_with(AppState::clone).ok()
+}
+
 /// Publish an event without a request context (services, jobs, scheduled tasks).
 ///
-/// Delegates to the process-global bus installed at startup. Inside a request,
-/// prefer the injectable [`Events`] extractor.
+/// Resolves the **current app** from the ambient request/job context when one is
+/// set (so parallel apps stay isolated), falling back to the process-global bus
+/// installed at startup. Inside a request, the injectable [`Events`] extractor is
+/// equivalent and slightly more explicit.
 ///
 /// # Errors
 ///
 /// Returns an error if the event cannot be serialized or if enqueueing a
-/// durable listener fails. If the bus is not initialized the call is a no-op.
+/// durable listener fails. If no app context is available the call is a no-op.
 pub async fn publish<E: Event>(event: E) -> AutumnResult<()> {
     let payload = serialize_event(&event)?;
+
+    // Prefer the ambient app context (set per request and per job) for isolation.
+    if let Some(state) = current_event_app() {
+        let registry = state.extension::<EventRegistry>();
+        let empty = EventRegistry::default();
+        let registry_ref = registry.as_deref().unwrap_or(&empty);
+        let recorder = state.extension::<EventRecorder>();
+        return dispatch(registry_ref, recorder.as_deref(), &state, E::NAME, payload).await;
+    }
+
+    // No ambient app (e.g. a startup hook or bare task) — fall back to the
+    // process-global bus, or no-op if nothing wired it.
     let Some(bus) = global_bus() else {
-        // No app wired the bus (e.g. a bare unit test) — nothing to dispatch to.
         return Ok(());
     };
     dispatch(

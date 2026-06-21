@@ -557,6 +557,15 @@ fn build_router_pre_state(
         http_interceptor_middleware,
     ));
 
+    // Install the request's app as the ambient event-bus context so any code in
+    // the request (handlers, services) that calls the free `events::publish`
+    // dispatches against this app rather than the process-global bus — keeping
+    // parallel in-process apps (notably tests) isolated.
+    let router = router.layer(axum::middleware::from_fn_with_state(
+        state.clone(),
+        event_app_context_middleware,
+    ));
+
     // Mount the MCP endpoint last so its dispatch target — a clone of the
     // fully-assembled router with state applied — traverses the exact same
     // routes, layers, and middleware an HTTP request would. The clone is
@@ -3274,6 +3283,16 @@ fn mount_swagger_ui_routes(
         }),
     );
     router
+}
+
+/// Scope the request's [`AppState`] as the ambient event-bus app for the
+/// duration of the request, so the free `events::publish` resolves this app.
+async fn event_app_context_middleware(
+    state: axum::extract::State<AppState>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    crate::events::scope_event_app(state.0.clone(), async move { next.run(req).await }).await
 }
 
 #[cfg(feature = "oauth2")]

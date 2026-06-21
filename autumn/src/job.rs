@@ -1335,6 +1335,10 @@ async fn run_job_handler(
     state: AppState,
     payload: Value,
 ) -> JobExecutionOutcome {
+    // Make this job's app the ambient event context so a job (or durable event
+    // listener) that calls the free `events::publish` dispatches against its own
+    // app rather than the process-global bus.
+    let event_app = state.clone();
     let interceptor = state
         .extension::<Arc<dyn crate::interceptor::JobInterceptor>>()
         .map(|arc| (*arc).clone());
@@ -1369,7 +1373,8 @@ async fn run_job_handler(
         Err(panic) => return JobExecutionOutcome::Panicked(format_job_panic(panic.as_ref())),
     };
 
-    match std::panic::AssertUnwindSafe(future).catch_unwind().await {
+    let execution = std::panic::AssertUnwindSafe(future).catch_unwind();
+    match crate::events::scope_event_app(event_app, execution).await {
         Ok(Ok(())) => JobExecutionOutcome::Succeeded,
         Ok(Err(error)) => JobExecutionOutcome::Failed(error.to_string()),
         Err(panic) => JobExecutionOutcome::Panicked(format_job_panic(panic.as_ref())),

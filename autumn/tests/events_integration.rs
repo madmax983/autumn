@@ -102,9 +102,17 @@ async fn quiet(events: Events) -> AutumnResult<&'static str> {
     Ok("ok")
 }
 
+#[get("/signup-free")]
+async fn signup_free() -> AutumnResult<&'static str> {
+    // Uses the module-level free publisher (no `Events` extractor). It must
+    // resolve *this* request's app via the ambient context, not a global.
+    autumn_web::events::publish(UserSignedUp { user_id: 42 }).await?;
+    Ok("ok")
+}
+
 fn app_with(listeners: Vec<autumn_web::events::ListenerInfo>) -> autumn_web::test::TestClient {
     TestApp::new()
-        .routes(routes![signup, quiet])
+        .routes(routes![signup, quiet, signup_free])
         .state_initializer(|state| state.insert_extension(Counters::default()))
         .listeners(listeners)
         .build()
@@ -179,6 +187,43 @@ async fn adding_a_listener_needs_zero_emitter_edits() {
     assert_eq!(read(client.state(), |c| &c.sync_a), 1);
     // The other listeners were not registered, so they never ran.
     assert_eq!(read(client.state(), |c| &c.survivor), 0);
+}
+
+#[tokio::test]
+async fn free_publisher_dispatches_to_the_current_app() {
+    // A handler using the module-level `events::publish` (not the extractor)
+    // must still reach this app's listeners and recorder via the ambient context.
+    let client = app_with(all_listeners());
+
+    client.get("/signup-free").send().await.assert_ok();
+
+    client.assert_event_published::<UserSignedUp>();
+    assert_eq!(
+        read(client.state(), |c| &c.sync_a),
+        1,
+        "sync_a ran via free publish"
+    );
+}
+
+#[tokio::test]
+async fn free_publisher_is_isolated_across_parallel_apps() {
+    // Two apps live at once. Publishing through the free function on app A must
+    // not leak into app B's recorder — proving the path is app-scoped, not global.
+    let app_a = app_with(all_listeners());
+    let app_b = app_with(all_listeners());
+
+    app_a.get("/signup-free").send().await.assert_ok();
+
+    assert_eq!(
+        app_a.published_events::<UserSignedUp>().len(),
+        1,
+        "app A recorded its own event"
+    );
+    assert_eq!(
+        app_b.published_events::<UserSignedUp>().len(),
+        0,
+        "app B must not see app A's event"
+    );
 }
 
 // Keep an explicit reference so the unused-import lints stay quiet if the test
