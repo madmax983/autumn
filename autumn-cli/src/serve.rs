@@ -1207,23 +1207,20 @@ pub fn managed_pg_env(package: Option<&str>) -> Option<ManagedPgEnv> {
     let paths = RuntimePaths::resolve(&project_identity(package)).ok()?;
     let data_dir = paths.pg_data_dir();
 
-    // Attach only to a cluster we can actually reach: a published URL whose
-    // endpoint accepts a connection. This confirms liveness portably — covering
-    // macOS/BSD PID reuse, where the postmaster-pid check can only test bare
-    // liveness — and never hands the child a stale/dead endpoint.
-    if let Some(url) = reachable_published_url(&data_dir) {
-        return Some(ManagedPgEnv {
+    // Only attach when a live postmaster actually owns this data dir. The identity
+    // guard in `live_postmaster_pid` (PID alive + process is `postgres` + its cwd
+    // is this data dir, where observable) prevents trusting a stale `.autumn-pg-url`
+    // whose old random port was reused by a foreign listener — a bare TCP probe
+    // can't tell our cluster from a stranger.
+    if live_postmaster_pid(&data_dir).is_some() {
+        // A live postmaster holds the dir. Attach only when its published URL is
+        // actually reachable; otherwise don't point the child at the *locked* dir
+        // (URL missing/unpublished, or a best-effort publish failure) — starting a
+        // second postmaster there would deadlock. Let it use its own default.
+        return reachable_published_url(&data_dir).map(|url| ManagedPgEnv {
             data_dir,
             attach_url: Some(url),
         });
-    }
-
-    // No reachable cluster. But if a live postmaster still holds this data dir
-    // (URL missing/unpublished, a best-effort publish failure, or a task racing
-    // the daemon's startup), don't point the child at the *locked* dir — it would
-    // deadlock starting a second postmaster. Let it use its own default cluster.
-    if live_postmaster_pid(&data_dir).is_some() {
-        return None;
     }
 
     // A daemon start is in flight (the startup lock is held by a live launcher)

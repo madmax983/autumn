@@ -3028,10 +3028,23 @@ impl AppBuilder {
                 // does not revoke a connection already established in that window.
                 // This matters for a user-configured `server.unix_socket` in a
                 // shared dir; the CLI's own socket also sits in a `0700` parent.
-                let prev_umask =
-                    nix::sys::stat::umask(nix::sys::stat::Mode::from_bits_truncate(0o177));
-                let bind_result = tokio::net::UnixListener::bind(path);
-                nix::sys::stat::umask(prev_umask);
+                // `umask` is process-wide, so serialize the save/bind/restore: a
+                // concurrent UDS bind in the same process (integration tests, or an
+                // app running several servers) could otherwise interleave these
+                // pairs and either bind under the wrong umask — reopening the
+                // bind→chmod window this closes — or leave `0177` set permanently.
+                // The guard is released before the `.await` in the error arm below.
+                let bind_result = {
+                    static UMASK_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+                    let _umask_guard = UMASK_LOCK
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let prev_umask =
+                        nix::sys::stat::umask(nix::sys::stat::Mode::from_bits_truncate(0o177));
+                    let result = tokio::net::UnixListener::bind(path);
+                    nix::sys::stat::umask(prev_umask);
+                    result
+                };
                 let listener = match bind_result {
                     Ok(listener) => listener,
                     Err(e) => {
