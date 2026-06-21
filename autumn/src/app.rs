@@ -4248,6 +4248,12 @@ impl AppBuilder {
 
         task_shutdown.cancel();
         run_shutdown_hooks(&shutdown_hooks).await;
+        // If the generated `pg.stop()` hook errored/timed out it keeps the
+        // handle for a retry, but a one-off task then exits — so retry the stop
+        // here (idempotent; a no-op once the hook stopped it cleanly) to avoid
+        // orphaning the postmaster on the data dir/port.
+        #[cfg(feature = "managed-pg")]
+        crate::managed_pg::emergency_stop_async().await;
 
         match result {
             Ok(()) => {

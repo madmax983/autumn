@@ -280,9 +280,28 @@ fn confirmed_running(rec: &process::PidRecord, socket: &Path, startup_in_progres
 /// reused stranger. Require `SO_PEERCRED` proof; where peer-PID is unavailable
 /// (macOS/BSD), report "not running" rather than risk signalling the wrong PID.
 fn lifecycle_target(paths: &RuntimePaths, socket: &Path) -> Option<process::PidRecord> {
-    if let Some(rec) = process::read_pidfile(&paths.pid_file()) {
+    let pidfile_rec = process::read_pidfile(&paths.pid_file());
+    // A definitive socket owner (Linux `SO_PEERCRED`) is the live daemon. Prefer
+    // it over a parseable-but-*stale* pidfile (e.g. one overwritten/restored
+    // while the daemon is healthy) so a damaged pidfile doesn't make a running
+    // daemon unmanageable. Keep the pidfile record when it matches the owner so
+    // its recorded start time is retained.
+    if let Some(owner) = socket_owner_pid(socket) {
+        return match pidfile_rec {
+            Some(rec) if rec.pid == owner => Some(rec),
+            _ => Some(process::PidRecord {
+                pid: owner,
+                start_time: process::process_start_time(owner),
+            }),
+        };
+    }
+    // No peer-PID (macOS/BSD, or no live listener): trust the pidfile if present.
+    if let Some(rec) = pidfile_rec {
         return Some(rec);
     }
+    // Last resort: the address file — but only when a peer-PID proves it owns the
+    // socket (it doesn't here, since `socket_owner_pid` was `None`), so this
+    // reports "not running" rather than risk signalling a reused PID.
     let addr = read_addr_file(paths)?;
     (socket_owner_pid(socket) == Some(addr.pid)).then_some(process::PidRecord {
         pid: addr.pid,

@@ -404,7 +404,14 @@ pub fn stop_postmaster(pid: u32, timeout: Duration) {
         );
     }
     if !wait_for_pid_exit(pid, timeout) {
+        // A fast shutdown didn't finish in time (e.g. a stuck backend). Postgres
+        // `setsid`s, so the postmaster leads its own process group with its
+        // backends in it; `SIGKILL`ing only the postmaster PID can leave those
+        // children holding the data dir/shared memory and block the next start.
+        // Kill the whole Postgres group (the postmaster is its leader, so its PID
+        // is the PGID).
         force_kill(pid);
+        force_kill_group(pid);
     }
 }
 
