@@ -1178,10 +1178,20 @@ fn remove_socket_if_not_live(socket: &Path) {
     use std::os::unix::fs::FileTypeExt;
     match std::fs::symlink_metadata(socket) {
         Ok(meta) if meta.file_type().is_socket() => {
-            if std::os::unix::net::UnixStream::connect(socket).is_ok() {
-                return; // live listener owns it
+            // Reclaim only a provably-stale socket: a connect refused with no
+            // listener (`ECONNREFUSED`) or whose path vanished (`NotFound`). A
+            // successful connect (live listener) or `EACCES`/`EPERM` (a mode/ACL-
+            // restricted socket whose liveness we can't prove) is left alone,
+            // mirroring the app's bind-path refusal so we never unlink a service
+            // that's still reachable to someone.
+            if std::os::unix::net::UnixStream::connect(socket).is_err_and(|e| {
+                matches!(
+                    e.kind(),
+                    std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+                )
+            }) {
+                let _ = std::fs::remove_file(socket);
             }
-            let _ = std::fs::remove_file(socket);
         }
         // Not a socket (or missing): leave it untouched.
         _ => {}
