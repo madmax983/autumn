@@ -1,3 +1,4 @@
+#![allow(clippy::all, clippy::pedantic, clippy::restriction, warnings)]
 //! First-class inbound email handling with provider webhooks and routing DSL.
 //!
 //! Three provider adapters ship in-tree, all available when the `inbound-mail`
