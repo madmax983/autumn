@@ -42,6 +42,70 @@ either fail the documented gate or carry an explicit release-note exception.
 
 ---
 
+## Cold-Start Onboarding Budget
+
+The budget matrix above measures the **warm incremental** loop — the experience
+of a developer already working in a built project. A brand-new user has a
+different, decisive first experience: `autumn new my-app` → `autumn dev` → a page
+in the browser, which includes Rust's **first clean compile**. That cold-start
+journey is the single biggest onboarding DX tax versus Rails/Django/Phoenix, so
+it gets its own budget and gate (issue #977).
+
+| Change class | p50 ms | p95 ms | max ms | Gate |
+|---|---:|---:|---:|---|
+| Cold start (`autumn new` → first 200, no-DB) | 45 000 | **60 000** | 90 000 | **Gated** |
+| Cold start (`autumn new` → first 200, database-backed) | 70 000 | 90 000 | 120 000 | Informational |
+
+**Success metric:** p95 cold start for the no-DB `hello` shape ≤ **60 s** on the
+CI reference runner — matching Autumn's stated "time-from-`cargo new` to first
+served route < 60 s" promise. The first scheduled CI run establishes the
+baseline; subsequent runs gate regressions of **> 20%** against that baseline
+until the absolute budget is comfortably met (same allowance as the warm loop
+above). The database-backed shape is **informational** in this slice and never
+fails the gate.
+
+### Cold-start methodology
+
+`autumn dev-loop-bench --cold-start` measures a genuine first-run, not a warm
+cache:
+
+1. Scaffolds a **throwaway project** in a fresh temp directory (`autumn new`,
+   no-DB daemon shape for `hello`). The clock starts just before scaffolding so
+   the whole journey is captured.
+2. Repoints the project's `autumn-web` dependency at the repository's local
+   source via `[patch.crates-io]`, so the number reflects the code in the repo
+   rather than a possibly-unpublished crates.io release — still a genuine clean
+   compile.
+3. Runs `cargo build` into the project's **own, empty `target/`** (any inherited
+   `CARGO_TARGET_DIR` is removed), so the workspace's warm cache is never reused
+   — this is the first clean compile.
+4. Starts the built binary and polls `http://127.0.0.1:3000/` until the first
+   HTTP `200`.
+5. Records `duration = first_200 − scaffold_start`, repeats `--runs` times, and
+   computes p50/p95/max.
+
+The cold-start report carries the **same environment metadata** as the warm
+report (`timestamp_utc`, `runner_os`, `rust_version`, `autumn_version`) and, like
+it, never includes local absolute paths, usernames, or secrets.
+
+### Running the cold-start benchmark
+
+```bash
+# Print the cold-start budget table (no build, no server):
+autumn dev-loop-bench --cold-start --dry-run
+
+# Measure the gated no-DB hello shape and write a JSON report:
+AUTUMN_BENCH_TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ) \
+AUTUMN_BENCH_RUST_VERSION="$(rustc --version)" \
+autumn dev-loop-bench --cold-start \
+  --output cold-start-report.json --fail-on-regression
+
+# Also measure the database-backed shape (informational; needs Postgres):
+autumn dev-loop-bench --cold-start --include-db
+```
+
+---
+
 ## Validated Examples
 
 Measurements are taken against at least two example projects to cover the two
@@ -262,6 +326,22 @@ polling, database-backed paths), the job is scheduled weekly and can be
 triggered manually via `workflow_dispatch`. These checks are excluded from
 per-PR required status checks.
 
+### Cold-start scheduled job (`.github/workflows/cold-start-latency.yml`)
+
+The cold-start onboarding budget is gated by a sibling workflow that mirrors this
+gating model. A full cold compile is far too slow and variable for a per-PR
+required check, so live measurement runs only on a **weekly schedule** and on
+manual `workflow_dispatch`; per-PR runs are limited to the `--cold-start
+--dry-run` budget-table smoke-check and the measurement unit tests. The
+measurement job writes a JSON report, uploads it as an artifact, and fails when
+`all_passed` is `false` (the no-DB `hello` shape exceeded its budget). The
+database-backed shape is opt-in via the `include_db` dispatch input and is
+informational only.
+
+```bash
+gh workflow run cold-start-latency.yml --ref your-branch-name
+```
+
 ### Per-PR opt-in
 
 To run the latency gate against a specific PR branch before merging:
@@ -306,5 +386,8 @@ in release notes when they regress.
 - **Production runtime latency** — this document covers local development only.
 - **Browser visual regression testing** — screenshot assertions are not part of
   this budget.
-- **Cold compile times** — the budgets above assume a warm incremental build.
-  Cold compile time is tracked separately in the runtime benchmarks.
+- **Reducing** cold compile time (dependency trimming, `codegen-units`, linker
+  swaps, prebuilt artifacts) — the [Cold-Start Onboarding
+  Budget](#cold-start-onboarding-budget) above *measures and gates* cold start;
+  optimizing it is a separate, evidence-driven slice that this measurement
+  unlocks.

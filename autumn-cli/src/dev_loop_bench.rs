@@ -9,6 +9,9 @@
 //! methodology used to measure end-to-end latency.
 
 use std::fmt::Write as FmtWrite;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 
@@ -36,6 +39,13 @@ pub enum ChangeClass {
     ConfigEdit,
     /// Custom `dev.watch_dirs` entry edit to restarted server.
     WatchDirEdit,
+    /// Cold-start onboarding: `autumn new` → `autumn dev` → first HTTP 200,
+    /// **including the first clean compile**, for the no-DB `hello` shape.
+    /// This is the gated onboarding budget (issue #977).
+    ColdStartHello,
+    /// Cold-start onboarding for the database-backed shape. Measured as
+    /// **informational** in this slice — it does not gate CI.
+    ColdStartDb,
 }
 
 impl ChangeClass {
@@ -49,6 +59,8 @@ impl ChangeClass {
             Self::StaticAsset => "static_asset",
             Self::ConfigEdit => "config_edit",
             Self::WatchDirEdit => "watch_dir_edit",
+            Self::ColdStartHello => "cold_start_hello",
+            Self::ColdStartDb => "cold_start_db",
         }
     }
 
@@ -62,6 +74,8 @@ impl ChangeClass {
             Self::StaticAsset => "Static asset edit to browser reload",
             Self::ConfigEdit => "Config edit (autumn.toml) to restarted server",
             Self::WatchDirEdit => "Custom watch_dirs edit to restarted server",
+            Self::ColdStartHello => "Cold start (autumn new → first 200, no-DB)",
+            Self::ColdStartDb => "Cold start (autumn new → first 200, database-backed)",
         }
     }
 }
@@ -116,6 +130,20 @@ pub const fn budget_for(class: ChangeClass) -> LatencyBudget {
             p95_ms: 8_000,
             max_ms: 15_000,
         },
+        // Cold-start onboarding budget (issue #977). The success metric is
+        // p95 ≤ 60s for the no-DB `hello` shape on the CI reference runner.
+        ChangeClass::ColdStartHello => LatencyBudget {
+            p50_ms: 45_000,
+            p95_ms: 60_000,
+            max_ms: 90_000,
+        },
+        // Database-backed cold start is informational only in this slice, so
+        // these limits are not gated; they document a generous expectation.
+        ChangeClass::ColdStartDb => LatencyBudget {
+            p50_ms: 70_000,
+            p95_ms: 90_000,
+            max_ms: 120_000,
+        },
     }
 }
 
@@ -168,6 +196,9 @@ pub fn compute_stats(samples: &[u64]) -> ClassStats {
 // ── Budget checking ──────────────────────────────────────────────────────────
 
 /// Result of comparing measured statistics against the accepted budget.
+// Each bool is an independent, named outcome flag (pass / p95 / max /
+// informational); a state machine would obscure rather than clarify them.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Serialize)]
 pub struct BudgetCheckResult {
     pub change_class: String,
@@ -183,6 +214,11 @@ pub struct BudgetCheckResult {
     pub diagnosis: String,
     /// What the developer should do next (empty string when passing).
     pub next_action: String,
+    /// When true this result is reported for visibility only and does **not**
+    /// contribute to the overall pass/fail gate (e.g. the database-backed
+    /// cold-start shape, which is informational in this slice).
+    #[serde(default)]
+    pub informational: bool,
 }
 
 /// Compare measured statistics against the accepted budget for a change class.
@@ -225,6 +261,7 @@ pub fn check_budget(
         p95_overage_pct,
         diagnosis,
         next_action,
+        informational: false,
     }
 }
 
@@ -288,6 +325,13 @@ fn build_diagnostics(
         ChangeClass::ConfigEdit | ChangeClass::WatchDirEdit => {
             "Server restart latency increased. Check for new startup hooks, \
              increased migration count, or blocking I/O in app initialisation."
+        }
+        ChangeClass::ColdStartHello | ChangeClass::ColdStartDb => {
+            "Cold-start onboarding slowed: the first clean compile got heavier. \
+             A new default dependency or feature likely bloated the from-scratch \
+             build. This slice is measurement-only — run `cargo build --timings` \
+             on a fresh checkout to find the slow crates, then open a separate \
+             optimization slice (dependency trimming, codegen-units, linker)."
         }
     };
 
@@ -437,35 +481,70 @@ pub fn run(
     0
 }
 
-fn print_budget_table() {
-    println!("Autumn dev-loop latency budget (issue #601)\n");
+/// Render a budget table for the given change classes as a string.
+///
+/// Shared by the warm dev-loop and cold-start dry-run paths so the table
+/// layout stays identical and is unit-testable without capturing stdout.
+fn format_budget_table(title: &str, classes: &[ChangeClass]) -> String {
+    let mut out = String::new();
     let col_w = 46usize;
-    println!(
+    writeln!(out, "{title}\n").unwrap();
+    writeln!(
+        out,
         "{:<col_w$}  {:>10}  {:>10}  {:>10}",
         "Change class", "p50 ms", "p95 ms", "max ms"
-    );
-    println!("{}", "-".repeat(col_w + 36));
+    )
+    .unwrap();
+    writeln!(out, "{}", "-".repeat(col_w + 36)).unwrap();
 
-    for class in [
-        ChangeClass::InitialBoot,
-        ChangeClass::RustRouteEditHello,
-        ChangeClass::RustRouteEditDb,
-        ChangeClass::CssTailwind,
-        ChangeClass::StaticAsset,
-        ChangeClass::ConfigEdit,
-        ChangeClass::WatchDirEdit,
-    ] {
+    for &class in classes {
         let b = budget_for(class);
-        println!(
+        writeln!(
+            out,
             "{:<col_w$}  {:>10}  {:>10}  {:>10}",
             class.journey_name(),
             b.p50_ms,
             b.p95_ms,
             b.max_ms
-        );
+        )
+        .unwrap();
     }
 
-    println!("\nSee docs/guide/dev-loop-latency.md for methodology and prerequisites.");
+    writeln!(
+        out,
+        "\nSee docs/guide/dev-loop-latency.md for methodology and prerequisites."
+    )
+    .unwrap();
+    out
+}
+
+fn print_budget_table() {
+    print!(
+        "{}",
+        format_budget_table(
+            "Autumn dev-loop latency budget (issue #601)",
+            &[
+                ChangeClass::InitialBoot,
+                ChangeClass::RustRouteEditHello,
+                ChangeClass::RustRouteEditDb,
+                ChangeClass::CssTailwind,
+                ChangeClass::StaticAsset,
+                ChangeClass::ConfigEdit,
+                ChangeClass::WatchDirEdit,
+            ],
+        )
+    );
+}
+
+/// Render the cold-start onboarding budget table. The database-backed shape is
+/// included only when `include_db` is set (it is informational in this slice).
+fn format_cold_start_budget_table(include_db: bool) -> String {
+    let classes: &[ChangeClass] = if include_db {
+        &[ChangeClass::ColdStartHello, ChangeClass::ColdStartDb]
+    } else {
+        &[ChangeClass::ColdStartHello]
+    };
+    format_budget_table("Autumn cold-start onboarding budget (issue #977)", classes)
 }
 
 fn build_placeholder_results(example: &str) -> Vec<BudgetCheckResult> {
@@ -508,6 +587,283 @@ fn chrono_utc_now() -> String {
 
 fn rust_version_string() -> String {
     std::env::var("AUTUMN_BENCH_RUST_VERSION").unwrap_or_else(|_| "unknown".to_string())
+}
+
+// ── Cold-start onboarding benchmark (issue #977) ──────────────────────────────
+
+/// Which scaffolded project shape to measure for cold start.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ColdStartShape {
+    /// No-database `hello` shape (the gated onboarding budget).
+    Hello,
+    /// Database-backed shape (informational only in this slice).
+    Db,
+}
+
+const fn class_for(shape: ColdStartShape) -> ChangeClass {
+    match shape {
+        ColdStartShape::Hello => ChangeClass::ColdStartHello,
+        ColdStartShape::Db => ChangeClass::ColdStartDb,
+    }
+}
+
+/// Assemble a cold-start report from measured samples.
+///
+/// `hello_samples` always gates the result. `db_samples`, when present, is
+/// recorded as **informational** and never affects `all_passed`.
+fn build_cold_start_report(hello_samples: &[u64], db_samples: Option<&[u64]>) -> FullReport {
+    let mut results = Vec::new();
+
+    let hello_budget = budget_for(ChangeClass::ColdStartHello);
+    results.push(check_budget(
+        ChangeClass::ColdStartHello,
+        compute_stats(hello_samples),
+        &hello_budget,
+    ));
+
+    if let Some(db) = db_samples {
+        let db_budget = budget_for(ChangeClass::ColdStartDb);
+        let mut r = check_budget(ChangeClass::ColdStartDb, compute_stats(db), &db_budget);
+        r.informational = true;
+        results.push(r);
+    }
+
+    // Only non-informational results contribute to the gate.
+    let all_passed = results
+        .iter()
+        .filter(|r| !r.informational)
+        .all(|r| r.passed);
+
+    FullReport {
+        timestamp_utc: chrono_utc_now(),
+        runner_os: std::env::consts::OS.to_string(),
+        rust_version: rust_version_string(),
+        autumn_version: env!("CARGO_PKG_VERSION").to_string(),
+        example_name: "cold-start".to_string(),
+        all_passed,
+        results,
+    }
+}
+
+/// Locate the workspace `autumn-web` crate so a throwaway project can be built
+/// against the repository's actual source (a genuine clean compile) rather than
+/// a possibly-unpublished crates.io version.
+///
+/// Honours the `AUTUMN_BENCH_AUTUMN_WEB_PATH` override, otherwise walks up from
+/// the current directory looking for an `autumn/Cargo.toml` whose package is
+/// `autumn-web`.
+fn locate_autumn_web() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("AUTUMN_BENCH_AUTUMN_WEB_PATH") {
+        let pb = PathBuf::from(p);
+        if pb.join("Cargo.toml").is_file() {
+            return Some(pb);
+        }
+    }
+    let cwd = std::env::current_dir().ok()?;
+    for ancestor in cwd.ancestors() {
+        let candidate = ancestor.join("autumn");
+        let manifest = candidate.join("Cargo.toml");
+        if manifest.is_file()
+            && let Ok(s) = std::fs::read_to_string(&manifest)
+            && s.contains("name = \"autumn-web\"")
+        {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// Append a `[patch.crates-io]` override pointing `autumn-web` at local source.
+///
+/// The scaffolded `Cargo.toml` already declares its own (empty) `[workspace]`
+/// table, so it is a standalone workspace root and a `[patch]` section is valid
+/// there. The patch applies regardless of whether the dependency is the plain
+/// `autumn-web = "x"` form or the daemon/`features` table form.
+fn repoint_autumn_web(project_dir: &Path, autumn_web: &Path) -> Result<(), String> {
+    let manifest = project_dir.join("Cargo.toml");
+    let mut content =
+        std::fs::read_to_string(&manifest).map_err(|e| format!("read Cargo.toml: {e}"))?;
+    // `{:?}` quotes and escapes the path into a valid TOML basic string.
+    let patch = format!(
+        "\n[patch.crates-io]\nautumn-web = {{ path = {:?} }}\n",
+        autumn_web.display().to_string()
+    );
+    content.push_str(&patch);
+    std::fs::write(&manifest, content).map_err(|e| format!("write Cargo.toml: {e}"))?;
+    Ok(())
+}
+
+/// Measure a single cold-start journey end-to-end: scaffold a throwaway project,
+/// compile it from a cold target, start it, and time until the first HTTP 200.
+///
+/// Returns the elapsed milliseconds from just before `autumn new` to the first
+/// successful response on `/`.
+fn measure_cold_start_once(shape: ColdStartShape) -> Result<u64, String> {
+    let autumn_web = locate_autumn_web().ok_or_else(|| {
+        "could not locate the workspace autumn-web crate; \
+         set AUTUMN_BENCH_AUTUMN_WEB_PATH to its directory"
+            .to_string()
+    })?;
+    let autumn_web = std::fs::canonicalize(&autumn_web)
+        .map_err(|e| format!("canonicalize autumn-web path: {e}"))?;
+
+    let tmp = tempfile::tempdir().map_err(|e| format!("create temp dir: {e}"))?;
+    let project_name = "coldstart_app";
+
+    let opts = match shape {
+        // The DB-free daemon starter compiles and serves without Postgres.
+        ColdStartShape::Hello => crate::new::GenerateOptions {
+            with_daemon: true,
+            ..Default::default()
+        },
+        ColdStartShape::Db => crate::new::GenerateOptions::default(),
+    };
+
+    // Start the clock just before `autumn new` so the whole onboarding journey
+    // (scaffold → first clean compile → boot → first 200) is captured.
+    let start = Instant::now();
+
+    crate::new::generate_with(project_name, tmp.path(), opts)
+        .map_err(|e| format!("autumn new failed: {e}"))?;
+    let project_dir = tmp.path().join(project_name);
+
+    repoint_autumn_web(&project_dir, &autumn_web)?;
+
+    // Cold build into the project's own (empty) target/. Remove any inherited
+    // CARGO_TARGET_DIR so we never reuse a warm cache from the parent build.
+    let build_ok = Command::new("cargo")
+        .arg("build")
+        .current_dir(&project_dir)
+        .env_remove("CARGO_TARGET_DIR")
+        .status()
+        .map_err(|e| format!("cargo build spawn failed: {e}"))?
+        .success();
+    if !build_ok {
+        return Err("cargo build failed for the scaffolded project".to_string());
+    }
+
+    let bin = project_dir.join("target").join("debug").join(project_name);
+    let mut child = Command::new(&bin)
+        .current_dir(&project_dir)
+        .spawn()
+        .map_err(|e| format!("failed to start the built server binary: {e}"))?;
+
+    // Poll the configured root route until the first 200 or the deadline.
+    let port = std::env::var("AUTUMN_BENCH_PORT")
+        .ok()
+        .and_then(|p| p.parse::<u16>().ok())
+        .unwrap_or(3000);
+    let url = format!("http://127.0.0.1:{port}/");
+    let deadline = start + Duration::from_millis(budget_for(class_for(shape)).max_ms * 2);
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .map_err(|e| format!("build http client: {e}"))?;
+
+    let mut measured = None;
+    while Instant::now() < deadline {
+        if let Ok(resp) = client.get(&url).send()
+            && resp.status().is_success()
+        {
+            measured = Some(u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX));
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    let _ = child.kill();
+    let _ = child.wait();
+
+    measured.ok_or_else(|| "server did not return HTTP 200 before the deadline".to_string())
+}
+
+/// Run the cold-start measurement `runs` times, returning the samples (ms).
+fn measure_cold_start(shape: ColdStartShape, runs: u32) -> Result<Vec<u64>, String> {
+    let mut samples = Vec::with_capacity(runs as usize);
+    for i in 1..=runs {
+        eprintln!("  cold-start {shape:?} run {i}/{runs}…");
+        let ms = measure_cold_start_once(shape)?;
+        eprintln!("    → {ms} ms");
+        samples.push(ms);
+    }
+    Ok(samples)
+}
+
+/// Run the `autumn dev-loop-bench --cold-start` command.
+///
+/// In `--dry-run` mode it prints the cold-start budget table with no build or
+/// server. Otherwise it measures the no-DB `hello` cold start (gated) and,
+/// when `include_db` is set, the database-backed shape (informational).
+// Mirrors the flag set of [`run`] (json / fail_on_regression / dry_run) plus
+// the cold-start-only `include_db` toggle; grouping these into a struct would
+// not improve the single CLI call site.
+#[allow(clippy::fn_params_excessive_bools)]
+pub fn run_cold_start(
+    runs: u32,
+    output: Option<&str>,
+    json: bool,
+    fail_on_regression: bool,
+    dry_run: bool,
+    include_db: bool,
+) -> i32 {
+    if dry_run {
+        print!("{}", format_cold_start_budget_table(include_db));
+        return 0;
+    }
+
+    eprintln!(
+        "autumn dev-loop-bench --cold-start: measuring onboarding cold start ({runs} run(s))"
+    );
+    eprintln!(
+        "This scaffolds throwaway projects and compiles them from a cold target — \
+         expect minutes per run.\n"
+    );
+
+    let hello_samples = match measure_cold_start(ColdStartShape::Hello, runs) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Error: cold-start (hello) measurement failed: {e}");
+            return 1;
+        }
+    };
+
+    let db_samples = if include_db {
+        match measure_cold_start(ColdStartShape::Db, runs) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                // The DB shape is informational; a failure must not break the run.
+                eprintln!("Warning: informational DB cold-start measurement failed: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let report = build_cold_start_report(&hello_samples, db_samples.as_deref());
+    let human = format_human_summary(&report);
+    let machine = format_json_report(&report);
+
+    if json {
+        println!("{machine}");
+    } else {
+        println!("{human}");
+    }
+
+    if let Some(path) = output {
+        if let Err(e) = std::fs::write(path, &machine) {
+            eprintln!("Warning: could not write report to {path}: {e}");
+        } else {
+            eprintln!("Report written to {path}");
+        }
+    }
+
+    if fail_on_regression && !report.all_passed {
+        eprintln!("Cold-start onboarding budget exceeded. Exiting 1.");
+        return 1;
+    }
+
+    0
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -1093,5 +1449,146 @@ mod tests {
             rust_version_string,
         );
         assert_eq!(result, "unknown");
+    }
+
+    // ── cold-start budgets ────────────────────────────────────────────────
+
+    #[test]
+    fn budget_cold_start_hello_p95_is_60000ms() {
+        // Success metric (issue #977): p95 ≤ 60s for the no-DB cold start.
+        assert_eq!(budget_for(ChangeClass::ColdStartHello).p95_ms, 60_000);
+    }
+
+    #[test]
+    fn budget_cold_start_classes_have_nonzero_p95() {
+        for class in [ChangeClass::ColdStartHello, ChangeClass::ColdStartDb] {
+            assert!(
+                budget_for(class).p95_ms > 0,
+                "p95 must be > 0 for {class:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cold_start_keys_are_unique_and_descriptive() {
+        let hello = ChangeClass::ColdStartHello;
+        let db = ChangeClass::ColdStartDb;
+        assert_ne!(hello.key(), db.key());
+        assert!(hello.key().contains("cold_start"), "got: {}", hello.key());
+        assert!(db.key().contains("cold_start"), "got: {}", db.key());
+    }
+
+    #[test]
+    fn cold_start_journey_names_mention_cold_start() {
+        for class in [ChangeClass::ColdStartHello, ChangeClass::ColdStartDb] {
+            assert!(
+                class.journey_name().to_lowercase().contains("cold start"),
+                "journey_name should mention cold start, got: {}",
+                class.journey_name()
+            );
+        }
+    }
+
+    // ── cold-start budget table ───────────────────────────────────────────
+
+    #[test]
+    fn format_cold_start_budget_table_lists_hello_and_budget() {
+        let table = format_cold_start_budget_table(false);
+        assert!(
+            table.to_lowercase().contains("cold start"),
+            "table must mention cold start, got:\n{table}"
+        );
+        // 60s p95 budget for the gated no-DB shape must be visible.
+        assert!(
+            table.contains("60000") || table.contains("60 000"),
+            "table must show the 60s p95 budget, got:\n{table}"
+        );
+    }
+
+    #[test]
+    fn format_cold_start_budget_table_db_row_only_when_requested() {
+        let without = format_cold_start_budget_table(false);
+        let with = format_cold_start_budget_table(true);
+        assert!(
+            !without.to_lowercase().contains("database"),
+            "DB row must be hidden unless include_db, got:\n{without}"
+        );
+        assert!(
+            with.to_lowercase().contains("database"),
+            "DB row must appear when include_db, got:\n{with}"
+        );
+    }
+
+    // ── cold-start report builder ─────────────────────────────────────────
+
+    #[test]
+    fn build_cold_start_report_hello_only_gates_on_hello() {
+        // Hello well within budget → all_passed true, one result, not informational.
+        let report = build_cold_start_report(&[40_000, 41_000, 42_000], None);
+        assert_eq!(report.results.len(), 1);
+        assert_eq!(report.results[0].change_class, "cold_start_hello");
+        assert!(!report.results[0].informational);
+        assert!(report.all_passed);
+    }
+
+    #[test]
+    fn build_cold_start_report_hello_over_budget_fails_gate() {
+        // p95 way above the 60s budget → gate fails.
+        let report = build_cold_start_report(&[120_000, 130_000, 140_000], None);
+        assert!(!report.all_passed, "over-budget hello must fail the gate");
+    }
+
+    #[test]
+    fn build_cold_start_report_db_is_informational_and_ungated() {
+        // DB samples blow past the budget but, being informational, must NOT
+        // flip the overall gate (hello is within budget).
+        let report = build_cold_start_report(
+            &[40_000, 41_000, 42_000],
+            Some(&[300_000, 310_000, 320_000]),
+        );
+        assert_eq!(report.results.len(), 2);
+        let db = report
+            .results
+            .iter()
+            .find(|r| r.change_class == "cold_start_db")
+            .expect("db result present");
+        assert!(db.informational, "db result must be informational");
+        assert!(
+            report.all_passed,
+            "informational db over-budget must not fail the gate"
+        );
+    }
+
+    #[test]
+    fn build_cold_start_report_json_has_metadata_and_no_path_leak() {
+        let report =
+            build_cold_start_report(&[40_000, 41_000, 42_000], Some(&[80_000, 81_000, 82_000]));
+        let s = format_json_report(&report);
+        let v: serde_json::Value = serde_json::from_str(&s).expect("valid JSON");
+        assert!(v.get("timestamp_utc").is_some());
+        assert!(v.get("runner_os").is_some());
+        assert!(v.get("rust_version").is_some());
+        assert!(v.get("autumn_version").is_some());
+        assert!(v.get("all_passed").is_some());
+        assert!(!s.contains("/home/"), "must not leak /home/ paths");
+        assert!(!s.contains("C:\\Users\\"), "must not leak Windows paths");
+    }
+
+    // ── run_cold_start ────────────────────────────────────────────────────
+
+    #[test]
+    fn run_cold_start_dry_run_returns_zero() {
+        assert_eq!(run_cold_start(1, None, false, false, true, false), 0);
+        assert_eq!(run_cold_start(1, None, true, false, true, true), 0);
+    }
+
+    // ── live driver (slow: compiles a fresh project) ──────────────────────
+
+    #[test]
+    #[ignore = "compiles a throwaway project from a cold target; run with --ignored"]
+    fn cold_start_live_hello_measures_a_positive_duration() {
+        let ms = measure_cold_start_once(ColdStartShape::Hello)
+            .expect("live cold-start measurement should succeed");
+        assert!(ms > 0, "measured cold-start duration must be positive");
     }
 }

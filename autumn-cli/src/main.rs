@@ -553,6 +553,14 @@ enum Commands {
         /// Print the budget table and exit without starting a server.
         #[arg(long)]
         dry_run: bool,
+        /// Measure the cold-start onboarding journey (`autumn new` → first 200,
+        /// including the first clean compile) instead of the warm dev loop.
+        #[arg(long)]
+        cold_start: bool,
+        /// With `--cold-start`, also measure the database-backed shape as an
+        /// informational (non-gating) result.
+        #[arg(long)]
+        include_db: bool,
     },
 }
 
@@ -1877,15 +1885,28 @@ fn run_command(command: Commands) {
             json,
             fail_on_regression,
             dry_run,
+            cold_start,
+            include_db,
         } => {
-            let exit_code = dev_loop_bench::run(
-                &example,
-                runs,
-                output.as_deref(),
-                json,
-                fail_on_regression,
-                dry_run,
-            );
+            let exit_code = if cold_start {
+                dev_loop_bench::run_cold_start(
+                    runs,
+                    output.as_deref(),
+                    json,
+                    fail_on_regression,
+                    dry_run,
+                    include_db,
+                )
+            } else {
+                dev_loop_bench::run(
+                    &example,
+                    runs,
+                    output.as_deref(),
+                    json,
+                    fail_on_regression,
+                    dry_run,
+                )
+            };
             if exit_code != 0 {
                 std::process::exit(exit_code);
             }
@@ -4158,6 +4179,8 @@ mod tests {
             json,
             fail_on_regression,
             dry_run,
+            cold_start,
+            include_db,
         } = cli.command
         else {
             panic!("expected dev-loop-bench");
@@ -4168,6 +4191,8 @@ mod tests {
         assert!(!json);
         assert!(!fail_on_regression);
         assert!(!dry_run);
+        assert!(!cold_start);
+        assert!(!include_db);
     }
 
     #[test]
@@ -4177,6 +4202,22 @@ mod tests {
             panic!("expected dev-loop-bench");
         };
         assert!(dry_run);
+    }
+
+    #[test]
+    fn parse_dev_loop_bench_cold_start_flags() {
+        let cli = Cli::try_parse_from(["autumn", "dev-loop-bench", "--cold-start", "--include-db"])
+            .unwrap();
+        let Commands::DevLoopBench {
+            cold_start,
+            include_db,
+            ..
+        } = cli.command
+        else {
+            panic!("expected dev-loop-bench");
+        };
+        assert!(cold_start);
+        assert!(include_db);
     }
 
     #[test]
