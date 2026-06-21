@@ -10,6 +10,7 @@
 //! property (a greenfield-generated table re-derived here is byte-identical)
 //! can be asserted directly against [`super::model`].
 
+use std::collections::BTreeSet;
 use std::fmt::Write as _;
 use std::path::Path;
 
@@ -30,6 +31,10 @@ pub struct Column {
     pub nullable: bool,
     /// True when the column participates in the table's primary key.
     pub is_pk: bool,
+    /// True when the column has a database default (`column_default IS NOT NULL`).
+    /// Non-PK columns with a default are annotated `#[default]` so they stay out
+    /// of `NewX` (e.g. `created_at TIMESTAMP NOT NULL DEFAULT NOW()`).
+    pub has_default: bool,
 }
 
 impl Column {
@@ -101,10 +106,24 @@ pub fn plan_pull(
     let mut schema = read_or_empty(&project_root.join("src").join("schema.rs"));
     let mut repos_mod = read_or_empty(&repos_dir.join("mod.rs"));
 
+    // Detect generated-name collisions up front: two tables can singularize to
+    // the same module (e.g. `status` and `statuses`), which would otherwise make
+    // the second model file silently clobber the first.
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+
     for table in tables {
         let resource = singularize(&table.table);
         let snake_name = snake(&resource);
         let pascal_name = pascal(&resource);
+
+        validate_table(table, &resource)?;
+        if !seen.insert(snake_name.clone()) {
+            return Err(GenerateError::Config(format!(
+                "two pulled tables map to the same model module '{snake_name}' \
+                 (last from table '{}'); pull them individually or rename one",
+                table.table
+            )));
+        }
 
         // (a) src/models/<snake>.rs
         plan.create(
@@ -156,10 +175,10 @@ pub fn plan_pull(
 /// Render a `#[model]` struct from introspected columns.
 ///
 /// Columns are emitted in catalog order; the primary-key column is annotated
-/// `#[id]` and a `created_at` column is annotated `#[default]` (so it stays out
-/// of `NewX`). For a greenfield-generated table — `id` `int8` PK first, user
-/// fields, `created_at` last — this is byte-identical to
-/// [`super::model::render_model_file`], which the round-trip property relies on.
+/// `#[id]` and a column with a database default is annotated `#[default]` (so it
+/// stays out of `NewX`). For a greenfield-generated table — `id` `int8` PK first,
+/// user fields, `created_at` (`DEFAULT NOW()`) last — this is byte-identical to
+/// `render_model_file` in `super::model`, which the round-trip property relies on.
 #[must_use]
 pub fn render_model(pascal_name: &str, table: &str, columns: &[Column]) -> String {
     let mut out = String::with_capacity(columns.len() * 64 + 256);
@@ -174,8 +193,9 @@ pub fn render_model(pascal_name: &str, table: &str, columns: &[Column]) -> Strin
     for col in columns {
         if col.is_pk {
             out.push_str("    #[id]\n");
-        }
-        if col.name == "created_at" {
+        } else if col.has_default {
+            // A DB default means the column is optional on insert — keep it out
+            // of `NewX`. The PK is already handled by `#[id]`.
             out.push_str("    #[default]\n");
         }
         let _ = writeln!(out, "    pub {}: {},", col.name, col.rust_type());
@@ -225,6 +245,37 @@ fn append_schema_block(existing: &str, table: &str, columns: &[Column]) -> Strin
     format!("{trimmed}\n\n{block}")
 }
 
+/// Validate that an introspected table can be emitted as compilable Autumn code.
+///
+/// Fails loudly (rather than emitting broken `.rs`) when:
+/// - the singularized table name is not a usable Rust module/struct name,
+/// - any column name is not a valid `snake_case` identifier or is a Rust keyword
+///   (e.g. a `type` column would produce `pub type: ...`), or
+/// - the table has no primary key (there is no column to annotate `#[id]`).
+fn validate_table(table: &TableSchema, resource: &str) -> Result<(), GenerateError> {
+    super::model::validate_resource_name(resource)?;
+    for col in &table.columns {
+        if !super::dsl::is_valid_ident(&col.name) || super::dsl::is_rust_keyword(&col.name) {
+            return Err(GenerateError::InvalidField {
+                token: format!("{}.{}", table.table, col.name),
+                reason: format!(
+                    "column '{}' is not a valid snake_case Rust identifier \
+                     (or is a reserved keyword); rename the column or skip this table",
+                    col.name
+                ),
+            });
+        }
+    }
+    if !table.columns.iter().any(|c| c.is_pk) {
+        return Err(GenerateError::Config(format!(
+            "table '{}' has no primary key; `db pull` needs one to derive #[id]. \
+             Add a primary key or skip this table.",
+            table.table
+        )));
+    }
+    Ok(())
+}
+
 fn read_or_empty(path: &Path) -> String {
     std::fs::read_to_string(path).unwrap_or_default()
 }
@@ -261,6 +312,19 @@ mod tests {
             kind,
             nullable,
             is_pk,
+            has_default: false,
+        }
+    }
+
+    /// A conventional `created_at` column: `TIMESTAMP NOT NULL DEFAULT NOW()`,
+    /// so it carries a database default (`has_default = true`).
+    fn created_at_col() -> Column {
+        Column {
+            name: "created_at".to_owned(),
+            kind: FieldKind::NaiveDateTime,
+            nullable: false,
+            is_pk: false,
+            has_default: true,
         }
     }
 
@@ -274,7 +338,7 @@ mod tests {
                 col("title", FieldKind::String, false, false),
                 col("body", FieldKind::String, false, false),
                 col("published", FieldKind::Bool, false, false),
-                col("created_at", FieldKind::NaiveDateTime, false, false),
+                created_at_col(),
             ],
         }
     }
@@ -393,7 +457,7 @@ mod tests {
             columns: vec![
                 col("id", FieldKind::I64, false, true),
                 col("body", FieldKind::String, false, false),
-                col("created_at", FieldKind::NaiveDateTime, false, false),
+                created_at_col(),
             ],
         };
         let plan = plan_pull(
@@ -497,6 +561,103 @@ mod tests {
         assert!(!tmp.path().join("src/schema.rs").exists());
     }
 
+    // ── Fail-loud guards for brownfield edge cases ──────────────────────────
+
+    #[test]
+    fn plan_pull_errors_on_table_without_primary_key() {
+        let tmp = project();
+        let no_pk = TableSchema {
+            table: "audit_logs".to_owned(),
+            columns: vec![
+                col("message", FieldKind::String, false, false),
+                created_at_col(),
+            ],
+        };
+        let err = plan_pull(tmp.path(), &[no_pk], PullOptions::default()).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("audit_logs"),
+            "error must name the table: {msg}"
+        );
+        assert!(msg.contains("primary key"), "error must explain why: {msg}");
+        assert!(!tmp.path().join("src/models/audit_log.rs").exists());
+    }
+
+    #[test]
+    fn plan_pull_errors_on_invalid_column_identifier() {
+        let tmp = project();
+        // `type` is a Rust keyword; emitting `pub type: ...` would not compile.
+        let bad = TableSchema {
+            table: "items".to_owned(),
+            columns: vec![
+                col("id", FieldKind::I64, false, true),
+                col("type", FieldKind::String, false, false),
+            ],
+        };
+        let err = plan_pull(tmp.path(), &[bad], PullOptions::default()).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("items.type"),
+            "error must name table.column: {msg}"
+        );
+        assert!(!tmp.path().join("src/models/item.rs").exists());
+    }
+
+    #[test]
+    fn plan_pull_errors_on_colliding_generated_module_names() {
+        let tmp = project();
+        // `status` and `statuses` both singularize to `status`.
+        let status = TableSchema {
+            table: "status".to_owned(),
+            columns: vec![col("id", FieldKind::I64, false, true)],
+        };
+        let statuses = TableSchema {
+            table: "statuses".to_owned(),
+            columns: vec![col("id", FieldKind::I64, false, true)],
+        };
+        let err = plan_pull(tmp.path(), &[status, statuses], PullOptions::default()).unwrap_err();
+        assert!(
+            err.to_string().contains("same model module"),
+            "error must explain the collision: {err}"
+        );
+    }
+
+    #[test]
+    fn plan_pull_marks_default_columns_and_excludes_pk() {
+        let tmp = project();
+        // A non-`created_at` column with a DB default must still be `#[default]`;
+        // the PK must be `#[id]` only (never `#[default]`).
+        let table = TableSchema {
+            table: "widgets".to_owned(),
+            columns: vec![
+                Column {
+                    name: "id".to_owned(),
+                    kind: FieldKind::I64,
+                    nullable: false,
+                    is_pk: true,
+                    has_default: true, // serial default — must NOT add #[default]
+                },
+                Column {
+                    name: "status".to_owned(),
+                    kind: FieldKind::String,
+                    nullable: false,
+                    is_pk: false,
+                    has_default: true, // e.g. DEFAULT 'active'
+                },
+                col("label", FieldKind::String, false, false),
+            ],
+        };
+        let plan = plan_pull(tmp.path(), &[table], PullOptions::default()).unwrap();
+        plan.execute(Flags::default()).unwrap();
+        let model = fs::read_to_string(tmp.path().join("src/models/widget.rs")).unwrap();
+        assert!(model.contains("#[default]\n    pub status: String,"));
+        assert!(model.contains("#[id]\n    pub id: i64,"));
+        // The PK must not be doubly annotated.
+        assert!(!model.contains("#[id]\n    #[default]"));
+        // A plain column has neither.
+        assert!(model.contains("    pub label: String,"));
+    }
+
     // ── Round-trip property (AC4) ───────────────────────────────────────────
 
     #[test]
@@ -527,20 +688,22 @@ mod tests {
 
         // Inverse: synthesize the catalog rows that table produces, invert each
         // udt_name, and re-render via the introspection path.
+        // (name, udt_name, nullable, is_pk, has_default)
         let udts = [
-            ("id", "int8", false, true),
-            ("title", "text", false, false),
-            ("body", "text", false, false),
-            ("published", "bool", false, false),
-            ("created_at", "timestamp", false, false),
+            ("id", "int8", false, true, false),
+            ("title", "text", false, false, false),
+            ("body", "text", false, false, false),
+            ("published", "bool", false, false, false),
+            ("created_at", "timestamp", false, false, true),
         ];
         let columns: Vec<Column> = udts
             .iter()
-            .map(|(name, udt, nullable, is_pk)| Column {
+            .map(|(name, udt, nullable, is_pk, has_default)| Column {
                 name: (*name).to_owned(),
                 kind: sql_type_to_field_kind(udt).unwrap(),
                 nullable: *nullable,
                 is_pk: *is_pk,
+                has_default: *has_default,
             })
             .collect();
         let re_derived = render_model(&pascal(&singularize("posts")), "posts", &columns);

@@ -101,9 +101,14 @@ pub fn run(args: &PullArgs) {
 
 fn pull(args: &PullArgs) -> Result<(), PullError> {
     let url = migrate::resolve_primary_url(args.profile.as_deref()).ok_or(PullError::NoUrl)?;
-    let (host, port) = parse_host_port(&url)?;
-    let mut conn =
-        PgConnection::establish(&url).map_err(|_| PullError::Connection { host, port })?;
+    // `PgConnection::establish` accepts both URL and libpq key-value DSNs
+    // (`host=... dbname=...`), but `url::Url::parse` only understands the former.
+    // Defer parsing to the error path so a valid key-value connection string
+    // still connects; host/port are only needed for a credential-safe message.
+    let mut conn = PgConnection::establish(&url).map_err(|_| {
+        let (host, port) = parse_host_port(&url).unwrap_or_else(|_| ("localhost".to_owned(), 5432));
+        PullError::Connection { host, port }
+    })?;
 
     let table_names = list_tables(&mut conn, &args.tables)?;
     if table_names.is_empty() {
@@ -155,6 +160,8 @@ struct ColumnRow {
     udt_name: String,
     #[diesel(sql_type = diesel::sql_types::Text)]
     is_nullable: String,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+    column_default: Option<String>,
 }
 
 /// List the base tables in `public`, excluding Diesel's bookkeeping table.
@@ -187,7 +194,7 @@ fn introspect_table(conn: &mut PgConnection, table: &str) -> Result<TableSchema,
     let pk = primary_key_columns(conn, table)?;
 
     let query = format!(
-        "SELECT column_name, udt_name, is_nullable \
+        "SELECT column_name, udt_name, is_nullable, column_default \
          FROM information_schema.columns \
          WHERE table_schema = 'public' AND table_name = {} \
          ORDER BY ordinal_position",
@@ -208,6 +215,7 @@ fn introspect_table(conn: &mut PgConnection, table: &str) -> Result<TableSchema,
         columns.push(Column {
             nullable: row.is_nullable.eq_ignore_ascii_case("YES"),
             is_pk: pk.iter().any(|c| c == &row.column_name),
+            has_default: row.column_default.is_some(),
             name: row.column_name,
             kind,
         });
@@ -225,7 +233,9 @@ fn primary_key_columns(conn: &mut PgConnection, table: &str) -> Result<Vec<Strin
          FROM pg_index i \
          JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey) \
          WHERE i.indrelid = to_regclass({}) AND i.indisprimary",
-        quote_literal(&format!("public.{table}"))
+        // Quote the identifier so case-sensitive table names (e.g. "UserRole")
+        // resolve correctly; an unquoted name folds to lowercase and misses.
+        quote_literal(&format!("public.\"{}\"", table.replace('"', "\"\"")))
     );
     let rows: Vec<NameRow> = sql_query(query)
         .load(conn)

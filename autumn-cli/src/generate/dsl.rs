@@ -321,7 +321,7 @@ fn strip_wrapper<'a>(ty: &'a str, wrapper: &str) -> Option<&'a str> {
     stripped.strip_suffix('>')
 }
 
-fn is_valid_ident(s: &str) -> bool {
+pub(super) fn is_valid_ident(s: &str) -> bool {
     let mut chars = s.chars();
     let Some(first) = chars.next() else {
         return false;

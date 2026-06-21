@@ -158,7 +158,14 @@ async fn db_pull_regenerates_models_from_existing_schema_and_compiles() {
         .count();
 
     // 3. Pull the schema back into Autumn artifacts, including repositories.
-    let (stdout, _) = run_autumn_ok(&project, &["db", "pull", "--with-repository"], &envs);
+    //    Scope to `posts` so the test does not depend on how Autumn's own
+    //    framework tables (created by `autumn migrate`) are handled by an
+    //    unscoped pull.
+    let (stdout, _) = run_autumn_ok(
+        &project,
+        &["db", "pull", "posts", "--with-repository"],
+        &envs,
+    );
     assert!(
         stdout.contains("post.rs"),
         "pull should report files:\n{stdout}"
