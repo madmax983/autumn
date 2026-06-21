@@ -165,12 +165,19 @@ fn run_unix(action: Option<ServeAction>, opts: &ServeOptions) -> i32 {
                     || managed_cluster_present(opts.package.as_deref()),
                     |a| a.managed_pg,
                 );
-            let keep_release = opts.release || running.as_ref().is_some_and(|a| a.release);
+            // Fall back to the `serve.mode` marker for release/profile when the
+            // address file is missing/corrupt (it persists them independently).
+            let recorded_mode = running_daemon_mode(opts.package.as_deref());
+            let keep_release = opts.release
+                || running.as_ref().is_some_and(|a| a.release)
+                || recorded_mode.as_ref().is_some_and(|m| m.release);
             // Preserve the original daemon's profile: prefer one set on *this*
             // restart's environment, else restore what the running daemon
-            // recorded, so a bare `restart` doesn't silently fall back to `dev`.
-            let keep_profile =
-                env_profile().or_else(|| running.as_ref().and_then(|a| a.profile.clone()));
+            // recorded (address file, then mode marker), so a bare `restart`
+            // doesn't silently fall back to `dev`.
+            let keep_profile = env_profile()
+                .or_else(|| running.as_ref().and_then(|a| a.profile.clone()))
+                .or_else(|| recorded_mode.and_then(|m| m.profile));
             let _ = stop(opts);
             let daemon_opts = ServeOptions {
                 daemon: true,
@@ -932,7 +939,50 @@ fn write_addr_file(
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
     }
+    // Persist release/profile in a separate marker too, so a later `restart` can
+    // recover them even if `serve.addr` is deleted/corrupted while the daemon is
+    // running. Best-effort: the address file is the primary record, so a failure
+    // here doesn't fail the start.
+    write_mode_file(paths, opts);
     Ok(())
+}
+
+/// The daemon's build/profile mode, recorded alongside `serve.addr` (see
+/// [`RuntimePaths::mode_file`]) as a resilient fallback for `restart`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct ModeFile {
+    /// Whether the daemon was built/started in release mode.
+    #[serde(default)]
+    release: bool,
+    /// The explicit profile (`AUTUMN_ENV`/`AUTUMN_PROFILE`) the daemon used.
+    #[serde(default)]
+    profile: Option<String>,
+}
+
+/// Write the `serve.mode` marker (`0600`). Best-effort.
+fn write_mode_file(paths: &RuntimePaths, opts: &ServeOptions) {
+    let mode = ModeFile {
+        release: opts.release,
+        profile: opts.profile.clone().or_else(env_profile),
+    };
+    let Ok(toml) = toml::to_string(&mode) else {
+        return;
+    };
+    let path = paths.mode_file();
+    if std::fs::write(&path, toml).is_ok() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        }
+    }
+}
+
+/// The recorded `serve.mode` for this project, if present and parseable.
+fn running_daemon_mode(package: Option<&str>) -> Option<ModeFile> {
+    let paths = RuntimePaths::resolve(&project_identity(package)).ok()?;
+    let contents = std::fs::read_to_string(paths.mode_file()).ok()?;
+    toml::from_str(&contents).ok()
 }
 
 /// Stop the running daemon. Returns the exit code.
@@ -1247,10 +1297,12 @@ fn status(opts: &ServeOptions) -> i32 {
     }
 }
 
-/// Best-effort removal of the pidfile, address file, readiness file, and socket.
+/// Best-effort removal of the pidfile, address file, mode marker, readiness
+/// file, and socket.
 fn cleanup(paths: &RuntimePaths, socket: &Path) {
     let _ = std::fs::remove_file(paths.pid_file());
     let _ = std::fs::remove_file(paths.addr_file());
+    let _ = std::fs::remove_file(paths.mode_file());
     let _ = std::fs::remove_file(paths.ready_file());
     remove_socket_if_not_live(socket);
 }
