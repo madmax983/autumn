@@ -2842,6 +2842,7 @@ impl AppBuilder {
         )
         .unwrap_or_else(|error| {
             tracing::error!(error = %error, "Failed to configure mailer");
+            exit_stop_managed_pg();
             std::process::exit(1);
         });
         #[cfg(feature = "mail")]
@@ -2991,6 +2992,7 @@ impl AppBuilder {
         )
         .unwrap_or_else(|error| {
             tracing::error!(error = %error, "Failed to build router");
+            exit_stop_managed_pg();
             std::process::exit(1);
         });
 

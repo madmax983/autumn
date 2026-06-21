@@ -208,6 +208,17 @@ impl ManagedPostgresPoolProvider {
         // `setup` is idempotent: it downloads/extracts and runs `initdb` only
         // when the data dir is not already initialized.
         pg.setup().await?;
+        // A previous process may have been killed after starting Postgres but
+        // before its shutdown hook ran, leaving a postmaster still bound to this
+        // data dir. `postgresql_embedded` does not attach to an existing server,
+        // so `start()` would fail against the locked dir (and direct `cargo run`
+        // managed-PG apps would then fail on every boot until the orphan is
+        // stopped by hand). Stop whatever is bound to the data dir first — a
+        // data-dir `pg_ctl stop`, best-effort: a no-op/`Err` for a merely-stale
+        // `postmaster.pid`, which `start()` then reclaims on its own.
+        if matches!(pg.status(), postgresql_embedded::Status::Started) {
+            let _ = pg.stop().await;
+        }
         pg.start().await?;
         // The post-start database checks can still fail (auth, bootstrap-DB
         // connection, etc.). The server is already running by now, so stop it
