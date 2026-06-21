@@ -584,6 +584,11 @@ pub type PoolError = diesel_async::pooled_connection::deadpool::BuildError;
 pub struct DatabaseTopology {
     primary: Pool<AsyncPgConnection>,
     replica: Option<Pool<AsyncPgConnection>>,
+    /// Connection URL to target with startup migrations, when the provider
+    /// resolved one at runtime that the static config doesn't carry (e.g. the
+    /// managed-Postgres provider whose socket URL is only known after boot).
+    /// Scoping it to the topology keeps it per-app instead of a process global.
+    migration_url: Option<String>,
 }
 
 impl DatabaseTopology {
@@ -596,7 +601,11 @@ impl DatabaseTopology {
         primary: Pool<AsyncPgConnection>,
         replica: Option<Pool<AsyncPgConnection>>,
     ) -> Self {
-        Self { primary, replica }
+        Self {
+            primary,
+            replica,
+            migration_url: None,
+        }
     }
 
     /// Build a topology from a primary pool only.
@@ -605,7 +614,26 @@ impl DatabaseTopology {
         Self {
             primary,
             replica: None,
+            migration_url: None,
         }
+    }
+
+    /// Attach a runtime-resolved migration URL (see [`Self::migration_url`]).
+    ///
+    /// Providers whose primary URL isn't present in the static config — such as
+    /// the managed-Postgres provider — call this so startup migrations target
+    /// the pool that was actually built, without publishing the URL to a
+    /// process-global shared across every app instance.
+    #[must_use]
+    pub fn with_migration_url(mut self, url: Option<String>) -> Self {
+        self.migration_url = url;
+        self
+    }
+
+    /// The runtime-resolved migration URL, if the provider supplied one.
+    #[must_use]
+    pub fn migration_url(&self) -> Option<&str> {
+        self.migration_url.as_deref()
     }
 
     /// Primary/write role pool.
@@ -696,7 +724,7 @@ pub fn create_topology(config: &DatabaseConfig) -> Result<Option<DatabaseTopolog
         })
         .transpose()?;
 
-    Ok(Some(DatabaseTopology { primary, replica }))
+    Ok(Some(DatabaseTopology::from_pools(primary, replica)))
 }
 
 /// Create one shard's primary and optional replica pools, applying the
@@ -726,7 +754,7 @@ pub fn create_shard_topology(
         })
         .transpose()?;
 
-    Ok(DatabaseTopology { primary, replica })
+    Ok(DatabaseTopology::from_pools(primary, replica))
 }
 
 // ── Db extractor ─────────────────────────────────────────────

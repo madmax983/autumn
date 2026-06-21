@@ -34,6 +34,10 @@ pub enum NewError {
     #[error("directory '{0}' already exists")]
     AlreadyExists(String),
 
+    /// The requested option combination is not supported.
+    #[error("incompatible options: {0}")]
+    IncompatibleOptions(String),
+
     /// Filesystem error during project creation.
     #[error("failed to create project: {0}")]
     Io(#[from] std::io::Error),
@@ -57,6 +61,9 @@ pub fn run(name: &str, opts: GenerateOptions) {
 }
 
 /// Optional toggles applied to project generation.
+// Independent on/off scaffolding toggles; a bitflags/enum here would be less
+// clear than named booleans at the (few) call sites.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
 pub struct GenerateOptions {
     /// Scaffold the optional i18n module (`i18n/en.ftl`, `[i18n]` block,
@@ -64,6 +71,14 @@ pub struct GenerateOptions {
     pub with_i18n: bool,
     /// Scaffold the optional seed binary and enable `autumn-web/seed`.
     pub with_seed: bool,
+    /// Daemon-flavored starter: a model-free app that builds with **no** Postgres
+    /// (drops the default `db` feature and migrations), ready for `autumn serve`.
+    pub with_daemon: bool,
+    /// Managed/bundled-Postgres daemon starter: keeps `db`, enables the
+    /// `managed-pg` feature, and wires a managed local Postgres provider.
+    /// Implies [`Self::with_daemon`]-style serve usage. Mutually exclusive with a
+    /// DB-free daemon.
+    pub with_bundled_pg: bool,
 }
 
 /// Generate a new Autumn project under `parent_dir/name` with default options.
@@ -71,9 +86,37 @@ pub fn generate(name: &str, parent_dir: &Path) -> Result<(), NewError> {
     generate_with(name, parent_dir, GenerateOptions::default())
 }
 
+/// Reject unsupported flag combinations before any files are written.
+fn check_option_combination(opts: GenerateOptions) -> Result<(), NewError> {
+    // The DB-free daemon starter builds with no database, so a seed binary
+    // (which needs `autumn_web::seed::SeedContext` and the `db` feature) cannot
+    // compile. Reject the combination rather than scaffolding a broken project.
+    if opts.with_daemon && !opts.with_bundled_pg && opts.with_seed {
+        return Err(NewError::IncompatibleOptions(
+            "--daemon scaffolds a database-free app, so --with-seed is not \
+             supported (seeding requires a database; use --bundled-pg for a \
+             daemon with a managed Postgres)"
+                .to_owned(),
+        ));
+    }
+    // A managed-Postgres daemon owns its database URL at runtime (chosen by the
+    // provider); the `autumn seed` CLI is a separate process that only reads
+    // env/config URLs, so it can't reach the managed DB. Reject the combo.
+    if opts.with_bundled_pg && opts.with_seed {
+        return Err(NewError::IncompatibleOptions(
+            "--bundled-pg manages Postgres inside the daemon, so the `autumn \
+             seed` CLI cannot reach its database; --with-seed is not supported \
+             with --bundled-pg. Seed from the app instead (e.g. a startup hook)."
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 /// Generate a new Autumn project under `parent_dir/name`, honouring `opts`.
 pub fn generate_with(name: &str, parent_dir: &Path, opts: GenerateOptions) -> Result<(), NewError> {
     validate_name(name)?;
+    check_option_combination(opts)?;
 
     let project_dir = parent_dir.join(name);
     if project_dir.exists() {
@@ -94,7 +137,14 @@ pub fn generate_with(name: &str, parent_dir: &Path, opts: GenerateOptions) -> Re
     }
 
     let render = |template: &str| -> String {
+        // Templates are embedded via `include_str!`; on Windows they may be
+        // checked out with CRLF line endings (git autocrlf), which would break
+        // the `\n`-anchored `.replace()` rewrites below (migration stripping,
+        // dependency edits) and silently emit the wrong scaffold. Normalize to
+        // LF so generation is deterministic — and generated projects use LF —
+        // regardless of the host platform's checkout.
         template
+            .replace("\r\n", "\n")
             .replace("{{project_name}}", name)
             .replace("{{crate_name}}", &crate_name)
             .replace("{{autumn_version}}", autumn_version)
@@ -109,7 +159,7 @@ pub fn generate_with(name: &str, parent_dir: &Path, opts: GenerateOptions) -> Re
     );
     fs::write(project_dir.join("Cargo.toml"), cargo_toml)?;
 
-    let main_rs = if opts.with_i18n {
+    let mut main_rs = if opts.with_i18n {
         render(templates::MAIN_RS).replace(
             "        .routes(routes![index, hello, hello_name])",
             "        .i18n_auto()\n        .routes(routes![index, hello, hello_name])",
@@ -117,15 +167,43 @@ pub fn generate_with(name: &str, parent_dir: &Path, opts: GenerateOptions) -> Re
     } else {
         render(templates::MAIN_RS)
     };
+    if opts.with_bundled_pg {
+        // Managed-Postgres daemon: keep migrations, install the pool provider.
+        main_rs = inject_managed_pg(&main_rs);
+    } else if opts.with_daemon {
+        // DB-free daemon: the `migrate` module is db-gated, so drop migrations.
+        main_rs = strip_migrations(&main_rs);
+    }
     fs::write(project_dir.join("src/main.rs"), main_rs)?;
 
-    let autumn_toml = if opts.with_i18n {
+    let mut autumn_toml = if opts.with_i18n {
         let mut s = render(templates::AUTUMN_TOML);
         s.push_str("\n[i18n]\ndefault_locale = \"en\"\nsupported_locales = [\"en\"]\n");
         s
     } else {
         render(templates::AUTUMN_TOML)
     };
+    if opts.with_daemon && !opts.with_bundled_pg {
+        autumn_toml.push_str(
+            "\n# Daemon starter: this app uses no database. Run it as a local\n\
+             # daemon with `autumn serve --daemon` (no Postgres required).\n",
+        );
+    }
+    if opts.with_bundled_pg {
+        // The managed cluster is private to this daemon and has no URL outside
+        // the provider, so `autumn migrate` can't reach it and `--release` runs
+        // under the `prod` profile (where migrations are otherwise only logged).
+        // Apply embedded migrations automatically so a fresh release data dir
+        // doesn't come up with missing tables.
+        autumn_toml.push_str(
+            "\n# Managed local Postgres (`autumn serve --bundled-pg`): the cluster is\n\
+             # owned by the daemon, so apply embedded migrations automatically even\n\
+             # under the production profile (a fresh data dir would otherwise start\n\
+             # with no tables).\n\
+             [database]\n\
+             auto_migrate_in_production = true\n",
+        );
+    }
     fs::write(project_dir.join("autumn.toml"), autumn_toml)?;
     fs::write(
         project_dir.join("Dockerfile"),
@@ -235,6 +313,49 @@ fn print_scaffold_summary(name: &str, opts: GenerateOptions) {
     }
 }
 
+/// Inject a managed-Postgres pool provider plus a shutdown hook into a
+/// generated `main.rs` so the bundled cluster is supervised by the daemon.
+fn inject_managed_pg(main_rs: &str) -> String {
+    main_rs.replace(
+        "    autumn_web::app()\n",
+        "    let pg = autumn_web::managed_pg::ManagedPostgresPoolProvider::new();\n\
+         \x20   let pg_shutdown = pg.clone();\n\
+         \x20   autumn_web::app()\n\
+         \x20       .with_pool_provider(pg)\n\
+         \x20       .on_shutdown(move || {\n\
+         \x20           let pg = pg_shutdown.clone();\n\
+         \x20           async move {\n\
+         \x20               pg.stop().await;\n\
+         \x20           }\n\
+         \x20       })\n",
+    )
+}
+
+/// Remove the diesel-migrations wiring from a generated `main.rs` so a DB-free
+/// app compiles without the db-gated `migrate` module.
+fn strip_migrations(main_rs: &str) -> String {
+    main_rs
+        .replace(
+            "use autumn_web::migrate::{EmbeddedMigrations, embed_migrations};\n",
+            "",
+        )
+        .replace(
+            "const MIGRATIONS: EmbeddedMigrations = embed_migrations!();\n\n",
+            "",
+        )
+        .replace("\n        .migrations(MIGRATIONS)", "")
+}
+
+/// Default `autumn-web` features minus `db` — the DB-free daemon feature set.
+const DAEMON_NO_DB_FEATURES: &[&str] = &[
+    "maud",
+    "htmx",
+    "tailwind",
+    "cache-moka",
+    "http-client",
+    "reporting",
+];
+
 fn render_cargo_toml(
     opts: GenerateOptions,
     autumn_version: &str,
@@ -242,7 +363,33 @@ fn render_cargo_toml(
     seed_bin_toml: &str,
 ) -> String {
     use std::fmt::Write;
+
+    // DB-free daemon starter: switch off default features (drops `db`) so the
+    // binary links no Postgres, and remove the diesel migrations dependency.
+    if opts.with_daemon && !opts.with_bundled_pg {
+        let plain_dep = format!(r#"autumn-web = "{autumn_version}""#);
+        let mut features: Vec<&str> = DAEMON_NO_DB_FEATURES.to_vec();
+        if opts.with_i18n {
+            features.push("i18n");
+        }
+        let features_str = features
+            .iter()
+            .map(|f| format!(r#""{f}""#))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let dep = format!(
+            r#"autumn-web = {{ version = "{autumn_version}", default-features = false, features = [{features_str}] }}"#
+        );
+        cargo_toml = cargo_toml.replace(&plain_dep, &dep);
+        cargo_toml = cargo_toml.replace("diesel_migrations = \"2\"\n", "");
+        return cargo_toml;
+    }
+
     let mut features = Vec::new();
+    if opts.with_bundled_pg {
+        // Single-binary mode: embed Postgres in the executable.
+        features.push("managed-pg-bundled");
+    }
     if opts.with_i18n {
         features.push("i18n");
     }
@@ -590,6 +737,164 @@ mod tests {
         assert!(!main.contains(".i18n_auto()"));
     }
 
+    fn daemon_opts() -> GenerateOptions {
+        GenerateOptions {
+            with_daemon: true,
+            ..GenerateOptions::default()
+        }
+    }
+
+    #[test]
+    fn daemon_with_seed_is_rejected() {
+        let tmp = TempDir::new().unwrap();
+        let err = generate_with(
+            "daemon-seed-app",
+            tmp.path(),
+            GenerateOptions {
+                with_daemon: true,
+                with_seed: true,
+                ..GenerateOptions::default()
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, NewError::IncompatibleOptions(_)));
+        // Nothing should be scaffolded on rejection.
+        assert!(!tmp.path().join("daemon-seed-app").exists());
+    }
+
+    #[test]
+    fn bundled_pg_with_seed_is_rejected() {
+        let tmp = TempDir::new().unwrap();
+        let err = generate_with(
+            "pg-seed-app",
+            tmp.path(),
+            GenerateOptions {
+                with_bundled_pg: true,
+                with_daemon: true,
+                with_seed: true,
+                ..GenerateOptions::default()
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, NewError::IncompatibleOptions(_)));
+        assert!(!tmp.path().join("pg-seed-app").exists());
+    }
+
+    #[test]
+    fn daemon_starter_omits_db_feature() {
+        let tmp = TempDir::new().unwrap();
+        generate_with("daemon-app", tmp.path(), daemon_opts()).unwrap();
+        let cargo = fs::read_to_string(tmp.path().join("daemon-app/Cargo.toml")).unwrap();
+        assert!(
+            cargo.contains("default-features = false"),
+            "daemon starter must disable default features (drop db): {cargo}"
+        );
+        assert!(
+            !cargo.contains("\"db\""),
+            "daemon starter must not enable db"
+        );
+        assert!(
+            !cargo.contains("diesel_migrations"),
+            "daemon starter must not depend on diesel_migrations"
+        );
+    }
+
+    #[test]
+    fn daemon_starter_main_has_no_migrations() {
+        let tmp = TempDir::new().unwrap();
+        generate_with("daemon-main-app", tmp.path(), daemon_opts()).unwrap();
+        let main = fs::read_to_string(tmp.path().join("daemon-main-app/src/main.rs")).unwrap();
+        assert!(
+            !main.contains(".migrations("),
+            "daemon main must not call .migrations()"
+        );
+        assert!(
+            !main.contains("embed_migrations"),
+            "daemon main must not embed migrations"
+        );
+    }
+
+    #[test]
+    fn daemon_starter_autumn_toml_documents_zero_db() {
+        let tmp = TempDir::new().unwrap();
+        generate_with("daemon-cfg-app", tmp.path(), daemon_opts()).unwrap();
+        let toml = fs::read_to_string(tmp.path().join("daemon-cfg-app/autumn.toml")).unwrap();
+        assert!(toml.contains("autumn serve"));
+    }
+
+    fn bundled_pg_opts() -> GenerateOptions {
+        GenerateOptions {
+            with_bundled_pg: true,
+            with_daemon: true,
+            ..GenerateOptions::default()
+        }
+    }
+
+    #[test]
+    fn bundled_pg_starter_enables_managed_feature_and_keeps_db() {
+        let tmp = TempDir::new().unwrap();
+        generate_with("pg-app", tmp.path(), bundled_pg_opts()).unwrap();
+        let cargo = fs::read_to_string(tmp.path().join("pg-app/Cargo.toml")).unwrap();
+        assert!(
+            cargo.contains("managed-pg-bundled"),
+            "bundled starter must enable managed-pg-bundled: {cargo}"
+        );
+        assert!(
+            !cargo.contains("default-features = false"),
+            "bundled starter keeps the database (default features on)"
+        );
+    }
+
+    #[test]
+    fn bundled_pg_autumn_toml_enables_auto_migrate_in_production() {
+        let tmp = TempDir::new().unwrap();
+        generate_with("pg-cfg-app", tmp.path(), bundled_pg_opts()).unwrap();
+        let toml = fs::read_to_string(tmp.path().join("pg-cfg-app/autumn.toml")).unwrap();
+        // A `--release` daemon runs under the prod profile and the managed DB is
+        // unreachable to `autumn migrate`, so migrations must apply automatically.
+        assert!(
+            toml.contains("[database]") && toml.contains("auto_migrate_in_production = true"),
+            "bundled starter must auto-migrate in production: {toml}"
+        );
+        // Still valid TOML (no duplicate tables with the commented template).
+        toml::from_str::<toml::Table>(&toml).expect("generated autumn.toml parses");
+    }
+
+    #[test]
+    fn bundled_pg_main_installs_provider_and_shutdown_hook() {
+        let tmp = TempDir::new().unwrap();
+        generate_with("pg-main-app", tmp.path(), bundled_pg_opts()).unwrap();
+        let main = fs::read_to_string(tmp.path().join("pg-main-app/src/main.rs")).unwrap();
+        assert!(main.contains("ManagedPostgresPoolProvider"));
+        assert!(main.contains(".with_pool_provider("));
+        assert!(main.contains(".on_shutdown("));
+        // Database present: migrations kept.
+        assert!(main.contains(".migrations("));
+    }
+
+    #[test]
+    fn default_generation_has_no_managed_pg() {
+        let tmp = TempDir::new().unwrap();
+        generate("plain2-app", tmp.path()).unwrap();
+        let main = fs::read_to_string(tmp.path().join("plain2-app/src/main.rs")).unwrap();
+        assert!(!main.contains("with_pool_provider"));
+        let cargo = fs::read_to_string(tmp.path().join("plain2-app/Cargo.toml")).unwrap();
+        assert!(!cargo.contains("managed-pg"));
+    }
+
+    #[test]
+    fn default_generation_still_has_db() {
+        let tmp = TempDir::new().unwrap();
+        generate("plain-app", tmp.path()).unwrap();
+        let cargo = fs::read_to_string(tmp.path().join("plain-app/Cargo.toml")).unwrap();
+        // Default keeps the simple full-default dependency and migrations.
+        assert!(cargo.contains(r#"autumn-web = ""#));
+        assert!(!cargo.contains("default-features = false"));
+        assert!(cargo.contains("diesel_migrations"));
+        let main = fs::read_to_string(tmp.path().join("plain-app/src/main.rs")).unwrap();
+        assert!(main.contains(".migrations("));
+    }
+
     #[test]
     fn with_i18n_scaffolds_translation_dir_and_stub_file() {
         let tmp = TempDir::new().unwrap();
@@ -749,6 +1054,7 @@ mod tests {
             GenerateOptions {
                 with_i18n: true,
                 with_seed: true,
+                ..GenerateOptions::default()
             },
         )
         .unwrap();

@@ -888,6 +888,11 @@ pub(crate) fn auto_migrate(
             }
             Err(e) => {
                 tracing::error!(error = %e, target = %target, "Failed to run migrations");
+                // Aborting boot via `process::exit` skips `on_shutdown`; stop any
+                // managed Postgres first so a bad migration doesn't orphan the
+                // supervised child holding the data dir and port.
+                #[cfg(feature = "managed-pg")]
+                crate::managed_pg::emergency_stop();
                 std::process::exit(1);
             }
         }

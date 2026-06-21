@@ -9,6 +9,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **daemon:** `autumn serve` — run an app as a production (non-watch) local
+  daemon, with an optional managed local Postgres (#1119)
+  - `autumn serve` runs the compiled app in the foreground as a production
+    server (distinct from `autumn dev`: no file watching or hot reload).
+    `--release` builds an optimized binary.
+  - `autumn serve --daemon` backgrounds the server under a PID lockfile (a
+    second start is rejected with a clear message instead of double-binding);
+    `autumn serve stop | status | restart` manage its lifecycle. Graceful
+    shutdown reuses the existing lame-duck drain via `SIGTERM`.
+  - The server binds a **Unix domain socket** (new `server.unix_socket` /
+    `AUTUMN_SERVER__UNIX_SOCKET`) — never a public interface by default — and
+    the chosen address is written to a discovery file for clients. PID, socket,
+    address file, and logs live under platform dirs (XDG / `%APPDATA%`), never
+    cwd or `/etc`.
+  - `autumn new --daemon` scaffolds a model-free starter that builds with **no
+    Postgres** (drops the `db` feature and migrations) — runnable as a daemon
+    with zero external dependencies.
+  - `ManagedPostgresPoolProvider` (feature `managed-pg`) provisions and
+    supervises a local Postgres in the app's data dir through the existing
+    `with_pool_provider` seam (no query-path changes); `managed-pg-bundled`
+    embeds the Postgres binaries in the app executable. `autumn new
+    --bundled-pg` scaffolds and wires it.
+
 - **sharding:** `from_shard(db: &ShardedDb) -> Self` constructor on generated
   repositories (#1273)
   - `#[repository]` now emits `from_shard` as the standard way to build a
