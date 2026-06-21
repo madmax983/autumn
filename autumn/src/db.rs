@@ -1738,6 +1738,33 @@ mod tests {
         assert_eq!(state.read_pool().expect("read pool").status().max_size, 3);
     }
 
+    #[test]
+    fn is_query_canceled_matches_57014() {
+        let err = diesel::result::Error::DatabaseError(
+            diesel::result::DatabaseErrorKind::Unknown,
+            Box::new("canceling statement due to user request (SQLSTATE 57014)".to_string()),
+        );
+        assert!(is_query_canceled(&err));
+    }
+
+    #[test]
+    fn is_query_canceled_matches_timeout() {
+        let err = diesel::result::Error::DatabaseError(
+            diesel::result::DatabaseErrorKind::Unknown,
+            Box::new("canceling statement due to statement timeout".to_string()),
+        );
+        assert!(is_query_canceled(&err));
+    }
+
+    #[test]
+    fn is_query_canceled_returns_false_for_unrelated_errors() {
+        let err = diesel::result::Error::DatabaseError(
+            diesel::result::DatabaseErrorKind::UniqueViolation,
+            Box::new("duplicate key value violates unique constraint".to_string()),
+        );
+        assert!(!is_query_canceled(&err));
+    }
+
     #[tokio::test]
     async fn db_extractor_rejects_when_no_pool() {
         use axum::Router;
