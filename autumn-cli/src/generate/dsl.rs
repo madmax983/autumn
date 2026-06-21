@@ -164,6 +164,40 @@ impl FieldKind {
 pub const SUPPORTED_TYPES: &str = "String, Text, i32, i64, bool, f32, f64, \
     Uuid, NaiveDateTime, DateTime, Vec<u8>, Bytea, Attachment, Option<…>";
 
+/// Comma-separated list of supported Postgres column types (`udt_name`), for
+/// the `db pull` introspection error message.
+pub const SQL_SUPPORTED_TYPES: &str = "text, varchar, bpchar (-> String), int4 (-> i32), \
+    int8 (-> i64), bool, float4 (-> f32), float8 (-> f64), uuid, timestamp, timestamptz, bytea";
+
+/// Inverse of [`FieldKind::sql_type`] / [`FieldKind::schema_type`]: map a
+/// Postgres `udt_name` (the concrete catalog type identifier such as `int4`,
+/// `int8`, `text`, `timestamptz`) to the [`FieldKind`] the generators use.
+///
+/// This is the introspection direction used by `autumn db pull`. `text`,
+/// `varchar`, and `bpchar` all collapse to the canonical [`FieldKind::String`]
+/// (the DSL's `String`/`Text` aliases both render `String` in Rust and `Text`
+/// in `schema.rs`, so the round-trip with a greenfield-generated model stays
+/// byte-identical).
+///
+/// Returns `None` for types outside the documented surface so the caller can
+/// fail loudly with a column-named error rather than silently dropping it.
+#[must_use]
+pub fn sql_type_to_field_kind(udt_name: &str) -> Option<FieldKind> {
+    match udt_name {
+        "text" | "varchar" | "bpchar" => Some(FieldKind::String),
+        "int4" => Some(FieldKind::I32),
+        "int8" => Some(FieldKind::I64),
+        "bool" => Some(FieldKind::Bool),
+        "float4" => Some(FieldKind::F32),
+        "float8" => Some(FieldKind::F64),
+        "uuid" => Some(FieldKind::Uuid),
+        "timestamp" => Some(FieldKind::NaiveDateTime),
+        "timestamptz" => Some(FieldKind::DateTime),
+        "bytea" => Some(FieldKind::Bytea),
+        _ => None,
+    }
+}
+
 /// Parse a single CLI token of the form `name:Type`.
 ///
 /// # Errors
@@ -545,5 +579,88 @@ mod tests {
             SUPPORTED_TYPES.contains("Attachment"),
             "SUPPORTED_TYPES must list Attachment"
         );
+    }
+
+    // ── Inverse mapping (db pull introspection, issue #975) ─────────────────
+
+    #[test]
+    fn sql_type_inverse_maps_all_supported_udt_names() {
+        // (udt_name, expected kind, expected rust_type, expected schema_type)
+        let cases: &[(&str, FieldKind, &str, &str)] = &[
+            ("text", FieldKind::String, "String", "Text"),
+            ("varchar", FieldKind::String, "String", "Text"),
+            ("bpchar", FieldKind::String, "String", "Text"),
+            ("int4", FieldKind::I32, "i32", "Int4"),
+            ("int8", FieldKind::I64, "i64", "Int8"),
+            ("bool", FieldKind::Bool, "bool", "Bool"),
+            ("float4", FieldKind::F32, "f32", "Float4"),
+            ("float8", FieldKind::F64, "f64", "Float8"),
+            ("uuid", FieldKind::Uuid, "uuid::Uuid", "Uuid"),
+            (
+                "timestamp",
+                FieldKind::NaiveDateTime,
+                "chrono::NaiveDateTime",
+                "Timestamp",
+            ),
+            (
+                "timestamptz",
+                FieldKind::DateTime,
+                "chrono::DateTime<chrono::Utc>",
+                "Timestamptz",
+            ),
+            ("bytea", FieldKind::Bytea, "Vec<u8>", "Bytea"),
+        ];
+        for (udt, kind, rust, schema) in cases {
+            let mapped = sql_type_to_field_kind(udt)
+                .unwrap_or_else(|| panic!("'{udt}' must map to a FieldKind"));
+            assert_eq!(mapped, *kind, "kind mismatch for {udt}");
+            assert_eq!(mapped.rust_type(), *rust, "rust_type mismatch for {udt}");
+            assert_eq!(
+                mapped.schema_type(),
+                *schema,
+                "schema_type mismatch for {udt}"
+            );
+        }
+    }
+
+    #[test]
+    fn sql_type_inverse_preserves_i64_for_int8() {
+        // i64 PKs must round-trip as i64 (AC3).
+        assert_eq!(sql_type_to_field_kind("int8"), Some(FieldKind::I64));
+        assert_eq!(sql_type_to_field_kind("int8").unwrap().rust_type(), "i64");
+    }
+
+    #[test]
+    fn sql_type_inverse_rejects_unknown_types() {
+        // Unmapped SQL types must be reported, never silently dropped (AC2).
+        for udt in ["numeric", "jsonb", "json", "inet", "money", "point"] {
+            assert!(
+                sql_type_to_field_kind(udt).is_none(),
+                "'{udt}' is outside the documented surface and must not map"
+            );
+        }
+    }
+
+    #[test]
+    fn sql_type_inverse_round_trips_forward_sql_types() {
+        // Every non-Attachment FieldKind's forward sql_type() (lowercased,
+        // base name) must invert back to an equivalent kind, guaranteeing the
+        // db-pull inverse stays in lockstep with the generate forward map.
+        for (kind, udt) in [
+            (FieldKind::String, "text"),
+            (FieldKind::I32, "int4"),
+            (FieldKind::I64, "int8"),
+            (FieldKind::Bool, "bool"),
+            (FieldKind::F32, "float4"),
+            (FieldKind::F64, "float8"),
+            (FieldKind::Uuid, "uuid"),
+            (FieldKind::NaiveDateTime, "timestamp"),
+            (FieldKind::DateTime, "timestamptz"),
+            (FieldKind::Bytea, "bytea"),
+        ] {
+            let back = sql_type_to_field_kind(udt).unwrap();
+            assert_eq!(back.rust_type(), kind.rust_type());
+            assert_eq!(back.schema_type(), kind.schema_type());
+        }
     }
 }

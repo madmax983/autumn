@@ -553,6 +553,53 @@ Every generator accepts:
   collision. `mod.rs` and `schema.rs` are always treated as modify-in-place
   edits and don't trigger collisions.
 
+## `autumn db pull` — scaffold models from an existing database
+
+The generators above are greenfield: you describe a table with the `name:Type`
+DSL and they emit a brand-new one. If you already run a Postgres database,
+`autumn db pull` goes the other direction — it introspects your live schema and
+emits the matching Autumn artifacts, so you can adopt autumn-web incrementally
+instead of rewriting every table by hand.
+
+```bash
+# Pull every table in the public schema:
+autumn db pull
+
+# Pull specific tables, and also emit a #[repository] per table:
+autumn db pull posts comments --with-repository
+```
+
+It connects using the same resolution `autumn migrate` uses
+(`database.primary_url` / `database.url` in `autumn.toml`, or
+`AUTUMN_DATABASE__PRIMARY_URL` / `AUTUMN_DATABASE__URL` / `DATABASE_URL`), and
+for each selected table emits, through the same file-emission machinery as the
+other generators:
+
+- a `#[model]` struct in `src/models/<name>.rs`,
+- a `diesel::table!` block in `src/schema.rs`,
+- the `pub mod <name>;` aggregator line, and `mod models;` / `mod schema;`
+  declarations in `src/main.rs`,
+- optionally, a `#[repository(Model)]` trait in `src/repositories/<name>.rs`
+  (with `--with-repository`).
+
+This is **read-only**: no migration is written and no data is touched — the
+tables already exist. Column types are the inverse of the [field-type DSL
+table](#the-field-type-dsl) (`int8` → `i64`, `text` → `String`, `timestamptz`
+→ `chrono::DateTime`, …); nullable columns become `Option<T>`. The primary key
+is annotated `#[id]` and a `created_at` column is annotated `#[default]`, so a
+table created by `autumn generate model` and then re-derived by `db pull`
+produces a field-for-field equivalent model. A column whose SQL type is outside
+the supported set fails with an error naming the column rather than silently
+dropping it.
+
+`--dry-run`, `--force`, and collision-refusal behave exactly as in the
+`autumn generate` family: existing model/repository files are not clobbered
+without `--force`, and `mod.rs` / `schema.rs` are modified in place.
+
+Out of scope for `db pull`: foreign-key/association inference, generating routes
+or admin adapters, non-Postgres backends, and SQL views / materialized views /
+partitioned tables.
+
 ## What's intentionally not here
 
 The generators are deliberately scoped to one resource per invocation and
@@ -567,7 +614,6 @@ you need them):
   project with its own release train, so core web generators do not depend on
   it.
 - Custom user-provided templates / template overrides.
-- Reverse generation (database → models).
 - Test scaffolding beyond the single smoke test.
 - Multi-resource scaffolds (`autumn generate scaffold Blog Post Comment`).
   One resource per invocation; chaining is the user's job.

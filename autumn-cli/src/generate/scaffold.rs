@@ -310,6 +310,15 @@ fn resolve_shard_key(
     Ok(Some("id".to_owned()))
 }
 
+/// Render a plain `#[repository(Model)]` trait for `autumn db pull --with-repository`.
+///
+/// No derived queries, soft-delete, or sharding — introspection cannot recover
+/// those from the database, so this emits the same baseline repository the
+/// scaffold would for a flagless resource.
+pub(super) fn render_repository_for_pull(pascal_name: &str, snake_name: &str) -> String {
+    render_repository_file(pascal_name, snake_name, &[], false, false, false)
+}
+
 fn render_repository_file(
     pascal_name: &str,
     snake_name: &str,
