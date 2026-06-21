@@ -2659,6 +2659,23 @@ pub fn try_build_router_with_static_inner(
     //   • ISR regeneration uses the inner router (no user layers), ensuring
     //     re-rendered pages are saved as raw HTML rather than pre-transformed.
     //
+    // KNOWN LIMITATION (`request_timeout_ms` does not bound these outer layers):
+    // the per-request timeout lives inside `inner_router` (applied by
+    // `apply_middleware`, inner to `RequestId`). Because `custom_layers` and
+    // `static_gate_layers` are reapplied OUTSIDE the static-first middleware
+    // (below), they — and the static cache lookup itself — run before the timer
+    // starts. So when a `dist` manifest is active, a hung async `static_gate`
+    // (e.g. remote JWT/IdP validation) or custom layer is NOT bounded by
+    // `request_timeout_ms`, unlike the non-static path where the timer wraps the
+    // user layers and tenancy. This is the same trade-off as the documented
+    // session-store and edge-layer (`MethodOverrideLayer`, `TrustedProxiesLayer`)
+    // limitations in `apply_middleware`: pulling the timer out here to cover them
+    // would place it outside `RequestId` (losing `X-Request-Id` on the timeout
+    // 503), double-time dynamic misses, and apply a global deadline to cached
+    // hits that have no route-table entry. Operators who terminate auth/tenant
+    // work in a `static_gate` should bound it with a layer-level or
+    // server/proxy read timeout instead.
+    //
     // Compute the idempotency flag NOW while custom_layers is still populated,
     // then drain it. build_router_pre_state would otherwise see an empty list
     // and incorrectly treat opaque layers as absent when selecting idempotency

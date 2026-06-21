@@ -74,6 +74,21 @@ async fn export() -> &'static str { "…" }
 async fn events() -> &'static str { "…" }
 ```
 
+> **WebSocket routes inherit only.** `#[ws]` does not accept `timeout_ms` /
+> `timeout = "off"`. The handshake is always bounded by the global
+> `request_timeout_ms` and the established socket is never bounded (see above).
+> If a handshake needs a different bound, wrap the async auth/setup inside the
+> upgrade handler with `tokio::time::timeout`.
+
+> **SSG/ISG outer layers are not bounded.** When a `dist` manifest is active,
+> `AppBuilder::static_gate` layers and `AppBuilder::layer` custom layers run
+> *outside* the deadline (it sits inside the dynamic router, inner to
+> `RequestId`, so cached hits and the gate never reach it). A hung async
+> `static_gate` — e.g. remote auth — is therefore not capped by
+> `request_timeout_ms`; bound it with a layer-level or server/proxy read
+> timeout. Live requests that fall through to the dynamic handler are bounded
+> normally.
+
 ---
 
 ## Quick start: any tower layer
