@@ -1,0 +1,18 @@
+🧨 **The Trigger:**
+A panicking thread holding the `Mutex` for the `CircuitBreaker` or `AFTER_COMMIT_REGISTRY` would poison the lock. Any subsequent access to these shared locks via `.unwrap()` or `.expect("registry lock")` caused the entire application to crash with a "called `Result::unwrap()` on an `Err` value: PoisonError { .. }" exception.
+
+📉 **The Stack Trace:**
+```
+thread 'db_registry_panic_isolation' (80795) panicked at autumn/tests/chaos_db_hooks_loom.rs:17:13:
+Boom in registration
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+thread 'db_registry_panic_isolation' (83365) panicked at autumn/tests/chaos_db_hooks_loom.rs:26:32:
+called `Result::unwrap()` on an `Err` value: PoisonError { .. }
+```
+
+🧪 **Reproduction:**
+Run the new tests via `cargo test -p autumn-web --test security_tests` or create a loom simulation of a panicking thread inside `autumn/tests/security/chaos_deadlock_registry.rs`.
+
+😈 **Comment:**
+"You assumed threads never panic while holding a Mutex, and thus a single failure in an async hook takes down the entire registry. I swapped your fragile `.unwrap()` calls for `.unwrap_or_else(std::sync::PoisonError::into_inner)`. If I can crash it, I win."
