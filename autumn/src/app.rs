@@ -3749,9 +3749,15 @@ impl AppBuilder {
         let storage_router = storage_bootstrap.and_then(|b| b.install(&state));
         install_webhook_registry(&state, &config);
         run_state_initializers(state_initializers, &state);
-        // Static generation has no job runtime; sync listeners still dispatch,
-        // so install the registry but drop the durable jobs it would synthesize.
-        finalize_event_bus(listeners, &mut Vec::new(), &state);
+        // Static generation has no job runtime, so register only sync listeners.
+        // Durable listeners are dropped entirely (not just their jobs) so a
+        // static route publishing such an event is a clean no-op for the durable
+        // side effect rather than a "job runtime not initialized" error.
+        let sync_listeners: Vec<_> = listeners
+            .into_iter()
+            .filter(|listener| listener.mode == crate::events::DispatchMode::Sync)
+            .collect();
+        finalize_event_bus(sync_listeners, &mut Vec::new(), &state);
 
         // Build the full router (same as production). Use the inner builder
         // so the custom session store installed via with_session_store(...)

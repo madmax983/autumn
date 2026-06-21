@@ -124,6 +124,7 @@ pub async fn register(
     mut db: Db,
     mailer: Mailer,
     session: Session,
+    events: autumn_web::events::Events,
     form: Form<RegisterForm>,
 ) -> AutumnResult<Redirect> {
     let open = crate::config_svc()
@@ -209,11 +210,13 @@ pub async fn register(
 
     // Publish a typed domain event. Listeners (see `crate::listeners`) react
     // independently — adding a new reaction needs zero edits to this handler.
-    autumn_web::events::publish(crate::events::UserSignedUp {
-        user_id: user.id,
-        username: user.username.clone(),
-    })
-    .await?;
+    // Use the injected `Events` extractor so dispatch is scoped to this app.
+    events
+        .publish(crate::events::UserSignedUp {
+            user_id: user.id,
+            username: user.username.clone(),
+        })
+        .await?;
 
     // Dispatch the outbound webhook event on "user.created"
     if let Some(manager) = state.extension::<WebhookOutboundManager>() {

@@ -31,9 +31,12 @@ struct UserSignedUp {
 }
 ```
 
-`#[event]` derives the serde + `Clone`/`Debug` impls the bus needs and implements
-`autumn_web::events::Event` with a stable `NAME` (the struct name by default, or
-`#[event(name = "user.signed_up")]`).
+`#[event]` derives the serde + `Clone`/`Debug` impls the bus needs (through
+`autumn-web`'s re-exported `serde`, so you don't need a direct `serde`
+dependency) and implements `autumn_web::events::Event` with a stable `NAME`. The
+default `NAME` is **module-qualified** (e.g. `my_app::events::UserSignedUp`) so
+two events that share a short name like `Created` in different modules never
+collide on the bus; override it with `#[event(name = "user.signed_up")]`.
 
 ## Publish an event
 

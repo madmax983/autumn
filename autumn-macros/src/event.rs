@@ -44,20 +44,31 @@ pub fn event_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     };
 
     let ident = &input.ident;
-    let event_name = attrs.name.unwrap_or_else(|| ident.to_string());
+    let ident_str = ident.to_string();
+    // Default the routing name to a module-qualified path so two event types
+    // that share a short name (e.g. `Created`) in different modules never
+    // collide on the registry's string key. An explicit `name = "..."` wins.
+    let name_const = attrs.name.map_or_else(
+        || quote! { ::std::concat!(::std::module_path!(), "::", #ident_str) },
+        |name| quote! { #name },
+    );
     let (impl_generics, ty_generics, where_clause) = input.generics.split_for_impl();
 
     quote! {
+        // Derive serde through the framework's re-export (and point serde's
+        // generated code at it) so `#[event]` works for apps that depend only
+        // on `autumn-web`, without a direct `serde` dependency.
         #[derive(
-            ::serde::Serialize,
-            ::serde::Deserialize,
+            ::autumn_web::reexports::serde::Serialize,
+            ::autumn_web::reexports::serde::Deserialize,
             ::std::clone::Clone,
             ::std::fmt::Debug,
         )]
+        #[serde(crate = "::autumn_web::reexports::serde")]
         #input
 
         impl #impl_generics ::autumn_web::events::Event for #ident #ty_generics #where_clause {
-            const NAME: &'static str = #event_name;
+            const NAME: &'static str = #name_const;
         }
     }
 }
@@ -78,14 +89,25 @@ mod tests {
             },
         )
         .to_string();
-        assert!(expanded.contains("serde :: Serialize"), "{expanded}");
-        assert!(expanded.contains("serde :: Deserialize"), "{expanded}");
+        assert!(
+            expanded.contains("autumn_web :: reexports :: serde :: Serialize"),
+            "{expanded}"
+        );
+        assert!(
+            expanded.contains("autumn_web :: reexports :: serde :: Deserialize"),
+            "{expanded}"
+        );
+        assert!(
+            expanded.contains("serde (crate = \"::autumn_web::reexports::serde\")"),
+            "{expanded}"
+        );
         assert!(
             expanded.contains("impl :: autumn_web :: events :: Event for UserSignedUp"),
             "{expanded}"
         );
+        // Default name is module-qualified to avoid cross-module collisions.
         assert!(
-            expanded.contains("const NAME : & 'static str = \"UserSignedUp\""),
+            expanded.contains("module_path ! ()") && expanded.contains("\"UserSignedUp\""),
             "{expanded}"
         );
     }

@@ -59,7 +59,12 @@ mod tests {
         assert_eq!(durable, 1, "welcome_new_user is durable");
         assert_eq!(sync, 1, "record_signup_metric is sync");
 
-        // Every listener subscribes to UserSignedUp.
-        assert!(listeners.iter().all(|l| l.event_name == "UserSignedUp"));
+        // Every listener subscribes to UserSignedUp. The default event name is
+        // module-qualified, so match on the suffix rather than the bare type.
+        assert!(
+            listeners
+                .iter()
+                .all(|l| l.event_name.ends_with("::UserSignedUp"))
+        );
     }
 }

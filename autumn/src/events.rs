@@ -319,6 +319,7 @@ async fn dispatch(
     // keeps parallel in-process apps (notably tests) from contending. We fall
     // back to the global client only if no app-local one is present.
     let app_client = state.extension::<crate::job::JobClient>();
+    let mut durable_error = None;
     for listener in listeners
         .iter()
         .filter(|listener| listener.mode == DispatchMode::Durable)
@@ -327,17 +328,26 @@ async fn dispatch(
             .job_name
             .as_deref()
             .expect("durable listener must carry a job_name");
-        if let Some(client) = &app_client {
-            client.enqueue(job_name, payload.clone()).await?;
+        let enqueued = if let Some(client) = &app_client {
+            client.enqueue(job_name, payload.clone()).await
         } else {
-            crate::job::enqueue(job_name, payload.clone()).await?;
+            crate::job::enqueue(job_name, payload.clone()).await
+        };
+        // Don't let one durable enqueue failure skip the in-request sync
+        // listeners (or the remaining durable enqueues); remember the first
+        // error and surface it after sync listeners have run.
+        if let Err(error) = enqueued
+            && durable_error.is_none()
+        {
+            durable_error = Some(error);
         }
     }
 
-    // 3. Sync listeners: run independently, isolated from each other.
+    // 3. Sync listeners: run independently, isolated from each other — these run
+    // even if a durable enqueue above failed.
     run_sync_listeners(state, listeners, &payload).await;
 
-    Ok(())
+    durable_error.map_or(Ok(()), Err)
 }
 
 /// Run every sync listener on its own task so a panic or error in one never
@@ -543,6 +553,37 @@ mod tests {
         .await;
         assert!(result.is_ok(), "publish stays Ok despite listener failures");
         assert_eq!(RAN.load(Ordering::SeqCst), 1, "surviving listener ran");
+    }
+
+    #[tokio::test]
+    async fn sync_listeners_run_even_when_a_durable_enqueue_fails() {
+        // With no app-local client and no global job runtime, the durable
+        // enqueue fails — but the sync listener must still run (and the error
+        // is surfaced afterwards rather than short-circuiting dispatch).
+        static RAN: AtomicU32 = AtomicU32::new(0);
+        crate::job::clear_global_job_client();
+        RAN.store(0, Ordering::SeqCst);
+        let counting: ListenerHandler = |_state, _payload| {
+            Box::pin(async {
+                RAN.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+        };
+        let registry = EventRegistry::from_listeners(vec![
+            durable_listener("seed_workspace"),
+            sync_listener("counts", counting),
+        ]);
+        let state = AppState::for_test();
+        let _ = dispatch(
+            &registry,
+            None,
+            &state,
+            Ping::NAME,
+            serde_json::json!({"n": 1}),
+        )
+        .await;
+        // The key guarantee: the durable failure did not skip the sync listener.
+        assert_eq!(RAN.load(Ordering::SeqCst), 1, "sync listener ran anyway");
     }
 
     #[tokio::test]
