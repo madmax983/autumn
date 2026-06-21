@@ -158,18 +158,16 @@ async fn db_pull_regenerates_models_from_existing_schema_and_compiles() {
         .count();
 
     // 3. Pull the schema back into Autumn artifacts, including repositories.
-    //    Scope to `posts` so the test does not depend on how Autumn's own
-    //    framework tables (created by `autumn migrate`) are handled by an
-    //    unscoped pull.
-    let (stdout, _) = run_autumn_ok(
-        &project,
-        &["db", "pull", "posts", "--with-repository"],
-        &envs,
-    );
+    //    Unscoped: Autumn's own framework tables (created by `autumn migrate`)
+    //    are skipped by default, so only the user table `posts` is pulled.
+    let (stdout, _) = run_autumn_ok(&project, &["db", "pull", "--with-repository"], &envs);
     assert!(
         stdout.contains("post.rs"),
         "pull should report files:\n{stdout}"
     );
+    // Framework tables must not have been turned into models.
+    assert!(!project.join("src/models/autumn_job.rs").exists());
+    assert!(!project.join("src/models/api_token.rs").exists());
 
     // 4. The model honors Autumn conventions and the inverse type mapping.
     let model = std::fs::read_to_string(project.join("src/models/post.rs")).unwrap();

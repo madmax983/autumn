@@ -125,6 +125,7 @@ fn pull(args: &PullArgs) -> Result<(), PullError> {
         &tables,
         PullOptions {
             with_repository: args.with_repository,
+            force: args.force,
         },
     )
     .map_err(PullError::Generate)?;
@@ -162,6 +163,9 @@ struct ColumnRow {
     is_nullable: String,
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
     column_default: Option<String>,
+    /// `'ALWAYS'` for stored generated columns, `'NEVER'` otherwise.
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    is_generated: String,
 }
 
 /// List the base tables in `public`, excluding Diesel's bookkeeping table.
@@ -177,7 +181,10 @@ fn list_tables(conn: &mut PgConnection, requested: &[String]) -> Result<Vec<Stri
     let all: Vec<String> = rows.into_iter().map(|r| r.name).collect();
 
     if requested.is_empty() {
-        return Ok(all);
+        // An unscoped pull skips Autumn's own framework-owned tables (created by
+        // `autumn migrate`), which carry JSONB/enum columns outside the supported
+        // mapping. They can still be pulled by naming them explicitly.
+        return Ok(all.into_iter().filter(|t| !is_framework_table(t)).collect());
     }
     for want in requested {
         if !all.iter().any(|t| t == want) {
@@ -189,12 +196,24 @@ fn list_tables(conn: &mut PgConnection, requested: &[String]) -> Result<Vec<Stri
     Ok(requested.to_vec())
 }
 
+/// Whether `table` is an Autumn/Diesel framework-owned table that an unscoped
+/// pull should skip by default. Framework tables use the `autumn_` / `_autumn`
+/// prefixes, plus a few historically unprefixed names.
+fn is_framework_table(table: &str) -> bool {
+    table.starts_with("autumn_")
+        || table.starts_with("_autumn")
+        || matches!(
+            table,
+            "api_tokens" | "feature_flag_changes" | "__diesel_schema_migrations"
+        )
+}
+
 /// Read a single table's columns (in ordinal order) and primary-key set.
 fn introspect_table(conn: &mut PgConnection, table: &str) -> Result<TableSchema, PullError> {
     let pk = primary_key_columns(conn, table)?;
 
     let query = format!(
-        "SELECT column_name, udt_name, is_nullable, column_default \
+        "SELECT column_name, udt_name, is_nullable, column_default, is_generated \
          FROM information_schema.columns \
          WHERE table_schema = 'public' AND table_name = {} \
          ORDER BY ordinal_position",
@@ -216,6 +235,7 @@ fn introspect_table(conn: &mut PgConnection, table: &str) -> Result<TableSchema,
             nullable: row.is_nullable.eq_ignore_ascii_case("YES"),
             is_pk: pk.iter().any(|c| c == &row.column_name),
             has_default: row.column_default.is_some(),
+            is_generated: row.is_generated.eq_ignore_ascii_case("ALWAYS"),
             name: row.column_name,
             kind,
         });
@@ -294,6 +314,27 @@ mod tests {
         assert!(msg.contains("numeric"));
         assert!(msg.contains("Supported:"));
         assert!(!msg.contains("postgres://"));
+    }
+
+    #[test]
+    fn framework_tables_are_excluded_user_tables_kept() {
+        for fw in [
+            "autumn_jobs",
+            "autumn_feature_flags",
+            "_autumn_version_history",
+            "_autumn_shard_directory",
+            "api_tokens",
+            "feature_flag_changes",
+            "__diesel_schema_migrations",
+        ] {
+            assert!(is_framework_table(fw), "{fw} should be a framework table");
+        }
+        for user in ["posts", "comments", "users", "autumnal_themes"] {
+            assert!(
+                !is_framework_table(user),
+                "{user} is a user table and must be kept"
+            );
+        }
     }
 
     #[test]

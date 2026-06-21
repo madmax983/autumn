@@ -594,7 +594,31 @@ dropping it.
 
 `--dry-run`, `--force`, and collision-refusal behave exactly as in the
 `autumn generate` family: existing model/repository files are not clobbered
-without `--force`, and `mod.rs` / `schema.rs` are modified in place.
+without `--force`, and `mod.rs` / `schema.rs` are modified in place. Under
+`--force`, an existing `schema.rs` block for a pulled table is replaced with the
+freshly introspected one so the model and schema can't drift apart on a re-pull.
+
+Brownfield specifics:
+
+- **Framework tables are skipped.** An unscoped `autumn db pull` ignores
+  Autumn's own tables (`autumn_*` / `_autumn*`, `api_tokens`, …) so it works on
+  a database that has already run `autumn migrate`. Name a table explicitly to
+  pull it anyway.
+- **Defaults and read-only columns.** A `created_at` column with a database
+  default, and stored generated columns (`GENERATED ALWAYS AS … STORED`), are
+  annotated `#[default]` so they stay out of inserts/updates. An ordinary
+  column with a default (e.g. `status TEXT DEFAULT 'draft'`) stays settable.
+- **Irregular plurals.** When the table name isn't the model macro's naive
+  `Struct + "s"` inference (e.g. `people`, `categories`), `db pull` emits an
+  explicit `#[autumn_web::model(table = "...")]` so the model compiles against
+  the generated schema block.
+- **`--with-repository` requires the `id`/`i64` PK convention.** Tables keyed by
+  a `uuid`, a non-`id` column, or a composite key still get a model, but the
+  repository is skipped (the `#[repository]` macro assumes an `i64 id`).
+- **Unsupported shapes fail loudly.** Tables without a primary key, columns
+  whose names aren't valid identifiers (e.g. `type`), unmapped SQL types, and
+  two tables that collapse to the same model module all stop the pull with a
+  clear error instead of emitting broken code.
 
 Out of scope for `db pull`: foreign-key/association inference, generating routes
 or admin adapters, non-Postgres backends, and SQL views / materialized views /

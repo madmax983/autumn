@@ -21,6 +21,10 @@ use super::schema_edit::{add_mod_declaration, schema_has_table, singularize, upd
 use super::{GenerateError, ensure_project_root};
 
 /// A single introspected column, in catalog (`ordinal_position`) order.
+// A flat catalog descriptor: each bool is an independent fact read straight from
+// `information_schema`, not interacting state, so separate fields read clearer
+// than packing them into an enum.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Column {
     /// Column name (used verbatim as the struct field and schema column).
@@ -32,9 +36,13 @@ pub struct Column {
     /// True when the column participates in the table's primary key.
     pub is_pk: bool,
     /// True when the column has a database default (`column_default IS NOT NULL`).
-    /// Non-PK columns with a default are annotated `#[default]` so they stay out
-    /// of `NewX` (e.g. `created_at TIMESTAMP NOT NULL DEFAULT NOW()`).
+    /// A `created_at` column with a default is annotated `#[default]` so it stays
+    /// out of `NewX` (e.g. `created_at TIMESTAMP NOT NULL DEFAULT NOW()`).
     pub has_default: bool,
+    /// True when the column is a stored generated column
+    /// (`GENERATED ALWAYS AS (...) STORED`). Such columns are read-only, so they
+    /// are annotated `#[default]` to keep them out of inserts and updates.
+    pub is_generated: bool,
 }
 
 impl Column {
@@ -75,6 +83,10 @@ pub struct TableSchema {
 pub struct PullOptions {
     /// Also emit a `#[repository(Model)]` trait per table.
     pub with_repository: bool,
+    /// Overwrite/replace existing artifacts (mirrors the generator `--force`).
+    /// When set, an existing `schema.rs` `table!` block for a pulled table is
+    /// replaced with the freshly introspected one instead of left untouched.
+    pub force: bool,
 }
 
 /// Compute every filesystem action an `autumn db pull` would perform.
@@ -110,6 +122,9 @@ pub fn plan_pull(
     // the same module (e.g. `status` and `statuses`), which would otherwise make
     // the second model file silently clobber the first.
     let mut seen: BTreeSet<String> = BTreeSet::new();
+    // Track whether any repository was actually emitted, so the `repositories`
+    // module is only wired up when at least one exists.
+    let mut emitted_repository = false;
 
     for table in tables {
         let resource = singularize(&table.table);
@@ -133,15 +148,27 @@ pub fn plan_pull(
         // (b) src/models/mod.rs aggregator line
         models_mod = add_mod_declaration(&models_mod, &snake_name);
         // (c) src/schema.rs table! block
-        schema = append_schema_block(&schema, &table.table, &table.columns);
+        schema = upsert_schema_block(&schema, &table.table, &table.columns, options.force);
 
-        // (d) optional repository
+        // (d) optional repository — only when the table follows the Autumn
+        // `id BIGINT` PK convention the repository macro assumes. The generated
+        // CRUD/REST code hardcodes an `i64` column named `id`, so a uuid /
+        // non-`id` / composite PK would emit a repository that cannot compile.
         if options.with_repository {
-            plan.create(
-                repos_dir.join(format!("{snake_name}.rs")),
-                super::scaffold::render_repository_for_pull(&pascal_name, &snake_name),
-            );
-            repos_mod = add_mod_declaration(&repos_mod, &snake_name);
+            if has_autumn_id_pk(&table.columns) {
+                plan.create(
+                    repos_dir.join(format!("{snake_name}.rs")),
+                    super::scaffold::render_repository_for_pull(&pascal_name, &snake_name),
+                );
+                repos_mod = add_mod_declaration(&repos_mod, &snake_name);
+                emitted_repository = true;
+            } else {
+                eprintln!(
+                    "  \u{2139} Skipping repository for '{}': it has no `id` BIGINT primary key \
+                     (the repository macro requires the Autumn id/i64 convention).",
+                    table.table
+                );
+            }
         }
     }
 
@@ -154,14 +181,14 @@ pub fn plan_pull(
     let main_path = project_root.join("src").join("main.rs");
     if let Ok(main_existing) = std::fs::read_to_string(&main_path) {
         let mut mods = vec!["models", "schema"];
-        if options.with_repository {
+        if emitted_repository {
             mods.push("repositories");
         }
         let updated = update_main_rs(&main_existing, &mods, &[]);
         plan.modify(main_path, updated);
     }
 
-    if options.with_repository {
+    if emitted_repository {
         plan.modify(repos_dir.join("mod.rs"), repos_mod);
     }
 
@@ -188,20 +215,45 @@ pub fn render_model(pascal_name: &str, table: &str, columns: &[Column]) -> Strin
     out.push_str("//! framework treats this as ordinary user code.\n\n");
     let _ = writeln!(out, "use crate::schema::{table};");
     out.push('\n');
-    out.push_str("#[autumn_web::model]\n");
+    // The model macro infers the table as `pascal_to_snake(Struct) + "s"`, which
+    // is wrong for irregular plurals (`person` -> `persons`, not `people`). Emit
+    // an explicit `table = "..."` override whenever the inference would not match
+    // the real table name, so the struct compiles against the emitted schema
+    // block. For regular plurals the inference matches and we emit the bare
+    // attribute, keeping greenfield round-trips byte-identical.
+    if inferred_table_name(pascal_name) == table {
+        out.push_str("#[autumn_web::model]\n");
+    } else {
+        let _ = writeln!(out, "#[autumn_web::model(table = \"{table}\")]");
+    }
     let _ = writeln!(out, "pub struct {pascal_name} {{");
     for col in columns {
         if col.is_pk {
             out.push_str("    #[id]\n");
-        } else if col.has_default {
-            // A DB default means the column is optional on insert — keep it out
-            // of `NewX`. The PK is already handled by `#[id]`.
+        } else if is_write_excluded(col) {
+            // Read-only / framework-managed columns are kept out of `NewX` and
+            // the update set via `#[default]`: a `created_at` with a DB default,
+            // or a stored generated column. (A plain mutable column with a DB
+            // default stays settable — `#[default]` would lock it out of writes.)
             out.push_str("    #[default]\n");
         }
         let _ = writeln!(out, "    pub {}: {},", col.name, col.rust_type());
     }
     out.push_str("}\n");
     out
+}
+
+/// Mirror the model macro's table-name inference (`pascal_to_snake(Struct) + "s"`)
+/// so `db pull` can tell when an explicit `table = "..."` override is required.
+fn inferred_table_name(pascal_name: &str) -> String {
+    format!("{}s", snake(pascal_name))
+}
+
+/// Whether a column must be excluded from inserts and updates (`#[default]`):
+/// the framework-managed `created_at` (when it carries a DB default) or a stored
+/// generated column. The primary key is handled separately by `#[id]`.
+fn is_write_excluded(col: &Column) -> bool {
+    col.is_generated || (col.name == "created_at" && col.has_default)
 }
 
 /// Build a `diesel::table!` block from introspected columns.
@@ -231,18 +283,81 @@ pub fn render_schema_block(table: &str, columns: &[Column]) -> String {
     out
 }
 
-/// Append a `table!` block to `schema.rs`, idempotently (no-op if `table`
-/// already has a block), mirroring [`super::schema_edit::append_schema_table`].
-fn append_schema_block(existing: &str, table: &str, columns: &[Column]) -> String {
-    if schema_has_table(existing, table) {
-        return existing.to_owned();
-    }
+/// Insert or refresh a `table!` block in `schema.rs`.
+///
+/// - If no block for `table` exists, append the freshly introspected one.
+/// - If a block exists and `force` is false, leave it untouched (idempotent).
+/// - If a block exists and `force` is true, replace it in place so a re-pull
+///   after the live table changed doesn't leave the schema block stale and out
+///   of sync with the regenerated model.
+fn upsert_schema_block(existing: &str, table: &str, columns: &[Column], force: bool) -> String {
     let block = render_schema_block(table, columns);
-    if existing.is_empty() {
-        return block;
+    if schema_has_table(existing, table) {
+        if force {
+            replace_schema_block(existing, table, &block)
+        } else {
+            existing.to_owned()
+        }
+    } else if existing.is_empty() {
+        block
+    } else {
+        let trimmed = existing.trim_end();
+        format!("{trimmed}\n\n{block}")
     }
-    let trimmed = existing.trim_end();
-    format!("{trimmed}\n\n{block}")
+}
+
+/// Replace the existing `diesel::table! { <table> (...) { ... } }` block with
+/// `new_block`, matching braces from the `diesel::table!` that declares `table`.
+/// Falls back to returning `existing` unchanged if the block can't be located.
+fn replace_schema_block(existing: &str, table: &str, new_block: &str) -> String {
+    let needle = format!("{table} (");
+    let mut search_from = 0;
+    while let Some(macro_rel) = existing[search_from..].find("diesel::table!") {
+        let macro_start = search_from + macro_rel;
+        // Find the opening brace of this macro invocation.
+        let Some(brace_rel) = existing[macro_start..].find('{') else {
+            break;
+        };
+        let open = macro_start + brace_rel;
+        // Match braces to find the end of the macro body.
+        let mut depth = 0usize;
+        let mut end = None;
+        for (i, b) in existing[open..].bytes().enumerate() {
+            match b {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = Some(open + i + 1);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let Some(end) = end else { break };
+        // Does this macro define the table we're replacing?
+        if existing[open..end]
+            .lines()
+            .any(|l| l.trim().starts_with(&needle))
+        {
+            let mut out = String::with_capacity(existing.len() + new_block.len());
+            out.push_str(&existing[..macro_start]);
+            out.push_str(new_block.trim_end());
+            out.push_str(&existing[end..]);
+            return out;
+        }
+        search_from = end;
+    }
+    existing.to_owned()
+}
+
+/// Whether `columns` follow the Autumn `id BIGINT` primary-key convention the
+/// `#[repository]` macro assumes: exactly one primary-key column, named `id`,
+/// of type `i64`.
+fn has_autumn_id_pk(columns: &[Column]) -> bool {
+    let pks: Vec<&Column> = columns.iter().filter(|c| c.is_pk).collect();
+    matches!(pks.as_slice(), [pk] if pk.name == "id" && pk.kind == FieldKind::I64)
 }
 
 /// Validate that an introspected table can be emitted as compilable Autumn code.
@@ -313,6 +428,7 @@ mod tests {
             nullable,
             is_pk,
             has_default: false,
+            is_generated: false,
         }
     }
 
@@ -325,6 +441,7 @@ mod tests {
             nullable: false,
             is_pk: false,
             has_default: true,
+            is_generated: false,
         }
     }
 
@@ -492,6 +609,7 @@ mod tests {
             &[post_table()],
             PullOptions {
                 with_repository: true,
+                force: false,
             },
         )
         .unwrap();
@@ -623,10 +741,8 @@ mod tests {
     }
 
     #[test]
-    fn plan_pull_marks_default_columns_and_excludes_pk() {
+    fn plan_pull_default_annotation_rules() {
         let tmp = project();
-        // A non-`created_at` column with a DB default must still be `#[default]`;
-        // the PK must be `#[id]` only (never `#[default]`).
         let table = TableSchema {
             table: "widgets".to_owned(),
             columns: vec![
@@ -635,27 +751,151 @@ mod tests {
                     kind: FieldKind::I64,
                     nullable: false,
                     is_pk: true,
-                    has_default: true, // serial default — must NOT add #[default]
+                    has_default: true, // serial default — `#[id]` only, never `#[default]`
+                    is_generated: false,
                 },
                 Column {
+                    // A mutable column with a DB default must stay settable, so it
+                    // must NOT be `#[default]` (that would lock it out of writes).
                     name: "status".to_owned(),
                     kind: FieldKind::String,
                     nullable: false,
                     is_pk: false,
-                    has_default: true, // e.g. DEFAULT 'active'
+                    has_default: true, // e.g. DEFAULT 'draft'
+                    is_generated: false,
+                },
+                Column {
+                    // A stored generated column is read-only -> `#[default]`.
+                    name: "search".to_owned(),
+                    kind: FieldKind::String,
+                    nullable: false,
+                    is_pk: false,
+                    has_default: false,
+                    is_generated: true,
                 },
                 col("label", FieldKind::String, false, false),
+                created_at_col(),
             ],
         };
         let plan = plan_pull(tmp.path(), &[table], PullOptions::default()).unwrap();
         plan.execute(Flags::default()).unwrap();
         let model = fs::read_to_string(tmp.path().join("src/models/widget.rs")).unwrap();
-        assert!(model.contains("#[default]\n    pub status: String,"));
         assert!(model.contains("#[id]\n    pub id: i64,"));
-        // The PK must not be doubly annotated.
+        // mutable defaulted column: plain field, settable.
+        assert!(model.contains("    pub status: String,"));
+        assert!(!model.contains("#[default]\n    pub status:"));
+        // generated column: read-only via #[default].
+        assert!(model.contains("#[default]\n    pub search: String,"));
+        // framework-managed created_at: #[default].
+        assert!(model.contains("#[default]\n    pub created_at: chrono::NaiveDateTime,"));
+        // the PK must not be doubly annotated.
         assert!(!model.contains("#[id]\n    #[default]"));
-        // A plain column has neither.
+        // a plain column has neither.
         assert!(model.contains("    pub label: String,"));
+    }
+
+    #[test]
+    fn plan_pull_emits_table_override_for_irregular_plural() {
+        let tmp = project();
+        // `people` singularizes to `person`; the macro would infer `persons`.
+        let people = TableSchema {
+            table: "people".to_owned(),
+            columns: vec![col("id", FieldKind::I64, false, true), created_at_col()],
+        };
+        let plan = plan_pull(tmp.path(), &[people], PullOptions::default()).unwrap();
+        plan.execute(Flags::default()).unwrap();
+        let model = fs::read_to_string(tmp.path().join("src/models/person.rs")).unwrap();
+        assert!(
+            model.contains("#[autumn_web::model(table = \"people\")]"),
+            "irregular plural needs an explicit table override: {model}"
+        );
+        assert!(model.contains("use crate::schema::people;"));
+    }
+
+    #[test]
+    fn plan_pull_skips_repository_for_non_id_primary_key() {
+        let tmp = project();
+        // A uuid-keyed table: the repository macro can't compile against it.
+        let sessions = TableSchema {
+            table: "sessions".to_owned(),
+            columns: vec![
+                col("token", FieldKind::Uuid, false, true),
+                col("data", FieldKind::String, false, false),
+            ],
+        };
+        let plan = plan_pull(
+            tmp.path(),
+            &[sessions],
+            PullOptions {
+                with_repository: true,
+                force: false,
+            },
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+        // Model is still generated; repository is skipped.
+        assert!(tmp.path().join("src/models/session.rs").exists());
+        assert!(!tmp.path().join("src/repositories/session.rs").exists());
+        // With no repository emitted, the repositories module is not wired in.
+        let main = fs::read_to_string(tmp.path().join("src/main.rs")).unwrap();
+        assert!(!main.contains("mod repositories;"));
+    }
+
+    #[test]
+    fn plan_pull_force_replaces_stale_schema_block() {
+        let tmp = project();
+        // Pre-seed schema.rs with a stale block (old column set) for `posts`.
+        let src = tmp.path().join("src");
+        fs::write(
+            src.join("schema.rs"),
+            "diesel::table! {\n    posts (id) {\n        id -> Int8,\n        old_col -> Text,\n    }\n}\n",
+        )
+        .unwrap();
+        let plan = plan_pull(
+            tmp.path(),
+            &[post_table()],
+            PullOptions {
+                with_repository: false,
+                force: true,
+            },
+        )
+        .unwrap();
+        plan.execute(Flags {
+            force: true,
+            dry_run: false,
+        })
+        .unwrap();
+        let schema = fs::read_to_string(src.join("schema.rs")).unwrap();
+        assert!(
+            !schema.contains("old_col"),
+            "stale column must be replaced under --force: {schema}"
+        );
+        assert!(schema.contains("title -> Text,"));
+        assert_eq!(schema.matches("posts (id)").count(), 1);
+    }
+
+    #[test]
+    fn plan_pull_without_force_keeps_existing_schema_block() {
+        let tmp = project();
+        let src = tmp.path().join("src");
+        fs::write(
+            src.join("schema.rs"),
+            "diesel::table! {\n    posts (id) {\n        id -> Int8,\n        old_col -> Text,\n    }\n}\n",
+        )
+        .unwrap();
+        // Without --force the existing block is left untouched (idempotent), and
+        // the colliding model file would error — so use force only on files.
+        let plan = plan_pull(tmp.path(), &[post_table()], PullOptions::default()).unwrap();
+        plan.execute(Flags {
+            force: true,
+            dry_run: false,
+        })
+        .unwrap();
+        let schema = fs::read_to_string(src.join("schema.rs")).unwrap();
+        assert!(
+            schema.contains("old_col"),
+            "without options.force the schema block stays unchanged: {schema}"
+        );
     }
 
     // ── Round-trip property (AC4) ───────────────────────────────────────────
@@ -704,6 +944,7 @@ mod tests {
                 nullable: *nullable,
                 is_pk: *is_pk,
                 has_default: *has_default,
+                is_generated: false,
             })
             .collect();
         let re_derived = render_model(&pascal(&singularize("posts")), "posts", &columns);
