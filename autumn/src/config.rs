@@ -2975,6 +2975,13 @@ pub struct RequestTimeoutsConfig {
     /// (`#[get("/poll", timeout_ms = 120000)]` or `timeout = "off"`), which is
     /// also how any other slow route can raise or disable its own deadline.
     ///
+    /// A second exception applies to *mutating* requests carrying an
+    /// `Idempotency-Key`: the idempotency layer buffers the full response body
+    /// (so the response can be cached and replayed) before the head is returned,
+    /// so those responses are bounded by the deadline even when the handler
+    /// streams them. Give such endpoints a per-route override if they
+    /// legitimately produce slow or large idempotent bodies.
+    ///
     /// The `prod` profile smart-defaults this to `30000` (30s); `dev` and custom
     /// profiles leave it disabled. Configured via
     /// `AUTUMN_SERVER__TIMEOUTS__REQUEST_TIMEOUT_MS`.

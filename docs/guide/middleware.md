@@ -41,14 +41,21 @@ the head is sent, the body is never interrupted mid-stream. WebSocket upgrades
 (`#[ws]`) follow the same rule: the pre-upgrade handshake (any async auth or
 setup that runs before the upgrade response) counts against the deadline, but the
 **established socket is never interrupted** — it is handed off after the head is
-sent. Static routes (`#[static_get]`) are exempt automatically, since their
-renders run at build time and during ISR regeneration with no inbound client
-request to bound.
+sent. `#[static_get]` **build-time and ISR regeneration** renders are exempt
+automatically (they run with no inbound client request to bound), but **live**
+requests that fall through to the dynamic handler — a cache miss, no `dist`, or a
+path absent from the manifest — are bounded like any other route.
 
 **Long-poll handlers are the exception**: because they block *before* returning
 the response head (waiting for an event), that wait counts against the deadline
 and the request will 503 once it elapses. Give such routes an explicit
 `timeout = "off"` (see below) if a poll may legitimately outlast the deadline.
+
+**Idempotent mutations are also bounded.** A mutating request carrying an
+`Idempotency-Key` has its full response body buffered (so the response can be
+cached and replayed) before the head is returned, so even a streamed body counts
+against the deadline. Give such endpoints a per-route override if they
+legitimately produce slow or large idempotent bodies.
 
 ### Per-route overrides
 
