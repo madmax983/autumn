@@ -616,7 +616,7 @@ pub fn effective_profile(explicit: Option<&str>) -> String {
 }
 
 /// Whether a resolved profile name is production (`prod`/`production`).
-fn is_production_profile_name(profile: &str) -> bool {
+pub fn is_production_profile_name(profile: &str) -> bool {
     let normalized = profile.trim().to_ascii_lowercase();
     normalized == "prod" || normalized == "production"
 }
@@ -762,7 +762,19 @@ fn deep_merge_toml(base: &mut toml::Table, overlay: toml::Table) {
     }
 }
 
-fn resolve_primary_database_url_from_sources<F>(
+/// Resolve the primary/write database URL for the given profile using the
+/// exact same layering as `autumn migrate` (defaults → `autumn.toml` →
+/// `autumn-{profile}.toml` → `AUTUMN_*` / `DATABASE_URL` / `primary_url`).
+///
+/// Returns `None` when no URL can be resolved, leaving the caller to decide how
+/// to report the failure (the `autumn db` commands surface their own message).
+pub fn resolve_primary_url(profile: Option<&str>) -> Option<String> {
+    let effective = effective_profile(profile);
+    let config_table = read_autumn_toml_table_with_profile(Some(&effective));
+    resolve_primary_database_url_from_sources(|key| std::env::var(key), config_table.as_ref())
+}
+
+pub fn resolve_primary_database_url_from_sources<F>(
     env_var: F,
     table: Option<&toml::Table>,
 ) -> Option<String>
@@ -2314,6 +2326,44 @@ replica_url = "postgres://replica:5432/app"
         let url = resolve_primary_database_url_from_sources(env_var, Some(&table)).unwrap();
 
         assert_eq!(url, "postgres://primary:5432/app");
+    }
+
+    #[test]
+    fn resolve_primary_url_reads_env_for_active_profile() {
+        // `resolve_primary_url` is the convenience entry the `autumn db`
+        // commands use; it must resolve the same primary URL `autumn migrate`
+        // would for the active profile. The env var wins over any file layer.
+        temp_env::with_vars(
+            [
+                ("AUTUMN_ENV", Some("dev")),
+                (
+                    "AUTUMN_DATABASE__PRIMARY_URL",
+                    Some("postgres://primary:5432/app"),
+                ),
+            ],
+            || {
+                assert_eq!(
+                    resolve_primary_url(None).as_deref(),
+                    Some("postgres://primary:5432/app")
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn resolve_primary_url_none_when_unset() {
+        // No env URL and no autumn.toml in the test's working directory → None,
+        // leaving the caller to report the missing-URL error.
+        temp_env::with_vars(
+            [
+                ("AUTUMN_DATABASE__PRIMARY_URL", None::<&str>),
+                ("AUTUMN_DATABASE__URL", None),
+                ("DATABASE_URL", None),
+            ],
+            || {
+                assert!(resolve_primary_url(Some("dev")).is_none());
+            },
+        );
     }
 
     // ── build_targets ──────────────────────────────────────────────────────

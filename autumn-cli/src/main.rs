@@ -6,6 +6,7 @@ mod check;
 mod config;
 mod credentials;
 mod data;
+mod db;
 mod dev;
 mod dev_loop_bench;
 mod doctor;
@@ -148,6 +149,19 @@ enum Commands {
         #[arg(long, value_name = "PROFILE")]
         profile: Option<String>,
     },
+    /// Create, drop, or reset the database itself.
+    ///
+    /// These commands resolve the connection the same way `autumn migrate`
+    /// does (defaults → `autumn.toml` → `autumn-{profile}.toml` → `AUTUMN_*`,
+    /// plus `DATABASE_URL` / `primary_url`) and operate only on the primary
+    /// write role, connecting to the server's maintenance database to issue
+    /// `CREATE`/`DROP`.
+    ///
+    ///   autumn db create
+    ///   autumn db drop --force
+    ///   autumn db reset
+    #[command(subcommand, verbatim_doc_comment, name = "db")]
+    Db(DbCommands),
     /// Shard operations (e.g. moving a tenant's data between shards)
     Shard(ShardCommands),
     /// Live monitoring dashboard for a running Autumn application
@@ -621,6 +635,58 @@ enum CredentialsCommands {
         #[arg(long)]
         reveal: bool,
     },
+}
+
+/// Subcommands for `autumn db`.
+#[derive(Subcommand)]
+enum DbCommands {
+    /// Create the configured database (idempotent: a no-op notice if it exists).
+    Create {
+        /// Resolve the connection through a profile overlay. When omitted, the
+        /// profile is selected from `AUTUMN_ENV` (preferred) or the legacy
+        /// `AUTUMN_PROFILE`, matching the app's runtime precedence.
+        #[arg(long, value_name = "PROFILE")]
+        profile: Option<String>,
+    },
+    /// Drop the configured database (idempotent if already absent).
+    ///
+    /// Refuses to run outside the `dev`/`test` profile unless `--force` is
+    /// passed. Credentials are never printed.
+    #[command(verbatim_doc_comment)]
+    Drop {
+        /// Resolve the connection through a profile overlay (see `db create`).
+        #[arg(long, value_name = "PROFILE")]
+        profile: Option<String>,
+        /// Allow the drop against a non-dev/test (e.g. production) profile.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Drop → create → migrate → seed, in that order, as a single command.
+    ///
+    /// Stops and exits non-zero if any step fails, naming the failed step. The
+    /// seed step is skipped (with a notice) when `src/bin/seed.rs` is absent.
+    /// Refuses to run outside the `dev`/`test` profile unless `--force` is set.
+    #[command(verbatim_doc_comment)]
+    Reset {
+        /// Resolve the connection through a profile overlay (see `db create`).
+        #[arg(long, value_name = "PROFILE")]
+        profile: Option<String>,
+        /// Allow the reset against a non-dev/test (e.g. production) profile.
+        #[arg(long)]
+        force: bool,
+    },
+}
+
+impl DbCommands {
+    /// Translate the parsed CLI subcommand into the `db` module's command and
+    /// the optional profile override the connection should be resolved under.
+    fn into_command(self) -> (db::DbCommand, Option<String>) {
+        match self {
+            Self::Create { profile } => (db::DbCommand::Create, profile),
+            Self::Drop { profile, force } => (db::DbCommand::Drop { force }, profile),
+            Self::Reset { profile, force } => (db::DbCommand::Reset { force }, profile),
+        }
+    }
 }
 
 /// Lifecycle subcommands for `autumn serve`.
@@ -1504,6 +1570,10 @@ fn run_command(command: Commands) {
                 (None, false) => migrate::MigrateTarget::All,
             };
             migrate::run(&action, with_maintenance, &target, profile.as_deref());
+        }
+        Commands::Db(cmd) => {
+            let (command, profile) = cmd.into_command();
+            db::run(&command, profile.as_deref());
         }
         Commands::Shard(cmd) => match cmd.command {
             ShardSubcommand::MoveSlot {
@@ -2743,6 +2813,89 @@ mod tests {
     #[test]
     fn parse_generate_model_without_name_is_error() {
         assert!(Cli::try_parse_from(["autumn", "generate", "model"]).is_err());
+    }
+
+    // ── autumn db tests ────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_db_create() {
+        let cli = Cli::try_parse_from(["autumn", "db", "create"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Db(DbCommands::Create { profile: None })
+        ));
+    }
+
+    #[test]
+    fn parse_db_create_with_profile() {
+        let cli = Cli::try_parse_from(["autumn", "db", "create", "--profile", "test"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Db(DbCommands::Create { profile: Some(p) }) if p == "test"
+        ));
+    }
+
+    #[test]
+    fn parse_db_drop_defaults_force_false() {
+        let cli = Cli::try_parse_from(["autumn", "db", "drop"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Db(DbCommands::Drop {
+                profile: None,
+                force: false
+            })
+        ));
+    }
+
+    #[test]
+    fn parse_db_drop_with_force() {
+        let cli = Cli::try_parse_from(["autumn", "db", "drop", "--force"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Db(DbCommands::Drop { force: true, .. })
+        ));
+    }
+
+    #[test]
+    fn parse_db_reset_with_profile_and_force() {
+        let cli =
+            Cli::try_parse_from(["autumn", "db", "reset", "--profile", "prod", "--force"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Db(DbCommands::Reset {
+                profile: Some(p),
+                force: true
+            }) if p == "prod"
+        ));
+    }
+
+    #[test]
+    fn parse_db_without_subcommand_is_error() {
+        assert!(Cli::try_parse_from(["autumn", "db"]).is_err());
+    }
+
+    #[test]
+    fn db_into_command_maps_every_variant() {
+        assert!(matches!(
+            DbCommands::Create { profile: None }.into_command(),
+            (db::DbCommand::Create, None)
+        ));
+        assert!(matches!(
+            DbCommands::Drop {
+                profile: Some("dev".to_owned()),
+                force: true,
+            }
+            .into_command(),
+            (db::DbCommand::Drop { force: true }, Some(p)) if p == "dev"
+        ));
+        assert!(matches!(
+            DbCommands::Reset {
+                profile: None,
+                force: false,
+            }
+            .into_command(),
+            (db::DbCommand::Reset { force: false }, None)
+        ));
     }
 
     // ── autumn seed tests ──────────────────────────────────────────────────

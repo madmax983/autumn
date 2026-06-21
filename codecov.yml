@@ -22,6 +22,7 @@ ignore:
   - "autumn-cli/src/config.rs"  # psql subprocess orchestration (run_set/unset/list/history/check_psql) — untestable in unit tests; URL-resolution logic is covered in separate tests
   - "autumn-cli/src/flags.rs"  # psql subprocess orchestration (enable/disable/set-rollout/allow) — same pattern as config.rs
   - "autumn-cli/src/shard.rs"  # psql subprocess orchestration (move-slot \copy/verify/delete) — untestable in unit tests; SQL-building, identifier-quoting and URL-resolution logic are covered in separate tests
+  - "autumn-cli/src/db.rs"     # DB lifecycle (create/drop/reset): Postgres connection + subprocess orchestration — untestable in unit tests; URL parsing, identifier quoting, profile guards and error formatting are covered in separate tests, end-to-end paths in Docker-gated tests/db.rs
   - "autumn-cli/src/templates/**"
   - "autumn-cache-redis/**"     # Requires a live Redis server (testcontainers); all tests are #[ignore] for cross-platform CI
   - "**/*_test.rs"
