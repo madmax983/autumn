@@ -755,23 +755,25 @@ impl InMemoryWebhookReplayStore {
             state.checks_since_cleanup = state.checks_since_cleanup.saturating_add(1);
 
             if let Some(expires_at) = state.seen.get(key).copied() {
-                if expires_at.duration_since(received_at).is_ok() {
-                    Self::cleanup_if_due(&mut state, received_at);
+                let now = SystemTime::now();
+                if expires_at.duration_since(now).is_ok() {
+                    Self::cleanup_if_due(&mut state, now);
                     drop(state);
                     return false;
                 }
                 state.seen.remove(key);
             }
 
+            let now = SystemTime::now();
             let expires_at = received_at.checked_add(window).unwrap_or(received_at);
             state.seen.insert(key.to_owned(), expires_at);
-            Self::cleanup_if_due(&mut state, received_at);
+            Self::cleanup_if_due(&mut state, now);
             drop(state);
         }
         true
     }
 
-    fn cleanup_if_due(state: &mut InMemoryWebhookReplayState, received_at: SystemTime) {
+    fn cleanup_if_due(state: &mut InMemoryWebhookReplayState, now: SystemTime) {
         if state.checks_since_cleanup < IN_MEMORY_REPLAY_CLEANUP_INTERVAL
             && state.seen.len() <= IN_MEMORY_REPLAY_CLEANUP_HIGH_WATER
         {
@@ -781,7 +783,7 @@ impl InMemoryWebhookReplayStore {
         state.checks_since_cleanup = 0;
         state
             .seen
-            .retain(|_, expires_at| expires_at.duration_since(received_at).is_ok());
+            .retain(|_, expires_at| expires_at.duration_since(now).is_ok());
     }
 }
 

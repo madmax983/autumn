@@ -1,5 +1,6 @@
 pub mod auth_dos;
 pub mod auth_timing_test;
+pub mod chaos_webhook_cleanup;
 pub mod cookie_tossing;
 pub mod csrf_cookie_tossing;
 pub mod csrf_empty_bypass;
