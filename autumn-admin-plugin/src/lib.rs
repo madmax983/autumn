@@ -275,6 +275,53 @@ impl Plugin for AdminPlugin {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn admin_plugin_builder_methods() {
+        let plugin = AdminPlugin::new()
+            .prefix("/custom_admin")
+            .actuator_prefix("/custom_actuator")
+            .auth_session_key("custom_key")
+            .require_role("custom_role".to_owned());
+
+        assert_eq!(plugin.prefix, "/custom_admin");
+        assert_eq!(plugin.actuator_prefix, "/custom_actuator");
+        assert_eq!(plugin.auth_session_key, "custom_key");
+        assert_eq!(plugin.require_role, Some("custom_role".to_owned()));
+
+        let plugin_no_role = plugin.require_role(None);
+        assert_eq!(plugin_no_role.require_role, None);
+    }
+
+    #[test]
+    fn admin_plugin_name() {
+        let plugin = AdminPlugin::new();
+        assert_eq!(plugin.name(), Cow::Borrowed("autumn-admin-plugin"));
+    }
+
+    #[test]
+    fn admin_plugin_register_adds_to_registry() {
+        let plugin = AdminPlugin::new().register(crate::experiments::ExperimentAdminModel);
+
+        assert!(plugin.registry.get("experiments").is_some());
+    }
+
+    #[test]
+    fn admin_plugin_with_runtime_config_sets_config() {
+        // We can just use the in-memory store for testing
+        let svc = std::sync::Arc::new(autumn_web::runtime_config::RuntimeConfigService::new(
+            std::sync::Arc::new(autumn_web::runtime_config::ConfigRegistry::new()),
+            std::sync::Arc::new(autumn_web::runtime_config::InMemoryConfigStore::new()),
+        ));
+        let plugin = AdminPlugin::new().with_runtime_config(svc);
+
+        assert!(plugin.runtime_config.is_some());
+    }
+}
+
 /// Generate the route metadata list for this plugin's mounted routes.
 ///
 /// `has_config` must match whether `with_runtime_config` was called; config
