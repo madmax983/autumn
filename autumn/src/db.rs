@@ -1932,4 +1932,36 @@ mod tests {
         assert_eq!(super::scrub_sql("SELECT col_5_val"), "SELECT col_5_val");
         assert_eq!(super::scrub_sql("SELECT col_5"), "SELECT col_5");
     }
+
+    // ── is_query_canceled tests ───────────────────────────────────────────
+
+    #[test]
+    fn is_query_canceled_matches_57014() {
+        let inner_err: Box<dyn std::error::Error + Send + Sync> = "Custom 57014 error".into();
+        let err = diesel::result::Error::DeserializationError(inner_err);
+        assert!(super::is_query_canceled(&err));
+    }
+
+    #[test]
+    fn is_query_canceled_matches_query_canceled() {
+        let inner_err: Box<dyn std::error::Error + Send + Sync> =
+            "Some query canceled error".into();
+        let err = diesel::result::Error::DeserializationError(inner_err);
+        assert!(super::is_query_canceled(&err));
+    }
+
+    #[test]
+    fn is_query_canceled_matches_statement_timeout() {
+        let inner_err: Box<dyn std::error::Error + Send + Sync> =
+            "canceling statement due to statement timeout".into();
+        let err = diesel::result::Error::DeserializationError(inner_err);
+        assert!(super::is_query_canceled(&err));
+    }
+
+    #[test]
+    fn is_query_canceled_returns_false_for_unrelated_error() {
+        let inner_err: Box<dyn std::error::Error + Send + Sync> = "connection refused".into();
+        let err = diesel::result::Error::DeserializationError(inner_err);
+        assert!(!super::is_query_canceled(&err));
+    }
 }
