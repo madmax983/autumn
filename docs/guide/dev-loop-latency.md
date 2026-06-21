@@ -54,7 +54,7 @@ it gets its own budget and gate (issue #977).
 | Change class | p50 ms | p95 ms | max ms | Gate |
 |---|---:|---:|---:|---|
 | Cold start (`autumn new` → first 200, no-DB) | 45 000 | **60 000** | 90 000 | **Gated** |
-| Cold start (`autumn new` → first 200, database-backed) | 70 000 | 90 000 | 120 000 | Informational |
+| Cold start (`autumn new` → first 200, database-backed) | 120 000 | 180 000 | 300 000 | Informational |
 
 **Success metric:** p95 cold start for the no-DB `hello` shape ≤ **60 s** on the
 CI reference runner — matching Autumn's stated "time-from-`cargo new` to first
@@ -74,9 +74,12 @@ this slice and never fails the gate.
 `autumn dev-loop-bench --cold-start` measures a genuine first-run, not a warm
 cache:
 
-1. Scaffolds a **throwaway project** in a fresh temp directory (`autumn new`,
-   no-DB daemon shape for `hello`). The clock starts just before scaffolding so
-   the whole journey is captured.
+1. Scaffolds a **throwaway project** in a fresh temp directory (`autumn new`).
+   The no-DB `hello` shape uses the daemon starter; the database-backed shape
+   (`--include-db`) uses the **bundled managed-Postgres** starter, so the app
+   self-provisions a real Postgres (via `postgresql_embedded`), runs migrations,
+   and connects before serving — no external database service required. The clock
+   starts just before scaffolding so the whole journey is captured.
 2. Repoints the project's `autumn-web` dependency at the repository's local
    source via `[patch.crates-io]`, so the number reflects the code in the repo
    rather than a possibly-unpublished crates.io release — still a genuine clean
@@ -84,8 +87,10 @@ cache:
 3. Runs `cargo build` into the project's **own, empty `target/`** (any inherited
    `CARGO_TARGET_DIR` is removed), so the workspace's warm cache is never reused
    — this is the first clean compile.
-4. Starts the built binary and polls `http://127.0.0.1:3000/` until the first
-   HTTP `200`.
+4. Starts the built binary — pinning host/port via the highest-precedence
+   `AUTUMN_SERVER__HOST`/`AUTUMN_SERVER__PORT` env vars and discarding its logs —
+   and polls `http://127.0.0.1:3000/` (override with `AUTUMN_BENCH_PORT`) until
+   the first HTTP `200`.
 5. Records `duration = first_200 − scaffold_start`, repeats `--runs` times, and
    computes p50/p95/max.
 

@@ -10,7 +10,7 @@
 
 use std::fmt::Write as FmtWrite;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
@@ -138,11 +138,13 @@ pub const fn budget_for(class: ChangeClass) -> LatencyBudget {
             max_ms: 90_000,
         },
         // Database-backed cold start is informational only in this slice, so
-        // these limits are not gated; they document a generous expectation.
+        // these limits are not gated. The bundled managed-Postgres provider adds
+        // significant compile + first-boot weight (it embeds and starts a real
+        // Postgres), so the expectation is generous.
         ChangeClass::ColdStartDb => LatencyBudget {
-            p50_ms: 70_000,
-            p95_ms: 90_000,
-            max_ms: 120_000,
+            p50_ms: 120_000,
+            p95_ms: 180_000,
+            max_ms: 300_000,
         },
     }
 }
@@ -693,22 +695,6 @@ fn repoint_autumn_web(project_dir: &Path, autumn_web: &Path) -> Result<(), Strin
     Ok(())
 }
 
-/// Pin `[server] port` in the scaffolded `autumn.toml` to `port`.
-///
-/// The template ships `port = 3000`; this rewrites that single line so the
-/// built binary binds the same port the harness polls. A no-op when `port` is
-/// already 3000.
-fn set_server_port(project_dir: &Path, port: u16) -> Result<(), String> {
-    if port == 3000 {
-        return Ok(());
-    }
-    let config = project_dir.join("autumn.toml");
-    let content = std::fs::read_to_string(&config).map_err(|e| format!("read autumn.toml: {e}"))?;
-    let updated = content.replace("port = 3000", &format!("port = {port}"));
-    std::fs::write(&config, updated).map_err(|e| format!("write autumn.toml: {e}"))?;
-    Ok(())
-}
-
 /// Measure a single cold-start journey end-to-end: scaffold a throwaway project,
 /// compile it from a cold target, start it, and time until the first HTTP 200.
 ///
@@ -732,7 +718,14 @@ fn measure_cold_start_once(shape: ColdStartShape) -> Result<u64, String> {
             with_daemon: true,
             ..Default::default()
         },
-        ColdStartShape::Db => crate::new::GenerateOptions::default(),
+        // The database-backed shape uses the bundled managed-Postgres provider so
+        // the app self-provisions a real Postgres (via `postgresql_embedded`),
+        // runs migrations, and connects before serving — a genuine DB-backed
+        // onboarding cold start with no external service required.
+        ColdStartShape::Db => crate::new::GenerateOptions {
+            with_bundled_pg: true,
+            ..Default::default()
+        },
     };
 
     // Start the clock just before `autumn new` so the whole onboarding journey
@@ -747,15 +740,12 @@ fn measure_cold_start_once(shape: ColdStartShape) -> Result<u64, String> {
 
     repoint_autumn_web(&project_dir, &autumn_web)?;
 
-    // Pin the server port into the scaffolded autumn.toml so the binary binds
-    // exactly the port we later poll. Writing the config (rather than relying on
-    // an env-var override) keeps the bound port and the polled port from a single
-    // source of truth. Defaults to the template's 3000.
+    // The port the app binds and the port we poll come from one source: the
+    // child's `AUTUMN_SERVER__*` env vars (highest config precedence) set below.
     let port = std::env::var("AUTUMN_BENCH_PORT")
         .ok()
         .and_then(|p| p.parse::<u16>().ok())
         .unwrap_or(3000);
-    set_server_port(&project_dir, port)?;
 
     // Cold build into the project's own (empty) target/. Remove any inherited
     // CARGO_TARGET_DIR so we never reuse a warm cache from the parent build.
@@ -778,6 +768,15 @@ fn measure_cold_start_once(shape: ColdStartShape) -> Result<u64, String> {
         .join(format!("{project_name}{}", std::env::consts::EXE_SUFFIX));
     let mut child = Command::new(&bin)
         .current_dir(&project_dir)
+        // Pin host+port explicitly: env vars are the highest-precedence config
+        // source, so this binds the port we poll regardless of autumn.toml or any
+        // `AUTUMN_SERVER__*` inherited from the surrounding shell/CI.
+        .env("AUTUMN_SERVER__HOST", "127.0.0.1")
+        .env("AUTUMN_SERVER__PORT", port.to_string())
+        // Discard the app's own logs so they never interleave with the JSON
+        // report on stdout; the harness reports progress on stderr separately.
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .spawn()
         .map_err(|e| format!("failed to start the built server binary: {e}"))?;
 
