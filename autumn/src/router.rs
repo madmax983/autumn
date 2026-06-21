@@ -879,17 +879,27 @@ fn build_openapi_router(
 /// generating a spec whose URLs don't match what axum serves.
 #[allow(dead_code)]
 pub fn join_nested_path(prefix: &str, child: &str) -> String {
-    let prefix_trimmed = prefix.trim_end_matches('/');
     if child == "/" || child.is_empty() {
-        if prefix_trimmed.is_empty() {
+        // axum mounts the root child at the prefix *verbatim*, keeping any
+        // trailing slash: `nest("/api", route("/"))` is served at "/api" while
+        // `nest("/api/", route("/"))` is served at "/api/" — and `MatchedPath`
+        // reports the same string. Preserve the prefix as-is so the per-route
+        // timeout table keys by exactly what the runtime looks up; only the
+        // empty (root) prefix collapses to "/".
+        if prefix.is_empty() {
             "/".to_owned()
         } else {
-            prefix_trimmed.to_owned()
+            prefix.to_owned()
         }
-    } else if child.starts_with('/') {
-        format!("{prefix_trimmed}{child}")
     } else {
-        format!("{prefix_trimmed}/{child}")
+        // Non-root children always join on a single slash, matching axum (e.g.
+        // `nest("/api/", route("/users"))` resolves to "/api/users").
+        let prefix_trimmed = prefix.trim_end_matches('/');
+        if child.starts_with('/') {
+            format!("{prefix_trimmed}{child}")
+        } else {
+            format!("{prefix_trimmed}/{child}")
+        }
     }
 }
 
@@ -3926,8 +3936,12 @@ mod tests {
         // openapi_json_path("/api") won't match the effective mount
         // point and the collision check is unreliable.
         assert_eq!(super::join_nested_path("/api", "/"), "/api");
-        // Trailing slash on prefix is stripped.
-        assert_eq!(super::join_nested_path("/api/", "/"), "/api");
+        // Trailing slash on the prefix is preserved for the root child:
+        // axum mounts `nest("/api/", route("/"))` at "/api/" and reports
+        // `MatchedPath` as "/api/" (verified by
+        // `join_nested_path_matches_axum_matched_path`), so the joined key
+        // must keep the slash or the runtime lookup misses.
+        assert_eq!(super::join_nested_path("/api/", "/"), "/api/");
         // Normal case: prefix + child.
         assert_eq!(super::join_nested_path("/api", "/users"), "/api/users");
         // Trailing slash on prefix + child starting with slash doesn't
@@ -3936,6 +3950,48 @@ mod tests {
         // Root prefix handles sensibly.
         assert_eq!(super::join_nested_path("", "/"), "/");
         assert_eq!(super::join_nested_path("", "/users"), "/users");
+    }
+
+    /// Pins `join_nested_path` to axum's real `MatchedPath` so the per-route
+    /// timeout table (and the `OpenAPI` collision check) key by exactly the
+    /// string the runtime looks up. The trailing-slash root child is the
+    /// subtle case: `nest("/api/", route("/"))` is served at "/api/", not
+    /// "/api".
+    #[tokio::test]
+    async fn join_nested_path_matches_axum_matched_path() {
+        use axum::routing::get;
+        async fn matched(mp: Option<axum::extract::MatchedPath>) -> String {
+            mp.map(|m| m.as_str().to_owned()).unwrap_or_default()
+        }
+        // (nest prefix, child route, request path that reaches the child)
+        for (prefix, child, req) in [
+            ("/api", "/", "/api"),
+            ("/api/", "/", "/api/"),
+            ("/api", "/users", "/api/users"),
+            ("/api/", "/users", "/api/users"),
+        ] {
+            let sub = axum::Router::new().route(child, get(matched));
+            let app: axum::Router = axum::Router::new().nest(prefix, sub);
+            let resp = tower::ServiceExt::oneshot(
+                app,
+                axum::http::Request::builder()
+                    .uri(req)
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(resp.status(), http::StatusCode::OK, "{prefix} + {child}");
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let axum_matched = String::from_utf8(body.to_vec()).unwrap();
+            assert_eq!(
+                super::join_nested_path(prefix, child),
+                axum_matched,
+                "join_nested_path must equal axum MatchedPath for nest({prefix:?}, {child:?})"
+            );
+        }
     }
 
     #[cfg(feature = "openapi")]
@@ -5667,6 +5723,40 @@ mod trusted_host_tests {
         let submit = table.get("/submit").expect("/submit keyed");
         assert_eq!(submit.get(&http::Method::POST), Some(&override_10s));
         assert!(submit.get(&http::Method::HEAD).is_none());
+    }
+
+    #[test]
+    fn build_route_timeout_table_keys_scoped_root_by_axum_matched_path() {
+        // A scoped group whose prefix carries a trailing slash mounts its `/`
+        // child at "/api/" in axum (verified by
+        // `join_nested_path_matches_axum_matched_path`), so the override must be
+        // keyed there — not at "/api" — or the runtime `MatchedPath` lookup
+        // misses and the per-route timeout is silently never enforced.
+        let override_5s = crate::route::RouteTimeout::Override(std::time::Duration::from_secs(5));
+        let make_group = |prefix: &str| crate::app::ScopedGroup {
+            prefix: prefix.to_owned(),
+            routes: vec![timeout_route(http::Method::GET, "/", override_5s)],
+            source: crate::route_listing::RouteSource::User,
+            apply_layer: Box::new(|r| r),
+        };
+
+        let table = build_route_timeout_table(&[], &[make_group("/api/")]);
+        assert_eq!(
+            table.get("/api/").and_then(|m| m.get(&http::Method::GET)),
+            Some(&override_5s),
+            "trailing-slash scoped root must key the override at /api/"
+        );
+        assert!(
+            table.get("/api").is_none(),
+            "the stripped /api key would never match the runtime lookup"
+        );
+
+        // The no-trailing-slash form still keys at "/api".
+        let table = build_route_timeout_table(&[], &[make_group("/api")]);
+        assert_eq!(
+            table.get("/api").and_then(|m| m.get(&http::Method::GET)),
+            Some(&override_5s),
+        );
     }
 
     // ----------------------------------------------------------------------

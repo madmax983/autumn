@@ -48,11 +48,11 @@ impl ExceptionFilter for ErrorPageFilter {
         //     middleware (`ProblemDetailsFilter` preserves these too). A
         //     cross-origin HTML/HTMX request that times out would otherwise see an
         //     opaque CORS failure instead of the styled error page.
-        // `Content-Type`/`Content-Length` are excluded because the HTML response
-        // sets its own.
-        let mut preserved_headers = response.headers().clone();
-        preserved_headers.remove(axum::http::header::CONTENT_TYPE);
-        preserved_headers.remove(axum::http::header::CONTENT_LENGTH);
+        // Body-representation headers (`Content-Type`/`Content-Length`/
+        // `Content-Encoding`/...) are dropped because this fresh, uncompressed
+        // HTML body sets its own — see `preserved_error_headers`.
+        let preserved_headers =
+            crate::middleware::exception_filter::preserved_error_headers(&response);
 
         let ctx = Self::build_error_context(error, &response, self.is_dev);
         let mut html_body =
@@ -865,6 +865,56 @@ mod tests {
             .unwrap();
         let body_str = String::from_utf8(body.to_vec()).unwrap();
         assert!(body_str.contains("<!DOCTYPE html>"), "should be HTML");
+    }
+
+    #[tokio::test]
+    async fn html_rebuild_drops_stale_content_encoding() {
+        // An inner response-transforming layer (e.g. a user `CompressionLayer`)
+        // may set `Content-Encoding: gzip` before the exception filter runs. The
+        // rebuilt HTML body is uncompressed, so the stale encoding header must be
+        // dropped or the browser fails to decode the page.
+        let renderer = error_pages::default_renderer();
+        let filter = ErrorPageFilter {
+            renderer,
+            is_dev: false,
+            parameter_filter: crate::log::filter::ParameterFilter::default(),
+        };
+
+        let error = AutumnErrorInfo {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: "boom".into(),
+            details: None,
+            problem_type: None,
+            backtrace_string: None,
+        };
+
+        let mut original = (StatusCode::INTERNAL_SERVER_ERROR, "compressed json").into_response();
+        original.headers_mut().insert(
+            http::header::CONTENT_ENCODING,
+            http::HeaderValue::from_static("gzip"),
+        );
+        original
+            .headers_mut()
+            .insert("x-request-id", http::HeaderValue::from_static("req-9"));
+        original.extensions_mut().insert(WantsHtml(true));
+
+        let response = filter.filter(&error, original);
+
+        assert!(
+            !response
+                .headers()
+                .contains_key(http::header::CONTENT_ENCODING),
+            "stale Content-Encoding must not ride along on the rebuilt HTML body"
+        );
+        assert_eq!(
+            response.headers()["x-request-id"],
+            "req-9",
+            "unrelated headers must still be preserved"
+        );
+        assert_eq!(
+            response.headers()[axum::http::header::CONTENT_TYPE],
+            "text/html; charset=utf-8"
+        );
     }
 
     #[tokio::test]
