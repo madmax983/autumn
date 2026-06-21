@@ -621,38 +621,12 @@ fn build_router_pre_state(
         };
         let mut mcp_router =
             crate::mcp::build_mcp_router(&mount_path, tools, dispatch, wiring, endpoint_layer);
-        // Bound the envelope's own metadata/auth work (initialize, tools/list,
-        // and the `secure_mcp` auth rejections that never reach the dispatch
-        // clone) by the global inbound deadline. The `/mcp` router is merged
-        // after `apply_middleware`, so the timeout layer installed there does
-        // NOT wrap it; without this the prod global deadline would not bound
-        // this surface. Applied innermost of the envelope's added layers so a
-        // timeout 503 still flows out through the rate-limit, security-header,
-        // and CORS layers below (and stays CORS-readable). The `tools/call`
-        // replay is already bounded — the dispatch clone carries the timeout
-        // layer from `apply_middleware`. Route-level overrides do not apply to
-        // the fixed mount path, so an empty override table is passed (the layer
-        // is a no-op when the global timeout is disabled).
-        //
-        // KNOWN LIMITATION (tools/call vs per-route timeout): this envelope timer
-        // wraps the whole POST, including the in-process `tools/call` dispatch
-        // replay, with the global default deadline. The dispatch clone carries
-        // its own per-route timeout layer, but it is *inner* to this one, so a
-        // tool whose route declares `timeout = "off"` or a longer `timeout_ms`
-        // is still capped at the global default when invoked via MCP (it runs
-        // unbounded / longer over a direct HTTP call). Honoring the per-route
-        // policy here would require propagating the dispatched route's timeout
-        // out to this single fixed-path endpoint, which has no per-route
-        // distinction at the layer level; the global deadline is kept as a
-        // safety bound instead. `mirror_cors = false`: the 503 already flows out
-        // through this router's own (outer) `CorsLayer` from `apply_mcp_cors_layer`.
-        mcp_router = apply_request_timeout_middleware(
-            mcp_router,
-            config,
-            state.metrics.clone(),
-            std::sync::Arc::new(std::collections::HashMap::new()),
-            false,
-        );
+        // NOTE: the inbound request-timeout layer for this envelope is applied
+        // further down, *outer* to the rate-limit layer (search for
+        // `apply_request_timeout_middleware` below). It must wrap the limiter so a
+        // stalled Redis rate-limit decision is bounded by `request_timeout_ms`,
+        // matching the main stack where `apply_middleware` installs the timeout
+        // outer to `apply_rate_limit_middleware`.
         // Gate the envelope under maintenance mode, mirroring the layer
         // `apply_middleware` installs for direct routes. The `/mcp` router is
         // merged after that layer, so without this `initialize`/`tools/list`
@@ -696,6 +670,41 @@ fn build_router_pre_state(
         // call does not consume the same per-user bucket a direct request would
         // (the framework only derives `RateLimitPrincipal` from the session).
         mcp_router = apply_rate_limit_middleware(mcp_router, config, state);
+        // Bound the whole envelope — the rate-limit decision (a stalled
+        // Redis-backed limiter would otherwise tie up `/mcp` indefinitely), the
+        // metadata/auth work (initialize, tools/list, and `secure_mcp` auth
+        // rejections that never reach the dispatch clone), and the in-process
+        // `tools/call` dispatch — by the global inbound deadline. The `/mcp`
+        // router is merged after `apply_middleware`, so the timeout layer
+        // installed there does NOT wrap it; without this the prod global deadline
+        // would not bound this surface. Applied here, outer to the rate-limit
+        // layer above (matching the main stack, where `apply_middleware` installs
+        // the timeout outer to `apply_rate_limit_middleware`) but inner to the
+        // security-header and CORS layers below, so a stalled limiter is bounded
+        // while the timeout 503 still flows out through those layers and stays
+        // CORS-readable. Route-level overrides do not apply to the fixed mount
+        // path, so an empty override table is passed (the layer is a no-op when
+        // the global timeout is disabled).
+        //
+        // KNOWN LIMITATION (tools/call vs per-route timeout): this envelope timer
+        // wraps the whole POST, including the in-process `tools/call` dispatch
+        // replay, with the global default deadline. The dispatch clone carries
+        // its own per-route timeout layer, but it is *inner* to this one, so a
+        // tool whose route declares `timeout = "off"` or a longer `timeout_ms`
+        // is still capped at the global default when invoked via MCP (it runs
+        // unbounded / longer over a direct HTTP call). Honoring the per-route
+        // policy here would require propagating the dispatched route's timeout
+        // out to this single fixed-path endpoint, which has no per-route
+        // distinction at the layer level; the global deadline is kept as a
+        // safety bound instead. `mirror_cors = false`: the 503 already flows out
+        // through this router's own (outer) `CorsLayer` from `apply_mcp_cors_layer`.
+        mcp_router = apply_request_timeout_middleware(
+            mcp_router,
+            config,
+            state.metrics.clone(),
+            std::sync::Arc::new(std::collections::HashMap::new()),
+            false,
+        );
         // Security headers (HSTS/CSP/etc.), mirroring the `SecurityHeadersLayer`
         // `apply_middleware` installs for direct routes. The `/mcp` router is
         // merged after that layer, so without this the envelope's responses —
@@ -1997,6 +2006,19 @@ async fn request_timeout_handler(
     metrics: crate::middleware::MetricsCollector,
     cors: Option<std::sync::Arc<crate::config::CorsConfig>>,
 ) -> axum::response::Response {
+    // Internal `autumn build` / ISR regeneration renders drive a `#[static_get]`
+    // route directly via `oneshot` and tag the request with `RenderDeadlineExempt`
+    // (there is no client connection whose deadline should apply). Skip the
+    // deadline for these; live inbound requests to the same route do not carry
+    // the marker and are bounded normally below.
+    if req
+        .extensions()
+        .get::<crate::static_gen::RenderDeadlineExempt>()
+        .is_some()
+    {
+        return next.run(req).await;
+    }
+
     // Resolve the effective deadline from the matched route template + method,
     // using borrowed lookups so exempt/disabled routes allocate nothing.
     let matched_path_ref = req
@@ -5112,6 +5134,63 @@ mod trusted_host_tests {
         assert_eq!(
             snap.http.request_timeouts_total, 1,
             "autumn_request_timeouts_total must be incremented on timeout"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn render_deadline_exempt_marker_skips_timeout() {
+        let mut config = AutumnConfig::default();
+        config.server.timeouts.request_timeout_ms = Some(100);
+
+        let state = crate::state::AppState::for_test();
+        let router: axum::Router<AppState> = axum::Router::new().route(
+            "/slow",
+            axum::routing::get(|| async {
+                // Far longer than the 100ms deadline; the paused clock advances
+                // automatically once the task is otherwise idle.
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                "ok"
+            }),
+        );
+
+        let router = apply_request_timeout_middleware(
+            router,
+            &config,
+            state.metrics.clone(),
+            no_route_timeouts(),
+            false,
+        )
+        .layer(RequestIdLayer)
+        .with_state(state);
+
+        // A live inbound request (no marker) is bounded by the deadline -> 503.
+        let live = router
+            .clone()
+            .oneshot(Request::builder().uri("/slow").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            live.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a live request to a slow handler must still time out"
+        );
+
+        // An internal build/ISR render carrying `RenderDeadlineExempt` is exempt
+        // and runs to completion.
+        let exempt = router
+            .oneshot(
+                Request::builder()
+                    .uri("/slow")
+                    .extension(crate::static_gen::RenderDeadlineExempt)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            exempt.status(),
+            StatusCode::OK,
+            "the build/ISR render marker must exempt the request from the deadline"
         );
     }
 

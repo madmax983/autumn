@@ -187,12 +187,15 @@ pub fn static_get_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 },
                 repository: ::core::option::Option::None,
                 idempotency: ::autumn_web::RouteIdempotency::Direct,
-                // Static prerenders run through this GET route at build time
-                // (`run_build_mode`) and during ISR regeneration — there is no
-                // inbound client request whose deadline should apply. Exempt them
-                // so a legitimately slow prerender can't fail `autumn build` or
-                // skip an ISR update with a 503 under the prod default (30s).
-                timeout: ::autumn_web::RouteTimeout::Disabled,
+                // Live inbound requests to this GET route (a manifest miss, no
+                // `dist`, or a cache read that falls through to the dynamic
+                // router) inherit the global deadline like any other route, so a
+                // slow/hung handler can't bypass `request_timeout_ms`. The
+                // build/ISR prerenders that drive this route internally are
+                // exempted instead via the `RenderDeadlineExempt` request marker
+                // (see `autumn_web::static_gen`), scoping the exemption to those
+                // internal renders rather than the live route metadata.
+                timeout: ::autumn_web::RouteTimeout::Inherit,
                 api_version: ::core::option::Option::None,
                 sunset_opt_out: false,
             }
