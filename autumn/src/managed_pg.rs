@@ -107,6 +107,46 @@ fn enforce_password_file_mode_or_exit(path: &Path) {
 #[cfg(not(unix))]
 fn enforce_password_file_mode_or_exit(_path: &Path) {}
 
+/// Make the directory that holds the managed-cluster superuser password file
+/// private (`0700`), or exit fatally. Rejects a symlink (a local user could
+/// repoint it) and, by treating a failed `chmod` as fatal, a directory owned by
+/// another user (a non-owner `chmod` errors). Best-effort against a root-owned
+/// attacker dir, which only a full `st_uid` check would catch — but it closes
+/// the common permissive-umask / shared-parent hole for non-root runs.
+#[cfg(unix)]
+fn harden_credential_dir_or_exit(dir: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    match std::fs::symlink_metadata(dir) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            reject_credential_dir(dir, "credential directory is a symlink");
+        }
+        Ok(_) => {
+            if std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).is_err() {
+                reject_credential_dir(
+                    dir,
+                    "cannot enforce owner-only (0700) permissions on the credential directory",
+                );
+            }
+        }
+        Err(_) => reject_credential_dir(dir, "cannot stat the credential directory"),
+    }
+}
+
+#[cfg(unix)]
+fn reject_credential_dir(dir: &Path, reason: &str) -> ! {
+    tracing::error!(path = %dir.display(), "managed Postgres: {reason}");
+    eprintln!(
+        "autumn: refusing to start managed Postgres — {reason} for {}. The cluster \
+         superuser password file lives here and could be replaced by another \
+         local user.",
+        dir.display()
+    );
+    std::process::exit(1);
+}
+
+#[cfg(not(unix))]
+fn harden_credential_dir_or_exit(_dir: &Path) {}
+
 /// Drop the current provider from the process-global emergency-stop slot.
 fn clear_emergency_registration() {
     if let Ok(mut g) = EMERGENCY_PROVIDER.lock() {
@@ -287,6 +327,12 @@ impl ManagedPostgresPoolProvider {
             .unwrap_or(&self.data_dir)
             .to_path_buf();
         let _ = std::fs::create_dir_all(&parent);
+        // Harden the directory that holds the superuser password file: even with
+        // the file at `0600`, a local user with write access to a permissive
+        // parent could *replace* it and feed us attacker-controlled credentials.
+        // Failing closed here also rejects a parent owned by another user (a
+        // non-owner `chmod` errors, except for root).
+        harden_credential_dir_or_exit(&parent);
         let password_file = parent.join(".autumn-pg-superuser");
 
         if let Ok(existing) = std::fs::read_to_string(&password_file) {

@@ -45,7 +45,13 @@ pub struct ServeOptions {
 }
 
 /// How long to wait for a freshly-spawned daemon to become reachable.
-const READY_TIMEOUT: Duration = Duration::from_secs(30);
+///
+/// The app writes its readiness file only after startup *migrations* complete,
+/// and those can legitimately block up to `migrate::DEFAULT_LOCK_WAIT_TIMEOUT`
+/// (60 s) waiting for the advisory migration lock when another runner holds it.
+/// Keep this comfortably above that wait so a healthy daemon queued behind a
+/// concurrent migration isn't killed before its own lock-wait can resolve.
+const READY_TIMEOUT: Duration = Duration::from_secs(90);
 /// Readiness budget when managed Postgres must provision on first boot
 /// (download/extract + `initdb` can take well over the default before the app
 /// binds its socket).
@@ -287,13 +293,23 @@ fn lifecycle_target(paths: &RuntimePaths, socket: &Path) -> Option<process::PidR
     // daemon unmanageable. Keep the pidfile record when it matches the owner so
     // its recorded start time is retained.
     if let Some(owner) = socket_owner_pid(socket) {
-        return match pidfile_rec {
-            Some(rec) if rec.pid == owner => Some(rec),
-            _ => Some(process::PidRecord {
+        // Keep the pidfile record when it matches the live owner (retains start_time).
+        if let Some(rec) = pidfile_rec
+            && rec.pid == owner
+        {
+            return Some(rec);
+        }
+        // Trust the socket owner over a missing/stale pidfile only when this
+        // project has daemon state corroborating it (a pidfile or address file).
+        // Without that, an unrelated same-user process that reused or squatted on
+        // the socket path must not be mistaken for our daemon and signalled.
+        if pidfile_rec.is_some() || read_addr_file(paths).is_some() {
+            return Some(process::PidRecord {
                 pid: owner,
                 start_time: process::process_start_time(owner),
-            }),
-        };
+            });
+        }
+        return None;
     }
     // No peer-PID (macOS/BSD, or no live listener): trust the pidfile if present.
     if let Some(rec) = pidfile_rec {
