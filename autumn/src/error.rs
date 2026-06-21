@@ -272,7 +272,13 @@ impl AutumnError {
         }
     }
 
-    /// Create a `400 Bad Request` error.
+    /// Creates a `400 Bad Request` error.
+    ///
+    /// This indicates the client sent a malformed request that the server
+    /// could not understand (e.g. invalid JSON syntax or missing headers).
+    ///
+    /// For field-level validation errors, prefer [`AutumnError::unprocessable`]
+    /// or [`AutumnError::validation`].
     ///
     /// # Examples
     ///
@@ -280,9 +286,10 @@ impl AutumnError {
     /// use autumn_web::error::AutumnError;
     /// use http::StatusCode;
     ///
-    /// let err = AutumnError::bad_request(std::io::Error::other("invalid input"));
+    /// let err = AutumnError::bad_request(std::io::Error::other("invalid header format"));
     /// assert_eq!(err.status(), StatusCode::BAD_REQUEST);
     /// ```
+    #[doc(alias = "400")]
     pub fn bad_request(err: impl std::error::Error + Send + Sync + 'static) -> Self {
         Self {
             inner: Box::new(err),
@@ -321,7 +328,11 @@ impl AutumnError {
         }
     }
 
-    /// Create a `503 Service Unavailable` error.
+    /// Creates a `503 Service Unavailable` error.
+    ///
+    /// This indicates the server is currently unable to handle the request due
+    /// to a temporary overload or maintenance of a downstream service (like the
+    /// database or an external API).
     ///
     /// # Examples
     ///
@@ -329,9 +340,10 @@ impl AutumnError {
     /// use autumn_web::error::AutumnError;
     /// use http::StatusCode;
     ///
-    /// let err = AutumnError::service_unavailable(std::io::Error::other("pool exhausted"));
+    /// let err = AutumnError::service_unavailable(std::io::Error::other("database pool exhausted"));
     /// assert_eq!(err.status(), StatusCode::SERVICE_UNAVAILABLE);
     /// ```
+    #[doc(alias = "503")]
     pub fn service_unavailable(err: impl std::error::Error + Send + Sync + 'static) -> Self {
         Self {
             inner: Box::new(err),
