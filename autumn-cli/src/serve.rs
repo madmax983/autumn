@@ -456,16 +456,16 @@ fn identity_root() -> PathBuf {
 /// ancestor containing any `Cargo.toml`, else `None`. Separated from CWD lookup
 /// so it can be unit-tested against a fixture tree.
 ///
-/// If a `Cargo.toml` above us exists but fails to parse, we can't confirm its
-/// `[workspace]` table, so fall back to the **topmost** manifest dir (the most
-/// likely workspace root) rather than the nearest. This keeps the namespace
-/// stable when the root manifest is *transiently* unparsable while a `-p`
-/// lifecycle command runs from a member — otherwise the anchor would flip from
-/// the root to the member and `status`/`stop` would target a different dir.
+/// If a `Cargo.toml` above us is unparsable but still contains the `[workspace]`
+/// header, we treat it as a *transiently-broken workspace root* and anchor to
+/// that exact dir (the nearest such one). This keeps the namespace stable while
+/// the root manifest is mid-edit during a `-p` lifecycle command from a member —
+/// otherwise the anchor would flip to the member and `status`/`stop` would target
+/// a different dir. A broken manifest *without* `[workspace]` is ignored so an
+/// unrelated stray file up the tree can't hijack a standalone project's anchor.
 fn workspace_anchor_from(start: &Path) -> Option<PathBuf> {
     let mut nearest_manifest: Option<PathBuf> = None;
-    let mut topmost_manifest: Option<PathBuf> = None;
-    let mut saw_unparsable = false;
+    let mut broken_workspace_dir: Option<PathBuf> = None;
     for dir in start.ancestors() {
         let Ok(contents) = std::fs::read_to_string(dir.join("Cargo.toml")) else {
             continue;
@@ -473,22 +473,24 @@ fn workspace_anchor_from(start: &Path) -> Option<PathBuf> {
         if nearest_manifest.is_none() {
             nearest_manifest = Some(dir.to_path_buf());
         }
-        topmost_manifest = Some(dir.to_path_buf());
         match toml::from_str::<toml::Table>(&contents) {
             Ok(table) if table.contains_key("workspace") => return Some(dir.to_path_buf()),
-            // Only a manifest that *looks* like a workspace root counts as a
-            // transiently-broken root worth anchoring to. An unrelated broken
-            // `Cargo.toml` up the tree (e.g. one in the user's home dir) must not
-            // hijack a standalone project's anchor and corrupt its identity.
-            Err(_) if contents.contains("[workspace]") => saw_unparsable = true,
+            // A *transiently-broken* workspace root: unparsable but still carrying
+            // the `[workspace]` header. Anchor to this exact dir (the nearest such
+            // root), not the topmost manifest in the ancestry — a higher unrelated
+            // `Cargo.toml` above it must not pull the anchor up to the outer
+            // project, or lifecycle commands would target a different runtime dir.
+            // An unrelated broken `Cargo.toml` (no `[workspace]`) is ignored so it
+            // can't hijack a standalone project's anchor.
+            Err(_) if contents.contains("[workspace]") => {
+                if broken_workspace_dir.is_none() {
+                    broken_workspace_dir = Some(dir.to_path_buf());
+                }
+            }
             Ok(_) | Err(_) => {}
         }
     }
-    if saw_unparsable {
-        topmost_manifest
-    } else {
-        nearest_manifest
-    }
+    broken_workspace_dir.or(nearest_manifest)
 }
 
 /// Build, then start the server (foreground or daemon). Returns the exit code.
@@ -1200,6 +1202,15 @@ pub fn managed_pg_env(package: Option<&str>) -> Option<ManagedPgEnv> {
         return None;
     }
 
+    // A daemon start is in flight (the startup lock is held by a live launcher)
+    // but it hasn't started its postmaster or published a URL yet — there's no
+    // `postmaster.pid` to catch above. Sharing the data dir now would let this
+    // run `initdb`/start against the directory the daemon is provisioning and
+    // corrupt or deadlock it, so fall back to the child's own default cluster.
+    if startup_in_progress(&paths) {
+        return None;
+    }
+
     // Nothing holds the data dir: safe to share its location so this run and a
     // future `serve` use the same cluster.
     Some(ManagedPgEnv {
@@ -1676,9 +1687,38 @@ mod tests {
             "[package]\nname = \"api\"\nversion = \"0.1.0\"\n",
         )
         .expect("write member manifest");
-        // The anchor must still be the root (topmost manifest), not the member,
+        // The anchor must still be the broken workspace root, not the member,
         // so the namespace doesn't flip while the root manifest is unparsable.
         assert_eq!(workspace_anchor_from(&member), Some(root));
+    }
+
+    #[test]
+    fn workspace_anchor_broken_root_not_pulled_up_to_outer_manifest() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let outer = std::fs::canonicalize(tmp.path()).expect("canonicalize");
+        // An unrelated outer crate sits *above* the (broken) workspace root.
+        std::fs::write(
+            outer.join("Cargo.toml"),
+            "[package]\nname = \"outer\"\nversion = \"0.1.0\"\n",
+        )
+        .expect("write outer manifest");
+        let ws = outer.join("ws");
+        let member = ws.join("crates/api");
+        std::fs::create_dir_all(&member).expect("create dirs");
+        // The intended workspace root is transiently broken (mid-edit).
+        std::fs::write(
+            ws.join("Cargo.toml"),
+            "[workspace]\nmembers = [\n  \"crates/api\"",
+        )
+        .expect("write broken ws manifest");
+        std::fs::write(
+            member.join("Cargo.toml"),
+            "[package]\nname = \"api\"\nversion = \"0.1.0\"\n",
+        )
+        .expect("write member manifest");
+        // Anchor must be the broken workspace dir, not the outer manifest above it,
+        // or lifecycle commands would target the wrong runtime dir.
+        assert_eq!(workspace_anchor_from(&member), Some(ws));
     }
 
     // Env vars touched by these tests; cleared so a polluted outer environment
