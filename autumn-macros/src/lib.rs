@@ -16,12 +16,15 @@ mod api_doc;
 mod authorize;
 mod cached;
 mod collect;
+mod event;
 mod feature_flag;
 mod i18n;
 mod idempotency_guard;
 mod inbound_mail;
 mod job;
 mod jobs_macro;
+mod listener;
+mod listeners_macro;
 mod mail_previews_macro;
 mod mailer;
 mod mailer_preview;
@@ -377,6 +380,41 @@ pub fn scheduled(attr: TokenStream, item: TokenStream) -> TokenStream {
 #[proc_macro_attribute]
 pub fn job(attr: TokenStream, item: TokenStream) -> TokenStream {
     job::job_macro(attr.into(), item.into()).into()
+}
+
+/// Declare a typed domain event.
+///
+/// Applies the serde + `Clone`/`Debug` derives the event bus needs and
+/// implements `autumn_web::events::Event` with a stable `NAME` (the struct
+/// name by default, or `#[event(name = "...")]`).
+///
+/// ```ignore
+/// #[event]
+/// struct UserSignedUp { user_id: i64 }
+/// ```
+#[proc_macro_attribute]
+pub fn event(attr: TokenStream, item: TokenStream) -> TokenStream {
+    event::event_macro(attr.into(), item.into()).into()
+}
+
+/// Declare an event listener that reacts to a typed `#[event]`.
+///
+/// Runs **synchronously** (in-request) by default, or **durably** (enqueued on
+/// the `#[job]` queue, surviving restarts with retry + DLQ) with `durable`.
+///
+/// ```ignore
+/// #[listener(UserSignedUp, durable, max_attempts = 5)]
+/// async fn send_welcome_email(state: AppState, event: UserSignedUp) -> AutumnResult<()> { Ok(()) }
+/// ```
+#[proc_macro_attribute]
+pub fn listener(attr: TokenStream, item: TokenStream) -> TokenStream {
+    listener::listener_macro(attr.into(), item.into()).into()
+}
+
+/// Collect `#[listener]` handlers into a `Vec<ListenerInfo>`.
+#[proc_macro]
+pub fn listeners(input: TokenStream) -> TokenStream {
+    listeners_macro::listeners_macro(input.into()).into()
 }
 
 /// Declare a one-off operational task runnable with `autumn task <name>`.

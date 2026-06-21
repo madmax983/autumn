@@ -218,6 +218,7 @@ pub mod time;
 pub mod time_zone;
 pub mod user_agent;
 
+pub mod events;
 pub mod experiments;
 pub mod feature_flags;
 pub mod form;
@@ -699,8 +700,12 @@ pub use autumn_macros::cached;
 #[cfg(feature = "ws")]
 pub use autumn_macros::ws;
 
+/// Declare a typed domain event. See [`mod@events`] module.
+pub use autumn_macros::event;
 /// Declare an on-demand background job. See [`mod@job`] module.
 pub use autumn_macros::job;
+/// Declare an event listener. See [`mod@events`] module.
+pub use autumn_macros::listener;
 /// Declare a scheduled background task. See [`mod@task`] module.
 pub use autumn_macros::scheduled;
 /// Declare a one-off operational task. See [`task::OneOffTaskInfo`].
@@ -849,6 +854,8 @@ pub use autumn_macros::feature_flag;
 pub use autumn_macros::authorize;
 /// Collect `#[job]` handlers into a `Vec<JobInfo>`.
 pub use autumn_macros::jobs;
+/// Collect `#[listener]` handlers into a `Vec<events::ListenerInfo>`.
+pub use autumn_macros::listeners;
 
 /// Collect `#[task]` handlers into a `Vec<task::OneOffTaskInfo>`.
 pub use autumn_macros::one_off_tasks;
@@ -1037,6 +1044,7 @@ pub mod reexports {
     pub use lettre;
     #[cfg(feature = "db")]
     pub use scoped_futures;
+    pub use serde;
     pub use serde_json;
     pub use tokio;
     pub use tokio_util;

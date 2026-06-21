@@ -1335,6 +1335,10 @@ async fn run_job_handler(
     state: AppState,
     payload: Value,
 ) -> JobExecutionOutcome {
+    // Make this job's app the ambient event context so a job (or durable event
+    // listener) that calls the free `events::publish` dispatches against its own
+    // app rather than the process-global bus.
+    let event_app = state.clone();
     let interceptor = state
         .extension::<Arc<dyn crate::interceptor::JobInterceptor>>()
         .map(|arc| (*arc).clone());
@@ -1369,7 +1373,8 @@ async fn run_job_handler(
         Err(panic) => return JobExecutionOutcome::Panicked(format_job_panic(panic.as_ref())),
     };
 
-    match std::panic::AssertUnwindSafe(future).catch_unwind().await {
+    let execution = std::panic::AssertUnwindSafe(future).catch_unwind();
+    match crate::events::scope_event_app(event_app, execution).await {
         Ok(Ok(())) => JobExecutionOutcome::Succeeded,
         Ok(Err(error)) => JobExecutionOutcome::Failed(error.to_string()),
         Err(panic) => JobExecutionOutcome::Panicked(format_job_panic(panic.as_ref())),
@@ -1425,6 +1430,16 @@ pub fn global_job_client() -> Option<Arc<JobClient>> {
     GLOBAL_JOB_CLIENT
         .get()
         .and_then(|lock| lock.read().ok().and_then(|guard| guard.clone()))
+}
+
+/// Install the runtime's [`JobClient`] both as the process-global client (used
+/// by the free [`enqueue`] functions and `#[job]` handlers) **and** as an
+/// [`AppState`] extension, so callers that hold an `AppState` — notably the
+/// event bus's durable dispatch — can enqueue against *this* app's client
+/// rather than racing on the process-global one.
+pub(crate) fn install_job_client(state: &AppState, client: JobClient) {
+    state.insert_extension(client.clone());
+    init_global_job_client(client);
 }
 
 pub(crate) fn init_global_job_client(client: JobClient) {
@@ -2259,7 +2274,7 @@ pub(crate) fn start_local_runtime(
             .extension::<crate::config::AutumnConfig>()
             .map(|c| Arc::new(c.resilience.clone())),
     };
-    init_global_job_client(client);
+    install_job_client(state, client);
 
     for _ in 0..worker_count {
         let state = state.clone();
@@ -4333,29 +4348,32 @@ fn start_redis_runtime(
         }
     }
 
-    init_global_job_client(JobClient {
-        local_sender: None,
-        local_coordination: None,
-        redis: Some(RedisClient {
-            connection: producer_connection,
-            queue_key: queue_key.clone(),
-            record_prefix: record_prefix.clone(),
-            unique_prefix: unique_prefix.clone(),
-        }),
-        #[cfg(feature = "db")]
-        pg_pool: None,
-        registry: state.job_registry.clone(),
-        job_admin: job_admin.clone(),
-        default_max_attempts: config.max_attempts,
-        default_initial_backoff_ms: config.initial_backoff_ms,
-        per_job_settings,
-        interceptor: state
-            .extension::<Arc<dyn crate::interceptor::JobInterceptor>>()
-            .map(|arc| (*arc).clone()),
-        resilience_config: state
-            .extension::<crate::config::AutumnConfig>()
-            .map(|c| Arc::new(c.resilience.clone())),
-    });
+    install_job_client(
+        state,
+        JobClient {
+            local_sender: None,
+            local_coordination: None,
+            redis: Some(RedisClient {
+                connection: producer_connection,
+                queue_key: queue_key.clone(),
+                record_prefix: record_prefix.clone(),
+                unique_prefix: unique_prefix.clone(),
+            }),
+            #[cfg(feature = "db")]
+            pg_pool: None,
+            registry: state.job_registry.clone(),
+            job_admin: job_admin.clone(),
+            default_max_attempts: config.max_attempts,
+            default_initial_backoff_ms: config.initial_backoff_ms,
+            per_job_settings,
+            interceptor: state
+                .extension::<Arc<dyn crate::interceptor::JobInterceptor>>()
+                .map(|arc| (*arc).clone()),
+            resilience_config: state
+                .extension::<crate::config::AutumnConfig>()
+                .map(|c| Arc::new(c.resilience.clone())),
+        },
+    );
 
     let worker_count = config.workers.max(1);
     for _ in 0..worker_count {
@@ -5642,24 +5660,27 @@ fn start_postgres_runtime(
         })));
     }
 
-    init_global_job_client(JobClient {
-        local_sender: None,
-        local_coordination: None,
-        #[cfg(feature = "redis")]
-        redis: None,
-        pg_pool: Some(pool.clone()),
-        registry: state.job_registry.clone(),
-        job_admin: job_admin.clone(),
-        default_max_attempts: config.max_attempts,
-        default_initial_backoff_ms: config.initial_backoff_ms,
-        per_job_settings,
-        interceptor: state
-            .extension::<Arc<dyn crate::interceptor::JobInterceptor>>()
-            .map(|arc| (*arc).clone()),
-        resilience_config: state
-            .extension::<crate::config::AutumnConfig>()
-            .map(|c| Arc::new(c.resilience.clone())),
-    });
+    install_job_client(
+        state,
+        JobClient {
+            local_sender: None,
+            local_coordination: None,
+            #[cfg(feature = "redis")]
+            redis: None,
+            pg_pool: Some(pool.clone()),
+            registry: state.job_registry.clone(),
+            job_admin: job_admin.clone(),
+            default_max_attempts: config.max_attempts,
+            default_initial_backoff_ms: config.initial_backoff_ms,
+            per_job_settings,
+            interceptor: state
+                .extension::<Arc<dyn crate::interceptor::JobInterceptor>>()
+                .map(|arc| (*arc).clone()),
+            resilience_config: state
+                .extension::<crate::config::AutumnConfig>()
+                .map(|c| Arc::new(c.resilience.clone())),
+        },
+    );
 
     let visibility_timeout_ms = config.postgres.visibility_timeout_ms;
     let worker_count = config.workers.max(1);

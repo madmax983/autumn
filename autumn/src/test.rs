@@ -254,6 +254,7 @@ pub struct TestApp {
     http_mock_registry: Option<std::sync::Arc<crate::http_client::MockRegistry>>,
     state_initializers: Vec<Box<dyn FnOnce(&AppState) + Send>>,
     jobs: Vec<crate::job::JobInfo>,
+    listeners: Vec<crate::events::ListenerInfo>,
     exception_filters: Vec<std::sync::Arc<dyn crate::middleware::ExceptionFilter>>,
     #[cfg(feature = "mail")]
     suppression_store: Option<crate::mail::SuppressionStoreHandle>,
@@ -324,6 +325,7 @@ impl TestApp {
             http_mock_registry: None,
             state_initializers: Vec::new(),
             jobs: Vec::new(),
+            listeners: Vec::new(),
             exception_filters: Vec::new(),
             #[cfg(feature = "mail")]
             suppression_store: None,
@@ -660,6 +662,7 @@ impl TestApp {
         self.static_gate_layers
             .extend(app_builder.static_gate_layers);
         self.jobs.extend(app_builder.jobs);
+        self.listeners.extend(app_builder.listeners);
         self.exception_filters.extend(app_builder.exception_filters);
         self.metrics_sources.extend(app_builder.metrics_sources);
         self.health_indicators.extend(app_builder.health_indicators);
@@ -773,6 +776,18 @@ impl TestApp {
         interceptor: impl crate::interceptor::JobInterceptor,
     ) -> Self {
         self.job_interceptor = Some(std::sync::Arc::new(interceptor));
+        self
+    }
+
+    /// Register event listeners with the test app.
+    ///
+    /// Collect them with `listeners![..]`, exactly as in `AppBuilder::listeners`.
+    /// Durable listeners run under the in-process test job runtime; sync
+    /// listeners run in-request. Published events are always recorded, so
+    /// [`TestClient::assert_event_published`] works without standing up jobs.
+    #[must_use]
+    pub fn listeners(mut self, listeners: Vec<crate::events::ListenerInfo>) -> Self {
+        self.listeners.extend(listeners);
         self
     }
 
@@ -991,6 +1006,9 @@ impl TestApp {
     pub fn build(mut self) -> TestClient {
         // Reset the global cache to prevent cross-test contamination.
         crate::cache::clear_global_cache();
+        // Reset the global event bus so a prior test's listeners/recorder do not
+        // leak into this one (it is re-installed below).
+        crate::events::clear_global_event_bus();
 
         #[cfg(feature = "db")]
         let (pool, replica_pool, db_interceptor) = if self.transactional {
@@ -1234,6 +1252,20 @@ impl TestApp {
             initializer(&state);
         }
 
+        // Wire the event bus: always install a recorder so tests can assert on
+        // published events without a job runner, register the listener registry
+        // for the `Events` extractor, and fold durable listeners into the jobs
+        // started below so they dispatch through the in-process test runtime.
+        state.insert_extension(crate::events::EventRecorder::default());
+        let event_recorder = state
+            .extension::<crate::events::EventRecorder>()
+            .expect("event recorder just installed");
+        let event_registry =
+            crate::events::EventRegistry::from_listeners(std::mem::take(&mut self.listeners));
+        self.jobs.extend(event_registry.durable_job_infos());
+        state.insert_extension(event_registry.clone());
+        crate::events::init_global_event_bus(&event_registry, &state, Some(event_recorder));
+
         for job in &self.jobs {
             state.job_registry.register(&job.name);
         }
@@ -1397,6 +1429,35 @@ impl TestClient {
     #[must_use]
     pub const fn state(&self) -> &AppState {
         &self.state
+    }
+
+    /// Every recorded publication of event type `E`, deserialized.
+    ///
+    /// Events are recorded synchronously at publish time, so this works whether
+    /// or not the listeners (sync or durable) have run.
+    #[must_use]
+    pub fn published_events<E: crate::events::Event>(&self) -> Vec<E> {
+        self.state
+            .extension::<crate::events::EventRecorder>()
+            .map(|recorder| recorder.published::<E>())
+            .unwrap_or_default()
+    }
+
+    /// Assert that at least one event of type `E` was published during the test.
+    ///
+    /// # Panics
+    ///
+    /// Panics if no event of type `E` was recorded.
+    pub fn assert_event_published<E: crate::events::Event>(&self) {
+        let count = self
+            .state
+            .extension::<crate::events::EventRecorder>()
+            .map_or(0, |recorder| recorder.count::<E>());
+        assert!(
+            count > 0,
+            "expected event `{}` to have been published, but none were recorded",
+            E::NAME,
+        );
     }
 
     /// Step the test clock forward by `duration`.
