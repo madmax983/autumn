@@ -489,6 +489,46 @@ impl Limiter {
         }
     }
 
+    #[cfg(feature = "redis")]
+    fn build_redis_backend(config: &RateLimitConfig) -> Option<BucketBackend> {
+        let url = config
+            .redis
+            .url
+            .as_deref()
+            .filter(|u| !u.trim().is_empty())?;
+        match redis::Client::open(url) {
+            Ok(client) => {
+                match redis::aio::ConnectionManager::new_lazy_with_config(
+                    client,
+                    redis::aio::ConnectionManagerConfig::new(),
+                ) {
+                    Ok(conn) => {
+                        return Some(BucketBackend::Redis(RedisStore::new(
+                            conn,
+                            config.redis.key_prefix.clone(),
+                            config.on_backend_failure,
+                        )));
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            error = %err,
+                            url = %url,
+                            "rate-limit Redis backend: failed to create                              connection manager; falling back to memory"
+                        );
+                    }
+                }
+            }
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    url = %url,
+                    "rate-limit Redis backend: invalid Redis URL;                      falling back to memory"
+                );
+            }
+        }
+        None
+    }
+
     fn build_backend(config: &RateLimitConfig) -> BucketBackend {
         if config.backend == RateLimitBackend::Redis {
             #[cfg(not(feature = "redis"))]
@@ -502,44 +542,19 @@ impl Limiter {
         }
         #[cfg(feature = "redis")]
         if config.backend == RateLimitBackend::Redis {
-            if let Some(url) = config.redis.url.as_deref().filter(|u| !u.trim().is_empty()) {
-                match redis::Client::open(url) {
-                    Ok(client) => {
-                        match redis::aio::ConnectionManager::new_lazy_with_config(
-                            client,
-                            redis::aio::ConnectionManagerConfig::new(),
-                        ) {
-                            Ok(conn) => {
-                                return BucketBackend::Redis(RedisStore::new(
-                                    conn,
-                                    config.redis.key_prefix.clone(),
-                                    config.on_backend_failure,
-                                ));
-                            }
-                            Err(err) => {
-                                tracing::warn!(
-                                    error = %err,
-                                    url = %url,
-                                    "rate-limit Redis backend: failed to create \
-                                     connection manager; falling back to memory"
-                                );
-                            }
-                        }
-                    }
-                    Err(err) => {
-                        tracing::warn!(
-                            error = %err,
-                            url = %url,
-                            "rate-limit Redis backend: invalid Redis URL; \
-                             falling back to memory"
-                        );
-                    }
-                }
-            } else {
+            if config
+                .redis
+                .url
+                .as_deref()
+                .filter(|u| !u.trim().is_empty())
+                .is_none()
+            {
                 tracing::warn!(
                     "rate-limit backend = \"redis\" but no redis.url configured; \
                      falling back to memory"
                 );
+            } else if let Some(backend) = Self::build_redis_backend(config) {
+                return backend;
             }
         }
         BucketBackend::Memory(MemoryStore::new())
