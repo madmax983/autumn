@@ -4953,7 +4953,16 @@ fn signal_serve_ready(drain_budget_secs: u64) {
         return;
     }
     let path = std::path::PathBuf::from(path);
-    if let Err(e) = std::fs::write(&path, drain_budget_secs.to_string()) {
+    // Write to a temp sibling and rename into place so the supervisor — which
+    // polls for the file's existence and then reads the budget from it — never
+    // observes a half-written file: it appears atomically with its full
+    // contents. A plain `write` would make the path exist before the bytes land.
+    let mut tmp = path.clone();
+    tmp.as_mut_os_string().push(".tmp");
+    if let Err(e) = std::fs::write(&tmp, drain_budget_secs.to_string())
+        .and_then(|()| std::fs::rename(&tmp, &path))
+    {
+        let _ = std::fs::remove_file(&tmp);
         tracing::warn!(error = %e, path = %path.display(),
             "could not write serve readiness file");
     }
@@ -5603,7 +5612,15 @@ async fn resolve_shard_set(
             // the TTL. Skipped during a static build (no DB access); needs the
             // control URL, without one we silently fall back to TTL-only refresh.
             if spawn_directory_listener {
-                if let Some(control_url) = config.database.effective_primary_url() {
+                // Prefer the provider-resolved control URL carried on the
+                // topology (managed Postgres has no `database.primary_url` in
+                // config); fall back to the configured URL. Without this a
+                // managed control DB would get no LISTEN/NOTIFY task (absent
+                // URL) or listen on a stale pre-provider URL.
+                if let Some(control_url) = topology
+                    .and_then(crate::db::DatabaseTopology::migration_url)
+                    .or_else(|| config.database.effective_primary_url())
+                {
                     // Detach: the listener runs for the life of the process;
                     // dropping the JoinHandle leaves the task running rather than
                     // aborting it.
@@ -5700,7 +5717,7 @@ async fn setup_database(
     // Spawn the directory invalidation listener only at real runtime — a static
     // build must not open control-DB connections.
     let runtime_boot = hook_queue_migration_mode == RepositoryCommitHookQueueMigrationMode::Runtime;
-    let shards = resolve_shard_set(
+    let shards = match resolve_shard_set(
         config,
         shard_router,
         shard_provider,
@@ -5708,7 +5725,20 @@ async fn setup_database(
         runtime_boot,
         topology.as_ref(),
     )
-    .await?;
+    .await
+    {
+        Ok(shards) => shards,
+        Err(e) => {
+            // The (managed) control topology is already up at this point, so a
+            // later setup failure — directory control-pool sizing, shard pool
+            // construction — must stop the managed Postgres child before the
+            // caller's `process::exit` (which skips `on_shutdown`/`Drop`).
+            // No-op when no managed cluster was started.
+            #[cfg(feature = "managed-pg")]
+            crate::managed_pg::emergency_stop_async().await;
+            return Err(e);
+        }
+    };
 
     // Skip migrations when the provider opted out of a database (returned
     // `Ok(None)`) — even if `database.url` is configured. Custom providers
