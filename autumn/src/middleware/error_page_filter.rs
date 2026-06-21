@@ -825,8 +825,7 @@ mod tests {
             backtrace_string: None,
         };
 
-        let mut original =
-            (StatusCode::SERVICE_UNAVAILABLE, "json body").into_response();
+        let mut original = (StatusCode::SERVICE_UNAVAILABLE, "json body").into_response();
         original.headers_mut().insert(
             "access-control-allow-origin",
             http::HeaderValue::from_static("https://app.example.com"),
@@ -853,7 +852,8 @@ mod tests {
             "mirrored CORS credentials flag must survive the HTML rebuild"
         );
         assert_eq!(
-            response.headers()["x-request-id"], "req-123",
+            response.headers()["x-request-id"],
+            "req-123",
             "request id must survive the HTML rebuild"
         );
         assert_eq!(

@@ -2243,6 +2243,16 @@ fn apply_middleware(
     // who need to bound session-store I/O should configure a store-level deadline
     // (e.g. the Redis command/connection timeout); a cancelled inbound request
     // cannot abort an already-issued store call regardless of layer order.
+    //
+    // The same applies to the edge layers `App::run` wraps around the finished
+    // router at the `axum::serve` boundary (`MethodOverrideLayer`,
+    // `TrustedProxiesLayer`): they sit outside `RequestId` and therefore outside
+    // this timer. In particular `MethodOverrideLayer` buffers an HTML form body
+    // (`axum::body::to_bytes`, capped at `upload.max_request_size_bytes`) before
+    // the inner router runs, so a slow `_method` form upload is not bounded by
+    // `request_timeout_ms`. Moving the timer out there would again lose the
+    // `X-Request-Id` correlation; bound this with a server/proxy read timeout
+    // instead.
     router = apply_request_timeout_middleware(
         router,
         config,

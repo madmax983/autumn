@@ -38,7 +38,12 @@ A timeout emits structured telemetry — a `request_timeouts_total` counter plus
 The deadline bounds the time to produce the **response head**, not the duration
 of body streaming. So **SSE and chunked/streaming responses are exempt** — once
 the head is sent, the body is never interrupted mid-stream. WebSocket upgrades
-(`#[ws]`) are exempt automatically.
+(`#[ws]`) follow the same rule: the pre-upgrade handshake (any async auth or
+setup that runs before the upgrade response) counts against the deadline, but the
+**established socket is never interrupted** — it is handed off after the head is
+sent. Static routes (`#[static_get]`) are exempt automatically, since their
+renders run at build time and during ISR regeneration with no inbound client
+request to bound.
 
 **Long-poll handlers are the exception**: because they block *before* returning
 the response head (waiting for an event), that wait counts against the deadline

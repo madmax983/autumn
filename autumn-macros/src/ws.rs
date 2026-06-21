@@ -154,9 +154,13 @@ pub fn ws_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 },
                 repository: ::core::option::Option::None,
                 idempotency: ::autumn_web::RouteIdempotency::Direct,
-                // WebSocket upgrades are long-lived by nature — exempt from the
-                // global inbound request timeout by default.
-                timeout: ::autumn_web::RouteTimeout::Disabled,
+                // The inbound timeout only wraps production of the upgrade
+                // response head; the live socket future handed to `on_upgrade`
+                // runs on a separate task and is never polled under the deadline.
+                // So `Inherit` bounds a hung pre-upgrade handshake (async auth /
+                // setup) under the global default without ever interrupting an
+                // established WebSocket.
+                timeout: ::autumn_web::RouteTimeout::Inherit,
                 api_version: ::core::option::Option::None,
                 sunset_opt_out: false,
             }

@@ -187,7 +187,12 @@ pub fn static_get_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 },
                 repository: ::core::option::Option::None,
                 idempotency: ::autumn_web::RouteIdempotency::Direct,
-                timeout: ::autumn_web::RouteTimeout::Inherit,
+                // Static prerenders run through this GET route at build time
+                // (`run_build_mode`) and during ISR regeneration — there is no
+                // inbound client request whose deadline should apply. Exempt them
+                // so a legitimately slow prerender can't fail `autumn build` or
+                // skip an ISR update with a 503 under the prod default (30s).
+                timeout: ::autumn_web::RouteTimeout::Disabled,
                 api_version: ::core::option::Option::None,
                 sunset_opt_out: false,
             }
