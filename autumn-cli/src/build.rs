@@ -54,8 +54,15 @@ pub fn run(debug: bool, package: Option<&str>) {
     // the daemon's locked data dir. A no-op for apps that don't use managed PG.
     if let Some(pg) = crate::serve::managed_pg_env(package) {
         cmd.env(crate::serve::MANAGED_PG_DATA_DIR_ENV, &pg.data_dir);
-        if let Some(url) = pg.attach_url {
-            cmd.env(crate::serve::MANAGED_PG_ATTACH_URL_ENV, url);
+        match pg.attach_url {
+            Some(url) => {
+                cmd.env(crate::serve::MANAGED_PG_ATTACH_URL_ENV, url);
+            }
+            // No live cluster: clear any inherited attach URL so a stale/foreign
+            // value can't redirect the static renderer to the wrong database.
+            None => {
+                cmd.env_remove(crate::serve::MANAGED_PG_ATTACH_URL_ENV);
+            }
         }
     }
     // Mirror cargo's profile selection: dev builds use the dev Autumn profile

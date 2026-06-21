@@ -586,6 +586,13 @@ fn start_foreground(opts: &ServeOptions) -> i32 {
 /// runtime directories.
 fn base_command(binary: &Path, paths: Option<&RuntimePaths>, opts: &ServeOptions) -> Command {
     let mut cmd = Command::new(binary);
+    // `autumn serve` is the cluster *owner*: it must provision and supervise its
+    // own managed Postgres, never attach to someone else's. Clear any inherited
+    // `AUTUMN_MANAGED_PG_ATTACH_URL` (e.g. leaked from the launching shell or a
+    // prior task/build run) so the provider can't take the attach branch and
+    // leave the daemon recorded as managed-PG while it never starts/stops a
+    // cluster (and `stop()` no-ops because `attached` is set).
+    cmd.env_remove(MANAGED_PG_ATTACH_URL_ENV);
     // For a workspace member selected with `-p`, run the child from the member's
     // manifest dir so its `autumn.toml`/profile and asset dirs resolve correctly
     // instead of the workspace-root CWD. Set both `current_dir` (covers CWD-

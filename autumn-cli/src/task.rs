@@ -43,8 +43,16 @@ fn apply_managed_pg_env(cmd: &mut Command, package: Option<&str>) {
         return;
     };
     cmd.env(crate::serve::MANAGED_PG_DATA_DIR_ENV, &env.data_dir);
-    if let Some(url) = env.attach_url {
-        cmd.env(crate::serve::MANAGED_PG_ATTACH_URL_ENV, url);
+    match env.attach_url {
+        Some(url) => {
+            cmd.env(crate::serve::MANAGED_PG_ATTACH_URL_ENV, url);
+        }
+        // No live cluster to attach to: clear any inherited attach URL so a stale
+        // or foreign value from the parent environment can't make the child
+        // connect to the wrong (or a dead) database instead of starting its own.
+        None => {
+            cmd.env_remove(crate::serve::MANAGED_PG_ATTACH_URL_ENV);
+        }
     }
 }
 
