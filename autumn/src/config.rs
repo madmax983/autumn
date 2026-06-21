@@ -2964,10 +2964,16 @@ pub struct RequestTimeoutsConfig {
     /// rendered as Problem Details JSON for API clients (and the standard error
     /// page for browser requests). `None` (default) or `0` disables the timeout.
     ///
-    /// The deadline bounds the time to produce the response head, so streaming
-    /// responses (SSE, long-poll, chunked bodies) and WebSocket upgrades are not
-    /// interrupted. Per-route overrides are available via the route macro
-    /// (`#[get("/slow", timeout_ms = 120000)]` or `timeout = "off"`).
+    /// The deadline bounds the time to produce the response *head*: once the
+    /// status and headers are sent, the streaming body is not interrupted, so
+    /// SSE, chunked responses, and WebSocket upgrades (all of which emit their
+    /// head promptly and then stream) run unbounded afterward. Long-poll
+    /// handlers are the exception — they intentionally withhold the response
+    /// head while waiting for data, so they *are* subject to this deadline and
+    /// will return `503` if it fires before they respond. Give such routes a
+    /// per-route override via the route macro
+    /// (`#[get("/poll", timeout_ms = 120000)]` or `timeout = "off"`), which is
+    /// also how any other slow route can raise or disable its own deadline.
     ///
     /// The `prod` profile smart-defaults this to `30000` (30s); `dev` and custom
     /// profiles leave it disabled. Configured via
