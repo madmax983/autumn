@@ -312,6 +312,13 @@ async fn dispatch(
     }
 
     // 2. Durable listeners: enqueue onto the job queue (at-least-once).
+    //
+    // Prefer this app's own `JobClient` (installed onto `AppState` by the job
+    // runtime) over the process-global client, so durable dispatch is scoped to
+    // the publishing app rather than whichever app last started a runtime. This
+    // keeps parallel in-process apps (notably tests) from contending. We fall
+    // back to the global client only if no app-local one is present.
+    let app_client = state.extension::<crate::job::JobClient>();
     for listener in listeners
         .iter()
         .filter(|listener| listener.mode == DispatchMode::Durable)
@@ -320,7 +327,11 @@ async fn dispatch(
             .job_name
             .as_deref()
             .expect("durable listener must carry a job_name");
-        crate::job::enqueue(job_name, payload.clone()).await?;
+        if let Some(client) = &app_client {
+            client.enqueue(job_name, payload.clone()).await?;
+        } else {
+            crate::job::enqueue(job_name, payload.clone()).await?;
+        }
     }
 
     // 3. Sync listeners: run independently, isolated from each other.

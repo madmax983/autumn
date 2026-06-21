@@ -80,12 +80,12 @@ async fn durable_seed(state: AppState, _event: UserSignedUp) -> AutumnResult<()>
     Ok(())
 }
 
-/// Sync-only listeners. The durable path rides the process-global job client
-/// (a job-system constraint), so only the dedicated durable test registers a
-/// durable listener — that keeps these parallel tests from stomping on each
-/// other's job runtime.
-fn sync_listeners() -> Vec<autumn_web::events::ListenerInfo> {
-    listeners![sync_a, sync_panics, sync_survivor]
+/// The full listener set, including the durable one. Durable dispatch is scoped
+/// to each app's own `JobClient` (installed on `AppState`), so several of these
+/// tests can register the durable listener and run in parallel without stomping
+/// on each other's job runtime.
+fn all_listeners() -> Vec<autumn_web::events::ListenerInfo> {
+    listeners![sync_a, sync_panics, sync_survivor, durable_seed]
 }
 
 // ── Emitting handler (never edited when listeners are added) ────────
@@ -112,7 +112,7 @@ fn app_with(listeners: Vec<autumn_web::events::ListenerInfo>) -> autumn_web::tes
 
 #[tokio::test]
 async fn publishing_runs_sync_listeners_with_panic_isolation() {
-    let client = app_with(sync_listeners());
+    let client = app_with(all_listeners());
 
     client.get("/signup").send().await.assert_ok();
 
@@ -127,9 +127,9 @@ async fn publishing_runs_sync_listeners_with_panic_isolation() {
 
 #[tokio::test]
 async fn durable_listener_runs_via_the_job_runtime() {
-    // This is the only test that registers a durable listener (and thus builds a
-    // job runtime), so the process-global job client it installs is not raced.
-    let client = app_with(listeners![durable_seed]);
+    // Durable dispatch uses this app's own JobClient, so registering the durable
+    // listener here is safe even though other parallel tests do the same.
+    let client = app_with(all_listeners());
 
     client.get("/signup").send().await.assert_ok();
 
@@ -148,7 +148,7 @@ async fn durable_listener_runs_via_the_job_runtime() {
 
 #[tokio::test]
 async fn test_recorder_captures_published_events() {
-    let client = app_with(sync_listeners());
+    let client = app_with(all_listeners());
 
     client.get("/signup").send().await.assert_ok();
 
