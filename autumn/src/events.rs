@@ -41,7 +41,7 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -342,7 +342,12 @@ async fn dispatch(
 
 /// Run every sync listener on its own task so a panic or error in one never
 /// blocks the others, then await them all (they finish before the response).
+///
+/// Each task is instrumented with the publishing span so listener logs stay
+/// correlated with the originating request/trace despite the `tokio::spawn`.
 async fn run_sync_listeners(state: &AppState, listeners: &[ListenerInfo], payload: &Value) {
+    use tracing::Instrument as _;
+
     let mut handles = Vec::new();
     for listener in listeners
         .iter()
@@ -352,14 +357,18 @@ async fn run_sync_listeners(state: &AppState, listeners: &[ListenerInfo], payloa
         let payload = payload.clone();
         let run = listener.handler;
         let name = listener.listener_name.clone();
-        handles.push(tokio::spawn(async move {
-            match run(state, payload).await {
-                Ok(()) => {}
-                Err(error) => {
-                    tracing::error!(listener = %name, %error, "sync event listener failed");
+        let span = tracing::Span::current();
+        handles.push(tokio::spawn(
+            async move {
+                match run(state, payload).await {
+                    Ok(()) => {}
+                    Err(error) => {
+                        tracing::error!(listener = %name, %error, "sync event listener failed");
+                    }
                 }
             }
-        }));
+            .instrument(span),
+        ));
     }
     for handle in handles {
         if let Err(join_error) = handle.await {
@@ -374,12 +383,10 @@ struct GlobalBus {
     state: AppState,
 }
 
-static GLOBAL_EVENT_BUS: OnceLock<RwLock<Option<Arc<GlobalBus>>>> = OnceLock::new();
+static GLOBAL_EVENT_BUS: RwLock<Option<Arc<GlobalBus>>> = RwLock::new(None);
 
 fn global_bus() -> Option<Arc<GlobalBus>> {
-    GLOBAL_EVENT_BUS
-        .get()
-        .and_then(|lock| lock.read().ok().and_then(|guard| guard.clone()))
+    GLOBAL_EVENT_BUS.read().ok().and_then(|guard| guard.clone())
 }
 
 /// Install the process-global event bus used by the module-level [`publish`].
@@ -395,23 +402,15 @@ pub(crate) fn init_global_event_bus(
         recorder,
         state: state.clone(),
     });
-    if let Some(lock) = GLOBAL_EVENT_BUS.get() {
-        if let Ok(mut guard) = lock.write() {
-            *guard = Some(bus);
-        }
-        return;
+    if let Ok(mut guard) = GLOBAL_EVENT_BUS.write() {
+        *guard = Some(bus);
     }
-    let _ = GLOBAL_EVENT_BUS.set(RwLock::new(Some(bus)));
 }
 
 /// Reset the process-global event bus (used for test isolation).
 pub fn clear_global_event_bus() {
-    if let Some(lock) = GLOBAL_EVENT_BUS.get() {
-        if let Ok(mut guard) = lock.write() {
-            *guard = None;
-        }
-    } else {
-        let _ = GLOBAL_EVENT_BUS.set(RwLock::new(None));
+    if let Ok(mut guard) = GLOBAL_EVENT_BUS.write() {
+        *guard = None;
     }
 }
 
