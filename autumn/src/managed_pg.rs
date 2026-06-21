@@ -20,7 +20,7 @@
 //!     .await;
 //! ```
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -82,6 +82,30 @@ pub(crate) async fn emergency_stop_async() {
         provider.stop().await;
     }
 }
+
+/// Enforce `0600` on the managed-cluster superuser password file, or exit
+/// fatally. The file holds the local cluster's superuser password; if we cannot
+/// keep it owner-only (a `chmod` rejected by the filesystem/ACL, or a file owned
+/// by another user), refuse to boot rather than run with the secret readable by
+/// other local users — matching the provider's other fatal-boot handling, and
+/// safe to call before the server is started (no child to orphan).
+#[cfg(unix)]
+fn enforce_password_file_mode_or_exit(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    if let Err(e) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)) {
+        tracing::error!(error = %e, path = %path.display(),
+            "managed Postgres: cannot enforce owner-only permissions on the superuser password file");
+        eprintln!(
+            "autumn: refusing to start managed Postgres — cannot set 0600 on {} ({e}). \
+             The cluster superuser password would be readable by other local users.",
+            path.display()
+        );
+        std::process::exit(1);
+    }
+}
+
+#[cfg(not(unix))]
+fn enforce_password_file_mode_or_exit(_path: &Path) {}
 
 /// Generate a random 24-character alphanumeric password for the managed cluster.
 fn generate_password() -> String {
@@ -264,15 +288,8 @@ impl ManagedPostgresPoolProvider {
                 // An existing file (older build, manual creation) may have a
                 // permissive mode; the create-time `0600` below never applied to
                 // it. Tighten it before reusing — it holds the cluster superuser
-                // password.
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    let _ = std::fs::set_permissions(
-                        &password_file,
-                        std::fs::Permissions::from_mode(0o600),
-                    );
-                }
+                // password — and refuse to boot if we can't.
+                enforce_password_file_mode_or_exit(&password_file);
                 return (trimmed.to_owned(), password_file);
             }
         }
@@ -290,13 +307,9 @@ impl ManagedPostgresPoolProvider {
             use std::io::Write;
             // `mode(0o600)` only applies when the file is newly created; an
             // existing empty/permissive file (interrupted first boot, manual
-            // `touch`) keeps its old mode, so tighten it before writing the
-            // superuser password.
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = f.set_permissions(std::fs::Permissions::from_mode(0o600));
-            }
+            // `touch`) keeps its old mode, so tighten it (failing closed) before
+            // writing the superuser password into it.
+            enforce_password_file_mode_or_exit(&password_file);
             let _ = f.write_all(password.as_bytes());
         }
         (password, password_file)

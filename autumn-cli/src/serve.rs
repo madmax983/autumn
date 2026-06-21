@@ -587,11 +587,14 @@ fn create_private_log(path: &Path) -> std::io::Result<std::fs::File> {
     let file = options.open(path)?;
     // `mode(0o600)` only applies when *creating* the file; an existing log
     // (from an earlier version or manual creation) keeps its old, possibly
-    // world-readable mode, so tighten it explicitly after opening.
+    // world-readable mode, so tighten it explicitly after opening — and fail
+    // *closed* if we can't. The child's stdout/stderr (request data, panics,
+    // diagnostics) goes here, so in a shared log dir we must not start while it
+    // stays readable to other users.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
     }
     Ok(file)
 }
@@ -920,7 +923,17 @@ fn stop(opts: &ServeOptions) -> i32 {
     // daemons started before that field was recorded.
     let recorded_release = addr.as_ref().is_some_and(|a| a.release);
     let recorded_budget = addr.as_ref().and_then(|a| a.stop_budget_secs);
-    process::stop_record(&rec, stop_timeout(opts, recorded_release, recorded_budget));
+    if !process::stop_record(&rec, stop_timeout(opts, recorded_release, recorded_budget)) {
+        // The daemon is still alive and we couldn't signal it (e.g. it is owned
+        // by another user — `kill` returned `EPERM`). Do NOT remove its state or
+        // report success: that would orphan a running daemon and lie to scripts.
+        eprintln!(
+            "autumn serve: could not stop the daemon (pid {}); it may be owned by \
+             another user or unresponsive. Leaving its state in place.",
+            rec.pid
+        );
+        return 1;
+    }
     // A concurrent `start` can reclaim the now-stale pidfile and bring up a
     // successor (even a new managed cluster on the same data dir) while we were
     // draining the old daemon. If the pidfile no longer records the pid we just
@@ -951,7 +964,8 @@ fn stop(opts: &ServeOptions) -> i32 {
 /// requests a fast shutdown and escalates. No-op when the cluster already
 /// stopped cleanly (pidfile absent or the postmaster is gone).
 fn reap_managed_postgres(paths: &RuntimePaths) {
-    let pidfile = paths.pg_data_dir().join("postmaster.pid");
+    let data_dir = paths.pg_data_dir();
+    let pidfile = data_dir.join("postmaster.pid");
     let Some(pid) = std::fs::read_to_string(&pidfile)
         .ok()
         .and_then(|s| s.lines().next()?.trim().parse::<u32>().ok())
@@ -962,12 +976,25 @@ fn reap_managed_postgres(paths: &RuntimePaths) {
         return;
     }
     // Guard against PID reuse: a `postmaster.pid` left behind by a crashed or
-    // `SIGKILL`ed cluster keeps its old PID, which the OS may have recycled for
-    // an unrelated process. Where the platform reports it, require the live
-    // process to actually be `postgres` before signalling it; if we can't tell
-    // (non-Linux), fall back to liveness alone.
+    // `SIGKILL`ed cluster keeps its old PID, which the OS may have recycled.
+    // Where the platform reports it, require the live process to actually be
+    // `postgres` before signalling it; if we can't tell (non-Linux), fall back
+    // to liveness alone.
     if process::process_command_name(pid).is_some_and(|name| name != "postgres") {
         return;
+    }
+    // ...and, since the reused PID could be *another* `postgres` cluster, require
+    // its working directory to be this cluster's data dir (a postmaster `chdir`s
+    // to its data dir). Only enforced where `cwd` is observable (Linux); a
+    // mismatch means a different cluster owns the PID, so leave it alone.
+    if let Some(cwd) = process::process_cwd(pid) {
+        let same_dir = std::fs::canonicalize(&cwd)
+            .ok()
+            .zip(std::fs::canonicalize(&data_dir).ok())
+            .is_some_and(|(live, ours)| live == ours);
+        if !same_dir {
+            return;
+        }
     }
     process::stop_postmaster(pid, Duration::from_secs(10));
 }

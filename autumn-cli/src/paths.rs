@@ -196,6 +196,12 @@ impl RuntimePaths {
         std::fs::create_dir_all(&self.runtime)?;
         std::fs::create_dir_all(&self.logs)?;
         std::fs::create_dir_all(&self.data)?;
+        // Harden the runtime dir: it holds `serve.pid`/`serve.addr`/`serve.ready`,
+        // which lifecycle commands trust. Another local user able to create or
+        // replace them (permissive umask, shared `AUTUMN_RUNTIME_DIR`) could
+        // redirect `stop`/`status` at the wrong process or strand the daemon.
+        #[cfg(unix)]
+        harden_private_dir(&self.runtime)?;
         // Harden the directory the control socket is bound in (the runtime dir,
         // or a short fallback under a shared temp root). Making it `0700` *before*
         // the app binds means no other local user can reach the socket during the

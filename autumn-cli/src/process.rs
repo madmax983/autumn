@@ -99,6 +99,24 @@ pub fn process_command_name(pid: u32) -> Option<String> {
     }
 }
 
+/// The working directory of `pid` (Linux `/proc/<pid>/cwd`), when the platform
+/// exposes it. A `PostgreSQL` postmaster runs with its cwd set to the data
+/// directory, so this lets a caller confirm a recorded PID is the cluster for a
+/// *specific* data dir — not an unrelated `postgres` that reused the PID.
+/// `None` elsewhere.
+#[must_use]
+pub fn process_cwd(pid: u32) -> Option<PathBuf> {
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_link(format!("/proc/{pid}/cwd")).ok()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
 /// The kernel-reported start time of `pid`, when the platform exposes it.
 ///
 /// Linux reads field 22 (`starttime`, jiffies since boot) of
@@ -338,24 +356,34 @@ pub fn wait_for_record_exit(record: &PidRecord, timeout: Duration) -> bool {
 
 /// Gracefully stop the daemon identified by `record`: send `SIGTERM`, wait up to
 /// `timeout` for it to drain and exit, then force-kill if it is still alive.
+/// Returns `true` only if the recorded process is gone afterwards.
 ///
 /// The wait and the pre-escalation check are identity-aware (start time, when
 /// the platform records it): if the daemon exits and its PID is reused before
 /// the loop observes the exit, the reused process has a different start time and
 /// is treated as already-gone, so the `SIGKILL`/`killpg` escalation is skipped
 /// rather than aimed at an unrelated process.
+///
+/// A `false` return means the daemon could **not** be stopped — e.g. it is owned
+/// by another user and `kill` returns `EPERM` — so the caller must not delete
+/// its state or report success.
 #[cfg(unix)]
-pub fn stop_record(record: &PidRecord, timeout: Duration) {
+#[must_use]
+pub fn stop_record(record: &PidRecord, timeout: Duration) -> bool {
     let _ = signal_terminate(record.pid);
-    if !wait_for_record_exit(record, timeout) && is_record_alive(record) {
-        // The app missed its graceful-drain budget and is still our daemon, so
-        // its `on_shutdown` hooks (which stop a managed Postgres child) may not
-        // have run. Kill the whole daemon process group, not just the app PID,
-        // so supervised children are not orphaned holding the data dir/port.
-        force_kill(record.pid);
-        force_kill_group(record.pid);
-        let _ = wait_for_record_exit(record, Duration::from_secs(5));
+    if wait_for_record_exit(record, timeout) {
+        return true;
     }
+    if !is_record_alive(record) {
+        return true;
+    }
+    // The app missed its graceful-drain budget and is still our daemon, so its
+    // `on_shutdown` hooks (which stop a managed Postgres child) may not have run.
+    // Kill the whole daemon process group, not just the app PID, so supervised
+    // children are not orphaned holding the data dir/port.
+    force_kill(record.pid);
+    force_kill_group(record.pid);
+    wait_for_record_exit(record, Duration::from_secs(5))
 }
 
 /// Stop a managed Postgres postmaster `pid`: request a "fast" shutdown (SIGINT —
@@ -386,7 +414,10 @@ pub fn stop_postmaster(_pid: u32, _timeout: Duration) {}
 
 /// Non-Unix fallback: no graceful-signal mechanism in this MVP.
 #[cfg(not(unix))]
-pub fn stop_record(_record: &PidRecord, _timeout: Duration) {}
+#[must_use]
+pub fn stop_record(_record: &PidRecord, _timeout: Duration) -> bool {
+    false
+}
 
 /// Wait for a child process with a timeout. Returns `Err(())` if it did not
 /// exit before `timeout` elapsed.

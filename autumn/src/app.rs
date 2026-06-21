@@ -3309,6 +3309,11 @@ impl AppBuilder {
                 exit_code = 1,
                 "shutdown: in_flight_drain phase exceeded deadline; terminating"
             );
+            // The watchdog's `process::exit` skips the remaining `on_shutdown`
+            // hooks — including a managed-Postgres `stop()` — so a drain that
+            // overruns its budget would orphan the postmaster. Stop it here too.
+            #[cfg(feature = "managed-pg")]
+            crate::managed_pg::emergency_stop_async().await;
             std::process::exit(1);
         });
 
