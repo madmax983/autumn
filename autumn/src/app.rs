@@ -3365,12 +3365,17 @@ impl AppBuilder {
         // watchdog in shutdown_task will force-exit if drain takes too long.
         let server_result = server_task.await.unwrap_or_else(|e| {
             tracing::error!("Server task join error: {e}");
+            // `process::exit` skips the `on_shutdown` hooks, so stop a managed
+            // Postgres child here to avoid orphaning it on an accept-loop/join
+            // failure (direct/foreground runs have no CLI reaper).
+            exit_stop_managed_pg();
             std::process::exit(1);
         });
         // Drain completed within the deadline; abort the watchdog.
         shutdown_task.abort();
         server_result.unwrap_or_else(|e| {
             tracing::error!("Server error: {e}");
+            exit_stop_managed_pg();
             std::process::exit(1);
         });
 
@@ -3384,6 +3389,13 @@ impl AppBuilder {
         let hook_budget =
             std::time::Duration::from_secs(shutdown_timeout).saturating_sub(drain_elapsed);
         run_shutdown_hooks_with_timeout(&shutdown_hooks, hook_budget, hook_budget).await;
+        // If request drain consumed the whole `shutdown_timeout_secs`, the
+        // managed-Postgres `on_shutdown` hook may have been budgeted away above.
+        // Stop the cluster directly here (idempotent — a no-op once the hook
+        // already stopped it) so a direct/foreground run, which has no CLI
+        // reaper, never leaves the postmaster holding the data dir/port.
+        #[cfg(feature = "managed-pg")]
+        crate::managed_pg::emergency_stop_async().await;
 
         // Remove the Unix socket file on clean exit; axum does not unlink it.
         // (An abnormal force-exit may leave it behind, but the next bind's

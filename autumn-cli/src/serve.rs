@@ -446,7 +446,12 @@ fn start_daemon(opts: &ServeOptions) -> i32 {
     // `postgresql_embedded` won't attach to it and the app's boot would fail.
     // Reap it here, where the daemon lifecycle is known to be gone, rather than
     // in the provider (which can't tell an orphan from a live direct-use app).
-    if opts.bundled_pg {
+    //
+    // Skip while another start holds a live startup lock: that concurrent start
+    // may already be *provisioning* this cluster (it took `serve.startlock`
+    // before writing `serve.pid`), and reaping would kill its postmaster. This
+    // losing start will be rejected by the startup-lock acquire below anyway.
+    if opts.bundled_pg && !startup_in_progress(&paths) {
         reap_managed_postgres(&paths);
     }
 

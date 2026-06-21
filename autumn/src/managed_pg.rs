@@ -107,6 +107,13 @@ fn enforce_password_file_mode_or_exit(path: &Path) {
 #[cfg(not(unix))]
 fn enforce_password_file_mode_or_exit(_path: &Path) {}
 
+/// Drop the current provider from the process-global emergency-stop slot.
+fn clear_emergency_registration() {
+    if let Ok(mut g) = EMERGENCY_PROVIDER.lock() {
+        *g = None;
+    }
+}
+
 /// Generate a random 24-character alphanumeric password for the managed cluster.
 fn generate_password() -> String {
     const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
@@ -319,18 +326,28 @@ impl ManagedPostgresPoolProvider {
     /// `on_shutdown` so the cluster shuts down with the app.
     pub async fn stop(&self) {
         let taken = self.instance.lock().ok().and_then(|mut guard| guard.take());
-        if let Some(pg) = taken
-            && let Err(e) = pg.stop().await
-        {
-            tracing::warn!(error = %e, "failed to stop managed Postgres cleanly");
+        let Some(pg) = taken else {
+            // Nothing running (or already stopped): clear the emergency registration.
+            clear_emergency_registration();
+            return;
+        };
+        if let Err(e) = pg.stop().await {
+            // The postmaster is still up. Put the handle back so a later
+            // `stop()`/emergency stop can retry, and leave the emergency
+            // registration in place — dropping both here would strand a running
+            // cluster with no way to reach it (notably for direct/foreground
+            // runs without the CLI's `postmaster.pid` reaper).
+            tracing::warn!(error = %e, "failed to stop managed Postgres cleanly; will retry on next stop");
+            if let Ok(mut guard) = self.instance.lock() {
+                *guard = Some(pg);
+            }
+            return;
         }
-        // Clear the emergency-stop registration so a later app in the same
-        // process (integration tests) doesn't try to emergency-stop this
-        // now-dead handle. The resolved URL is carried on the per-app topology,
-        // so there is no process-global URL to clear.
-        if let Ok(mut g) = EMERGENCY_PROVIDER.lock() {
-            *g = None;
-        }
+        // Stopped cleanly: drop the emergency-stop registration so a later app in
+        // the same process (integration tests) doesn't try to stop this now-dead
+        // handle. The resolved URL is carried on the per-app topology, so there is
+        // no process-global URL to clear.
+        clear_emergency_registration();
     }
 }
 
@@ -437,21 +454,26 @@ fn default_data_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os(MANAGED_PG_DATA_DIR_ENV) {
         return PathBuf::from(dir);
     }
+    // Layout is `<base>/<project>/pg`, not `<base>/pg/<project>`: the data dir's
+    // *parent* holds the per-cluster `.autumn-pg-superuser` file (initdb needs an
+    // empty data dir), so the project component must be the parent or every
+    // direct-run project under one user would share a single superuser password.
     let project = project_data_namespace();
     if let Some(home) = std::env::var_os("HOME") {
         return PathBuf::from(home)
-            .join(".local/share/autumn/pg")
-            .join(project);
+            .join(".local/share/autumn")
+            .join(project)
+            .join("pg");
     }
     // Windows (where HOME is usually unset): use a persistent app-data dir
     // rather than the volatile temp dir, which is cleared on reboot.
     if let Some(local_appdata) = std::env::var_os("LOCALAPPDATA") {
         return PathBuf::from(local_appdata)
             .join("autumn")
-            .join("pg")
-            .join(project);
+            .join(project)
+            .join("pg");
     }
-    std::env::temp_dir().join("autumn").join("pg").join(project)
+    std::env::temp_dir().join("autumn").join(project).join("pg")
 }
 
 /// A per-project namespace component for the fallback data dir, derived from the
