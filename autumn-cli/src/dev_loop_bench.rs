@@ -766,17 +766,29 @@ fn measure_cold_start_once(shape: ColdStartShape) -> Result<u64, String> {
         .join("target")
         .join("debug")
         .join(format!("{project_name}{}", std::env::consts::EXE_SUFFIX));
-    let mut child = Command::new(&bin)
-        .current_dir(&project_dir)
-        // Pin host+port explicitly: env vars are the highest-precedence config
-        // source, so this binds the port we poll regardless of autumn.toml or any
-        // `AUTUMN_SERVER__*` inherited from the surrounding shell/CI.
-        .env("AUTUMN_SERVER__HOST", "127.0.0.1")
+
+    let mut cmd = Command::new(&bin);
+    cmd.current_dir(&project_dir);
+    // Isolate the child from the surrounding environment: clear every inherited
+    // `AUTUMN_*` var so app-mode settings can't change how the scaffolded app
+    // boots or what it binds. Without this, e.g. `AUTUMN_ENV=prod` would trigger
+    // production boot checks, `AUTUMN_BUILD_STATIC=1` would render static output
+    // and exit instead of serving, and a stray `AUTUMN_SERVER__UNIX_SOCKET`
+    // would make the app bind a socket instead of the TCP port we poll.
+    for (key, _) in std::env::vars() {
+        if key.starts_with("AUTUMN_") {
+            cmd.env_remove(&key);
+        }
+    }
+    // Then pin exactly the host+port we poll (env vars are the highest-precedence
+    // config source, overriding autumn.toml).
+    cmd.env("AUTUMN_SERVER__HOST", "127.0.0.1")
         .env("AUTUMN_SERVER__PORT", port.to_string())
         // Discard the app's own logs so they never interleave with the JSON
         // report on stdout; the harness reports progress on stderr separately.
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::null());
+    let mut child = cmd
         .spawn()
         .map_err(|e| format!("failed to start the built server binary: {e}"))?;
 
@@ -790,6 +802,15 @@ fn measure_cold_start_once(shape: ColdStartShape) -> Result<u64, String> {
 
     let mut measured = None;
     while Instant::now() < deadline {
+        // If the app exited (e.g. the chosen port is already in use → bind
+        // failure → process exit), stop immediately so we never record a 200
+        // served by some other process listening on this port.
+        if let Ok(Some(status)) = child.try_wait() {
+            return Err(format!(
+                "scaffolded server exited before serving (exit: {status}); \
+                 port {port} may already be in use"
+            ));
+        }
         if let Ok(resp) = client.get(&url).send()
             && resp.status().is_success()
         {
@@ -799,10 +820,38 @@ fn measure_cold_start_once(shape: ColdStartShape) -> Result<u64, String> {
         std::thread::sleep(Duration::from_millis(100));
     }
 
-    let _ = child.kill();
-    let _ = child.wait();
+    // Graceful shutdown so the app's on-shutdown hooks run — notably the
+    // managed-Postgres provider stopping its supervised cluster on the DB shape,
+    // which otherwise orphans Postgres processes/data between samples.
+    stop_child(&mut child);
 
     measured.ok_or_else(|| "server did not return HTTP 200 before the deadline".to_string())
+}
+
+/// Stop a scaffolded cold-start server, preferring a graceful SIGTERM so the
+/// app runs its shutdown hooks (e.g. stopping a bundled Postgres cluster) before
+/// falling back to SIGKILL if it does not exit in time.
+fn stop_child(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        if let Some(pid) = crate::process::validate_pid_for_kill(child.id())
+            && let Err(e) = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(pid),
+                nix::sys::signal::Signal::SIGTERM,
+            )
+        {
+            eprintln!("  Warning: failed to SIGTERM cold-start server: {e}");
+        }
+        if crate::process::wait_with_timeout(child, Duration::from_secs(10)).is_err() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
 }
 
 /// Run the cold-start measurement `runs` times, returning the samples (ms).
