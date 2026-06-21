@@ -187,7 +187,6 @@ fn run_unix(action: Option<ServeAction>, opts: &ServeOptions) -> i32 {
             let keep_profile = env_profile()
                 .or_else(|| running.as_ref().and_then(|a| a.profile.clone()))
                 .or_else(|| recorded_mode.and_then(|m| m.profile));
-            let _ = stop(opts);
             let daemon_opts = ServeOptions {
                 daemon: true,
                 bundled_pg: keep_managed,
@@ -195,6 +194,12 @@ fn run_unix(action: Option<ServeAction>, opts: &ServeOptions) -> i32 {
                 profile: keep_profile,
                 ..opts.clone()
             };
+            // Stop using the *recovered* mode, not the bare restart flags: when
+            // `serve.addr` is missing/corrupt, `stop`'s budget falls back to
+            // recomputing from release/profile, and the restart shell's defaults
+            // would otherwise derive a short `dev` budget and SIGKILL a release
+            // daemon before it finishes draining.
+            let _ = stop(&daemon_opts);
             start(&daemon_opts)
         }
     }
@@ -464,8 +469,12 @@ fn workspace_anchor_from(start: &Path) -> Option<PathBuf> {
         topmost_manifest = Some(dir.to_path_buf());
         match toml::from_str::<toml::Table>(&contents) {
             Ok(table) if table.contains_key("workspace") => return Some(dir.to_path_buf()),
-            Ok(_) => {}
-            Err(_) => saw_unparsable = true,
+            // Only a manifest that *looks* like a workspace root counts as a
+            // transiently-broken root worth anchoring to. An unrelated broken
+            // `Cargo.toml` up the tree (e.g. one in the user's home dir) must not
+            // hijack a standalone project's anchor and corrupt its identity.
+            Err(_) if contents.contains("[workspace]") => saw_unparsable = true,
+            Ok(_) | Err(_) => {}
         }
     }
     if saw_unparsable {
@@ -1059,6 +1068,7 @@ fn stop(opts: &ServeOptions) -> i32 {
         &rec,
         stop_timeout(opts, recorded_release, recorded_budget),
         &socket,
+        startup_in_progress(&paths),
     ) {
         // The daemon is still alive and we couldn't signal it (e.g. it is owned
         // by another user — `kill` returned `EPERM`). Do NOT remove its state or
@@ -1154,6 +1164,13 @@ pub struct ManagedPgEnv {
 /// in which case the run falls back to the provider's own per-project default.
 #[must_use]
 pub fn managed_pg_env(package: Option<&str>) -> Option<ManagedPgEnv> {
+    // Respect an explicit operator override: if the environment already pins the
+    // managed-PG data dir (e.g. a CI/ops run targeting an isolated cluster), don't
+    // clobber it or redirect the run to the CLI's platform cluster. Returning
+    // `None` leaves the child to inherit the caller's `AUTUMN_MANAGED_PG_DATA_DIR`.
+    if std::env::var_os(MANAGED_PG_DATA_DIR_ENV).is_some() {
+        return None;
+    }
     let paths = RuntimePaths::resolve(&project_identity(package)).ok()?;
     let attach_url = live_managed_pg_url(&paths);
     Some(ManagedPgEnv {
@@ -1166,21 +1183,34 @@ pub fn managed_pg_env(package: Option<&str>) -> Option<ManagedPgEnv> {
 /// the cluster is currently running. Combines the live-postmaster check with the
 /// URL file the provider writes next to the data dir.
 fn live_managed_pg_url(paths: &RuntimePaths) -> Option<String> {
-    let data_dir = paths.pg_data_dir();
-    live_postmaster_pid(&data_dir)?;
-    // The provider publishes the URL beside the data dir. Keep this filename in
-    // sync with `autumn_web::managed_pg::PUBLISHED_URL_FILE` (the CLI doesn't
-    // build the `managed-pg` feature, so it can't reference the const).
-    let url_file = data_dir
-        .parent()
-        .unwrap_or(&data_dir)
-        .join(".autumn-pg-url");
-    let contents = std::fs::read_to_string(url_file).ok()?;
-    let trimmed = contents.trim();
-    if trimmed.is_empty() {
+    // Restrict attach discovery to Unix. Off Unix, `process::is_process_alive` is
+    // a conservative `true` (the daemon lock's fail-safe), so a stale
+    // `postmaster.pid` + URL file left by a crash would make `task`/`build`
+    // attach to a *dead* cluster instead of starting their own. The daemon is
+    // Unix-only anyway, so there's nothing live to share off Unix.
+    #[cfg(not(unix))]
+    {
+        let _ = paths;
         None
-    } else {
-        Some(trimmed.to_owned())
+    }
+    #[cfg(unix)]
+    {
+        let data_dir = paths.pg_data_dir();
+        live_postmaster_pid(&data_dir)?;
+        // The provider publishes the URL beside the data dir. Keep this filename
+        // in sync with `autumn_web::managed_pg::PUBLISHED_URL_FILE` (the CLI
+        // doesn't build the `managed-pg` feature, so it can't reference the const).
+        let url_file = data_dir
+            .parent()
+            .unwrap_or(&data_dir)
+            .join(".autumn-pg-url");
+        let contents = std::fs::read_to_string(url_file).ok()?;
+        let trimmed = contents.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_owned())
+        }
     }
 }
 
@@ -1550,13 +1580,34 @@ mod tests {
     }
 
     #[test]
+    fn workspace_anchor_ignores_unrelated_broken_parent_manifest() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = std::fs::canonicalize(tmp.path()).expect("canonicalize root");
+        // A broken `Cargo.toml` up the tree that is NOT a workspace root (e.g. a
+        // stray/half-written file in a parent dir) must not hijack the anchor.
+        std::fs::write(root.join("Cargo.toml"), "this is = not [ valid toml")
+            .expect("write broken parent manifest");
+        let project = root.join("proj");
+        std::fs::create_dir_all(&project).expect("create project dir");
+        std::fs::write(
+            project.join("Cargo.toml"),
+            "[package]\nname = \"proj\"\nversion = \"0.1.0\"\n",
+        )
+        .expect("write project manifest");
+        // The anchor is the standalone project, not the broken parent.
+        assert_eq!(workspace_anchor_from(&project), Some(project));
+    }
+
+    #[test]
     fn workspace_anchor_stable_when_root_manifest_unparsable() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let root = std::fs::canonicalize(tmp.path()).expect("canonicalize root");
-        // The workspace root manifest is temporarily broken (mid-edit).
+        // The workspace root manifest is temporarily broken (mid-edit) but still
+        // carries the recognizable `[workspace]` header, so it's treated as a
+        // transiently-broken root rather than an unrelated broken manifest.
         std::fs::write(
             root.join("Cargo.toml"),
-            "[workspace\nthis is not valid toml",
+            "[workspace]\nmembers = [\n  \"crates/api\"",
         )
         .expect("write broken root manifest");
         let member = root.join("crates/api");

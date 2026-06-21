@@ -295,8 +295,15 @@ impl ManagedPostgresPoolProvider {
                 use std::io::Write;
                 // `mode(0o600)` only applies on create; tighten an existing
                 // (older-build / manually-created) file before writing the URL,
-                // which embeds the cluster superuser password.
-                enforce_password_file_mode_or_exit(&path);
+                // which embeds the cluster superuser password. Best-effort: unlike
+                // the superuser password file (whose mode gates boot), this
+                // published copy is an optimization, so a `chmod` failure (e.g. a
+                // mount without Unix permissions) must not fail the boot.
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+                }
                 if let Err(e) = f.write_all(url.as_bytes()) {
                     tracing::warn!(error = %e, path = %path.display(),
                         "managed Postgres: failed to publish cluster URL for task/build attach");

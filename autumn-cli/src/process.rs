@@ -364,13 +364,21 @@ pub fn wait_for_record_exit(record: &PidRecord, timeout: Duration) -> bool {
 /// signal instead — if it no longer has a live listener, the daemon has exited
 /// and the still-"alive" PID belongs to an unrelated reuser, so the
 /// `SIGKILL`/`killpg` escalation is skipped rather than aimed at a stranger.
+/// `startup_in_progress` guards that socket check: a daemon still starting hasn't
+/// bound its socket yet, so without it a stop racing startup would mistake our
+/// own starting daemon for a dead one and orphan it.
 ///
 /// A `false` return means the daemon could **not** be stopped — e.g. it is owned
 /// by another user and `kill` returns `EPERM` — so the caller must not delete
 /// its state or report success.
 #[cfg(unix)]
 #[must_use]
-pub fn stop_record(record: &PidRecord, timeout: Duration, socket: &Path) -> bool {
+pub fn stop_record(
+    record: &PidRecord,
+    timeout: Duration,
+    socket: &Path,
+    startup_in_progress: bool,
+) -> bool {
     let _ = signal_terminate(record.pid);
     if wait_for_record_exit(record, timeout) {
         return true;
@@ -379,8 +387,10 @@ pub fn stop_record(record: &PidRecord, timeout: Duration, socket: &Path) -> bool
     // recorded start time, `is_record_alive` is a bare liveness check that can't
     // tell our daemon from a process that reused its PID after it exited. Use the
     // daemon's socket as the identity check: only our daemon listens there, so a
-    // dead socket means it's gone — don't escalate against the reused PID.
-    if record.start_time.is_none() && !socket_has_live_listener(socket) {
+    // dead socket means it's gone — don't escalate against the reused PID. But a
+    // start still in progress hasn't bound the socket yet, and that live PID *is*
+    // our starting daemon, so don't skip escalation in that window.
+    if record.start_time.is_none() && !startup_in_progress && !socket_has_live_listener(socket) {
         return true;
     }
     if !is_record_alive(record) {
@@ -440,7 +450,12 @@ pub fn stop_postmaster(_pid: u32, _timeout: Duration) {}
 /// Non-Unix fallback: no graceful-signal mechanism in this MVP.
 #[cfg(not(unix))]
 #[must_use]
-pub fn stop_record(_record: &PidRecord, _timeout: Duration, _socket: &Path) -> bool {
+pub fn stop_record(
+    _record: &PidRecord,
+    _timeout: Duration,
+    _socket: &Path,
+    _startup_in_progress: bool,
+) -> bool {
     false
 }
 
