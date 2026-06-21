@@ -747,12 +747,16 @@ fn measure_cold_start_once(shape: ColdStartShape) -> Result<u64, String> {
         .and_then(|p| p.parse::<u16>().ok())
         .unwrap_or(3000);
 
-    // Cold build into the project's own (empty) target/. Remove any inherited
-    // CARGO_TARGET_DIR so we never reuse a warm cache from the parent build.
+    // Cold build into the project's own (empty) target/. Remove every inherited
+    // Cargo target/triple override so artifacts land in `target/debug/` (not a
+    // shared dir or a `target/<triple>/debug/` path) and the warm cache from the
+    // parent build is never reused.
     let build_ok = Command::new("cargo")
         .arg("build")
         .current_dir(&project_dir)
         .env_remove("CARGO_TARGET_DIR")
+        .env_remove("CARGO_BUILD_TARGET_DIR")
+        .env_remove("CARGO_BUILD_TARGET")
         .status()
         .map_err(|e| format!("cargo build spawn failed: {e}"))?
         .success();
@@ -783,7 +787,18 @@ fn measure_cold_start_once(shape: ColdStartShape) -> Result<u64, String> {
     // Then pin exactly the host+port we poll (env vars are the highest-precedence
     // config source, overriding autumn.toml).
     cmd.env("AUTUMN_SERVER__HOST", "127.0.0.1")
-        .env("AUTUMN_SERVER__PORT", port.to_string())
+        .env("AUTUMN_SERVER__PORT", port.to_string());
+    // For the DB shape, keep the bundled managed-Postgres cluster inside the
+    // throwaway temp dir so the run is self-contained: otherwise the provider
+    // defaults to `$HOME/.local/share/autumn/...` and leaves a full Postgres
+    // data/extraction directory behind after the tempdir is removed.
+    if matches!(shape, ColdStartShape::Db) {
+        cmd.env(
+            "AUTUMN_MANAGED_PG_DATA_DIR",
+            project_dir.join("managed-pg-data"),
+        );
+    }
+    cmd
         // Discard the app's own logs so they never interleave with the JSON
         // report on stdout; the harness reports progress on stderr separately.
         .stdout(Stdio::null())
