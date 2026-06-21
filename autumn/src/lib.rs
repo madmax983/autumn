@@ -90,6 +90,7 @@ pub mod encryption;
 pub mod error;
 pub mod error_pages;
 pub mod extract;
+pub mod feature_flag;
 pub mod health;
 #[cfg(feature = "db")]
 pub mod hooks;
