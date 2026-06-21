@@ -2083,6 +2083,11 @@ impl AutumnConfig {
             "AUTUMN_SERVER__TIMEOUTS__REQUEST_TIMEOUT_MS",
             &mut self.server.timeouts.request_timeout_ms,
         );
+        parse_env_option_string(
+            env,
+            "AUTUMN_SERVER__UNIX_SOCKET",
+            &mut self.server.unix_socket,
+        );
     }
 
     fn apply_database_env_overrides_with_env(&mut self, env: &dyn Env) {
@@ -3008,6 +3013,18 @@ pub struct ServerConfig {
     /// Set `request_timeout_ms` in `[server.timeouts]` to enable.
     #[serde(default)]
     pub timeouts: RequestTimeoutsConfig,
+
+    /// Bind to a Unix domain socket at this path instead of `host:port`.
+    ///
+    /// When set, the server binds a `UnixListener` at the given path
+    /// (replacing the TCP `host:port` bind) — the local-daemon transport
+    /// used by `autumn serve`. The socket is created with `0600`
+    /// permissions and removed on graceful shutdown. Unix-only; on other
+    /// platforms a configured value is rejected at startup.
+    ///
+    /// Configured via `AUTUMN_SERVER__UNIX_SOCKET`. Default: `None` (TCP).
+    #[serde(default)]
+    pub unix_socket: Option<String>,
 }
 
 /// Behavior when a configured read replica is unavailable or stale.
@@ -4137,6 +4154,7 @@ impl Default for ServerConfig {
             shutdown_timeout_secs: default_shutdown_timeout(),
             prestop_grace_secs: default_prestop_grace(),
             timeouts: RequestTimeoutsConfig::default(),
+            unix_socket: None,
         }
     }
 }
@@ -6028,6 +6046,38 @@ path = "/healthz"
         let mut config = AutumnConfig::default();
         config.apply_env_overrides_with_env(&env);
         assert_eq!(config.server.shutdown_timeout_secs, 30);
+    }
+
+    #[test]
+    fn server_config_defaults_unix_socket_none() {
+        let config = AutumnConfig::default();
+        assert!(config.server.unix_socket.is_none());
+    }
+
+    #[test]
+    fn env_override_server_unix_socket() {
+        let env = MockEnv::new().with("AUTUMN_SERVER__UNIX_SOCKET", "/run/autumn/app.sock");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+        assert_eq!(
+            config.server.unix_socket.as_deref(),
+            Some("/run/autumn/app.sock")
+        );
+    }
+
+    #[test]
+    fn unix_socket_parses_from_toml() {
+        let config: AutumnConfig = toml::from_str(
+            r#"
+            [server]
+            unix_socket = "/tmp/autumn.sock"
+            "#,
+        )
+        .expect("config with server.unix_socket should parse");
+        assert_eq!(
+            config.server.unix_socket.as_deref(),
+            Some("/tmp/autumn.sock")
+        );
     }
 
     // ── Log env override tests ───────────────────────────────────

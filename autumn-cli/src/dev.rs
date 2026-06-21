@@ -208,11 +208,11 @@ pub fn run(package: Option<&str>, show_config: bool) {
         }
     };
     // Initial build
-    if !cargo_build(package) {
+    if !cargo_build(package, false) {
         eprintln!("\u{2717} Initial build failed. Fix errors and save to retry.\n");
     }
 
-    let binary = find_binary(package);
+    let binary = find_binary(package, false);
     let mut child = start_server(
         &binary,
         reload_state.as_ref().map(DevReloadState::path),
@@ -468,7 +468,7 @@ fn execute_plan(
     if plan.build {
         stop_server(child);
 
-        if cargo_build(package) {
+        if cargo_build(package, false) {
             if restart_server(
                 package,
                 child,
@@ -534,9 +534,12 @@ fn plan_changes(
 }
 
 /// Build a `cargo build` command for the given package.
-fn build_cargo_command(package: Option<&str>) -> Command {
+pub fn build_cargo_command(package: Option<&str>, release: bool) -> Command {
     let mut cmd = Command::new("cargo");
     cmd.arg("build");
+    if release {
+        cmd.arg("--release");
+    }
     if let Some(pkg) = package {
         cmd.args(["-p", pkg]);
     }
@@ -544,8 +547,8 @@ fn build_cargo_command(package: Option<&str>) -> Command {
 }
 
 /// Run `cargo build` for the given package. Returns true on success.
-fn cargo_build(package: Option<&str>) -> bool {
-    let mut cmd = build_cargo_command(package);
+pub fn cargo_build(package: Option<&str>, release: bool) -> bool {
+    let mut cmd = build_cargo_command(package, release);
 
     eprintln!("  Compiling...");
     match cmd.status() {
@@ -589,19 +592,13 @@ fn start_server(
     }
 }
 
-#[cfg(unix)]
-fn validate_pid_for_kill(pid: u32) -> Option<libc::pid_t> {
-    let cast_pid = pid.try_into().ok()?;
-    if cast_pid > 0 { Some(cast_pid) } else { None }
-}
-
 /// Stop the running server process gracefully.
 fn stop_server(child: &mut Option<Child>) {
     if let Some(proc) = child {
         // Send SIGTERM on Unix for graceful shutdown
         #[cfg(unix)]
         {
-            if let Some(pid) = validate_pid_for_kill(proc.id())
+            if let Some(pid) = crate::process::validate_pid_for_kill(proc.id())
                 && let Err(e) = nix::sys::signal::kill(
                     nix::unistd::Pid::from_raw(pid),
                     nix::sys::signal::Signal::SIGTERM,
@@ -610,7 +607,7 @@ fn stop_server(child: &mut Option<Child>) {
                 eprintln!("  Warning: failed to send SIGTERM to process: {e}");
             }
             // Wait briefly for graceful shutdown before forcing
-            if wait_with_timeout(proc, Duration::from_secs(5)).is_err() {
+            if crate::process::wait_with_timeout(proc, Duration::from_secs(5)).is_err() {
                 let _ = proc.kill();
                 let _ = proc.wait();
             }
@@ -623,24 +620,6 @@ fn stop_server(child: &mut Option<Child>) {
         }
     }
     *child = None;
-}
-
-/// Wait for a child process with a timeout. Returns Err if timed out.
-#[cfg(unix)]
-fn wait_with_timeout(child: &mut Child, timeout: Duration) -> Result<(), ()> {
-    let start = std::time::Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => return Ok(()),
-            Ok(None) => {
-                if start.elapsed() >= timeout {
-                    return Err(());
-                }
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            Err(_) => return Err(()),
-        }
-    }
 }
 
 /// Check if a file change event is relevant enough to trigger a rebuild.
@@ -795,7 +774,7 @@ fn restart_server(
     reload_state_path: Option<&Path>,
     show_config: bool,
 ) -> bool {
-    let binary = find_binary(package);
+    let binary = find_binary(package, false);
     *child = start_server(&binary, reload_state_path, show_config);
     child.is_some()
 }
@@ -906,6 +885,44 @@ fn cargo_metadata() -> serde_json::Value {
     serde_json::from_slice(&output.stdout).expect("parse cargo metadata")
 }
 
+/// Best-effort `cargo metadata`: returns `None` instead of exiting when the
+/// workspace manifests are missing/invalid. Used by lifecycle paths (e.g.
+/// `autumn serve stop`) that must keep working even with a broken `Cargo.toml`.
+fn try_cargo_metadata() -> Option<serde_json::Value> {
+    let output = Command::new("cargo")
+        .args(["metadata", "--format-version=1", "--no-deps"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    serde_json::from_slice(&output.stdout).ok()
+}
+
+/// Directory containing a workspace member's `Cargo.toml`, resolved via
+/// `cargo metadata`.
+///
+/// `autumn serve -p <member>` launched from a workspace root would otherwise run
+/// the app with the workspace-root CWD, so the app's config loader (which falls
+/// back to CWD when `AUTUMN_MANIFEST_DIR` is unset) skips the member's
+/// `autumn.toml`/profile and asset dirs. Callers use this to point the child at
+/// the member's directory. Best-effort: returns `None` if metadata can't be read
+/// or the package isn't found, so lifecycle commands never fail solely because
+/// `cargo metadata` does.
+#[must_use]
+pub fn find_manifest_dir(package: &str) -> Option<PathBuf> {
+    let metadata = try_cargo_metadata()?;
+    metadata["packages"].as_array()?.iter().find_map(|pkg| {
+        if pkg["name"].as_str() == Some(package) {
+            Path::new(pkg["manifest_path"].as_str()?)
+                .parent()
+                .map(Path::to_path_buf)
+        } else {
+            None
+        }
+    })
+}
+
 /// Resolve a binary path from parsed cargo metadata JSON.
 ///
 /// Extracted from `find_binary` for testability. Takes the parsed
@@ -980,19 +997,30 @@ fn resolve_binary_from_metadata(
 
 /// Locate the compiled binary using `cargo metadata`.
 ///
-/// Always targets the debug profile since `autumn dev` is for development.
-fn find_binary(package: Option<&str>) -> PathBuf {
+/// Resolves the debug-profile path; when `release` is set, swaps the profile
+/// directory to `release` (used by `autumn serve` for production builds).
+pub fn find_binary(package: Option<&str>, release: bool) -> PathBuf {
     let metadata = cargo_metadata();
 
     let cwd = std::env::current_dir().expect("current dir");
 
-    resolve_binary_from_metadata(&metadata, package, &cwd).unwrap_or_else(|e| {
+    let path = resolve_binary_from_metadata(&metadata, package, &cwd).unwrap_or_else(|e| {
         eprintln!("\u{2717} {e}");
         if package.is_none() {
             eprintln!("  Hint: use -p <package> to specify the target package");
         }
         std::process::exit(1);
-    })
+    });
+
+    if release {
+        // `.../<target>/debug/<bin>` -> `.../<target>/release/<bin>`.
+        if let (Some(target_dir), Some(bin)) =
+            (path.parent().and_then(Path::parent), path.file_name())
+        {
+            return target_dir.join("release").join(bin);
+        }
+    }
+    path
 }
 
 #[cfg(test)]
@@ -1325,7 +1353,7 @@ mod tests {
 
     #[test]
     fn build_command_without_package() {
-        let cmd = build_cargo_command(None);
+        let cmd = build_cargo_command(None, false);
         let args: Vec<_> = cmd.get_args().collect();
         assert_eq!(cmd.get_program(), "cargo");
         assert_eq!(args, &["build"]);
@@ -1333,10 +1361,17 @@ mod tests {
 
     #[test]
     fn build_command_with_package() {
-        let cmd = build_cargo_command(Some("my-app"));
+        let cmd = build_cargo_command(Some("my-app"), false);
         let args: Vec<_> = cmd.get_args().collect();
         assert_eq!(cmd.get_program(), "cargo");
         assert_eq!(args, &["build", "-p", "my-app"]);
+    }
+
+    #[test]
+    fn build_command_release_adds_flag() {
+        let cmd = build_cargo_command(None, true);
+        let args: Vec<_> = cmd.get_args().collect();
+        assert_eq!(args, &["build", "--release"]);
     }
 
     #[test]
@@ -1559,21 +1594,6 @@ mod tests {
 
     // ── stop_server tests ──────────────────────────────────────────
 
-    #[cfg(unix)]
-    mod havoc_proptest {
-        use super::*;
-        use proptest::prelude::*;
-
-        proptest! {
-            #[test]
-            fn safe_pid_cast(pid in proptest::num::u32::ANY) {
-                if let Some(safe_pid) = validate_pid_for_kill(pid) {
-                    assert!(safe_pid > 0, "Safe PID must be strictly positive");
-                }
-            }
-        }
-    }
-
     #[test]
     fn stop_server_with_none_is_noop() {
         let mut child: Option<Child> = None;
@@ -1596,42 +1616,20 @@ mod tests {
         assert!(child.is_none());
     }
 
-    // ── wait_with_timeout tests ────────────────────────────────────
-
-    #[cfg(unix)]
-    #[test]
-    fn wait_with_timeout_succeeds_for_fast_process() {
-        let mut child = Command::new("true").spawn().expect("spawn true");
-        // Give it a moment to exit
-        std::thread::sleep(Duration::from_millis(50));
-        let result = wait_with_timeout(&mut child, Duration::from_secs(2));
-        assert!(result.is_ok());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn wait_with_timeout_times_out_for_long_process() {
-        let mut child = Command::new("sleep")
-            .arg("60")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn sleep");
-        let result = wait_with_timeout(&mut child, Duration::from_millis(100));
-        assert!(result.is_err());
-        // Clean up
-        let _ = child.kill();
-        let _ = child.wait();
-    }
-
     // ── find_binary tests ──────────────────────────────────────────
 
     #[test]
     fn find_binary_resolves_workspace_package() {
         // We're running inside the autumn workspace, so this should find
         // the hello example's binary.
-        let path = find_binary(Some("hello"));
+        let path = find_binary(Some("hello"), false);
         assert!(path.ends_with("debug/hello") || path.ends_with("debug/hello.exe"));
+    }
+
+    #[test]
+    fn find_binary_release_resolves_release_dir() {
+        let path = find_binary(Some("hello"), true);
+        assert!(path.ends_with("release/hello") || path.ends_with("release/hello.exe"));
     }
 
     // ── constants tests ────────────────────────────────────────────

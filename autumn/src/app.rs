@@ -2842,6 +2842,7 @@ impl AppBuilder {
         )
         .unwrap_or_else(|error| {
             tracing::error!(error = %error, "Failed to configure mailer");
+            exit_stop_managed_pg();
             std::process::exit(1);
         });
         #[cfg(feature = "mail")]
@@ -2991,19 +2992,95 @@ impl AppBuilder {
         )
         .unwrap_or_else(|error| {
             tracing::error!(error = %error, "Failed to build router");
+            exit_stop_managed_pg();
             std::process::exit(1);
         });
 
         // 7. Bind and initialize pre-serve runtime dependencies. Once those
         // are ready, start listening before startup hooks finish so `/startup`
         // can honestly report startup progress.
-        let addr = format!("{}:{}", config.server.host, config.server.port);
-        let listener = tokio::net::TcpListener::bind(&addr)
-            .await
-            .unwrap_or_else(|e| {
-                tracing::error!(addr = %addr, "Failed to bind: {e}");
+        // Bind the configured transport. A `server.unix_socket` path selects a
+        // Unix domain socket (local daemon mode); otherwise bind TCP on
+        // `host:port` as before. `bound_desc` is the human/log description and
+        // `unix_socket_cleanup` is the socket to unlink on clean exit (axum does
+        // not remove it for us), as `(path, dev, inode)` so cleanup can confirm
+        // the file is still the one *this* process bound before removing it.
+        let (bound_listener, bound_desc, unix_socket_cleanup): (
+            BoundListener,
+            String,
+            Option<(std::path::PathBuf, u64, u64)>,
+        ) = if let Some(socket_path) = config.server.unix_socket.as_deref() {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let path = std::path::Path::new(socket_path);
+                if let Err(e) = prepare_unix_socket_path(path) {
+                    tracing::error!(socket = %socket_path, "Failed to prepare unix socket: {e}");
+                    // `setup_database` already started the managed Postgres child;
+                    // `process::exit` skips `on_shutdown`, so stop it first.
+                    #[cfg(feature = "managed-pg")]
+                    crate::managed_pg::emergency_stop_async().await;
+                    std::process::exit(1);
+                }
+                let listener = match tokio::net::UnixListener::bind(path) {
+                    Ok(listener) => listener,
+                    Err(e) => {
+                        tracing::error!(socket = %socket_path, "Failed to bind unix socket: {e}");
+                        #[cfg(feature = "managed-pg")]
+                        crate::managed_pg::emergency_stop_async().await;
+                        std::process::exit(1);
+                    }
+                };
+                // Local-daemon socket: owner-only access. Fail *closed* — a
+                // user-configured `server.unix_socket` may sit in a shared
+                // directory, so if we cannot enforce `0600` (chmod error, an ACL
+                // /filesystem that rejects it), refuse to serve rather than
+                // expose a world-reachable control socket. Remove the socket we
+                // just bound so nothing keeps listening on it.
+                if let Err(e) =
+                    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+                {
+                    tracing::error!(socket = %socket_path, "Failed to enforce owner-only permissions on unix socket: {e}");
+                    let _ = std::fs::remove_file(path);
+                    #[cfg(feature = "managed-pg")]
+                    crate::managed_pg::emergency_stop_async().await;
+                    std::process::exit(1);
+                }
+                // Capture the bound socket's identity so a later successor that
+                // rebinds the same path isn't unlinked by our shutdown.
+                let (dev, ino) = {
+                    use std::os::unix::fs::MetadataExt;
+                    std::fs::metadata(path).map_or((0, 0), |m| (m.dev(), m.ino()))
+                };
+                (
+                    BoundListener::Unix(listener),
+                    format!("unix:{socket_path}"),
+                    Some((path.to_path_buf(), dev, ino)),
+                )
+            }
+            #[cfg(not(unix))]
+            {
+                tracing::error!(
+                    "server.unix_socket is only supported on Unix platforms; \
+                     unset it or use server.host/server.port"
+                );
                 std::process::exit(1);
-            });
+            }
+        } else {
+            let addr = format!("{}:{}", config.server.host, config.server.port);
+            let listener = match tokio::net::TcpListener::bind(&addr).await {
+                Ok(listener) => listener,
+                Err(e) => {
+                    tracing::error!(addr = %addr, "Failed to bind: {e}");
+                    // Stop the managed Postgres child started by `setup_database`
+                    // before bailing; `process::exit` skips `on_shutdown`.
+                    #[cfg(feature = "managed-pg")]
+                    crate::managed_pg::emergency_stop_async().await;
+                    std::process::exit(1);
+                }
+            };
+            (BoundListener::Tcp(listener), addr, None)
+        };
 
         let shutdown_timeout = config.server.shutdown_timeout_secs;
         let prestop_grace = config.server.prestop_grace_secs;
@@ -3011,6 +3088,10 @@ impl AppBuilder {
 
         if let Err(error) = initialize_job_runtime(jobs, &state, &server_shutdown, &config.jobs) {
             tracing::error!(error = %error, "job runtime initialization failed");
+            // Post-DB failure: `process::exit` skips `on_shutdown`, so stop any
+            // managed Postgres before bailing.
+            #[cfg(feature = "managed-pg")]
+            crate::managed_pg::emergency_stop_async().await;
             std::process::exit(1);
         }
 
@@ -3050,7 +3131,7 @@ impl AppBuilder {
             });
         }
 
-        tracing::info!(addr = %addr, "Listening");
+        tracing::info!(bound = %bound_desc, "Listening");
 
         let server_shutdown_wait = server_shutdown.clone();
         // Wrap the built router with the HTML form method-override layer at
@@ -3073,17 +3154,49 @@ impl AppBuilder {
             &crate::security::TrustedProxiesLayer::from_config(&config.security.trusted_proxies),
             after_method,
         );
-        let make_service =
-            axum::ServiceExt::<axum::extract::Request>::into_make_service_with_connect_info::<
-                std::net::SocketAddr,
-            >(service);
-        let server_task = tokio::spawn(async move {
-            axum::serve(listener, make_service)
-                .with_graceful_shutdown(async move {
-                    server_shutdown_wait.cancelled().await;
+        // Spawn the serve task per transport. The two arms differ only in the
+        // connect-info type baked into the make-service (`SocketAddr` for TCP,
+        // `UdsConnectInfo` for Unix sockets); the graceful-shutdown wiring and
+        // the resulting `JoinHandle<io::Result<()>>` are identical. Handlers
+        // extracting `ConnectInfo<SocketAddr>` are unsupported under a Unix
+        // socket (acceptable: daemon mode is loopback-equivalent and local).
+        let server_task = match bound_listener {
+            BoundListener::Tcp(listener) => {
+                let make_service =
+                    axum::ServiceExt::<axum::extract::Request>::into_make_service_with_connect_info::<
+                        std::net::SocketAddr,
+                    >(service);
+                tokio::spawn(async move {
+                    axum::serve(listener, make_service)
+                        .with_graceful_shutdown(async move {
+                            server_shutdown_wait.cancelled().await;
+                        })
+                        .await
                 })
-                .await
-        });
+            }
+            #[cfg(unix)]
+            BoundListener::Unix(listener) => {
+                // UDS requests carry no TCP peer, so stamp a loopback identity
+                // before `TrustedProxiesLayer` runs — local daemon requests then
+                // resolve a `ClientAddr` (and IP-based maintenance/rate-limit
+                // behavior works) exactly like a localhost TCP connection.
+                let service = tower::Layer::layer(
+                    &axum::middleware::from_fn(stamp_loopback_connect_info),
+                    service,
+                );
+                let make_service =
+                    axum::ServiceExt::<axum::extract::Request>::into_make_service_with_connect_info::<
+                        UdsConnectInfo,
+                    >(service);
+                tokio::spawn(async move {
+                    axum::serve(listener, make_service)
+                        .with_graceful_shutdown(async move {
+                            server_shutdown_wait.cancelled().await;
+                        })
+                        .await
+                })
+            }
+        };
 
         let shutdown_state = state.clone();
         let shutdown_signal_token = server_shutdown.clone();
@@ -3196,6 +3309,11 @@ impl AppBuilder {
                 exit_code = 1,
                 "shutdown: in_flight_drain phase exceeded deadline; terminating"
             );
+            // The watchdog's `process::exit` skips the remaining `on_shutdown`
+            // hooks — including a managed-Postgres `stop()` — so a drain that
+            // overruns its budget would orphan the postmaster. Stop it here too.
+            #[cfg(feature = "managed-pg")]
+            crate::managed_pg::emergency_stop_async().await;
             std::process::exit(1);
         });
 
@@ -3203,6 +3321,9 @@ impl AppBuilder {
             tracing::error!(error = %error, "startup hook failed");
             server_shutdown.cancel();
             server_task.abort();
+            // `process::exit` skips `on_shutdown`; stop any managed Postgres.
+            #[cfg(feature = "managed-pg")]
+            crate::managed_pg::emergency_stop_async().await;
             std::process::exit(1);
         }
 
@@ -3218,10 +3339,19 @@ impl AppBuilder {
                     tracing::error!(error = %err, "scheduled task runtime initialization failed");
                     server_shutdown.cancel();
                     server_task.abort();
+                    // `process::exit` skips `on_shutdown`; stop any managed Postgres.
+                    #[cfg(feature = "managed-pg")]
+                    crate::managed_pg::emergency_stop_async().await;
                     std::process::exit(1);
                 }
             }
             state.probes().mark_startup_complete();
+            signal_serve_ready(
+                config
+                    .server
+                    .prestop_grace_secs
+                    .saturating_add(config.server.shutdown_timeout_secs),
+            );
         }
 
         // Signal the drain phase. The watchdog checks the flag for the common
@@ -3235,12 +3365,17 @@ impl AppBuilder {
         // watchdog in shutdown_task will force-exit if drain takes too long.
         let server_result = server_task.await.unwrap_or_else(|e| {
             tracing::error!("Server task join error: {e}");
+            // `process::exit` skips the `on_shutdown` hooks, so stop a managed
+            // Postgres child here to avoid orphaning it on an accept-loop/join
+            // failure (direct/foreground runs have no CLI reaper).
+            exit_stop_managed_pg();
             std::process::exit(1);
         });
         // Drain completed within the deadline; abort the watchdog.
         shutdown_task.abort();
         server_result.unwrap_or_else(|e| {
             tracing::error!("Server error: {e}");
+            exit_stop_managed_pg();
             std::process::exit(1);
         });
 
@@ -3254,6 +3389,31 @@ impl AppBuilder {
         let hook_budget =
             std::time::Duration::from_secs(shutdown_timeout).saturating_sub(drain_elapsed);
         run_shutdown_hooks_with_timeout(&shutdown_hooks, hook_budget, hook_budget).await;
+        // If request drain consumed the whole `shutdown_timeout_secs`, the
+        // managed-Postgres `on_shutdown` hook may have been budgeted away above.
+        // Stop the cluster directly here (idempotent — a no-op once the hook
+        // already stopped it) so a direct/foreground run, which has no CLI
+        // reaper, never leaves the postmaster holding the data dir/port.
+        #[cfg(feature = "managed-pg")]
+        crate::managed_pg::emergency_stop_async().await;
+
+        // Remove the Unix socket file on clean exit; axum does not unlink it.
+        // (An abnormal force-exit may leave it behind, but the next bind's
+        // `prepare_unix_socket_path` reclaims a stale socket.) Only unlink if the
+        // socket is still the one we bound — a successor that rebound the same
+        // path after we closed has a different inode, and removing it would make
+        // the new server unreachable.
+        #[cfg(unix)]
+        if let Some((path, dev, ino)) = &unix_socket_cleanup {
+            use std::os::unix::fs::MetadataExt;
+            let still_ours =
+                std::fs::metadata(path).is_ok_and(|m| m.dev() == *dev && m.ino() == *ino);
+            if still_ours {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = &unix_socket_cleanup;
 
         tracing::info!(exit_code = 0, "shutdown: all phases completed cleanly");
     }
@@ -3539,6 +3699,7 @@ impl AppBuilder {
         )
         .unwrap_or_else(|error| {
             eprintln!("Failed to configure mailer: {error}");
+            exit_stop_managed_pg();
             std::process::exit(1);
         });
         #[cfg(feature = "mail")]
@@ -3604,6 +3765,7 @@ impl AppBuilder {
         )
         .unwrap_or_else(|error| {
             eprintln!("Failed to build router: {error}");
+            exit_stop_managed_pg();
             std::process::exit(1);
         });
 
@@ -3621,6 +3783,7 @@ impl AppBuilder {
             }
             Err(e) => {
                 eprintln!("\n  \u{2717} Static build failed: {e}");
+                exit_stop_managed_pg();
                 std::process::exit(1);
             }
         }
@@ -3695,6 +3858,12 @@ impl AppBuilder {
                 }
             }
         }
+
+        // Build finished: stop the managed Postgres child `setup_database` may
+        // have started. Build mode discards the app's `on_shutdown` hooks, so
+        // without this even a *successful* `autumn build` would leak the cluster.
+        #[cfg(feature = "managed-pg")]
+        crate::managed_pg::emergency_stop_async().await;
     }
 
     /// Dump the application's route listing as JSON and exit.
@@ -4007,6 +4176,7 @@ impl AppBuilder {
         )
         .unwrap_or_else(|error| {
             eprintln!("Failed to configure mailer: {error}");
+            exit_stop_managed_pg();
             std::process::exit(1);
         });
 
@@ -4024,6 +4194,8 @@ impl AppBuilder {
         let task_shutdown = tokio_util::sync::CancellationToken::new();
         if let Err(error) = initialize_job_runtime(jobs, &state, &task_shutdown, &config.jobs) {
             eprintln!("job runtime initialization failed: {error}");
+            #[cfg(feature = "managed-pg")]
+            crate::managed_pg::emergency_stop_async().await;
             std::process::exit(1);
         }
 
@@ -4049,6 +4221,8 @@ impl AppBuilder {
         if let Err(error) = run_startup_hooks(&startup_hooks, state.clone()).await {
             eprintln!("startup hook failed: {error}");
             task_shutdown.cancel();
+            #[cfg(feature = "managed-pg")]
+            crate::managed_pg::emergency_stop_async().await;
             std::process::exit(1);
         }
         state.probes().mark_startup_complete();
@@ -4074,6 +4248,12 @@ impl AppBuilder {
 
         task_shutdown.cancel();
         run_shutdown_hooks(&shutdown_hooks).await;
+        // If the generated `pg.stop()` hook errored/timed out it keeps the
+        // handle for a retry, but a one-off task then exits — so retry the stop
+        // here (idempotent; a no-op once the hook stopped it cleanly) to avoid
+        // orphaning the postmaster on the data dir/port.
+        #[cfg(feature = "managed-pg")]
+        crate::managed_pg::emergency_stop_async().await;
 
         match result {
             Ok(()) => {
@@ -4093,6 +4273,24 @@ impl AppBuilder {
 
 pub(crate) fn is_static_build_mode() -> bool {
     std::env::var("AUTUMN_BUILD_STATIC").as_deref() == Ok("1")
+}
+
+/// Stop a managed Postgres child from a synchronous `process::exit` path in a
+/// non-server entrypoint (static build, one-off task). Those modes don't run
+/// `on_shutdown` before their failure exits, and `process::exit` skips `Drop`,
+/// so a managed cluster started by `setup_database` would otherwise be orphaned
+/// on the data dir/port.
+///
+/// These call sites run on a Tokio worker thread; the (blocking, own-runtime)
+/// `emergency_stop` would panic if entered there, so run it on a fresh thread
+/// with no ambient runtime. No-op unless the `managed-pg` feature is active.
+// The body is empty without `managed-pg` (so it can't be `const` with it).
+#[allow(clippy::missing_const_for_fn)]
+fn exit_stop_managed_pg() {
+    #[cfg(feature = "managed-pg")]
+    {
+        let _ = std::thread::spawn(crate::managed_pg::emergency_stop).join();
+    }
 }
 
 pub(crate) fn is_dump_routes_mode() -> bool {
@@ -4691,6 +4889,171 @@ fn initialize_job_runtime(
     }
 }
 
+/// A bound network listener for the server, abstracting over the transport.
+///
+/// `run()` binds one of these based on `config.server.unix_socket`: a TCP
+/// listener on `host:port` (the default) or a Unix domain socket (local
+/// daemon mode). The two carry different connect-info types, so the serve
+/// task is spawned per-variant.
+enum BoundListener {
+    /// TCP listener on `host:port`.
+    Tcp(tokio::net::TcpListener),
+    /// Unix domain socket listener (local daemon transport).
+    #[cfg(unix)]
+    Unix(tokio::net::UnixListener),
+}
+
+/// Connection info for a Unix-domain-socket request.
+///
+/// axum's `into_make_service_with_connect_info::<C>` requires `C:
+/// Connected<IncomingStream>`. Unlike TCP there is no peer `SocketAddr` for a
+/// Unix socket, so this carries no data — it exists purely to satisfy the
+/// connect-info bound on the UDS serve path.
+#[cfg(unix)]
+#[derive(Clone, Debug)]
+struct UdsConnectInfo;
+
+#[cfg(unix)]
+impl
+    axum::extract::connect_info::Connected<
+        axum::serve::IncomingStream<'_, tokio::net::UnixListener>,
+    > for UdsConnectInfo
+{
+    fn connect_info(_stream: axum::serve::IncomingStream<'_, tokio::net::UnixListener>) -> Self {
+        Self
+    }
+}
+
+/// Stamp a loopback peer (`127.0.0.1`) on Unix-domain-socket requests.
+///
+/// A UDS connection has no TCP peer `SocketAddr`, so without this the
+/// trusted-proxy resolver and the [`ClientAddr`](crate::extract::ClientAddr)
+/// extractor resolve no client address — breaking any route or middleware that
+/// requires `ClientAddr` and any IP-based maintenance/rate-limit behavior. Local
+/// daemon requests are loopback-equivalent, so present them as a `127.0.0.1`
+/// connection (matching how an equivalent localhost TCP request is treated).
+/// Installed before `TrustedProxiesLayer` on the UDS serve path only.
+#[cfg(unix)]
+async fn stamp_loopback_connect_info(
+    mut req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    if req
+        .extensions()
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+        .is_none()
+    {
+        let loopback =
+            std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 0);
+        req.extensions_mut()
+            .insert(axum::extract::ConnectInfo(loopback));
+    }
+    next.run(req).await
+}
+
+/// Signal `autumn serve --daemon`'s supervisor that startup is complete.
+///
+/// The CLI passes a path via `AUTUMN_SERVE_READY_FILE` and polls for it; we
+/// create it here, immediately after [`mark_startup_complete`], so the
+/// supervisor's notion of "ready" means the socket is bound and serving *and*
+/// startup hooks/migrations have finished — with no dependence on the app's HTTP
+/// middleware (the startup barrier, maintenance mode, rate limiting, or custom
+/// health paths, which an HTTP readiness probe would all have to thread).
+///
+/// The file's contents are the app's *resolved* graceful-drain budget in seconds
+/// (`prestop_grace_secs + shutdown_timeout_secs`). The supervisor records this so
+/// `autumn serve stop` waits for the budget the app will actually drain for —
+/// even when a custom `with_config_loader` set it — instead of reconstructing it
+/// from TOML/env and risking a premature `SIGKILL`.
+///
+/// Best-effort: a write failure only delays readiness detection until the
+/// supervisor's timeout, and a non-daemon run leaves the variable unset (no-op).
+///
+/// [`mark_startup_complete`]: crate::probe::ProbeState::mark_startup_complete
+fn signal_serve_ready(drain_budget_secs: u64) {
+    let Some(path) = std::env::var_os("AUTUMN_SERVE_READY_FILE") else {
+        return;
+    };
+    if path.is_empty() {
+        return;
+    }
+    let path = std::path::PathBuf::from(path);
+    // Write to a temp sibling and rename into place so the supervisor — which
+    // polls for the file's existence and then reads the budget from it — never
+    // observes a half-written file: it appears atomically with its full
+    // contents. A plain `write` would make the path exist before the bytes land.
+    let mut tmp = path.clone();
+    tmp.as_mut_os_string().push(".tmp");
+    if let Err(e) = std::fs::write(&tmp, drain_budget_secs.to_string())
+        .and_then(|()| std::fs::rename(&tmp, &path))
+    {
+        let _ = std::fs::remove_file(&tmp);
+        tracing::warn!(error = %e, path = %path.display(),
+            "could not write serve readiness file");
+    }
+}
+
+/// Prepare a Unix-socket path for binding: remove a *stale* socket left by a
+/// previous run, but refuse to touch a non-socket file (guards against
+/// clobbering a regular file) or a socket with a **live** listener (probed via
+/// `connect`; clobbering it would silently make that service unreachable —
+/// instead we fail like a TCP `EADDRINUSE`). A missing path is fine.
+///
+/// # Errors
+///
+/// Returns an error if the path exists and is not a socket, names a live
+/// listener, or the stale socket cannot be removed.
+#[cfg(unix)]
+fn prepare_unix_socket_path(path: &std::path::Path) -> std::io::Result<()> {
+    use std::os::unix::fs::FileTypeExt;
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_socket() => {
+            match std::os::unix::net::UnixStream::connect(path) {
+                // A successful connect means another process is listening here.
+                Ok(_) => Err(std::io::Error::new(
+                    std::io::ErrorKind::AddrInUse,
+                    format!(
+                        "refusing to bind unix socket: {} is already in use by a \
+                         live listener",
+                        path.display()
+                    ),
+                )),
+                // `ECONNREFUSED` (no listener) — or the path vanishing — means the
+                // socket is stale; reclaim it.
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+                    ) =>
+                {
+                    std::fs::remove_file(path)
+                }
+                // `EACCES`/`EPERM` (or any other error): the socket may be a live,
+                // operator-managed listener whose mode/ACL denies us. Connecting
+                // failed, but liveness is unproven — refuse rather than clobber a
+                // possibly-live service.
+                Err(e) => Err(std::io::Error::new(
+                    std::io::ErrorKind::AddrInUse,
+                    format!(
+                        "refusing to bind unix socket: cannot determine whether {} \
+                         is live ({e}); not removing it",
+                        path.display()
+                    ),
+                )),
+            }
+        }
+        Ok(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!(
+                "refusing to bind unix socket: {} exists and is not a socket",
+                path.display()
+            ),
+        )),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
 async fn run_shutdown_hooks(hooks: &[ShutdownHook]) {
     for hook in hooks.iter().rev() {
         hook().await;
@@ -5109,7 +5472,7 @@ async fn load_config_and_telemetry(
 ) -> (AutumnConfig, crate::telemetry::TelemetryGuard) {
     // 1. Load configuration via the installed loader, falling back to the
     //    five-layer TOML + env default.
-    let config = match config_loader {
+    let mut config = match config_loader {
         Some(factory) => factory().await,
         None => crate::config::TomlEnvConfigLoader::new().load().await,
     }
@@ -5117,6 +5480,19 @@ async fn load_config_and_telemetry(
         eprintln!("Failed to load configuration: {e}");
         std::process::exit(1);
     });
+
+    // `autumn serve --daemon` binds the app on a private Unix socket and then
+    // discovers/health-probes it by path. A custom `with_config_loader` can
+    // construct its `ServerConfig` from scratch and silently drop the
+    // `AUTUMN_SERVER__UNIX_SOCKET` env override, leaving the daemon on TCP where
+    // the supervisor can't reach it. The CLI therefore also passes the socket
+    // out-of-band via `AUTUMN_SERVE_FORCE_UNIX_SOCKET`, applied here *after* the
+    // loader runs so no loader can drop it.
+    if let Ok(forced) = std::env::var("AUTUMN_SERVE_FORCE_UNIX_SOCKET")
+        && !forced.is_empty()
+    {
+        config.server.unix_socket = Some(forced);
+    }
 
     // 2. Initialize logging/telemetry via the installed provider, falling
     //    back to the default `tracing-subscriber + OTLP` initializer.
@@ -5261,7 +5637,15 @@ async fn resolve_shard_set(
             // the TTL. Skipped during a static build (no DB access); needs the
             // control URL, without one we silently fall back to TTL-only refresh.
             if spawn_directory_listener {
-                if let Some(control_url) = config.database.effective_primary_url() {
+                // Prefer the provider-resolved control URL carried on the
+                // topology (managed Postgres has no `database.primary_url` in
+                // config); fall back to the configured URL. Without this a
+                // managed control DB would get no LISTEN/NOTIFY task (absent
+                // URL) or listen on a stale pre-provider URL.
+                if let Some(control_url) = topology
+                    .and_then(crate::db::DatabaseTopology::migration_url)
+                    .or_else(|| config.database.effective_primary_url())
+                {
                     // Detach: the listener runs for the life of the process;
                     // dropping the JoinHandle leaves the task running rather than
                     // aborting it.
@@ -5358,7 +5742,7 @@ async fn setup_database(
     // Spawn the directory invalidation listener only at real runtime — a static
     // build must not open control-DB connections.
     let runtime_boot = hook_queue_migration_mode == RepositoryCommitHookQueueMigrationMode::Runtime;
-    let shards = resolve_shard_set(
+    let shards = match resolve_shard_set(
         config,
         shard_router,
         shard_provider,
@@ -5366,16 +5750,38 @@ async fn setup_database(
         runtime_boot,
         topology.as_ref(),
     )
-    .await?;
+    .await
+    {
+        Ok(shards) => shards,
+        Err(e) => {
+            // The (managed) control topology is already up at this point, so a
+            // later setup failure — directory control-pool sizing, shard pool
+            // construction — must stop the managed Postgres child before the
+            // caller's `process::exit` (which skips `on_shutdown`/`Drop`).
+            // No-op when no managed cluster was started.
+            #[cfg(feature = "managed-pg")]
+            crate::managed_pg::emergency_stop_async().await;
+            return Err(e);
+        }
+    };
 
     // Skip migrations when the provider opted out of a database (returned
     // `Ok(None)`) — even if `database.url` is configured. Custom providers
     // signal "this app runs without a DB" by returning None; running
     // migrations against the URL anyway would defeat the opt-out.
+    //
+    // A provider may also resolve its primary URL at runtime (managed Postgres)
+    // and carry it on the topology; prefer it so migrations target the pool that
+    // was actually built rather than a stale/absent configured URL.
+    let provider_migration_url = topology
+        .as_ref()
+        .and_then(|t| t.migration_url())
+        .map(str::to_owned);
     run_startup_migrations(
         config,
         topology.is_some(),
         shards.is_some(),
+        provider_migration_url,
         migrations,
         directory_migration_required,
     )
@@ -5430,11 +5836,18 @@ async fn run_startup_migrations(
     config: &AutumnConfig,
     control_configured: bool,
     shards_configured: bool,
+    provider_migration_url: Option<String>,
     migrations: Vec<crate::migrate::EmbeddedMigrations>,
     directory_migration_required: bool,
 ) {
     let control_url = if control_configured {
-        config.database.effective_primary_url().map(str::to_owned)
+        // Prefer a provider-resolved URL (e.g. managed Postgres, whose socket
+        // URL isn't in config) carried on the topology: the runtime pool is
+        // built from it, so embedded startup migrations must target it — even if
+        // a stale `database.url`/`primary_url` is still configured (an existing
+        // app adopting the provider). Fall back to the configured URL otherwise.
+        provider_migration_url
+            .or_else(|| config.database.effective_primary_url().map(str::to_owned))
     } else {
         None
     };
@@ -5450,7 +5863,7 @@ async fn run_startup_migrations(
     };
     let profile = config.profile.clone();
     let auto_in_prod = config.database.auto_migrate_in_production;
-    tokio::task::spawn_blocking(move || {
+    let migration_result = tokio::task::spawn_blocking(move || {
         if let Some(url) = control_url {
             for mig in &migrations {
                 crate::migrate::auto_migrate(
@@ -5488,11 +5901,17 @@ async fn run_startup_migrations(
             }
         }
     })
-    .await
-    .unwrap_or_else(|e| {
+    .await;
+    if let Err(e) = migration_result {
         tracing::error!(error = %e, "Migration task panicked");
+        // Same orphan hazard as a migration failure: `process::exit` skips
+        // `on_shutdown`, so stop any managed Postgres before bailing. We are back
+        // on the Tokio runtime here (after the `spawn_blocking` await), so use the
+        // async stop — the sync `emergency_stop` would panic nesting a runtime.
+        #[cfg(feature = "managed-pg")]
+        crate::managed_pg::emergency_stop_async().await;
         std::process::exit(1);
-    });
+    }
 }
 
 /// Per-shard replica migration parity feeds each shard's runtime state
@@ -9975,5 +10394,51 @@ mod tests {
             fast_ran.load(Ordering::SeqCst),
             "fast hook must still run even after slow hook overruns its per-hook budget"
         );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod unix_socket_tests {
+    use super::prepare_unix_socket_path;
+
+    #[test]
+    fn prepare_unix_socket_path_noop_when_absent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("missing.sock");
+        prepare_unix_socket_path(&path).expect("absent path is fine");
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn prepare_unix_socket_path_removes_stale_socket() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("stale.sock");
+        // Bind then drop a real socket to leave a stale socket file behind.
+        let listener = std::os::unix::net::UnixListener::bind(&path).expect("bind socket");
+        drop(listener);
+        assert!(path.exists(), "socket file should exist before prepare");
+        prepare_unix_socket_path(&path).expect("stale socket should be removed");
+        assert!(!path.exists(), "stale socket should be unlinked");
+    }
+
+    #[test]
+    fn prepare_unix_socket_path_refuses_live_socket() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("live.sock");
+        // Keep the listener bound so a connect probe succeeds.
+        let _listener = std::os::unix::net::UnixListener::bind(&path).expect("bind socket");
+        let err = prepare_unix_socket_path(&path).expect_err("must refuse a live socket");
+        assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse);
+        assert!(path.exists(), "live socket must not be removed");
+    }
+
+    #[test]
+    fn prepare_unix_socket_path_errors_on_regular_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("not-a-socket");
+        std::fs::write(&path, b"i am a regular file").expect("write file");
+        let err = prepare_unix_socket_path(&path).expect_err("must refuse a non-socket file");
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        assert!(path.exists(), "regular file must not be removed");
     }
 }

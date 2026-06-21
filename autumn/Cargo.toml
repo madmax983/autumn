@@ -95,6 +95,16 @@ csv = ["dep:csv"]
 # live Autumn server. Off by default — intended as a dev-dependency only.
 # Adds `autumn_web::system_test::{SystemTest, Page, BrowserCheck}`.
 system-tests = ["dep:chromiumoxide"]
+# Managed local Postgres: a `ManagedPostgresPoolProvider` that provisions
+# (initdb) and supervises a local `postgres` child in the app's data dir,
+# surfaced through the pluggable pool-provider seam. Postgres binaries are
+# downloaded on first run. Implies `db`.
+managed-pg = ["db", "dep:postgresql_embedded"]
+# Bundled single-binary mode: embed the Postgres binaries into the app
+# executable at build time (no first-run download). Per-target build, large
+# binary (tens-to-~150MB), still a supervised child process with an on-disk
+# data dir. Implies `managed-pg`.
+managed-pg-bundled = ["managed-pg", "postgresql_embedded/bundled"]
 
 [dependencies]
 autumn-macros = { version = "0.5.0", path = "../autumn-macros" }
@@ -110,6 +120,11 @@ diesel-async = { workspace = true, optional = true }
 diesel_migrations = { workspace = true, optional = true }
 scoped-futures = { version = "0.1.4", optional = true }
 tokio-postgres = { version = "0.7", optional = true }
+postgresql_embedded = { version = "0.19", optional = true, default-features = false, features = [
+    "tokio",
+    "theseus",
+    "rustls",
+] }
 futures.workspace = true
 http.workspace = true
 indexmap.workspace = true
