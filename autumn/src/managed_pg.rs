@@ -21,6 +21,7 @@
 //! ```
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -38,6 +39,23 @@ const MANAGED_DB_NAME: &str = "autumn";
 /// `autumn serve` sets this to a platform data dir; falls back to a per-user
 /// default otherwise.
 pub const MANAGED_PG_DATA_DIR_ENV: &str = "AUTUMN_MANAGED_PG_DATA_DIR";
+
+/// Makes the provider *attach* to an already-running cluster instead of starting
+/// its own.
+///
+/// When set, the value is the connection URL to use. `autumn task`/`autumn build`
+/// set this (to the URL the running daemon published, see [`PUBLISHED_URL_FILE`])
+/// so a one-off command shares the daemon's live cluster rather than failing to
+/// start a second postmaster on the daemon's locked data dir.
+pub const MANAGED_PG_ATTACH_URL_ENV: &str = "AUTUMN_MANAGED_PG_ATTACH_URL";
+
+/// File the provider writes with the running cluster's connection URL.
+///
+/// Written next to the data dir at mode `0600` so `autumn task`/`autumn build`
+/// can discover it and attach via [`MANAGED_PG_ATTACH_URL_ENV`]. Lives in the
+/// data dir's parent alongside `.autumn-pg-superuser` (the secret it embeds is
+/// the same one).
+pub const PUBLISHED_URL_FILE: &str = ".autumn-pg-url";
 
 /// How long to allow each `initdb`/`start` step before surfacing a diagnostic.
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(60);
@@ -193,6 +211,15 @@ pub struct ManagedPostgresPoolProvider {
     /// when an archive is compiled into the binary.
     version: Option<VersionReq>,
     instance: Arc<Mutex<Option<PostgreSQL>>>,
+    /// The cluster's connection URL once resolved — set whether we *started* the
+    /// cluster or *attached* to an externally-owned one. `create_topology` reads
+    /// it for the migration URL, which is the only path that needs the URL when
+    /// attached (there is no local `instance` to read it from).
+    resolved_url: Arc<Mutex<Option<String>>>,
+    /// Whether we attached to a cluster owned by another process (the daemon)
+    /// rather than starting our own. When set, [`stop`](Self::stop) is a no-op:
+    /// the cluster's lifecycle belongs to whoever started it.
+    attached: Arc<AtomicBool>,
 }
 
 impl std::fmt::Debug for ManagedPostgresPoolProvider {
@@ -227,6 +254,8 @@ impl ManagedPostgresPoolProvider {
             // embedded archive version (offline, exact) instead of `*`.
             version: None,
             instance: Arc::new(Mutex::new(None)),
+            resolved_url: Arc::new(Mutex::new(None)),
+            attached: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -240,6 +269,58 @@ impl ManagedPostgresPoolProvider {
             .join("postgresql")
     }
 
+    /// Path of the published connection-URL file (data dir's parent, alongside
+    /// the superuser password file).
+    fn published_url_path(&self) -> PathBuf {
+        self.data_dir
+            .parent()
+            .unwrap_or(&self.data_dir)
+            .join(PUBLISHED_URL_FILE)
+    }
+
+    /// Publish the running cluster's URL (mode `0600`) so `autumn task`/`autumn
+    /// build` can attach to it. Best-effort: a failure only means those one-off
+    /// commands fall back to their own resolution; it must not fail the boot.
+    fn publish_url(&self, url: &str) {
+        let path = self.published_url_path();
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        match options.open(&path) {
+            Ok(mut f) => {
+                use std::io::Write;
+                // `mode(0o600)` only applies on create; an existing (older-build /
+                // manually-created / symlinked) file keeps its old, possibly
+                // permissive mode. The URL embeds the cluster superuser password,
+                // so if we can't enforce owner-only we must NOT write it — skip
+                // publishing (it's only an optimization for task/build attach) and
+                // drop the truncated file rather than expose credentials.
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    if std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+                        .is_err()
+                    {
+                        tracing::warn!(path = %path.display(),
+                            "managed Postgres: cannot enforce owner-only mode on the cluster URL file; not publishing");
+                        let _ = std::fs::remove_file(&path);
+                        return;
+                    }
+                }
+                if let Err(e) = f.write_all(url.as_bytes()) {
+                    tracing::warn!(error = %e, path = %path.display(),
+                        "managed Postgres: failed to publish cluster URL for task/build attach");
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, path = %path.display(),
+                "managed Postgres: failed to open cluster URL file for publishing"),
+        }
+    }
+
     /// Provision (if needed) and start the cluster, returning its connection URL.
     async fn ensure_running(&self) -> Result<String, postgresql_embedded::Error> {
         // Already started (e.g. a second pool, or repeated calls): reuse the
@@ -249,6 +330,22 @@ impl ManagedPostgresPoolProvider {
             && let Some(pg) = guard.as_ref()
         {
             return Ok(pg.settings().url(MANAGED_DB_NAME));
+        }
+
+        // Attach mode: a cluster is already running (started by `autumn serve`)
+        // and `autumn task`/`autumn build` set `AUTUMN_MANAGED_PG_ATTACH_URL` to
+        // its published URL. Connect to it instead of starting a second
+        // postmaster on the daemon's locked data dir — and never `stop()` it,
+        // since its lifecycle belongs to the daemon.
+        if let Some(url) = std::env::var_os(MANAGED_PG_ATTACH_URL_ENV)
+            .and_then(|v| v.into_string().ok())
+            .filter(|s| !s.trim().is_empty())
+        {
+            self.attached.store(true, Ordering::SeqCst);
+            if let Ok(mut g) = self.resolved_url.lock() {
+                *g = Some(url.clone());
+            }
+            return Ok(url);
         }
 
         let mut settings = Settings::new();
@@ -295,6 +392,13 @@ impl ManagedPostgresPoolProvider {
         if let Ok(mut guard) = self.instance.lock() {
             *guard = Some(pg);
         }
+        if let Ok(mut g) = self.resolved_url.lock() {
+            *g = Some(url.clone());
+        }
+
+        // Publish the URL so `autumn task`/`autumn build` can attach to this
+        // running cluster instead of contending for its locked data dir.
+        self.publish_url(&url);
 
         // Register for emergency shutdown so an abnormal boot exit (which
         // bypasses `on_shutdown`) still stops the supervised child instead of
@@ -371,6 +475,12 @@ impl ManagedPostgresPoolProvider {
     /// Stop the supervised Postgres child. Wire this to the daemon's
     /// `on_shutdown` so the cluster shuts down with the app.
     pub async fn stop(&self) {
+        // Attached to a cluster owned by another process (the daemon): never stop
+        // it or remove its published URL — `autumn task`/`autumn build` only
+        // borrowed the running cluster.
+        if self.attached.load(Ordering::SeqCst) {
+            return;
+        }
         let taken = self.instance.lock().ok().and_then(|mut guard| guard.take());
         let Some(pg) = taken else {
             // Nothing running (or already stopped): clear the emergency registration.
@@ -394,6 +504,9 @@ impl ManagedPostgresPoolProvider {
         // handle. The resolved URL is carried on the per-app topology, so there is
         // no process-global URL to clear.
         clear_emergency_registration();
+        // Remove the published URL file so a later `autumn task`/`autumn build`
+        // doesn't try to attach to a cluster that is now down.
+        let _ = std::fs::remove_file(self.published_url_path());
     }
 }
 
@@ -445,14 +558,20 @@ impl DatabasePoolProvider for ManagedPostgresPoolProvider {
         let Some(primary) = self.create_pool(config).await? else {
             return Ok(None);
         };
-        // After `create_pool`, the cluster is running; read its URL from the
-        // retained handle and carry it on the topology so startup migrations
-        // target this managed cluster — per-app, with no process-global.
-        let migration_url = self
-            .instance
-            .lock()
-            .ok()
-            .and_then(|guard| guard.as_ref().map(|pg| pg.settings().url(MANAGED_DB_NAME)));
+        // After `create_pool`, the cluster is running; carry its URL on the
+        // topology so startup migrations target this managed cluster — per-app,
+        // with no process-global. Prefer the resolved URL (set whether we started
+        // the cluster or attached to one), falling back to the retained handle.
+        let migration_url =
+            self.resolved_url
+                .lock()
+                .ok()
+                .and_then(|g| g.clone())
+                .or_else(|| {
+                    self.instance.lock().ok().and_then(|guard| {
+                        guard.as_ref().map(|pg| pg.settings().url(MANAGED_DB_NAME))
+                    })
+                });
         Ok(Some(
             crate::db::DatabaseTopology::from_pools(primary, None)
                 .with_migration_url(migration_url),
@@ -561,5 +680,37 @@ mod tests {
     fn with_data_dir_is_used() {
         let p = ManagedPostgresPoolProvider::with_data_dir(PathBuf::from("/var/lib/x"));
         assert_eq!(p.data_dir, PathBuf::from("/var/lib/x"));
+    }
+
+    #[test]
+    fn attach_mode_uses_env_url_without_starting() {
+        // With the attach env set, `ensure_running` must return that URL without
+        // touching the (nonexistent) data dir, and `stop` must be a no-op.
+        temp_env::with_var(
+            MANAGED_PG_ATTACH_URL_ENV,
+            Some("postgresql://u:p@localhost:5499/autumn"),
+            || {
+                let provider =
+                    ManagedPostgresPoolProvider::with_data_dir(PathBuf::from("/nonexistent/pg"));
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                let url = rt.block_on(provider.ensure_running()).unwrap();
+                assert_eq!(url, "postgresql://u:p@localhost:5499/autumn");
+                assert!(provider.attached.load(Ordering::SeqCst));
+                // No-op in attach mode: must not panic or strand state.
+                rt.block_on(provider.stop());
+            },
+        );
+    }
+
+    #[test]
+    fn published_url_path_is_beside_data_dir() {
+        let p = ManagedPostgresPoolProvider::with_data_dir(PathBuf::from("/var/lib/app/pg"));
+        assert_eq!(
+            p.published_url_path(),
+            PathBuf::from("/var/lib/app").join(PUBLISHED_URL_FILE)
+        );
     }
 }

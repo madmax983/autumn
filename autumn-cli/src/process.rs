@@ -358,18 +358,22 @@ pub fn wait_for_record_exit(record: &PidRecord, timeout: Duration) -> bool {
 /// `timeout` for it to drain and exit, then force-kill if it is still alive.
 /// Returns `true` only if the recorded process is gone afterwards.
 ///
-/// The wait and the pre-escalation check are identity-aware (start time, when
-/// the platform records it): if the daemon exits and its PID is reused before
-/// the loop observes the exit, the reused process has a different start time and
-/// is treated as already-gone, so the `SIGKILL`/`killpg` escalation is skipped
-/// rather than aimed at an unrelated process.
+/// On Linux the wait is identity-aware: a recorded start time detects a PID
+/// reused mid-drain, so the `SIGKILL`/`killpg` escalation never aims at a
+/// stranger. Where a start time is unavailable (macOS/BSD, or legacy pidfiles)
+/// we can't distinguish our stuck daemon from a reused PID, so we enforce the
+/// timeout and escalate against the still-live PID rather than risk reporting a
+/// false "stopped" and orphaning a daemon that merely closed its listener while
+/// still draining. (The residual risk of signalling a reused PID is bounded: the
+/// wait returns the instant the original exits, so reaching here with a live PID
+/// almost always means our own daemon never exited.)
 ///
 /// A `false` return means the daemon could **not** be stopped — e.g. it is owned
 /// by another user and `kill` returns `EPERM` — so the caller must not delete
 /// its state or report success.
 #[cfg(unix)]
 #[must_use]
-pub fn stop_record(record: &PidRecord, timeout: Duration) -> bool {
+pub fn stop_record(record: &PidRecord, timeout: Duration, socket: &Path) -> bool {
     let _ = signal_terminate(record.pid);
     if wait_for_record_exit(record, timeout) {
         return true;
@@ -377,6 +381,12 @@ pub fn stop_record(record: &PidRecord, timeout: Duration) -> bool {
     if !is_record_alive(record) {
         return true;
     }
+    // Timed out with the PID still alive. A daemon can close its control socket
+    // before its `on_shutdown` hooks finish (or hang outright), so a dead socket
+    // is *not* proof of exit — enforce the budget with a `SIGKILL`. `socket` is
+    // retained for symmetry with the non-Unix stub and possible future identity
+    // checks, but is intentionally not used as an exit signal here.
+    let _ = socket;
     // The app missed its graceful-drain budget and is still our daemon, so its
     // `on_shutdown` hooks (which stop a managed Postgres child) may not have run.
     // Kill the whole daemon process group, not just the app PID, so supervised
@@ -422,7 +432,7 @@ pub fn stop_postmaster(_pid: u32, _timeout: Duration) {}
 /// Non-Unix fallback: no graceful-signal mechanism in this MVP.
 #[cfg(not(unix))]
 #[must_use]
-pub fn stop_record(_record: &PidRecord, _timeout: Duration) -> bool {
+pub fn stop_record(_record: &PidRecord, _timeout: Duration, _socket: &Path) -> bool {
     false
 }
 

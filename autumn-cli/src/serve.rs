@@ -15,6 +15,15 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
+/// Env var the managed-Postgres provider reads to locate its data dir. Mirrors
+/// `autumn_web::managed_pg::MANAGED_PG_DATA_DIR_ENV`; redefined here because the
+/// CLI doesn't build the `managed-pg` feature and so can't reference the const.
+pub const MANAGED_PG_DATA_DIR_ENV: &str = "AUTUMN_MANAGED_PG_DATA_DIR";
+/// Env var that makes the provider *attach* to an already-running cluster at the
+/// given URL instead of starting its own. Mirrors
+/// `autumn_web::managed_pg::MANAGED_PG_ATTACH_URL_ENV`.
+pub const MANAGED_PG_ATTACH_URL_ENV: &str = "AUTUMN_MANAGED_PG_ATTACH_URL";
+
 /// Lifecycle subcommand for `autumn serve`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServeAction {
@@ -165,13 +174,26 @@ fn run_unix(action: Option<ServeAction>, opts: &ServeOptions) -> i32 {
                     || managed_cluster_present(opts.package.as_deref()),
                     |a| a.managed_pg,
                 );
-            let keep_release = opts.release || running.as_ref().is_some_and(|a| a.release);
+            // The address file is authoritative when present; only fall back to
+            // the `serve.mode` marker for release/profile when it is
+            // missing/corrupt. A best-effort marker left over from an older
+            // release run must not force a parseable dev daemon back to release.
+            let recorded_mode = running_daemon_mode(opts.package.as_deref());
+            let keep_release = opts.release
+                || running.as_ref().map_or_else(
+                    || recorded_mode.as_ref().is_some_and(|m| m.release),
+                    |a| a.release,
+                );
             // Preserve the original daemon's profile: prefer one set on *this*
-            // restart's environment, else restore what the running daemon
-            // recorded, so a bare `restart` doesn't silently fall back to `dev`.
-            let keep_profile =
-                env_profile().or_else(|| running.as_ref().and_then(|a| a.profile.clone()));
-            let _ = stop(opts);
+            // restart's environment, else what the running daemon recorded —
+            // address file first, the mode marker only when there is no address
+            // file — so a bare `restart` doesn't silently fall back to `dev`.
+            let keep_profile = env_profile().or_else(|| {
+                running.as_ref().map_or_else(
+                    || recorded_mode.as_ref().and_then(|m| m.profile.clone()),
+                    |a| a.profile.clone(),
+                )
+            });
             let daemon_opts = ServeOptions {
                 daemon: true,
                 bundled_pg: keep_managed,
@@ -179,6 +201,12 @@ fn run_unix(action: Option<ServeAction>, opts: &ServeOptions) -> i32 {
                 profile: keep_profile,
                 ..opts.clone()
             };
+            // Stop using the *recovered* mode, not the bare restart flags: when
+            // `serve.addr` is missing/corrupt, `stop`'s budget falls back to
+            // recomputing from release/profile, and the restart shell's defaults
+            // would otherwise derive a short `dev` budget and SIGKILL a release
+            // daemon before it finishes draining.
+            let _ = stop(&daemon_opts);
             start(&daemon_opts)
         }
     }
@@ -427,8 +455,17 @@ fn identity_root() -> PathBuf {
 /// ancestor whose `Cargo.toml` has a `[workspace]` table), else the nearest
 /// ancestor containing any `Cargo.toml`, else `None`. Separated from CWD lookup
 /// so it can be unit-tested against a fixture tree.
+///
+/// If a `Cargo.toml` above us is unparsable but still contains the `[workspace]`
+/// header, we treat it as a *transiently-broken workspace root* and anchor to
+/// that exact dir (the nearest such one). This keeps the namespace stable while
+/// the root manifest is mid-edit during a `-p` lifecycle command from a member —
+/// otherwise the anchor would flip to the member and `status`/`stop` would target
+/// a different dir. A broken manifest *without* `[workspace]` is ignored so an
+/// unrelated stray file up the tree can't hijack a standalone project's anchor.
 fn workspace_anchor_from(start: &Path) -> Option<PathBuf> {
     let mut nearest_manifest: Option<PathBuf> = None;
+    let mut broken_workspace_dir: Option<PathBuf> = None;
     for dir in start.ancestors() {
         let Ok(contents) = std::fs::read_to_string(dir.join("Cargo.toml")) else {
             continue;
@@ -436,11 +473,30 @@ fn workspace_anchor_from(start: &Path) -> Option<PathBuf> {
         if nearest_manifest.is_none() {
             nearest_manifest = Some(dir.to_path_buf());
         }
-        if toml::from_str::<toml::Table>(&contents).is_ok_and(|t| t.contains_key("workspace")) {
-            return Some(dir.to_path_buf());
+        match toml::from_str::<toml::Table>(&contents) {
+            // A nearer transiently-broken workspace root (the one being edited)
+            // takes precedence over an outer valid `[workspace]`: in a nested
+            // checkout the daemon was started under the inner root, so anchoring
+            // to the outer one would make lifecycle commands miss it.
+            Ok(table) if table.contains_key("workspace") => {
+                return broken_workspace_dir.or_else(|| Some(dir.to_path_buf()));
+            }
+            // A *transiently-broken* workspace root: unparsable but still carrying
+            // the `[workspace]` header. Anchor to this exact dir (the nearest such
+            // root), not the topmost manifest in the ancestry — a higher unrelated
+            // `Cargo.toml` above it must not pull the anchor up to the outer
+            // project, or lifecycle commands would target a different runtime dir.
+            // An unrelated broken `Cargo.toml` (no `[workspace]`) is ignored so it
+            // can't hijack a standalone project's anchor.
+            Err(_) if contents.contains("[workspace]") => {
+                if broken_workspace_dir.is_none() {
+                    broken_workspace_dir = Some(dir.to_path_buf());
+                }
+            }
+            Ok(_) | Err(_) => {}
         }
     }
-    nearest_manifest
+    broken_workspace_dir.or(nearest_manifest)
 }
 
 /// Build, then start the server (foreground or daemon). Returns the exit code.
@@ -536,6 +592,13 @@ fn start_foreground(opts: &ServeOptions) -> i32 {
 /// runtime directories.
 fn base_command(binary: &Path, paths: Option<&RuntimePaths>, opts: &ServeOptions) -> Command {
     let mut cmd = Command::new(binary);
+    // `autumn serve` is the cluster *owner*: it must provision and supervise its
+    // own managed Postgres, never attach to someone else's. Clear any inherited
+    // `AUTUMN_MANAGED_PG_ATTACH_URL` (e.g. leaked from the launching shell or a
+    // prior task/build run) so the provider can't take the attach branch and
+    // leave the daemon recorded as managed-PG while it never starts/stops a
+    // cluster (and `stop()` no-ops because `attached` is set).
+    cmd.env_remove(MANAGED_PG_ATTACH_URL_ENV);
     // For a workspace member selected with `-p`, run the child from the member's
     // manifest dir so its `autumn.toml`/profile and asset dirs resolve correctly
     // instead of the workspace-root CWD. Set both `current_dir` (covers CWD-
@@ -569,7 +632,7 @@ fn base_command(binary: &Path, paths: Option<&RuntimePaths>, opts: &ServeOptions
     if opts.bundled_pg
         && let Some(paths) = paths
     {
-        cmd.env("AUTUMN_MANAGED_PG_DATA_DIR", paths.pg_data_dir());
+        cmd.env(MANAGED_PG_DATA_DIR_ENV, paths.pg_data_dir());
     }
     // Restore an explicit profile (set by `restart`) so the relaunched daemon
     // loads the same config as the original even when the restart shell didn't
@@ -932,7 +995,50 @@ fn write_addr_file(
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
     }
+    // Persist release/profile in a separate marker too, so a later `restart` can
+    // recover them even if `serve.addr` is deleted/corrupted while the daemon is
+    // running. Best-effort: the address file is the primary record, so a failure
+    // here doesn't fail the start.
+    write_mode_file(paths, opts);
     Ok(())
+}
+
+/// The daemon's build/profile mode, recorded alongside `serve.addr` (see
+/// [`RuntimePaths::mode_file`]) as a resilient fallback for `restart`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct ModeFile {
+    /// Whether the daemon was built/started in release mode.
+    #[serde(default)]
+    release: bool,
+    /// The explicit profile (`AUTUMN_ENV`/`AUTUMN_PROFILE`) the daemon used.
+    #[serde(default)]
+    profile: Option<String>,
+}
+
+/// Write the `serve.mode` marker (`0600`). Best-effort.
+fn write_mode_file(paths: &RuntimePaths, opts: &ServeOptions) {
+    let mode = ModeFile {
+        release: opts.release,
+        profile: opts.profile.clone().or_else(env_profile),
+    };
+    let Ok(toml) = toml::to_string(&mode) else {
+        return;
+    };
+    let path = paths.mode_file();
+    if std::fs::write(&path, toml).is_ok() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        }
+    }
+}
+
+/// The recorded `serve.mode` for this project, if present and parseable.
+fn running_daemon_mode(package: Option<&str>) -> Option<ModeFile> {
+    let paths = RuntimePaths::resolve(&project_identity(package)).ok()?;
+    let contents = std::fs::read_to_string(paths.mode_file()).ok()?;
+    toml::from_str(&contents).ok()
 }
 
 /// Stop the running daemon. Returns the exit code.
@@ -980,7 +1086,11 @@ fn stop(opts: &ServeOptions) -> i32 {
     // daemons started before that field was recorded.
     let recorded_release = addr.as_ref().is_some_and(|a| a.release);
     let recorded_budget = addr.as_ref().and_then(|a| a.stop_budget_secs);
-    if !process::stop_record(&rec, stop_timeout(opts, recorded_release, recorded_budget)) {
+    if !process::stop_record(
+        &rec,
+        stop_timeout(opts, recorded_release, recorded_budget),
+        &socket,
+    ) {
         // The daemon is still alive and we couldn't signal it (e.g. it is owned
         // by another user — `kill` returned `EPERM`). Do NOT remove its state or
         // report success: that would orphan a running daemon and lie to scripts.
@@ -1016,44 +1126,165 @@ fn stop(opts: &ServeOptions) -> i32 {
     0
 }
 
-/// Reap a managed Postgres cluster the daemon may have left running. Reads the
-/// postmaster pid from the data dir's `postmaster.pid` and, if it's still alive,
-/// requests a fast shutdown and escalates. No-op when the cluster already
-/// stopped cleanly (pidfile absent or the postmaster is gone).
-fn reap_managed_postgres(paths: &RuntimePaths) {
-    let data_dir = paths.pg_data_dir();
+/// The PID of this cluster's live postmaster, or `None` when none is running.
+///
+/// Reads the data dir's `postmaster.pid` and applies PID-reuse guards: the live
+/// process must actually be `postgres` and (where the platform exposes it) be
+/// `chdir`'d into *this* data dir, since a postmaster `chdir`s to its data dir.
+/// A `postmaster.pid` left by a crashed/`SIGKILL`ed cluster keeps its old PID,
+/// which the OS may have recycled — these checks stop us from mistaking an
+/// unrelated process (or a *different* cluster) for this one.
+fn live_postmaster_pid(data_dir: &Path) -> Option<u32> {
     let pidfile = data_dir.join("postmaster.pid");
-    let Some(pid) = std::fs::read_to_string(&pidfile)
+    let pid = std::fs::read_to_string(&pidfile)
         .ok()
-        .and_then(|s| s.lines().next()?.trim().parse::<u32>().ok())
-    else {
-        return;
-    };
+        .and_then(|s| s.lines().next()?.trim().parse::<u32>().ok())?;
     if !process::is_process_alive(pid) {
-        return;
+        return None;
     }
-    // Guard against PID reuse: a `postmaster.pid` left behind by a crashed or
-    // `SIGKILL`ed cluster keeps its old PID, which the OS may have recycled.
-    // Where the platform reports it, require the live process to actually be
-    // `postgres` before signalling it; if we can't tell (non-Linux), fall back
-    // to liveness alone.
     if process::process_command_name(pid).is_some_and(|name| name != "postgres") {
-        return;
+        return None;
     }
-    // ...and, since the reused PID could be *another* `postgres` cluster, require
-    // its working directory to be this cluster's data dir (a postmaster `chdir`s
-    // to its data dir). Only enforced where `cwd` is observable (Linux); a
-    // mismatch means a different cluster owns the PID, so leave it alone.
     if let Some(cwd) = process::process_cwd(pid) {
         let same_dir = std::fs::canonicalize(&cwd)
             .ok()
-            .zip(std::fs::canonicalize(&data_dir).ok())
+            .zip(std::fs::canonicalize(data_dir).ok())
             .is_some_and(|(live, ours)| live == ours);
         if !same_dir {
-            return;
+            return None;
         }
     }
+    Some(pid)
+}
+
+/// Reap a managed Postgres cluster the daemon may have left running. If a live
+/// postmaster owns the data dir, requests a fast shutdown and escalates. No-op
+/// when the cluster already stopped cleanly (pidfile absent or postmaster gone).
+fn reap_managed_postgres(paths: &RuntimePaths) {
+    let data_dir = paths.pg_data_dir();
+    // Whether or not a postmaster is still up, drop the published URL: this
+    // reaper bypasses `ManagedPostgresPoolProvider::stop()` (the only path that
+    // normally removes it), so a leftover `.autumn-pg-url` could make a later
+    // `task`/`build` attach to a dead — or, if the port was reused, foreign —
+    // endpoint instead of starting its own cluster.
+    let url_file = data_dir
+        .parent()
+        .unwrap_or(&data_dir)
+        .join(".autumn-pg-url");
+    let _ = std::fs::remove_file(&url_file);
+    let Some(pid) = live_postmaster_pid(&data_dir) else {
+        return;
+    };
     process::stop_postmaster(pid, Duration::from_secs(10));
+}
+
+/// Managed-Postgres environment for a one-off `autumn task`/`autumn build` run
+/// (see [`managed_pg_env`]).
+pub struct ManagedPgEnv {
+    /// The daemon's cluster data dir, always set so a one-off run and the daemon
+    /// agree on the cluster location.
+    pub data_dir: PathBuf,
+    /// The running cluster's connection URL, set only when a live cluster is
+    /// detected — the run then *attaches* instead of starting its own.
+    pub attach_url: Option<String>,
+}
+
+/// Resolve the managed-Postgres environment for a one-off run of `package` so it
+/// shares the serve daemon's cluster. `None` when the project's runtime paths
+/// can't be resolved (the run then uses the provider's own per-project default),
+/// or when a live postmaster holds the data dir but we can't attach to it (so the
+/// child must not be pointed at the locked dir). Otherwise returns the data dir
+/// and, when a reachable cluster is published, its attach URL.
+#[must_use]
+pub fn managed_pg_env(package: Option<&str>) -> Option<ManagedPgEnv> {
+    // Respect an explicit operator override: if the environment already pins the
+    // managed-PG data dir (e.g. a CI/ops run targeting an isolated cluster), don't
+    // clobber it or redirect the run to the CLI's platform cluster. Returning
+    // `None` leaves the child to inherit the caller's `AUTUMN_MANAGED_PG_DATA_DIR`.
+    if std::env::var_os(MANAGED_PG_DATA_DIR_ENV).is_some() {
+        return None;
+    }
+    let paths = RuntimePaths::resolve(&project_identity(package)).ok()?;
+    let data_dir = paths.pg_data_dir();
+
+    // Only attach when a live postmaster actually owns this data dir. The identity
+    // guard in `live_postmaster_pid` (PID alive + process is `postgres` + its cwd
+    // is this data dir, where observable) prevents trusting a stale `.autumn-pg-url`
+    // whose old random port was reused by a foreign listener — a bare TCP probe
+    // can't tell our cluster from a stranger.
+    if live_postmaster_pid(&data_dir).is_some() {
+        // A live postmaster holds the dir. Attach only when its published URL is
+        // actually reachable; otherwise don't point the child at the *locked* dir
+        // (URL missing/unpublished, or a best-effort publish failure) — starting a
+        // second postmaster there would deadlock. Let it use its own default.
+        return reachable_published_url(&data_dir).map(|url| ManagedPgEnv {
+            data_dir,
+            attach_url: Some(url),
+        });
+    }
+
+    // A daemon start is in flight (the startup lock is held by a live launcher)
+    // but it hasn't started its postmaster or published a URL yet — there's no
+    // `postmaster.pid` to catch above. Sharing the data dir now would let this
+    // run `initdb`/start against the directory the daemon is provisioning and
+    // corrupt or deadlock it, so fall back to the child's own default cluster.
+    if startup_in_progress(&paths) {
+        return None;
+    }
+
+    // Nothing holds the data dir: safe to share its location so this run and a
+    // future `serve` use the same cluster.
+    Some(ManagedPgEnv {
+        data_dir,
+        attach_url: None,
+    })
+}
+
+/// The published connection URL for this project's managed cluster, returned only
+/// when its endpoint is reachable. Reads the URL file the provider writes next to
+/// the data dir, then confirms a live postmaster answers there so a stale
+/// `.autumn-pg-url` (crash / PID reuse) can't make a run attach to a dead cluster.
+fn reachable_published_url(data_dir: &Path) -> Option<String> {
+    // The provider publishes the URL beside the data dir. Keep this filename in
+    // sync with `autumn_web::managed_pg::PUBLISHED_URL_FILE` (the CLI doesn't
+    // build the `managed-pg` feature, so it can't reference the const).
+    let url_file = data_dir.parent().unwrap_or(data_dir).join(".autumn-pg-url");
+    let contents = std::fs::read_to_string(url_file).ok()?;
+    let url = contents.trim();
+    if url.is_empty() || !published_url_reachable(url) {
+        return None;
+    }
+    Some(url.to_owned())
+}
+
+/// Whether the `host:port` in a `postgresql://…` URL accepts a TCP connection
+/// within a short timeout — a portable, definitive "the cluster is up" probe.
+fn published_url_reachable(url: &str) -> bool {
+    use std::net::ToSocketAddrs;
+    let Some(hostport) = pg_url_host_port(url) else {
+        return false;
+    };
+    let Ok(addrs) = hostport.to_socket_addrs() else {
+        return false;
+    };
+    addrs
+        .take(4)
+        .any(|sa| std::net::TcpStream::connect_timeout(&sa, Duration::from_millis(500)).is_ok())
+}
+
+/// Extract `host:port` from a `postgresql://[user[:pass]@]host:port/db` URL.
+/// Returns `None` unless an explicit numeric port is present (the managed
+/// provider always emits one; a unix-socket URL has none and isn't TCP-probable).
+fn pg_url_host_port(url: &str) -> Option<String> {
+    let after_scheme = url.split_once("://")?.1;
+    let authority = after_scheme.split(['/', '?']).next()?;
+    // Drop any `user:pass@` userinfo (split at the last '@' before the host).
+    let hostport = authority.rsplit_once('@').map_or(authority, |(_, hp)| hp);
+    let (_, port) = hostport.rsplit_once(':')?;
+    if port.parse::<u16>().is_err() {
+        return None;
+    }
+    Some(hostport.to_owned())
 }
 
 /// Graceful-stop budget before escalating to `SIGKILL`.
@@ -1247,10 +1478,12 @@ fn status(opts: &ServeOptions) -> i32 {
     }
 }
 
-/// Best-effort removal of the pidfile, address file, readiness file, and socket.
+/// Best-effort removal of the pidfile, address file, mode marker, readiness
+/// file, and socket.
 fn cleanup(paths: &RuntimePaths, socket: &Path) {
     let _ = std::fs::remove_file(paths.pid_file());
     let _ = std::fs::remove_file(paths.addr_file());
+    let _ = std::fs::remove_file(paths.mode_file());
     let _ = std::fs::remove_file(paths.ready_file());
     remove_socket_if_not_live(socket);
 }
@@ -1417,6 +1650,124 @@ mod tests {
         let nested = root.join("src");
         std::fs::create_dir_all(&nested).expect("create nested dir");
         assert_eq!(workspace_anchor_from(&nested), Some(root));
+    }
+
+    #[test]
+    fn pg_url_host_port_extracts_authority() {
+        assert_eq!(
+            pg_url_host_port("postgresql://postgres:secret@localhost:54213/autumn"),
+            Some("localhost:54213".to_owned())
+        );
+        // No userinfo.
+        assert_eq!(
+            pg_url_host_port("postgres://127.0.0.1:5432/db"),
+            Some("127.0.0.1:5432".to_owned())
+        );
+        // Missing/invalid port → not TCP-probable.
+        assert_eq!(pg_url_host_port("postgresql://localhost/autumn"), None);
+        assert_eq!(pg_url_host_port("postgresql://localhost:notaport/db"), None);
+        // Not a URL.
+        assert_eq!(pg_url_host_port("/var/run/pg.sock"), None);
+    }
+
+    #[test]
+    fn workspace_anchor_ignores_unrelated_broken_parent_manifest() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = std::fs::canonicalize(tmp.path()).expect("canonicalize root");
+        // A broken `Cargo.toml` up the tree that is NOT a workspace root (e.g. a
+        // stray/half-written file in a parent dir) must not hijack the anchor.
+        std::fs::write(root.join("Cargo.toml"), "this is = not [ valid toml")
+            .expect("write broken parent manifest");
+        let project = root.join("proj");
+        std::fs::create_dir_all(&project).expect("create project dir");
+        std::fs::write(
+            project.join("Cargo.toml"),
+            "[package]\nname = \"proj\"\nversion = \"0.1.0\"\n",
+        )
+        .expect("write project manifest");
+        // The anchor is the standalone project, not the broken parent.
+        assert_eq!(workspace_anchor_from(&project), Some(project));
+    }
+
+    #[test]
+    fn workspace_anchor_stable_when_root_manifest_unparsable() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = std::fs::canonicalize(tmp.path()).expect("canonicalize root");
+        // The workspace root manifest is temporarily broken (mid-edit) but still
+        // carries the recognizable `[workspace]` header, so it's treated as a
+        // transiently-broken root rather than an unrelated broken manifest.
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\n  \"crates/api\"",
+        )
+        .expect("write broken root manifest");
+        let member = root.join("crates/api");
+        std::fs::create_dir_all(&member).expect("create member dir");
+        std::fs::write(
+            member.join("Cargo.toml"),
+            "[package]\nname = \"api\"\nversion = \"0.1.0\"\n",
+        )
+        .expect("write member manifest");
+        // The anchor must still be the broken workspace root, not the member,
+        // so the namespace doesn't flip while the root manifest is unparsable.
+        assert_eq!(workspace_anchor_from(&member), Some(root));
+    }
+
+    #[test]
+    fn workspace_anchor_broken_root_not_pulled_up_to_outer_manifest() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let outer = std::fs::canonicalize(tmp.path()).expect("canonicalize");
+        // An unrelated outer crate sits *above* the (broken) workspace root.
+        std::fs::write(
+            outer.join("Cargo.toml"),
+            "[package]\nname = \"outer\"\nversion = \"0.1.0\"\n",
+        )
+        .expect("write outer manifest");
+        let ws = outer.join("ws");
+        let member = ws.join("crates/api");
+        std::fs::create_dir_all(&member).expect("create dirs");
+        // The intended workspace root is transiently broken (mid-edit).
+        std::fs::write(
+            ws.join("Cargo.toml"),
+            "[workspace]\nmembers = [\n  \"crates/api\"",
+        )
+        .expect("write broken ws manifest");
+        std::fs::write(
+            member.join("Cargo.toml"),
+            "[package]\nname = \"api\"\nversion = \"0.1.0\"\n",
+        )
+        .expect("write member manifest");
+        // Anchor must be the broken workspace dir, not the outer manifest above it,
+        // or lifecycle commands would target the wrong runtime dir.
+        assert_eq!(workspace_anchor_from(&member), Some(ws));
+    }
+
+    #[test]
+    fn workspace_anchor_inner_broken_root_wins_over_outer_valid_workspace() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let outer = std::fs::canonicalize(tmp.path()).expect("canonicalize");
+        // A *valid* outer workspace sits above a transiently-broken inner one.
+        std::fs::write(
+            outer.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"inner\"]\n",
+        )
+        .expect("write outer ws manifest");
+        let inner = outer.join("inner");
+        let member = inner.join("crates/api");
+        std::fs::create_dir_all(&member).expect("create dirs");
+        std::fs::write(
+            inner.join("Cargo.toml"),
+            "[workspace]\nmembers = [\n  \"crates/api\"",
+        )
+        .expect("write broken inner ws manifest");
+        std::fs::write(
+            member.join("Cargo.toml"),
+            "[package]\nname = \"api\"\nversion = \"0.1.0\"\n",
+        )
+        .expect("write member manifest");
+        // The inner (broken) workspace root the daemon was started under wins; the
+        // walk must not return the outer valid workspace.
+        assert_eq!(workspace_anchor_from(&member), Some(inner));
     }
 
     // Env vars touched by these tests; cleared so a polluted outer environment

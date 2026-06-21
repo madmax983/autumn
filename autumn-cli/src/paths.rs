@@ -161,6 +161,14 @@ impl RuntimePaths {
         self.runtime.join("serve.addr")
     }
 
+    /// Mode-marker file (`<runtime>/serve.mode`): the daemon's `release`/`profile`
+    /// recorded separately from `serve.addr` so `restart` can recover them even
+    /// if the address file is deleted/corrupted while the daemon runs.
+    #[must_use]
+    pub fn mode_file(&self) -> PathBuf {
+        self.runtime.join("serve.mode")
+    }
+
     /// Readiness-signal file (`<runtime>/serve.ready`). The daemon creates it
     /// after `mark_startup_complete()`; the supervisor polls for it to detect
     /// true startup completion without probing HTTP.
