@@ -702,6 +702,23 @@ pub struct SessionService<S: SessionStore, Inner> {
     signing_keys: Option<Arc<crate::security::config::ResolvedSigningKeys>>,
 }
 
+/// `true` when the response was produced by the request-timeout layer
+/// cancelling the handler future (it stamps [`RequestDeadlineCancelled`]).
+///
+/// The session layer is applied *outer* to the timeout layer, so a cancelled
+/// handler can leave the shared `Session` handle dirty with a partial mutation.
+/// Persisting it would commit half-finished state (e.g. a login that set the
+/// user id but never completed), so the caller skips session persistence
+/// entirely when this returns `true`.
+///
+/// [`RequestDeadlineCancelled`]: crate::router::RequestDeadlineCancelled
+fn response_was_deadline_cancelled(response: &Response) -> bool {
+    response
+        .extensions()
+        .get::<crate::router::RequestDeadlineCancelled>()
+        .is_some()
+}
+
 impl<St, Inner> Service<Request> for SessionService<St, Inner>
 where
     St: SessionStore + Clone,
@@ -717,6 +734,7 @@ where
         self.inner.poll_ready(cx)
     }
 
+    #[allow(clippy::too_many_lines)]
     fn call(&mut self, mut req: Request) -> Self::Future {
         let store = Arc::clone(&self.store);
         let config = Arc::clone(&self.config);
@@ -777,7 +795,12 @@ where
             // 3. Call inner service
             let mut response = inner.call(req).await?;
 
-            // 4. Save or destroy session based on state
+            // 4. Save or destroy session — but skip persistence when the deadline
+            // cancelled the handler, so a partial mutation isn't committed.
+            if response_was_deadline_cancelled(&response) {
+                return Ok(response);
+            }
+
             let inner_guard = session.inner.read().await;
             if inner_guard.destroyed {
                 if let Err(error) = store.destroy(&session_id).await {
@@ -1438,6 +1461,84 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn deadline_cancelled_response_skips_partial_session_save() {
+        let state = test_state();
+        let store = MemoryStore::new();
+        // Seed an existing cookie-backed session with no application data.
+        store
+            .save("existing-id", HashMap::new())
+            .await
+            .expect("seed save");
+
+        // A handler that mutates the session and then exceeds an inner deadline,
+        // standing in for the real request-timeout layer (which is applied inner
+        // to the session layer and stamps `RequestDeadlineCancelled` on its 503).
+        let timeout_layer = axum::middleware::from_fn(
+            |req: HttpRequest<Body>, next: axum::middleware::Next| async move {
+                match tokio::time::timeout(
+                    std::time::Duration::from_millis(50),
+                    next.run(req),
+                )
+                .await
+                {
+                    Ok(resp) => resp,
+                    Err(_) => {
+                        use axum::response::IntoResponse;
+                        let mut resp = StatusCode::SERVICE_UNAVAILABLE.into_response();
+                        resp.extensions_mut()
+                            .insert(crate::router::RequestDeadlineCancelled);
+                        resp
+                    }
+                }
+            },
+        );
+
+        let app = Router::new()
+            .route(
+                "/",
+                get(|session: Session| async move {
+                    session.insert("user", "alice").await;
+                    // Far exceeds the 50ms inner deadline; the handler future is
+                    // cancelled before it returns.
+                    tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                    "ok"
+                }),
+            )
+            .layer(timeout_layer)
+            .layer(SessionLayer::new(store.clone(), SessionConfig::default()))
+            .with_state(state);
+
+        let response = app
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/")
+                    .header(COOKIE, "autumn.sid=existing-id")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        // The partial mutation must NOT have been persisted: the stored session
+        // is still the seeded empty map, with no `user` key.
+        let saved = store
+            .load("existing-id")
+            .await
+            .expect("load")
+            .expect("session still present");
+        assert!(
+            !saved.contains_key("user"),
+            "a deadline-cancelled request must not persist partial session changes"
+        );
+        // The session layer must also not emit a Set-Cookie for the skipped save.
+        assert!(
+            response.headers().get(SET_COOKIE).is_none(),
+            "no Set-Cookie should be written when the partial save is skipped"
+        );
     }
 
     // ── Signed session cookies (RED phase) ─────────────────────────────────

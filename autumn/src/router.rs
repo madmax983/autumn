@@ -1874,6 +1874,19 @@ impl std::fmt::Display for RequestDeadlineExceeded {
 
 impl std::error::Error for RequestDeadlineExceeded {}
 
+/// Response-extension marker stamped on the `503` produced when the inbound
+/// request-timeout deadline cancels the handler future.
+///
+/// The session layer is applied *outer* to the timeout layer, so when the
+/// deadline fires it observes the (still-shared) `Session` handle as dirty even
+/// though the handler was cancelled mid-flight. Persisting that partial mutation
+/// would commit half-finished state — e.g. a login that set the user id but
+/// never finished — so `SessionService` checks for this marker and skips the
+/// dirty save/destroy when it is present. Only the timeout handler sets it, so
+/// ordinary handler-produced `503`s still persist session changes as before.
+#[derive(Clone, Copy, Debug)]
+pub struct RequestDeadlineCancelled;
+
 /// Build the per-route timeout override table from the top-level routes and any
 /// scoped (prefixed) groups. Group routes are keyed by their nested template so
 /// the runtime lookup matches [`axum::extract::MatchedPath`].
@@ -2078,6 +2091,9 @@ async fn request_timeout_handler(
                     timeout_ms: u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
                 })
                 .into_response();
+            // Tag the 503 so the outer session layer skips persisting any partial
+            // session mutation the cancelled handler made before the deadline.
+            response.extensions_mut().insert(RequestDeadlineCancelled);
             // This layer is outside `CorsLayer` in the main stack, so the 503
             // never passes back through it; mirror the CORS headers ourselves so
             // cross-origin browser clients can read the Problem Details body
