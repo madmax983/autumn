@@ -174,19 +174,26 @@ fn run_unix(action: Option<ServeAction>, opts: &ServeOptions) -> i32 {
                     || managed_cluster_present(opts.package.as_deref()),
                     |a| a.managed_pg,
                 );
-            // Fall back to the `serve.mode` marker for release/profile when the
-            // address file is missing/corrupt (it persists them independently).
+            // The address file is authoritative when present; only fall back to
+            // the `serve.mode` marker for release/profile when it is
+            // missing/corrupt. A best-effort marker left over from an older
+            // release run must not force a parseable dev daemon back to release.
             let recorded_mode = running_daemon_mode(opts.package.as_deref());
             let keep_release = opts.release
-                || running.as_ref().is_some_and(|a| a.release)
-                || recorded_mode.as_ref().is_some_and(|m| m.release);
+                || running.as_ref().map_or_else(
+                    || recorded_mode.as_ref().is_some_and(|m| m.release),
+                    |a| a.release,
+                );
             // Preserve the original daemon's profile: prefer one set on *this*
-            // restart's environment, else restore what the running daemon
-            // recorded (address file, then mode marker), so a bare `restart`
-            // doesn't silently fall back to `dev`.
-            let keep_profile = env_profile()
-                .or_else(|| running.as_ref().and_then(|a| a.profile.clone()))
-                .or_else(|| recorded_mode.and_then(|m| m.profile));
+            // restart's environment, else what the running daemon recorded —
+            // address file first, the mode marker only when there is no address
+            // file — so a bare `restart` doesn't silently fall back to `dev`.
+            let keep_profile = env_profile().or_else(|| {
+                running.as_ref().map_or_else(
+                    || recorded_mode.as_ref().and_then(|m| m.profile.clone()),
+                    |a| a.profile.clone(),
+                )
+            });
             let daemon_opts = ServeOptions {
                 daemon: true,
                 bundled_pg: keep_managed,
@@ -1068,7 +1075,6 @@ fn stop(opts: &ServeOptions) -> i32 {
         &rec,
         stop_timeout(opts, recorded_release, recorded_budget),
         &socket,
-        startup_in_progress(&paths),
     ) {
         // The daemon is still alive and we couldn't signal it (e.g. it is owned
         // by another user — `kill` returned `EPERM`). Do NOT remove its state or
@@ -1158,10 +1164,11 @@ pub struct ManagedPgEnv {
 }
 
 /// Resolve the managed-Postgres environment for a one-off run of `package` so it
-/// shares the serve daemon's cluster. Returns the daemon's data dir (always) and
-/// the live cluster's published URL (only when a postmaster is actually running
-/// for this project). `None` when the project's runtime paths can't be resolved,
-/// in which case the run falls back to the provider's own per-project default.
+/// shares the serve daemon's cluster. `None` when the project's runtime paths
+/// can't be resolved (the run then uses the provider's own per-project default),
+/// or when a live postmaster holds the data dir but we can't attach to it (so the
+/// child must not be pointed at the locked dir). Otherwise returns the data dir
+/// and, when a reachable cluster is published, its attach URL.
 #[must_use]
 pub fn managed_pg_env(package: Option<&str>) -> Option<ManagedPgEnv> {
     // Respect an explicit operator override: if the environment already pins the
@@ -1172,46 +1179,80 @@ pub fn managed_pg_env(package: Option<&str>) -> Option<ManagedPgEnv> {
         return None;
     }
     let paths = RuntimePaths::resolve(&project_identity(package)).ok()?;
-    let attach_url = live_managed_pg_url(&paths);
+    let data_dir = paths.pg_data_dir();
+
+    // Attach only to a cluster we can actually reach: a published URL whose
+    // endpoint accepts a connection. This confirms liveness portably — covering
+    // macOS/BSD PID reuse, where the postmaster-pid check can only test bare
+    // liveness — and never hands the child a stale/dead endpoint.
+    if let Some(url) = reachable_published_url(&data_dir) {
+        return Some(ManagedPgEnv {
+            data_dir,
+            attach_url: Some(url),
+        });
+    }
+
+    // No reachable cluster. But if a live postmaster still holds this data dir
+    // (URL missing/unpublished, a best-effort publish failure, or a task racing
+    // the daemon's startup), don't point the child at the *locked* dir — it would
+    // deadlock starting a second postmaster. Let it use its own default cluster.
+    if live_postmaster_pid(&data_dir).is_some() {
+        return None;
+    }
+
+    // Nothing holds the data dir: safe to share its location so this run and a
+    // future `serve` use the same cluster.
     Some(ManagedPgEnv {
-        data_dir: paths.pg_data_dir(),
-        attach_url,
+        data_dir,
+        attach_url: None,
     })
 }
 
-/// The published connection URL of this project's managed cluster, but only when
-/// the cluster is currently running. Combines the live-postmaster check with the
-/// URL file the provider writes next to the data dir.
-fn live_managed_pg_url(paths: &RuntimePaths) -> Option<String> {
-    // Restrict attach discovery to Unix. Off Unix, `process::is_process_alive` is
-    // a conservative `true` (the daemon lock's fail-safe), so a stale
-    // `postmaster.pid` + URL file left by a crash would make `task`/`build`
-    // attach to a *dead* cluster instead of starting their own. The daemon is
-    // Unix-only anyway, so there's nothing live to share off Unix.
-    #[cfg(not(unix))]
-    {
-        let _ = paths;
-        None
+/// The published connection URL for this project's managed cluster, returned only
+/// when its endpoint is reachable. Reads the URL file the provider writes next to
+/// the data dir, then confirms a live postmaster answers there so a stale
+/// `.autumn-pg-url` (crash / PID reuse) can't make a run attach to a dead cluster.
+fn reachable_published_url(data_dir: &Path) -> Option<String> {
+    // The provider publishes the URL beside the data dir. Keep this filename in
+    // sync with `autumn_web::managed_pg::PUBLISHED_URL_FILE` (the CLI doesn't
+    // build the `managed-pg` feature, so it can't reference the const).
+    let url_file = data_dir.parent().unwrap_or(data_dir).join(".autumn-pg-url");
+    let contents = std::fs::read_to_string(url_file).ok()?;
+    let url = contents.trim();
+    if url.is_empty() || !published_url_reachable(url) {
+        return None;
     }
-    #[cfg(unix)]
-    {
-        let data_dir = paths.pg_data_dir();
-        live_postmaster_pid(&data_dir)?;
-        // The provider publishes the URL beside the data dir. Keep this filename
-        // in sync with `autumn_web::managed_pg::PUBLISHED_URL_FILE` (the CLI
-        // doesn't build the `managed-pg` feature, so it can't reference the const).
-        let url_file = data_dir
-            .parent()
-            .unwrap_or(&data_dir)
-            .join(".autumn-pg-url");
-        let contents = std::fs::read_to_string(url_file).ok()?;
-        let trimmed = contents.trim();
-        if trimmed.is_empty() {
-            None
-        } else {
-            Some(trimmed.to_owned())
-        }
+    Some(url.to_owned())
+}
+
+/// Whether the `host:port` in a `postgresql://…` URL accepts a TCP connection
+/// within a short timeout — a portable, definitive "the cluster is up" probe.
+fn published_url_reachable(url: &str) -> bool {
+    use std::net::ToSocketAddrs;
+    let Some(hostport) = pg_url_host_port(url) else {
+        return false;
+    };
+    let Ok(addrs) = hostport.to_socket_addrs() else {
+        return false;
+    };
+    addrs
+        .take(4)
+        .any(|sa| std::net::TcpStream::connect_timeout(&sa, Duration::from_millis(500)).is_ok())
+}
+
+/// Extract `host:port` from a `postgresql://[user[:pass]@]host:port/db` URL.
+/// Returns `None` unless an explicit numeric port is present (the managed
+/// provider always emits one; a unix-socket URL has none and isn't TCP-probable).
+fn pg_url_host_port(url: &str) -> Option<String> {
+    let after_scheme = url.split_once("://")?.1;
+    let authority = after_scheme.split(['/', '?']).next()?;
+    // Drop any `user:pass@` userinfo (split at the last '@' before the host).
+    let hostport = authority.rsplit_once('@').map_or(authority, |(_, hp)| hp);
+    let (_, port) = hostport.rsplit_once(':')?;
+    if port.parse::<u16>().is_err() {
+        return None;
     }
+    Some(hostport.to_owned())
 }
 
 /// Graceful-stop budget before escalating to `SIGKILL`.
@@ -1577,6 +1618,24 @@ mod tests {
         let nested = root.join("src");
         std::fs::create_dir_all(&nested).expect("create nested dir");
         assert_eq!(workspace_anchor_from(&nested), Some(root));
+    }
+
+    #[test]
+    fn pg_url_host_port_extracts_authority() {
+        assert_eq!(
+            pg_url_host_port("postgresql://postgres:secret@localhost:54213/autumn"),
+            Some("localhost:54213".to_owned())
+        );
+        // No userinfo.
+        assert_eq!(
+            pg_url_host_port("postgres://127.0.0.1:5432/db"),
+            Some("127.0.0.1:5432".to_owned())
+        );
+        // Missing/invalid port → not TCP-probable.
+        assert_eq!(pg_url_host_port("postgresql://localhost/autumn"), None);
+        assert_eq!(pg_url_host_port("postgresql://localhost:notaport/db"), None);
+        // Not a URL.
+        assert_eq!(pg_url_host_port("/var/run/pg.sock"), None);
     }
 
     #[test]

@@ -358,44 +358,35 @@ pub fn wait_for_record_exit(record: &PidRecord, timeout: Duration) -> bool {
 /// `timeout` for it to drain and exit, then force-kill if it is still alive.
 /// Returns `true` only if the recorded process is gone afterwards.
 ///
-/// The wait and the pre-escalation check are identity-aware: a recorded start
-/// time (Linux) detects a PID reused mid-drain, and where that's unavailable
-/// (macOS/BSD, or legacy pidfiles) the daemon's `socket` is used as the identity
-/// signal instead — if it no longer has a live listener, the daemon has exited
-/// and the still-"alive" PID belongs to an unrelated reuser, so the
-/// `SIGKILL`/`killpg` escalation is skipped rather than aimed at a stranger.
-/// `startup_in_progress` guards that socket check: a daemon still starting hasn't
-/// bound its socket yet, so without it a stop racing startup would mistake our
-/// own starting daemon for a dead one and orphan it.
+/// On Linux the wait is identity-aware: a recorded start time detects a PID
+/// reused mid-drain, so the `SIGKILL`/`killpg` escalation never aims at a
+/// stranger. Where a start time is unavailable (macOS/BSD, or legacy pidfiles)
+/// we can't distinguish our stuck daemon from a reused PID, so we enforce the
+/// timeout and escalate against the still-live PID rather than risk reporting a
+/// false "stopped" and orphaning a daemon that merely closed its listener while
+/// still draining. (The residual risk of signalling a reused PID is bounded: the
+/// wait returns the instant the original exits, so reaching here with a live PID
+/// almost always means our own daemon never exited.)
 ///
 /// A `false` return means the daemon could **not** be stopped — e.g. it is owned
 /// by another user and `kill` returns `EPERM` — so the caller must not delete
 /// its state or report success.
 #[cfg(unix)]
 #[must_use]
-pub fn stop_record(
-    record: &PidRecord,
-    timeout: Duration,
-    socket: &Path,
-    startup_in_progress: bool,
-) -> bool {
+pub fn stop_record(record: &PidRecord, timeout: Duration, socket: &Path) -> bool {
     let _ = signal_terminate(record.pid);
     if wait_for_record_exit(record, timeout) {
-        return true;
-    }
-    // Timed out with the PID still apparently alive. On platforms without a
-    // recorded start time, `is_record_alive` is a bare liveness check that can't
-    // tell our daemon from a process that reused its PID after it exited. Use the
-    // daemon's socket as the identity check: only our daemon listens there, so a
-    // dead socket means it's gone — don't escalate against the reused PID. But a
-    // start still in progress hasn't bound the socket yet, and that live PID *is*
-    // our starting daemon, so don't skip escalation in that window.
-    if record.start_time.is_none() && !startup_in_progress && !socket_has_live_listener(socket) {
         return true;
     }
     if !is_record_alive(record) {
         return true;
     }
+    // Timed out with the PID still alive. A daemon can close its control socket
+    // before its `on_shutdown` hooks finish (or hang outright), so a dead socket
+    // is *not* proof of exit — enforce the budget with a `SIGKILL`. `socket` is
+    // retained for symmetry with the non-Unix stub and possible future identity
+    // checks, but is intentionally not used as an exit signal here.
+    let _ = socket;
     // The app missed its graceful-drain budget and is still our daemon, so its
     // `on_shutdown` hooks (which stop a managed Postgres child) may not have run.
     // Kill the whole daemon process group, not just the app PID, so supervised
@@ -403,15 +394,6 @@ pub fn stop_record(
     force_kill(record.pid);
     force_kill_group(record.pid);
     wait_for_record_exit(record, Duration::from_secs(5))
-}
-
-/// Whether a Unix socket at `path` currently has a live listener (a `connect`
-/// succeeds). Used as an identity signal where a process start time isn't
-/// available, since only our daemon listens on its control socket.
-#[cfg(unix)]
-#[must_use]
-fn socket_has_live_listener(path: &Path) -> bool {
-    std::os::unix::net::UnixStream::connect(path).is_ok()
 }
 
 /// Stop a managed Postgres postmaster `pid`: request a "fast" shutdown (SIGINT —
@@ -450,12 +432,7 @@ pub fn stop_postmaster(_pid: u32, _timeout: Duration) {}
 /// Non-Unix fallback: no graceful-signal mechanism in this MVP.
 #[cfg(not(unix))]
 #[must_use]
-pub fn stop_record(
-    _record: &PidRecord,
-    _timeout: Duration,
-    _socket: &Path,
-    _startup_in_progress: bool,
-) -> bool {
+pub fn stop_record(_record: &PidRecord, _timeout: Duration, _socket: &Path) -> bool {
     false
 }
 
