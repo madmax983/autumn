@@ -167,6 +167,9 @@ struct ColumnRow {
     /// `'ALWAYS'` for stored generated columns, `'NEVER'` otherwise.
     #[diesel(sql_type = diesel::sql_types::Text)]
     is_generated: String,
+    /// `'YES'` for identity columns (`GENERATED ... AS IDENTITY`), `'NO'` otherwise.
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    is_identity: String,
 }
 
 /// List the base tables in `public`, excluding Diesel's bookkeeping table.
@@ -214,7 +217,7 @@ fn introspect_table(conn: &mut PgConnection, table: &str) -> Result<TableSchema,
     let pk = primary_key_columns(conn, table)?;
 
     let query = format!(
-        "SELECT column_name, udt_name, is_nullable, column_default, is_generated \
+        "SELECT column_name, udt_name, is_nullable, column_default, is_generated, is_identity \
          FROM information_schema.columns \
          WHERE table_schema = 'public' AND table_name = {} \
          ORDER BY ordinal_position",
@@ -237,6 +240,7 @@ fn introspect_table(conn: &mut PgConnection, table: &str) -> Result<TableSchema,
             is_pk: pk.iter().any(|c| c == &row.column_name),
             has_default: row.column_default.is_some(),
             is_generated: row.is_generated.eq_ignore_ascii_case("ALWAYS"),
+            is_identity: row.is_identity.eq_ignore_ascii_case("YES"),
             name: row.column_name,
             kind,
         });

@@ -187,7 +187,9 @@ async fn db_pull_regenerates_models_from_existing_schema_and_compiles() {
     assert!(schema.contains("summary -> Nullable<Text>,"));
 
     let repo = std::fs::read_to_string(project.join("src/repositories/post.rs")).unwrap();
-    assert!(repo.contains("#[autumn_web::repository(Post, api = \"/api/posts\")]"));
+    assert!(
+        repo.contains("#[autumn_web::repository(Post, table = \"posts\", api = \"/api/posts\")]")
+    );
 
     let main = std::fs::read_to_string(project.join("src/main.rs")).unwrap();
     assert!(main.contains("mod models;"));

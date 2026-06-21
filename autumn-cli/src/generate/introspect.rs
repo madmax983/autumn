@@ -43,6 +43,11 @@ pub struct Column {
     /// (`GENERATED ALWAYS AS (...) STORED`). Such columns are read-only, so they
     /// are annotated `#[default]` to keep them out of inserts and updates.
     pub is_generated: bool,
+    /// True when the column is an identity column (`GENERATED ... AS IDENTITY`).
+    /// The database supplies the value, so it is annotated `#[default]` to keep
+    /// it out of inserts/updates (a `GENERATED ALWAYS` identity rejects explicit
+    /// writes outright).
+    pub is_identity: bool,
 }
 
 impl Column {
@@ -265,10 +270,11 @@ fn inferred_table_name(pascal_name: &str) -> String {
 }
 
 /// Whether a column must be excluded from inserts and updates (`#[default]`):
-/// the framework-managed `created_at` (when it carries a DB default) or a stored
-/// generated column. The primary key is handled separately by `#[id]`.
+/// a stored generated column, an identity column, or the framework-managed
+/// `created_at` (when it carries a DB default). A plain mutable column with a
+/// DB default stays settable. The primary key is handled separately by `#[id]`.
 fn is_write_excluded(col: &Column) -> bool {
-    col.is_generated || (col.name == "created_at" && col.has_default)
+    col.is_generated || col.is_identity || (col.name == "created_at" && col.has_default)
 }
 
 /// Build a `diesel::table!` block from introspected columns.
@@ -279,11 +285,11 @@ pub fn render_schema_block(table: &str, columns: &[Column]) -> String {
         .filter(|c| c.is_pk)
         .map(|c| c.name.as_str())
         .collect();
+    // `plan_pull` rejects/skips tables without an `id` primary key before they
+    // reach here, so `pk` is non-empty in practice; default to the Autumn `id`
+    // convention rather than inventing the first column as the key.
     let pk_clause = if pk.is_empty() {
-        // Diesel's `table!` requires a primary key; fall back to the first
-        // column when the table declares none (rare; introspected tables
-        // tested here always have one).
-        columns.first().map_or("id", |c| c.name.as_str()).to_owned()
+        "id".to_owned()
     } else {
         pk.join(", ")
     };
@@ -368,11 +374,16 @@ fn replace_schema_block(existing: &str, table: &str, new_block: &str) -> String 
 }
 
 /// Whether `columns` follow the Autumn `id BIGINT` primary-key convention the
-/// `#[repository]` macro assumes: exactly one primary-key column, named `id`,
-/// of type `i64`.
+/// `#[model]` / `#[repository]` macros assume: exactly one primary-key column,
+/// named `id`, of type `i64`, whose value is supplied by the database
+/// (`BIGSERIAL`/`DEFAULT` or `GENERATED ... AS IDENTITY`). The macros always
+/// exclude `#[id]` from `NewX`, so a non-generated `id` could never be inserted.
 fn has_autumn_id_pk(columns: &[Column]) -> bool {
     let pks: Vec<&Column> = columns.iter().filter(|c| c.is_pk).collect();
-    matches!(pks.as_slice(), [pk] if pk.name == "id" && pk.kind == FieldKind::I64)
+    matches!(
+        pks.as_slice(),
+        [pk] if pk.name == "id" && pk.kind == FieldKind::I64 && (pk.has_default || pk.is_identity)
+    )
 }
 
 /// Validate that an introspected table can be emitted as compilable Autumn code.
@@ -392,6 +403,15 @@ fn unsupported_reason(table: &TableSchema, resource: &str) -> Option<String> {
             "the derived model name '{resource}' is not a valid Rust identifier"
         ));
     }
+    // The raw table name is emitted verbatim as the `schema.rs` module and in
+    // `use crate::schema::<table>`, so it too must be a valid identifier (a
+    // table named `as` singularizes to a fine model `A` but breaks the schema).
+    if !super::dsl::is_valid_ident(&table.table) || super::dsl::is_rust_keyword(&table.table) {
+        return Some(format!(
+            "the table name '{}' is not a valid snake_case Rust identifier (or is a reserved keyword)",
+            table.table
+        ));
+    }
     for col in &table.columns {
         if !super::dsl::is_valid_ident(&col.name) || super::dsl::is_rust_keyword(&col.name) {
             return Some(format!(
@@ -402,8 +422,9 @@ fn unsupported_reason(table: &TableSchema, resource: &str) -> Option<String> {
     }
     if !has_autumn_id_pk(&table.columns) {
         return Some(
-            "it lacks the Autumn convention of a single `id` BIGINT (i64) primary key \
-             (the #[model] macro references the `id` column directly)"
+            "it lacks the Autumn convention of a single database-generated `id` BIGINT (i64) \
+             primary key (BIGSERIAL/DEFAULT or GENERATED AS IDENTITY); the #[model] macro \
+             references the `id` column directly and excludes it from inserts"
                 .to_owned(),
         );
     }
@@ -448,6 +469,21 @@ mod tests {
             is_pk,
             has_default: false,
             is_generated: false,
+            is_identity: false,
+        }
+    }
+
+    /// The conventional Autumn `id BIGSERIAL PRIMARY KEY` column: i64 PK whose
+    /// value is database-generated (`has_default = true`).
+    fn id_col() -> Column {
+        Column {
+            name: "id".to_owned(),
+            kind: FieldKind::I64,
+            nullable: false,
+            is_pk: true,
+            has_default: true,
+            is_generated: false,
+            is_identity: false,
         }
     }
 
@@ -461,6 +497,7 @@ mod tests {
             is_pk: false,
             has_default: true,
             is_generated: false,
+            is_identity: false,
         }
     }
 
@@ -470,7 +507,7 @@ mod tests {
         TableSchema {
             table: "posts".to_owned(),
             columns: vec![
-                col("id", FieldKind::I64, false, true),
+                id_col(),
                 col("title", FieldKind::String, false, false),
                 col("body", FieldKind::String, false, false),
                 col("published", FieldKind::Bool, false, false),
@@ -535,10 +572,7 @@ mod tests {
         let tmp = project();
         let table = TableSchema {
             table: "notes".to_owned(),
-            columns: vec![
-                col("id", FieldKind::I64, false, true),
-                col("body", FieldKind::String, true, false),
-            ],
+            columns: vec![id_col(), col("body", FieldKind::String, true, false)],
         };
         let plan = plan_pull(tmp.path(), &[table], PullOptions::default()).unwrap();
         plan.execute(Flags::default()).unwrap();
@@ -591,7 +625,7 @@ mod tests {
         let comments = TableSchema {
             table: "comments".to_owned(),
             columns: vec![
-                col("id", FieldKind::I64, false, true),
+                id_col(),
                 col("body", FieldKind::String, false, false),
                 created_at_col(),
             ],
@@ -635,7 +669,11 @@ mod tests {
         plan.execute(Flags::default()).unwrap();
 
         let repo = fs::read_to_string(tmp.path().join("src/repositories/post.rs")).unwrap();
-        assert!(repo.contains("#[autumn_web::repository(Post, api = \"/api/posts\")]"));
+        assert!(
+            repo.contains(
+                "#[autumn_web::repository(Post, table = \"posts\", api = \"/api/posts\")]"
+            )
+        );
         assert!(repo.contains("use crate::schema::posts;"));
         let repo_mod = fs::read_to_string(tmp.path().join("src/repositories/mod.rs")).unwrap();
         assert!(repo_mod.contains("pub mod post;"));
@@ -750,10 +788,7 @@ mod tests {
         // `type` is a Rust keyword; emitting `pub type: ...` would not compile.
         let bad = TableSchema {
             table: "items".to_owned(),
-            columns: vec![
-                col("id", FieldKind::I64, false, true),
-                col("type", FieldKind::String, false, false),
-            ],
+            columns: vec![id_col(), col("type", FieldKind::String, false, false)],
         };
         let err = plan_pull(
             tmp.path(),
@@ -776,11 +811,11 @@ mod tests {
         // `status` and `statuses` both singularize to `status`.
         let status = TableSchema {
             table: "status".to_owned(),
-            columns: vec![col("id", FieldKind::I64, false, true)],
+            columns: vec![id_col()],
         };
         let statuses = TableSchema {
             table: "statuses".to_owned(),
-            columns: vec![col("id", FieldKind::I64, false, true)],
+            columns: vec![id_col()],
         };
         let err = plan_pull(tmp.path(), &[status, statuses], PullOptions::default()).unwrap_err();
         assert!(
@@ -795,14 +830,7 @@ mod tests {
         let table = TableSchema {
             table: "widgets".to_owned(),
             columns: vec![
-                Column {
-                    name: "id".to_owned(),
-                    kind: FieldKind::I64,
-                    nullable: false,
-                    is_pk: true,
-                    has_default: true, // serial default — `#[id]` only, never `#[default]`
-                    is_generated: false,
-                },
+                id_col(),
                 Column {
                     // A mutable column with a DB default must stay settable, so it
                     // must NOT be `#[default]` (that would lock it out of writes).
@@ -812,6 +840,7 @@ mod tests {
                     is_pk: false,
                     has_default: true, // e.g. DEFAULT 'draft'
                     is_generated: false,
+                    is_identity: false,
                 },
                 Column {
                     // A stored generated column is read-only -> `#[default]`.
@@ -821,6 +850,7 @@ mod tests {
                     is_pk: false,
                     has_default: false,
                     is_generated: true,
+                    is_identity: false,
                 },
                 col("label", FieldKind::String, false, false),
                 created_at_col(),
@@ -849,7 +879,7 @@ mod tests {
         // `people` singularizes to `person`; the macro would infer `persons`.
         let people = TableSchema {
             table: "people".to_owned(),
-            columns: vec![col("id", FieldKind::I64, false, true), created_at_col()],
+            columns: vec![id_col(), created_at_col()],
         };
         let plan = plan_pull(tmp.path(), &[people], PullOptions::default()).unwrap();
         plan.execute(Flags::default()).unwrap();
@@ -897,7 +927,7 @@ mod tests {
         // wrong `statuss` schema import. The repo must use the real table name.
         let statuses = TableSchema {
             table: "statuses".to_owned(),
-            columns: vec![col("id", FieldKind::I64, false, true), created_at_col()],
+            columns: vec![id_col(), created_at_col()],
         };
         let plan = plan_pull(
             tmp.path(),
@@ -915,10 +945,111 @@ mod tests {
             "repo must import the real table module: {repo}"
         );
         assert!(
+            repo.contains("table = \"statuses\""),
+            "repo macro must pin the real table name: {repo}"
+        );
+        assert!(
             repo.contains("api = \"/api/statuses\""),
             "repo REST mount must use the real table name: {repo}"
         );
-        assert!(!repo.contains("statuss"), "must not re-pluralize: {repo}");
+        assert!(!repo.contains("statuss\""), "must not re-pluralize: {repo}");
+    }
+
+    #[test]
+    fn plan_pull_rejects_non_database_generated_id() {
+        let tmp = project();
+        // `id BIGINT PRIMARY KEY` with no default/identity: the macro excludes
+        // `#[id]` from inserts, so rows could never be created.
+        let bare_id = TableSchema {
+            table: "things".to_owned(),
+            columns: vec![
+                Column {
+                    name: "id".to_owned(),
+                    kind: FieldKind::I64,
+                    nullable: false,
+                    is_pk: true,
+                    has_default: false,
+                    is_generated: false,
+                    is_identity: false,
+                },
+                col("label", FieldKind::String, false, false),
+            ],
+        };
+        let err = plan_pull(
+            tmp.path(),
+            &[bare_id],
+            PullOptions {
+                explicit: true,
+                ..PullOptions::default()
+            },
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("database-generated"),
+            "error must explain the id must be DB-generated: {err}"
+        );
+    }
+
+    #[test]
+    fn plan_pull_accepts_identity_id_and_excludes_identity_columns() {
+        let tmp = project();
+        let invoices = TableSchema {
+            table: "invoices".to_owned(),
+            columns: vec![
+                // id via GENERATED AS IDENTITY (no column_default) is supported.
+                Column {
+                    name: "id".to_owned(),
+                    kind: FieldKind::I64,
+                    nullable: false,
+                    is_pk: true,
+                    has_default: false,
+                    is_generated: false,
+                    is_identity: true,
+                },
+                // A non-PK identity column must be kept out of writes.
+                Column {
+                    name: "invoice_no".to_owned(),
+                    kind: FieldKind::I64,
+                    nullable: false,
+                    is_pk: false,
+                    has_default: false,
+                    is_generated: false,
+                    is_identity: true,
+                },
+                created_at_col(),
+            ],
+        };
+        let plan = plan_pull(tmp.path(), &[invoices], PullOptions::default()).unwrap();
+        plan.execute(Flags::default()).unwrap();
+        let model = fs::read_to_string(tmp.path().join("src/models/invoice.rs")).unwrap();
+        assert!(model.contains("#[id]\n    pub id: i64,"));
+        assert!(
+            model.contains("#[default]\n    pub invoice_no: i64,"),
+            "identity column must be write-excluded: {model}"
+        );
+    }
+
+    #[test]
+    fn plan_pull_rejects_keyword_table_name_when_explicit() {
+        let tmp = project();
+        // A (quoted) table literally named `as` would emit `use crate::schema::as;`.
+        let bad = TableSchema {
+            table: "as".to_owned(),
+            columns: vec![id_col()],
+        };
+        let err = plan_pull(
+            tmp.path(),
+            &[bad],
+            PullOptions {
+                explicit: true,
+                ..PullOptions::default()
+            },
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("table name 'as'"),
+            "error must name the offending table: {err}"
+        );
     }
 
     #[test]
@@ -1025,6 +1156,7 @@ mod tests {
                 is_pk: *is_pk,
                 has_default: *has_default,
                 is_generated: false,
+                is_identity: false,
             })
             .collect();
         let re_derived = render_model(&pascal(&singularize("posts")), "posts", &columns);

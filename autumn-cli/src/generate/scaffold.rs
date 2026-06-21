@@ -313,10 +313,10 @@ fn resolve_shard_key(
 /// Render a plain `#[repository(Model)]` trait for `autumn db pull --with-repository`.
 ///
 /// No derived queries, soft-delete, or sharding — introspection cannot recover
-/// those from the database. Unlike the scaffold path, the schema module and REST
-/// mount point use the introspected `table` name directly rather than
-/// re-pluralizing `snake_name`, which would be wrong for irregular plurals
-/// (`status` -> `statuss`, not `statuses`).
+/// those from the database. The introspected `table` name is passed through
+/// explicitly — both as the schema import and as `table = "..."` in the macro —
+/// because the repository macro otherwise infers the table from the model name
+/// (`Status` -> `statuss`), which is wrong for irregular plurals.
 pub(super) fn render_repository_for_pull(
     pascal_name: &str,
     snake_name: &str,
@@ -331,7 +331,7 @@ pub(super) fn render_repository_for_pull(
          use crate::models::{snake_name}::{{{pascal_name}, New{pascal_name}, Update{pascal_name}}};\n\
          use crate::schema::{table};\n\
          \n\
-         #[autumn_web::repository({pascal_name}, api = \"/api/{table}\")]\n\
+         #[autumn_web::repository({pascal_name}, table = \"{table}\", api = \"/api/{table}\")]\n\
          pub trait {pascal_name}Repository {{\n\
          }}\n"
     )
