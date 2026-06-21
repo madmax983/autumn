@@ -1,0 +1,567 @@
+//! Typed domain event bus with decoupled, durable listeners.
+//!
+//! A *domain event* is a typed value (declared with `#[event]`) describing
+//! something that happened in your application — `UserSignedUp { user_id }`,
+//! `OrderPlaced { .. }`. *Listeners* (declared with `#[listener]`) react to an
+//! event independently of the code that emitted it: adding a new reaction is a
+//! new listener and **zero edits** to the emitter.
+//!
+//! ```ignore
+//! use autumn_web::prelude::*;
+//!
+//! #[event]
+//! struct UserSignedUp { user_id: i64 }
+//!
+//! // Durable: rides the #[job] queue, survives restarts, retried on failure.
+//! #[listener(UserSignedUp, durable)]
+//! async fn send_welcome_email(state: AppState, event: UserSignedUp) -> AutumnResult<()> {
+//!     // ...
+//!     Ok(())
+//! }
+//!
+//! #[post("/signup")]
+//! async fn signup(events: Events) -> AutumnResult<&'static str> {
+//!     events.publish(UserSignedUp { user_id: 42 }).await?;
+//!     Ok("ok")
+//! }
+//! ```
+//!
+//! # Dispatch
+//!
+//! - **Sync** listeners run in-request, before the response is returned — use
+//!   these for invariants the caller depends on. Each runs independently with
+//!   panic/error isolation: one failing listener never blocks the others, and
+//!   never fails the publish.
+//! - **Durable** listeners are enqueued onto the existing `#[job]` queue, so
+//!   they survive a process restart and inherit the queue's retry + DLQ
+//!   semantics (at-least-once delivery).
+//!
+//! A published event with no registered listeners is a **no-op**, not an error.
+
+use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
+
+use serde::Serialize;
+use serde::de::DeserializeOwned;
+use serde_json::Value;
+
+use crate::{AppState, AutumnError, AutumnResult};
+
+/// A typed domain event.
+///
+/// Implemented by the `#[event]` macro, which also derives the serde +
+/// `Clone`/`Debug` impls the bus needs to carry the payload across the durable
+/// job queue.
+pub trait Event: Serialize + DeserializeOwned + Send + Sync + 'static {
+    /// Stable identifier used to route the event to its listeners and to name
+    /// the durable listener jobs.
+    const NAME: &'static str;
+}
+
+/// How a listener is dispatched when its event is published.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DispatchMode {
+    /// Runs in-request, before the response, with panic/error isolation.
+    Sync,
+    /// Enqueued onto the `#[job]` queue (retry + DLQ + restart-safe).
+    Durable,
+}
+
+/// The async function signature for an event listener.
+///
+/// Intentionally identical to [`crate::job::JobHandler`] so a durable listener
+/// becomes a [`crate::job::JobInfo`] with no adapter.
+pub type ListenerHandler =
+    fn(AppState, Value) -> Pin<Box<dyn Future<Output = AutumnResult<()>> + Send + 'static>>;
+
+/// Metadata describing a registered event listener.
+///
+/// Produced by the `#[listener]` macro's `__autumn_listener_info_*` companion
+/// and collected by `listeners![]`.
+#[derive(Clone)]
+pub struct ListenerInfo {
+    /// The [`Event::NAME`] this listener subscribes to.
+    pub event_name: &'static str,
+    /// Fully-qualified, per-listener identity (`module::fn`).
+    pub listener_name: String,
+    /// Sync (in-request) or Durable (job queue).
+    pub mode: DispatchMode,
+    /// For durable listeners, the registered job name; `None` for sync.
+    pub job_name: Option<String>,
+    /// Durable retry cap (mirrors [`crate::job::JobInfo`]); ignored for sync.
+    pub max_attempts: u32,
+    /// Durable initial backoff in ms; ignored for sync.
+    pub initial_backoff_ms: u64,
+    /// Runs the listener: deserialize the event payload, call the function.
+    pub handler: ListenerHandler,
+}
+
+/// Routes published events to their registered listeners.
+///
+/// Built from the listeners registered with `AppBuilder::listeners` and
+/// installed onto [`AppState`] as a typed extension.
+#[derive(Clone, Default)]
+pub struct EventRegistry {
+    by_event: Arc<HashMap<&'static str, Vec<ListenerInfo>>>,
+}
+
+impl EventRegistry {
+    /// Group listeners by event name, preserving registration order.
+    #[must_use]
+    pub fn from_listeners(listeners: Vec<ListenerInfo>) -> Self {
+        let mut by_event: HashMap<&'static str, Vec<ListenerInfo>> = HashMap::new();
+        for listener in listeners {
+            by_event
+                .entry(listener.event_name)
+                .or_default()
+                .push(listener);
+        }
+        Self {
+            by_event: Arc::new(by_event),
+        }
+    }
+
+    /// Listeners registered for `event_name` (empty slice if none).
+    #[must_use]
+    pub fn listeners_for(&self, event_name: &str) -> &[ListenerInfo] {
+        self.by_event.get(event_name).map_or(&[][..], Vec::as_slice)
+    }
+
+    /// Synthesize a [`crate::job::JobInfo`] for each durable listener so the
+    /// app builder can register them with the job runtime.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a durable listener is missing its `job_name` (the `#[listener]`
+    /// macro always sets one, so this only fires on a hand-built `ListenerInfo`).
+    #[must_use]
+    pub fn durable_job_infos(&self) -> Vec<crate::job::JobInfo> {
+        self.by_event
+            .values()
+            .flatten()
+            .filter(|listener| listener.mode == DispatchMode::Durable)
+            .map(|listener| crate::job::JobInfo {
+                name: listener
+                    .job_name
+                    .clone()
+                    .expect("durable listener must carry a job_name"),
+                max_attempts: listener.max_attempts,
+                initial_backoff_ms: listener.initial_backoff_ms,
+                uniqueness: None,
+                concurrency: None,
+                handler: listener.handler,
+            })
+            .collect()
+    }
+}
+
+/// A single recorded publication, captured by [`EventRecorder`] in tests.
+#[derive(Clone, Debug)]
+pub struct RecordedEvent {
+    /// The [`Event::NAME`] of the published event.
+    pub event_name: &'static str,
+    /// The serialized event payload.
+    pub payload: Value,
+}
+
+/// Records published events so tests can assert on them without standing up the
+/// job runner. Installed onto [`AppState`] by the test client.
+#[derive(Default)]
+pub struct EventRecorder {
+    events: Mutex<Vec<RecordedEvent>>,
+}
+
+impl EventRecorder {
+    fn record(&self, event_name: &'static str, payload: Value) {
+        self.events
+            .lock()
+            .expect("event recorder lock poisoned")
+            .push(RecordedEvent {
+                event_name,
+                payload,
+            });
+    }
+
+    /// Deserialize every recorded publication of event type `E`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the recorder's internal lock is poisoned.
+    #[must_use]
+    pub fn published<E: Event>(&self) -> Vec<E> {
+        self.events
+            .lock()
+            .expect("event recorder lock poisoned")
+            .iter()
+            .filter(|recorded| recorded.event_name == E::NAME)
+            .filter_map(|recorded| serde_json::from_value(recorded.payload.clone()).ok())
+            .collect()
+    }
+
+    /// How many times event type `E` was published.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the recorder's internal lock is poisoned.
+    #[must_use]
+    pub fn count<E: Event>(&self) -> usize {
+        self.events
+            .lock()
+            .expect("event recorder lock poisoned")
+            .iter()
+            .filter(|recorded| recorded.event_name == E::NAME)
+            .count()
+    }
+
+    /// All recorded events, in publication order.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the recorder's internal lock is poisoned.
+    #[must_use]
+    pub fn all(&self) -> Vec<RecordedEvent> {
+        self.events
+            .lock()
+            .expect("event recorder lock poisoned")
+            .clone()
+    }
+}
+
+/// Injectable event publisher.
+///
+/// Extracted in handlers/services just like the `Mailer`. Call
+/// [`Events::publish`] to emit a typed event to its listeners.
+#[derive(Clone)]
+pub struct Events {
+    registry: Arc<EventRegistry>,
+    recorder: Option<Arc<EventRecorder>>,
+    state: AppState,
+}
+
+impl Events {
+    /// Publish a typed event to its registered listeners.
+    ///
+    /// Durable listeners are enqueued onto the job queue; sync listeners run
+    /// in-request with panic/error isolation. A missing-listener event is a
+    /// no-op. Returns `Ok(())` even when sync listeners fail (the emitter stays
+    /// decoupled); only a durable **enqueue** failure propagates.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the event cannot be serialized, or if enqueueing a
+    /// durable listener onto the job queue fails.
+    pub async fn publish<E: Event>(&self, event: E) -> AutumnResult<()> {
+        let payload = serialize_event(&event)?;
+        dispatch(
+            &self.registry,
+            self.recorder.as_deref(),
+            &self.state,
+            E::NAME,
+            payload,
+        )
+        .await
+    }
+}
+
+impl axum::extract::FromRequestParts<AppState> for Events {
+    type Rejection = AutumnError;
+
+    async fn from_request_parts(
+        _parts: &mut http::request::Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        // A missing registry is not an error — publishing is then a safe no-op.
+        let registry = state
+            .extension::<EventRegistry>()
+            .unwrap_or_else(|| Arc::new(EventRegistry::default()));
+        let recorder = state.extension::<EventRecorder>();
+        Ok(Self {
+            registry,
+            recorder,
+            state: state.clone(),
+        })
+    }
+}
+
+fn serialize_event<E: Event>(event: &E) -> AutumnResult<Value> {
+    serde_json::to_value(event).map_err(|e| {
+        AutumnError::internal_server_error(std::io::Error::other(format!(
+            "event serialization failed: {e}"
+        )))
+    })
+}
+
+/// Core dispatch shared by [`Events::publish`] and the module-level [`publish`].
+async fn dispatch(
+    registry: &EventRegistry,
+    recorder: Option<&EventRecorder>,
+    state: &AppState,
+    event_name: &'static str,
+    payload: Value,
+) -> AutumnResult<()> {
+    // 1. Record first so tests observe the event even without a job runner.
+    if let Some(recorder) = recorder {
+        recorder.record(event_name, payload.clone());
+    }
+
+    let listeners = registry.listeners_for(event_name);
+    if listeners.is_empty() {
+        return Ok(());
+    }
+
+    // 2. Durable listeners: enqueue onto the job queue (at-least-once).
+    for listener in listeners
+        .iter()
+        .filter(|listener| listener.mode == DispatchMode::Durable)
+    {
+        let job_name = listener
+            .job_name
+            .as_deref()
+            .expect("durable listener must carry a job_name");
+        crate::job::enqueue(job_name, payload.clone()).await?;
+    }
+
+    // 3. Sync listeners: run independently, isolated from each other.
+    run_sync_listeners(state, listeners, &payload).await;
+
+    Ok(())
+}
+
+/// Run every sync listener on its own task so a panic or error in one never
+/// blocks the others, then await them all (they finish before the response).
+async fn run_sync_listeners(state: &AppState, listeners: &[ListenerInfo], payload: &Value) {
+    let mut handles = Vec::new();
+    for listener in listeners
+        .iter()
+        .filter(|listener| listener.mode == DispatchMode::Sync)
+    {
+        let state = state.clone();
+        let payload = payload.clone();
+        let run = listener.handler;
+        let name = listener.listener_name.clone();
+        handles.push(tokio::spawn(async move {
+            match run(state, payload).await {
+                Ok(()) => {}
+                Err(error) => {
+                    tracing::error!(listener = %name, %error, "sync event listener failed");
+                }
+            }
+        }));
+    }
+    for handle in handles {
+        if let Err(join_error) = handle.await {
+            tracing::error!(%join_error, "sync event listener panicked");
+        }
+    }
+}
+
+struct GlobalBus {
+    registry: Arc<EventRegistry>,
+    recorder: Option<Arc<EventRecorder>>,
+    state: AppState,
+}
+
+static GLOBAL_EVENT_BUS: OnceLock<RwLock<Option<Arc<GlobalBus>>>> = OnceLock::new();
+
+fn global_bus() -> Option<Arc<GlobalBus>> {
+    GLOBAL_EVENT_BUS
+        .get()
+        .and_then(|lock| lock.read().ok().and_then(|guard| guard.clone()))
+}
+
+/// Install the process-global event bus used by the module-level [`publish`].
+///
+/// Called by the app builder (and the test client) after the registry is built.
+pub(crate) fn init_global_event_bus(
+    registry: &EventRegistry,
+    state: &AppState,
+    recorder: Option<Arc<EventRecorder>>,
+) {
+    let bus = Arc::new(GlobalBus {
+        registry: Arc::new(registry.clone()),
+        recorder,
+        state: state.clone(),
+    });
+    if let Some(lock) = GLOBAL_EVENT_BUS.get() {
+        if let Ok(mut guard) = lock.write() {
+            *guard = Some(bus);
+        }
+        return;
+    }
+    let _ = GLOBAL_EVENT_BUS.set(RwLock::new(Some(bus)));
+}
+
+/// Reset the process-global event bus (used for test isolation).
+pub fn clear_global_event_bus() {
+    if let Some(lock) = GLOBAL_EVENT_BUS.get() {
+        if let Ok(mut guard) = lock.write() {
+            *guard = None;
+        }
+    } else {
+        let _ = GLOBAL_EVENT_BUS.set(RwLock::new(None));
+    }
+}
+
+/// Publish an event without a request context (services, jobs, scheduled tasks).
+///
+/// Delegates to the process-global bus installed at startup. Inside a request,
+/// prefer the injectable [`Events`] extractor.
+///
+/// # Errors
+///
+/// Returns an error if the event cannot be serialized or if enqueueing a
+/// durable listener fails. If the bus is not initialized the call is a no-op.
+pub async fn publish<E: Event>(event: E) -> AutumnResult<()> {
+    let payload = serialize_event(&event)?;
+    let Some(bus) = global_bus() else {
+        // No app wired the bus (e.g. a bare unit test) — nothing to dispatch to.
+        return Ok(());
+    };
+    dispatch(
+        &bus.registry,
+        bus.recorder.as_deref(),
+        &bus.state,
+        E::NAME,
+        payload,
+    )
+    .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde::Deserialize;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    #[derive(Serialize, Deserialize, Clone, Debug)]
+    struct Ping {
+        n: i64,
+    }
+    impl Event for Ping {
+        const NAME: &'static str = "Ping";
+    }
+
+    fn ok_handler() -> ListenerHandler {
+        |_state, _payload| Box::pin(async { Ok(()) })
+    }
+
+    fn sync_listener(name: &str, handler: ListenerHandler) -> ListenerInfo {
+        ListenerInfo {
+            event_name: Ping::NAME,
+            listener_name: name.to_string(),
+            mode: DispatchMode::Sync,
+            job_name: None,
+            max_attempts: 0,
+            initial_backoff_ms: 0,
+            handler,
+        }
+    }
+
+    fn durable_listener(name: &str) -> ListenerInfo {
+        ListenerInfo {
+            event_name: Ping::NAME,
+            listener_name: name.to_string(),
+            mode: DispatchMode::Durable,
+            job_name: Some(format!("__event_listener::{name}")),
+            max_attempts: 4,
+            initial_backoff_ms: 250,
+            handler: ok_handler(),
+        }
+    }
+
+    #[test]
+    fn registry_groups_by_event_name() {
+        let registry = EventRegistry::from_listeners(vec![
+            sync_listener("a", ok_handler()),
+            sync_listener("b", ok_handler()),
+        ]);
+        assert_eq!(registry.listeners_for("Ping").len(), 2);
+        assert!(registry.listeners_for("Other").is_empty());
+    }
+
+    #[test]
+    fn durable_listeners_become_job_infos() {
+        let registry = EventRegistry::from_listeners(vec![
+            sync_listener("a", ok_handler()),
+            durable_listener("seed_workspace"),
+        ]);
+        let jobs = registry.durable_job_infos();
+        assert_eq!(jobs.len(), 1, "only durable listeners become jobs");
+        assert_eq!(jobs[0].name, "__event_listener::seed_workspace");
+        assert_eq!(jobs[0].max_attempts, 4);
+        assert_eq!(jobs[0].initial_backoff_ms, 250);
+    }
+
+    #[tokio::test]
+    async fn sync_listeners_are_isolated_from_panics_and_errors() {
+        static RAN: AtomicU32 = AtomicU32::new(0);
+        RAN.store(0, Ordering::SeqCst);
+
+        let panicking: ListenerHandler = |_state, _payload| Box::pin(async { panic!("boom") });
+        let erroring: ListenerHandler = |_state, _payload| {
+            Box::pin(async {
+                Err(AutumnError::internal_server_error(std::io::Error::other(
+                    "nope",
+                )))
+            })
+        };
+        let counting: ListenerHandler = |_state, _payload| {
+            Box::pin(async {
+                RAN.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+        };
+
+        let registry = EventRegistry::from_listeners(vec![
+            sync_listener("panics", panicking),
+            sync_listener("errors", erroring),
+            sync_listener("counts", counting),
+        ]);
+        let state = AppState::for_test();
+
+        // No recorder, no durable listeners: a panicking/erroring sibling must
+        // not stop the third listener from running, and publish still succeeds.
+        let result = dispatch(
+            &registry,
+            None,
+            &state,
+            Ping::NAME,
+            serde_json::json!({"n": 1}),
+        )
+        .await;
+        assert!(result.is_ok(), "publish stays Ok despite listener failures");
+        assert_eq!(RAN.load(Ordering::SeqCst), 1, "surviving listener ran");
+    }
+
+    #[tokio::test]
+    async fn missing_listener_is_a_noop() {
+        let registry = EventRegistry::default();
+        let state = AppState::for_test();
+        let result = dispatch(
+            &registry,
+            None,
+            &state,
+            Ping::NAME,
+            serde_json::json!({"n": 1}),
+        )
+        .await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn recorder_captures_published_events() {
+        let registry = EventRegistry::default();
+        let recorder = EventRecorder::default();
+        let state = AppState::for_test();
+        let payload = serialize_event(&Ping { n: 7 }).unwrap();
+        dispatch(&registry, Some(&recorder), &state, Ping::NAME, payload)
+            .await
+            .unwrap();
+        assert_eq!(recorder.count::<Ping>(), 1);
+        let published = recorder.published::<Ping>();
+        assert_eq!(published.len(), 1);
+        assert_eq!(published[0].n, 7);
+    }
+}

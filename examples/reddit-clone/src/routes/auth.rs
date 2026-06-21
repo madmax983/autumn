@@ -207,6 +207,14 @@ pub async fn register(
         })
         .await?;
 
+    // Publish a typed domain event. Listeners (see `crate::listeners`) react
+    // independently — adding a new reaction needs zero edits to this handler.
+    autumn_web::events::publish(crate::events::UserSignedUp {
+        user_id: user.id,
+        username: user.username.clone(),
+    })
+    .await?;
+
     // Dispatch the outbound webhook event on "user.created"
     if let Some(manager) = state.extension::<WebhookOutboundManager>() {
         let dispatch_result = manager.dispatch(&state, "user.created", &user).await;

@@ -31,9 +31,9 @@ pub use crate::paths::PathExt;
 pub use autumn_macros::ws;
 /// HTTP method route macros, main macro, and route collection.
 pub use autumn_macros::{
-    api_doc, authorize, cached, delete, feature_flag, get, job, jobs, main, oauth2_callback,
-    one_off_tasks, patch, paths, post, put, routes, scheduled, secured, service, static_get,
-    static_routes, step_up, task, tasks,
+    api_doc, authorize, cached, delete, event, feature_flag, get, job, jobs, listener, listeners,
+    main, oauth2_callback, one_off_tasks, patch, paths, post, put, routes, scheduled, secured,
+    service, static_get, static_routes, step_up, task, tasks,
 };
 #[cfg(feature = "mail")]
 pub use autumn_macros::{mail_previews, mailer, mailer_preview};
@@ -51,6 +51,10 @@ pub use crate::canary::CanaryRoute;
 /// Database connection extractor.
 #[cfg(feature = "db")]
 pub use crate::db::Db;
+/// Typed domain event bus publisher extractor. The `Event` trait it works with
+/// lives at [`crate::events::Event`] (kept out of the prelude to avoid clashing
+/// with [`crate::sse::Event`]).
+pub use crate::events::Events;
 /// Form data extractor.
 pub use crate::extract::Form;
 /// JSON request/response type.

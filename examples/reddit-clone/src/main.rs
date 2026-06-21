@@ -152,6 +152,7 @@ async fn main() {
             tasks::prune_live_feed_events
         ])
         .jobs(reddit_clone::jobs::registered_jobs())
+        .listeners(reddit_clone::listeners::registered_listeners())
         .plugin(webhook_plugin)
         .plugin(live_events::LiveFeedPlugin::new())
         // Custom health indicator — visible at GET /actuator/health under "live_feed_relay".

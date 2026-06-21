@@ -73,6 +73,7 @@ pub fn app() -> AppBuilder {
         tasks: Vec::new(),
         one_off_tasks: Vec::new(),
         jobs: Vec::new(),
+        listeners: Vec::new(),
         static_metas: Vec::new(),
         exception_filters: Vec::new(),
         scoped_groups: Vec::new(),
@@ -247,6 +248,9 @@ pub struct AppBuilder {
     tasks: Vec<crate::task::TaskInfo>,
     one_off_tasks: Vec<crate::task::OneOffTaskInfo>,
     pub(crate) jobs: Vec<crate::job::JobInfo>,
+    /// Registered event listeners; durable ones are synthesized into jobs at
+    /// build time and the rest dispatch synchronously via the event registry.
+    pub(crate) listeners: Vec<crate::events::ListenerInfo>,
     pub(crate) static_metas: Vec<crate::static_gen::StaticRouteMeta>,
     pub(crate) exception_filters: Vec<Arc<dyn ExceptionFilter>>,
     pub(crate) scoped_groups: Vec<ScopedGroup>,
@@ -562,6 +566,18 @@ impl AppBuilder {
     #[must_use]
     pub fn jobs(mut self, jobs: Vec<crate::job::JobInfo>) -> Self {
         self.jobs.extend(jobs);
+        self
+    }
+
+    /// Register event listeners with the application.
+    ///
+    /// Collect them with `listeners![..]`. Durable listeners are wired onto the
+    /// job runtime automatically (no separate `jobs![..]` entry needed); sync
+    /// listeners run in-request when their event is published. Decoupled from
+    /// emitters: adding a listener never touches the code that publishes.
+    #[must_use]
+    pub fn listeners(mut self, listeners: Vec<crate::events::ListenerInfo>) -> Self {
+        self.listeners.extend(listeners);
         self
     }
 
@@ -2432,7 +2448,8 @@ impl AppBuilder {
             current_plugin: _,
             tasks,
             one_off_tasks: _,
-            jobs,
+            mut jobs,
+            listeners,
             static_metas,
             exception_filters,
             scoped_groups,
@@ -2860,6 +2877,7 @@ impl AppBuilder {
         let storage_router = storage_bootstrap.and_then(|b| b.install(&state));
         install_webhook_registry(&state, &config);
         run_state_initializers(state_initializers, &state);
+        finalize_event_bus(listeners, &mut jobs, &state);
 
         let env = crate::config::OsEnv;
         let dist_dir = project_dir("dist", &env);
@@ -3433,6 +3451,7 @@ impl AppBuilder {
             tasks: _,
             one_off_tasks: _,
             jobs: _,
+            listeners,
             static_metas,
             exception_filters: _,
             scoped_groups,
@@ -3730,6 +3749,9 @@ impl AppBuilder {
         let storage_router = storage_bootstrap.and_then(|b| b.install(&state));
         install_webhook_registry(&state, &config);
         run_state_initializers(state_initializers, &state);
+        // Static generation has no job runtime; sync listeners still dispatch,
+        // so install the registry but drop the durable jobs it would synthesize.
+        finalize_event_bus(listeners, &mut Vec::new(), &state);
 
         // Build the full router (same as production). Use the inner builder
         // so the custom session store installed via with_session_store(...)
@@ -3990,7 +4012,8 @@ impl AppBuilder {
     async fn run_one_off_task_mode(self, requested_name: String) {
         let Self {
             one_off_tasks,
-            jobs,
+            mut jobs,
+            listeners,
             #[cfg(feature = "i18n")]
             custom_layers,
             #[cfg(not(feature = "i18n"))]
@@ -4190,6 +4213,7 @@ impl AppBuilder {
         #[cfg(feature = "storage")]
         let _storage_router = storage_bootstrap.and_then(|bootstrap| bootstrap.install(&state));
         run_state_initializers(state_initializers, &state);
+        finalize_event_bus(listeners, &mut jobs, &state);
 
         let task_shutdown = tokio_util::sync::CancellationToken::new();
         if let Err(error) = initialize_job_runtime(jobs, &state, &task_shutdown, &config.jobs) {
@@ -4873,6 +4897,24 @@ fn run_state_initializers(initializers: Vec<StateInitializer>, state: &AppState)
     for initializer in initializers {
         initializer(state);
     }
+}
+
+/// Wire the typed event bus into the app at build time.
+///
+/// Builds the [`EventRegistry`](crate::events::EventRegistry) from registered
+/// listeners, installs it onto `state` for the [`Events`](crate::events::Events)
+/// extractor, appends a job per durable listener so they ride the job runtime
+/// (retry + DLQ + restart-safety), and initializes the process-global bus used
+/// by the module-level `events::publish`.
+fn finalize_event_bus(
+    listeners: Vec<crate::events::ListenerInfo>,
+    jobs: &mut Vec<crate::job::JobInfo>,
+    state: &AppState,
+) {
+    let registry = crate::events::EventRegistry::from_listeners(listeners);
+    jobs.extend(registry.durable_job_infos());
+    state.insert_extension(registry.clone());
+    crate::events::init_global_event_bus(&registry, state, None);
 }
 
 fn initialize_job_runtime(
