@@ -128,6 +128,13 @@ A published event with **no registered listeners is a no-op**, not an error.
   retry can run a listener more than once. **Make durable listeners idempotent**
   (key off the event's domain ids). With the `local` backend, durable listeners
   run in-process and are lost on restart — use `postgres`/`redis` in production.
+- **Durable listeners are transaction-aware.** Publishing inside a
+  [`Db::tx`](transactions.md) block enqueues durable listeners **after the
+  transaction commits** — a rolled-back event never fires them, and the job is
+  not picked up before the event's data is visible. (This after-commit deferral
+  is process-local, mirroring `job::enqueue_after_commit`: a crash between commit
+  and enqueue can drop the reaction.) Publishing outside a transaction enqueues
+  immediately.
 - **No ordering guarantee between independent listeners.** Sync listeners run
   concurrently; durable listeners are independent queue jobs. Do not rely on one
   listener observing another's effects.

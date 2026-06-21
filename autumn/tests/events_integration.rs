@@ -55,6 +55,11 @@ struct NothingListens {
     value: i64,
 }
 
+#[event]
+struct ChainedFollowup {
+    source_user: i64,
+}
+
 // ── Listeners (decoupled from the emitter) ─────────────────────────
 #[listener(UserSignedUp)]
 async fn sync_a(state: AppState, event: UserSignedUp) -> AutumnResult<()> {
@@ -78,6 +83,16 @@ async fn sync_survivor(state: AppState, _event: UserSignedUp) -> AutumnResult<()
 async fn durable_seed(state: AppState, _event: UserSignedUp) -> AutumnResult<()> {
     bump(&state, |c| &c.durable);
     Ok(())
+}
+
+// A sync listener that itself publishes a follow-up event via the free
+// publisher — exercising that the ambient app context survives into listeners.
+#[listener(UserSignedUp)]
+async fn republish_followup(_state: AppState, event: UserSignedUp) -> AutumnResult<()> {
+    autumn_web::events::publish(ChainedFollowup {
+        source_user: event.user_id,
+    })
+    .await
 }
 
 /// The full listener set, including the durable one. Durable dispatch is scoped
@@ -203,6 +218,26 @@ async fn free_publisher_dispatches_to_the_current_app() {
         1,
         "sync_a ran via free publish"
     );
+}
+
+#[tokio::test]
+async fn sync_listener_can_publish_a_followup_event() {
+    // The sync listener runs on the request's task and calls the free publisher;
+    // the ambient app context must carry through so the follow-up is recorded
+    // against this app (it would be lost if listeners were detached via spawn).
+    let client = TestApp::new()
+        .routes(routes![signup])
+        .state_initializer(|state| state.insert_extension(Counters::default()))
+        .listeners(listeners![republish_followup])
+        .build();
+
+    client.get("/signup").send().await.assert_ok();
+
+    client.assert_event_published::<UserSignedUp>();
+    client.assert_event_published::<ChainedFollowup>();
+    let followups = client.published_events::<ChainedFollowup>();
+    assert_eq!(followups.len(), 1);
+    assert_eq!(followups[0].source_user, 42);
 }
 
 #[tokio::test]

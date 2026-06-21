@@ -328,10 +328,15 @@ async fn dispatch(
             .job_name
             .as_deref()
             .expect("durable listener must carry a job_name");
+        // Enqueue *after commit* so publishing inside a `Db::tx` defers the
+        // durable reaction until the transaction commits — a rolled-back event
+        // never fires its listeners, and (on Postgres) the job is not claimed on
+        // another connection before the event's data is visible. Outside a
+        // transaction this enqueues immediately.
         let enqueued = if let Some(client) = &app_client {
-            client.enqueue(job_name, payload.clone()).await
+            client.enqueue_after_commit(job_name, payload.clone()).await
         } else {
-            crate::job::enqueue(job_name, payload.clone()).await
+            crate::job::enqueue_after_commit(job_name, payload.clone()).await
         };
         // Don't let one durable enqueue failure skip the in-request sync
         // listeners (or the remaining durable enqueues); remember the first
@@ -350,41 +355,43 @@ async fn dispatch(
     durable_error.map_or(Ok(()), Err)
 }
 
-/// Run every sync listener on its own task so a panic or error in one never
-/// blocks the others, then await them all (they finish before the response).
+/// Run every sync listener concurrently on the caller's task, isolating each
+/// from its siblings with `catch_unwind` (the same panic-isolation the job
+/// runtime uses), then await them all (they finish before the response).
 ///
-/// Each task is instrumented with the publishing span so listener logs stay
-/// correlated with the originating request/trace despite the `tokio::spawn`.
+/// Running directly — rather than `tokio::spawn` — keeps the ambient app context
+/// (`CURRENT_EVENT_APP`) and tracing span in scope, so a listener that itself
+/// calls the free [`publish`] dispatches against the right app and stays
+/// log-correlated. It also ties the listeners to the publish future's lifecycle,
+/// so cancelling the request (timeout, disconnect) cancels the listeners instead
+/// of leaving detached tasks running after the response is abandoned.
 async fn run_sync_listeners(state: &AppState, listeners: &[ListenerInfo], payload: &Value) {
-    use tracing::Instrument as _;
+    use futures::FutureExt as _;
 
-    let mut handles = Vec::new();
-    for listener in listeners
+    let runs = listeners
         .iter()
         .filter(|listener| listener.mode == DispatchMode::Sync)
-    {
-        let state = state.clone();
-        let payload = payload.clone();
-        let run = listener.handler;
-        let name = listener.listener_name.clone();
-        let span = tracing::Span::current();
-        handles.push(tokio::spawn(
+        .map(|listener| {
+            let state = state.clone();
+            let payload = payload.clone();
+            let run = listener.handler;
+            let name = listener.listener_name.clone();
             async move {
-                match run(state, payload).await {
-                    Ok(()) => {}
-                    Err(error) => {
+                match std::panic::AssertUnwindSafe(run(state, payload))
+                    .catch_unwind()
+                    .await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => {
                         tracing::error!(listener = %name, %error, "sync event listener failed");
+                    }
+                    Err(_panic) => {
+                        tracing::error!(listener = %name, "sync event listener panicked");
                     }
                 }
             }
-            .instrument(span),
-        ));
-    }
-    for handle in handles {
-        if let Err(join_error) = handle.await {
-            tracing::error!(%join_error, "sync event listener panicked");
-        }
-    }
+        });
+    futures::future::join_all(runs).await;
 }
 
 struct GlobalBus {
