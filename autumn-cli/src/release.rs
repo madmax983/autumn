@@ -209,9 +209,15 @@ pub fn init(
         }
     }
 
+    // Embed assets into the binary only when the project opts in via the
+    // `embed-assets` feature (as `autumn new` generates). Pre-existing apps
+    // without that feature get the disk-based build (`cargo build --release`
+    // plus `COPY static`), so their Docker builds keep working.
+    let embed = project_has_embed_assets(dir);
+
     let mut created = Vec::new();
     for (name, template) in files {
-        fs::write(dir.join(name), render(template, project_name))?;
+        fs::write(dir.join(name), render(template, project_name, embed))?;
         created.push(name.to_string());
     }
     Ok(created)
@@ -219,7 +225,44 @@ pub fn init(
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
-fn render(template: &str, project_name: &str) -> String {
+/// Whether the project at `dir` defines an `embed-assets` Cargo feature, i.e.
+/// it is wired for single-binary embedded builds (`autumn build --embed`).
+///
+/// Parses the `[features]` table rather than substring-matching the file, so a
+/// comment or unrelated text mentioning "embed-assets" doesn't cause
+/// `autumn build --embed` (which would then fail for a project that lacks the
+/// feature) to be baked into the generated Dockerfile.
+fn project_has_embed_assets(dir: &Path) -> bool {
+    let Ok(contents) = fs::read_to_string(dir.join("Cargo.toml")) else {
+        return false;
+    };
+    let Ok(parsed) = toml::from_str::<toml::Table>(&contents) else {
+        return false;
+    };
+    parsed
+        .get("features")
+        .and_then(toml::Value::as_table)
+        .is_some_and(|features| features.contains_key("embed-assets"))
+}
+
+fn render(template: &str, project_name: &str, embed: bool) -> String {
+    let (build_step, static_copy) = if embed {
+        (
+            "# Single-binary build: fingerprint static assets, then compile with the\n\
+             # embed-assets feature so the binary serves static/ (incl. the fingerprint\n\
+             # manifest) and i18n locales from itself — no sidecar directories. The app\n\
+             # opts in via `.embedded_static()` / `.embedded_locales()` (see src/main.rs).\n\
+             RUN autumn build --embed",
+            // Assets/locales are embedded; only migrations/ is staged below.
+            "# Assets and locales are embedded in the binary (`autumn build --embed`);\n\
+             # only migrations/ is staged, for the one-shot `autumn migrate` job.\n",
+        )
+    } else {
+        (
+            "RUN cargo build --release",
+            "COPY --chown=autumn:autumn --from=builder /app/static /app/static\n",
+        )
+    };
     template
         .replace("{{project_name}}", project_name)
         .replace(
@@ -228,6 +271,8 @@ fn render(template: &str, project_name: &str) -> String {
         )
         .replace("{{autumn_cli_version}}", env!("CARGO_PKG_VERSION"))
         .replace("{{diesel_cli_version}}", "2.3.8")
+        .replace("{{build_step}}", build_step)
+        .replace("{{static_copy}}", static_copy)
 }
 
 fn planned_files(target: Target) -> Vec<(&'static str, &'static str)> {
@@ -405,14 +450,49 @@ mod tests {
     }
 
     #[test]
-    fn dockerfile_copies_static_assets() {
+    fn dockerfile_uses_disk_build_without_embed_feature() {
+        // A project that doesn't define the `embed-assets` feature (e.g. one
+        // scaffolded before embedding existed) must get the disk-based build so
+        // its Docker build keeps working.
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
         init(&dir, "my-app", false, Target::Default).unwrap();
         let content = fs::read_to_string(dir.join("Dockerfile")).unwrap();
         assert!(
-            content.contains("static"),
-            "Dockerfile must COPY static/ assets into runtime image"
+            content.contains("RUN cargo build --release"),
+            "non-embed project must use the disk-based build: {content}"
+        );
+        assert!(
+            !content.contains("autumn build --embed"),
+            "non-embed project must not require the embed-assets feature"
+        );
+        assert!(
+            content.contains("/app/static"),
+            "non-embed build must COPY the static/ sidecar into the runtime image"
+        );
+    }
+
+    #[test]
+    fn dockerfile_embeds_when_project_has_embed_feature() {
+        // A project that opts into the `embed-assets` feature gets a
+        // single-binary build with no static/ sidecar.
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        fs::write(
+            dir.join("Cargo.toml"),
+            "[package]\nname = \"my-app\"\nversion = \"0.1.0\"\n\n\
+             [features]\nembed-assets = [\"autumn-web/embed-assets\"]\n",
+        )
+        .unwrap();
+        init(&dir, "my-app", false, Target::Default).unwrap();
+        let content = fs::read_to_string(dir.join("Dockerfile")).unwrap();
+        assert!(
+            content.contains("autumn build --embed"),
+            "embed-feature project must build the embedded single binary: {content}"
+        );
+        assert!(
+            !content.contains("/app/static"),
+            "embedded build must not COPY a static/ sidecar into the runtime image"
         );
     }
 

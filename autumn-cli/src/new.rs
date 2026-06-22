@@ -185,10 +185,7 @@ fn generate_inner(
     fs::write(project_dir.join("Cargo.toml"), cargo_toml)?;
 
     let mut main_rs = if opts.with_i18n {
-        render(templates::MAIN_RS).replace(
-            "        .routes(routes![index, hello, hello_name])",
-            "        .i18n_auto()\n        .routes(routes![index, hello, hello_name])",
-        )
+        inject_i18n(&render(templates::MAIN_RS))
     } else {
         render(templates::MAIN_RS)
     };
@@ -340,14 +337,55 @@ fn print_scaffold_summary(name: &str, opts: GenerateOptions) {
     }
 }
 
+/// Replace `from` with `to`, asserting the anchor exists first.
+///
+/// The scaffold generators below patch the generated `main.rs` by string
+/// replacement against anchors in `main.rs.tmpl`. If the template and an anchor
+/// drift out of sync, a plain `.replace()` silently no-ops and produces a
+/// broken scaffold (this exact class of bug has bitten the mailer wiring once
+/// already). Asserting the anchor turns that into a loud, test-caught failure.
+fn replace_anchor(src: &str, from: &str, to: &str) -> String {
+    assert!(
+        src.contains(from),
+        "scaffold template anchor not found: {from:?} — src/templates/main.rs.tmpl and the \
+         inject_* helpers in new.rs have drifted out of sync"
+    );
+    src.replace(from, to)
+}
+
+/// Enable i18n in a generated `main.rs`: call `.i18n_auto()` and embed the
+/// `i18n/` locale bundles alongside the static assets for single-binary deploys.
+fn inject_i18n(main_rs: &str) -> String {
+    let with_locale = replace_anchor(
+        main_rs,
+        "        .routes(routes![index, hello, hello_name])",
+        "        .i18n_auto()\n        .routes(routes![index, hello, hello_name])",
+    );
+    let with_static = replace_anchor(
+        &with_locale,
+        "static EMBEDDED_STATIC: autumn_web::include_dir::Dir = autumn_web::embed_static!();",
+        "static EMBEDDED_STATIC: autumn_web::include_dir::Dir = autumn_web::embed_static!();\n\
+         #[cfg(feature = \"embed-assets\")]\n\
+         static EMBEDDED_LOCALES: autumn_web::include_dir::Dir = autumn_web::embed_locales!();",
+    );
+    replace_anchor(
+        &with_static,
+        "    let app = app.embedded_static(&EMBEDDED_STATIC);\n",
+        "    let app = app.embedded_static(&EMBEDDED_STATIC);\n\
+         \x20   #[cfg(feature = \"embed-assets\")]\n\
+         \x20   let app = app.embedded_locales(&EMBEDDED_LOCALES);\n",
+    )
+}
+
 /// Inject a managed-Postgres pool provider plus a shutdown hook into a
 /// generated `main.rs` so the bundled cluster is supervised by the daemon.
 fn inject_managed_pg(main_rs: &str) -> String {
-    main_rs.replace(
-        "    autumn_web::app()\n",
+    replace_anchor(
+        main_rs,
+        "    let app = autumn_web::app()\n",
         "    let pg = autumn_web::managed_pg::ManagedPostgresPoolProvider::new();\n\
          \x20   let pg_shutdown = pg.clone();\n\
-         \x20   autumn_web::app()\n\
+         \x20   let app = autumn_web::app()\n\
          \x20       .with_pool_provider(pg)\n\
          \x20       .on_shutdown(move || {\n\
          \x20           let pg = pg_shutdown.clone();\n\
@@ -361,16 +399,17 @@ fn inject_managed_pg(main_rs: &str) -> String {
 /// Remove the diesel-migrations wiring from a generated `main.rs` so a DB-free
 /// app compiles without the db-gated `migrate` module.
 fn strip_migrations(main_rs: &str) -> String {
-    main_rs
-        .replace(
-            "use autumn_web::migrate::{EmbeddedMigrations, embed_migrations};\n",
-            "",
-        )
-        .replace(
-            "const MIGRATIONS: EmbeddedMigrations = embed_migrations!();\n\n",
-            "",
-        )
-        .replace("\n        .migrations(MIGRATIONS)", "")
+    let no_use = replace_anchor(
+        main_rs,
+        "use autumn_web::migrate::{EmbeddedMigrations, embed_migrations};\n",
+        "",
+    );
+    let no_const = replace_anchor(
+        &no_use,
+        "const MIGRATIONS: EmbeddedMigrations = embed_migrations!();\n\n",
+        "",
+    );
+    replace_anchor(&no_const, "\n        .migrations(MIGRATIONS)", "")
 }
 
 /// Default `autumn-web` features minus `db` — the DB-free daemon feature set.
