@@ -3,6 +3,7 @@ use clap::{Parser, Subcommand};
 mod build;
 mod canary;
 mod check;
+mod cold_start_driver;
 mod config;
 mod credentials;
 mod data;
@@ -1889,7 +1890,7 @@ fn run_command(command: Commands) {
             include_db,
         } => {
             let exit_code = if cold_start {
-                dev_loop_bench::run_cold_start(
+                cold_start_driver::run_cold_start(
                     runs,
                     output.as_deref(),
                     json,
