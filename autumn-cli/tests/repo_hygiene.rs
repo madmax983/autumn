@@ -991,7 +991,7 @@ fn release_image_boot_gate_is_configured() {
 
     // AC: exercise the one-shot migrate path before the web container is ready.
     assert!(
-        harness.contains("autumn migrate") || harness.contains("migrate"),
+        harness.contains("autumn migrate"),
         "harness must run the one-shot `autumn migrate` before booting the web tier",
     );
 
@@ -1005,9 +1005,9 @@ fn release_image_boot_gate_is_configured() {
         "harness must probe GET /actuator/health",
     );
 
-    // AC: bounded startup window (≤ 30s) — the budget must be encoded.
+    // AC: bounded startup window (≤ 30s) — the budget must be encoded by name.
     assert!(
-        harness.contains("30"),
+        harness.contains("STARTUP_BUDGET_SECS"),
         "harness must encode a bounded (≤ 30s) startup window for the health probe",
     );
 

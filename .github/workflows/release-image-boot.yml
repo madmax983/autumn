@@ -34,6 +34,8 @@ on:
       - "autumn-cli/src/templates/**"
       - "autumn-cli/src/main.rs"
       - "autumn-cli/Cargo.toml"
+      - "autumn/src/**"
+      - "autumn/Cargo.toml"
   pull_request:
     branches: [trunk, trunk-dev]
     paths:
@@ -44,6 +46,8 @@ on:
       - "autumn-cli/src/templates/**"
       - "autumn-cli/src/main.rs"
       - "autumn-cli/Cargo.toml"
+      - "autumn/src/**"
+      - "autumn/Cargo.toml"
   schedule:
     # Weekly on Monday at 05:00 UTC — catches base-image / crate rot that does
     # not touch the path-filtered files above.

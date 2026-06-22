@@ -89,24 +89,44 @@ log "Scaffolding a fresh project with \`autumn new\`"
 ( cd "${WORKDIR}" && "${AUTUMN}" new "${PROJECT_NAME}" )
 
 # ── health probe helper ─────────────────────────────────────────────────────
-# Polls a URL until it returns HTTP 200 or the budget elapses. Records the last
-# response into LAST_PROBE_RESPONSE for the failure summary.
+# Polls URLs until all return HTTP 200 or the shared absolute deadline elapses.
+# A single shared deadline is used for all URLs so the total wait is bounded
+# by STARTUP_BUDGET_SECS regardless of how many endpoints are checked.
+# A single curl invocation per tick captures body and status atomically,
+# avoiding the TOCTOU window and double round-trip of two separate calls.
+#
+# Usage: probe_until_healthy <deadline_absolute> <url> [<url> ...]
+#   deadline_absolute  — value of $SECONDS at which probing must stop
+#   url(s)             — one or more endpoints; all must return 200
 probe_until_healthy() {
-  local url="$1"
-  local deadline=$(( SECONDS + STARTUP_BUDGET_SECS ))
-  local code body
-  while (( SECONDS < deadline )); do
-    body="$(curl -fsS -m 5 "${url}" 2>/dev/null)"
-    code="$(curl -o /dev/null -s -m 5 -w '%{http_code}' "${url}" 2>/dev/null || echo 000)"
-    if [[ "${code}" == "200" ]]; then
-      log "HEALTHY: ${url} -> 200 (${body})"
-      return 0
+  local deadline="$1"
+  shift
+  local urls=("$@")
+  local probe_body_file
+  probe_body_file="$(mktemp)"
+
+  for url in "${urls[@]}"; do
+    local code=""
+    local body=""
+    while (( SECONDS < deadline )); do
+      code="$(curl -o "${probe_body_file}" -s -m 5 -w '%{http_code}' "${url}" 2>/dev/null || echo 000)"
+      body="$(cat "${probe_body_file}" 2>/dev/null || true)"
+      if [[ "${code}" == "200" ]]; then
+        log "HEALTHY: ${url} -> 200 (${body})"
+        break
+      fi
+      LAST_PROBE_RESPONSE="${code} ${body}"
+      sleep 1
+    done
+    if [[ "${code}" != "200" ]]; then
+      rm -f "${probe_body_file}"
+      fail "${url} did not return 200 within ${STARTUP_BUDGET_SECS}s (last code: ${code:-none}, body: ${body:-<empty>})"
+      return 1
     fi
-    sleep 1
   done
-  LAST_PROBE_RESPONSE="$(curl -isS -m 5 "${url}" 2>&1 || true)"
-  fail "${url} did not return 200 within ${STARTUP_BUDGET_SECS}s (last code: ${code:-none})"
-  return 1
+
+  rm -f "${probe_body_file}"
+  return 0
 }
 
 # Report the runtime image size against the secondary budget (informational).
@@ -148,6 +168,8 @@ run_default_target() {
   fi
 
   log "boot the web container"
+  # Remove any leftover container with the same name before starting a new one.
+  docker rm -f "${CONTAINER_NAME}" >/dev/null 2>&1 || true
   # --network host lets the container reach the Postgres service on localhost
   # and bind :3000 on the runner. Minimal AUTUMN_* env: the primary URL, the
   # required production signing secret, and a trusted-host allowlist so the
@@ -158,8 +180,10 @@ run_default_target() {
     -e AUTUMN_SECURITY__TRUSTED_HOSTS__HOSTS="*" \
     "${IMAGE_TAG}"
 
-  if ! probe_until_healthy "http://localhost:3000/health" \
-     || ! probe_until_healthy "http://localhost:3000/actuator/health"; then
+  local deadline=$(( SECONDS + STARTUP_BUDGET_SECS ))
+  if ! probe_until_healthy "${deadline}" \
+       "http://localhost:3000/health" \
+       "http://localhost:3000/actuator/health"; then
     fail "container did not reach a healthy state — boot logs follow"
     docker logs "${CONTAINER_NAME}" || true
     printf '\n--- failing probe response ---\n%s\n' "${LAST_PROBE_RESPONSE}" >&2
@@ -194,8 +218,10 @@ YAML
     exit 1
   fi
 
-  if ! probe_until_healthy "http://localhost:3000/health" \
-     || ! probe_until_healthy "http://localhost:3000/actuator/health"; then
+  local deadline=$(( SECONDS + STARTUP_BUDGET_SECS ))
+  if ! probe_until_healthy "${deadline}" \
+       "http://localhost:3000/health" \
+       "http://localhost:3000/actuator/health"; then
     fail "compose stack did not reach a healthy state — compose logs follow"
     ( cd "${PROJECT_DIR}" && docker compose logs ) || true
     printf '\n--- failing probe response ---\n%s\n' "${LAST_PROBE_RESPONSE}" >&2
