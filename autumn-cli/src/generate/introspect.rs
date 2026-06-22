@@ -179,7 +179,7 @@ pub fn plan_pull(
         // (b) src/models/mod.rs aggregator line
         models_mod = add_mod_declaration(&models_mod, &snake_name);
         // (c) src/schema.rs table! block
-        schema = upsert_schema_block(&schema, &table.table, &table.columns, options.force);
+        schema = upsert_schema_block(&schema, &table.table, &table.columns, options.force)?;
 
         // (d) optional repository. `unsupported_reason` already guaranteed the
         // Autumn `id`/`i64` PK convention the repository macro assumes, so the
@@ -301,11 +301,16 @@ fn inferred_table_name(pascal_name: &str) -> String {
 }
 
 /// Whether a column must be excluded from inserts and updates (`#[default]`):
-/// a stored generated column, an identity column, or the framework-managed
-/// `created_at` (when it carries a DB default). A plain mutable column with a
-/// DB default stays settable. The primary key is handled separately by `#[id]`.
+/// a stored generated column, an identity column, a sequence-backed column
+/// (`SERIAL`/`BIGSERIAL`, where the database advances the sequence), or the
+/// framework-managed `created_at` (when it carries a DB default). A plain
+/// mutable column with a DB default stays settable. The primary key is handled
+/// separately by `#[id]` (which takes precedence in `render_model`).
 fn is_write_excluded(col: &Column) -> bool {
-    col.is_generated || col.is_identity || (col.name == "created_at" && col.has_default)
+    col.is_generated
+        || col.is_identity
+        || col.has_sequence_default
+        || (col.name == "created_at" && col.has_default)
 }
 
 /// Build a `diesel::table!` block from introspected columns.
@@ -338,39 +343,50 @@ pub fn render_schema_block(table: &str, columns: &[Column]) -> String {
 /// Insert or refresh a `table!` block in `schema.rs`.
 ///
 /// - If no block for `table` exists, append the freshly introspected one.
-/// - If a block exists and `force` is false, leave it untouched (idempotent).
-/// - If a block exists and `force` is true, replace it in place so a re-pull
-///   after the live table changed doesn't leave the schema block stale and out
-///   of sync with the regenerated model.
-fn upsert_schema_block(existing: &str, table: &str, columns: &[Column], force: bool) -> String {
+/// - If a block exists and matches the live table, leave it untouched.
+/// - If a block exists, `force` is true, replace it in place so a re-pull after
+///   the live table changed doesn't leave the schema block stale.
+/// - If a block exists but differs from the live table and `force` is false,
+///   error: keeping the stale block while regenerating the model from new
+///   columns would emit a model that references a mismatched schema and fail to
+///   compile.
+fn upsert_schema_block(
+    existing: &str,
+    table: &str,
+    columns: &[Column],
+    force: bool,
+) -> Result<String, GenerateError> {
     let block = render_schema_block(table, columns);
     if schema_has_table(existing, table) {
         if force {
-            replace_schema_block(existing, table, &block)
+            Ok(replace_schema_block(existing, table, &block))
+        } else if schema_block_matches(existing, table, &block) {
+            Ok(existing.to_owned())
         } else {
-            existing.to_owned()
+            Err(GenerateError::Config(format!(
+                "src/schema.rs already has a `table!` block for '{table}' that differs from the \
+                 live database; re-run with --force to replace it (the regenerated model would \
+                 otherwise reference a stale schema and fail to compile)"
+            )))
         }
     } else if existing.is_empty() {
-        block
+        Ok(block)
     } else {
         let trimmed = existing.trim_end();
-        format!("{trimmed}\n\n{block}")
+        Ok(format!("{trimmed}\n\n{block}"))
     }
 }
 
-/// Replace the existing `table!` block (qualified `diesel::table!` or the bare
-/// `table!` re-export) that declares `table` with `new_block`, matching braces
-/// from the macro invocation. Falls back to returning `existing` unchanged if
-/// the block can't be located.
-fn replace_schema_block(existing: &str, table: &str, new_block: &str) -> String {
+/// Byte range `[start, end)` of the `table!` block (qualified `diesel::table!`
+/// or the bare `table!` re-export) that declares `table`, including any path
+/// qualifier so a replacement isn't double-prefixed. `None` if not found.
+fn schema_block_range(existing: &str, table: &str) -> Option<(usize, usize)> {
     let needle = format!("{table} (");
     let bytes = existing.as_bytes();
     let mut search_from = 0;
     while let Some(macro_rel) = existing[search_from..].find("table!") {
         let name_start = search_from + macro_rel;
-        // Walk back over an optional path qualifier (e.g. `diesel::`) so the
-        // replacement range covers the whole invocation and the regenerated
-        // `diesel::table!` block does not get prefixed with a stray `diesel::`.
+        // Walk back over an optional path qualifier (e.g. `diesel::`).
         let mut macro_start = name_start;
         while macro_start > 0 {
             let c = bytes[macro_start - 1];
@@ -402,20 +418,36 @@ fn replace_schema_block(existing: &str, table: &str, new_block: &str) -> String 
             }
         }
         let Some(end) = end else { break };
-        // Does this macro define the table we're replacing?
+        // Does this macro define the table we're looking for?
         if existing[open..end]
             .lines()
             .any(|l| l.trim().starts_with(&needle))
         {
-            let mut out = String::with_capacity(existing.len() + new_block.len());
-            out.push_str(&existing[..macro_start]);
-            out.push_str(new_block.trim_end());
-            out.push_str(&existing[end..]);
-            return out;
+            return Some((macro_start, end));
         }
         search_from = end;
     }
-    existing.to_owned()
+    None
+}
+
+/// Replace the existing `table!` block for `table` with `new_block`, or return
+/// `existing` unchanged if the block can't be located.
+fn replace_schema_block(existing: &str, table: &str, new_block: &str) -> String {
+    let Some((start, end)) = schema_block_range(existing, table) else {
+        return existing.to_owned();
+    };
+    let mut out = String::with_capacity(existing.len() + new_block.len());
+    out.push_str(&existing[..start]);
+    out.push_str(new_block.trim_end());
+    out.push_str(&existing[end..]);
+    out
+}
+
+/// Whether the existing `table!` block for `table` is byte-identical (modulo
+/// surrounding whitespace) to the freshly introspected `block`.
+fn schema_block_matches(existing: &str, table: &str, block: &str) -> bool {
+    schema_block_range(existing, table)
+        .is_some_and(|(start, end)| existing[start..end].trim() == block.trim())
 }
 
 /// Whether `columns` follow the Autumn `id BIGINT` primary-key convention the
@@ -1117,6 +1149,37 @@ mod tests {
     }
 
     #[test]
+    fn plan_pull_excludes_non_pk_sequence_column_from_writes() {
+        let tmp = project();
+        // A non-PK `BIGSERIAL` column is database-advanced, so it must stay out
+        // of inserts/updates (`#[default]`) — same as identity/generated.
+        let table = TableSchema {
+            table: "invoices".to_owned(),
+            columns: vec![
+                id_col(),
+                Column {
+                    name: "invoice_no".to_owned(),
+                    kind: FieldKind::I64,
+                    nullable: false,
+                    is_pk: false,
+                    has_default: true,
+                    has_sequence_default: true,
+                    is_generated: false,
+                    is_identity: false,
+                },
+                created_at_col(),
+            ],
+        };
+        let plan = plan_pull(tmp.path(), &[table], PullOptions::default()).unwrap();
+        plan.execute(Flags::default()).unwrap();
+        let model = fs::read_to_string(tmp.path().join("src/models/invoice.rs")).unwrap();
+        assert!(
+            model.contains("#[default]\n    pub invoice_no: i64,"),
+            "non-PK sequence column must be write-excluded: {model}"
+        );
+    }
+
+    #[test]
     fn plan_pull_rejects_keyword_table_name_when_explicit() {
         let tmp = project();
         // A (quoted) table literally named `as` would emit `use crate::schema::as;`.
@@ -1214,16 +1277,31 @@ mod tests {
     }
 
     #[test]
-    fn plan_pull_without_force_keeps_existing_schema_block() {
+    fn plan_pull_without_force_errors_on_stale_schema_block() {
         let tmp = project();
         let src = tmp.path().join("src");
+        // A stale block (extra/old column) that no longer matches the live table.
         fs::write(
             src.join("schema.rs"),
             "diesel::table! {\n    posts (id) {\n        id -> Int8,\n        old_col -> Text,\n    }\n}\n",
         )
         .unwrap();
-        // Without --force the existing block is left untouched (idempotent), and
-        // the colliding model file would error — so use force only on files.
+        // Without --force, regenerating the model against this stale block would
+        // emit uncompilable code, so the pull must error rather than "succeed".
+        let err = plan_pull(tmp.path(), &[post_table()], PullOptions::default()).unwrap_err();
+        assert!(
+            err.to_string().contains("differs from the live database"),
+            "stale schema block must be reported: {err}"
+        );
+    }
+
+    #[test]
+    fn plan_pull_without_force_keeps_matching_schema_block() {
+        let tmp = project();
+        let src = tmp.path().join("src");
+        // An existing block identical to the live table is fine without --force.
+        let block = render_schema_block("posts", &post_table().columns);
+        fs::write(src.join("schema.rs"), format!("{block}\n")).unwrap();
         let plan = plan_pull(tmp.path(), &[post_table()], PullOptions::default()).unwrap();
         plan.execute(Flags {
             force: true,
@@ -1231,10 +1309,12 @@ mod tests {
         })
         .unwrap();
         let schema = fs::read_to_string(src.join("schema.rs")).unwrap();
-        assert!(
-            schema.contains("old_col"),
-            "without options.force the schema block stays unchanged: {schema}"
+        assert_eq!(
+            schema.matches("posts (id)").count(),
+            1,
+            "an identical block must not be duplicated: {schema}"
         );
+        assert!(schema.contains("title -> Text,"));
     }
 
     #[test]
