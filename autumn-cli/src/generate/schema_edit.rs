@@ -946,6 +946,16 @@ fn patch_dotted_dep(
 /// Returns `existing` unchanged when the `autumn-web` dep cannot be found.
 #[must_use]
 pub fn ensure_autumn_web_feature(existing: &str, feature: &str) -> String {
+    ensure_autumn_web_feature_status(existing, feature).0
+}
+
+/// Like [`ensure_autumn_web_feature`], but also reports whether the `autumn-web`
+/// dependency ends up carrying `feature`. The `bool` is `false` only when no
+/// `autumn-web` dependency could be located (so the caller can warn that the
+/// feature must be enabled by hand); it is `true` when the feature was added or
+/// was already present.
+#[must_use]
+pub fn ensure_autumn_web_feature_status(existing: &str, feature: &str) -> (String, bool) {
     let feature_quoted = format!("\"{feature}\"");
     let lines: Vec<&str> = existing.lines().collect();
     let mut in_deps = false;
@@ -975,7 +985,10 @@ pub fn ensure_autumn_web_feature(existing: &str, feature: &str) -> String {
         if let Some(rest) = after_ws.strip_prefix("autumn-web") {
             if rest.starts_with('.') {
                 // Dotted key form: autumn-web.workspace = true, autumn-web.features = [...], etc.
-                return patch_dotted_dep(&lines, i, existing, feature, &feature_quoted);
+                return (
+                    patch_dotted_dep(&lines, i, existing, feature, &feature_quoted),
+                    true,
+                );
             }
             if rest.starts_with(|c: char| c != '=' && !c.is_whitespace()) {
                 continue;
@@ -1001,7 +1014,7 @@ pub fn ensure_autumn_web_feature(existing: &str, feature: &str) -> String {
         // does not falsely appear to already have the feature enabled.
         let line_code = line.split_once('#').map_or(line, |(before, _)| before);
         if line_code.contains(&feature_quoted) {
-            return existing.to_owned();
+            return (existing.to_owned(), true);
         }
         let new_line = rewrite_dep_with_feature(line, feature);
         if new_line == line {
@@ -1014,7 +1027,7 @@ pub fn ensure_autumn_web_feature(existing: &str, feature: &str) -> String {
                 &feature_quoted,
             ) {
                 None => continue,
-                Some(result) => return result,
+                Some(result) => return (result, true),
             }
         }
         let mut out = String::with_capacity(existing.len() + 32);
@@ -1025,7 +1038,7 @@ pub fn ensure_autumn_web_feature(existing: &str, feature: &str) -> String {
         if !existing.ends_with('\n') {
             out.pop();
         }
-        return out;
+        return (out, true);
     }
 
     // Pass 2: multiline section form `[dependencies.autumn-web]`.
@@ -1035,7 +1048,10 @@ pub fn ensure_autumn_web_feature(existing: &str, feature: &str) -> String {
         if key_part != "[dependencies.autumn-web]" {
             continue;
         }
-        return add_feature_to_deps_section(&lines, i + 1, existing, feature, &feature_quoted);
+        return (
+            add_feature_to_deps_section(&lines, i + 1, existing, feature, &feature_quoted),
+            true,
+        );
     }
 
     // Pass 2b: `[dependencies.autumn_web]` table section whose body declares
@@ -1043,10 +1059,13 @@ pub fn ensure_autumn_web_feature(existing: &str, feature: &str) -> String {
     if let Some(start) =
         find_section_start_with_autumn_web_package(&lines, "[dependencies.autumn_web]")
     {
-        return add_feature_to_deps_section(&lines, start, existing, feature, &feature_quoted);
+        return (
+            add_feature_to_deps_section(&lines, start, existing, feature, &feature_quoted),
+            true,
+        );
     }
 
-    existing.to_owned()
+    (existing.to_owned(), false)
 }
 
 /// Scan `lines` for a section header matching `key` (after stripping inline TOML comments)
@@ -2585,6 +2604,29 @@ async fn main() {\n\
     }
 
     // ── ensure_autumn_web_feature ─────────────────────────────────────────
+
+    #[test]
+    fn ensure_feature_status_reports_not_found_when_dep_absent() {
+        // No `autumn-web` dependency at all → status `false` so callers can warn.
+        let cargo = "[package]\nname=\"x\"\n\n[dependencies]\nserde = \"1\"\n";
+        let (out, applied) = ensure_autumn_web_feature_status(cargo, "db");
+        assert!(!applied, "absent dependency must report not-applied");
+        assert_eq!(
+            out, cargo,
+            "an unlocatable dependency leaves the toml untouched"
+        );
+    }
+
+    #[test]
+    fn ensure_feature_status_reports_applied_when_present() {
+        let cargo = "[package]\nname=\"x\"\n\n[dependencies]\nautumn-web = \"0.6\"\n";
+        let (_, added) = ensure_autumn_web_feature_status(cargo, "db");
+        assert!(added, "adding the feature to a present dep reports applied");
+        // Idempotent re-run still reports applied (feature already present).
+        let once = ensure_autumn_web_feature(cargo, "db");
+        let (_, again) = ensure_autumn_web_feature_status(&once, "db");
+        assert!(again, "an already-present feature still reports applied");
+    }
 
     #[test]
     fn ensure_feature_transforms_bare_string_dep() {

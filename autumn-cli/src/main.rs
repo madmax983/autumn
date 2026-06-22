@@ -8,6 +8,7 @@ mod config;
 mod credentials;
 mod data;
 mod db;
+mod db_pull;
 mod dev;
 mod dev_loop_bench;
 mod doctor;
@@ -684,16 +685,52 @@ enum DbCommands {
         #[arg(long)]
         force: bool,
     },
+    /// Scaffold Autumn models from an existing database (read-only introspection).
+    ///
+    /// Connects to the resolved primary database (the same way `autumn migrate`
+    /// does) and emits, for each selected table, a `#[model]` struct in
+    /// `src/models/`, a `diesel::table!` entry in `src/schema.rs`, and the
+    /// `pub mod` aggregator line — using the same file-emission machinery as
+    /// `autumn generate`. No migration is written and no data is touched.
+    ///
+    /// # Examples
+    ///
+    ///   # Pull every table:
+    ///   autumn db pull
+    ///
+    ///   # Pull specific tables, also emitting repositories:
+    ///   autumn db pull posts comments --with-repository
+    #[command(verbatim_doc_comment)]
+    Pull {
+        /// Tables to pull. When omitted, every non-system table is pulled.
+        #[arg(value_name = "TABLE")]
+        tables: Vec<String>,
+        /// Resolve the connection through a profile overlay (see `db create`).
+        #[arg(long, value_name = "PROFILE")]
+        profile: Option<String>,
+        /// Also emit a `#[repository(Model)]` trait per table.
+        #[arg(long)]
+        with_repository: bool,
+        /// Print the planned actions without writing any files.
+        #[arg(long)]
+        dry_run: bool,
+        /// Overwrite existing model/repository files instead of erroring.
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 impl DbCommands {
-    /// Translate the parsed CLI subcommand into the `db` module's command and
-    /// the optional profile override the connection should be resolved under.
+    /// Translate a lifecycle subcommand (`create`/`drop`/`reset`) into the `db`
+    /// module's command and the optional profile override the connection should
+    /// be resolved under. `pull` is dispatched separately (it does not map onto
+    /// [`db::DbCommand`]).
     fn into_command(self) -> (db::DbCommand, Option<String>) {
         match self {
             Self::Create { profile } => (db::DbCommand::Create, profile),
             Self::Drop { profile, force } => (db::DbCommand::Drop { force }, profile),
             Self::Reset { profile, force } => (db::DbCommand::Reset { force }, profile),
+            Self::Pull { .. } => unreachable!("db pull is dispatched before into_command"),
         }
     }
 }
@@ -1580,10 +1617,25 @@ fn run_command(command: Commands) {
             };
             migrate::run(&action, with_maintenance, &target, profile.as_deref());
         }
-        Commands::Db(cmd) => {
-            let (command, profile) = cmd.into_command();
-            db::run(&command, profile.as_deref());
-        }
+        Commands::Db(cmd) => match cmd {
+            DbCommands::Pull {
+                tables,
+                profile,
+                with_repository,
+                dry_run,
+                force,
+            } => db_pull::run(&db_pull::PullArgs {
+                profile,
+                tables,
+                with_repository,
+                dry_run,
+                force,
+            }),
+            other => {
+                let (command, profile) = other.into_command();
+                db::run(&command, profile.as_deref());
+            }
+        },
         Commands::Shard(cmd) => match cmd.command {
             ShardSubcommand::MoveSlot {
                 from,
@@ -2918,6 +2970,58 @@ mod tests {
             .into_command(),
             (db::DbCommand::Reset { force: false }, None)
         ));
+    }
+
+    #[test]
+    fn parse_db_pull_defaults() {
+        let cli = Cli::try_parse_from(["autumn", "db", "pull"]).unwrap();
+        let Commands::Db(DbCommands::Pull {
+            tables,
+            profile,
+            with_repository,
+            dry_run,
+            force,
+        }) = cli.command
+        else {
+            panic!("expected db pull");
+        };
+        assert!(tables.is_empty());
+        assert!(profile.is_none());
+        assert!(!with_repository);
+        assert!(!dry_run);
+        assert!(!force);
+    }
+
+    #[test]
+    fn parse_db_pull_with_tables_and_flags() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "db",
+            "pull",
+            "posts",
+            "comments",
+            "--with-repository",
+            "--dry-run",
+            "--force",
+            "--profile",
+            "test",
+        ])
+        .unwrap();
+        let Commands::Db(DbCommands::Pull {
+            tables,
+            profile,
+            with_repository,
+            dry_run,
+            force,
+        }) = cli.command
+        else {
+            panic!("expected db pull");
+        };
+        assert_eq!(tables, vec!["posts".to_owned(), "comments".to_owned()]);
+        assert_eq!(profile.as_deref(), Some("test"));
+        assert!(with_repository);
+        assert!(dry_run);
+        assert!(force);
     }
 
     // ── autumn seed tests ──────────────────────────────────────────────────

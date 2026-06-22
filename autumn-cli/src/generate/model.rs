@@ -319,8 +319,6 @@ pub(super) fn ensure_cargo_dependencies(existing: &str, deps: &[(&str, &str)]) -
     out
 }
 
-/// True iff `line` is a TOML table header for `[<table>]`, tolerating leading
-/// whitespace and trailing `# comment` text (which `cargo` itself accepts).
 fn is_table_header(line: &str, table: &str) -> bool {
     let trimmed = line.trim_start();
     let Some(rest) = trimmed.strip_prefix('[') else {
@@ -653,6 +651,15 @@ fn sql_default_literal(field: &Field, value: &str) -> Result<String, String> {
             field.rust_type()
         )),
     }
+}
+
+/// Render a baseline `#[model]` file (no soft-delete, sharding, or field
+/// metadata) — the greenfield reference the `db pull` round-trip property
+/// asserts byte-equivalence against. See `generate::introspect`.
+#[cfg(test)]
+#[must_use]
+pub(super) fn render_model_file_for_test(name: &str, table: &str, fields: &[Field]) -> String {
+    render_model_file(name, table, fields, &ModelMetadata::default(), false, None)
 }
 
 fn render_model_file(
