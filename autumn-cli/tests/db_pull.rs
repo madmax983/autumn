@@ -229,9 +229,10 @@ async fn db_pull_fails_loudly_on_unsupported_column_type() {
     );
     run_autumn_ok(&project, &["migrate"], &envs);
 
-    // Pull must fail, name the offending column, list supported types, and never
-    // leak credentials.
-    let (stdout, stderr) = run_autumn_fail(&project, &["db", "pull"], &envs);
+    // An explicitly-requested table with an unsupported type must fail loudly,
+    // name the offending column, list supported types, and never leak creds.
+    // (An unscoped pull would instead skip it — see the test below.)
+    let (stdout, stderr) = run_autumn_fail(&project, &["db", "pull", "ledgers"], &envs);
     assert!(
         stderr.contains("ledgers.amount"),
         "error must name the column: {stderr}"
@@ -245,5 +246,41 @@ async fn db_pull_fails_loudly_on_unsupported_column_type() {
         "credentials leaked!\nstdout: {stdout}\nstderr: {stderr}"
     );
     // Nothing should have been written for the failed table.
+    assert!(!project.join("src/models/ledger.rs").exists());
+}
+
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers); run with -- --ignored"]
+async fn db_pull_unscoped_skips_unsupported_tables_and_pulls_the_rest() {
+    let (_container, host, port) = start_postgres().await;
+    let url = format!("postgres://postgres:{SECRET_PW}@{host}:{port}/postgres");
+    let envs = [("AUTUMN_DATABASE__URL", url.as_str())];
+
+    let (_tmp, project) = fresh_project("pull_mixed_app");
+    patch_generated_cargo_toml(&project);
+
+    // One supported table and one with an unmapped (NUMERIC) column.
+    run_autumn_ok(
+        &project,
+        &["generate", "model", "Post", "title:String"],
+        &envs,
+    );
+    write_migration(
+        &project,
+        "20260101000000_create_ledgers",
+        "CREATE TABLE ledgers (id BIGSERIAL PRIMARY KEY, amount NUMERIC NOT NULL);",
+        "DROP TABLE ledgers;",
+    );
+    run_autumn_ok(&project, &["migrate"], &envs);
+    std::fs::remove_dir_all(project.join("src/models")).unwrap();
+    std::fs::remove_file(project.join("src/schema.rs")).unwrap();
+
+    // Unscoped pull: ledgers is skipped (unsupported type), posts is generated.
+    let (_, stderr) = run_autumn_ok(&project, &["db", "pull"], &envs);
+    assert!(
+        stderr.contains("Skipping table 'ledgers'"),
+        "unsupported table should be skipped with a notice: {stderr}"
+    );
+    assert!(project.join("src/models/post.rs").exists());
     assert!(!project.join("src/models/ledger.rs").exists());
 }

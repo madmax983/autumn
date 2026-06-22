@@ -115,9 +115,20 @@ fn pull(args: &PullArgs) -> Result<(), PullError> {
         return Err(PullError::NoTables);
     }
 
+    let explicit = !args.tables.is_empty();
     let mut tables = Vec::with_capacity(table_names.len());
     for table in &table_names {
-        tables.push(introspect_table(&mut conn, table)?);
+        match introspect_table(&mut conn, table) {
+            Ok(schema) => tables.push(schema),
+            // An unscoped pull skips a table it can't map (e.g. a `jsonb` column)
+            // with a notice so the supported tables still come through; an
+            // explicitly-requested table is still a hard error. Connection/SQL
+            // failures always propagate.
+            Err(e) if !explicit && matches!(e, PullError::UnsupportedType { .. }) => {
+                eprintln!("  \u{2139} Skipping table '{table}': {e}");
+            }
+            Err(e) => return Err(e),
+        }
     }
 
     let plan = plan_pull(
@@ -126,7 +137,7 @@ fn pull(args: &PullArgs) -> Result<(), PullError> {
         PullOptions {
             with_repository: args.with_repository,
             force: args.force,
-            explicit: !args.tables.is_empty(),
+            explicit,
         },
     )
     .map_err(PullError::Generate)?;
