@@ -655,10 +655,8 @@ impl DbState for AppState {
         self.shards.as_ref()
     }
 
-    fn db_interceptors(
-        &self,
-    ) -> Vec<std::sync::Arc<dyn crate::interceptor::DbConnectionInterceptor>> {
-        self.extension::<Arc<dyn crate::interceptor::DbConnectionInterceptor>>()
+    fn db_interceptors(&self) -> Vec<std::sync::Arc<dyn crate::db::DbConnectionInterceptor>> {
+        self.extension::<Arc<dyn crate::db::DbConnectionInterceptor>>()
             .map(|arc| vec![(*arc).clone()])
             .unwrap_or_default()
     }

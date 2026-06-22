@@ -228,9 +228,7 @@ pub trait DbState {
     }
 
     /// Returns any registered database connection checkout interceptors.
-    fn db_interceptors(
-        &self,
-    ) -> Vec<std::sync::Arc<dyn crate::interceptor::DbConnectionInterceptor>> {
+    fn db_interceptors(&self) -> Vec<std::sync::Arc<dyn crate::db::DbConnectionInterceptor>> {
         Vec::new()
     }
     /// Returns the global statement timeout, if configured.
@@ -975,7 +973,7 @@ pub(crate) struct DbCheckoutParams<'a> {
     pub route_key: Option<String>,
     pub metrics: Option<crate::middleware::MetricsCollector>,
     pub slow_query_threshold: std::time::Duration,
-    pub interceptors: Vec<std::sync::Arc<dyn crate::interceptor::DbConnectionInterceptor>>,
+    pub interceptors: Vec<std::sync::Arc<dyn crate::db::DbConnectionInterceptor>>,
 }
 
 impl Db {
@@ -1017,7 +1015,7 @@ impl Db {
             })
         });
         for interceptor in &params.interceptors {
-            let ctx = crate::interceptor::DbCheckoutContext {
+            let ctx = crate::db::DbCheckoutContext {
                 pool_name: params.pool_name.to_string(),
             };
             checkout_future = interceptor.intercept_checkout(ctx, checkout_future);
@@ -1072,7 +1070,7 @@ pub(crate) struct RequestDbContext {
     pub route_key: Option<String>,
     pub metrics: Option<crate::middleware::MetricsCollector>,
     pub slow_query_threshold: std::time::Duration,
-    pub interceptors: Vec<std::sync::Arc<dyn crate::interceptor::DbConnectionInterceptor>>,
+    pub interceptors: Vec<std::sync::Arc<dyn crate::db::DbConnectionInterceptor>>,
 }
 
 impl RequestDbContext {
@@ -1959,5 +1957,36 @@ mod tests {
         assert_eq!(super::scrub_sql("SELECT 1_000.5_0"), "SELECT ?");
         assert_eq!(super::scrub_sql("SELECT col_5_val"), "SELECT col_5_val");
         assert_eq!(super::scrub_sql("SELECT col_5"), "SELECT col_5");
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct DbCheckoutContext {
+    pub pool_name: String,
+}
+
+#[cfg(feature = "db")]
+pub trait DbConnectionInterceptor: Send + Sync + 'static {
+    fn intercept_checkout<'a>(
+        &'a self,
+        ctx: DbCheckoutContext,
+        next: std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<PooledConnection, crate::AutumnError>>
+                    + Send
+                    + 'a,
+            >,
+        >,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<PooledConnection, crate::AutumnError>>
+                + Send
+                + 'a,
+        >,
+    >;
+
+    /// Returns whether this interceptor enables transactional test isolation mode.
+    fn is_transactional_test(&self) -> bool {
+        false
     }
 }

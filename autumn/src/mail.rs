@@ -2450,7 +2450,7 @@ fn lettre_message(mail: &Mail) -> Result<Message, MailError> {
 
 struct InterceptedMailTransport {
     inner: Arc<dyn MailTransport>,
-    interceptor: Arc<dyn crate::interceptor::MailInterceptor>,
+    interceptor: Arc<dyn crate::mail::MailInterceptor>,
 }
 
 impl MailTransport for InterceptedMailTransport {
@@ -2497,7 +2497,7 @@ pub(crate) fn install_mailer(
     let mut mailer =
         Mailer::from_config_inner(config, resilience).map_err(AutumnError::service_unavailable)?;
 
-    if let Some(interceptor) = state.extension::<Arc<dyn crate::interceptor::MailInterceptor>>() {
+    if let Some(interceptor) = state.extension::<Arc<dyn crate::mail::MailInterceptor>>() {
         mailer.transport = Arc::new(InterceptedMailTransport {
             inner: Arc::clone(&mailer.transport),
             interceptor: (*interceptor).clone(),
@@ -4385,7 +4385,7 @@ mod tests {
         }
 
         struct ShortCircuitMailInterceptor;
-        impl crate::interceptor::MailInterceptor for ShortCircuitMailInterceptor {
+        impl crate::mail::MailInterceptor for ShortCircuitMailInterceptor {
             fn intercept<'a>(
                 &'a self,
                 _mail: &'a Mail,
@@ -4618,4 +4618,15 @@ mod tests {
         assert!(runtime.list_unsubscribe_header("a@x.com", "list").is_none());
         assert!(!runtime.supports_one_click());
     }
+}
+
+#[cfg(feature = "mail")]
+pub trait MailInterceptor: Send + Sync + 'static {
+    fn intercept<'a>(
+        &'a self,
+        mail: &'a Mail,
+        next: std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<(), MailError>> + Send + 'a>,
+        >,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), MailError>> + Send + 'a>>;
 }
