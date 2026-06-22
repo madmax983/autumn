@@ -135,6 +135,8 @@ pub fn plan_pull(
     // Track whether any repository was actually emitted, so the `repositories`
     // module is only wired up when at least one exists.
     let mut emitted_repository = false;
+    // `routes![]` entries for the read-only API handlers of emitted repositories.
+    let mut route_entries: Vec<String> = Vec::new();
 
     for table in tables {
         let resource = singularize(&table.table);
@@ -188,8 +190,23 @@ pub fn plan_pull(
                 ),
             );
             repos_mod = add_mod_declaration(&repos_mod, &snake_name);
+            // Register the read-only JSON handlers the `api = ...` repository
+            // generates so `/api/<table>` is reachable. Mutating handlers
+            // (create/update/delete) are intentionally left out until the user
+            // adds a policy — matching the scaffold's default posture and the
+            // security note in the generated repository.
+            route_entries.push(format!("repositories::{snake_name}::{snake_name}_api_list"));
+            route_entries.push(format!("repositories::{snake_name}::{snake_name}_api_get"));
             emitted_repository = true;
         }
+    }
+
+    // If an unscoped pull skipped every table, leave the project untouched
+    // rather than writing empty aggregators, bumping deps, and exiting "ok".
+    // (An explicitly-requested unsupported table already errored above.)
+    if seen.is_empty() {
+        eprintln!("  \u{2139} No supported tables to pull \u{2014} nothing was generated.");
+        return Ok(Plan::new(project_root));
     }
 
     plan.modify(models_dir.join("mod.rs"), models_mod);
@@ -204,7 +221,7 @@ pub fn plan_pull(
         if emitted_repository {
             mods.push("repositories");
         }
-        let updated = update_main_rs(&main_existing, &mods, &[]);
+        let updated = update_main_rs(&main_existing, &mods, &route_entries);
         plan.modify(main_path, updated);
     }
 
@@ -679,6 +696,36 @@ mod tests {
         assert!(repo_mod.contains("pub mod post;"));
         let main = fs::read_to_string(tmp.path().join("src/main.rs")).unwrap();
         assert!(main.contains("mod repositories;"));
+        // The read-only API handlers are registered so /api/posts is reachable;
+        // mutating handlers are intentionally left out until a policy is added.
+        assert!(
+            main.contains("repositories::post::post_api_list"),
+            "API list route must be registered: {main}"
+        );
+        assert!(main.contains("repositories::post::post_api_get"));
+        assert!(
+            !main.contains("post_api_create"),
+            "mutating API routes must not be auto-registered: {main}"
+        );
+    }
+
+    #[test]
+    fn plan_pull_unscoped_all_unsupported_writes_nothing() {
+        let tmp = project();
+        // Only a uuid-keyed table: unscoped pull skips it and must not touch the
+        // project (no empty mod.rs/schema.rs, no Cargo.toml churn).
+        let sessions = TableSchema {
+            table: "sessions".to_owned(),
+            columns: vec![col("token", FieldKind::Uuid, false, true)],
+        };
+        let plan = plan_pull(tmp.path(), &[sessions], PullOptions::default()).unwrap();
+        assert!(
+            plan.actions.is_empty(),
+            "an all-skipped unscoped pull must produce no actions"
+        );
+        plan.execute(Flags::default()).unwrap();
+        assert!(!tmp.path().join("src/schema.rs").exists());
+        assert!(!tmp.path().join("src/models/mod.rs").exists());
     }
 
     #[test]
