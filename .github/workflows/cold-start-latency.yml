@@ -101,6 +101,14 @@ jobs:
             -- dev_loop_bench cold_start_driver new:: \
             2>&1 | tee test-output.txt
           grep -E "^test result:" test-output.txt
+          # Guard against a stale filter silently matching zero tests: assert a
+          # representative test from each targeted module actually ran.
+          for module in dev_loop_bench cold_start_driver new; do
+            if ! grep -qE "^test ${module}::tests::.* \.\.\. ok" test-output.txt; then
+              echo "::error::No ${module} unit tests ran — the test filter may be stale."
+              exit 1
+            fi
+          done
 
   # ── Live cold-start measurement (scheduled / manual only) ──────────────────
   measure:
@@ -167,7 +175,8 @@ jobs:
       - name: Regression gate
         if: ${{ inputs.fail_on_regression == 'true' || inputs.fail_on_regression == '' }}
         run: |
-          ALL_PASSED=$(jq -r '.all_passed' cold-start-report.json 2>/dev/null || echo "true")
+          # Fail closed: a missing or unparseable report must NOT pass the gate.
+          ALL_PASSED=$(jq -r '.all_passed' cold-start-report.json 2>/dev/null || echo "false")
           if [ "$ALL_PASSED" != "true" ]; then
             echo "::error::The no-DB cold-start onboarding budget was exceeded."
             echo "::error::See the report artifact for per-shape diagnostics and next actions."

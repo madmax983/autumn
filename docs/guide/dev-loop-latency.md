@@ -87,10 +87,12 @@ cache:
 3. Runs `cargo build` into the project's **own, empty `target/`** (any inherited
    `CARGO_TARGET_DIR` is removed), so the workspace's warm cache is never reused
    — this is the first clean compile.
-4. Starts the built binary — pinning host/port via the highest-precedence
-   `AUTUMN_SERVER__HOST`/`AUTUMN_SERVER__PORT` env vars and discarding its logs —
-   and polls `http://127.0.0.1:3000/` (override with `AUTUMN_BENCH_PORT`) until
-   the first HTTP `200`.
+4. Reserves a **free ephemeral port** for the sample (override with
+   `AUTUMN_BENCH_PORT`), starts the built binary — pinning host/port via the
+   highest-precedence `AUTUMN_SERVER__HOST`/`AUTUMN_SERVER__PORT` env vars and
+   discarding its logs — and polls `http://127.0.0.1:<port>/` until the first
+   HTTP `200`. A fresh port per sample avoids colliding with a lingering
+   `TIME_WAIT` socket from the previous sample.
 5. Records `duration = first_200 − scaffold_start`, repeats `--runs` times, and
    computes p50/p95/max.
 

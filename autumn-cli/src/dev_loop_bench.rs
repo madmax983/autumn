@@ -456,8 +456,24 @@ pub fn run(
         results,
     };
 
-    let human = format_human_summary(&report);
-    let machine = format_json_report(&report);
+    emit_report(&report, json, output, fail_on_regression)
+}
+
+/// Print a report (human or JSON), optionally write it to `output`, and return the
+/// process exit code.
+///
+/// Shared by the warm dev-loop [`run`] and the cold-start
+/// [`crate::cold_start_driver::run_cold_start`] so both emit identically. Returns
+/// non-zero when a requested `--output` write fails (so CI never proceeds with a
+/// missing report) or when `fail_on_regression` is set and the report did not pass.
+pub fn emit_report(
+    report: &FullReport,
+    json: bool,
+    output: Option<&str>,
+    fail_on_regression: bool,
+) -> i32 {
+    let human = format_human_summary(report);
+    let machine = format_json_report(report);
 
     if json {
         println!("{machine}");
@@ -465,20 +481,26 @@ pub fn run(
         println!("{human}");
     }
 
+    let mut exit = 0;
+
     if let Some(path) = output {
         if let Err(e) = std::fs::write(path, &machine) {
-            eprintln!("Warning: could not write report to {path}: {e}");
+            // A requested report that can't be written must fail the run: CI gates
+            // read this file, and a fail-open here would let a gate pass with no
+            // report.
+            eprintln!("Error: could not write report to {path}: {e}");
+            exit = 1;
         } else {
             eprintln!("Report written to {path}");
         }
     }
 
-    if fail_on_regression && !all_passed {
+    if fail_on_regression && !report.all_passed {
         eprintln!("One or more change classes exceeded the latency budget. Exiting 1.");
-        return 1;
+        exit = 1;
     }
 
-    0
+    exit
 }
 
 /// Render a budget table for the given change classes as a string.
@@ -669,13 +691,7 @@ fn sanitize_failure_reason(msg: &str) -> String {
     let redacted = first_line
         .split_whitespace()
         .map(|tok| {
-            let trimmed = tok.trim_start_matches(['(', '"', '`', '\'', '[']);
-            let unix_abs = trimmed.starts_with('/') || trimmed.starts_with("~/");
-            // `C:\` / `C:/` style drive-rooted Windows paths.
-            let win_drive = trimmed.len() >= 3
-                && trimmed.as_bytes()[1] == b':'
-                && matches!(trimmed.as_bytes()[2], b'\\' | b'/');
-            if unix_abs || win_drive || trimmed.contains('\\') {
+            if looks_like_path_token(tok) {
                 "<path>"
             } else {
                 tok
@@ -689,6 +705,41 @@ fn sanitize_failure_reason(msg: &str) -> String {
     } else {
         redacted
     }
+}
+
+/// Whether a whitespace-delimited token contains a filesystem path.
+///
+/// Detects an absolute-path marker (`/`, `~/`, or a `X:\`/`X:/` drive root) at the
+/// **start of the token or immediately after a delimiter** (`: = ( , [ ] { } " '`),
+/// or any backslash. Checking only the token *prefix* would miss paths glued after
+/// a non-path prefix, e.g. `note:/home/runner/x` or `registry=/home/.cargo/...`,
+/// while the delimiter rule still leaves ordinary slashes like `and/or` alone.
+fn looks_like_path_token(tok: &str) -> bool {
+    const DELIMS: &[u8] = b":=(,[]{}\"'";
+    // Windows separators / UNC paths.
+    if tok.contains('\\') {
+        return true;
+    }
+    let bytes = tok.as_bytes();
+    let at_boundary = |i: usize| i == 0 || DELIMS.contains(&bytes[i - 1]);
+    for i in 0..bytes.len() {
+        match bytes[i] {
+            // Unix absolute path "/…" or home path "~/…".
+            b'/' if at_boundary(i) => return true,
+            b'~' if at_boundary(i) && bytes.get(i + 1) == Some(&b'/') => return true,
+            // Windows drive root "X:/" (the "X:\\" form is caught by the
+            // backslash check above).
+            c if c.is_ascii_alphabetic()
+                && at_boundary(i)
+                && bytes.get(i + 1) == Some(&b':')
+                && bytes.get(i + 2) == Some(&b'/') =>
+            {
+                return true;
+            }
+            _ => {}
+        }
+    }
+    false
 }
 
 /// Build an informational failure row for a DB-shape measurement that could not
@@ -1277,8 +1328,10 @@ mod tests {
     }
 
     #[test]
-    fn run_output_bad_path_still_returns_zero() {
-        // A write error on the output path is non-fatal; the command still succeeds.
+    fn run_output_write_failure_returns_nonzero() {
+        // A requested --output that cannot be written must fail the run (not be
+        // swallowed): CI gates read this file, so a fail-open would let a gate
+        // pass with no report.
         let exit = run(
             "examples/hello",
             3,
@@ -1287,7 +1340,7 @@ mod tests {
             false,
             false,
         );
-        assert_eq!(exit, 0);
+        assert_eq!(exit, 1);
     }
 
     // ── env var helpers ───────────────────────────────────────────────────
@@ -1493,6 +1546,29 @@ mod tests {
         assert!(!first_line_case.contains("C:\\Users\\"));
         assert!(first_line_case.contains("<path>"));
         assert!(first_line_case.starts_with("autumn new failed:"));
+    }
+
+    #[test]
+    fn sanitize_failure_reason_redacts_paths_glued_after_a_delimiter() {
+        // Absolute paths embedded mid-token (after a `:` or `=`, no surrounding
+        // whitespace and no backslash) must still be redacted.
+        for raw in [
+            "note:/home/runner/work/app/src/main.rs",
+            "registry=/home/runner/.cargo/registry/foo",
+            "(/home/runner/x)",
+            "boom ~/.cargo/config",
+        ] {
+            let clean = sanitize_failure_reason(raw);
+            assert!(
+                !clean.contains("/home/") && !clean.contains("/.cargo"),
+                "leaked a path for {raw:?} -> {clean:?}"
+            );
+            assert!(clean.contains("<path>"), "expected redaction for {raw:?}");
+        }
+        // Ordinary slashed words are left intact (not treated as paths).
+        let kept = sanitize_failure_reason("choose and/or neither n/a");
+        assert!(kept.contains("and/or"), "must not over-redact: {kept:?}");
+        assert!(!kept.contains("<path>"), "must not over-redact: {kept:?}");
     }
 
     #[test]

@@ -15,11 +15,12 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use crate::dev_loop_bench::{
     ChangeClass, DbOutcome, budget_for, build_cold_start_report, cargo_executable_path,
-    format_cold_start_budget_table, format_human_summary, format_json_report,
+    emit_report, format_cold_start_budget_table,
 };
 
 /// Which scaffolded project shape to measure for cold start.
@@ -66,6 +67,17 @@ fn locate_autumn_web() -> Option<PathBuf> {
     None
 }
 
+/// Canonicalized workspace `autumn-web` path, resolved once per process.
+///
+/// The repo location is invariant across samples, so the ancestor walk + file
+/// reads + canonicalize run only on the first sample and are cached for the rest.
+fn cached_autumn_web() -> Option<PathBuf> {
+    static AUTUMN_WEB: OnceLock<Option<PathBuf>> = OnceLock::new();
+    AUTUMN_WEB
+        .get_or_init(|| locate_autumn_web().and_then(|p| std::fs::canonicalize(p).ok()))
+        .clone()
+}
+
 /// Append a `[patch.crates-io]` override pointing `autumn-web` at local source.
 ///
 /// The scaffolded `Cargo.toml` already declares its own (empty) `[workspace]`
@@ -92,13 +104,11 @@ fn repoint_autumn_web(project_dir: &Path, autumn_web: &Path) -> Result<(), Strin
 /// Returns the elapsed milliseconds from just before `autumn new` to the first
 /// successful response on `/`.
 fn measure_cold_start_once(shape: ColdStartShape) -> Result<u64, String> {
-    let autumn_web = locate_autumn_web().ok_or_else(|| {
-        "could not locate the workspace autumn-web crate; \
+    let autumn_web = cached_autumn_web().ok_or_else(|| {
+        "could not locate (or canonicalize) the workspace autumn-web crate; \
          set AUTUMN_BENCH_AUTUMN_WEB_PATH to its directory"
             .to_string()
     })?;
-    let autumn_web = std::fs::canonicalize(&autumn_web)
-        .map_err(|e| format!("canonicalize autumn-web path: {e}"))?;
 
     let tmp = tempfile::tempdir().map_err(|e| format!("create temp dir: {e}"))?;
     let project_name = "coldstart_app";
@@ -184,8 +194,12 @@ fn measure_cold_start_once(shape: ColdStartShape) -> Result<u64, String> {
         .map_err(|e| format!("failed to start the built server binary: {e}"))?;
 
     // Poll the configured root route until the first 200 or the deadline.
+    // The poll timeout is measured from *now* (after the multi-minute build), not
+    // from `start`: a slow cold compile must not eat the boot-poll window and make
+    // a server that boots fine look like a serve failure. `start` still drives the
+    // measured duration recorded below.
     let url = format!("http://127.0.0.1:{port}/");
-    let deadline = start + Duration::from_millis(budget_for(class_for(shape)).max_ms * 2);
+    let deadline = Instant::now() + Duration::from_millis(budget_for(class_for(shape)).max_ms * 2);
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(2))
         .build()
@@ -244,18 +258,23 @@ fn cold_build(project_dir: &Path, project_name: &str) -> Result<PathBuf, String>
         .current_dir(project_dir)
         .env_remove("CARGO_TARGET_DIR")
         .env_remove("CARGO_BUILD_TARGET_DIR")
-        .env_remove("CARGO_BUILD_TARGET")
-        // Setting wrappers to an empty string is Cargo's documented way to disable
-        // wrapping, and an env var overrides config files — which `env_remove`
-        // alone cannot neutralise.
-        .env("RUSTC_WRAPPER", "")
-        .env("RUSTC_WORKSPACE_WRAPPER", "")
-        .env("CARGO_BUILD_RUSTC_WRAPPER", "")
-        .env("CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER", "");
+        .env_remove("CARGO_BUILD_TARGET");
+    // Disable any compiler wrapper (e.g. `sccache`) so the measurement is a genuine
+    // first clean compile. Setting each to an empty string is Cargo's documented
+    // way to disable wrapping, and an env var overrides a config-file
+    // `build.rustc-wrapper` — which `env_remove` alone cannot neutralise.
+    for var in [
+        "RUSTC_WRAPPER",
+        "RUSTC_WORKSPACE_WRAPPER",
+        "CARGO_BUILD_RUSTC_WRAPPER",
+        "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER",
+    ] {
+        build.env(var, "");
+    }
     // An explicit `--target` overrides a config-file `build.target` and keeps the
     // artifact host-runnable. If the host triple can't be determined we omit it
     // and fall back to Cargo's default (the host unless config overrides it).
-    if let Some(triple) = host_target_triple() {
+    if let Some(triple) = cached_host_target_triple() {
         build.arg("--target").arg(triple);
     }
     let output = build
@@ -289,6 +308,15 @@ fn host_target_triple() -> Option<String> {
         .map(|triple| triple.trim().to_string())
 }
 
+/// Host target triple, resolved once per process.
+///
+/// The triple is invariant, so the `rustc -vV` subprocess runs only on the first
+/// sample; caching also keeps it out of every subsequent sample's timed window.
+fn cached_host_target_triple() -> Option<String> {
+    static HOST_TRIPLE: OnceLock<Option<String>> = OnceLock::new();
+    HOST_TRIPLE.get_or_init(host_target_triple).clone()
+}
+
 /// Reserve a currently-free TCP port on loopback.
 ///
 /// Binds an ephemeral port, reads it, then drops the listener so the scaffolded
@@ -311,16 +339,16 @@ fn reserve_free_port() -> Result<u16, String> {
 fn stop_child(child: &mut std::process::Child) {
     #[cfg(unix)]
     {
-        if let Some(pid) = crate::process::validate_pid_for_kill(child.id())
-            && let Err(e) = nix::sys::signal::kill(
-                nix::unistd::Pid::from_raw(pid),
-                nix::sys::signal::Signal::SIGTERM,
-            )
-        {
+        // Graceful SIGTERM first (via the shared helper) so the app's on_shutdown
+        // hooks run — notably the managed-Postgres provider stopping its cluster.
+        // Note: a *forced* fallback can still leave that Postgres behind, because
+        // it `setsid`s into its own process group (see process::stop_postmaster);
+        // the SIGTERM path is what reaps it.
+        if let Err(e) = crate::process::signal_terminate(child.id()) {
             eprintln!("  Warning: failed to SIGTERM cold-start server: {e}");
         }
         if crate::process::wait_with_timeout(child, Duration::from_secs(10)).is_err() {
-            let _ = child.kill();
+            crate::process::force_kill(child.id());
             let _ = child.wait();
         }
     }
@@ -404,29 +432,7 @@ pub fn run_cold_start(
     };
 
     let report = build_cold_start_report(&hello_samples, &db);
-    let human = format_human_summary(&report);
-    let machine = format_json_report(&report);
-
-    if json {
-        println!("{machine}");
-    } else {
-        println!("{human}");
-    }
-
-    if let Some(path) = output {
-        if let Err(e) = std::fs::write(path, &machine) {
-            eprintln!("Warning: could not write report to {path}: {e}");
-        } else {
-            eprintln!("Report written to {path}");
-        }
-    }
-
-    if fail_on_regression && !report.all_passed {
-        eprintln!("Cold-start onboarding budget exceeded. Exiting 1.");
-        return 1;
-    }
-
-    0
+    emit_report(&report, json, output, fail_on_regression)
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
