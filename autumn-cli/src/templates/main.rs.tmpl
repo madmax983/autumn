@@ -4,12 +4,6 @@ use autumn_web::prelude::*;
 
 const MIGRATIONS: EmbeddedMigrations = embed_migrations!();
 
-// Embed the `static/` tree (and its fingerprint manifest) into the binary for
-// single-binary deploys. Active only when built with the `embed-assets` feature
-// (`autumn build --embed`); in dev the app serves from disk for hot-reload.
-#[cfg(feature = "embed-assets")]
-static EMBEDDED_STATIC: autumn_web::include_dir::Dir = autumn_web::embed_static!();
-
 pub fn layout(title: &str, content: maud::Markup) -> maud::Markup {
     maud::html! {
         (maud::DOCTYPE)
@@ -58,16 +52,9 @@ async fn hello_name(name: autumn_web::extract::Path<String>) -> String {
 
 #[autumn_web::main]
 async fn main() {
-    let app = autumn_web::app()
+    autumn_web::app()
         .routes(routes![index, hello, hello_name])
-        .migrations(MIGRATIONS);
-
-    // Single-binary deploys: serve static assets (and i18n locales) from the
-    // binary when built with `autumn build --embed`.
-    #[cfg(feature = "embed-assets")]
-    let app = app.embedded_static(&EMBEDDED_STATIC);
-
-    app
+        .migrations(MIGRATIONS)
         .run()
         .await;
 }
