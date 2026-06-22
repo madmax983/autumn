@@ -136,7 +136,7 @@ impl TelemetryGuard {
     }
 
     #[cfg(feature = "telemetry-otlp")]
-    fn with_provider(provider: SdkTracerProvider) -> Self {
+    const fn with_provider(provider: SdkTracerProvider) -> Self {
         Self {
             provider: Some(provider),
             log_buffer: None,
