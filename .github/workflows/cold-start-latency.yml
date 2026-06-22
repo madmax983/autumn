@@ -92,11 +92,13 @@ jobs:
         # `cargo test` is not masked by the `tee` in the pipeline.
         shell: bash
         run: |
-          # Pass both module names as test-binary filters so the pure logic in
-          # `dev_loop_bench` *and* the live-driver helpers in `cold_start_driver`
-          # (scaffold locate/repoint, zero-run handling, dry-run) are exercised.
+          # Pass the relevant module names as test-binary filters so the pure
+          # logic in `dev_loop_bench`, the live-driver helpers in
+          # `cold_start_driver` (scaffold locate/repoint, zero-run, dry-run), and
+          # the `new` scaffold-generation tests (which exercise the embedded
+          # templates this workflow also triggers on) are all run.
           cargo test -p autumn-cli \
-            -- dev_loop_bench cold_start_driver \
+            -- dev_loop_bench cold_start_driver new:: \
             2>&1 | tee test-output.txt
           grep -E "^test result:" test-output.txt
 

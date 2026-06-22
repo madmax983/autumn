@@ -131,8 +131,12 @@ fn measure_cold_start_once(shape: ColdStartShape) -> Result<u64, String> {
 
     repoint_autumn_web(&project_dir, &autumn_web)?;
 
-    // Pick the port the app binds and we poll. Default: a freshly reserved
-    // ephemeral port per sample, so repeated runs never collide on a lingering
+    let bin = cold_build(&project_dir, project_name)?;
+
+    // Pick the port the app binds and we poll, *after* the minutes-long build and
+    // immediately before spawning, to minimise the window between reserving the
+    // ephemeral port (the listener is dropped right away) and the child binding
+    // it. A fresh port per sample also avoids colliding with a lingering
     // TIME_WAIT socket from the previous sample. An explicit AUTUMN_BENCH_PORT
     // override is honoured as-is.
     let port = match std::env::var("AUTUMN_BENCH_PORT")
@@ -142,45 +146,6 @@ fn measure_cold_start_once(shape: ColdStartShape) -> Result<u64, String> {
         Some(p) => p,
         None => reserve_free_port()?,
     };
-
-    // Cold build into the project's own (empty) target/. Remove every inherited
-    // Cargo target/triple override so the parent's warm cache is never reused,
-    // and ask Cargo for JSON artifact messages so we learn the *exact* built
-    // binary path. We *also* pass an explicit `--target-dir` pinned inside the
-    // throwaway project: `env_remove` only neutralises env-var overrides, but a
-    // `.cargo/config.toml` with `build.target-dir` (anywhere up the directory
-    // tree, including the user's home) could still redirect artifacts into a
-    // shared, possibly-warm directory. The explicit flag is the highest-precedence
-    // source and forces the first clean compile into this empty dir.
-    let target_dir = project_dir.join("target");
-    let output = Command::new("cargo")
-        .args(["build", "--message-format=json", "--target-dir"])
-        .arg(&target_dir)
-        .current_dir(&project_dir)
-        .env_remove("CARGO_TARGET_DIR")
-        .env_remove("CARGO_BUILD_TARGET_DIR")
-        .env_remove("CARGO_BUILD_TARGET")
-        // Disable any compiler wrapper (e.g. `sccache`) so the measurement is a
-        // genuine first clean compile. A `RUSTC_WRAPPER` env var or a config-file
-        // `build.rustc-wrapper` could otherwise serve cached compiler outputs even
-        // into an empty target dir. Setting these to an empty string is Cargo's
-        // documented way to disable wrapping, and an env var overrides config
-        // files — which `env_remove` alone cannot neutralise.
-        .env("RUSTC_WRAPPER", "")
-        .env("RUSTC_WORKSPACE_WRAPPER", "")
-        .env("CARGO_BUILD_RUSTC_WRAPPER", "")
-        .env("CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER", "")
-        .output()
-        .map_err(|e| format!("cargo build spawn failed: {e}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "cargo build failed for the scaffolded project:\n{}",
-            String::from_utf8_lossy(&output.stderr)
-        ));
-    }
-    let bin = cargo_executable_path(&output.stdout, project_name).ok_or_else(|| {
-        "could not determine the built binary path from cargo's JSON output".to_string()
-    })?;
 
     let mut cmd = Command::new(&bin);
     cmd.current_dir(&project_dir);
@@ -257,6 +222,71 @@ fn measure_cold_start_once(shape: ColdStartShape) -> Result<u64, String> {
     stop_child(&mut child);
 
     measured.ok_or_else(|| "server did not return HTTP 200 before the deadline".to_string())
+}
+
+/// Compile the scaffolded project from a cold target and return its built binary.
+///
+/// Cold build into the project's own (empty) `target/`. Removes every inherited
+/// Cargo target/triple override so the parent's warm cache is never reused, asks
+/// Cargo for JSON artifact messages so we learn the *exact* built binary path,
+/// and pins both the target dir and the host triple explicitly because
+/// `env_remove` only neutralises the env-var forms — a `.cargo/config.toml`
+/// `build.target-dir` / `build.target` (anywhere up the tree) could otherwise
+/// redirect artifacts into a shared warm dir or cross-compile an unrunnable
+/// binary. Compiler wrappers (e.g. `sccache`) are disabled so the measurement is
+/// a genuine first clean compile.
+fn cold_build(project_dir: &Path, project_name: &str) -> Result<PathBuf, String> {
+    let target_dir = project_dir.join("target");
+    let mut build = Command::new("cargo");
+    build
+        .args(["build", "--message-format=json", "--target-dir"])
+        .arg(&target_dir)
+        .current_dir(project_dir)
+        .env_remove("CARGO_TARGET_DIR")
+        .env_remove("CARGO_BUILD_TARGET_DIR")
+        .env_remove("CARGO_BUILD_TARGET")
+        // Setting wrappers to an empty string is Cargo's documented way to disable
+        // wrapping, and an env var overrides config files — which `env_remove`
+        // alone cannot neutralise.
+        .env("RUSTC_WRAPPER", "")
+        .env("RUSTC_WORKSPACE_WRAPPER", "")
+        .env("CARGO_BUILD_RUSTC_WRAPPER", "")
+        .env("CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER", "");
+    // An explicit `--target` overrides a config-file `build.target` and keeps the
+    // artifact host-runnable. If the host triple can't be determined we omit it
+    // and fall back to Cargo's default (the host unless config overrides it).
+    if let Some(triple) = host_target_triple() {
+        build.arg("--target").arg(triple);
+    }
+    let output = build
+        .output()
+        .map_err(|e| format!("cargo build spawn failed: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "cargo build failed for the scaffolded project:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    cargo_executable_path(&output.stdout, project_name).ok_or_else(|| {
+        "could not determine the built binary path from cargo's JSON output".to_string()
+    })
+}
+
+/// Determine the host target triple via `rustc -vV`.
+///
+/// Used to pin the measured cold build to the host with an explicit `--target`,
+/// so a config-file `build.target` cannot cross-compile an artifact the harness
+/// then fails to execute. Returns `None` if `rustc` can't be run or parsed, in
+/// which case the caller falls back to Cargo's default target.
+fn host_target_triple() -> Option<String> {
+    let out = Command::new("rustc").arg("-vV").output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    text.lines()
+        .find_map(|line| line.strip_prefix("host: "))
+        .map(|triple| triple.trim().to_string())
 }
 
 /// Reserve a currently-free TCP port on loopback.
