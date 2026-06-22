@@ -885,7 +885,7 @@ pub fn check_toml_content(content: &str) -> CheckResult {
 
             // 2. Validate any autumn-*.toml profile files
             let profile_files = find_all_profile_files();
-            for (profile, path) in profile_files {
+            for (_, path) in profile_files {
                 if let Ok(file_content) = std::fs::read_to_string(&path) {
                     let profile_errors = validate_toml_content(&file_content, &schema);
                     let filename = path.file_name().and_then(|n| n.to_str()).unwrap_or("profile config");
