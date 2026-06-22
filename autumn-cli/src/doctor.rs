@@ -2247,7 +2247,7 @@ fn resolve_is_production() -> bool {
 ///
 /// Falls back to a heuristic: if `build.rs` exists the project is assumed to
 /// use the Tailwind build pipeline.
-fn tailwind_enabled() -> bool {
+pub fn tailwind_enabled() -> bool {
     std::fs::read_to_string("autumn.toml")
         .ok()
         .and_then(|c| toml::from_str::<toml::Table>(&c).ok())
