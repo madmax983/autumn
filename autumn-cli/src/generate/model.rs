@@ -330,6 +330,7 @@ pub(super) fn ensure_cargo_dependencies(existing: &str, deps: &[(&str, &str)]) -
 pub(super) fn ensure_autumn_web_feature(toml: &str, feature: &str) -> String {
     const CRATE: &str = "autumn-web";
     let quoted = format!("\"{feature}\"");
+    let quoted_key = format!("\"{CRATE}\"");
 
     let mut lines: Vec<String> = toml.lines().map(str::to_owned).collect();
     let trailing_newline = toml.ends_with('\n');
@@ -344,10 +345,12 @@ pub(super) fn ensure_autumn_web_feature(toml: &str, feature: &str) -> String {
         let trimmed = code.trim();
 
         // Table header: update the active section, or handle the unambiguous
-        // `[dependencies.autumn-web]` subtable directly.
+        // `[dependencies.autumn-web]` subtable directly (bare or quoted key).
         if let Some(inner) = trimmed.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
             let header = inner.trim();
-            if header == format!("dependencies.{CRATE}") {
+            if header == format!("dependencies.{CRATE}")
+                || header == format!("dependencies.{quoted_key}")
+            {
                 ensure_feature_in_subtable(&mut lines, i, &quoted);
                 return join_lines(&lines, trailing_newline);
             }
@@ -356,11 +359,18 @@ pub(super) fn ensure_autumn_web_feature(toml: &str, feature: &str) -> String {
             continue;
         }
 
+        // Match a bare (`autumn-web =`) or quoted (`"autumn-web" =`) key.
+        let key_match = trimmed.strip_prefix(CRATE).map(|r| (CRATE, r)).or_else(|| {
+            trimmed
+                .strip_prefix(quoted_key.as_str())
+                .map(|r| (quoted_key.as_str(), r))
+        });
+
         if in_runtime_deps
-            && let Some(rest) = trimmed
-                .strip_prefix(CRATE)
-                .map(str::trim_start)
-                .and_then(|r| r.strip_prefix('='))
+            && let Some((key, after_key)) = key_match
+            && let Some(rest) = after_key
+                .trim_start()
+                .strip_prefix('=')
                 .map(str::trim_start)
         {
             let indent: String = line.chars().take_while(char::is_ascii_whitespace).collect();
@@ -376,7 +386,7 @@ pub(super) fn ensure_autumn_web_feature(toml: &str, feature: &str) -> String {
                 if let Some(end) = after.find('"') {
                     let version = &after[..end];
                     lines[i] = format!(
-                        "{indent}{CRATE} = {{ version = \"{version}\", features = [{quoted}] }}{comment_suffix}"
+                        "{indent}{key} = {{ version = \"{version}\", features = [{quoted}] }}{comment_suffix}"
                     );
                 }
                 return join_lines(&lines, trailing_newline);
@@ -435,19 +445,14 @@ fn ensure_feature_in_inline_table(line: &str, quoted: &str) -> String {
     if line.contains(quoted) {
         return line.to_owned();
     }
-    if let Some(bracket) = line.find("features = [") {
-        let list_start = bracket + "features = [".len();
-        let Some(rel_end) = line[list_start..].find(']') else {
-            return line.to_owned();
-        };
-        let list_end = list_start + rel_end;
-        let existing = line[list_start..list_end].trim();
+    if let Some((open, close)) = find_features_array(line) {
+        let existing = line[open + 1..close].trim();
         let new_list = if existing.is_empty() {
             quoted.to_owned()
         } else {
             format!("{existing}, {quoted}")
         };
-        format!("{}{}{}", &line[..list_start], new_list, &line[list_end..])
+        format!("{}{}{}", &line[..=open], new_list, &line[close..])
     } else {
         let Some(close) = line.rfind('}') else {
             return line.to_owned();
@@ -460,6 +465,42 @@ fn ensure_feature_in_inline_table(line: &str, quoted: &str) -> String {
             format!("{head}, features = [{quoted}] {closing}")
         }
     }
+}
+
+/// Locate a `features = [ ... ]` key in `line`, tolerating any whitespace
+/// around `=` (e.g. `features=[...]`). Returns the byte offsets of the opening
+/// `[` and the matching `]`, or `None` if there is no well-formed features key.
+fn find_features_array(line: &str) -> Option<(usize, usize)> {
+    let bytes = line.as_bytes();
+    let mut from = 0;
+    while let Some(rel) = line[from..].find("features") {
+        let kw = from + rel;
+        // Require a word boundary before the key so `xfeatures` doesn't match.
+        let boundary = kw == 0 || {
+            let c = bytes[kw - 1];
+            !(c.is_ascii_alphanumeric() || c == b'_' || c == b'-')
+        };
+        if boundary {
+            let mut p = kw + "features".len();
+            while p < bytes.len() && bytes[p].is_ascii_whitespace() {
+                p += 1;
+            }
+            if p < bytes.len() && bytes[p] == b'=' {
+                p += 1;
+                while p < bytes.len() && bytes[p].is_ascii_whitespace() {
+                    p += 1;
+                }
+                if p < bytes.len() && bytes[p] == b'[' {
+                    let open = p;
+                    if let Some(rel_close) = line[open..].find(']') {
+                        return Some((open, open + rel_close));
+                    }
+                }
+            }
+        }
+        from = kw + "features".len();
+    }
+    None
 }
 
 /// Add `quoted` to the `features` array of a `[dependencies.autumn-web]`
@@ -1237,6 +1278,45 @@ autumn-web = \"0.3\"\n";
         assert_eq!(
             out, input,
             "must not edit when there is no runtime dependency"
+        );
+    }
+
+    #[test]
+    fn ensure_autumn_web_feature_handles_compact_feature_array() {
+        // Compact spacing around `=` must be detected, not duplicated.
+        let input = "[dependencies]\nautumn-web = { version = \"0.5\", features=[\"json\"] }\n";
+        let out = ensure_autumn_web_feature(input, "db");
+        assert!(
+            out.contains("features=[\"json\", \"db\"]"),
+            "compact features array must be extended in place: {out}"
+        );
+        assert_eq!(
+            out.matches("features").count(),
+            1,
+            "must not append a second features key: {out}"
+        );
+    }
+
+    #[test]
+    fn ensure_autumn_web_feature_recognizes_quoted_key() {
+        let input =
+            "[dependencies]\n\"autumn-web\" = { version = \"0.5\", default-features = false }\n";
+        let out = ensure_autumn_web_feature(input, "db");
+        assert!(
+            out.contains(
+                "\"autumn-web\" = { version = \"0.5\", default-features = false, features = [\"db\"] }"
+            ),
+            "quoted dependency key must be recognized and preserved: {out}"
+        );
+    }
+
+    #[test]
+    fn ensure_autumn_web_feature_quoted_subtable_form() {
+        let input = "[dependencies.\"autumn-web\"]\nversion = \"0.5\"\n";
+        let out = ensure_autumn_web_feature(input, "db");
+        assert!(
+            out.contains("features = [\"db\"]"),
+            "quoted subtable key must be recognized: {out}"
         );
     }
 
