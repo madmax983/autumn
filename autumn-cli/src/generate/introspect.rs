@@ -1100,6 +1100,52 @@ mod tests {
     }
 
     #[test]
+    fn plan_pull_rejects_bare_underscore_column_when_explicit() {
+        let tmp = project();
+        // `pub _: String` is the reserved wildcard and would not compile.
+        let bad = TableSchema {
+            table: "items".to_owned(),
+            columns: vec![id_col(), col("_", FieldKind::String, false, false)],
+        };
+        let err = plan_pull(
+            tmp.path(),
+            &[bad],
+            PullOptions {
+                explicit: true,
+                ..PullOptions::default()
+            },
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("column '_'"),
+            "error must name the offending column: {err}"
+        );
+    }
+
+    #[test]
+    fn plan_pull_maps_jsonb_to_attachment() {
+        let tmp = project();
+        // A nullable `jsonb` column round-trips to an `Attachment` (`Blob`) field.
+        let table = TableSchema {
+            table: "uploads".to_owned(),
+            columns: vec![
+                id_col(),
+                col("cover", FieldKind::Attachment, true, false),
+                created_at_col(),
+            ],
+        };
+        let plan = plan_pull(tmp.path(), &[table], PullOptions::default()).unwrap();
+        plan.execute(Flags::default()).unwrap();
+        let model = fs::read_to_string(tmp.path().join("src/models/upload.rs")).unwrap();
+        assert!(
+            model.contains("pub cover: Option<autumn_web::storage::Blob>,"),
+            "jsonb must map to an Attachment Blob field: {model}"
+        );
+        let schema = fs::read_to_string(tmp.path().join("src/schema.rs")).unwrap();
+        assert!(schema.contains("cover -> Nullable<Jsonb>,"));
+    }
+
+    #[test]
     fn plan_pull_force_replaces_stale_schema_block() {
         let tmp = project();
         // Pre-seed schema.rs with a stale block (old column set) for `posts`.

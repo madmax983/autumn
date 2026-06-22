@@ -167,7 +167,8 @@ pub const SUPPORTED_TYPES: &str = "String, Text, i32, i64, bool, f32, f64, \
 /// Comma-separated list of supported Postgres column types (`udt_name`), for
 /// the `db pull` introspection error message.
 pub const SQL_SUPPORTED_TYPES: &str = "text, varchar, bpchar (-> String), int4 (-> i32), \
-    int8 (-> i64), bool, float4 (-> f32), float8 (-> f64), uuid, timestamp, timestamptz, bytea";
+    int8 (-> i64), bool, float4 (-> f32), float8 (-> f64), uuid, timestamp, timestamptz, bytea, \
+    jsonb (-> Attachment)";
 
 /// Inverse of [`FieldKind::sql_type`] / [`FieldKind::schema_type`]: map a
 /// Postgres `udt_name` (the concrete catalog type identifier such as `int4`,
@@ -194,6 +195,10 @@ pub fn sql_type_to_field_kind(udt_name: &str) -> Option<FieldKind> {
         "timestamp" => Some(FieldKind::NaiveDateTime),
         "timestamptz" => Some(FieldKind::DateTime),
         "bytea" => Some(FieldKind::Bytea),
+        // The DSL's only `JSONB` producer is `Attachment` (a stored `Blob`), so
+        // the inverse maps `jsonb` back to `Attachment` to round-trip
+        // Autumn-generated attachment columns.
+        "jsonb" => Some(FieldKind::Attachment),
         _ => None,
     }
 }
@@ -322,6 +327,11 @@ fn strip_wrapper<'a>(ty: &'a str, wrapper: &str) -> Option<&'a str> {
 }
 
 pub(super) fn is_valid_ident(s: &str) -> bool {
+    // A bare `_` is the reserved wildcard, not a usable field/module name
+    // (`pub _: T` does not compile), so reject it explicitly.
+    if s == "_" {
+        return false;
+    }
     let mut chars = s.chars();
     let Some(first) = chars.next() else {
         return false;
@@ -609,6 +619,12 @@ mod tests {
                 "Timestamptz",
             ),
             ("bytea", FieldKind::Bytea, "Vec<u8>", "Bytea"),
+            (
+                "jsonb",
+                FieldKind::Attachment,
+                "autumn_web::storage::Blob",
+                "Jsonb",
+            ),
         ];
         for (udt, kind, rust, schema) in cases {
             let mapped = sql_type_to_field_kind(udt)
@@ -633,12 +649,21 @@ mod tests {
     #[test]
     fn sql_type_inverse_rejects_unknown_types() {
         // Unmapped SQL types must be reported, never silently dropped (AC2).
-        for udt in ["numeric", "jsonb", "json", "inet", "money", "point"] {
+        for udt in ["numeric", "json", "inet", "money", "point"] {
             assert!(
                 sql_type_to_field_kind(udt).is_none(),
                 "'{udt}' is outside the documented surface and must not map"
             );
         }
+    }
+
+    #[test]
+    fn bare_underscore_is_not_a_valid_ident() {
+        // `pub _: T` is the reserved wildcard and does not compile.
+        assert!(!is_valid_ident("_"));
+        assert!(parse_field("_:String").is_err());
+        // But `_`-prefixed names remain valid.
+        assert!(is_valid_ident("_internal"));
     }
 
     #[test]
