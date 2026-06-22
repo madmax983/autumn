@@ -41,6 +41,9 @@ pub use autumn_macros::{mail_previews, mailer, mailer_preview};
 // ── Rendering ────────────────────────────────────────────────────
 /// Resolve a logical static asset path to a fingerprinted URL in release builds.
 pub use crate::assets::asset_url;
+/// Render a `<script>` tag with SRI integrity for a named vendored JS dependency.
+#[cfg(feature = "maud")]
+pub use crate::assets::javascript_include_tag;
 /// Maud HTML templating types.
 #[cfg(feature = "maud")]
 pub use maud::{Markup, PreEscaped, html};

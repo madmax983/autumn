@@ -17,6 +17,7 @@ path = "src/main.rs"
 
 [dependencies]
 autumn-web = { version = "0.5.0", path = "../autumn", default-features = false, features = ["db", "htmx", "maud"] }
+base64 = "0.22"
 clap = { version = "4", features = ["derive", "env"] }
 diesel = { workspace = true }
 crossterm = "0.29"

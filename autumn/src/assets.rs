@@ -32,9 +32,7 @@
 //! }
 //! ```
 
-#[cfg(any(not(debug_assertions), feature = "embed-assets"))]
 use std::collections::HashMap;
-#[cfg(any(not(debug_assertions), feature = "embed-assets"))]
 use std::sync::OnceLock;
 
 /// Filename of the fingerprint manifest within the `static/` tree.
@@ -59,6 +57,148 @@ fn load_manifest() -> &'static Option<AssetManifest> {
         let contents = std::fs::read_to_string(manifest_path).ok()?;
         serde_json::from_str(&contents).ok()
     })
+}
+
+// ── Vendor asset manifest (.autumn-assets.json) ──────────────────────────────
+
+/// Filename of the vendor asset manifest within the `static/` tree.
+pub(crate) const VENDOR_MANIFEST_FILE: &str = ".autumn-assets.json";
+
+/// A single vendored JS dependency recorded in the vendor manifest.
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct VendorAsset {
+    /// Pinned version string (e.g. `"2.0.4"`).
+    pub version: String,
+    /// Original download URL.
+    pub source: String,
+    /// Path relative to `static/` where the file is vendored (e.g. `"js/htmx.min.js"`).
+    pub file: String,
+    /// `sha384-<base64>` Subresource Integrity hash.
+    pub integrity: String,
+}
+
+/// On-disk format of `static/.autumn-assets.json`.
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
+pub struct VendorManifest {
+    /// Format version; currently `"1"`.
+    pub version: String,
+    /// Map from logical name (e.g. `"htmx"`) to asset metadata.
+    pub assets: HashMap<String, VendorAsset>,
+}
+
+static VENDOR_MANIFEST: OnceLock<Option<VendorManifest>> = OnceLock::new();
+
+fn load_vendor_manifest() -> Option<&'static VendorManifest> {
+    VENDOR_MANIFEST
+        .get_or_init(|| {
+            // In single-binary builds the embedded dir is the sole source of truth.
+            #[cfg(feature = "embed-assets")]
+            if embedded_static_dir().is_some() {
+                return load_embedded_vendor_manifest();
+            }
+            let manifest_path =
+                crate::app::project_dir("static", &crate::config::OsEnv).join(VENDOR_MANIFEST_FILE);
+            let contents = std::fs::read_to_string(manifest_path).ok()?;
+            serde_json::from_str(&contents).ok()
+        })
+        .as_ref()
+}
+
+/// Returns `true` when htmx has been pinned via `autumn assets add htmx@…`.
+///
+/// The router uses this to skip the built-in embedded htmx handler so the
+/// vendored file (and its pinned integrity hash) is served by `ServeDir` instead.
+pub(crate) fn htmx_is_vendored() -> bool {
+    load_vendor_manifest().is_some_and(|m| m.assets.contains_key("htmx"))
+}
+
+#[cfg(feature = "embed-assets")]
+fn load_embedded_vendor_manifest() -> Option<VendorManifest> {
+    EMBEDDED_STATIC
+        .get()?
+        .0
+        .get_file(VENDOR_MANIFEST_FILE)
+        .and_then(include_dir::File::contents_utf8)
+        .and_then(|s| serde_json::from_str(s).ok())
+}
+
+/// Render a `<script>` tag for a vendored JS dependency.
+///
+/// Resolves the asset URL through [`asset_url`] (fingerprinted in release,
+/// plain in dev) and emits `integrity` + `crossorigin="anonymous"` for SRI.
+#[cfg(feature = "maud")]
+fn render_javascript_tag(asset: &VendorAsset) -> maud::Markup {
+    maud::html! {
+        script
+            src=(asset_url(&asset.file))
+            integrity=(asset.integrity)
+            crossorigin="anonymous"
+            {}
+    }
+}
+
+/// Render a `<script>` tag for a named vendored JS dependency.
+///
+/// Looks up `name` in `static/.autumn-assets.json` and emits:
+/// ```html
+/// <script src="{url}" integrity="{sri}" crossorigin="anonymous"></script>
+/// ```
+/// where `{url}` is fingerprinted in release builds and plain in dev.
+///
+/// When `name` is not found in the manifest the helper logs a `tracing::warn!`
+/// and returns a visible HTML comment so the gap is discoverable in View Source.
+/// In debug builds a `<script>console.error(…)</script>` is also emitted so the
+/// error appears in the browser `DevTools` console.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use autumn_web::prelude::*;
+///
+/// html! {
+///     head {
+///         (javascript_include_tag("htmx"))
+///     }
+/// }
+/// ```
+#[cfg(feature = "maud")]
+#[must_use]
+#[allow(clippy::option_if_let_else)] // side-effecting else branch makes map_or_else harder to read
+pub fn javascript_include_tag(name: &str) -> maud::Markup {
+    if let Some(asset) = load_vendor_manifest().and_then(|m| m.assets.get(name)) {
+        render_javascript_tag(asset)
+    } else {
+        tracing::warn!(
+            asset = name,
+            "javascript_include_tag: asset not found in {}; \
+             run `autumn assets add {name}@<version>` to pin it",
+            VENDOR_MANIFEST_FILE,
+        );
+        missing_asset_markup(name)
+    }
+}
+
+/// Diagnostic markup returned when [`javascript_include_tag`] cannot find a
+/// named asset.  Always contains an HTML comment visible in View Source; in
+/// debug builds also fires `console.error` so `DevTools` catches the gap early.
+#[cfg(feature = "maud")]
+fn missing_asset_markup(name: &str) -> maud::Markup {
+    let comment = format!(
+        "<!-- autumn: asset '{name}' not found in {VENDOR_MANIFEST_FILE}; \
+         run `autumn assets add {name}@<version>` -->"
+    );
+    if cfg!(debug_assertions) {
+        let console_err = format!(
+            "console.error('[autumn] asset not found: {name} \
+             \u{2014} run autumn assets add {name}@<version>');"
+        );
+        maud::html! {
+            (maud::PreEscaped(comment))
+            script { (maud::PreEscaped(console_err)) }
+        }
+    } else {
+        maud::html! { (maud::PreEscaped(comment)) }
+    }
 }
 
 // ── Embedded assets (feature = "embed-assets") ──────────────────────────────
@@ -330,7 +470,7 @@ fn embedded_response(rel_path: &str) -> axum::response::Response {
     let is_manifest = rel_path
         .rsplit('/')
         .next()
-        .is_some_and(|name| name == ASSET_MANIFEST_FILE);
+        .is_some_and(|name| name == ASSET_MANIFEST_FILE || name == VENDOR_MANIFEST_FILE);
     if is_traversal || is_manifest {
         return http::StatusCode::NOT_FOUND.into_response();
     }
@@ -408,6 +548,64 @@ mod tests {
         assert!(!is_fingerprinted_path("/static/css/autumn.A1B2C3D4.css"));
         // No extension
         assert!(!is_fingerprinted_path("/static/file.a1b2c3d4"));
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn vendor_manifest_parses_json() {
+        let json = r#"{
+            "version": "1",
+            "assets": {
+                "htmx": {
+                    "version": "2.0.4",
+                    "source": "https://cdn.jsdelivr.net/npm/htmx.org@2.0.4/dist/htmx.min.js",
+                    "file": "js/htmx.min.js",
+                    "integrity": "sha384-testintegrityhash"
+                }
+            }
+        }"#;
+        let manifest: VendorManifest = serde_json::from_str(json).unwrap();
+        assert_eq!(manifest.version, "1");
+        let htmx = manifest.assets.get("htmx").unwrap();
+        assert_eq!(htmx.version, "2.0.4");
+        assert_eq!(htmx.file, "js/htmx.min.js");
+        assert_eq!(htmx.integrity, "sha384-testintegrityhash");
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn render_javascript_tag_has_src_integrity_crossorigin() {
+        let asset = VendorAsset {
+            version: "2.0.4".into(),
+            source: "https://cdn.jsdelivr.net/npm/htmx.org@2.0.4/dist/htmx.min.js".into(),
+            file: "js/htmx.min.js".into(),
+            integrity: "sha384-abc123".into(),
+        };
+        let markup = render_javascript_tag(&asset);
+        let html = markup.into_string();
+        assert!(
+            html.contains("src=\"/static/js/htmx.min.js\""),
+            "missing src: {html}"
+        );
+        assert!(
+            html.contains("integrity=\"sha384-abc123\""),
+            "missing integrity: {html}"
+        );
+        assert!(
+            html.contains("crossorigin=\"anonymous\""),
+            "missing crossorigin: {html}"
+        );
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn javascript_include_tag_unknown_name_returns_diagnostic_comment() {
+        let markup = javascript_include_tag("__nonexistent_pkg__");
+        let html = markup.into_string();
+        assert!(
+            html.contains("<!-- autumn: asset '__nonexistent_pkg__' not found"),
+            "expected HTML comment diagnostic for unknown asset, got: {html}"
+        );
     }
 
     #[cfg(feature = "embed-assets")]
