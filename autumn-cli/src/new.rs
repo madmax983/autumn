@@ -154,6 +154,7 @@ fn generate_inner(
 
     fs::create_dir_all(project_dir.join("src"))?;
     fs::create_dir_all(project_dir.join("static/css"))?;
+    fs::create_dir_all(project_dir.join("static/js"))?;
     fs::create_dir_all(project_dir.join("migrations"))?;
     fs::create_dir_all(project_dir.join("tests"))?;
     fs::create_dir_all(project_dir.join("config/credentials"))?;
@@ -247,6 +248,7 @@ fn generate_inner(
     fs::write(project_dir.join(".gitignore"), render(templates::GITIGNORE))?;
     fs::write(project_dir.join("migrations/.gitkeep"), "")?;
 
+    scaffold_vendor_assets(&project_dir)?;
     scaffold_credentials(&project_dir, name)?;
     fs::write(
         project_dir.join("tests/integration_test.rs"),
@@ -258,6 +260,37 @@ fn generate_inner(
     if !quiet {
         print_scaffold_summary(name, opts);
     }
+
+    Ok(())
+}
+
+fn scaffold_vendor_assets(project_dir: &Path) -> Result<(), NewError> {
+    let htmx_bytes = autumn_web::HTMX_JS;
+    let htmx_version = autumn_web::HTMX_VERSION;
+    let htmx_source =
+        format!("https://cdn.jsdelivr.net/npm/htmx.org@{htmx_version}/dist/htmx.min.js");
+    let htmx_file = "js/htmx.min.js";
+    let integrity = crate::assets::compute_sri(htmx_bytes);
+
+    fs::write(project_dir.join("static").join(htmx_file), htmx_bytes)?;
+
+    let mut assets = std::collections::BTreeMap::new();
+    assets.insert(
+        "htmx".to_owned(),
+        crate::assets::VendorAsset {
+            version: htmx_version.to_owned(),
+            source: htmx_source,
+            file: htmx_file.to_owned(),
+            integrity,
+        },
+    );
+    let manifest = crate::assets::VendorManifest {
+        version: "1".to_owned(),
+        assets,
+    };
+    let manifest_path = project_dir.join("static").join(".autumn-assets.json");
+    crate::assets::save_manifest(&manifest_path, &manifest)
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
 
     Ok(())
 }
@@ -1284,6 +1317,89 @@ mod tests {
         assert_eq!(
             mode, 0o600,
             "master.key permissions must be 0o600, got {mode:#o}"
+        );
+    }
+
+    // ── Vendor asset scaffolding ─────────────────────────────────────────────
+
+    #[test]
+    fn scaffold_writes_htmx_js_file() {
+        let tmp = TempDir::new().unwrap();
+        generate("asset-app", tmp.path()).unwrap();
+        let htmx = tmp.path().join("asset-app/static/js/htmx.min.js");
+        assert!(
+            htmx.is_file(),
+            "static/js/htmx.min.js must be created by `autumn new`"
+        );
+        let bytes = fs::read(&htmx).unwrap();
+        assert!(!bytes.is_empty(), "htmx.min.js must not be empty");
+    }
+
+    #[test]
+    fn scaffold_writes_vendor_manifest() {
+        let tmp = TempDir::new().unwrap();
+        generate("manifest-app", tmp.path()).unwrap();
+        let manifest_path = tmp.path().join("manifest-app/static/.autumn-assets.json");
+        assert!(
+            manifest_path.is_file(),
+            "static/.autumn-assets.json must be created by `autumn new`"
+        );
+        let content = fs::read_to_string(&manifest_path).unwrap();
+        let manifest: serde_json::Value =
+            serde_json::from_str(&content).expect("manifest must be valid JSON");
+        assert_eq!(manifest["version"], "1", "manifest must have version=1");
+        let htmx = &manifest["assets"]["htmx"];
+        assert!(!htmx.is_null(), "manifest must contain an htmx entry");
+        assert!(
+            htmx["version"].as_str().unwrap_or("").contains('.'),
+            "htmx version must look like a semver: {}",
+            htmx["version"]
+        );
+        let integrity = htmx["integrity"].as_str().unwrap_or("");
+        assert!(
+            integrity.starts_with("sha384-"),
+            "htmx integrity must be a sha384 SRI hash: {integrity}"
+        );
+    }
+
+    #[test]
+    fn manifest_integrity_matches_vendored_file() {
+        let tmp = TempDir::new().unwrap();
+        generate("sri-app", tmp.path()).unwrap();
+        let p = tmp.path().join("sri-app");
+
+        let htmx_bytes = fs::read(p.join("static/js/htmx.min.js")).unwrap();
+        let computed = crate::assets::compute_sri(&htmx_bytes);
+
+        let manifest_raw = fs::read_to_string(p.join("static/.autumn-assets.json")).unwrap();
+        let manifest: serde_json::Value = serde_json::from_str(&manifest_raw).unwrap();
+        let recorded = manifest["assets"]["htmx"]["integrity"].as_str().unwrap();
+
+        assert_eq!(
+            computed, recorded,
+            "SRI hash in manifest must match the vendored htmx.min.js"
+        );
+    }
+
+    #[test]
+    fn generated_main_rs_uses_javascript_include_tag() {
+        let tmp = TempDir::new().unwrap();
+        generate("helper-app", tmp.path()).unwrap();
+        let content = fs::read_to_string(tmp.path().join("helper-app/src/main.rs")).unwrap();
+        assert!(
+            content.contains("javascript_include_tag(\"htmx\")"),
+            "generated main.rs must use javascript_include_tag(\"htmx\"), got:\n{content}"
+        );
+    }
+
+    #[test]
+    fn generated_main_rs_has_no_hardcoded_htmx_script_src() {
+        let tmp = TempDir::new().unwrap();
+        generate("no-hardcode-app", tmp.path()).unwrap();
+        let content = fs::read_to_string(tmp.path().join("no-hardcode-app/src/main.rs")).unwrap();
+        assert!(
+            !content.contains("/static/js/htmx.min.js"),
+            "generated main.rs must not hardcode /static/js/htmx.min.js, got:\n{content}"
         );
     }
 }
