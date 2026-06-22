@@ -1623,6 +1623,146 @@ impl AutumnConfig {
         deserializer.into_schema()
     }
 
+    /// Recursively validates TOML content against the derived schema.
+    /// Returns a list of errors: (dotted_path, option_suggestion)
+    pub fn validate_toml(
+        content: &str,
+        schema: &HashMap<String, HashSet<String>>,
+    ) -> Vec<(String, Option<String>)> {
+        let Ok(table) = toml::from_str::<toml::Table>(content) else {
+            return Vec::new();
+        };
+
+        let mut errors = Vec::new();
+        let mut path = Vec::new();
+        Self::validate_toml_table(&table, &mut path, schema, &mut errors);
+        errors
+    }
+
+    fn validate_toml_table(
+        table: &toml::Table,
+        path: &mut Vec<String>,
+        schema: &HashMap<String, HashSet<String>>,
+        errors: &mut Vec<(String, Option<String>)>,
+    ) {
+        let mut schema_path_parts = Vec::new();
+        if path.len() >= 2 && path[0] == "profile" {
+            schema_path_parts.extend(path[2..].iter().cloned());
+        } else {
+            schema_path_parts.extend(path.iter().cloned());
+        }
+        let schema_path = schema_path_parts.join(".");
+
+        if let Some(valid_keys) = schema.get(&schema_path) {
+            for (k, val) in table {
+                if path.is_empty() && k == "profile" {
+                    path.push(k.clone());
+                    match val {
+                        toml::Value::Table(t) => {
+                            Self::validate_toml_table(t, path, schema, errors);
+                        }
+                        toml::Value::Array(arr) => {
+                            for item in arr {
+                                if let toml::Value::Table(t) = item {
+                                    Self::validate_toml_table(t, path, schema, errors);
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                    path.pop();
+                    continue;
+                }
+
+                if !valid_keys.contains(k) {
+                    let mut full_path_parts = path.clone();
+                    full_path_parts.push(k.clone());
+                    let full_path = full_path_parts.join(".");
+
+                    let mut closest: Option<&str> = None;
+                    let mut min_dist = usize::MAX;
+                    for valid_key in valid_keys {
+                        let dist = levenshtein(k, valid_key);
+                        if dist <= 2 && dist < min_dist {
+                            min_dist = dist;
+                            closest = Some(valid_key);
+                        }
+                    }
+
+                    let suggestion = closest.map(|c| {
+                        let mut sug_parts = path.clone();
+                        sug_parts.push(c.to_string());
+                        sug_parts.join(".")
+                    });
+
+                    errors.push((full_path, suggestion));
+                } else {
+                    path.push(k.clone());
+                    match val {
+                        toml::Value::Table(t) => {
+                            Self::validate_toml_table(t, path, schema, errors);
+                        }
+                        toml::Value::Array(arr) => {
+                            for item in arr {
+                                if let toml::Value::Table(t) = item {
+                                    Self::validate_toml_table(t, path, schema, errors);
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                    path.pop();
+                }
+            }
+        } else {
+            if path.len() == 1 && path[0] == "profile" {
+                for (k, val) in table {
+                    if let toml::Value::Table(t) = val {
+                        path.push(k.clone());
+                        Self::validate_toml_table(t, path, schema, errors);
+                        path.pop();
+                    } else {
+                        let mut full_path_parts = path.clone();
+                        full_path_parts.push(k.clone());
+                        errors.push((full_path_parts.join("."), None));
+                    }
+                }
+            } else if path.is_empty() {
+                let root_keys = schema.get("").cloned().unwrap_or_default();
+                for (k, val) in table {
+                    if k != "profile" && !root_keys.contains(k) {
+                        let mut closest: Option<&str> = None;
+                        let mut min_dist = usize::MAX;
+                        for valid_key in &root_keys {
+                            let dist = levenshtein(k, valid_key);
+                            if dist <= 2 && dist < min_dist {
+                                min_dist = dist;
+                                closest = Some(valid_key);
+                            }
+                        }
+                        errors.push((k.clone(), closest.map(String::from)));
+                    } else {
+                        path.push(k.clone());
+                        match val {
+                            toml::Value::Table(t) => {
+                                Self::validate_toml_table(t, path, schema, errors);
+                            }
+                            toml::Value::Array(arr) => {
+                                for item in arr {
+                                    if let toml::Value::Table(t) = item {
+                                        Self::validate_toml_table(t, path, schema, errors);
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                        path.pop();
+                    }
+                }
+            }
+        }
+    }
+
     /// Access the decrypted credentials store.
     ///
     /// Returns an empty store when no credentials file was found (the feature is opt-in).
@@ -1713,6 +1853,30 @@ impl AutumnConfig {
 
         // Layer 6: env var overrides (highest priority)
         config.apply_env_overrides_with_env(env);
+
+        let is_strict_env = env
+            .var("AUTUMN_SERVER__STRICT_CONFIG")
+            .is_ok_and(|v| v == "true" || v == "1");
+        if config.server.strict_config || is_strict_env {
+            let schema = Self::get_schema_keys();
+            let errors = Self::validate_toml(&toml_str, &schema);
+            if !errors.is_empty() {
+                let err_messages: Vec<String> = errors
+                    .into_iter()
+                    .map(|(path, sug)| {
+                        if let Some(s) = sug {
+                            format!("unknown key \"{path}\" — did you mean \"{s}\"?")
+                        } else {
+                            format!("unknown key \"{path}\"")
+                        }
+                    })
+                    .collect();
+                return Err(ConfigError::Validation(format!(
+                    "Strict config check failed. Unknown keys in configuration: {}",
+                    err_messages.join(", ")
+                )));
+            }
+        }
 
         #[cfg(feature = "mail")]
         if config.profile.as_deref() == Some("dev") && !has_mail_transport_source(&merged, env) {
@@ -3014,6 +3178,10 @@ pub struct ServerConfig {
     #[serde(default = "default_host")]
     pub host: String,
 
+    /// Exit startup if any unknown config keys are found in autumn.toml/profiles.
+    #[serde(default)]
+    pub strict_config: bool,
+
     /// Seconds to wait for in-flight requests during graceful shutdown.
     /// Default: `30`.
     ///
@@ -4179,6 +4347,7 @@ impl Default for ServerConfig {
         Self {
             port: default_port(),
             host: default_host(),
+            strict_config: false,
             shutdown_timeout_secs: default_shutdown_timeout(),
             prestop_grace_secs: default_prestop_grace(),
             timeouts: RequestTimeoutsConfig::default(),
@@ -4947,9 +5116,20 @@ impl<'de> de::VariantAccess<'de> for SchemaEnumAccess {
     }
 }
 
+#[cfg(test)]
 mod tests {
 
     use super::*;
+
+    struct FakeEnv(std::collections::HashMap<String, String>);
+    impl Env for FakeEnv {
+        fn var(&self, key: &str) -> Result<String, std::env::VarError> {
+            self.0
+                .get(key)
+                .cloned()
+                .ok_or(std::env::VarError::NotPresent)
+        }
+    }
 
     #[test]
     fn test_schema_extractor() {
@@ -4965,6 +5145,26 @@ mod tests {
 
         assert!(keys.contains_key("database"));
         assert!(keys["database"].contains("primary_url"));
+    }
+
+    #[test]
+    fn test_strict_config_startup_fails_on_typo() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("autumn.toml");
+        std::fs::write(&config_path, "[database]\nprimry_url = \"postgres://localhost/db\"").unwrap();
+
+        let env = FakeEnv(
+            [
+                ("AUTUMN_SERVER__STRICT_CONFIG".to_owned(), "true".to_owned()),
+                ("AUTUMN_MANIFEST_DIR".to_owned(), temp.path().to_str().unwrap().to_owned()),
+            ]
+            .into(),
+        );
+
+        let res = AutumnConfig::load_with_env(&env);
+        assert!(res.is_err());
+        let err_str = format!("{:?}", res.err().unwrap());
+        assert!(err_str.contains("primry_url"));
     }
 
     #[test]
