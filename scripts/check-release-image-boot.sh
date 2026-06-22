@@ -125,6 +125,15 @@ vendor_in_tree_autumn_web() {
   sed 's|^members = \[.*\]|members = ["autumn", "autumn-macros"]|' \
     "${REPO_ROOT}/Cargo.toml" > "${vendor_dir}/Cargo.toml"
 
+  # The scaffold's own Cargo.toml declares an (empty) `[workspace]`, which makes
+  # `${PROJECT_DIR}` a workspace root covering everything beneath it — including
+  # the vendored crates under `vendor/`. Cargo would then try to resolve their
+  # `*.workspace = true` inheritance against the scaffold root (which has no
+  # `[workspace.package]`) and fail. Exclude `vendor/` so the vendored crates
+  # resolve against their own trimmed root (`vendor/Cargo.toml`) instead.
+  sed -i 's|^\[workspace\]$|[workspace]\nexclude = ["vendor"]|' \
+    "${PROJECT_DIR}/Cargo.toml"
+
   # Point the scaffold's `autumn-web` crates.io dependency at the vendored source.
   cat >> "${PROJECT_DIR}/Cargo.toml" <<'TOML'
 
