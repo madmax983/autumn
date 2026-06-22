@@ -1282,8 +1282,45 @@ impl DatabasePoolProvider for DieselDeadpoolPoolProvider {
 mod tests {
     use super::*;
     use crate::config::DatabaseConfig;
+    use diesel::result::{DatabaseErrorKind, Error};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+    #[derive(Debug)]
+    struct MockDbError(String);
+    impl diesel::result::DatabaseErrorInformation for MockDbError {
+        fn message(&self) -> &str {
+            &self.0
+        }
+        fn details(&self) -> Option<&str> {
+            None
+        }
+        fn hint(&self) -> Option<&str> {
+            None
+        }
+        fn table_name(&self) -> Option<&str> {
+            None
+        }
+        fn column_name(&self) -> Option<&str> {
+            None
+        }
+        fn constraint_name(&self) -> Option<&str> {
+            None
+        }
+        fn statement_position(&self) -> Option<i32> {
+            None
+        }
+    }
+
+    #[test]
+    fn test_is_query_canceled_string() {
+        let err = Error::DatabaseError(
+            DatabaseErrorKind::Unknown,
+            Box::new(MockDbError("57014".to_string())),
+        );
+        assert!(is_query_canceled(&err));
+    }
+
     use std::time::Duration;
 
     // ── after_commit tests ───────────────────────────────────────

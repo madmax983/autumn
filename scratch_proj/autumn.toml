@@ -1,0 +1,63 @@
+# Autumn configuration
+# All values shown are defaults — uncomment and change as needed.
+
+[server]
+host = "127.0.0.1"
+port = 3000
+# shutdown_timeout_secs = 30
+
+[log]
+level = "info"
+# format = "Auto"  # Auto | Pretty | Json
+
+[health]
+path = "/health"
+# live_path = "/live"
+# ready_path = "/ready"
+# startup_path = "/startup"
+
+# Uncomment for OpenTelemetry / OTLP tracing:
+# [telemetry]
+# enabled = true
+# service_name = "scratch_proj"
+# service_namespace = "apps"
+# environment = "production"
+# otlp_endpoint = "http://otel-collector:4317"
+# protocol = "Grpc"  # Grpc | HttpProtobuf
+
+# Uncomment to configure database:
+# Single-primary apps can use url. Multi-role deployments should use
+# primary_url for writes/migrations and optional replica_url for reads.
+# [database]
+# url = "postgres://user:pass@localhost:5432/scratch_proj"
+# primary_url = "postgres://user:pass@localhost:5432/scratch_proj"
+# replica_url = "postgres://user:pass@localhost:5433/scratch_proj"
+# pool_size = 10
+# primary_pool_size = 10
+# replica_pool_size = 5
+# replica_fallback = "fail_readiness"  # fail_readiness | primary
+# connect_timeout_secs = 5  # pool wait/create timeout in seconds
+# Production web replicas should not run migrations. Use a one-shot
+# primary-role `autumn migrate` job before rolling the web tier.
+# auto_migrate_in_production = false
+
+# Uncomment to send transactional email in production:
+# [mail]
+# transport = "smtp"  # dev default is "log"; prod should use "smtp"
+# from = "scratch_proj <noreply@example.com>"
+# reply_to = "support@example.com"
+#
+# [mail.smtp]
+# host = "smtp.example.com"
+# port = 587
+# username = "apikey"
+# password_env = "SMTP_PASSWORD"
+# tls = "starttls"  # disabled | starttls | tls
+
+# Uncomment to externalize sessions in production:
+# [session]
+# backend = "redis"
+#
+# [session.redis]
+# url = "redis://redis:6379"
+# key_prefix = "scratch_proj:sessions"
