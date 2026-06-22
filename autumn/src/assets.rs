@@ -152,13 +152,16 @@ fn embedded_is_manifest_asset(rel_path: &str) -> bool {
 /// ```
 #[must_use]
 pub fn asset_url(path: &str) -> String {
-    // When an embedded manifest is registered (release single-binary builds),
-    // it is authoritative regardless of build profile — both the manifest and
-    // the served files come from the same build, so there is no drift.
+    // When an embedded `static/` tree is registered (single-binary build), the
+    // embedded manifest is the *only* source of truth — assets are served from
+    // the binary, so a miss means the asset isn't fingerprinted and should use
+    // the plain embedded path. Never fall through to a disk sidecar manifest,
+    // which could otherwise point at a hashed file that was never baked in.
     #[cfg(feature = "embed-assets")]
     {
-        if let Some(fingerprinted) = embedded_manifest_lookup(path) {
-            return format!("/static/{fingerprinted}");
+        if embedded_static_dir().is_some() {
+            return embedded_manifest_lookup(path)
+                .map_or_else(|| format!("/static/{path}"), |fp| format!("/static/{fp}"));
         }
     }
     #[cfg(debug_assertions)]
@@ -189,13 +192,13 @@ pub fn asset_url(path: &str) -> String {
 // release/embedded arms perform non-const lookups.
 #[allow(clippy::missing_const_for_fn)]
 pub(crate) fn is_manifest_asset(rel_path: &str) -> bool {
-    // An embedded manifest (release single-binary build) is consulted first and
-    // is reachable in debug builds too, so the cache policy is correct whenever
-    // assets are embedded — not only in `--release`.
+    // When an embedded `static/` tree is registered, its manifest is the sole
+    // authority for the immutable-cache decision (and is reachable in debug
+    // builds too); never consult a disk sidecar manifest in that case.
     #[cfg(feature = "embed-assets")]
     {
-        if embedded_is_manifest_asset(rel_path) {
-            return true;
+        if embedded_static_dir().is_some() {
+            return embedded_is_manifest_asset(rel_path);
         }
     }
     #[cfg(not(debug_assertions))]

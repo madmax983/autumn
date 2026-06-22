@@ -67,5 +67,7 @@ async fn main() {
     #[cfg(feature = "embed-assets")]
     let app = app.embedded_static(&EMBEDDED_STATIC);
 
-    app.run().await;
+    app
+        .run()
+        .await;
 }
