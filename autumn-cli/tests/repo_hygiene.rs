@@ -896,3 +896,157 @@ fn benchmark_runtime_startup_applies_packaged_migrations() {
         loco_production_path.display(),
     );
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Issue #978 — build-and-boot the generated release image in CI so the deploy
+// story can't rot. The generated Dockerfile and the "10-minute deploy" promise
+// in docs/guide/deployment.md must be enforced by a gate that actually builds
+// and boots the image, not just by file-shape string assertions.
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn release_image_boot_gate_is_configured() {
+    let root = workspace_root();
+
+    // AC: a dedicated workflow file must exist that builds and boots the
+    // generated release image — not just `cargo test` shape assertions.
+    let workflow_path = root.join(".github/workflows/release-image-boot.yml");
+    let workflow = std::fs::read_to_string(&workflow_path).unwrap_or_else(|err| {
+        panic!(
+            "failed to read {}: {err}\n\
+             issue #978 requires a build-and-boot gate for the generated release image",
+            workflow_path.display()
+        )
+    });
+
+    // The heavy lifting (docker build, boot, probe) lives in a reusable shell
+    // harness so the workflow stays thin and the gate is runnable locally.
+    let harness_path = root.join("scripts/check-release-image-boot.sh");
+    let harness = std::fs::read_to_string(&harness_path).unwrap_or_else(|err| {
+        panic!(
+            "failed to read {}: {err}\n\
+             issue #978 requires a build-and-boot harness script invoked by the gate",
+            harness_path.display()
+        )
+    });
+
+    // AC: the gate is path-scoped to the deployment scaffold surface so it
+    // protects the artifacts without taxing every unrelated PR.
+    for path_fragment in [
+        "autumn-cli/src/release.rs",
+        "autumn-cli/src/new.rs",
+        "autumn-cli/src/templates",
+        "scripts/check-release-image-boot.sh",
+        ".github/workflows/release-image-boot.yml",
+    ] {
+        assert!(
+            workflow.contains(path_fragment),
+            "release-image-boot.yml must declare a path filter covering `{path_fragment}` \
+             so changes to the deploy scaffold trigger the gate",
+        );
+    }
+
+    // AC: a scheduled run protects branches where the path filter would not
+    // fire (e.g. a base-image bump reaching crates.io transitively).
+    assert!(
+        workflow.contains("schedule"),
+        "release-image-boot.yml must include a cron schedule so the deploy path \
+         is verified even when no scaffold file was touched directly",
+    );
+
+    // The workflow must run the harness for the bare target and the
+    // docker-compose target (AC: both covered).
+    assert!(
+        workflow.contains("check-release-image-boot.sh"),
+        "release-image-boot.yml must invoke the build-and-boot harness script",
+    );
+    assert!(
+        workflow.contains("docker-compose"),
+        "release-image-boot.yml must exercise the --target docker-compose variant",
+    );
+
+    // AC: a throwaway Postgres (service container) backs the bare target.
+    assert!(
+        workflow.contains("postgres"),
+        "release-image-boot.yml must provision a throwaway Postgres for the boot test",
+    );
+
+    // ── Harness behaviour (the actual build-and-boot contract) ──────────────
+
+    // AC: scaffolds a fresh project then runs `autumn release init --force`.
+    assert!(
+        harness.contains("autumn new") || harness.contains("\"new\""),
+        "harness must scaffold a fresh project via `autumn new`",
+    );
+    assert!(
+        harness.contains("release") && harness.contains("init") && harness.contains("--force"),
+        "harness must run `autumn release init --force`",
+    );
+
+    // AC: docker build the generated image.
+    assert!(
+        harness.contains("docker build"),
+        "harness must `docker build` the generated image",
+    );
+
+    // AC: exercise the one-shot migrate path before the web container is ready.
+    assert!(
+        harness.contains("autumn migrate") || harness.contains("migrate"),
+        "harness must run the one-shot `autumn migrate` before booting the web tier",
+    );
+
+    // AC: assert both /health and /actuator/health reach 200.
+    assert!(
+        harness.contains("/health"),
+        "harness must probe GET /health",
+    );
+    assert!(
+        harness.contains("/actuator/health"),
+        "harness must probe GET /actuator/health",
+    );
+
+    // AC: bounded startup window (≤ 30s) — the budget must be encoded.
+    assert!(
+        harness.contains("30"),
+        "harness must encode a bounded (≤ 30s) startup window for the health probe",
+    );
+
+    // AC: docker-compose path is brought up and torn down cleanly.
+    assert!(
+        harness.contains("docker compose") || harness.contains("docker-compose"),
+        "harness must drive the docker-compose target",
+    );
+    assert!(
+        harness.contains("down -v"),
+        "harness must tear the compose stack down cleanly (`docker compose down -v`)",
+    );
+
+    // AC: on failure, surface build/boot logs and the failing probe response.
+    assert!(
+        harness.contains("docker logs") || harness.contains("compose logs"),
+        "harness must dump container logs on failure for diagnosability",
+    );
+
+    // Secondary guard: final runtime image size budget (< 150 MB).
+    assert!(
+        harness.contains("150"),
+        "harness must guard the runtime image size budget (< 150 MB)",
+    );
+}
+
+#[test]
+fn deployment_guide_references_build_and_boot_gate() {
+    let root = workspace_root();
+
+    // AC: docs/guide/deployment.md references this gate as the proof behind its
+    // "10-minute" claim — the numeric promise must point at the machine check.
+    let doc_path = root.join("docs/guide/deployment.md");
+    let doc = std::fs::read_to_string(&doc_path)
+        .unwrap_or_else(|err| panic!("failed to read {}: {err}", doc_path.display()));
+
+    assert!(
+        doc.contains("release-image-boot"),
+        "deployment.md must reference the `release-image-boot` CI gate as the proof \
+         behind the documented 10-minute deploy promise",
+    );
+}

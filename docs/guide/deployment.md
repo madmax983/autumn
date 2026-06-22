@@ -7,6 +7,19 @@ no file editing is required to reach a running container.
 Target time: **under 10 minutes** on a machine with Docker and a working
 internet connection.
 
+> **This promise is machine-verified, not aspirational.** The
+> [`release-image-boot`](../../.github/workflows/release-image-boot.yml) CI gate
+> scaffolds a fresh project, runs every command on this page (`autumn new` →
+> `autumn release init --force` → `docker build` → one-shot `autumn migrate` →
+> boot), and fails the build unless the container answers `GET /health` **and**
+> `GET /actuator/health` with `200` within the documented startup budget. It
+> covers both the bare `release init` image and the `--target docker-compose`
+> stack, so the deployment scaffold can never silently rot — a base-image bump,
+> a missing system lib, or an asset-path drift is caught in CI, not by a user's
+> first failed production deploy. See
+> [`scripts/check-release-image-boot.sh`](../../scripts/check-release-image-boot.sh)
+> for the build-and-boot harness.
+
 ---
 
 ## Prerequisites
