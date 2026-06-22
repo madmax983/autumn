@@ -5,6 +5,7 @@
 //! code 0 (all clear) or 1 (any failure detected).
 
 use serde::Serialize;
+use std::collections::{HashMap, HashSet};
 
 // ── Signing secret validation constants (mirrored from autumn-web) ────────────
 
@@ -704,6 +705,127 @@ pub fn to_json_output(results: &[CheckResult], summary: &Summary) -> String {
 
 // ─── Check implementations ────────────────────────────────────────────────────
 
+/// Recursively validates TOML content against the derived schema.
+/// Returns a list of errors: (dotted_path, option_suggestion)
+pub fn validate_toml_content(
+    content: &str,
+    schema: &HashMap<String, HashSet<String>>,
+) -> Vec<(String, Option<String>)> {
+    let Ok(table) = toml::from_str::<toml::Table>(content) else {
+        return Vec::new();
+    };
+
+    let mut errors = Vec::new();
+    let mut path = Vec::new();
+    validate_toml_table(&table, &mut path, schema, &mut errors);
+    errors
+}
+
+fn validate_toml_table(
+    table: &toml::Table,
+    path: &mut Vec<String>,
+    schema: &HashMap<String, HashSet<String>>,
+    errors: &mut Vec<(String, Option<String>)>,
+) {
+    let mut schema_path_parts = Vec::new();
+    if path.len() >= 2 && path[0] == "profile" {
+        schema_path_parts.extend(path[2..].iter().cloned());
+    } else {
+        schema_path_parts.extend(path.iter().cloned());
+    }
+    let schema_path = schema_path_parts.join(".");
+
+    if let Some(valid_keys) = schema.get(&schema_path) {
+        for (k, val) in table {
+            if !valid_keys.contains(k) {
+                let mut full_path_parts = path.clone();
+                full_path_parts.push(k.clone());
+                let full_path = full_path_parts.join(".");
+
+                let mut closest: Option<&str> = None;
+                let mut min_dist = usize::MAX;
+                for valid_key in valid_keys {
+                    let dist = autumn_web::config::levenshtein(k, valid_key);
+                    if dist <= 2 && dist < min_dist {
+                        min_dist = dist;
+                        closest = Some(valid_key);
+                    }
+                }
+
+                let suggestion = closest.map(|c| {
+                    let mut sug_parts = path.clone();
+                    sug_parts.push(c.to_string());
+                    sug_parts.join(".")
+                });
+
+                errors.push((full_path, suggestion));
+            } else {
+                path.push(k.clone());
+                match val {
+                    toml::Value::Table(t) => {
+                        validate_toml_table(t, path, schema, errors);
+                    }
+                    toml::Value::Array(arr) => {
+                        for item in arr {
+                            if let toml::Value::Table(t) = item {
+                                validate_toml_table(t, path, schema, errors);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                path.pop();
+            }
+        }
+    } else {
+        if path.len() == 1 && path[0] == "profile" {
+            for (k, val) in table {
+                if let toml::Value::Table(t) = val {
+                    path.push(k.clone());
+                    validate_toml_table(t, path, schema, errors);
+                    path.pop();
+                } else {
+                    let mut full_path_parts = path.clone();
+                    full_path_parts.push(k.clone());
+                    errors.push((full_path_parts.join("."), None));
+                }
+            }
+        } else if path.is_empty() {
+            let root_keys = schema.get("").cloned().unwrap_or_default();
+            for (k, val) in table {
+                if k != "profile" && !root_keys.contains(k) {
+                    let mut closest: Option<&str> = None;
+                    let mut min_dist = usize::MAX;
+                    for valid_key in &root_keys {
+                        let dist = autumn_web::config::levenshtein(k, valid_key);
+                        if dist <= 2 && dist < min_dist {
+                            min_dist = dist;
+                            closest = Some(valid_key);
+                        }
+                    }
+                    errors.push((k.clone(), closest.map(String::from)));
+                } else {
+                    path.push(k.clone());
+                    match val {
+                        toml::Value::Table(t) => {
+                            validate_toml_table(t, path, schema, errors);
+                        }
+                        toml::Value::Array(arr) => {
+                            for item in arr {
+                                if let toml::Value::Table(t) = item {
+                                    validate_toml_table(t, path, schema, errors);
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                    path.pop();
+                }
+            }
+        }
+    }
+}
+
 /// Check that `autumn.toml` content parses cleanly (pure, injectable for tests).
 pub fn check_toml_content(content: &str) -> CheckResult {
     match toml::from_str::<toml::Table>(content) {
@@ -713,13 +835,10 @@ pub fn check_toml_content(content: &str) -> CheckResult {
             detail: Some(e.to_string()),
             hint: Some("Fix the syntax error in autumn.toml"),
         },
-        Ok(table) => {
-            let unknown: Vec<String> = table
-                .keys()
-                .filter(|k| !KNOWN_TOML_SECTIONS.contains(&k.as_str()))
-                .cloned()
-                .collect();
-            if unknown.is_empty() {
+        Ok(_) => {
+            let schema = autumn_web::config::AutumnConfig::get_schema_keys();
+            let errors = validate_toml_content(content, &schema);
+            if errors.is_empty() {
                 CheckResult {
                     name: "autumn_toml",
                     status: CheckStatus::Pass,
@@ -727,10 +846,20 @@ pub fn check_toml_content(content: &str) -> CheckResult {
                     hint: None,
                 }
             } else {
+                let details: Vec<String> = errors
+                    .into_iter()
+                    .map(|(path, suggestion)| {
+                        if let Some(sug) = suggestion {
+                            format!("unknown key \"{path}\" — did you mean \"{sug}\"?")
+                        } else {
+                            format!("unknown key \"{path}\"")
+                        }
+                    })
+                    .collect();
                 CheckResult {
                     name: "autumn_toml",
                     status: CheckStatus::Warn,
-                    detail: Some(format!("unknown keys: {}", unknown.join(", "))),
+                    detail: Some(details.join(", ")),
                     hint: Some("Remove or rename unrecognised keys in autumn.toml"),
                 }
             }
@@ -2967,6 +3096,40 @@ pub fn check_gdpr_export_registration_impl(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_recursive_toml_validation() {
+        let valid_toml = r#"
+            [server]
+            port = 4000
+            host = "0.0.0.0"
+
+            [database]
+            primary_url = "postgres://localhost/db"
+        "#;
+        let r = check_toml_content(valid_toml);
+        assert_eq!(r.status, CheckStatus::Pass);
+
+        let typo_toml = r#"
+            [database]
+            primry_url = "postgres://localhost/db"
+        "#;
+        let r = check_toml_content(typo_toml);
+        assert_eq!(r.status, CheckStatus::Warn);
+        let detail = r.detail.as_ref().unwrap();
+        assert!(detail.contains("database.primry_url"));
+        assert!(detail.contains("did you mean \"database.primary_url\"?"));
+
+        let unknown_toml = r#"
+            [server]
+            xyz_completely_unknown_key = 123
+        "#;
+        let r = check_toml_content(unknown_toml);
+        assert_eq!(r.status, CheckStatus::Warn);
+        let detail = r.detail.as_ref().unwrap();
+        assert!(detail.contains("server.xyz_completely_unknown_key"));
+        assert!(!detail.contains("did you mean"));
+    }
 
     // ── mail_unsubscribe check ─────────────────────────────────────────────────
 
