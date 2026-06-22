@@ -144,6 +144,22 @@ autumn-web = { path = "vendor/autumn" }
 TOML
 }
 
+# The generated Dockerfile uses cargo-chef: the builder stage copies only
+# `recipe.json` and runs `cargo chef cook` to pre-build dependencies before the
+# real `COPY . .`. cargo-chef reconstructs skeleton manifests for the analyzed
+# *workspace*, but our vendored autumn-web lives in its own (excluded) workspace
+# under `vendor/`, so chef does not skeletonize it — `cargo chef cook` then needs
+# the real `vendor/` source on disk and fails with "failed to read
+# /app/vendor/autumn/Cargo.toml". Stage `vendor/` from the planner (which did
+# `COPY . .`) before the cook step so the path-patched dependency resolves. This
+# post-processing is CI-only and matches the CI-only vendoring above; the
+# generated artifact a user gets is unchanged.
+stage_vendor_before_chef_cook() {
+  sed -i \
+    's|^COPY --from=planner /app/recipe.json recipe.json$|COPY --from=planner /app/vendor vendor\nCOPY --from=planner /app/recipe.json recipe.json|' \
+    "${PROJECT_DIR}/Dockerfile"
+}
+
 vendor_in_tree_autumn_web
 
 # ── health probe helper ─────────────────────────────────────────────────────
@@ -209,6 +225,7 @@ report_image_size() {
 run_default_target() {
   log "release init (bare/default target)"
   ( cd "${PROJECT_DIR}" && "${AUTUMN}" release init --force )
+  stage_vendor_before_chef_cook
 
   log "docker build the generated image"
   if ! ( cd "${PROJECT_DIR}" && docker build -t "${IMAGE_TAG}" . 2>&1 | tee "${WORKDIR}/build.log" ); then
@@ -257,6 +274,7 @@ run_default_target() {
 run_compose_target() {
   log "release init --target docker-compose"
   ( cd "${PROJECT_DIR}" && "${AUTUMN}" release init --force --target docker-compose )
+  stage_vendor_before_chef_cook
 
   # The generated compose app runs in the prod profile, which requires a
   # non-empty trusted-host allowlist to bind. Inject it (and a signing secret)
