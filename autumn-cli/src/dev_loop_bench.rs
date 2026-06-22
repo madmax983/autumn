@@ -609,11 +609,24 @@ const fn class_for(shape: ColdStartShape) -> ChangeClass {
     }
 }
 
+/// Outcome of the (optional) database-backed cold-start shape.
+enum DbOutcome {
+    /// `--include-db` was not requested.
+    NotRequested,
+    /// Measured samples (milliseconds).
+    Measured(Vec<u64>),
+    /// `--include-db` was requested but the measurement failed; the message is
+    /// surfaced as an informational failure row so the run does not silently
+    /// drop the requested result.
+    Failed(String),
+}
+
 /// Assemble a cold-start report from measured samples.
 ///
-/// `hello_samples` always gates the result. `db_samples`, when present, is
-/// recorded as **informational** and never affects `all_passed`.
-fn build_cold_start_report(hello_samples: &[u64], db_samples: Option<&[u64]>) -> FullReport {
+/// `hello_samples` always gates the result. The database-backed shape, when
+/// requested, is recorded as **informational** (measured or failed) and never
+/// affects `all_passed`.
+fn build_cold_start_report(hello_samples: &[u64], db: &DbOutcome) -> FullReport {
     let mut results = Vec::new();
 
     let hello_budget = budget_for(ChangeClass::ColdStartHello);
@@ -623,11 +636,15 @@ fn build_cold_start_report(hello_samples: &[u64], db_samples: Option<&[u64]>) ->
         &hello_budget,
     ));
 
-    if let Some(db) = db_samples {
-        let db_budget = budget_for(ChangeClass::ColdStartDb);
-        let mut r = check_budget(ChangeClass::ColdStartDb, compute_stats(db), &db_budget);
-        r.informational = true;
-        results.push(r);
+    match db {
+        DbOutcome::NotRequested => {}
+        DbOutcome::Measured(samples) => {
+            let db_budget = budget_for(ChangeClass::ColdStartDb);
+            let mut r = check_budget(ChangeClass::ColdStartDb, compute_stats(samples), &db_budget);
+            r.informational = true;
+            results.push(r);
+        }
+        DbOutcome::Failed(msg) => results.push(db_failure_result(msg)),
     }
 
     // Only non-informational results contribute to the gate.
@@ -644,6 +661,29 @@ fn build_cold_start_report(hello_samples: &[u64], db_samples: Option<&[u64]>) ->
         example_name: "cold-start".to_string(),
         all_passed,
         results,
+    }
+}
+
+/// Build an informational failure row for a DB-shape measurement that could not
+/// be completed, so an `--include-db` run records the requested-but-failed
+/// result in the report instead of silently omitting it.
+fn db_failure_result(msg: &str) -> BudgetCheckResult {
+    let class = ChangeClass::ColdStartDb;
+    BudgetCheckResult {
+        change_class: class.key().to_string(),
+        journey_name: class.journey_name().to_string(),
+        stats: compute_stats(&[]),
+        budget: budget_for(class),
+        passed: false,
+        p95_exceeded: false,
+        max_exceeded: false,
+        p95_overage_pct: 0.0,
+        diagnosis: format!("Database-backed cold start could not be measured: {msg}"),
+        next_action: "This shape is informational and does not affect the gate. \
+                      Re-run `--include-db` in an environment where the bundled \
+                      managed-Postgres prerequisites are available."
+            .to_string(),
+        informational: true,
     }
 }
 
@@ -740,36 +780,40 @@ fn measure_cold_start_once(shape: ColdStartShape) -> Result<u64, String> {
 
     repoint_autumn_web(&project_dir, &autumn_web)?;
 
-    // The port the app binds and the port we poll come from one source: the
-    // child's `AUTUMN_SERVER__*` env vars (highest config precedence) set below.
-    let port = std::env::var("AUTUMN_BENCH_PORT")
+    // Pick the port the app binds and we poll. Default: a freshly reserved
+    // ephemeral port per sample, so repeated runs never collide on a lingering
+    // TIME_WAIT socket from the previous sample. An explicit AUTUMN_BENCH_PORT
+    // override is honoured as-is.
+    let port = match std::env::var("AUTUMN_BENCH_PORT")
         .ok()
         .and_then(|p| p.parse::<u16>().ok())
-        .unwrap_or(3000);
+    {
+        Some(p) => p,
+        None => reserve_free_port()?,
+    };
 
     // Cold build into the project's own (empty) target/. Remove every inherited
-    // Cargo target/triple override so artifacts land in `target/debug/` (not a
-    // shared dir or a `target/<triple>/debug/` path) and the warm cache from the
-    // parent build is never reused.
-    let build_ok = Command::new("cargo")
-        .arg("build")
+    // Cargo target/triple override so the parent's warm cache is never reused,
+    // and ask Cargo for JSON artifact messages so we learn the *exact* built
+    // binary path — robust to any `build.target` / `build.target-dir` coming from
+    // Cargo config files, which `env_remove` alone cannot neutralise.
+    let output = Command::new("cargo")
+        .args(["build", "--message-format=json"])
         .current_dir(&project_dir)
         .env_remove("CARGO_TARGET_DIR")
         .env_remove("CARGO_BUILD_TARGET_DIR")
         .env_remove("CARGO_BUILD_TARGET")
-        .status()
-        .map_err(|e| format!("cargo build spawn failed: {e}"))?
-        .success();
-    if !build_ok {
-        return Err("cargo build failed for the scaffolded project".to_string());
+        .output()
+        .map_err(|e| format!("cargo build spawn failed: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "cargo build failed for the scaffolded project:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
     }
-
-    // Binaries carry a platform-specific suffix (`.exe` on Windows, empty
-    // elsewhere) — append it so the path resolves on every OS.
-    let bin = project_dir
-        .join("target")
-        .join("debug")
-        .join(format!("{project_name}{}", std::env::consts::EXE_SUFFIX));
+    let bin = cargo_executable_path(&output.stdout, project_name).ok_or_else(|| {
+        "could not determine the built binary path from cargo's JSON output".to_string()
+    })?;
 
     let mut cmd = Command::new(&bin);
     cmd.current_dir(&project_dir);
@@ -826,8 +870,16 @@ fn measure_cold_start_once(shape: ColdStartShape) -> Result<u64, String> {
                  port {port} may already be in use"
             ));
         }
+        // Accept only a 200 whose body proves it came from OUR scaffolded app:
+        // its index page renders the project name. This rules out a 200 served by
+        // some unrelated service that happens to answer on this port during the
+        // child's boot-toward-bind-failure window.
         if let Ok(resp) = client.get(&url).send()
             && resp.status().is_success()
+            && resp
+                .text()
+                .map(|body| body.contains(project_name))
+                .unwrap_or(false)
         {
             measured = Some(u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX));
             break;
@@ -841,6 +893,48 @@ fn measure_cold_start_once(shape: ColdStartShape) -> Result<u64, String> {
     stop_child(&mut child);
 
     measured.ok_or_else(|| "server did not return HTTP 200 before the deadline".to_string())
+}
+
+/// Reserve a currently-free TCP port on loopback.
+///
+/// Binds an ephemeral port, reads it, then drops the listener so the scaffolded
+/// app can bind it. There is a tiny race between release and the child's bind,
+/// but the per-iteration `try_wait()` and the response-body check make a
+/// mis-attributed sample impossible even if the port is lost.
+fn reserve_free_port() -> Result<u16, String> {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0))
+        .map_err(|e| format!("failed to reserve a free port: {e}"))?;
+    let port = listener
+        .local_addr()
+        .map_err(|e| format!("failed to read reserved port: {e}"))?
+        .port();
+    Ok(port)
+}
+
+/// Extract the built binary path from `cargo build --message-format=json` output.
+///
+/// Scans the `compiler-artifact` messages for the one whose target is the
+/// project's binary and returns its reported `executable` path. This is robust
+/// to a non-default target dir or `--target <triple>` configured via Cargo
+/// config files (which would otherwise move the artifact out of `target/debug/`).
+fn cargo_executable_path(stdout: &[u8], bin_name: &str) -> Option<PathBuf> {
+    let text = String::from_utf8_lossy(stdout);
+    let mut found = None;
+    for line in text.lines() {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if v.get("reason").and_then(serde_json::Value::as_str) == Some("compiler-artifact")
+            && v.get("target")
+                .and_then(|t| t.get("name"))
+                .and_then(serde_json::Value::as_str)
+                == Some(bin_name)
+            && let Some(exe) = v.get("executable").and_then(serde_json::Value::as_str)
+        {
+            found = Some(PathBuf::from(exe));
+        }
+    }
+    found
 }
 
 /// Stop a scaffolded cold-start server, preferring a graceful SIGTERM so the
@@ -927,20 +1021,21 @@ pub fn run_cold_start(
         }
     };
 
-    let db_samples = if include_db {
+    let db = if include_db {
         match measure_cold_start(ColdStartShape::Db, runs) {
-            Ok(s) => Some(s),
+            Ok(s) => DbOutcome::Measured(s),
             Err(e) => {
-                // The DB shape is informational; a failure must not break the run.
+                // The DB shape is informational; a failure must not break the run,
+                // but it is recorded in the report rather than silently dropped.
                 eprintln!("Warning: informational DB cold-start measurement failed: {e}");
-                None
+                DbOutcome::Failed(e)
             }
         }
     } else {
-        None
+        DbOutcome::NotRequested
     };
 
-    let report = build_cold_start_report(&hello_samples, db_samples.as_deref());
+    let report = build_cold_start_report(&hello_samples, &db);
     let human = format_human_summary(&report);
     let machine = format_json_report(&report);
 
@@ -1624,7 +1719,7 @@ mod tests {
     #[test]
     fn build_cold_start_report_hello_only_gates_on_hello() {
         // Hello well within budget → all_passed true, one result, not informational.
-        let report = build_cold_start_report(&[40_000, 41_000, 42_000], None);
+        let report = build_cold_start_report(&[40_000, 41_000, 42_000], &DbOutcome::NotRequested);
         assert_eq!(report.results.len(), 1);
         assert_eq!(report.results[0].change_class, "cold_start_hello");
         assert!(!report.results[0].informational);
@@ -1634,7 +1729,8 @@ mod tests {
     #[test]
     fn build_cold_start_report_hello_over_budget_fails_gate() {
         // p95 way above the 60s budget → gate fails.
-        let report = build_cold_start_report(&[120_000, 130_000, 140_000], None);
+        let report =
+            build_cold_start_report(&[120_000, 130_000, 140_000], &DbOutcome::NotRequested);
         assert!(!report.all_passed, "over-budget hello must fail the gate");
     }
 
@@ -1644,7 +1740,7 @@ mod tests {
         // flip the overall gate (hello is within budget).
         let report = build_cold_start_report(
             &[40_000, 41_000, 42_000],
-            Some(&[300_000, 310_000, 320_000]),
+            &DbOutcome::Measured(vec![300_000, 310_000, 320_000]),
         );
         assert_eq!(report.results.len(), 2);
         let db = report
@@ -1660,9 +1756,34 @@ mod tests {
     }
 
     #[test]
+    fn build_cold_start_report_db_failure_is_informational_row() {
+        // A requested-but-failed DB shape is recorded (not dropped) and does not
+        // fail the gate.
+        let report = build_cold_start_report(
+            &[40_000, 41_000, 42_000],
+            &DbOutcome::Failed("postgres unavailable".to_string()),
+        );
+        assert_eq!(report.results.len(), 2);
+        let db = report
+            .results
+            .iter()
+            .find(|r| r.change_class == "cold_start_db")
+            .expect("db failure row present");
+        assert!(db.informational);
+        assert!(!db.passed, "failure row must be marked not-passed");
+        assert!(db.diagnosis.contains("postgres unavailable"));
+        assert!(
+            report.all_passed,
+            "informational db failure must not fail the gate"
+        );
+    }
+
+    #[test]
     fn build_cold_start_report_json_has_metadata_and_no_path_leak() {
-        let report =
-            build_cold_start_report(&[40_000, 41_000, 42_000], Some(&[80_000, 81_000, 82_000]));
+        let report = build_cold_start_report(
+            &[40_000, 41_000, 42_000],
+            &DbOutcome::Measured(vec![80_000, 81_000, 82_000]),
+        );
         let s = format_json_report(&report);
         let v: serde_json::Value = serde_json::from_str(&s).expect("valid JSON");
         assert!(v.get("timestamp_utc").is_some());
@@ -1672,6 +1793,37 @@ mod tests {
         assert!(v.get("all_passed").is_some());
         assert!(!s.contains("/home/"), "must not leak /home/ paths");
         assert!(!s.contains("C:\\Users\\"), "must not leak Windows paths");
+    }
+
+    // ── cargo artifact path / free port ───────────────────────────────────
+
+    #[test]
+    fn cargo_executable_path_picks_matching_bin() {
+        let stdout = concat!(
+            r#"{"reason":"compiler-artifact","target":{"name":"some_dep"},"executable":null}"#,
+            "\n",
+            r#"{"reason":"compiler-artifact","target":{"name":"coldstart_app"},"executable":"/tmp/x/target/debug/coldstart_app"}"#,
+            "\n",
+            r#"{"reason":"build-finished","success":true}"#,
+            "\n",
+        );
+        let path = cargo_executable_path(stdout.as_bytes(), "coldstart_app");
+        assert_eq!(
+            path,
+            Some(PathBuf::from("/tmp/x/target/debug/coldstart_app"))
+        );
+    }
+
+    #[test]
+    fn cargo_executable_path_none_when_absent() {
+        let stdout = r#"{"reason":"build-finished","success":true}"#;
+        assert!(cargo_executable_path(stdout.as_bytes(), "coldstart_app").is_none());
+    }
+
+    #[test]
+    fn reserve_free_port_returns_nonzero() {
+        let port = reserve_free_port().expect("should reserve a port");
+        assert!(port > 0);
     }
 
     // ── run_cold_start ────────────────────────────────────────────────────
