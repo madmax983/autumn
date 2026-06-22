@@ -4,7 +4,10 @@ use autumn_web::prelude::*;
 
 const MIGRATIONS: EmbeddedMigrations = embed_migrations!();
 
-pub fn layout(title: &str, content: maud::Markup) -> maud::Markup {
+// `flash` carries one-shot notices set with `flash.success(...)` before a
+// redirect. Pass `flash.render().await` from your handlers; it renders any
+// pending messages (and clears them) and is harmless when empty.
+pub fn layout(title: &str, flash: maud::Markup, content: maud::Markup) -> maud::Markup {
     maud::html! {
         (maud::DOCTYPE)
         html lang="en" {
@@ -22,6 +25,7 @@ pub fn layout(title: &str, content: maud::Markup) -> maud::Markup {
                     }
                 }
                 main id="main-content" role="main" {
+                    (flash)
                     (content)
                 }
                 footer role="contentinfo" {
@@ -33,8 +37,8 @@ pub fn layout(title: &str, content: maud::Markup) -> maud::Markup {
 }
 
 #[get("/")]
-async fn index() -> maud::Markup {
-    layout("Welcome", maud::html! {
+async fn index(flash: Flash) -> maud::Markup {
+    layout("Welcome", flash.render().await, maud::html! {
         h1 { "Welcome to {{project_name}}!" }
         p { "Edit " code { "src/main.rs" } " to get started." }
     })

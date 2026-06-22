@@ -167,6 +167,87 @@ impl Flash {
     }
 }
 
+#[cfg(feature = "maud")]
+impl Flash {
+    /// Consume all pending flash messages and render them as HTML.
+    ///
+    /// This is the one-line helper for a base layout: drop `(flash.render().await)`
+    /// into your template and every pending notice is rendered and cleared in a
+    /// single call — no manual `consume()` + loop required.
+    ///
+    /// The output is wrapped in a stable `<div id="flash">` container that is
+    /// *always* emitted, even when there are no messages, so it can act as the
+    /// target for htmx out-of-band swaps on later requests.
+    ///
+    /// ```rust,no_run
+    /// use autumn_web::prelude::*;
+    ///
+    /// #[get("/items")]
+    /// async fn list_items(flash: Flash) -> Markup {
+    ///     html! {
+    ///         (flash.render().await)
+    ///         h1 { "Items" }
+    ///     }
+    /// }
+    /// ```
+    pub async fn render(&self) -> maud::Markup {
+        self.render_inner(false).await
+    }
+
+    /// Like [`render`](Self::render), but marks the container for an htmx
+    /// out-of-band swap (`hx-swap-oob="true"`).
+    ///
+    /// Include `(flash.render_oob().await)` anywhere in an htmx partial response
+    /// and the flash container in the already-rendered page is replaced in place,
+    /// so notices appear on htmx-driven swaps — not just full-page loads. For the
+    /// header-based alternative see [`inject_hx_trigger`](Self::inject_hx_trigger).
+    pub async fn render_oob(&self) -> maud::Markup {
+        self.render_inner(true).await
+    }
+
+    async fn render_inner(&self, oob: bool) -> maud::Markup {
+        let messages = self.consume().await;
+        maud::html! {
+            div id="flash" class="flash-messages" role="status" aria-live="polite"
+                hx-swap-oob=[oob.then_some("true")] {
+                @for msg in &messages {
+                    div class={ "flash flash-" (msg.level.as_str()) } role="alert"
+                        style=(level_style(msg.level)) {
+                        (msg.message)
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Minimal inline styling per level so a generated app shows a *visible* notice
+/// with zero added CSS. Apps that want full control can target the
+/// `.flash` / `.flash-<level>` classes and ignore these defaults.
+#[cfg(feature = "maud")]
+const fn level_style(level: FlashLevel) -> &'static str {
+    // Shared box layout plus a per-level color palette, inlined per variant so
+    // this stays a `const fn` returning a single `&'static str`.
+    match level {
+        FlashLevel::Success => {
+            "padding:0.75rem 1rem;border-radius:0.375rem;margin-bottom:0.5rem;border:1px solid;\
+             background:#ecfdf5;color:#065f46;border-color:#6ee7b7;"
+        }
+        FlashLevel::Info => {
+            "padding:0.75rem 1rem;border-radius:0.375rem;margin-bottom:0.5rem;border:1px solid;\
+             background:#eff6ff;color:#1e3a8a;border-color:#93c5fd;"
+        }
+        FlashLevel::Warning => {
+            "padding:0.75rem 1rem;border-radius:0.375rem;margin-bottom:0.5rem;border:1px solid;\
+             background:#fffbeb;color:#92400e;border-color:#fcd34d;"
+        }
+        FlashLevel::Error => {
+            "padding:0.75rem 1rem;border-radius:0.375rem;margin-bottom:0.5rem;border:1px solid;\
+             background:#fef2f2;color:#991b1b;border-color:#fca5a5;"
+        }
+    }
+}
+
 impl<S> FromRequestParts<S> for Flash
 where
     S: Send + Sync,
@@ -273,6 +354,64 @@ mod tests {
         assert_eq!(messages[2].message, "Warning msg");
         assert_eq!(messages[3].level, FlashLevel::Error);
         assert_eq!(messages[3].message, "Error msg");
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "maud")]
+    async fn render_emits_messages_and_clears_them() {
+        let session = Session::new_for_test("test_id".to_string(), HashMap::new());
+        let flash = Flash::new(session.clone());
+
+        flash.success("Saved!").await;
+        flash.error("Oops").await;
+
+        let markup = flash.render().await.into_string();
+        // Stable container that doubles as the htmx OOB target.
+        assert!(markup.contains("id=\"flash\""), "missing container: {markup}");
+        assert!(markup.contains("aria-live=\"polite\""));
+        // Per-message level classes and text.
+        assert!(markup.contains("flash flash-success"));
+        assert!(markup.contains("Saved!"));
+        assert!(markup.contains("flash flash-error"));
+        assert!(markup.contains("Oops"));
+        // Inline styles guarantee visibility with zero CSS plumbing.
+        assert!(markup.contains("style="), "expected inline styling: {markup}");
+        // A plain full-page render is not an out-of-band swap.
+        assert!(!markup.contains("hx-swap-oob"));
+
+        // render() consumes — the next render is empty.
+        assert_eq!(flash.peek().await.len(), 0);
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "maud")]
+    async fn render_emits_container_even_when_empty() {
+        let session = Session::new_for_test("test_id".to_string(), HashMap::new());
+        let flash = Flash::new(session);
+
+        // No messages pushed — the container must still render so htmx OOB
+        // swaps have a stable target on subsequent requests.
+        let markup = flash.render().await.into_string();
+        assert!(markup.contains("id=\"flash\""), "missing container: {markup}");
+        assert!(!markup.contains("flash flash-"));
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "maud")]
+    async fn render_oob_marks_container_for_out_of_band_swap() {
+        let session = Session::new_for_test("test_id".to_string(), HashMap::new());
+        let flash = Flash::new(session.clone());
+
+        flash.info("Updated").await;
+
+        let markup = flash.render_oob().await.into_string();
+        assert!(markup.contains("id=\"flash\""));
+        assert!(markup.contains("hx-swap-oob=\"true\""), "missing OOB attr: {markup}");
+        assert!(markup.contains("flash flash-info"));
+        assert!(markup.contains("Updated"));
+
+        // Like render(), render_oob() consumes.
+        assert_eq!(flash.peek().await.len(), 0);
     }
 
     #[tokio::test]

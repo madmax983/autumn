@@ -125,6 +125,7 @@ pub async fn register(
     mailer: Mailer,
     session: Session,
     events: autumn_web::events::Events,
+    flash: Flash,
     form: Form<RegisterForm>,
 ) -> AutumnResult<Redirect> {
     let open = crate::config_svc()
@@ -232,6 +233,8 @@ pub async fn register(
     session.insert("username", &user.username).await;
     session.insert("role", &user.role).await;
 
+    flash.success(format!("Welcome to autumn/reddit, u/{}!", user.username))
+        .await;
     Ok(Redirect::to("/"))
 }
 
@@ -349,7 +352,12 @@ pub struct LoginForm {
 }
 
 #[post("/login")]
-pub async fn login(mut db: Db, session: Session, form: Form<LoginForm>) -> AutumnResult<Redirect> {
+pub async fn login(
+    mut db: Db,
+    session: Session,
+    flash: Flash,
+    form: Form<LoginForm>,
+) -> AutumnResult<Redirect> {
     let username = form.0.username.trim().to_lowercase();
 
     let user: User = users::table
@@ -369,14 +377,24 @@ pub async fn login(mut db: Db, session: Session, form: Form<LoginForm>) -> Autum
     session.insert("username", &user.username).await;
     session.insert("role", &user.role).await;
 
+    flash.success(format!("Welcome back, u/{}!", user.username))
+        .await;
     Ok(Redirect::to("/"))
 }
 
 // ── Logout ─────────────────────────────────────────────────────
 
 #[post("/logout")]
-pub async fn logout(session: Session) -> autumn_web::reexports::axum::response::Response {
-    session.destroy().await;
+pub async fn logout(
+    session: Session,
+    flash: Flash,
+) -> autumn_web::reexports::axum::response::Response {
+    // Clear the session data and rotate the id so the old cookie can't be
+    // replayed, while letting a one-shot "signed out" notice ride the rotated
+    // session through to the front page.
+    session.clear().await;
+    session.rotate_id().await;
+    flash.info("You have been signed out.").await;
     super::layout::hx_redirect_to("/")
 }
 

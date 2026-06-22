@@ -10,7 +10,8 @@
 //! - Reset tokens are random values; only SHA-256 digests are persisted.
 //! - Duplicate signup and failed login return identical non-enumerating errors.
 //! - Login and reset-password rotate the session ID (prevents session fixation).
-//! - Logout destroys the session (old session cannot remain authenticated).
+//! - Logout clears the session data and rotates the ID, invalidating the old
+//!   session (old cookie cannot be replayed) while carrying a one-shot notice.
 
 use std::fmt::Write as _;
 use std::path::Path;
@@ -1772,7 +1773,8 @@ fn render_routes_file(
 //! - Reset tokens are 32-byte random values; only the SHA-256 digest is stored.
 //! - Duplicate signup and failed login return identical non-enumerating errors.
 //! - Login and reset-password rotate the session ID to prevent fixation.
-//! - Logout destroys the session so the old session cannot remain authenticated.
+//! - Logout clears + rotates the session, invalidating the old session (the old
+//!   cookie cannot be replayed) while carrying a one-shot "logged out" notice.
 //! - Every login is tracked as a `{sess_table}` row (digest of the opaque
 //!   session id + device attribution); revoking the row signs that device out
 //!   immediately — see `require_tracked_session` and
@@ -2226,6 +2228,7 @@ pub async fn signup(
     mut db: Db,
     mailer: Mailer,
     session: Session,
+    flash: Flash,
     Form(form): Form<SignupForm>,
 ) -> AutumnResult<Response> {{
     // Fail fast: confirmation requires mail. Check before any DB work so the
@@ -2304,6 +2307,7 @@ pub async fn signup(
         ));
     }}
 
+    flash.info("Account created — check your email to confirm.").await;
     Ok(redirect_to("/check-your-email"))
 }}
 
@@ -2311,8 +2315,10 @@ pub async fn signup(
 
 /// `GET /login` — render the login form.
 #[get("/login")]
-pub async fn login_form(csrf: Option<CsrfToken>, csrf_field: Option<CsrfFormField>) -> AutumnResult<Markup> {{
+pub async fn login_form(flash: Flash, csrf: Option<CsrfToken>, csrf_field: Option<CsrfFormField>) -> AutumnResult<Markup> {{
+    let flash_html = flash.render().await;
     Ok(layout("Log In", html! {{
+        (flash_html)
         h1 {{ "Log In" }}
         form action="/login" method="post" {{
             @if let Some(ref csrf) = csrf {{ input type="hidden" name=(csrf_field.as_ref().map_or("_csrf", |f| f.0.as_str())) value=(csrf.token()); }}
@@ -2375,6 +2381,7 @@ pub async fn login(
     mut db: Db,
     State(state): State<AppState>,
     session: Session,
+    flash: Flash,
     MaybeClientIp(addr_ip): MaybeClientIp,
     headers: axum::http::HeaderMap,
     Form(form): Form<LoginForm>,
@@ -2574,6 +2581,7 @@ pub async fn login(
     autumn_web::step_up::set_last_strong_auth_at(&session).await;
     // Track this login as an active session (device list + revocation).
     record_login_session(&mut db, &session, {snake_name}.id, addr_ip, &headers).await?;
+    flash.success("Logged in.").await;
     Ok(redirect_to("/account"))
 }}
 
@@ -2585,10 +2593,17 @@ pub async fn login(
 /// cannot be replayed after logout. The tracked `{sess_table}` row is removed
 /// too so the device disappears from the active-sessions list.
 #[post("/logout")]
-pub async fn logout(session: Session, mut db: Db) -> AutumnResult<Response> {{
+pub async fn logout(session: Session, mut db: Db, flash: Flash) -> AutumnResult<Response> {{
     // Best-effort: the device must sign out even if the row delete hiccups.
     let _ = untrack_current_session(&mut db, &session).await;
-    session.destroy().await;
+    // Invalidate the session: clear all data (drops the auth keys) and rotate
+    // the id so the pre-logout cookie can no longer be replayed — the old id is
+    // destroyed in the session store on save. This is equivalent to `destroy()`
+    // for replay safety while letting a one-shot logout notice ride the freshly
+    // rotated session through to the login page.
+    session.clear().await;
+    session.rotate_id().await;
+    flash.info("You have been logged out.").await;
     Ok(redirect_to("/login"))
 }}
 
@@ -2660,7 +2675,7 @@ pub async fn unlock_account(
 /// anonymous requests before the handler body runs.
 #[secured]
 #[get("/account")]
-pub async fn account(session: Session, State(state): State<AppState>, mut db: Db, csrf: Option<CsrfToken>, csrf_field: Option<CsrfFormField>) -> AutumnResult<Response> {{
+pub async fn account(session: Session, State(state): State<AppState>, mut db: Db, flash: Flash, csrf: Option<CsrfToken>, csrf_field: Option<CsrfFormField>) -> AutumnResult<Response> {{
     // Validates the tracked session row (401s immediately if revoked) and
     // refreshes `last_seen_at` with bounded write amplification.
     let {snake_name} = require_tracked_session(&session, &mut db, &state).await?;
@@ -2673,7 +2688,9 @@ pub async fn account(session: Session, State(state): State<AppState>, mut db: Db
         return Ok(redirect_to("/check-your-email").into_response());
     }}
 
+    let flash_html = flash.render().await;
     Ok(layout("Your Account", html! {{
+        (flash_html)
         h1 {{ "Your Account" }}
         @if let Some(scheduled) = {snake_name}.delete_scheduled_at {{
             div style="border:1px solid #c00;padding:0.75rem;margin-bottom:1rem;" {{
@@ -3279,8 +3296,10 @@ async fn send_reset_email(mailer: &Mailer, to: &str, token: &str) -> AutumnResul
 
 /// `GET /check-your-email` — shown after signup while awaiting email confirmation.
 #[get("/check-your-email")]
-pub async fn check_your_email() -> AutumnResult<Markup> {{
+pub async fn check_your_email(flash: Flash) -> AutumnResult<Markup> {{
+    let flash_html = flash.render().await;
     Ok(layout("Check Your Email", html! {{
+        (flash_html)
         h1 {{ "Check Your Email" }}
         p {{ "We've sent a confirmation link to your email address." }}
         p {{ "Please click the link in the email to activate your account. The link expires in 24 hours." }}
@@ -4743,8 +4762,10 @@ password hashing, and mail primitives.
   (`confirm_token_digest`); the raw token lives only in the email and URL bar.
 - **Session fixation**: Login and password-reset rotate the session ID
   (`session.rotate_id()`).
-- **Session invalidation**: Logout calls `session.destroy()` so an old session
-  cookie cannot be replayed.
+- **Session invalidation**: Logout clears the session data and rotates the ID,
+  destroying the old server-side session so the pre-logout cookie cannot be
+  replayed (equivalent to `destroy()` for replay safety) while still carrying a
+  one-shot "logged out" flash notice to the login page.
 - **Protected routes**: The `/account` route uses `#[secured]` to reject
   unauthenticated requests before the handler runs.
 - **Account lockout**: After the configured threshold of failed login attempts,
@@ -8082,9 +8103,54 @@ mod tests {
         let plan = plan_auth(tmp.path(), "User", "20260508000000").unwrap();
         plan.execute(Flags::default()).unwrap();
         let routes = fs::read_to_string(tmp.path().join("src/routes/auth.rs")).unwrap();
+        // Scope the assertion to the logout handler body so it cannot be
+        // satisfied by `session.destroy()` calls in other handlers.
+        let logout_pos = routes
+            .find("pub async fn logout(")
+            .expect("logout handler missing");
+        let after = &routes[logout_pos..];
+        let next_fn = after[1..]
+            .find("\npub async fn ")
+            .map_or(after.len(), |p| p + 1);
+        let logout_body = &after[..next_fn];
+        // Logout must invalidate the session so the pre-logout cookie cannot be
+        // replayed: clear the data (drops auth keys) and rotate the id (the old
+        // id is destroyed in the store on save). This is equivalent to
+        // `destroy()` for replay safety while letting a one-shot logout notice
+        // ride the rotated session to the login page.
         assert!(
-            routes.contains("session.destroy"),
-            "logout must destroy the session: {routes}"
+            logout_body.contains("session.clear()") && logout_body.contains("session.rotate_id()"),
+            "logout must invalidate the session via clear + rotate: {logout_body}"
+        );
+    }
+
+    #[test]
+    fn routes_file_emits_flash_messages() {
+        let tmp = project_with_main();
+        let plan = plan_auth(tmp.path(), "User", "20260508000000").unwrap();
+        plan.execute(Flags::default()).unwrap();
+        let routes = fs::read_to_string(tmp.path().join("src/routes/auth.rs")).unwrap();
+        // Flashes are set on the PRG-compatible auth flows.
+        assert!(
+            routes.contains(r#"flash.success("Logged in.")"#),
+            "login success must set a flash: {routes}"
+        );
+        assert!(
+            routes.contains(r#"flash.info("You have been logged out.")"#),
+            "logout must set a flash: {routes}"
+        );
+        assert!(
+            routes.contains("flash.info(\"Account created"),
+            "signup must set a flash: {routes}"
+        );
+        // The redirect-target pages render pending flashes in their layout.
+        assert!(
+            routes.contains("flash.render().await"),
+            "auth pages must render pending flashes: {routes}"
+        );
+        assert!(
+            routes.contains("pub async fn login_form(flash: Flash"),
+            "login_form must take the Flash extractor to render notices: {routes}"
         );
     }
 

@@ -176,8 +176,10 @@ pub async fn show(
     csrf: CsrfToken,
     repo: PgSubredditRepository,
     mut db: Db,
+    flash: Flash,
 ) -> AutumnResult<Markup> {
     let current_user = session.get("username").await;
+    let flash_html = flash.render().await;
 
     let subs = repo.find_by_slug(slug.clone()).await?;
     let sub = subs
@@ -208,6 +210,7 @@ pub async fn show(
         current_user.as_deref(),
         Some(csrf.token()),
         html! {
+            (flash_html)
             // Subreddit header
             div class="bg-white rounded-lg shadow-sm border border-gray-200 p-6 mb-6" {
                 div class="flex justify-between items-start" {
