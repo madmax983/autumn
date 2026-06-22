@@ -1,3 +1,11 @@
+//! PII and sensitive parameter filtering for structured logs.
+//!
+//! Scans deeply nested JSON payloads and masks field values whose keys match
+//! a predefined set of sensitive terms (e.g. passwords, API keys, credit cards).
+//!
+//! Replaces matches with `[FILTERED]` to ensure credentials and PII do not leak
+//! into observability backends.
+
 use serde_json::{Map, Value};
 use std::collections::BTreeSet;
 

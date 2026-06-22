@@ -1,3 +1,17 @@
+//! Pluggable interceptors for cross-cutting observability and mutation.
+//!
+//! Interceptors provide a hook into core framework pipelines—such as `OAuth2` flows,
+//! Mail delivery, or Background Jobs—allowing applications to transparently
+//! observe, mutate, or block operations before they occur.
+//!
+//! For example, a `MailInterceptor` could log outgoing emails, rewrite test domains,
+//! or deny delivery based on external rate-limiting. A `JobInterceptor` could
+//! inject distributed tracing contexts or increment enqueue metrics.
+//!
+//! # Note
+//! These are distinct from HTTP Middleware (`tower::Layer`), which operates exclusively
+//! on the incoming HTTP request path.
+
 #[cfg(feature = "oauth2")]
 use std::sync::Arc;
 

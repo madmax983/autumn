@@ -1,3 +1,12 @@
+//! Trusted proxy management and client IP extraction.
+//!
+//! When operating behind load balancers or reverse proxies (like AWS ALB or Cloudflare),
+//! the immediate peer IP address belongs to the proxy, not the end user.
+//!
+//! This module resolves the true client IP by parsing the `X-Forwarded-For` header
+//! from right to left, stripping out IPs belonging to configured `TrustedProxy` networks.
+//! This prevents spoofing attacks where malicious clients send their own `X-Forwarded-For` header.
+
 use axum::extract::ConnectInfo;
 use axum::http::Request;
 use std::net::{IpAddr, SocketAddr};

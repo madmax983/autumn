@@ -1,3 +1,12 @@
+//! Multi-tenant isolation context and extractors.
+//!
+//! Provides a `Tenant` extractor for identifying the current tenant from the HTTP request path,
+//! alongside middleware and task-local storage to securely propagate tenant IDs throughout
+//! the lifecycle of the request.
+//!
+//! When tenancy is configured, database models will automatically append `tenant_id` clauses
+//! preventing cross-tenant data leakage.
+
 use axum::{
     extract::State,
     http::Request,
