@@ -176,6 +176,7 @@ pub async fn show(
     csrf: CsrfToken,
     repo: PgSubredditRepository,
     mut db: Db,
+    flash: Flash,
 ) -> AutumnResult<Markup> {
     let current_user = session.get("username").await;
 
@@ -203,11 +204,14 @@ pub async fn show(
             .load(&mut *db)
             .await?;
 
+    // Consume the flash only after all fallible work above.
+    let flash_html = flash.render().await;
     Ok(layout(
         &format!("r/{}", sub.name),
         current_user.as_deref(),
         Some(csrf.token()),
         html! {
+            (flash_html)
             // Subreddit header
             div class="bg-white rounded-lg shadow-sm border border-gray-200 p-6 mb-6" {
                 div class="flex justify-between items-start" {

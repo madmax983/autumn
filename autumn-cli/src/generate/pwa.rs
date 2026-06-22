@@ -455,9 +455,10 @@ async fn pwa_register_js() -> impl IntoResponse {\n\
 }\n\
 \n\
 #[get(\"/offline\")]\n\
-async fn pwa_offline() -> maud::Markup {\n\
+async fn pwa_offline(flash: Flash) -> maud::Markup {\n\
     layout(\n\
         \"Offline\",\n\
+        flash.render().await,\n\
         maud::html! {\n\
             h1 { \"You are offline\" }\n\
             p { \"Check your internet connection and try again.\" }\n\
@@ -523,7 +524,7 @@ use autumn_web::prelude::*;
 
 const MIGRATIONS: EmbeddedMigrations = embed_migrations!();
 
-pub fn layout(title: &str, content: maud::Markup) -> maud::Markup {
+pub fn layout(title: &str, flash: maud::Markup, content: maud::Markup) -> maud::Markup {
     maud::html! {
         (maud::DOCTYPE)
         html lang=\"en\" {
@@ -531,6 +532,7 @@ pub fn layout(title: &str, content: maud::Markup) -> maud::Markup {
                 meta charset=\"utf-8\";
                 meta name=\"viewport\" content=\"width=device-width, initial-scale=1\";
                 title { (title) }
+                link rel=\"stylesheet\" href=(autumn_web::flash::FLASH_CSS_PATH);
                 link rel=\"stylesheet\" href=\"/static/css/app.css\";
             }
             body {
@@ -541,6 +543,7 @@ pub fn layout(title: &str, content: maud::Markup) -> maud::Markup {
                     }
                 }
                 main id=\"main-content\" role=\"main\" {
+                    (flash)
                     (content)
                 }
                 footer role=\"contentinfo\" {
@@ -552,8 +555,8 @@ pub fn layout(title: &str, content: maud::Markup) -> maud::Markup {
 }
 
 #[get(\"/\")]
-async fn index() -> maud::Markup {
-    layout(\"Welcome\", maud::html! {
+async fn index(flash: Flash) -> maud::Markup {
+    layout(\"Welcome\", flash.render().await, maud::html! {
         h1 { \"Welcome!\" }
     })
 }
@@ -834,7 +837,7 @@ async fn main() {
     fn inject_handlers_adds_offline_route() {
         let updated = inject_pwa_handlers(DEFAULT_MAIN);
         assert!(
-            updated.contains("async fn pwa_offline()"),
+            updated.contains("async fn pwa_offline("),
             "must add pwa_offline handler"
         );
     }
@@ -1014,7 +1017,7 @@ async fn main() {
         assert!(main_rs.contains("async fn pwa_manifest()"));
         assert!(main_rs.contains("async fn pwa_service_worker()"));
         assert!(main_rs.contains("async fn pwa_register_js()"));
-        assert!(main_rs.contains("async fn pwa_offline()"));
+        assert!(main_rs.contains("async fn pwa_offline("));
     }
 
     #[test]

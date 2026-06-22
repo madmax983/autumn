@@ -12,7 +12,7 @@ keywords = ["web", "composable", "axum", "htmx", "fullstack"]
 categories = ["web-programming", "web-programming::http-server"]
 
 [features]
-default = ["maud", "htmx", "tailwind", "db", "cache-moka", "http-client", "reporting"]
+default = ["maud", "htmx", "tailwind", "db", "cache-moka", "http-client", "reporting", "flash"]
 ws = ["dep:tokio-stream"]
 presence = ["ws"]
 flash = []

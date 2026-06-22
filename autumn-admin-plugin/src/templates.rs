@@ -4,7 +4,7 @@
 //! The design mirrors the actuator UI: system-ui font, Tailwind-ish
 //! color palette, clean cards with subtle shadows.
 
-use autumn_web::flash::FlashMessage;
+use autumn_web::flash::{FlashMessage, flash_message_divs};
 use autumn_web::job::{
     JobAdminPage, JobAdminRecord, JobAdminSnapshot, JobAdminStatus, JobScheduleSummary,
 };
@@ -476,11 +476,7 @@ pub fn admin_layout(
                     }
                     // Main content landmark
                     main id="admin-main" class="admin-main" {
-                        @for msg in messages {
-                            div class={ "flash flash-" (msg.level.as_str()) } role="alert" {
-                                (msg.message)
-                            }
-                        }
+                        (flash_message_divs(messages))
                         (content)
                     }
                 }
