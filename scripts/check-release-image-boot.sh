@@ -93,6 +93,50 @@ trap cleanup EXIT
 log "Scaffolding a fresh project with \`autumn new\`"
 ( cd "${WORKDIR}" && "${AUTUMN}" new "${PROJECT_NAME}" )
 
+# ── vendor the in-tree autumn-web into the build context ─────────────────────
+# The scaffold depends on `autumn-web` from crates.io. On trunk-dev the templates
+# use framework APIs (e.g. `Flash::render`, `FLASH_CSS_PATH`) that are ahead of
+# the last published autumn-web release, so a real `docker build` against
+# crates.io can't compile the generated project until the next release ships.
+#
+# Mirror what the Generator Conformance gates already do for plain `cargo` builds
+# (see autumn-cli/tests/generate.rs::patch_generated_cargo_toml): vendor the
+# in-tree autumn-web — and its proc-macro path dependency autumn-macros — into
+# the Docker build context and `[patch.crates-io]` the scaffold at it. The gate
+# then exercises *this* tree's framework through the real Docker plumbing
+# (cargo-chef, libpq, the runtime image) instead of a stale published crate.
+vendor_in_tree_autumn_web() {
+  log "Vendoring in-tree autumn-web into the build context"
+  local vendor_dir="${PROJECT_DIR}/vendor"
+  mkdir -p "${vendor_dir}"
+
+  # autumn (= autumn-web) and its path-dep autumn-macros are the only crates the
+  # scaffold's framework dependency needs. The shared target/ lives at the
+  # workspace root, so these crate dirs are source-only and cheap to copy.
+  cp -R "${REPO_ROOT}/autumn" "${vendor_dir}/autumn"
+  cp -R "${REPO_ROOT}/autumn-macros" "${vendor_dir}/autumn-macros"
+  # Drop any stray build artifacts so the context stays small and deterministic.
+  rm -rf "${vendor_dir}/autumn/target" "${vendor_dir}/autumn-macros/target"
+
+  # A workspace root so the vendored crates' `*.workspace = true` keys,
+  # `[workspace.dependencies]`, and `[workspace.lints]` resolve exactly as in the
+  # real tree. Derived from the real root manifest (members trimmed to the two
+  # vendored crates) so it stays in sync automatically.
+  sed 's|^members = \[.*\]|members = ["autumn", "autumn-macros"]|' \
+    "${REPO_ROOT}/Cargo.toml" > "${vendor_dir}/Cargo.toml"
+
+  # Point the scaffold's `autumn-web` crates.io dependency at the vendored source.
+  cat >> "${PROJECT_DIR}/Cargo.toml" <<'TOML'
+
+# CI-only: build the generated image against the in-tree autumn-web rather than
+# the last published crate (injected by scripts/check-release-image-boot.sh).
+[patch.crates-io]
+autumn-web = { path = "vendor/autumn" }
+TOML
+}
+
+vendor_in_tree_autumn_web
+
 # ── health probe helper ─────────────────────────────────────────────────────
 # Polls each URL until it returns HTTP 200 or the per-URL budget elapses.
 # Each URL gets a fresh budget window so a slow-starting first endpoint cannot
