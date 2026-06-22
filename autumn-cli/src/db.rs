@@ -312,8 +312,9 @@ fn quote_ident(name: &str) -> String {
 }
 
 /// Quote a value as a single-quoted SQL string literal, doubling embedded
-/// single quotes.
-fn quote_literal(value: &str) -> String {
+/// single quotes. Shared with `db_pull` (catalog/identifier values only — the
+/// connection URL is never interpolated).
+pub fn quote_literal(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
 

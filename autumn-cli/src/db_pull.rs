@@ -10,6 +10,8 @@
 //! No migration is written and no data is touched — the tables already exist.
 //! Errors are credential-safe: no variant ever embeds the resolved URL.
 
+use std::collections::BTreeMap;
+
 use diesel::{Connection as _, PgConnection, QueryableByName, RunQueryDsl as _, sql_query};
 
 use crate::generate::Flags;
@@ -115,10 +117,16 @@ fn pull(args: &PullArgs) -> Result<(), PullError> {
         return Err(PullError::NoTables);
     }
 
+    // Fetch every target table's columns and primary keys in two batched
+    // queries (not two per table), then assemble each `TableSchema` with no
+    // further I/O.
+    let columns_by_table = fetch_columns(&mut conn, &table_names)?;
+    let pks_by_table = fetch_primary_keys(&mut conn, &table_names)?;
+
     let explicit = !args.tables.is_empty();
     let mut tables = Vec::with_capacity(table_names.len());
     for table in &table_names {
-        match introspect_table(&mut conn, table) {
+        match build_table_schema(table, &columns_by_table, &pks_by_table) {
             Ok(schema) => tables.push(schema),
             // An unscoped pull skips a table it can't map (e.g. a `jsonb` column)
             // with a notice so the supported tables still come through; an
@@ -164,9 +172,12 @@ struct NameRow {
     name: String,
 }
 
-/// One column's catalog metadata.
+/// One column's catalog metadata (batched across tables, so it carries its
+/// owning `table_name`).
 #[derive(QueryableByName)]
 struct ColumnRow {
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    table_name: String,
     #[diesel(sql_type = diesel::sql_types::Text)]
     column_name: String,
     #[diesel(sql_type = diesel::sql_types::Text)]
@@ -181,6 +192,15 @@ struct ColumnRow {
     /// `'YES'` for identity columns (`GENERATED ... AS IDENTITY`), `'NO'` otherwise.
     #[diesel(sql_type = diesel::sql_types::Text)]
     is_identity: String,
+}
+
+/// A primary-key column paired with its owning table (batched PK probe).
+#[derive(QueryableByName)]
+struct TablePkRow {
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    table_name: String,
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    name: String,
 }
 
 /// List the base tables in `public`, excluding Diesel's bookkeeping table.
@@ -223,21 +243,78 @@ fn is_framework_table(table: &str) -> bool {
         )
 }
 
-/// Read a single table's columns (in ordinal order) and primary-key set.
-fn introspect_table(conn: &mut PgConnection, table: &str) -> Result<TableSchema, PullError> {
-    let pk = primary_key_columns(conn, table)?;
+/// Build a comma-separated SQL string-literal list (`'a', 'b'`) for an `IN (..)`
+/// clause from catalog-sourced names. `tables` is always non-empty here (the
+/// caller guards `table_names.is_empty()`), so the list is never `IN ()`.
+fn quoted_in_list(tables: &[String]) -> String {
+    tables
+        .iter()
+        .map(|t| crate::db::quote_literal(t))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
 
+/// Fetch every column (in ordinal order) for all `tables` in one query, grouped
+/// by table name.
+fn fetch_columns(
+    conn: &mut PgConnection,
+    tables: &[String],
+) -> Result<BTreeMap<String, Vec<ColumnRow>>, PullError> {
     let query = format!(
-        "SELECT column_name, udt_name, is_nullable, column_default, is_generated, is_identity \
-         FROM information_schema.columns \
-         WHERE table_schema = 'public' AND table_name = {} \
-         ORDER BY ordinal_position",
-        quote_literal(table)
+        "SELECT table_name, column_name, udt_name, is_nullable, column_default, is_generated, \
+         is_identity FROM information_schema.columns \
+         WHERE table_schema = 'public' AND table_name IN ({}) \
+         ORDER BY table_name, ordinal_position",
+        quoted_in_list(tables)
     );
     let rows: Vec<ColumnRow> = sql_query(query)
         .load(conn)
         .map_err(|e| PullError::Sql(e.to_string()))?;
+    let mut by_table: BTreeMap<String, Vec<ColumnRow>> = BTreeMap::new();
+    for row in rows {
+        by_table
+            .entry(row.table_name.clone())
+            .or_default()
+            .push(row);
+    }
+    Ok(by_table)
+}
 
+/// Fetch the primary-key column set for all `tables` in one query, grouped by
+/// table name. Joins through `pg_class`/`pg_namespace` so the index is matched
+/// in the `public` schema and tagged with its table.
+fn fetch_primary_keys(
+    conn: &mut PgConnection,
+    tables: &[String],
+) -> Result<BTreeMap<String, Vec<String>>, PullError> {
+    let query = format!(
+        "SELECT c.relname AS table_name, a.attname AS name \
+         FROM pg_index i \
+         JOIN pg_class c ON c.oid = i.indrelid \
+         JOIN pg_namespace n ON n.oid = c.relnamespace \
+         JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey) \
+         WHERE n.nspname = 'public' AND i.indisprimary AND c.relname IN ({})",
+        quoted_in_list(tables)
+    );
+    let rows: Vec<TablePkRow> = sql_query(query)
+        .load(conn)
+        .map_err(|e| PullError::Sql(e.to_string()))?;
+    let mut by_table: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for row in rows {
+        by_table.entry(row.table_name).or_default().push(row.name);
+    }
+    Ok(by_table)
+}
+
+/// Assemble a `TableSchema` (columns in ordinal order, PK columns flagged) from
+/// the pre-fetched catalog maps. Pure — no database access.
+fn build_table_schema(
+    table: &str,
+    columns_by_table: &BTreeMap<String, Vec<ColumnRow>>,
+    pks_by_table: &BTreeMap<String, Vec<String>>,
+) -> Result<TableSchema, PullError> {
+    let rows = columns_by_table.get(table).map_or(&[][..], Vec::as_slice);
+    let pk = pks_by_table.get(table).map_or(&[][..], Vec::as_slice);
     let mut columns = Vec::with_capacity(rows.len());
     for row in rows {
         let kind =
@@ -257,7 +334,7 @@ fn introspect_table(conn: &mut PgConnection, table: &str) -> Result<TableSchema,
             has_sequence_default,
             is_generated: row.is_generated.eq_ignore_ascii_case("ALWAYS"),
             is_identity: row.is_identity.eq_ignore_ascii_case("YES"),
-            name: row.column_name,
+            name: row.column_name.clone(),
             kind,
         });
     }
@@ -265,30 +342,6 @@ fn introspect_table(conn: &mut PgConnection, table: &str) -> Result<TableSchema,
         table: table.to_owned(),
         columns,
     })
-}
-
-/// The primary-key column names for `table`, in index order.
-fn primary_key_columns(conn: &mut PgConnection, table: &str) -> Result<Vec<String>, PullError> {
-    let query = format!(
-        "SELECT a.attname AS name \
-         FROM pg_index i \
-         JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey) \
-         WHERE i.indrelid = to_regclass({}) AND i.indisprimary",
-        // Quote the identifier so case-sensitive table names (e.g. "UserRole")
-        // resolve correctly; an unquoted name folds to lowercase and misses.
-        quote_literal(&format!("public.\"{}\"", table.replace('"', "\"\"")))
-    );
-    let rows: Vec<NameRow> = sql_query(query)
-        .load(conn)
-        .map_err(|e| PullError::Sql(e.to_string()))?;
-    Ok(rows.into_iter().map(|r| r.name).collect())
-}
-
-/// Quote a value as a single-quoted SQL string literal, doubling embedded
-/// single quotes. (Same construction as `db.rs`; column/table names from the
-/// catalog are interpolated, never the URL.)
-fn quote_literal(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "''"))
 }
 
 #[cfg(test)]
@@ -307,12 +360,6 @@ mod tests {
         let (host, port) = parse_host_port("postgres://localhost/app").unwrap();
         assert_eq!(host, "localhost");
         assert_eq!(port, 5432);
-    }
-
-    #[test]
-    fn quote_literal_doubles_single_quotes() {
-        assert_eq!(quote_literal("posts"), "'posts'");
-        assert_eq!(quote_literal("o'brien"), "'o''brien'");
     }
 
     #[test]

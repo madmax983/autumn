@@ -17,7 +17,7 @@ use std::path::Path;
 use super::dsl::FieldKind;
 use super::emit::Plan;
 use super::naming::{pascal, snake};
-use super::schema_edit::{add_mod_declaration, schema_has_table, singularize, update_main_rs};
+use super::schema_edit::{add_mod_declaration, singularize, update_main_rs};
 use super::{GenerateError, ensure_project_root};
 
 /// A single introspected column, in catalog (`ordinal_position`) order.
@@ -56,6 +56,15 @@ pub struct Column {
 }
 
 impl Column {
+    /// Whether the database supplies this column's value on insert — a sequence
+    /// default (`SERIAL`/`BIGSERIAL`, `nextval(...)`) or an identity column. Such
+    /// a value must not appear in `NewX`, and an `id` PK must satisfy this to be
+    /// insertable at all.
+    #[must_use]
+    pub const fn is_db_generated(&self) -> bool {
+        self.has_sequence_default || self.is_identity
+    }
+
     /// The Rust type for the model struct, wrapping nullable columns in `Option`.
     #[must_use]
     pub fn rust_type(&self) -> String {
@@ -242,7 +251,18 @@ pub fn plan_pull(
     let cargo_path = project_root.join("Cargo.toml");
     let existing = read_or_empty(&cargo_path);
     let with_deps = super::model::ensure_cargo_dependencies(&existing, super::model::MODEL_DEPS);
-    let updated = super::schema_edit::ensure_autumn_web_feature(&with_deps, "db");
+    let (updated, db_enabled) =
+        super::schema_edit::ensure_autumn_web_feature_status(&with_deps, "db");
+    if !db_enabled {
+        // No `autumn-web` dependency could be located to enable `db` on. The
+        // generated `#[autumn_web::model]` code needs that feature, so warn
+        // rather than emit silently-uncompilable output.
+        eprintln!(
+            "  \u{26a0} Could not enable autumn-web's `db` feature automatically. \
+             Add `features = [\"db\"]` to the `autumn-web` dependency in Cargo.toml \
+             so the generated models compile."
+        );
+    }
     if updated != existing {
         plan.modify(cargo_path, updated);
     }
@@ -307,10 +327,7 @@ fn inferred_table_name(pascal_name: &str) -> String {
 /// mutable column with a DB default stays settable. The primary key is handled
 /// separately by `#[id]` (which takes precedence in `render_model`).
 fn is_write_excluded(col: &Column) -> bool {
-    col.is_generated
-        || col.is_identity
-        || col.has_sequence_default
-        || (col.name == "created_at" && col.has_default)
+    col.is_db_generated() || col.is_generated || (col.name == "created_at" && col.has_default)
 }
 
 /// Build a `diesel::table!` block from introspected columns.
@@ -357,23 +374,31 @@ fn upsert_schema_block(
     force: bool,
 ) -> Result<String, GenerateError> {
     let block = render_schema_block(table, columns);
-    if schema_has_table(existing, table) {
-        if force {
-            Ok(replace_schema_block(existing, table, &block))
-        } else if schema_block_matches(existing, table, &block) {
-            Ok(existing.to_owned())
-        } else {
-            Err(GenerateError::Config(format!(
-                "src/schema.rs already has a `table!` block for '{table}' that differs from the \
-                 live database; re-run with --force to replace it (the regenerated model would \
-                 otherwise reference a stale schema and fail to compile)"
-            )))
+    // Locate any existing block once and branch on the result, rather than
+    // re-scanning the (growing) schema for has/matches/replace separately.
+    match schema_block_range(existing, table) {
+        Some((start, end)) => {
+            if force {
+                let mut out = String::with_capacity(existing.len() + block.len());
+                out.push_str(&existing[..start]);
+                out.push_str(block.trim_end());
+                out.push_str(&existing[end..]);
+                Ok(out)
+            } else if existing[start..end].trim() == block.trim() {
+                Ok(existing.to_owned())
+            } else {
+                Err(GenerateError::Config(format!(
+                    "src/schema.rs already has a `table!` block for '{table}' that differs from \
+                     the live database; re-run with --force to replace it (the regenerated model \
+                     would otherwise reference a stale schema and fail to compile)"
+                )))
+            }
         }
-    } else if existing.is_empty() {
-        Ok(block)
-    } else {
-        let trimmed = existing.trim_end();
-        Ok(format!("{trimmed}\n\n{block}"))
+        None if existing.is_empty() => Ok(block),
+        None => {
+            let trimmed = existing.trim_end();
+            Ok(format!("{trimmed}\n\n{block}"))
+        }
     }
 }
 
@@ -401,21 +426,42 @@ fn schema_block_range(existing: &str, table: &str) -> Option<(usize, usize)> {
             break;
         };
         let open = name_start + brace_rel;
-        // Match braces to find the end of the macro body.
+        // Match braces to find the end of the macro body, ignoring `{`/`}` that
+        // appear inside a `//` line comment or a "..." string (Diesel blocks can
+        // carry `///` doc comments and `#[sql_name = "..."]` attributes).
         let mut depth = 0usize;
         let mut end = None;
-        for (i, b) in existing[open..].bytes().enumerate() {
-            match b {
-                b'{' => depth += 1,
-                b'}' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        end = Some(open + i + 1);
-                        break;
-                    }
+        let mut in_string = false;
+        let mut in_line_comment = false;
+        let region = &existing.as_bytes()[open..];
+        let mut i = 0;
+        while i < region.len() {
+            let b = region[i];
+            if in_line_comment {
+                if b == b'\n' {
+                    in_line_comment = false;
                 }
-                _ => {}
+            } else if in_string {
+                if b == b'\\' {
+                    i += 1; // skip the escaped byte
+                } else if b == b'"' {
+                    in_string = false;
+                }
+            } else if b == b'/' && region.get(i + 1) == Some(&b'/') {
+                in_line_comment = true;
+                i += 1;
+            } else if b == b'"' {
+                in_string = true;
+            } else if b == b'{' {
+                depth += 1;
+            } else if b == b'}' {
+                depth -= 1;
+                if depth == 0 {
+                    end = Some(open + i + 1);
+                    break;
+                }
             }
+            i += 1;
         }
         let Some(end) = end else { break };
         // Does this macro define the table we're looking for?
@@ -430,26 +476,6 @@ fn schema_block_range(existing: &str, table: &str) -> Option<(usize, usize)> {
     None
 }
 
-/// Replace the existing `table!` block for `table` with `new_block`, or return
-/// `existing` unchanged if the block can't be located.
-fn replace_schema_block(existing: &str, table: &str, new_block: &str) -> String {
-    let Some((start, end)) = schema_block_range(existing, table) else {
-        return existing.to_owned();
-    };
-    let mut out = String::with_capacity(existing.len() + new_block.len());
-    out.push_str(&existing[..start]);
-    out.push_str(new_block.trim_end());
-    out.push_str(&existing[end..]);
-    out
-}
-
-/// Whether the existing `table!` block for `table` is byte-identical (modulo
-/// surrounding whitespace) to the freshly introspected `block`.
-fn schema_block_matches(existing: &str, table: &str, block: &str) -> bool {
-    schema_block_range(existing, table)
-        .is_some_and(|(start, end)| existing[start..end].trim() == block.trim())
-}
-
 /// Whether `columns` follow the Autumn `id BIGINT` primary-key convention the
 /// `#[model]` / `#[repository]` macros assume: exactly one primary-key column,
 /// named `id`, of type `i64`, whose value is generated by the database
@@ -461,9 +487,7 @@ fn has_autumn_id_pk(columns: &[Column]) -> bool {
     let pks: Vec<&Column> = columns.iter().filter(|c| c.is_pk).collect();
     matches!(
         pks.as_slice(),
-        [pk] if pk.name == "id"
-            && pk.kind == FieldKind::I64
-            && (pk.has_sequence_default || pk.is_identity)
+        [pk] if pk.name == "id" && pk.kind == FieldKind::I64 && pk.is_db_generated()
     )
 }
 
@@ -1274,6 +1298,51 @@ mod tests {
         );
         assert!(schema.contains("title -> Text,"));
         assert_eq!(schema.matches("posts (id)").count(), 1);
+    }
+
+    #[test]
+    fn plan_pull_force_replaces_block_with_brace_in_comment() {
+        let tmp = project();
+        let src = tmp.path().join("src");
+        // A hand-edited block whose doc comment contains a `}` must not confuse
+        // brace-matching: the whole block (through its real closing brace) is
+        // replaced, leaving no dangling brace.
+        fs::write(
+            src.join("schema.rs"),
+            "diesel::table! {\n    posts (id) {\n        /// trailing brace } in a comment\n        old_col -> Text,\n    }\n}\n",
+        )
+        .unwrap();
+        let plan = plan_pull(
+            tmp.path(),
+            &[post_table()],
+            PullOptions {
+                force: true,
+                ..PullOptions::default()
+            },
+        )
+        .unwrap();
+        plan.execute(Flags {
+            force: true,
+            dry_run: false,
+        })
+        .unwrap();
+        let schema = fs::read_to_string(src.join("schema.rs")).unwrap();
+        assert!(
+            !schema.contains("old_col"),
+            "stale block must be replaced: {schema}"
+        );
+        assert!(
+            !schema.contains("trailing brace"),
+            "comment must be gone: {schema}"
+        );
+        assert!(schema.contains("title -> Text,"));
+        assert_eq!(schema.matches("posts (id)").count(), 1);
+        // No leftover/dangling brace: braces stay balanced.
+        assert_eq!(
+            schema.matches('{').count(),
+            schema.matches('}').count(),
+            "braces must be balanced: {schema}"
+        );
     }
 
     #[test]
