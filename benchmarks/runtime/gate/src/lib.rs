@@ -72,28 +72,37 @@ pub fn parse_k6_summary(json_str: &str) -> anyhow::Result<HashMap<String, f64>> 
 /// Return the median of a non-empty slice of p99 values.
 ///
 /// Sorts the slice in place and picks the middle element (nearest-rank).
+/// Uses `f64::total_cmp` so a `NaN` reading cannot panic the sort (it orders
+/// after all real values; `check_gate` then treats it as a budget failure).
 ///
 /// # Panics
 /// Panics if `values` is empty.
 #[must_use]
 pub fn median_p99(values: &mut [f64]) -> f64 {
     assert!(!values.is_empty(), "median_p99 requires at least one value");
-    values.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    values.sort_by(f64::total_cmp);
     values[values.len() / 2]
 }
 
 /// Build a `GateReport` from budget definitions and per-path median p99 values.
 #[must_use]
-pub fn check_gate<S: BuildHasher>(budgets: &Budgets, medians: &HashMap<String, f64, S>) -> GateReport {
+pub fn check_gate<S: BuildHasher>(
+    budgets: &Budgets,
+    medians: &HashMap<String, f64, S>,
+) -> GateReport {
     let mut results: Vec<GateResult> = budgets
         .paths
         .iter()
         .map(|(path, budget)| {
-            // No measurement for a budgeted path (e.g. app was down) → conservative
-            // sentinel that exceeds any realistic budget so the gate fails loudly.
+            // No measurement for a budgeted path (e.g. app was down), or a NaN
+            // reading (malformed/incomplete k6 run) → conservative sentinel that
+            // exceeds any realistic budget so the gate fails loudly. NaN must be
+            // filtered explicitly: `NaN.ceil() as u64` saturates to 0 in Rust,
+            // which would otherwise pass any budget silently.
             let observed = medians
                 .get(path)
                 .copied()
+                .filter(|v| !v.is_nan())
                 .unwrap_or_else(|| f64::from(u32::MAX));
             // ceil so that 110.1ms rounds up to 111ms and fails a 110ms budget,
             // rather than being silently truncated to 110 and appearing to pass.
@@ -110,7 +119,10 @@ pub fn check_gate<S: BuildHasher>(budgets: &Budgets, medians: &HashMap<String, f
         .collect();
     results.sort_by(|a, b| a.path.cmp(&b.path));
     let all_passed = results.iter().all(|r| r.passed);
-    GateReport { all_passed, results }
+    GateReport {
+        all_passed,
+        results,
+    }
 }
 
 /// Format the single-line failure message for one gate result.
@@ -310,7 +322,26 @@ p99_ms = 95
             .iter()
             .find(|r| r.path == "GET /posts")
             .unwrap();
-        assert!(!html_result.passed, "path with no measurement must not pass");
+        assert!(
+            !html_result.passed,
+            "path with no measurement must not pass"
+        );
+    }
+
+    #[test]
+    fn check_gate_fails_when_measurement_is_nan() {
+        let budgets = two_path_budgets();
+        let mut medians = HashMap::new();
+        medians.insert("GET /api/posts".to_string(), f64::NAN);
+        medians.insert("GET /posts".to_string(), 70.0);
+        let report = check_gate(&budgets, &medians);
+        assert!(!report.all_passed, "NaN measurement must fail the gate");
+        let api_result = report
+            .results
+            .iter()
+            .find(|r| r.path == "GET /api/posts")
+            .unwrap();
+        assert!(!api_result.passed, "NaN must not pass via saturation to 0");
     }
 
     #[test]
@@ -334,10 +365,7 @@ p99_ms = 95
             passed: false,
         };
         let msg = format_failure_message(&result);
-        assert!(
-            msg.contains("GET /api/posts"),
-            "must name the path: {msg}"
-        );
+        assert!(msg.contains("GET /api/posts"), "must name the path: {msg}");
         assert!(msg.contains("142"), "must include observed p99: {msg}");
         assert!(msg.contains("110"), "must include budget: {msg}");
     }
@@ -400,8 +428,7 @@ p99_ms = 110
 "#;
         let budgets = parse_budgets(toml).unwrap();
         let required = &["GET /api/posts", "GET /posts"];
-        let err = check_budgets_dryrun(&budgets, required)
-            .expect_err("missing path must error");
+        let err = check_budgets_dryrun(&budgets, required).expect_err("missing path must error");
         assert!(
             err.to_string().contains("GET /posts"),
             "error must name the missing path: {err}"

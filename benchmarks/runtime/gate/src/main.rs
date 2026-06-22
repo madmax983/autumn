@@ -46,23 +46,26 @@ fn main() -> anyhow::Result<()> {
             }
             "--budgets" => {
                 i += 1;
-                budgets_path = Some(PathBuf::from(args.get(i).ok_or_else(|| {
-                    anyhow::anyhow!("--budgets requires a path argument")
-                })?));
+                budgets_path =
+                    Some(PathBuf::from(args.get(i).ok_or_else(|| {
+                        anyhow::anyhow!("--budgets requires a path argument")
+                    })?));
                 i += 1;
             }
             "--summary" => {
                 i += 1;
-                summary_paths.push(PathBuf::from(args.get(i).ok_or_else(|| {
-                    anyhow::anyhow!("--summary requires a path argument")
-                })?));
+                summary_paths
+                    .push(PathBuf::from(args.get(i).ok_or_else(|| {
+                        anyhow::anyhow!("--summary requires a path argument")
+                    })?));
                 i += 1;
             }
             "--report" => {
                 i += 1;
-                report_path = Some(PathBuf::from(args.get(i).ok_or_else(|| {
-                    anyhow::anyhow!("--report requires a path argument")
-                })?));
+                report_path =
+                    Some(PathBuf::from(args.get(i).ok_or_else(|| {
+                        anyhow::anyhow!("--report requires a path argument")
+                    })?));
                 i += 1;
             }
             other => {
@@ -78,7 +81,10 @@ fn main() -> anyhow::Result<()> {
 
     if check_budgets_mode {
         check_budgets_dryrun(&budgets, REQUIRED_PATHS)?;
-        println!("budgets.toml OK — covers all {} required path(s).", REQUIRED_PATHS.len());
+        println!(
+            "budgets.toml OK — covers all {} required path(s).",
+            REQUIRED_PATHS.len()
+        );
         return Ok(());
     }
 
@@ -97,11 +103,22 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
-    // Compute median p99 per path across the runs.
-    let medians: HashMap<String, f64> = per_path_runs
-        .iter_mut()
-        .map(|(path, runs)| (path.clone(), median_p99(runs)))
-        .collect();
+    // Compute median p99 per path across the runs. Every path must appear in
+    // every summary file — a path missing from some runs (e.g. the app was down
+    // and k6 recorded no samples for it) would otherwise have its median taken
+    // over a partial set, letting a transient outage slip past the gate.
+    let expected_runs = summary_paths.len();
+    let mut medians: HashMap<String, f64> = HashMap::new();
+    for (path, runs) in &mut per_path_runs {
+        if runs.len() != expected_runs {
+            anyhow::bail!(
+                "path '{path}' has {} measurement(s), but {expected_runs} were expected \
+                 (one per summary file) — a run may have failed to record this path",
+                runs.len()
+            );
+        }
+        medians.insert(path.clone(), median_p99(runs));
+    }
 
     let report = check_gate(&budgets, &medians);
     let summary = format_human_summary(&report);
@@ -116,7 +133,10 @@ fn main() -> anyhow::Result<()> {
 
     if !report.all_passed {
         for result in report.results.iter().filter(|r| !r.passed) {
-            eprintln!("::error::{}", bench_runtime_gate::format_failure_message(result));
+            eprintln!(
+                "::error::{}",
+                bench_runtime_gate::format_failure_message(result)
+            );
         }
         std::process::exit(1);
     }
