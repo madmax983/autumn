@@ -17,6 +17,7 @@ mod experiments;
 mod export;
 mod flags;
 mod generate;
+mod http;
 mod maintenance;
 mod migrate;
 mod monitor;

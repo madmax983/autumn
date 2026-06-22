@@ -104,6 +104,14 @@ fn load_vendor_manifest() -> Option<&'static VendorManifest> {
         .as_ref()
 }
 
+/// Returns `true` when htmx has been pinned via `autumn assets add htmx@…`.
+///
+/// The router uses this to skip the built-in embedded htmx handler so the
+/// vendored file (and its pinned integrity hash) is served by `ServeDir` instead.
+pub(crate) fn htmx_is_vendored() -> bool {
+    load_vendor_manifest().is_some_and(|m| m.assets.contains_key("htmx"))
+}
+
 #[cfg(feature = "embed-assets")]
 fn load_embedded_vendor_manifest() -> Option<VendorManifest> {
     EMBEDDED_STATIC
@@ -137,8 +145,10 @@ fn render_javascript_tag(asset: &VendorAsset) -> maud::Markup {
 /// ```
 /// where `{url}` is fingerprinted in release builds and plain in dev.
 ///
-/// Returns empty markup (with a `tracing::warn!`) when `name` is not found in
-/// the manifest, so a missing entry is a soft error that never breaks rendering.
+/// When `name` is not found in the manifest the helper logs a `tracing::warn!`
+/// and returns a visible HTML comment so the gap is discoverable in View Source.
+/// In debug builds a `<script>console.error(…)</script>` is also emitted so the
+/// error appears in the browser `DevTools` console.
 ///
 /// # Example
 ///
@@ -164,7 +174,30 @@ pub fn javascript_include_tag(name: &str) -> maud::Markup {
              run `autumn assets add {name}@<version>` to pin it",
             VENDOR_MANIFEST_FILE,
         );
-        maud::html! {}
+        missing_asset_markup(name)
+    }
+}
+
+/// Diagnostic markup returned when [`javascript_include_tag`] cannot find a
+/// named asset.  Always contains an HTML comment visible in View Source; in
+/// debug builds also fires `console.error` so `DevTools` catches the gap early.
+#[cfg(feature = "maud")]
+fn missing_asset_markup(name: &str) -> maud::Markup {
+    let comment = format!(
+        "<!-- autumn: asset '{name}' not found in {VENDOR_MANIFEST_FILE}; \
+         run `autumn assets add {name}@<version>` -->"
+    );
+    if cfg!(debug_assertions) {
+        let console_err = format!(
+            "console.error('[autumn] asset not found: {name} \
+             \u{2014} run autumn assets add {name}@<version>');"
+        );
+        maud::html! {
+            (maud::PreEscaped(comment))
+            script { (maud::PreEscaped(console_err)) }
+        }
+    } else {
+        maud::html! { (maud::PreEscaped(comment)) }
     }
 }
 
@@ -437,7 +470,7 @@ fn embedded_response(rel_path: &str) -> axum::response::Response {
     let is_manifest = rel_path
         .rsplit('/')
         .next()
-        .is_some_and(|name| name == ASSET_MANIFEST_FILE);
+        .is_some_and(|name| name == ASSET_MANIFEST_FILE || name == VENDOR_MANIFEST_FILE);
     if is_traversal || is_manifest {
         return http::StatusCode::NOT_FOUND.into_response();
     }
@@ -566,11 +599,12 @@ mod tests {
 
     #[cfg(feature = "maud")]
     #[test]
-    fn javascript_include_tag_unknown_name_returns_empty() {
+    fn javascript_include_tag_unknown_name_returns_diagnostic_comment() {
         let markup = javascript_include_tag("__nonexistent_pkg__");
+        let html = markup.into_string();
         assert!(
-            markup.into_string().is_empty(),
-            "expected empty markup for unknown asset"
+            html.contains("<!-- autumn: asset '__nonexistent_pkg__' not found"),
+            "expected HTML comment diagnostic for unknown asset, got: {html}"
         );
     }
 

@@ -18,7 +18,6 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use base64::Engine as _;
-use indicatif::{ProgressBar, ProgressStyle};
 use sha2::{Digest, Sha384};
 
 // ---------------------------------------------------------------------------
@@ -131,11 +130,24 @@ pub fn resolve_source(
         |url| {
             let file_rel = entry.map_or_else(
                 || {
-                    let basename = url.rsplit('/').next().unwrap_or("asset.js");
-                    format!("js/{basename}")
+                    // Parse the URL properly so query strings and fragments are
+                    // stripped before deriving the output filename.
+                    let basename = ::url::Url::parse(url)
+                        .ok()
+                        .and_then(|u| {
+                            u.path_segments()
+                                .and_then(|mut segs| segs.next_back().map(str::to_owned))
+                        })
+                        .filter(|s| !s.is_empty() && !s.contains(".."))
+                        .ok_or_else(|| {
+                            AssetsError::BadSpec(format!(
+                                "cannot derive a safe filename from URL: {url}"
+                            ))
+                        })?;
+                    Ok::<String, AssetsError>(format!("js/{basename}"))
                 },
-                |e| format!("js/{}", e.output_file),
-            );
+                |e| Ok(format!("js/{}", e.output_file)),
+            )?;
             Ok((url.to_owned(), file_rel))
         },
     )
@@ -225,24 +237,10 @@ pub fn save_manifest(path: &Path, manifest: &VendorManifest) -> Result<(), Asset
 // Download helper
 // ---------------------------------------------------------------------------
 
+/// Download `url` and return the bytes.  Delegates to [`crate::http::fetch_bytes`]
+/// so progress-bar logic is shared with `autumn setup`.
 pub fn download_bytes(url: &str) -> Result<Vec<u8>, AssetsError> {
-    let response = reqwest::blocking::Client::new()
-        .get(url)
-        .send()?
-        .error_for_status()?;
-
-    let total = response.content_length().unwrap_or(0);
-    let pb = ProgressBar::new(total);
-    pb.set_style(
-        ProgressStyle::with_template("  [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta})")
-            .expect("valid progress template")
-            .progress_chars("=> "),
-    );
-
-    let bytes = response.bytes()?;
-    pb.set_length(bytes.len() as u64);
-    pb.finish_and_clear();
-    Ok(bytes.to_vec())
+    Ok(crate::http::fetch_bytes(url)?)
 }
 
 /// Write `bytes` to `dest` atomically via a temp file so a failed write never
@@ -378,7 +376,19 @@ pub fn run_update(name: Option<&str>) {
 
 fn execute_update(name_spec: Option<&str>) -> Result<(), AssetsError> {
     let manifest_path = PathBuf::from(VENDOR_MANIFEST_PATH);
-    let mut manifest = load_manifest(&manifest_path);
+    execute_update_with_manifest(name_spec, &manifest_path, Path::new("static"))
+}
+
+/// Testable core of `run_update`: resolves, downloads, and re-pins assets.
+///
+/// Separated from [`execute_update`] so tests can point at a temp directory
+/// without touching the real `static/` tree.
+fn execute_update_with_manifest(
+    name_spec: Option<&str>,
+    manifest_path: &Path,
+    static_dir: &Path,
+) -> Result<(), AssetsError> {
+    let mut manifest = load_manifest(manifest_path);
 
     let to_update: Vec<(String, String, String, String)> = match name_spec {
         None => {
@@ -400,16 +410,16 @@ fn execute_update(name_spec: Option<&str>) -> Result<(), AssetsError> {
             if spec.contains('@') {
                 // Re-pin to a different version.
                 let (name, version) = parse_spec(spec)?;
-                let existing = manifest
-                    .assets
-                    .get(&name)
-                    .map(|a| a.file.clone())
-                    .ok_or_else(|| AssetsError::UnknownPackage(name.clone()));
-                let (source_url, file_rel) = resolve_source(&name, &version, None)?;
-                // If the name isn't in registry but is in manifest, use existing file path.
-                let file_rel = match existing {
-                    Ok(f) if source_url.contains(&name) => f,
-                    _ => file_rel,
+                let in_registry = registry().iter().any(|(k, _)| *k == name.as_str());
+                let (source_url, file_rel) = if in_registry {
+                    resolve_source(&name, &version, None)?
+                } else {
+                    // Package was added with `--url`; we cannot derive the new
+                    // version's URL automatically.  The user must re-add it:
+                    return Err(AssetsError::UnknownPackage(format!(
+                        "{name} was added with --url and is not in the built-in registry; \
+                         re-pin with `autumn assets add {name}@{version} --url <url>`"
+                    )));
                 };
                 vec![(name, version, source_url, file_rel)]
             } else {
@@ -432,7 +442,7 @@ fn execute_update(name_spec: Option<&str>) -> Result<(), AssetsError> {
         println!("Updating {name} → {version}...");
         let bytes = download_bytes(&source_url)?;
         let sri = compute_sri(&bytes);
-        let dest = PathBuf::from("static").join(&file_rel);
+        let dest = static_dir.join(&file_rel);
         write_atomic(&bytes, &dest)?;
         manifest.assets.insert(
             name.clone(),
@@ -446,7 +456,7 @@ fn execute_update(name_spec: Option<&str>) -> Result<(), AssetsError> {
         println!("  Updated {name} {version}  {sri}");
     }
 
-    save_manifest(&manifest_path, &manifest)?;
+    save_manifest(manifest_path, &manifest)?;
     Ok(())
 }
 
@@ -457,7 +467,6 @@ fn execute_update(name_spec: Option<&str>) -> Result<(), AssetsError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write as _;
 
     // --- parse_spec ---
 
@@ -650,5 +659,93 @@ mod tests {
         assert_eq!(fs::read(&dest).unwrap(), b"data");
         // No leftover .tmp file.
         assert!(!dest.with_extension("tmp").exists());
+    }
+
+    // --- Fix #2: execute_update for --url packages ---
+
+    #[test]
+    fn execute_update_with_version_for_url_package_errors_with_hint() {
+        let tmp_dir = tempfile::TempDir::new().unwrap();
+        let static_dir = tmp_dir.path().to_path_buf();
+        let manifest_path = static_dir.join(".autumn-assets.json");
+
+        // Simulate a package added with --url (not in the built-in registry).
+        let mut manifest = VendorManifest::default();
+        manifest.assets.insert(
+            "my-custom-lib".into(),
+            VendorAsset {
+                version: "1.0.0".into(),
+                source: "https://example.com/my-custom-lib.min.js".into(),
+                file: "js/my-custom-lib.min.js".into(),
+                integrity: "sha384-abc".into(),
+            },
+        );
+        save_manifest(&manifest_path, &manifest).unwrap();
+
+        // Attempting to re-pin with @version should fail with a clear message.
+        let result =
+            execute_update_with_manifest(Some("my-custom-lib@2.0.0"), &manifest_path, &static_dir);
+        assert!(result.is_err(), "expected error for --url package re-pin");
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("--url"), "error should mention --url: {msg}");
+        assert!(
+            msg.contains("my-custom-lib"),
+            "error should mention the package name: {msg}"
+        );
+    }
+
+    // --- Fix #3: URL→filename sanitization ---
+
+    #[test]
+    fn resolve_url_with_query_string_strips_it() {
+        // A URL with ?v= query: the derived filename must NOT include the query string.
+        let custom = "https://example.com/lib.min.js?v=1.2.3";
+        let (url, file) = resolve_source("unknown-pkg", "1.0.0", Some(custom)).unwrap();
+        assert_eq!(url, custom);
+        assert_eq!(file, "js/lib.min.js", "query string must be stripped");
+    }
+
+    #[test]
+    fn resolve_url_with_trailing_slash_errors() {
+        // A URL ending in / has an empty last path segment — cannot derive filename.
+        let custom = "https://example.com/path/";
+        let err = resolve_source("unknown-pkg", "1.0.0", Some(custom)).unwrap_err();
+        assert!(
+            matches!(err, AssetsError::BadSpec(_)),
+            "expected BadSpec for trailing-slash URL"
+        );
+    }
+
+    // --- Fix #4: Schema-identity test (CLI types ↔ framework types) ---
+
+    #[test]
+    fn cli_and_web_vendor_manifest_schemas_are_compatible() {
+        let json = r#"{
+            "version": "1",
+            "assets": {
+                "htmx": {
+                    "version": "2.0.4",
+                    "source": "https://example.com",
+                    "file": "js/htmx.min.js",
+                    "integrity": "sha384-abc"
+                }
+            }
+        }"#;
+
+        // Must parse as CLI type.
+        let cli: VendorManifest = serde_json::from_str(json).unwrap();
+        assert_eq!(cli.assets["htmx"].version, "2.0.4");
+        assert_eq!(cli.assets["htmx"].integrity, "sha384-abc");
+
+        // Must also parse as the framework type.
+        let fw: autumn_web::assets::VendorManifest = serde_json::from_str(json).unwrap();
+        assert_eq!(fw.assets["htmx"].version, "2.0.4");
+        assert_eq!(fw.assets["htmx"].file, "js/htmx.min.js");
+
+        // CLI → JSON → framework round-trip must preserve all fields.
+        let serialized = serde_json::to_string(&cli).unwrap();
+        let fw2: autumn_web::assets::VendorManifest = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(fw2.assets["htmx"].integrity, "sha384-abc");
+        assert_eq!(fw2.assets["htmx"].source, "https://example.com");
     }
 }

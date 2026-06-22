@@ -1032,7 +1032,12 @@ fn collect_claimed_get_paths(
     }
     #[cfg(feature = "htmx")]
     {
-        claimed.insert(crate::htmx::HTMX_JS_PATH.to_owned());
+        // Only claim the htmx path when the built-in handler is actually
+        // mounted; when htmx is vendored via `autumn assets`, ServeDir serves
+        // the file and the path must not appear in the claimed-routes set.
+        if !crate::assets::htmx_is_vendored() {
+            claimed.insert(crate::htmx::HTMX_JS_PATH.to_owned());
+        }
         claimed.insert(crate::htmx::HTMX_CSRF_JS_PATH.to_owned());
         claimed.insert(crate::htmx::AUTUMN_WIDGETS_JS_PATH.to_owned());
     }
@@ -1384,7 +1389,24 @@ fn mount_framework_routes(
     // Framework-provided routes
     #[cfg(feature = "htmx")]
     {
-        router = router.route(crate::htmx::HTMX_JS_PATH, axum::routing::get(htmx_handler));
+        // When htmx is vendored via `autumn assets add htmx@…`, skip the
+        // built-in handler so ServeDir serves the correctly-pinned file.
+        // Axum explicit routes beat `nest_service`, so without this guard the
+        // embedded 2.0.4 bytes would shadow any updated vendored version.
+        if crate::assets::htmx_is_vendored() {
+            tracing::debug!(
+                path = crate::htmx::HTMX_JS_PATH,
+                "htmx vendored via `autumn assets`; built-in handler skipped, ServeDir serves it"
+            );
+        } else {
+            router = router.route(crate::htmx::HTMX_JS_PATH, axum::routing::get(htmx_handler));
+            tracing::debug!(
+                method = "GET",
+                path = crate::htmx::HTMX_JS_PATH,
+                name = format!("htmx {}", crate::htmx::HTMX_VERSION),
+                "Mounted route"
+            );
+        }
         router = router.route(
             crate::htmx::HTMX_CSRF_JS_PATH,
             axum::routing::get(htmx_csrf_handler),
@@ -1392,12 +1414,6 @@ fn mount_framework_routes(
         router = router.route(
             crate::htmx::AUTUMN_WIDGETS_JS_PATH,
             axum::routing::get(autumn_widgets_handler),
-        );
-        tracing::debug!(
-            method = "GET",
-            path = crate::htmx::HTMX_JS_PATH,
-            name = format!("htmx {}", crate::htmx::HTMX_VERSION),
-            "Mounted route"
         );
         tracing::debug!(
             method = "GET",
