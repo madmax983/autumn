@@ -1283,18 +1283,15 @@ pub(crate) fn add_deferred_session_replay_key(
     session_id: Option<&str>,
     primary_replay_after_guard_denial: bool,
 ) {
-    if let Some(commit) = response.extensions().get::<DeferredIdempotencyCommit>() {
-        commit.add_session_alias(session_id, primary_replay_after_guard_denial);
-    }
+    let Some(commit) = response.extensions().get::<DeferredIdempotencyCommit>() else { return; };
+    commit.add_session_alias(session_id, primary_replay_after_guard_denial);
 }
 
 pub(crate) fn keep_deferred_session_commit_locked(response: &mut Response<Body>) {
-    if let Some(commit) = response
+    let Some(commit) = response
         .extensions_mut()
-        .remove::<DeferredIdempotencyCommit>()
-    {
-        commit.keep_locked_until_ttl();
-    }
+        .remove::<DeferredIdempotencyCommit>() else { return; };
+    commit.keep_locked_until_ttl();
 }
 
 fn request_idempotency_key(req: &Request<Body>) -> Option<String> {

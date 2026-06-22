@@ -274,20 +274,16 @@ pub(crate) fn resolve_profile(env: &dyn Env) -> String {
 
 /// Resolve the raw profile selector value (before normalization).
 fn resolve_profile_input(env: &dyn Env) -> String {
+    let check_env = |var| env.var(var).ok().map(|s| s.trim().to_owned()).filter(|s| !s.is_empty());
+
     // 1. Preferred env var
-    if let Ok(profile) = env.var("AUTUMN_ENV") {
-        let trimmed = profile.trim();
-        if !trimmed.is_empty() {
-            return trimmed.to_owned();
-        }
+    if let Some(profile) = check_env("AUTUMN_ENV") {
+        return profile;
     }
 
     // 2. Legacy env var
-    if let Ok(profile) = env.var("AUTUMN_PROFILE") {
-        let trimmed = profile.trim();
-        if !trimmed.is_empty() {
-            return trimmed.to_owned();
-        }
+    if let Some(profile) = check_env("AUTUMN_PROFILE") {
+        return profile;
     }
 
     // 3. CLI flag
