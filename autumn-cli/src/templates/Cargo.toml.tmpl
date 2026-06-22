@@ -10,6 +10,11 @@ autumn-web = "{{autumn_version}}"
 maud = { version = "0.27", features = ["axum"] }
 diesel_migrations = "2"
 
+[features]
+# Bake static/ (incl. the fingerprint manifest) and i18n locales into the
+# release binary for single-binary deploys. Enable with `autumn build --embed`.
+embed-assets = ["autumn-web/embed-assets"]
+
 [dev-dependencies]
 # tokio runtime macros are needed for #[tokio::test] in integration tests.
 tokio = { version = "1", features = ["rt", "macros"] }

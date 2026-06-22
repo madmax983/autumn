@@ -3,10 +3,12 @@ use clap::{Parser, Subcommand};
 mod build;
 mod canary;
 mod check;
+mod cold_start_driver;
 mod config;
 mod credentials;
 mod data;
 mod db;
+mod db_pull;
 mod dev;
 mod dev_loop_bench;
 mod doctor;
@@ -84,6 +86,11 @@ enum Commands {
         /// Package to build (for workspaces)
         #[arg(short, long)]
         package: Option<String>,
+        /// Embed static assets + i18n locales into the binary for a true
+        /// single-binary deploy (enables the `autumn-web/embed-assets` feature
+        /// and fingerprints before compiling so the manifest is baked in).
+        #[arg(long)]
+        embed: bool,
     },
     /// Start the dev server with hot reload (watch mode)
     Dev {
@@ -553,6 +560,14 @@ enum Commands {
         /// Print the budget table and exit without starting a server.
         #[arg(long)]
         dry_run: bool,
+        /// Measure the cold-start onboarding journey (`autumn new` → first 200,
+        /// including the first clean compile) instead of the warm dev loop.
+        #[arg(long)]
+        cold_start: bool,
+        /// With `--cold-start`, also measure the database-backed shape as an
+        /// informational (non-gating) result.
+        #[arg(long)]
+        include_db: bool,
     },
 }
 
@@ -675,16 +690,52 @@ enum DbCommands {
         #[arg(long)]
         force: bool,
     },
+    /// Scaffold Autumn models from an existing database (read-only introspection).
+    ///
+    /// Connects to the resolved primary database (the same way `autumn migrate`
+    /// does) and emits, for each selected table, a `#[model]` struct in
+    /// `src/models/`, a `diesel::table!` entry in `src/schema.rs`, and the
+    /// `pub mod` aggregator line — using the same file-emission machinery as
+    /// `autumn generate`. No migration is written and no data is touched.
+    ///
+    /// # Examples
+    ///
+    ///   # Pull every table:
+    ///   autumn db pull
+    ///
+    ///   # Pull specific tables, also emitting repositories:
+    ///   autumn db pull posts comments --with-repository
+    #[command(verbatim_doc_comment)]
+    Pull {
+        /// Tables to pull. When omitted, every non-system table is pulled.
+        #[arg(value_name = "TABLE")]
+        tables: Vec<String>,
+        /// Resolve the connection through a profile overlay (see `db create`).
+        #[arg(long, value_name = "PROFILE")]
+        profile: Option<String>,
+        /// Also emit a `#[repository(Model)]` trait per table.
+        #[arg(long)]
+        with_repository: bool,
+        /// Print the planned actions without writing any files.
+        #[arg(long)]
+        dry_run: bool,
+        /// Overwrite existing model/repository files instead of erroring.
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 impl DbCommands {
-    /// Translate the parsed CLI subcommand into the `db` module's command and
-    /// the optional profile override the connection should be resolved under.
+    /// Translate a lifecycle subcommand (`create`/`drop`/`reset`) into the `db`
+    /// module's command and the optional profile override the connection should
+    /// be resolved under. `pull` is dispatched separately (it does not map onto
+    /// [`db::DbCommand`]).
     fn into_command(self) -> (db::DbCommand, Option<String>) {
         match self {
             Self::Create { profile } => (db::DbCommand::Create, profile),
             Self::Drop { profile, force } => (db::DbCommand::Drop { force }, profile),
             Self::Reset { profile, force } => (db::DbCommand::Reset { force }, profile),
+            Self::Pull { .. } => unreachable!("db pull is dispatched before into_command"),
         }
     }
 }
@@ -1512,7 +1563,11 @@ fn main() {
 #[allow(clippy::too_many_lines)]
 fn run_command(command: Commands) {
     match command {
-        Commands::Build { debug, package } => build::run(debug, package.as_deref()),
+        Commands::Build {
+            debug,
+            package,
+            embed,
+        } => build::run(debug, embed, package.as_deref()),
         Commands::Dev {
             package,
             show_config,
@@ -1571,10 +1626,25 @@ fn run_command(command: Commands) {
             };
             migrate::run(&action, with_maintenance, &target, profile.as_deref());
         }
-        Commands::Db(cmd) => {
-            let (command, profile) = cmd.into_command();
-            db::run(&command, profile.as_deref());
-        }
+        Commands::Db(cmd) => match cmd {
+            DbCommands::Pull {
+                tables,
+                profile,
+                with_repository,
+                dry_run,
+                force,
+            } => db_pull::run(&db_pull::PullArgs {
+                profile,
+                tables,
+                with_repository,
+                dry_run,
+                force,
+            }),
+            other => {
+                let (command, profile) = other.into_command();
+                db::run(&command, profile.as_deref());
+            }
+        },
         Commands::Shard(cmd) => match cmd.command {
             ShardSubcommand::MoveSlot {
                 from,
@@ -1877,15 +1947,28 @@ fn run_command(command: Commands) {
             json,
             fail_on_regression,
             dry_run,
+            cold_start,
+            include_db,
         } => {
-            let exit_code = dev_loop_bench::run(
-                &example,
-                runs,
-                output.as_deref(),
-                json,
-                fail_on_regression,
-                dry_run,
-            );
+            let exit_code = if cold_start {
+                cold_start_driver::run_cold_start(
+                    runs,
+                    output.as_deref(),
+                    json,
+                    fail_on_regression,
+                    dry_run,
+                    include_db,
+                )
+            } else {
+                dev_loop_bench::run(
+                    &example,
+                    runs,
+                    output.as_deref(),
+                    json,
+                    fail_on_regression,
+                    dry_run,
+                )
+            };
             if exit_code != 0 {
                 std::process::exit(exit_code);
             }
@@ -2349,7 +2432,8 @@ mod tests {
             cli.command,
             Commands::Build {
                 debug: false,
-                package: None
+                package: None,
+                embed: false
             }
         ));
     }
@@ -2361,7 +2445,8 @@ mod tests {
             cli.command,
             Commands::Build {
                 debug: true,
-                package: None
+                package: None,
+                embed: false
             }
         ));
     }
@@ -2370,9 +2455,26 @@ mod tests {
     fn parse_build_with_package() {
         let cli = Cli::try_parse_from(["autumn", "build", "-p", "blog"]).unwrap();
         match cli.command {
-            Commands::Build { debug, package } => {
+            Commands::Build {
+                debug,
+                package,
+                embed,
+            } => {
                 assert!(!debug);
+                assert!(!embed);
                 assert_eq!(package.as_deref(), Some("blog"));
+            }
+            _ => panic!("expected Build command"),
+        }
+    }
+
+    #[test]
+    fn parse_build_with_embed() {
+        let cli = Cli::try_parse_from(["autumn", "build", "--embed"]).unwrap();
+        match cli.command {
+            Commands::Build { embed, debug, .. } => {
+                assert!(embed, "--embed must set the embed flag");
+                assert!(!debug);
             }
             _ => panic!("expected Build command"),
         }
@@ -2382,7 +2484,7 @@ mod tests {
     fn parse_build_with_long_package() {
         let cli = Cli::try_parse_from(["autumn", "build", "--package", "blog", "--debug"]).unwrap();
         match cli.command {
-            Commands::Build { debug, package } => {
+            Commands::Build { debug, package, .. } => {
                 assert!(debug);
                 assert_eq!(package.as_deref(), Some("blog"));
             }
@@ -2896,6 +2998,58 @@ mod tests {
             .into_command(),
             (db::DbCommand::Reset { force: false }, None)
         ));
+    }
+
+    #[test]
+    fn parse_db_pull_defaults() {
+        let cli = Cli::try_parse_from(["autumn", "db", "pull"]).unwrap();
+        let Commands::Db(DbCommands::Pull {
+            tables,
+            profile,
+            with_repository,
+            dry_run,
+            force,
+        }) = cli.command
+        else {
+            panic!("expected db pull");
+        };
+        assert!(tables.is_empty());
+        assert!(profile.is_none());
+        assert!(!with_repository);
+        assert!(!dry_run);
+        assert!(!force);
+    }
+
+    #[test]
+    fn parse_db_pull_with_tables_and_flags() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "db",
+            "pull",
+            "posts",
+            "comments",
+            "--with-repository",
+            "--dry-run",
+            "--force",
+            "--profile",
+            "test",
+        ])
+        .unwrap();
+        let Commands::Db(DbCommands::Pull {
+            tables,
+            profile,
+            with_repository,
+            dry_run,
+            force,
+        }) = cli.command
+        else {
+            panic!("expected db pull");
+        };
+        assert_eq!(tables, vec!["posts".to_owned(), "comments".to_owned()]);
+        assert_eq!(profile.as_deref(), Some("test"));
+        assert!(with_repository);
+        assert!(dry_run);
+        assert!(force);
     }
 
     // ── autumn seed tests ──────────────────────────────────────────────────
@@ -4158,6 +4312,8 @@ mod tests {
             json,
             fail_on_regression,
             dry_run,
+            cold_start,
+            include_db,
         } = cli.command
         else {
             panic!("expected dev-loop-bench");
@@ -4168,6 +4324,8 @@ mod tests {
         assert!(!json);
         assert!(!fail_on_regression);
         assert!(!dry_run);
+        assert!(!cold_start);
+        assert!(!include_db);
     }
 
     #[test]
@@ -4177,6 +4335,22 @@ mod tests {
             panic!("expected dev-loop-bench");
         };
         assert!(dry_run);
+    }
+
+    #[test]
+    fn parse_dev_loop_bench_cold_start_flags() {
+        let cli = Cli::try_parse_from(["autumn", "dev-loop-bench", "--cold-start", "--include-db"])
+            .unwrap();
+        let Commands::DevLoopBench {
+            cold_start,
+            include_db,
+            ..
+        } = cli.command
+        else {
+            panic!("expected dev-loop-bench");
+        };
+        assert!(cold_start);
+        assert!(include_db);
     }
 
     #[test]

@@ -117,6 +117,72 @@ pub mod migrate;
 pub mod plugin;
 pub mod plugin_conformance;
 pub mod probe;
+
+/// Re-export of the [`include_dir`](https://docs.rs/include_dir) crate.
+///
+/// Lets apps embed their `static/` and `i18n/` trees without adding `include_dir`
+/// as a direct dependency. Used by the [`embed_static!`] and [`embed_locales!`]
+/// macros. Nested in a module (rather than a crate-root `pub use`) so the
+/// re-export resolves for external consumers, mirroring [`reexports`].
+#[cfg(feature = "embed-assets")]
+pub mod include_dir {
+    pub use ::include_dir::*;
+}
+
+/// Embed the app's `static/` directory (including the `.autumn-manifest.json`
+/// written by `autumn build --embed`) into the binary at compile time.
+///
+/// Expands to an [`include_dir::Dir`] rooted at the **calling crate's**
+/// `static/` directory (resolved via `$CARGO_MANIFEST_DIR`, exactly like
+/// `embed_migrations!`). Pass the result to
+/// [`AppBuilder::embedded_static`](crate::app::AppBuilder::embedded_static):
+///
+/// ```rust,ignore
+/// static STATIC: autumn_web::include_dir::Dir = autumn_web::embed_static!();
+///
+/// #[autumn_web::main]
+/// async fn main() {
+///     autumn_web::app().embedded_static(&STATIC).run().await;
+/// }
+/// ```
+#[cfg(feature = "embed-assets")]
+#[macro_export]
+macro_rules! embed_static {
+    () => {{
+        // `include_dir!` emits `include_dir::{Dir, File, ...}` paths resolved at
+        // the call site, so bring our re-export into scope under that name. This
+        // lets apps embed without depending on the `include_dir` crate directly.
+        #[allow(unused_imports)]
+        use $crate::include_dir;
+        $crate::include_dir::include_dir!("$CARGO_MANIFEST_DIR/static")
+    }};
+}
+
+/// Embed the app's i18n locale bundles (the `i18n/` directory, or a custom
+/// directory) into the binary at compile time.
+///
+/// Pass the result to
+/// [`AppBuilder::embedded_locales`](crate::app::AppBuilder::embedded_locales).
+///
+/// ```rust,ignore
+/// static LOCALES: autumn_web::include_dir::Dir = autumn_web::embed_locales!();
+/// // or a custom directory:
+/// static LOCALES: autumn_web::include_dir::Dir = autumn_web::embed_locales!("translations");
+/// ```
+#[cfg(all(feature = "embed-assets", feature = "i18n"))]
+#[macro_export]
+macro_rules! embed_locales {
+    () => {{
+        #[allow(unused_imports)]
+        use $crate::include_dir;
+        $crate::include_dir::include_dir!("$CARGO_MANIFEST_DIR/i18n")
+    }};
+    ($dir:literal) => {{
+        #[allow(unused_imports)]
+        use $crate::include_dir;
+        $crate::include_dir::include_dir!(concat!("$CARGO_MANIFEST_DIR/", $dir))
+    }};
+}
 #[cfg(feature = "system-info")]
 pub mod system_info;
 pub use plugin::{Plugin, Plugins};

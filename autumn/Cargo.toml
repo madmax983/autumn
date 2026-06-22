@@ -52,6 +52,12 @@ telemetry-otlp = [
 ]
 redis = ["dep:redis"]
 i18n = []
+# Embed the app's `static/` tree (incl. the fingerprint manifest) and i18n
+# `locales`/`i18n` bundles into the release binary at compile time, so a single
+# binary serves styled, localized pages with zero sidecar files. Opt-in: dev
+# builds (or this feature off) still serve from disk for hot-reload. Mirrors the
+# `embed_migrations!` precedent. See `embed_static!`/`embed_locales!`.
+embed-assets = ["dep:include_dir"]
 # Pluggable file storage backends. Off by default; enabling adds the
 # `BlobStore` trait, the `Blob` value type, and a Local backend.
 # For S3-compatible storage add `autumn-storage-s3` as a separate
@@ -175,6 +181,7 @@ rsa = { version = "0.9", default-features = false, features = ["std", "pem"], op
 aes-gcm = "0.10"
 getrandom = "0.2"
 hex = "0.4"
+include_dir = { version = "0.7", optional = true }
 csv = { workspace = true, optional = true }
 lettre = { version = "0.11.21", default-features = false, features = ["builder", "smtp-transport", "tokio1-rustls-tls"], optional = true }
 chromiumoxide = { workspace = true, optional = true }
@@ -216,7 +223,7 @@ features = [
   "maud", "htmx", "tailwind", "db", "cache-moka",
   "ws", "flash", "multipart", "http-client", "oauth2", "openapi", "mcp",
   "redis", "i18n", "storage", "variants", "mail", "seed", "system-info", "markdown",
-  "reporting", "csv",
+  "reporting", "csv", "embed-assets",
 ]
 rustdoc-args = ["--cfg", "docsrs"]
 
