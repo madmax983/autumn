@@ -1,5 +1,6 @@
 use clap::{Parser, Subcommand};
 
+mod assets;
 mod build;
 mod canary;
 mod check;
@@ -130,6 +131,11 @@ enum Commands {
         /// Re-download even if the binary already exists
         #[arg(long)]
         force: bool,
+    },
+    /// Pin, vendor, and integrity-verify JS dependencies
+    Assets {
+        #[command(subcommand)]
+        action: AssetsCommands,
     },
     /// Run or inspect database migrations
     Migrate {
@@ -569,6 +575,35 @@ enum Commands {
         #[arg(long)]
         include_db: bool,
     },
+}
+
+/// Subcommands for `autumn assets`.
+#[derive(Subcommand)]
+enum AssetsCommands {
+    /// Download a JS dependency, compute a sha384 SRI hash, and record it in the manifest.
+    ///
+    /// Example: `autumn assets add htmx@2.0.4`
+    Add {
+        /// Package spec in `<name>@<version>` format (e.g. `htmx@2.0.4`).
+        spec: String,
+        /// Override the download URL (required for packages not in the built-in registry).
+        #[arg(long)]
+        url: Option<String>,
+    },
+    /// Print all pinned JS dependencies with their version and integrity hash.
+    List,
+    /// Re-download and re-pin a dependency (or all if no name given).
+    ///
+    /// Examples:
+    ///   `autumn assets update htmx`         — re-pin the recorded version
+    ///   `autumn assets update htmx@2.0.5`   — re-pin to a new version
+    ///   `autumn assets update`               — refresh all vendored assets
+    Update {
+        /// Name or `<name>@<version>` spec to update. Omit to update all.
+        name: Option<String>,
+    },
+    /// Recompute sha384 hashes for all vendored files and compare to the manifest.
+    Verify,
 }
 
 /// Subcommands for `autumn config`.
@@ -1772,6 +1807,16 @@ fn run_command(command: Commands) {
             &args,
         ),
         Commands::Setup { force } => setup::run(force),
+        Commands::Assets { action } => match action {
+            AssetsCommands::Add { spec, url } => assets::run_add(&spec, url.as_deref()),
+            AssetsCommands::List => assets::run_list(),
+            AssetsCommands::Update { name } => assets::run_update(name.as_deref()),
+            AssetsCommands::Verify => {
+                let manifest_path = std::path::PathBuf::from(assets::VENDOR_MANIFEST_PATH);
+                let static_dir = std::path::PathBuf::from("static");
+                assets::run_verify(&manifest_path, &static_dir);
+            }
+        },
         Commands::Routes {
             package,
             bin,
