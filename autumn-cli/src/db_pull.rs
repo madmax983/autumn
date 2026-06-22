@@ -246,10 +246,15 @@ fn introspect_table(conn: &mut PgConnection, table: &str) -> Result<TableSchema,
                 column: row.column_name.clone(),
                 udt: row.udt_name.clone(),
             })?;
+        let has_sequence_default = row
+            .column_default
+            .as_deref()
+            .is_some_and(|d| d.trim_start().to_ascii_lowercase().starts_with("nextval("));
         columns.push(Column {
             nullable: row.is_nullable.eq_ignore_ascii_case("YES"),
             is_pk: pk.iter().any(|c| c == &row.column_name),
             has_default: row.column_default.is_some(),
+            has_sequence_default,
             is_generated: row.is_generated.eq_ignore_ascii_case("ALWAYS"),
             is_identity: row.is_identity.eq_ignore_ascii_case("YES"),
             name: row.column_name,
