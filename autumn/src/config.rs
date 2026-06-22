@@ -584,7 +584,7 @@ fn should_warn_missing_profile_file(profile: &str, has_inline_profile_section: b
 /// ⚡ Bolt Optimization:
 /// Reduces memory allocations by using a single `Vec` instead of two and
 /// iterating directly over `Chars` to avoid `Vec<char>` allocations.
-fn levenshtein(a: &str, b: &str) -> usize {
+pub fn levenshtein(a: &str, b: &str) -> usize {
     let n = b.chars().count();
     let mut prev: Vec<usize> = (0..=n).collect();
     for (i, a_ch) in a.chars().enumerate() {
@@ -1616,6 +1616,13 @@ const fn default_jobs_redis_visibility_timeout_ms() -> u64 {
 }
 
 impl AutumnConfig {
+    /// Recursively extracts all valid configuration schema keys and nested fields.
+    pub fn get_schema_keys() -> HashMap<String, HashSet<String>> {
+        let deserializer = SchemaDeserializer::new();
+        let _ = Self::deserialize(deserializer.clone());
+        deserializer.into_schema()
+    }
+
     /// Access the decrypted credentials store.
     ///
     /// Returns an empty store when no credentials file was found (the feature is opt-in).
@@ -4563,10 +4570,402 @@ impl AutumnConfig {
     }
 }
 
-#[cfg(test)]
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
+use serde::de::{self, Visitor, MapAccess, SeqAccess, DeserializeSeed};
+
+#[derive(Clone)]
+pub struct SchemaDeserializer {
+    path: Vec<String>,
+    schema: Arc<Mutex<HashMap<String, HashSet<String>>>>,
+}
+
+impl SchemaDeserializer {
+    pub fn new() -> Self {
+        Self {
+            path: Vec::new(),
+            schema: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    pub fn into_schema(self) -> HashMap<String, HashSet<String>> {
+        let lock = self.schema.lock().unwrap();
+        lock.clone()
+    }
+}
+
+impl<'de> de::Deserializer<'de> for SchemaDeserializer {
+    type Error = serde::de::value::Error;
+
+    fn deserialize_any<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+    where
+        V: Visitor<'de>,
+    {
+        visitor.visit_str("")
+    }
+
+    fn deserialize_bool<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+    where
+        V: Visitor<'de>,
+    {
+        visitor.visit_bool(false)
+    }
+
+    fn deserialize_i8<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+    where
+        V: Visitor<'de>,
+    {
+        visitor.visit_i8(0)
+    }
+
+    fn deserialize_i16<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+    where
+        V: Visitor<'de>,
+    {
+        visitor.visit_i16(0)
+    }
+
+    fn deserialize_i32<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+    where
+        V: Visitor<'de>,
+    {
+        visitor.visit_i32(0)
+    }
+
+    fn deserialize_i64<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+    where
+        V: Visitor<'de>,
+    {
+        visitor.visit_i64(0)
+    }
+
+    fn deserialize_u8<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+    where
+        V: Visitor<'de>,
+    {
+        visitor.visit_u8(0)
+    }
+
+    fn deserialize_u16<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+    where
+        V: Visitor<'de>,
+    {
+        visitor.visit_u16(0)
+    }
+
+    fn deserialize_u32<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+    where
+        V: Visitor<'de>,
+    {
+        visitor.visit_u32(0)
+    }
+
+    fn deserialize_u64<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+    where
+        V: Visitor<'de>,
+    {
+        visitor.visit_u64(0)
+    }
+
+    fn deserialize_f32<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+    where
+        V: Visitor<'de>,
+    {
+        visitor.visit_f32(0.0)
+    }
+
+    fn deserialize_f64<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+    where
+        V: Visitor<'de>,
+    {
+        visitor.visit_f64(0.0)
+    }
+
+    fn deserialize_char<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+    where
+        V: Visitor<'de>,
+    {
+        visitor.visit_char('\0')
+    }
+
+    fn deserialize_str<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+    where
+        V: Visitor<'de>,
+    {
+        visitor.visit_str("")
+    }
+
+    fn deserialize_string<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+    where
+        V: Visitor<'de>,
+    {
+        visitor.visit_string(String::new())
+    }
+
+    fn deserialize_bytes<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+    where
+        V: Visitor<'de>,
+    {
+        visitor.visit_bytes(&[])
+    }
+
+    fn deserialize_byte_buf<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+    where
+        V: Visitor<'de>,
+    {
+        visitor.visit_byte_buf(Vec::new())
+    }
+
+    fn deserialize_option<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+    where
+        V: Visitor<'de>,
+    {
+        visitor.visit_some(self)
+    }
+
+    fn deserialize_unit<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+    where
+        V: Visitor<'de>,
+    {
+        visitor.visit_unit()
+    }
+
+    fn deserialize_unit_struct<V>(
+        self,
+        _name: &'static str,
+        visitor: V,
+    ) -> Result<V::Value, Self::Error>
+    where
+        V: Visitor<'de>,
+    {
+        visitor.visit_unit()
+    }
+
+    fn deserialize_newtype_struct<V>(
+        self,
+        _name: &'static str,
+        visitor: V,
+    ) -> Result<V::Value, Self::Error>
+    where
+        V: Visitor<'de>,
+    {
+        visitor.visit_newtype_struct(self)
+    }
+
+    fn deserialize_seq<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+    where
+        V: Visitor<'de>,
+    {
+        visitor.visit_seq(SchemaSeqAccess {
+            done: false,
+            deserializer: self,
+        })
+    }
+
+    fn deserialize_tuple<V>(self, _len: usize, visitor: V) -> Result<V::Value, Self::Error>
+    where
+        V: Visitor<'de>,
+    {
+        self.deserialize_seq(visitor)
+    }
+
+    fn deserialize_tuple_struct<V>(
+        self,
+        _name: &'static str,
+        _len: usize,
+        visitor: V,
+    ) -> Result<V::Value, Self::Error>
+    where
+        V: Visitor<'de>,
+    {
+        self.deserialize_seq(visitor)
+    }
+
+    fn deserialize_map<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+    where
+        V: Visitor<'de>,
+    {
+        visitor.visit_map(SchemaMapAccess {
+            fields: [].iter(),
+            current_field: None,
+            deserializer: self,
+        })
+    }
+
+    fn deserialize_struct<V>(
+        self,
+        _name: &'static str,
+        fields: &'static [&'static str],
+        visitor: V,
+    ) -> Result<V::Value, Self::Error>
+    where
+        V: Visitor<'de>,
+    {
+        let path_str = self.path.join(".");
+        {
+            let mut schema = self.schema.lock().unwrap();
+            schema.insert(path_str, fields.iter().map(|&s| s.to_string()).collect());
+        }
+
+        visitor.visit_map(SchemaMapAccess {
+            fields: fields.iter(),
+            current_field: None,
+            deserializer: self,
+        })
+    }
+
+    fn deserialize_enum<V>(
+        self,
+        _name: &'static str,
+        _variants: &'static [&'static str],
+        visitor: V,
+    ) -> Result<V::Value, Self::Error>
+    where
+        V: Visitor<'de>,
+    {
+        visitor.visit_enum(SchemaEnumAccess)
+    }
+
+    fn deserialize_identifier<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+    where
+        V: Visitor<'de>,
+    {
+        visitor.visit_str("")
+    }
+
+    fn deserialize_ignored_any<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+    where
+        V: Visitor<'de>,
+    {
+        visitor.visit_unit()
+    }
+}
+
+struct SchemaSeqAccess {
+    done: bool,
+    deserializer: SchemaDeserializer,
+}
+
+impl<'de> SeqAccess<'de> for SchemaSeqAccess {
+    type Error = serde::de::value::Error;
+
+    fn next_element_seed<T>(&mut self, seed: T) -> Result<Option<T::Value>, Self::Error>
+    where
+        T: DeserializeSeed<'de>,
+    {
+        if !self.done {
+            self.done = true;
+            seed.deserialize(self.deserializer.clone()).map(Some)
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+struct SchemaMapAccess {
+    fields: std::slice::Iter<'static, &'static str>,
+    current_field: Option<&'static str>,
+    deserializer: SchemaDeserializer,
+}
+
+impl<'de> MapAccess<'de> for SchemaMapAccess {
+    type Error = serde::de::value::Error;
+
+    fn next_key_seed<K>(&mut self, seed: K) -> Result<Option<K::Value>, Self::Error>
+    where
+        K: DeserializeSeed<'de>,
+    {
+        if let Some(&field) = self.fields.next() {
+            self.current_field = Some(field);
+            seed.deserialize(de::value::StrDeserializer::new(field)).map(Some)
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn next_value_seed<V>(&mut self, seed: V) -> Result<V::Value, Self::Error>
+    where
+        V: DeserializeSeed<'de>,
+    {
+        let field = self.current_field.take().unwrap();
+        let mut new_path = self.deserializer.path.clone();
+        new_path.push(field.to_string());
+
+        let nested = SchemaDeserializer {
+            path: new_path,
+            schema: self.deserializer.schema.clone(),
+        };
+        seed.deserialize(nested)
+    }
+}
+
+struct SchemaEnumAccess;
+
+impl<'de> de::EnumAccess<'de> for SchemaEnumAccess {
+    type Error = serde::de::value::Error;
+    type Variant = Self;
+
+    fn variant_seed<V>(self, seed: V) -> Result<(V::Value, Self::Variant), Self::Error>
+    where
+        V: de::DeserializeSeed<'de>,
+    {
+        let val = seed.deserialize(de::value::StrDeserializer::new(""))?;
+        Ok((val, self))
+    }
+}
+
+impl<'de> de::VariantAccess<'de> for SchemaEnumAccess {
+    type Error = serde::de::value::Error;
+
+    fn unit_variant(self) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    fn newtype_variant_seed<T>(self, seed: T) -> Result<T::Value, Self::Error>
+    where
+        T: de::DeserializeSeed<'de>,
+    {
+        seed.deserialize(SchemaDeserializer::new())
+    }
+
+    fn tuple_variant<V>(self, _len: usize, visitor: V) -> Result<V::Value, Self::Error>
+    where
+        V: Visitor<'de>,
+    {
+        visitor.visit_unit()
+    }
+
+    fn struct_variant<V>(
+        self,
+        _fields: &'static [&'static str],
+        visitor: V,
+    ) -> Result<V::Value, Self::Error>
+    where
+        V: Visitor<'de>,
+    {
+        visitor.visit_unit()
+    }
+}
+
 mod tests {
 
     use super::*;
+
+    #[test]
+    fn test_schema_extractor() {
+        let keys = AutumnConfig::get_schema_keys();
+        assert!(keys.contains_key(""));
+        let root_keys = &keys[""];
+        assert!(root_keys.contains("server"));
+        assert!(root_keys.contains("database"));
+
+        assert!(keys.contains_key("server"));
+        assert!(keys["server"].contains("port"));
+        assert!(keys["server"].contains("host"));
+
+        assert!(keys.contains_key("database"));
+        assert!(keys["database"].contains("primary_url"));
+    }
 
     #[test]
     fn should_warn_total_connections_at_and_above_threshold() {
