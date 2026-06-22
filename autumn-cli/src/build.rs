@@ -95,14 +95,8 @@ pub fn run(debug: bool, embed: bool, package: Option<&str>) {
         return;
     }
 
-    let mut cargo = build_cargo_command(debug, embed, package);
-
     eprintln!("Compiling ({profile} profile)...");
-    let status = cargo.status().expect("failed to run cargo build");
-    if !status.success() {
-        eprintln!("\u{2717} Compilation failed");
-        std::process::exit(1);
-    }
+    run_cargo_or_exit(build_cargo_command(debug, embed, package));
 
     // Release builds fingerprint *after* the compile (the runtime reads the
     // manifest from disk, so order doesn't matter, and the static renderer below

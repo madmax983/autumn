@@ -227,8 +227,22 @@ pub fn init(
 
 /// Whether the project at `dir` defines an `embed-assets` Cargo feature, i.e.
 /// it is wired for single-binary embedded builds (`autumn build --embed`).
+///
+/// Parses the `[features]` table rather than substring-matching the file, so a
+/// comment or unrelated text mentioning "embed-assets" doesn't cause
+/// `autumn build --embed` (which would then fail for a project that lacks the
+/// feature) to be baked into the generated Dockerfile.
 fn project_has_embed_assets(dir: &Path) -> bool {
-    fs::read_to_string(dir.join("Cargo.toml")).is_ok_and(|toml| toml.contains("embed-assets"))
+    let Ok(contents) = fs::read_to_string(dir.join("Cargo.toml")) else {
+        return false;
+    };
+    let Ok(parsed) = toml::from_str::<toml::Table>(&contents) else {
+        return false;
+    };
+    parsed
+        .get("features")
+        .and_then(toml::Value::as_table)
+        .is_some_and(|features| features.contains_key("embed-assets"))
 }
 
 fn render(template: &str, project_name: &str, embed: bool) -> String {

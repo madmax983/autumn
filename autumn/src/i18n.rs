@@ -373,11 +373,28 @@ impl Bundle {
             messages.insert(stem, parsed);
         }
 
-        let default_path = dir.join(format!("{}.ftl", config.default_locale));
+        Self::from_locale_messages(
+            messages,
+            config,
+            dir.join(format!("{}.ftl", config.default_locale)),
+        )
+    }
+
+    /// Validate that the default locale is present and assemble the bundle.
+    ///
+    /// Shared tail of [`load_from_dir`](Self::load_from_dir) and
+    /// [`load_from_embedded`](Self::load_from_embedded): only their file-source
+    /// loops differ. `missing_default_path` is the path reported when the
+    /// default locale's file is absent.
+    fn from_locale_messages(
+        messages: HashMap<String, HashMap<String, String>>,
+        config: &I18nConfig,
+        missing_default_path: PathBuf,
+    ) -> Result<Self, LoadError> {
         if !messages.contains_key(&config.default_locale) {
             return Err(LoadError::MissingDefaultLocale {
                 locale: config.default_locale.clone(),
-                path: default_path,
+                path: missing_default_path,
             });
         }
 
@@ -433,22 +450,11 @@ impl Bundle {
             messages.insert(stem, parsed);
         }
 
-        if !messages.contains_key(&config.default_locale) {
-            return Err(LoadError::MissingDefaultLocale {
-                locale: config.default_locale.clone(),
-                path: PathBuf::from(format!("{}.ftl", config.default_locale)),
-            });
-        }
-
-        Ok(Self {
+        Self::from_locale_messages(
             messages,
-            fallback_chain: config.resolved_fallback_chain(),
-            default_locale: config.default_locale.clone(),
-            supported_locales: config.supported_locales.clone(),
-            miss_warnings: std::sync::Mutex::new(HashMap::new()),
-            warn_dedup_window: Duration::from_secs(60),
-            miss_count: AtomicU64::new(0),
-        })
+            config,
+            PathBuf::from(format!("{}.ftl", config.default_locale)),
+        )
     }
 
     /// Construct a bundle directly from in-memory translations (test helper).

@@ -37,6 +37,10 @@ use std::collections::HashMap;
 #[cfg(any(not(debug_assertions), feature = "embed-assets"))]
 use std::sync::OnceLock;
 
+/// Filename of the fingerprint manifest within the `static/` tree.
+#[cfg(any(not(debug_assertions), feature = "embed-assets"))]
+const ASSET_MANIFEST_FILE: &str = ".autumn-manifest.json";
+
 /// On-disk format of `static/.autumn-manifest.json`.
 #[cfg(any(not(debug_assertions), feature = "embed-assets"))]
 #[derive(Debug, serde::Deserialize)]
@@ -51,7 +55,7 @@ static ASSET_MANIFEST: OnceLock<Option<AssetManifest>> = OnceLock::new();
 fn load_manifest() -> &'static Option<AssetManifest> {
     ASSET_MANIFEST.get_or_init(|| {
         let manifest_path =
-            crate::app::project_dir("static", &crate::config::OsEnv).join(".autumn-manifest.json");
+            crate::app::project_dir("static", &crate::config::OsEnv).join(ASSET_MANIFEST_FILE);
         let contents = std::fs::read_to_string(manifest_path).ok()?;
         serde_json::from_str(&contents).ok()
     })
@@ -104,7 +108,7 @@ pub fn register_embedded_static(dir: EmbeddedStaticDir) {
     let _ = EMBEDDED_STATIC.set(dir);
     let _ = EMBEDDED_MANIFEST.set(
         dir.0
-            .get_file(".autumn-manifest.json")
+            .get_file(ASSET_MANIFEST_FILE)
             .and_then(include_dir::File::contents_utf8)
             .and_then(|s| serde_json::from_str::<AssetManifest>(s).ok()),
     );
@@ -271,13 +275,23 @@ pub async fn asset_cache_control(
 #[cfg(feature = "embed-assets")]
 #[must_use]
 pub(crate) fn content_type_for(path: &str) -> &'static str {
-    let ext = path
+    // Lowercase the extension into a small stack buffer (extensions are short
+    // and ASCII) to avoid a per-request heap allocation on the serving path.
+    let raw = path
         .rsplit('/')
         .next()
         .unwrap_or("")
         .rsplit_once('.')
-        .map_or(String::new(), |(_, e)| e.to_ascii_lowercase());
-    match ext.as_str() {
+        .map_or("", |(_, e)| e);
+    let mut buf = [0u8; 8];
+    let ext = if raw.is_ascii() && raw.len() <= buf.len() {
+        buf[..raw.len()].copy_from_slice(raw.as_bytes());
+        buf[..raw.len()].make_ascii_lowercase();
+        std::str::from_utf8(&buf[..raw.len()]).unwrap_or("")
+    } else {
+        "" // unknown long/non-ASCII extension → octet-stream
+    };
+    match ext {
         "css" => "text/css; charset=utf-8",
         "js" | "mjs" => "text/javascript; charset=utf-8",
         "json" | "map" => "application/json",
@@ -302,17 +316,22 @@ pub(crate) fn content_type_for(path: &str) -> &'static str {
 
 /// Serve a single file from the registered embedded `static/` tree.
 ///
-/// Returns `404` for traversal attempts, dotfiles (so the embedded
-/// `.autumn-manifest.json` is never exposed), missing files, or when no
-/// embedded dir is registered.
+/// Returns `404` for path-traversal attempts, the framework manifest
+/// (`.autumn-manifest.json`, which must never be exposed), missing files, or
+/// when no embedded dir is registered. Other files — including legitimate
+/// dotfile assets — are served, matching the on-disk `ServeDir` behavior.
 #[cfg(feature = "embed-assets")]
 fn embedded_response(rel_path: &str) -> axum::response::Response {
     use axum::response::IntoResponse;
 
-    if rel_path
+    let is_traversal = rel_path
         .split('/')
-        .any(|seg| seg.is_empty() || seg == ".." || seg.starts_with('.'))
-    {
+        .any(|seg| seg.is_empty() || seg == "." || seg == "..");
+    let is_manifest = rel_path
+        .rsplit('/')
+        .next()
+        .is_some_and(|name| name == ASSET_MANIFEST_FILE);
+    if is_traversal || is_manifest {
         return http::StatusCode::NOT_FOUND.into_response();
     }
     let Some(dir) = embedded_static_dir() else {
@@ -321,9 +340,10 @@ fn embedded_response(rel_path: &str) -> axum::response::Response {
     dir.0.get_file(rel_path).map_or_else(
         || http::StatusCode::NOT_FOUND.into_response(),
         |file| {
+            // `contents()` is `&'static [u8]`; serve it directly (no per-request copy).
             (
                 [(http::header::CONTENT_TYPE, content_type_for(rel_path))],
-                file.contents().to_vec(),
+                file.contents(),
             )
                 .into_response()
         },
