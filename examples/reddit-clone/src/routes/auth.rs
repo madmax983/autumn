@@ -233,7 +233,8 @@ pub async fn register(
     session.insert("username", &user.username).await;
     session.insert("role", &user.role).await;
 
-    flash.success(format!("Welcome to autumn/reddit, u/{}!", user.username))
+    flash
+        .success(format!("Welcome to autumn/reddit, u/{}!", user.username))
         .await;
     Ok(Redirect::to("/"))
 }
@@ -377,7 +378,8 @@ pub async fn login(
     session.insert("username", &user.username).await;
     session.insert("role", &user.role).await;
 
-    flash.success(format!("Welcome back, u/{}!", user.username))
+    flash
+        .success(format!("Welcome back, u/{}!", user.username))
         .await;
     Ok(Redirect::to("/"))
 }

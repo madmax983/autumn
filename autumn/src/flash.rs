@@ -367,7 +367,10 @@ mod tests {
 
         let markup = flash.render().await.into_string();
         // Stable container that doubles as the htmx OOB target.
-        assert!(markup.contains("id=\"flash\""), "missing container: {markup}");
+        assert!(
+            markup.contains("id=\"flash\""),
+            "missing container: {markup}"
+        );
         assert!(markup.contains("aria-live=\"polite\""));
         // Per-message level classes and text.
         assert!(markup.contains("flash flash-success"));
@@ -375,7 +378,10 @@ mod tests {
         assert!(markup.contains("flash flash-error"));
         assert!(markup.contains("Oops"));
         // Inline styles guarantee visibility with zero CSS plumbing.
-        assert!(markup.contains("style="), "expected inline styling: {markup}");
+        assert!(
+            markup.contains("style="),
+            "expected inline styling: {markup}"
+        );
         // A plain full-page render is not an out-of-band swap.
         assert!(!markup.contains("hx-swap-oob"));
 
@@ -392,7 +398,10 @@ mod tests {
         // No messages pushed — the container must still render so htmx OOB
         // swaps have a stable target on subsequent requests.
         let markup = flash.render().await.into_string();
-        assert!(markup.contains("id=\"flash\""), "missing container: {markup}");
+        assert!(
+            markup.contains("id=\"flash\""),
+            "missing container: {markup}"
+        );
         assert!(!markup.contains("flash flash-"));
     }
 
@@ -406,7 +415,10 @@ mod tests {
 
         let markup = flash.render_oob().await.into_string();
         assert!(markup.contains("id=\"flash\""));
-        assert!(markup.contains("hx-swap-oob=\"true\""), "missing OOB attr: {markup}");
+        assert!(
+            markup.contains("hx-swap-oob=\"true\""),
+            "missing OOB attr: {markup}"
+        );
         assert!(markup.contains("flash flash-info"));
         assert!(markup.contains("Updated"));
 
