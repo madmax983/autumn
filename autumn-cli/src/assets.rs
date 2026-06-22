@@ -50,6 +50,9 @@ pub enum AssetsError {
 
     #[error("manifest parse error: {0}")]
     Parse(String),
+
+    #[error("update failed: {0}")]
+    UpdateFailed(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -216,11 +219,18 @@ impl Default for VendorManifest {
     }
 }
 
-pub fn load_manifest(path: &Path) -> VendorManifest {
-    fs::read_to_string(path)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
+/// Load the vendor manifest from `path`.
+///
+/// Returns a default (empty) manifest when the file does not exist, but
+/// propagates a parse error when the file exists with invalid JSON — otherwise
+/// a corrupt manifest (e.g. from a merge conflict) would silently become empty
+/// and the next `save_manifest` would overwrite every other pinned asset.
+pub fn load_manifest(path: &Path) -> Result<VendorManifest, AssetsError> {
+    if !path.exists() {
+        return Ok(VendorManifest::default());
+    }
+    let s = fs::read_to_string(path)?;
+    serde_json::from_str(&s).map_err(|e| AssetsError::Parse(e.to_string()))
 }
 
 pub fn save_manifest(path: &Path, manifest: &VendorManifest) -> Result<(), AssetsError> {
@@ -275,7 +285,7 @@ pub fn run_verify(manifest_path: &Path, static_dir: &Path) {
 }
 
 pub fn verify_all(manifest_path: &Path, static_dir: &Path) -> Result<(), AssetsError> {
-    let manifest = load_manifest(manifest_path);
+    let manifest = load_manifest(manifest_path)?;
     if manifest.assets.is_empty() {
         println!("No vendored assets recorded in {}", manifest_path.display());
         return Ok(());
@@ -335,7 +345,7 @@ fn execute_add(spec: &str, url_override: Option<&str>) -> Result<(), AssetsError
     write_atomic(&bytes, &dest)?;
 
     let manifest_path = PathBuf::from(VENDOR_MANIFEST_PATH);
-    let mut manifest = load_manifest(&manifest_path);
+    let mut manifest = load_manifest(&manifest_path)?;
     manifest.assets.insert(
         name.clone(),
         VendorAsset {
@@ -355,7 +365,13 @@ fn execute_add(spec: &str, url_override: Option<&str>) -> Result<(), AssetsError
 
 pub fn run_list() {
     let manifest_path = PathBuf::from(VENDOR_MANIFEST_PATH);
-    let manifest = load_manifest(&manifest_path);
+    let manifest = match load_manifest(&manifest_path) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("Error loading manifest: {e}");
+            std::process::exit(1);
+        }
+    };
     if manifest.assets.is_empty() {
         println!("No vendored assets. Run `autumn assets add <name>@<version>` to add one.");
         return;
@@ -388,7 +404,7 @@ fn execute_update_with_manifest(
     manifest_path: &Path,
     static_dir: &Path,
 ) -> Result<(), AssetsError> {
-    let mut manifest = load_manifest(manifest_path);
+    let mut manifest = load_manifest(manifest_path)?;
 
     let to_update: Vec<(String, String, String, String)> = match name_spec {
         None => {
@@ -416,7 +432,7 @@ fn execute_update_with_manifest(
                 } else {
                     // Package was added with `--url`; we cannot derive the new
                     // version's URL automatically.  The user must re-add it:
-                    return Err(AssetsError::UnknownPackage(format!(
+                    return Err(AssetsError::UpdateFailed(format!(
                         "{name} was added with --url and is not in the built-in registry; \
                          re-pin with `autumn assets add {name}@{version} --url <url>`"
                     )));
@@ -580,11 +596,47 @@ mod tests {
             },
         );
         save_manifest(tmp.path(), &manifest).unwrap();
-        let loaded = load_manifest(tmp.path());
+        let loaded = load_manifest(tmp.path()).unwrap();
         assert_eq!(loaded.assets.len(), 1);
         let htmx = loaded.assets.get("htmx").unwrap();
         assert_eq!(htmx.version, "2.0.4");
         assert_eq!(htmx.integrity, "sha384-abc");
+    }
+
+    #[test]
+    fn load_manifest_missing_file_returns_default() {
+        let tmp_dir = tempfile::TempDir::new().unwrap();
+        let missing = tmp_dir.path().join("does-not-exist.json");
+        let manifest = load_manifest(&missing).unwrap();
+        assert!(manifest.assets.is_empty());
+        assert_eq!(manifest.version, "1");
+    }
+
+    #[test]
+    fn load_manifest_corrupt_json_propagates_error() {
+        // A corrupt manifest (e.g. from a merge conflict) must NOT silently
+        // become an empty manifest — otherwise a subsequent save would wipe
+        // every other pinned asset.
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        fs::write(tmp.path(), b"{ this is not valid json <<<<<<< HEAD").unwrap();
+        let err = load_manifest(tmp.path()).unwrap_err();
+        assert!(
+            matches!(err, AssetsError::Parse(_)),
+            "expected Parse error for corrupt manifest, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn verify_all_errors_on_corrupt_manifest() {
+        let tmp_dir = tempfile::TempDir::new().unwrap();
+        let static_dir = tmp_dir.path().to_path_buf();
+        let manifest_path = static_dir.join(".autumn-assets.json");
+        fs::write(&manifest_path, b"not json").unwrap();
+        let result = verify_all(&manifest_path, &static_dir);
+        assert!(
+            matches!(result, Err(AssetsError::Parse(_))),
+            "verify must surface a parse error rather than report an empty manifest"
+        );
     }
 
     // --- verify detects tampering ---
@@ -685,8 +737,12 @@ mod tests {
         // Attempting to re-pin with @version should fail with a clear message.
         let result =
             execute_update_with_manifest(Some("my-custom-lib@2.0.0"), &manifest_path, &static_dir);
-        assert!(result.is_err(), "expected error for --url package re-pin");
-        let msg = result.unwrap_err().to_string();
+        let err = result.expect_err("expected error for --url package re-pin");
+        assert!(
+            matches!(err, AssetsError::UpdateFailed(_)),
+            "expected UpdateFailed variant, got: {err:?}"
+        );
+        let msg = err.to_string();
         assert!(msg.contains("--url"), "error should mention --url: {msg}");
         assert!(
             msg.contains("my-custom-lib"),

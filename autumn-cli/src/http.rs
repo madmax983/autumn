@@ -8,7 +8,9 @@ use indicatif::{ProgressBar, ProgressStyle};
 /// own error type (both [`crate::setup::SetupError`] and
 /// [`crate::assets::AssetsError`] wrap `reqwest::Error` via `#[from]`).
 pub fn fetch_bytes(url: &str) -> Result<Vec<u8>, reqwest::Error> {
-    let response = reqwest::blocking::Client::new()
+    let response = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()?
         .get(url)
         .send()?
         .error_for_status()?;
