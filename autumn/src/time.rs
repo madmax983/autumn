@@ -318,7 +318,7 @@ mod tests {
         let clock = TickingClock::starting_at(start);
 
         // This duration is large enough to overflow the chrono::Duration if directly added
-        let max_dur = std::time::Duration::from_secs(10000000000000);
+        let max_dur = std::time::Duration::from_secs(10_000_000_000_000);
         clock.advance(max_dur);
         assert_eq!(clock.now(), DateTime::<Utc>::MAX_UTC);
     }
