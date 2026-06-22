@@ -103,7 +103,7 @@ probe_until_healthy() {
   shift
   local urls=("$@")
   local probe_body_file
-  probe_body_file="$(mktemp)"
+  probe_body_file="$(mktemp "${WORKDIR}/probe_body.XXXXXX")"
 
   for url in "${urls[@]}"; do
     local code=""
