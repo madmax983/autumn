@@ -135,9 +135,6 @@ pub fn plan_pull(
     // Track whether any repository was actually emitted, so the `repositories`
     // module is only wired up when at least one exists.
     let mut emitted_repository = false;
-    // Track whether any emitted column maps to `Attachment` (a stored `Blob`),
-    // which references `autumn_web::storage`, gated behind the `storage` feature.
-    let mut needs_storage = false;
     // `routes![]` entries for the read-only API handlers of emitted repositories.
     let mut route_entries: Vec<String> = Vec::new();
 
@@ -174,10 +171,6 @@ pub fn plan_pull(
             models_dir.join(format!("{snake_name}.rs")),
             render_model(&pascal_name, &table.table, &table.columns),
         );
-        needs_storage |= table
-            .columns
-            .iter()
-            .any(|c| c.kind == FieldKind::Attachment);
         // (b) src/models/mod.rs aggregator line
         models_mod = add_mod_declaration(&models_mod, &snake_name);
         // (c) src/schema.rs table! block
@@ -237,16 +230,14 @@ pub fn plan_pull(
     }
 
     // Cargo.toml: the `#[model]` expansion references diesel/serde/chrono/uuid,
-    // none of which a freshly-`autumn new`-ed project carries. When a pulled
-    // column maps to `Attachment`, the model field is an
-    // `autumn_web::storage::Blob`, which lives behind `autumn-web`'s `storage`
-    // feature; enable it too so the generated project compiles out of the box.
+    // none of which a freshly-`autumn new`-ed project carries. The `#[model]`
+    // macro itself is exported only behind `autumn-web`'s `db` feature, which a
+    // DB-free `autumn new --daemon` project disables; enable it so the pulled
+    // models compile there too.
     let cargo_path = project_root.join("Cargo.toml");
     let existing = read_or_empty(&cargo_path);
     let mut updated = super::model::ensure_cargo_dependencies(&existing, super::model::MODEL_DEPS);
-    if needs_storage {
-        updated = super::model::ensure_autumn_web_feature(&updated, "storage");
-    }
+    updated = super::model::ensure_autumn_web_feature(&updated, "db");
     if updated != existing {
         plan.modify(cargo_path, updated);
     }
@@ -1141,38 +1132,10 @@ mod tests {
     }
 
     #[test]
-    fn plan_pull_maps_jsonb_to_attachment() {
+    fn plan_pull_enables_autumn_web_db_feature() {
         let tmp = project();
-        // A nullable `jsonb` column round-trips to an `Attachment` (`Blob`) field.
-        let table = TableSchema {
-            table: "uploads".to_owned(),
-            columns: vec![
-                id_col(),
-                col("cover", FieldKind::Attachment, true, false),
-                created_at_col(),
-            ],
-        };
-        let plan = plan_pull(tmp.path(), &[table], PullOptions::default()).unwrap();
-        plan.execute(Flags::default()).unwrap();
-        let model = fs::read_to_string(tmp.path().join("src/models/upload.rs")).unwrap();
-        assert!(
-            model.contains("pub cover: Option<autumn_web::storage::Blob>,"),
-            "jsonb must map to an Attachment Blob field: {model}"
-        );
-        let schema = fs::read_to_string(tmp.path().join("src/schema.rs")).unwrap();
-        assert!(schema.contains("cover -> Nullable<Jsonb>,"));
-        // The Blob type lives behind autumn-web's `storage` feature, so the
-        // pull must enable it for the generated project to compile.
-        let cargo = fs::read_to_string(tmp.path().join("Cargo.toml")).unwrap();
-        assert!(
-            cargo.contains("autumn-web = { version = \"0.5\", features = [\"storage\"] }"),
-            "pull with an Attachment column must enable the storage feature: {cargo}"
-        );
-    }
-
-    #[test]
-    fn plan_pull_without_attachment_leaves_autumn_web_features_untouched() {
-        let tmp = project();
+        // The `#[model]` macro is gated behind autumn-web's `db` feature, which a
+        // DB-free daemon project disables, so the pull must enable it.
         let table = TableSchema {
             table: "widgets".to_owned(),
             columns: vec![id_col(), col("name", FieldKind::String, false, false)],
@@ -1181,8 +1144,8 @@ mod tests {
         plan.execute(Flags::default()).unwrap();
         let cargo = fs::read_to_string(tmp.path().join("Cargo.toml")).unwrap();
         assert!(
-            !cargo.contains("storage"),
-            "non-attachment pull must not enable the storage feature: {cargo}"
+            cargo.contains("autumn-web = { version = \"0.5\", features = [\"db\"] }"),
+            "pull must enable autumn-web's db feature: {cargo}"
         );
     }
 

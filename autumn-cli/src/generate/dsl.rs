@@ -167,8 +167,7 @@ pub const SUPPORTED_TYPES: &str = "String, Text, i32, i64, bool, f32, f64, \
 /// Comma-separated list of supported Postgres column types (`udt_name`), for
 /// the `db pull` introspection error message.
 pub const SQL_SUPPORTED_TYPES: &str = "text, varchar, bpchar (-> String), int4 (-> i32), \
-    int8 (-> i64), bool, float4 (-> f32), float8 (-> f64), uuid, timestamp, timestamptz, bytea, \
-    jsonb (-> Attachment)";
+    int8 (-> i64), bool, float4 (-> f32), float8 (-> f64), uuid, timestamp, timestamptz, bytea";
 
 /// Inverse of [`FieldKind::sql_type`] / [`FieldKind::schema_type`]: map a
 /// Postgres `udt_name` (the concrete catalog type identifier such as `int4`,
@@ -195,10 +194,13 @@ pub fn sql_type_to_field_kind(udt_name: &str) -> Option<FieldKind> {
         "timestamp" => Some(FieldKind::NaiveDateTime),
         "timestamptz" => Some(FieldKind::DateTime),
         "bytea" => Some(FieldKind::Bytea),
-        // The DSL's only `JSONB` producer is `Attachment` (a stored `Blob`), so
-        // the inverse maps `jsonb` back to `Attachment` to round-trip
-        // Autumn-generated attachment columns.
-        "jsonb" => Some(FieldKind::Attachment),
+        // `jsonb` is intentionally unsupported: although the DSL maps
+        // `Attachment` -> `JSONB`, the inverse is ambiguous. A brownfield
+        // `jsonb` column is usually arbitrary application JSON, not an Autumn
+        // `Blob`, and introspection cannot tell them apart (both report
+        // `udt_name = jsonb`). Mapping it to `Attachment` would emit a
+        // `Blob` field that fails to deserialize real JSON rows, so we leave
+        // it unsupported rather than risk corrupting brownfield data.
         _ => None,
     }
 }
@@ -619,12 +621,6 @@ mod tests {
                 "Timestamptz",
             ),
             ("bytea", FieldKind::Bytea, "Vec<u8>", "Bytea"),
-            (
-                "jsonb",
-                FieldKind::Attachment,
-                "autumn_web::storage::Blob",
-                "Jsonb",
-            ),
         ];
         for (udt, kind, rust, schema) in cases {
             let mapped = sql_type_to_field_kind(udt)
@@ -649,7 +645,10 @@ mod tests {
     #[test]
     fn sql_type_inverse_rejects_unknown_types() {
         // Unmapped SQL types must be reported, never silently dropped (AC2).
-        for udt in ["numeric", "json", "inet", "money", "point"] {
+        // `jsonb` is deliberately unsupported: the inverse of `Attachment ->
+        // JSONB` is ambiguous (arbitrary JSON vs an Autumn `Blob`), so pulling
+        // it must not silently produce a `Blob` field.
+        for udt in ["numeric", "jsonb", "json", "inet", "money", "point"] {
             assert!(
                 sql_type_to_field_kind(udt).is_none(),
                 "'{udt}' is outside the documented surface and must not map"
