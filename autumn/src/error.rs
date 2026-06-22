@@ -1239,7 +1239,10 @@ mod mutant_hunting_tests {
         let err = AutumnError::query_timeout("db timeout");
         assert_eq!(err.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(err.to_string(), "db timeout");
-        assert_eq!(err.problem_type, Some("https://autumn.dev/problems/query-timeout"));
+        assert_eq!(
+            err.problem_type,
+            Some("https://autumn.dev/problems/query-timeout")
+        );
     }
 
     #[test]
@@ -1260,7 +1263,9 @@ mod mutant_hunting_tests {
     #[derive(Debug)]
     struct CustomError;
     impl std::fmt::Display for CustomError {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "CustomError") }
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "CustomError")
+        }
     }
     impl std::error::Error for CustomError {}
 
@@ -1280,61 +1285,166 @@ mod mutant_hunting_tests {
 
     #[test]
     fn problem_type_for_mappings() {
-        assert_eq!(problem_type_for(StatusCode::BAD_REQUEST, false), "https://autumn.dev/problems/bad-request");
-        assert_eq!(problem_type_for(StatusCode::UNAUTHORIZED, false), "https://autumn.dev/problems/unauthorized");
-        assert_eq!(problem_type_for(StatusCode::FORBIDDEN, false), "https://autumn.dev/problems/forbidden");
-        assert_eq!(problem_type_for(StatusCode::NOT_FOUND, false), "https://autumn.dev/problems/not-found");
-        assert_eq!(problem_type_for(StatusCode::GONE, false), "https://autumn.dev/problems/gone");
-        assert_eq!(problem_type_for(StatusCode::CONFLICT, false), "https://autumn.dev/problems/conflict");
-        assert_eq!(problem_type_for(StatusCode::PAYLOAD_TOO_LARGE, false), "https://autumn.dev/problems/payload-too-large");
-        assert_eq!(problem_type_for(StatusCode::UNPROCESSABLE_ENTITY, false), "https://autumn.dev/problems/unprocessable-entity");
-        assert_eq!(problem_type_for(StatusCode::INTERNAL_SERVER_ERROR, false), "https://autumn.dev/problems/internal-server-error");
-        assert_eq!(problem_type_for(StatusCode::NOT_IMPLEMENTED, false), "https://autumn.dev/problems/not-implemented");
-        assert_eq!(problem_type_for(StatusCode::SERVICE_UNAVAILABLE, false), "https://autumn.dev/problems/service-unavailable");
+        assert_eq!(
+            problem_type_for(StatusCode::BAD_REQUEST, false),
+            "https://autumn.dev/problems/bad-request"
+        );
+        assert_eq!(
+            problem_type_for(StatusCode::UNAUTHORIZED, false),
+            "https://autumn.dev/problems/unauthorized"
+        );
+        assert_eq!(
+            problem_type_for(StatusCode::FORBIDDEN, false),
+            "https://autumn.dev/problems/forbidden"
+        );
+        assert_eq!(
+            problem_type_for(StatusCode::NOT_FOUND, false),
+            "https://autumn.dev/problems/not-found"
+        );
+        assert_eq!(
+            problem_type_for(StatusCode::GONE, false),
+            "https://autumn.dev/problems/gone"
+        );
+        assert_eq!(
+            problem_type_for(StatusCode::CONFLICT, false),
+            "https://autumn.dev/problems/conflict"
+        );
+        assert_eq!(
+            problem_type_for(StatusCode::PAYLOAD_TOO_LARGE, false),
+            "https://autumn.dev/problems/payload-too-large"
+        );
+        assert_eq!(
+            problem_type_for(StatusCode::UNPROCESSABLE_ENTITY, false),
+            "https://autumn.dev/problems/unprocessable-entity"
+        );
+        assert_eq!(
+            problem_type_for(StatusCode::INTERNAL_SERVER_ERROR, false),
+            "https://autumn.dev/problems/internal-server-error"
+        );
+        assert_eq!(
+            problem_type_for(StatusCode::NOT_IMPLEMENTED, false),
+            "https://autumn.dev/problems/not-implemented"
+        );
+        assert_eq!(
+            problem_type_for(StatusCode::SERVICE_UNAVAILABLE, false),
+            "https://autumn.dev/problems/service-unavailable"
+        );
         // Unknown status code fallbacks
-        assert_eq!(problem_type_for(StatusCode::IM_A_TEAPOT, false), "about:blank");
+        assert_eq!(
+            problem_type_for(StatusCode::IM_A_TEAPOT, false),
+            "about:blank"
+        );
     }
 
     #[test]
     fn problem_title_for_mappings() {
-        assert_eq!(problem_title_for(StatusCode::BAD_REQUEST, false), "Bad Request");
-        assert_eq!(problem_title_for(StatusCode::UNAUTHORIZED, false), "Unauthorized");
+        assert_eq!(
+            problem_title_for(StatusCode::BAD_REQUEST, false),
+            "Bad Request"
+        );
+        assert_eq!(
+            problem_title_for(StatusCode::UNAUTHORIZED, false),
+            "Unauthorized"
+        );
         assert_eq!(problem_title_for(StatusCode::FORBIDDEN, false), "Forbidden");
         assert_eq!(problem_title_for(StatusCode::NOT_FOUND, false), "Not Found");
         assert_eq!(problem_title_for(StatusCode::GONE, false), "Gone");
         assert_eq!(problem_title_for(StatusCode::CONFLICT, false), "Conflict");
-        assert_eq!(problem_title_for(StatusCode::PAYLOAD_TOO_LARGE, false), "Payload Too Large");
-        assert_eq!(problem_title_for(StatusCode::UNPROCESSABLE_ENTITY, false), "Unprocessable Entity");
-        assert_eq!(problem_title_for(StatusCode::INTERNAL_SERVER_ERROR, false), "Internal Server Error");
-        assert_eq!(problem_title_for(StatusCode::NOT_IMPLEMENTED, false), "Not Implemented");
-        assert_eq!(problem_title_for(StatusCode::SERVICE_UNAVAILABLE, false), "Service Unavailable");
+        assert_eq!(
+            problem_title_for(StatusCode::PAYLOAD_TOO_LARGE, false),
+            "Payload Too Large"
+        );
+        assert_eq!(
+            problem_title_for(StatusCode::UNPROCESSABLE_ENTITY, false),
+            "Unprocessable Entity"
+        );
+        assert_eq!(
+            problem_title_for(StatusCode::INTERNAL_SERVER_ERROR, false),
+            "Internal Server Error"
+        );
+        assert_eq!(
+            problem_title_for(StatusCode::NOT_IMPLEMENTED, false),
+            "Not Implemented"
+        );
+        assert_eq!(
+            problem_title_for(StatusCode::SERVICE_UNAVAILABLE, false),
+            "Service Unavailable"
+        );
         // Unknown
-        assert_eq!(problem_title_for(StatusCode::IM_A_TEAPOT, false), "I'm a teapot");
+        assert_eq!(
+            problem_title_for(StatusCode::IM_A_TEAPOT, false),
+            "I'm a teapot"
+        );
     }
 
     #[test]
     fn problem_code_for_mappings() {
-        assert_eq!(problem_code_for(StatusCode::BAD_REQUEST, false), "autumn.bad_request");
-        assert_eq!(problem_code_for(StatusCode::UNAUTHORIZED, false), "autumn.unauthorized");
-        assert_eq!(problem_code_for(StatusCode::FORBIDDEN, false), "autumn.forbidden");
-        assert_eq!(problem_code_for(StatusCode::NOT_FOUND, false), "autumn.not_found");
+        assert_eq!(
+            problem_code_for(StatusCode::BAD_REQUEST, false),
+            "autumn.bad_request"
+        );
+        assert_eq!(
+            problem_code_for(StatusCode::UNAUTHORIZED, false),
+            "autumn.unauthorized"
+        );
+        assert_eq!(
+            problem_code_for(StatusCode::FORBIDDEN, false),
+            "autumn.forbidden"
+        );
+        assert_eq!(
+            problem_code_for(StatusCode::NOT_FOUND, false),
+            "autumn.not_found"
+        );
         assert_eq!(problem_code_for(StatusCode::GONE, false), "autumn.gone");
-        assert_eq!(problem_code_for(StatusCode::CONFLICT, false), "autumn.conflict");
-        assert_eq!(problem_code_for(StatusCode::PAYLOAD_TOO_LARGE, false), "autumn.payload_too_large");
-        assert_eq!(problem_code_for(StatusCode::UNPROCESSABLE_ENTITY, false), "autumn.unprocessable_entity");
-        assert_eq!(problem_code_for(StatusCode::INTERNAL_SERVER_ERROR, false), "autumn.internal_server_error");
-        assert_eq!(problem_code_for(StatusCode::NOT_IMPLEMENTED, false), "autumn.not_implemented");
-        assert_eq!(problem_code_for(StatusCode::SERVICE_UNAVAILABLE, false), "autumn.service_unavailable");
+        assert_eq!(
+            problem_code_for(StatusCode::CONFLICT, false),
+            "autumn.conflict"
+        );
+        assert_eq!(
+            problem_code_for(StatusCode::PAYLOAD_TOO_LARGE, false),
+            "autumn.payload_too_large"
+        );
+        assert_eq!(
+            problem_code_for(StatusCode::UNPROCESSABLE_ENTITY, false),
+            "autumn.unprocessable_entity"
+        );
+        assert_eq!(
+            problem_code_for(StatusCode::INTERNAL_SERVER_ERROR, false),
+            "autumn.internal_server_error"
+        );
+        assert_eq!(
+            problem_code_for(StatusCode::NOT_IMPLEMENTED, false),
+            "autumn.not_implemented"
+        );
+        assert_eq!(
+            problem_code_for(StatusCode::SERVICE_UNAVAILABLE, false),
+            "autumn.service_unavailable"
+        );
         // Unknown
-        assert_eq!(problem_code_for(StatusCode::IM_A_TEAPOT, false), "autumn.client_error");
+        assert_eq!(
+            problem_code_for(StatusCode::IM_A_TEAPOT, false),
+            "autumn.client_error"
+        );
     }
 
     #[test]
     fn server_error_detail_mappings() {
-        assert_eq!(server_error_detail(StatusCode::SERVICE_UNAVAILABLE), "Service unavailable");
-        assert_eq!(server_error_detail(StatusCode::NOT_IMPLEMENTED), "Not implemented");
-        assert_eq!(server_error_detail(StatusCode::INTERNAL_SERVER_ERROR), "Internal server error");
-        assert_eq!(server_error_detail(StatusCode::BAD_GATEWAY), "Internal server error");
+        assert_eq!(
+            server_error_detail(StatusCode::SERVICE_UNAVAILABLE),
+            "Service unavailable"
+        );
+        assert_eq!(
+            server_error_detail(StatusCode::NOT_IMPLEMENTED),
+            "Not implemented"
+        );
+        assert_eq!(
+            server_error_detail(StatusCode::INTERNAL_SERVER_ERROR),
+            "Internal server error"
+        );
+        assert_eq!(
+            server_error_detail(StatusCode::BAD_GATEWAY),
+            "Internal server error"
+        );
     }
 
     #[test]
@@ -1346,9 +1456,12 @@ mod mutant_hunting_tests {
             None,
             None,
             None,
-            false // hide internal details
+            false, // hide internal details
         );
-        assert_eq!(details.detail, "Internal server error", "Should hide internal details");
+        assert_eq!(
+            details.detail, "Internal server error",
+            "Should hide internal details"
+        );
     }
 
     #[test]
@@ -1360,9 +1473,12 @@ mod mutant_hunting_tests {
             None,
             None,
             None,
-            true // show internal details
+            true, // show internal details
         );
-        assert_eq!(details.detail, "Detailed DB crash message", "Should expose internal details");
+        assert_eq!(
+            details.detail, "Detailed DB crash message",
+            "Should expose internal details"
+        );
     }
 
     #[test]
@@ -1374,13 +1490,23 @@ mod mutant_hunting_tests {
         let res = err.into_response();
         assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
 
-        let err2 = AutumnError::internal_server_error_msg("canceling statement due to statement timeout");
+        let err2 =
+            AutumnError::internal_server_error_msg("canceling statement due to statement timeout");
         let res2 = err2.into_response();
-        assert_eq!(res2.status(), StatusCode::SERVICE_UNAVAILABLE, "Should map timeout string to 503");
+        assert_eq!(
+            res2.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Should map timeout string to 503"
+        );
 
-        let err3 = AutumnError::internal_server_error_msg("canceling statement due to user request");
+        let err3 =
+            AutumnError::internal_server_error_msg("canceling statement due to user request");
         let res3 = err3.into_response();
-        assert_eq!(res3.status(), StatusCode::INTERNAL_SERVER_ERROR, "Should not map user cancel string to 503");
+        assert_eq!(
+            res3.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Should not map user cancel string to 503"
+        );
     }
 
     #[test]
