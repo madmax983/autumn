@@ -43,6 +43,10 @@ on:
       - "autumn-cli/src/cold_start_driver.rs"
       - "autumn-cli/src/new.rs"
       - "autumn-cli/src/main.rs"
+      # The harness builds the *generated* project, whose sources are embedded
+      # from these templates via `include_str!`, so template-only changes must
+      # still run the cold-start smoke/unit checks.
+      - "autumn-cli/src/templates/**"
       - "docs/guide/dev-loop-latency.md"
       - ".github/workflows/cold-start-latency.yml"
 
@@ -83,13 +87,16 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2.7.8
 
-      - name: Run dev_loop_bench unit tests
+      - name: Run cold-start measurement unit tests
         # `shell: bash` enables `pipefail` on the runner, so a failing
         # `cargo test` is not masked by the `tee` in the pipeline.
         shell: bash
         run: |
+          # Pass both module names as test-binary filters so the pure logic in
+          # `dev_loop_bench` *and* the live-driver helpers in `cold_start_driver`
+          # (scaffold locate/repoint, zero-run handling, dry-run) are exercised.
           cargo test -p autumn-cli \
-            dev_loop_bench \
+            -- dev_loop_bench cold_start_driver \
             2>&1 | tee test-output.txt
           grep -E "^test result:" test-output.txt
 
