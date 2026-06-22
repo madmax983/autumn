@@ -1,3 +1,19 @@
+//! Circuit breaker pattern for resilience against cascading failures.
+//!
+//! A circuit breaker acts as a proxy for operations that might fail. It monitors
+//! for failures and, when the failure rate exceeds a threshold, "opens" the circuit
+//! to immediately fail fast without executing the operation. This gives the failing
+//! service time to recover and prevents the calling service from hanging or crashing
+//! due to resource exhaustion.
+//!
+//! After a configurable duration, the circuit transitions to a "half-open" state,
+//! allowing a small number of test requests through. If they succeed, the circuit
+//! "closes" and resumes normal operation. If they fail, it trips back open.
+//!
+//! The core type is [`CircuitBreaker`], which can be manually constructed or
+//! acquired from the [`CircuitBreakerRegistry`] to share state across an application.
+//! It can also be applied as a Tower middleware via [`CircuitBreakerLayer`].
+
 #![allow(
     clippy::missing_panics_doc,
     clippy::missing_errors_doc,
@@ -17,6 +33,16 @@ use thiserror::Error;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+/// Represents the current operational state of a [`CircuitBreaker`].
+///
+/// # Examples
+///
+/// ```rust
+/// use autumn_web::circuit_breaker::CircuitState;
+///
+/// let state = CircuitState::Closed;
+/// assert_eq!(state.as_str(), "CLOSED");
+/// ```
 pub enum CircuitState {
     Closed,
     Open,
@@ -34,6 +60,23 @@ impl CircuitState {
 }
 
 #[derive(Debug, Clone)]
+/// Configuration for a [`CircuitBreaker`], defining thresholds and durations.
+///
+/// By default, a circuit breaker trips if the failure ratio exceeds 50% (`0.5`)
+/// over a 10-second `sample_window`, provided at least 10 requests
+/// (`minimum_sample_count`) have occurred. Once open, it waits 60 seconds
+/// (`open_duration`) before attempting 3 trial requests (`half_open_trial_count`).
+///
+/// # Examples
+///
+/// ```rust
+/// use autumn_web::circuit_breaker::CircuitBreakerPolicy;
+/// use std::time::Duration;
+///
+/// let mut policy = CircuitBreakerPolicy::default();
+/// policy.failure_ratio_threshold = 0.8; // Trip at 80% failure rate
+/// policy.open_duration = Duration::from_secs(30); // Wait 30s before retrying
+/// ```
 pub struct CircuitBreakerPolicy {
     pub failure_ratio_threshold: f64,
     pub sample_window: Duration,
@@ -104,6 +147,22 @@ pub enum CircuitBreakerError<E> {
 }
 
 #[derive(Clone)]
+/// A proxy that monitors failures and "trips" to prevent cascading outages.
+///
+/// Use [`CircuitBreaker::new`] to create an isolated breaker, or fetch a shared
+/// instance from the [`CircuitBreakerRegistry`] if multiple parts of your application
+/// call the same external dependency.
+///
+/// # Examples
+///
+/// ```rust
+/// use autumn_web::circuit_breaker::{CircuitBreaker, CircuitBreakerPolicy};
+///
+/// let policy = CircuitBreakerPolicy::default();
+/// let breaker = CircuitBreaker::new("payment_api", policy);
+///
+/// assert_eq!(breaker.name(), "payment_api");
+/// ```
 pub struct CircuitBreaker {
     name: String,
     pub(crate) inner: Arc<Mutex<CircuitBreakerInner>>,
@@ -148,6 +207,10 @@ impl CircuitBreakerInner {
 }
 
 impl CircuitBreaker {
+    /// Creates a new, isolated [`CircuitBreaker`] starting in the `Closed` state.
+    ///
+    /// The `failure_ratio_threshold` in the provided `config` will be automatically
+    /// clamped between `0.0001` and `1.0` to ensure valid calculations.
     pub fn new(name: impl Into<String>, mut config: CircuitBreakerPolicy) -> Self {
         config.failure_ratio_threshold = config.failure_ratio_threshold.clamp(0.000_1, 1.0);
         Self {
@@ -280,6 +343,27 @@ impl CircuitBreaker {
         }
     }
 
+    /// Executes the given future, recording its success or failure.
+    ///
+    /// If the circuit is currently open, this immediately returns a
+    /// [`CircuitBreakerError::Open`] without polling the future.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # tokio::runtime::Runtime::new().unwrap().block_on(async {
+    /// use autumn_web::circuit_breaker::{CircuitBreaker, CircuitBreakerPolicy, CircuitBreakerError};
+    ///
+    /// let breaker = CircuitBreaker::new("example", CircuitBreakerPolicy::default());
+    ///
+    /// // Successful execution
+    /// let result = breaker.run(async {
+    ///     Ok::<_, &'static str>("Success!")
+    /// }).await;
+    ///
+    /// assert!(result.is_ok());
+    /// # });
+    /// ```
     pub async fn run<F, T, E>(&self, fut: F) -> Result<T, CircuitBreakerError<E>>
     where
         F: Future<Output = Result<T, E>>,
@@ -297,6 +381,33 @@ impl CircuitBreaker {
         res.map_err(CircuitBreakerError::Execution)
     }
 
+    /// Executes the future, invoking a fallback closure if execution fails
+    /// or if the circuit is open.
+    ///
+    /// This is useful for providing default data or degraded experiences
+    /// when a downstream service is unavailable.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// # tokio::runtime::Runtime::new().unwrap().block_on(async {
+    /// use autumn_web::circuit_breaker::{CircuitBreaker, CircuitBreakerPolicy, CircuitBreakerError};
+    ///
+    /// let breaker = CircuitBreaker::new("example", CircuitBreakerPolicy::default());
+    ///
+    /// let result = breaker.run_with_fallback(
+    ///     async { Err::<&'static str, _>("Connection timeout") },
+    ///     |err| {
+    ///         match err {
+    ///             CircuitBreakerError::Open => Ok("Service unavailable (fallback)"),
+    ///             CircuitBreakerError::Execution(_) => Ok("Failed (fallback)"),
+    ///         }
+    ///     }
+    /// ).await;
+    ///
+    /// assert_eq!(result.unwrap(), "Failed (fallback)");
+    /// # });
+    /// ```
     pub async fn run_with_fallback<F, T, E, FB>(&self, fut: F, fallback: FB) -> Result<T, E>
     where
         F: Future<Output = Result<T, E>>,
@@ -346,6 +457,25 @@ impl Drop for CircuitBreakerGuard {
     }
 }
 
+/// A shared registry for managing named [`CircuitBreaker`] instances.
+///
+/// When multiple parts of an application interact with the same downstream
+/// dependency (e.g., a specific external API or database), they should share
+/// the same circuit breaker state. The registry allows fetching an existing
+/// breaker by name or creating it if it doesn't exist.
+///
+/// # Examples
+///
+/// ```rust
+/// use autumn_web::circuit_breaker::{CircuitBreakerRegistry, CircuitBreakerPolicy};
+///
+/// let registry = CircuitBreakerRegistry::new();
+/// let breaker1 = registry.get_or_create("github_api", CircuitBreakerPolicy::default());
+/// let breaker2 = registry.get_or_create("github_api", CircuitBreakerPolicy::default());
+///
+/// // breaker1 and breaker2 share the same internal state.
+/// assert_eq!(registry.all_breakers().len(), 1);
+/// ```
 pub struct CircuitBreakerRegistry {
     breakers: Mutex<HashMap<String, CircuitBreaker>>,
 }
@@ -411,6 +541,23 @@ pub fn global_registry() -> &'static CircuitBreakerRegistry {
 pub static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[derive(Clone)]
+/// A Tower [`Layer`](tower::Layer) that wraps requests with a [`CircuitBreaker`].
+///
+/// This applies the circuit breaker pattern to the entire service pipeline. If the
+/// circuit trips open, the service will instantly reject requests with a
+/// [`CircuitBreakerError`] instead of passing them down to the inner service.
+///
+/// # Examples
+///
+/// ```rust
+/// use autumn_web::circuit_breaker::{CircuitBreakerLayer, CircuitBreaker, CircuitBreakerPolicy};
+/// use tower::ServiceBuilder;
+///
+/// let breaker = CircuitBreaker::new("my_service", CircuitBreakerPolicy::default());
+/// let layer = CircuitBreakerLayer::new(breaker);
+///
+/// // Use ServiceBuilder to compose this layer with other middleware...
+/// ```
 pub struct CircuitBreakerLayer {
     breaker: CircuitBreaker,
 }
