@@ -584,6 +584,7 @@ fn should_warn_missing_profile_file(profile: &str, has_inline_profile_section: b
 /// ⚡ Bolt Optimization:
 /// Reduces memory allocations by using a single `Vec` instead of two and
 /// iterating directly over `Chars` to avoid `Vec<char>` allocations.
+#[must_use]
 pub fn levenshtein(a: &str, b: &str) -> usize {
     let n = b.chars().count();
     let mut prev: Vec<usize> = (0..=n).collect();
@@ -1617,6 +1618,7 @@ const fn default_jobs_redis_visibility_timeout_ms() -> u64 {
 
 impl AutumnConfig {
     /// Recursively extracts all valid configuration schema keys and nested fields.
+    #[must_use]
     pub fn get_schema_keys() -> HashMap<String, HashSet<String>> {
         let deserializer = SchemaDeserializer::new();
         let _ = Self::deserialize(deserializer.clone());
@@ -1624,7 +1626,8 @@ impl AutumnConfig {
     }
 
     /// Recursively validates TOML content against the derived schema.
-    /// Returns a list of errors: (dotted_path, option_suggestion)
+    /// Returns a list of errors: (`dotted_path`, `option_suggestion`)
+    #[must_use]
     pub fn validate_toml(
         content: &str,
         schema: &HashMap<String, HashSet<String>>,
@@ -1639,6 +1642,7 @@ impl AutumnConfig {
         errors
     }
 
+    #[allow(clippy::too_many_lines)]
     fn validate_toml_table(
         table: &toml::Table,
         path: &mut Vec<String>,
@@ -1674,7 +1678,23 @@ impl AutumnConfig {
                     continue;
                 }
 
-                if !valid_keys.contains(k) {
+                if valid_keys.contains(k) {
+                    path.push(k.clone());
+                    match val {
+                        toml::Value::Table(t) => {
+                            Self::validate_toml_table(t, path, schema, errors);
+                        }
+                        toml::Value::Array(arr) => {
+                            for item in arr {
+                                if let toml::Value::Table(t) = item {
+                                    Self::validate_toml_table(t, path, schema, errors);
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                    path.pop();
+                } else {
                     let mut full_path_parts = path.clone();
                     full_path_parts.push(k.clone());
                     let full_path = full_path_parts.join(".");
@@ -1696,6 +1716,34 @@ impl AutumnConfig {
                     });
 
                     errors.push((full_path, suggestion));
+                }
+            }
+        } else if path.len() == 1 && path[0] == "profile" {
+            for (k, val) in table {
+                if let toml::Value::Table(t) = val {
+                    path.push(k.clone());
+                    Self::validate_toml_table(t, path, schema, errors);
+                    path.pop();
+                } else {
+                    let mut full_path_parts = path.clone();
+                    full_path_parts.push(k.clone());
+                    errors.push((full_path_parts.join("."), None));
+                }
+            }
+        } else if path.is_empty() {
+            let root_keys = schema.get("").cloned().unwrap_or_default();
+            for (k, val) in table {
+                if k != "profile" && !root_keys.contains(k) {
+                    let mut closest: Option<&str> = None;
+                    let mut min_dist = usize::MAX;
+                    for valid_key in &root_keys {
+                        let dist = levenshtein(k, valid_key);
+                        if dist <= 2 && dist < min_dist {
+                            min_dist = dist;
+                            closest = Some(valid_key);
+                        }
+                    }
+                    errors.push((k.clone(), closest.map(String::from)));
                 } else {
                     path.push(k.clone());
                     match val {
@@ -1712,52 +1760,6 @@ impl AutumnConfig {
                         _ => {}
                     }
                     path.pop();
-                }
-            }
-        } else {
-            if path.len() == 1 && path[0] == "profile" {
-                for (k, val) in table {
-                    if let toml::Value::Table(t) = val {
-                        path.push(k.clone());
-                        Self::validate_toml_table(t, path, schema, errors);
-                        path.pop();
-                    } else {
-                        let mut full_path_parts = path.clone();
-                        full_path_parts.push(k.clone());
-                        errors.push((full_path_parts.join("."), None));
-                    }
-                }
-            } else if path.is_empty() {
-                let root_keys = schema.get("").cloned().unwrap_or_default();
-                for (k, val) in table {
-                    if k != "profile" && !root_keys.contains(k) {
-                        let mut closest: Option<&str> = None;
-                        let mut min_dist = usize::MAX;
-                        for valid_key in &root_keys {
-                            let dist = levenshtein(k, valid_key);
-                            if dist <= 2 && dist < min_dist {
-                                min_dist = dist;
-                                closest = Some(valid_key);
-                            }
-                        }
-                        errors.push((k.clone(), closest.map(String::from)));
-                    } else {
-                        path.push(k.clone());
-                        match val {
-                            toml::Value::Table(t) => {
-                                Self::validate_toml_table(t, path, schema, errors);
-                            }
-                            toml::Value::Array(arr) => {
-                                for item in arr {
-                                    if let toml::Value::Table(t) = item {
-                                        Self::validate_toml_table(t, path, schema, errors);
-                                    }
-                                }
-                            }
-                            _ => {}
-                        }
-                        path.pop();
-                    }
                 }
             }
         }
@@ -1864,11 +1866,10 @@ impl AutumnConfig {
                 let err_messages: Vec<String> = errors
                     .into_iter()
                     .map(|(path, sug)| {
-                        if let Some(s) = sug {
-                            format!("unknown key \"{path}\" — did you mean \"{s}\"?")
-                        } else {
-                            format!("unknown key \"{path}\"")
-                        }
+                        sug.map_or_else(
+                            || format!("unknown key \"{path}\""),
+                            |s| format!("unknown key \"{path}\" — did you mean \"{s}\"?"),
+                        )
                     })
                     .collect();
                 return Err(ConfigError::Validation(format!(
@@ -4739,9 +4740,9 @@ impl AutumnConfig {
     }
 }
 
+use serde::de::{self, DeserializeSeed, MapAccess, SeqAccess, Visitor};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
-use serde::de::{self, Visitor, MapAccess, SeqAccess, DeserializeSeed};
 
 #[derive(Clone)]
 pub struct SchemaDeserializer {
@@ -4749,7 +4750,14 @@ pub struct SchemaDeserializer {
     schema: Arc<Mutex<HashMap<String, HashSet<String>>>>,
 }
 
+impl Default for SchemaDeserializer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SchemaDeserializer {
+    #[must_use]
     pub fn new() -> Self {
         Self {
             path: Vec::new(),
@@ -4757,8 +4765,12 @@ impl SchemaDeserializer {
         }
     }
 
+    #[must_use]
     pub fn into_schema(self) -> HashMap<String, HashSet<String>> {
-        let lock = self.schema.lock().unwrap();
+        let lock = self
+            .schema
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         lock.clone()
     }
 }
@@ -5022,11 +5034,11 @@ impl<'de> SeqAccess<'de> for SchemaSeqAccess {
     where
         T: DeserializeSeed<'de>,
     {
-        if !self.done {
+        if self.done {
+            Ok(None)
+        } else {
             self.done = true;
             seed.deserialize(self.deserializer.clone()).map(Some)
-        } else {
-            Ok(None)
         }
     }
 }
@@ -5046,7 +5058,8 @@ impl<'de> MapAccess<'de> for SchemaMapAccess {
     {
         if let Some(&field) = self.fields.next() {
             self.current_field = Some(field);
-            seed.deserialize(de::value::StrDeserializer::new(field)).map(Some)
+            seed.deserialize(de::value::StrDeserializer::new(field))
+                .map(Some)
         } else {
             Ok(None)
         }
@@ -5151,12 +5164,19 @@ mod tests {
     fn test_strict_config_startup_fails_on_typo() {
         let temp = tempfile::tempdir().unwrap();
         let config_path = temp.path().join("autumn.toml");
-        std::fs::write(&config_path, "[database]\nprimry_url = \"postgres://localhost/db\"").unwrap();
+        std::fs::write(
+            &config_path,
+            "[database]\nprimry_url = \"postgres://localhost/db\"",
+        )
+        .unwrap();
 
         let env = FakeEnv(
             [
                 ("AUTUMN_SERVER__STRICT_CONFIG".to_owned(), "true".to_owned()),
-                ("AUTUMN_MANIFEST_DIR".to_owned(), temp.path().to_str().unwrap().to_owned()),
+                (
+                    "AUTUMN_MANIFEST_DIR".to_owned(),
+                    temp.path().to_str().unwrap().to_owned(),
+                ),
             ]
             .into(),
         );

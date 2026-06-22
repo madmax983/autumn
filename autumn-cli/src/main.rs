@@ -1813,8 +1813,10 @@ fn run_command(command: Commands) {
                 }
             } else if config {
                 match check::run_config_check() {
-                    Ok(_) => {
-                        println!("Configuration check passed: all keys in autumn.toml and profile configurations are valid.");
+                    Ok(()) => {
+                        println!(
+                            "Configuration check passed: all keys in autumn.toml and profile configurations are valid."
+                        );
                     }
                     Err(e) => {
                         eprintln!("Configuration check failed:\n{e}");

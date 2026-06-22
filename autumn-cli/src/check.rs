@@ -70,8 +70,11 @@ pub fn run_config_check_impl(dir: &std::path::Path) -> Result<(), String> {
     // 1. Validate base autumn.toml
     let base_errors = crate::doctor::validate_toml_content(&toml_content, &schema);
     for (path, sug) in base_errors {
-        errors.push(format!("autumn.toml: unknown key \"{path}\"{}", 
-            sug.map(|s| format!(" — did you mean \"{s}\"?")).unwrap_or_default()));
+        errors.push(format!(
+            "autumn.toml: unknown key \"{path}\"{}",
+            sug.map(|s| format!(" — did you mean \"{s}\"?"))
+                .unwrap_or_default()
+        ));
     }
 
     // 2. Validate any autumn-*.toml profile files
@@ -82,10 +85,14 @@ pub fn run_config_check_impl(dir: &std::path::Path) -> Result<(), String> {
                 if let Some(filename) = path.file_name().and_then(|n| n.to_str()) {
                     if filename.starts_with("autumn-") && filename.ends_with(".toml") {
                         if let Ok(file_content) = std::fs::read_to_string(&path) {
-                            let profile_errors = crate::doctor::validate_toml_content(&file_content, &schema);
+                            let profile_errors =
+                                crate::doctor::validate_toml_content(&file_content, &schema);
                             for (p_path, sug) in profile_errors {
-                                errors.push(format!("{filename}: unknown key \"{p_path}\"{}", 
-                                    sug.map(|s| format!(" — did you mean \"{s}\"?")).unwrap_or_default()));
+                                errors.push(format!(
+                                    "{filename}: unknown key \"{p_path}\"{}",
+                                    sug.map(|s| format!(" — did you mean \"{s}\"?"))
+                                        .unwrap_or_default()
+                                ));
                             }
                         }
                     }
@@ -738,45 +745,73 @@ mod tests {
     fn test_run_config_check_passes_on_valid_and_fails_on_typo() {
         let temp = tempfile::tempdir().unwrap();
         let toml_path = temp.path().join("autumn.toml");
-        std::fs::write(&toml_path, "[database]\nprimary_url = \"postgres://localhost/db\"").unwrap();
+        std::fs::write(
+            &toml_path,
+            "[database]\nprimary_url = \"postgres://localhost/db\"",
+        )
+        .unwrap();
 
         // Valid check passes
         if let Err(e) = run_config_check_impl(temp.path()) {
-            panic!("Valid check failed: {}", e);
+            panic!("Valid check failed: {e}");
         }
 
         // Typo check fails
-        std::fs::write(&toml_path, "[database]\nprimry_url = \"postgres://localhost/db\"").unwrap();
+        std::fs::write(
+            &toml_path,
+            "[database]\nprimry_url = \"postgres://localhost/db\"",
+        )
+        .unwrap();
         let res = run_config_check_impl(temp.path());
         assert!(res.is_err());
         assert!(res.err().unwrap().contains("primry_url"));
 
         // Inline profile with valid key passes
-        std::fs::write(&toml_path, "[profile.dev.database]\nprimary_url = \"postgres://localhost/db\"").unwrap();
+        std::fs::write(
+            &toml_path,
+            "[profile.dev.database]\nprimary_url = \"postgres://localhost/db\"",
+        )
+        .unwrap();
         if let Err(e) = run_config_check_impl(temp.path()) {
-            panic!("Inline profile with valid key failed: {}", e);
+            panic!("Inline profile with valid key failed: {e}");
         }
 
         // Inline profile with typo fails
-        std::fs::write(&toml_path, "[profile.dev.database]\nprimry_url = \"postgres://localhost/db\"").unwrap();
+        std::fs::write(
+            &toml_path,
+            "[profile.dev.database]\nprimry_url = \"postgres://localhost/db\"",
+        )
+        .unwrap();
         let res = run_config_check_impl(temp.path());
         assert!(res.is_err());
         assert!(res.err().unwrap().contains("primry_url"));
 
         // Reset autumn.toml to be clean
-        std::fs::write(&toml_path, "[database]\nprimary_url = \"postgres://localhost/db\"").unwrap();
+        std::fs::write(
+            &toml_path,
+            "[database]\nprimary_url = \"postgres://localhost/db\"",
+        )
+        .unwrap();
 
         // Profile file (autumn-dev.toml) with typo fails
         let profile_toml_path = temp.path().join("autumn-dev.toml");
-        std::fs::write(&profile_toml_path, "[database]\nprimry_url = \"postgres://localhost/db\"").unwrap();
+        std::fs::write(
+            &profile_toml_path,
+            "[database]\nprimry_url = \"postgres://localhost/db\"",
+        )
+        .unwrap();
         let res = run_config_check_impl(temp.path());
         assert!(res.is_err());
         assert!(res.err().unwrap().contains("primry_url"));
 
         // Profile file (autumn-dev.toml) valid passes
-        std::fs::write(&profile_toml_path, "[database]\nprimary_url = \"postgres://localhost/db\"").unwrap();
+        std::fs::write(
+            &profile_toml_path,
+            "[database]\nprimary_url = \"postgres://localhost/db\"",
+        )
+        .unwrap();
         if let Err(e) = run_config_check_impl(temp.path()) {
-            panic!("Profile file with valid key failed: {}", e);
+            panic!("Profile file with valid key failed: {e}");
         }
     }
 

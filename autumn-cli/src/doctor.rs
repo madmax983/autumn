@@ -39,6 +39,7 @@ const SIGNING_SECRET_DEMO_VALUES: &[&str] = &[
 ];
 
 /// Known top-level keys in a valid `autumn.toml`.
+#[cfg(test)]
 const KNOWN_TOML_SECTIONS: &[&str] = &[
     "server",
     "database",
@@ -711,138 +712,7 @@ pub fn validate_toml_content(
     content: &str,
     schema: &HashMap<String, HashSet<String>>,
 ) -> Vec<(String, Option<String>)> {
-    let Ok(table) = toml::from_str::<toml::Table>(content) else {
-        return Vec::new();
-    };
-
-    let mut errors = Vec::new();
-    let mut path = Vec::new();
-    validate_toml_table(&table, &mut path, schema, &mut errors);
-    errors
-}
-
-fn validate_toml_table(
-    table: &toml::Table,
-    path: &mut Vec<String>,
-    schema: &HashMap<String, HashSet<String>>,
-    errors: &mut Vec<(String, Option<String>)>,
-) {
-    let mut schema_path_parts = Vec::new();
-    if path.len() >= 2 && path[0] == "profile" {
-        schema_path_parts.extend(path[2..].iter().cloned());
-    } else {
-        schema_path_parts.extend(path.iter().cloned());
-    }
-    let schema_path = schema_path_parts.join(".");
-
-    if let Some(valid_keys) = schema.get(&schema_path) {
-        for (k, val) in table {
-            if path.is_empty() && k == "profile" {
-                path.push(k.clone());
-                match val {
-                    toml::Value::Table(t) => {
-                        validate_toml_table(t, path, schema, errors);
-                    }
-                    toml::Value::Array(arr) => {
-                        for item in arr {
-                            if let toml::Value::Table(t) = item {
-                                validate_toml_table(t, path, schema, errors);
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-                path.pop();
-                continue;
-            }
-
-            if !valid_keys.contains(k) {
-                let mut full_path_parts = path.clone();
-                full_path_parts.push(k.clone());
-                let full_path = full_path_parts.join(".");
-
-                let mut closest: Option<&str> = None;
-                let mut min_dist = usize::MAX;
-                for valid_key in valid_keys {
-                    let dist = autumn_web::config::levenshtein(k, valid_key);
-                    if dist <= 2 && dist < min_dist {
-                        min_dist = dist;
-                        closest = Some(valid_key);
-                    }
-                }
-
-                let suggestion = closest.map(|c| {
-                    let mut sug_parts = path.clone();
-                    sug_parts.push(c.to_string());
-                    sug_parts.join(".")
-                });
-
-                errors.push((full_path, suggestion));
-            } else {
-                path.push(k.clone());
-                match val {
-                    toml::Value::Table(t) => {
-                        validate_toml_table(t, path, schema, errors);
-                    }
-                    toml::Value::Array(arr) => {
-                        for item in arr {
-                            if let toml::Value::Table(t) = item {
-                                validate_toml_table(t, path, schema, errors);
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-                path.pop();
-            }
-        }
-    } else {
-        if path.len() == 1 && path[0] == "profile" {
-            for (k, val) in table {
-                if let toml::Value::Table(t) = val {
-                    path.push(k.clone());
-                    validate_toml_table(t, path, schema, errors);
-                    path.pop();
-                } else {
-                    let mut full_path_parts = path.clone();
-                    full_path_parts.push(k.clone());
-                    errors.push((full_path_parts.join("."), None));
-                }
-            }
-        } else if path.is_empty() {
-            let root_keys = schema.get("").cloned().unwrap_or_default();
-            for (k, val) in table {
-                if k != "profile" && !root_keys.contains(k) {
-                    let mut closest: Option<&str> = None;
-                    let mut min_dist = usize::MAX;
-                    for valid_key in &root_keys {
-                        let dist = autumn_web::config::levenshtein(k, valid_key);
-                        if dist <= 2 && dist < min_dist {
-                            min_dist = dist;
-                            closest = Some(valid_key);
-                        }
-                    }
-                    errors.push((k.clone(), closest.map(String::from)));
-                } else {
-                    path.push(k.clone());
-                    match val {
-                        toml::Value::Table(t) => {
-                            validate_toml_table(t, path, schema, errors);
-                        }
-                        toml::Value::Array(arr) => {
-                            for item in arr {
-                                if let toml::Value::Table(t) = item {
-                                    validate_toml_table(t, path, schema, errors);
-                                }
-                            }
-                        }
-                        _ => {}
-                    }
-                    path.pop();
-                }
-            }
-        }
-    }
+    autumn_web::config::AutumnConfig::validate_toml(content, schema)
 }
 
 fn find_all_profile_files() -> Vec<(String, std::path::PathBuf)> {
@@ -853,7 +723,8 @@ fn find_all_profile_files() -> Vec<(String, std::path::PathBuf)> {
             if path.is_file() {
                 if let Some(filename) = path.file_name().and_then(|n| n.to_str()) {
                     if filename.starts_with("autumn-") && filename.ends_with(".toml") {
-                        let profile = filename["autumn-".len()..filename.len() - ".toml".len()].to_string();
+                        let profile =
+                            filename["autumn-".len()..filename.len() - ".toml".len()].to_string();
                         files.push((profile, path));
                     }
                 }
@@ -879,8 +750,11 @@ pub fn check_toml_content(content: &str) -> CheckResult {
             // 1. Validate base autumn.toml
             let base_errors = validate_toml_content(content, &schema);
             for (path, sug) in base_errors {
-                errors.push(format!("autumn.toml: unknown key \"{path}\"{}", 
-                    sug.map(|s| format!(" — did you mean \"{s}\"?")).unwrap_or_default()));
+                errors.push(format!(
+                    "autumn.toml: unknown key \"{path}\"{}",
+                    sug.map(|s| format!(" — did you mean \"{s}\"?"))
+                        .unwrap_or_default()
+                ));
             }
 
             // 2. Validate any autumn-*.toml profile files
@@ -888,10 +762,16 @@ pub fn check_toml_content(content: &str) -> CheckResult {
             for (_, path) in profile_files {
                 if let Ok(file_content) = std::fs::read_to_string(&path) {
                     let profile_errors = validate_toml_content(&file_content, &schema);
-                    let filename = path.file_name().and_then(|n| n.to_str()).unwrap_or("profile config");
+                    let filename = path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("profile config");
                     for (path, sug) in profile_errors {
-                        errors.push(format!("{filename}: unknown key \"{path}\"{}", 
-                            sug.map(|s| format!(" — did you mean \"{s}\"?")).unwrap_or_default()));
+                        errors.push(format!(
+                            "{filename}: unknown key \"{path}\"{}",
+                            sug.map(|s| format!(" — did you mean \"{s}\"?"))
+                                .unwrap_or_default()
+                        ));
                     }
                 }
             }
@@ -3941,9 +3821,7 @@ foo = "bar"
             .flat_map(|&s| ["[", s, "]\n"])
             .collect();
         let r = check_toml_content(&content);
-        if r.status != CheckStatus::Pass {
-            panic!("Test failed with result: {:?}", r);
-        }
+        assert_eq!(r.status, CheckStatus::Pass, "Test failed with result: {r:?}");
     }
 
     // ── check_version_compat ─────────────────────────────────────────────────
