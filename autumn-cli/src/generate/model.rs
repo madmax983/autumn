@@ -319,113 +319,204 @@ pub(super) fn ensure_cargo_dependencies(existing: &str, deps: &[(&str, &str)]) -
     out
 }
 
-/// Ensure the `autumn-web` dependency in `Cargo.toml` carries `feature`
-/// (a bare name like `storage`). Returns the toml unchanged if it is already
-/// present. Handles the three forms a fresh Autumn project may use:
-/// - `autumn-web = "x.y"` (simple string)
-/// - `autumn-web = { version = "x.y", ... }` (inline table)
-/// - `[dependencies.autumn-web]` subtable
+/// Ensure the `autumn-web` dependency in the runtime `[dependencies]` table
+/// carries `feature` (a bare name like `db`). Returns the toml unchanged if the
+/// feature is already present or no runtime `autumn-web` dependency is found.
+///
+/// Handles the simple-string, inline-table (single- or multi-line), and
+/// `[dependencies.autumn-web]` subtable forms; preserves trailing `# comments`;
+/// and only touches the runtime `[dependencies]` table — never
+/// `[dev-dependencies]`, `[build-dependencies]`, or target-specific tables.
 pub(super) fn ensure_autumn_web_feature(toml: &str, feature: &str) -> String {
     const CRATE: &str = "autumn-web";
-    let feature_token = format!("\"{feature}\"");
-    let feature = feature_token.as_str();
+    let quoted = format!("\"{feature}\"");
 
     let mut lines: Vec<String> = toml.lines().map(str::to_owned).collect();
     let trailing_newline = toml.ends_with('\n');
 
-    let simple_prefix = format!("{CRATE} = \"");
-    let table_prefix = format!("{CRATE} = {{");
-    let subtable_header = format!("[dependencies.{CRATE}]");
-
+    // Shorthand `autumn-web = ...` keys belong to whichever table header most
+    // recently preceded them, so only edit them while inside `[dependencies]`.
+    let mut in_runtime_deps = false;
     let mut i = 0;
     while i < lines.len() {
-        let trimmed = lines[i].trim().to_owned();
-        let indent: String = lines[i]
-            .chars()
-            .take_while(char::is_ascii_whitespace)
-            .collect();
+        let line = lines[i].clone();
+        let (code, comment) = strip_toml_comment(&line);
+        let trimmed = code.trim();
 
-        if let Some(rest) = trimmed.strip_prefix(&simple_prefix) {
-            let version = rest.trim_end_matches('"');
-            lines[i] =
-                format!("{indent}{CRATE} = {{ version = \"{version}\", features = [{feature}] }}");
-            break;
+        // Table header: update the active section, or handle the unambiguous
+        // `[dependencies.autumn-web]` subtable directly.
+        if let Some(inner) = trimmed.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+            let header = inner.trim();
+            if header == format!("dependencies.{CRATE}") {
+                ensure_feature_in_subtable(&mut lines, i, &quoted);
+                return join_lines(&lines, trailing_newline);
+            }
+            in_runtime_deps = header == "dependencies";
+            i += 1;
+            continue;
         }
 
-        if trimmed.starts_with(&table_prefix) {
-            if trimmed.contains(feature) {
-                break; // already present
-            }
-            if let Some(feat_bracket) = trimmed.find("features = [") {
-                let list_start = feat_bracket + "features = [".len();
-                let list_end = trimmed[list_start..].find(']').unwrap() + list_start;
-                let existing = trimmed[list_start..list_end].trim();
-                let new_list = if existing.is_empty() {
-                    feature.to_owned()
-                } else {
-                    format!("{existing}, {feature}")
-                };
-                lines[i] = format!(
-                    "{indent}{}{}{}",
-                    &trimmed[..list_start],
-                    new_list,
-                    &trimmed[list_end..]
-                );
+        if in_runtime_deps
+            && let Some(rest) = trimmed
+                .strip_prefix(CRATE)
+                .map(str::trim_start)
+                .and_then(|r| r.strip_prefix('='))
+                .map(str::trim_start)
+        {
+            let indent: String = line.chars().take_while(char::is_ascii_whitespace).collect();
+            let comment = comment.trim();
+            let comment_suffix = if comment.is_empty() {
+                String::new()
             } else {
-                let close = trimmed.rfind('}').unwrap();
-                let before_close = trimmed[..close].trim_end();
-                let sep = if before_close.ends_with('{') {
-                    ""
-                } else {
-                    ", "
-                };
-                lines[i] = format!(
-                    "{indent}{}{sep}features = [{feature}]{}",
-                    &trimmed[..close],
-                    &trimmed[close..]
-                );
-            }
-            break;
-        }
+                format!("  {comment}")
+            };
 
-        if trimmed == subtable_header {
-            let mut j = i + 1;
-            let mut found_features = false;
-            while j < lines.len() {
-                let t = lines[j].trim().to_owned();
-                if t.starts_with('[') {
-                    break;
+            // (A) Simple string: `autumn-web = "x.y"` (the comment is split off).
+            if let Some(after) = rest.strip_prefix('"') {
+                if let Some(end) = after.find('"') {
+                    let version = &after[..end];
+                    lines[i] = format!(
+                        "{indent}{CRATE} = {{ version = \"{version}\", features = [{quoted}] }}{comment_suffix}"
+                    );
                 }
-                if t.starts_with("features") {
-                    found_features = true;
-                    if !t.contains(feature)
-                        && let (Some(open), Some(close)) = (t.find('['), t.rfind(']'))
-                    {
-                        let inner = t[open + 1..close].trim();
-                        let new_inner = if inner.is_empty() {
-                            feature.to_owned()
-                        } else {
-                            format!("{inner}, {feature}")
-                        };
-                        let indent_j: String = lines[j]
-                            .chars()
-                            .take_while(char::is_ascii_whitespace)
-                            .collect();
-                        lines[j] = format!("{indent_j}features = [{new_inner}]");
+                return join_lines(&lines, trailing_newline);
+            }
+
+            // (B) Inline table: `autumn-web = { ... }`, single- or multi-line.
+            if rest.starts_with('{') {
+                let mut end = i;
+                while end < lines.len() {
+                    let (c, _) = strip_toml_comment(&lines[end]);
+                    if c.contains('}') {
+                        break;
                     }
-                    break;
+                    end += 1;
                 }
-                j += 1;
+                if end >= lines.len() {
+                    return join_lines(&lines, trailing_newline); // unterminated — leave as-is
+                }
+                // Collapse the span's code into one logical inline-table line.
+                let mut joined = String::new();
+                let mut tail_comment = "";
+                for (k, owned) in lines[i..=end].iter().enumerate() {
+                    let (c, cm) = strip_toml_comment(owned);
+                    if !joined.is_empty() {
+                        joined.push(' ');
+                    }
+                    joined.push_str(c.trim());
+                    if i + k == end {
+                        tail_comment = cm.trim();
+                    }
+                }
+                let edited = ensure_feature_in_inline_table(&joined, &quoted);
+                let comment_suffix = if tail_comment.is_empty() {
+                    String::new()
+                } else {
+                    format!("  {tail_comment}")
+                };
+                lines.splice(
+                    i..=end,
+                    std::iter::once(format!("{indent}{edited}{comment_suffix}")),
+                );
+                return join_lines(&lines, trailing_newline);
             }
-            if !found_features {
-                lines.insert(i + 1, format!("features = [{feature}]"));
-            }
-            break;
         }
 
         i += 1;
     }
 
+    join_lines(&lines, trailing_newline)
+}
+
+/// Add `quoted` (already wrapped in `"`) to a single-line inline-table
+/// dependency spec like `autumn-web = { version = "x", features = [...] }`,
+/// returning it unchanged if the feature is present or the spec is malformed.
+fn ensure_feature_in_inline_table(line: &str, quoted: &str) -> String {
+    if line.contains(quoted) {
+        return line.to_owned();
+    }
+    if let Some(bracket) = line.find("features = [") {
+        let list_start = bracket + "features = [".len();
+        let Some(rel_end) = line[list_start..].find(']') else {
+            return line.to_owned();
+        };
+        let list_end = list_start + rel_end;
+        let existing = line[list_start..list_end].trim();
+        let new_list = if existing.is_empty() {
+            quoted.to_owned()
+        } else {
+            format!("{existing}, {quoted}")
+        };
+        format!("{}{}{}", &line[..list_start], new_list, &line[list_end..])
+    } else {
+        let Some(close) = line.rfind('}') else {
+            return line.to_owned();
+        };
+        let head = line[..close].trim_end();
+        let closing = line[close..].trim_start();
+        if head.ends_with('{') {
+            format!("{head} features = [{quoted}] {closing}")
+        } else {
+            format!("{head}, features = [{quoted}] {closing}")
+        }
+    }
+}
+
+/// Add `quoted` to the `features` array of a `[dependencies.autumn-web]`
+/// subtable beginning at `header_idx`, inserting a `features` line if absent.
+fn ensure_feature_in_subtable(lines: &mut Vec<String>, header_idx: usize, quoted: &str) {
+    let mut j = header_idx + 1;
+    while j < lines.len() {
+        let owned = lines[j].clone();
+        let (code, comment) = strip_toml_comment(&owned);
+        let t = code.trim();
+        if t.starts_with('[') {
+            break; // next table — no features key in this subtable
+        }
+        if t.starts_with("features") {
+            if !t.contains(quoted)
+                && let (Some(open), Some(close)) = (t.find('['), t.rfind(']'))
+            {
+                let inner = t[open + 1..close].trim();
+                let new_inner = if inner.is_empty() {
+                    quoted.to_owned()
+                } else {
+                    format!("{inner}, {quoted}")
+                };
+                let indent: String = owned
+                    .chars()
+                    .take_while(char::is_ascii_whitespace)
+                    .collect();
+                let comment = comment.trim();
+                let comment_suffix = if comment.is_empty() {
+                    String::new()
+                } else {
+                    format!("  {comment}")
+                };
+                lines[j] = format!("{indent}features = [{new_inner}]{comment_suffix}");
+            }
+            return;
+        }
+        j += 1;
+    }
+    lines.insert(header_idx + 1, format!("features = [{quoted}]"));
+}
+
+/// Split a TOML line into its code and trailing-`# comment` parts, ignoring
+/// `#` characters that appear inside a double-quoted string.
+fn strip_toml_comment(line: &str) -> (&str, &str) {
+    let mut in_string = false;
+    for (idx, ch) in line.char_indices() {
+        match ch {
+            '"' => in_string = !in_string,
+            '#' if !in_string => return (&line[..idx], &line[idx..]),
+            _ => {}
+        }
+    }
+    (line, "")
+}
+
+fn join_lines(lines: &[String], trailing_newline: bool) -> String {
     let mut out = lines.join("\n");
     if trailing_newline && !out.ends_with('\n') {
         out.push('\n');
@@ -1100,6 +1191,53 @@ autumn-web = \"0.3\"\n";
             "[dependencies]\nautumn-web = { version = \"0.5\", features = [\"storage\"] }\n";
         let out = ensure_autumn_web_feature(input, "storage");
         assert_eq!(out, input, "must not duplicate an already-present feature");
+    }
+
+    #[test]
+    fn ensure_autumn_web_feature_preserves_trailing_comment() {
+        let input = "[dependencies]\nautumn-web = \"0.5\" # framework\n";
+        let out = ensure_autumn_web_feature(input, "db");
+        assert!(
+            out.contains("autumn-web = { version = \"0.5\", features = [\"db\"] }  # framework"),
+            "trailing comment must be preserved, not embedded: {out}"
+        );
+    }
+
+    #[test]
+    fn ensure_autumn_web_feature_ignores_dev_dependencies() {
+        // A dev-dependencies autumn-web must NOT be edited; only the runtime one.
+        let input = "[dev-dependencies]\nautumn-web = \"0.5\"\n\n\
+                     [dependencies]\nautumn-web = { version = \"0.5\", default-features = false }\n";
+        let out = ensure_autumn_web_feature(input, "db");
+        assert!(
+            out.contains("[dependencies]\nautumn-web = { version = \"0.5\", default-features = false, features = [\"db\"] }"),
+            "runtime dependency must gain the feature: {out}"
+        );
+        assert!(
+            out.contains("[dev-dependencies]\nautumn-web = \"0.5\"\n"),
+            "dev-dependencies entry must be untouched: {out}"
+        );
+    }
+
+    #[test]
+    fn ensure_autumn_web_feature_handles_multiline_inline_table() {
+        // A multiline inline table must not panic; it collapses to one valid line.
+        let input = "[dependencies]\nautumn-web = {\n    version = \"0.5\"\n}\n";
+        let out = ensure_autumn_web_feature(input, "db");
+        assert!(
+            out.contains("autumn-web = { version = \"0.5\", features = [\"db\"] }"),
+            "multiline inline table must be handled without panic: {out}"
+        );
+    }
+
+    #[test]
+    fn ensure_autumn_web_feature_no_runtime_dep_is_noop() {
+        let input = "[dev-dependencies]\nautumn-web = \"0.5\"\n";
+        let out = ensure_autumn_web_feature(input, "db");
+        assert_eq!(
+            out, input,
+            "must not edit when there is no runtime dependency"
+        );
     }
 
     #[test]
