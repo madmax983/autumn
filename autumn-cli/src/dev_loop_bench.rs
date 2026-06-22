@@ -876,10 +876,7 @@ fn measure_cold_start_once(shape: ColdStartShape) -> Result<u64, String> {
         // child's boot-toward-bind-failure window.
         if let Ok(resp) = client.get(&url).send()
             && resp.status().is_success()
-            && resp
-                .text()
-                .map(|body| body.contains(project_name))
-                .unwrap_or(false)
+            && resp.text().is_ok_and(|body| body.contains(project_name))
         {
             measured = Some(u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX));
             break;
