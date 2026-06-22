@@ -178,8 +178,7 @@ pub fn read_project_name(dir: &Path) -> Result<String, ReleaseError> {
         ));
     }
 
-    let parsed: toml::Value = content
-        .parse()
+    let parsed: toml::Value = toml::from_str(&content)
         .map_err(|e| ReleaseError::CargoToml(format!("parse error: {e}")))?;
     parsed
         .get("package")
