@@ -974,8 +974,11 @@ fn release_image_boot_gate_is_configured() {
     // ── Harness behaviour (the actual build-and-boot contract) ──────────────
 
     // AC: scaffolds a fresh project then runs `autumn release init --force`.
+    // Assert against the actual command invocation, not just a log/comment string:
+    // the harness runs `"${AUTUMN}" new "${PROJECT_NAME}"` which contains the
+    // literal substring `"${AUTUMN}" new "` in the script source.
     assert!(
-        harness.contains("autumn new") || harness.contains("\"new\""),
+        harness.contains("\"${AUTUMN}\" new \""),
         "harness must scaffold a fresh project via `autumn new`",
     );
     assert!(

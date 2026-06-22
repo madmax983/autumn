@@ -38,6 +38,8 @@ on:
       - "autumn/Cargo.toml"
   pull_request:
     branches: [trunk, trunk-dev]
+    # Keep this list in sync with push.paths above — GitHub Actions YAML does
+    # not support anchors inside `on:`, so both blocks must be updated together.
     paths:
       - ".github/workflows/release-image-boot.yml"
       - "scripts/check-release-image-boot.sh"

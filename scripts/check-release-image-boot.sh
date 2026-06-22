@@ -79,7 +79,12 @@ cleanup() {
     log "Tearing down docker-compose stack"
     ( cd "${PROJECT_DIR}" && docker compose down -v --remove-orphans >/dev/null 2>&1 )
   fi
-  docker rm -f "${CONTAINER_NAME}" >/dev/null 2>&1
+  # Only remove the named container in the default target; the docker-compose
+  # target never starts it, and removing it unconditionally would kill a
+  # sibling job's container on a shared runner.
+  if [[ "${TARGET}" == "default" ]]; then
+    docker rm -f "${CONTAINER_NAME}" >/dev/null 2>&1 || true
+  fi
   rm -rf "${WORKDIR}"
 }
 trap cleanup EXIT
@@ -89,17 +94,17 @@ log "Scaffolding a fresh project with \`autumn new\`"
 ( cd "${WORKDIR}" && "${AUTUMN}" new "${PROJECT_NAME}" )
 
 # ── health probe helper ─────────────────────────────────────────────────────
-# Polls URLs until all return HTTP 200 or the shared absolute deadline elapses.
-# A single shared deadline is used for all URLs so the total wait is bounded
-# by STARTUP_BUDGET_SECS regardless of how many endpoints are checked.
-# A single curl invocation per tick captures body and status atomically,
-# avoiding the TOCTOU window and double round-trip of two separate calls.
+# Polls each URL until it returns HTTP 200 or the per-URL budget elapses.
+# Each URL gets a fresh budget window so a slow-starting first endpoint cannot
+# starve subsequent ones. A single curl invocation per tick captures body and
+# status atomically (no TOCTOU). The body file is truncated before each curl
+# so a failed request (no HTTP response written) never exposes stale bytes.
 #
-# Usage: probe_until_healthy <deadline_absolute> <url> [<url> ...]
-#   deadline_absolute  — value of $SECONDS at which probing must stop
-#   url(s)             — one or more endpoints; all must return 200
+# Usage: probe_until_healthy <budget_secs> <url> [<url> ...]
+#   budget_secs  — seconds each URL is given to reach 200
+#   url(s)       — one or more endpoints; all must return 200
 probe_until_healthy() {
-  local deadline="$1"
+  local budget_secs="$1"
   shift
   local urls=("$@")
   local probe_body_file
@@ -108,7 +113,10 @@ probe_until_healthy() {
   for url in "${urls[@]}"; do
     local code=""
     local body=""
-    while (( SECONDS < deadline )); do
+    LAST_PROBE_RESPONSE=""
+    local url_deadline=$(( SECONDS + budget_secs ))
+    while (( SECONDS < url_deadline )); do
+      : > "${probe_body_file}"
       code="$(curl -o "${probe_body_file}" -s -m 5 -w '%{http_code}' "${url}" 2>/dev/null || echo 000)"
       body="$(cat "${probe_body_file}" 2>/dev/null || true)"
       if [[ "${code}" == "200" ]]; then
@@ -120,7 +128,7 @@ probe_until_healthy() {
     done
     if [[ "${code}" != "200" ]]; then
       rm -f "${probe_body_file}"
-      fail "${url} did not return 200 within ${STARTUP_BUDGET_SECS}s (last code: ${code:-none}, body: ${body:-<empty>})"
+      fail "${url} did not return 200 within ${budget_secs}s (last code: ${code:-none}, body: ${body:-<empty>})"
       return 1
     fi
   done
@@ -180,8 +188,7 @@ run_default_target() {
     -e AUTUMN_SECURITY__TRUSTED_HOSTS__HOSTS="*" \
     "${IMAGE_TAG}"
 
-  local deadline=$(( SECONDS + STARTUP_BUDGET_SECS ))
-  if ! probe_until_healthy "${deadline}" \
+  if ! probe_until_healthy "${STARTUP_BUDGET_SECS}" \
        "http://localhost:3000/health" \
        "http://localhost:3000/actuator/health"; then
     fail "container did not reach a healthy state — boot logs follow"
@@ -218,8 +225,7 @@ YAML
     exit 1
   fi
 
-  local deadline=$(( SECONDS + STARTUP_BUDGET_SECS ))
-  if ! probe_until_healthy "${deadline}" \
+  if ! probe_until_healthy "${STARTUP_BUDGET_SECS}" \
        "http://localhost:3000/health" \
        "http://localhost:3000/actuator/health"; then
     fail "compose stack did not reach a healthy state — compose logs follow"
