@@ -67,6 +67,7 @@ jobs:
 
       - name: Run gate crate unit tests
         run: |
+          set -o pipefail
           cargo test -p bench-runtime-gate --lib 2>&1 | tee gate-test-output.txt
           grep -E "^test result:" gate-test-output.txt
 
@@ -114,6 +115,10 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2.7.8
+        with:
+          workspaces: |
+            . -> target
+            benchmarks/runtime/autumn -> benchmarks/runtime/autumn/target
         continue-on-error: true
 
       # ── Apply schema and seed ────────────────────────────────────────────────
@@ -126,6 +131,10 @@ jobs:
           psql -h 127.0.0.1 -U benchmark -d benchmark \
             -f benchmarks/runtime/seed/seed.sql
           echo "Schema and seed applied."
+
+      # ── Build gate binary first (fast; fail-fast on compile errors) ──────────
+      - name: Build gate binary
+        run: cargo build -p bench-runtime-gate
 
       # ── Build bench-autumn (release) ─────────────────────────────────────────
       - name: Build bench-autumn (release)
@@ -205,13 +214,11 @@ jobs:
           cp gate-summary.json summary-3.json
           echo "Run 3: $(cat summary-3.json)"
 
-      # ── Build gate binary and compare ────────────────────────────────────────
-      - name: Build gate binary
-        run: cargo build -p bench-runtime-gate
-
+      # ── Compare median p99 against budget ────────────────────────────────────
       - name: Compare median p99 against budget
         id: gate
         run: |
+          set -o pipefail
           ./target/debug/bench-runtime-gate \
             --budgets benchmarks/runtime/budgets.toml \
             --summary gate-runs/summary-1.json \
@@ -252,7 +259,9 @@ jobs:
       - name: Regression gate
         if: ${{ inputs.fail_on_regression != 'false' }}
         run: |
-          ALL_PASSED=$(jq -r '.all_passed' gate-report.json 2>/dev/null || echo "true")
+          # Do NOT fall back to "true" on jq failure — a missing gate-report.json
+          # (e.g. the gate binary crashed before writing it) should fail the gate.
+          ALL_PASSED=$(jq -r '.all_passed' gate-report.json)
           if [ "$ALL_PASSED" != "true" ]; then
             echo "::error::One or more paths exceeded the p99 latency budget."
             echo "::error::See gate-report.json artifact for details."

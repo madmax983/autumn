@@ -65,12 +65,15 @@ export default function () {
 // Emit gate-summary.json keyed by the exact budget path strings.
 // bench-runtime-gate reads this file to get p99_ms per path.
 export function handleSummary(data) {
+  // Use a large sentinel when a metric is absent (app down, no responses recorded)
+  // so bench-runtime-gate fails the gate rather than silently passing with 0ms.
+  const MISSING = 999_999;
   const apiP99 = data.metrics["gate_api_posts"]
     ? data.metrics["gate_api_posts"].values["p(99)"]
-    : 0;
+    : MISSING;
   const htmlP99 = data.metrics["gate_html_posts"]
     ? data.metrics["gate_html_posts"].values["p(99)"]
-    : 0;
+    : MISSING;
 
   const summary = {
     "GET /api/posts": { p99_ms: apiP99 },

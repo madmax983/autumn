@@ -89,7 +89,12 @@ pub fn check_gate<S: BuildHasher>(budgets: &Budgets, medians: &HashMap<String, f
         .paths
         .iter()
         .map(|(path, budget)| {
-            let observed = medians.get(path).copied().unwrap_or(0.0);
+            // No measurement for a budgeted path (e.g. app was down) → conservative
+            // sentinel that exceeds any realistic budget so the gate fails loudly.
+            let observed = medians
+                .get(path)
+                .copied()
+                .unwrap_or_else(|| f64::from(u32::MAX));
             // ceil so that 110.1ms rounds up to 111ms and fails a 110ms budget,
             // rather than being silently truncated to 110 and appearing to pass.
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
@@ -290,6 +295,22 @@ p99_ms = 95
         assert!(!api_result.passed);
         assert_eq!(api_result.observed_p99_ms, 200);
         assert_eq!(api_result.budget_p99_ms, 110);
+    }
+
+    #[test]
+    fn check_gate_fails_when_budgeted_path_has_no_measurement() {
+        let budgets = two_path_budgets();
+        let mut medians = HashMap::new();
+        medians.insert("GET /api/posts".to_string(), 80.0);
+        // "GET /posts" measurement is intentionally absent (app was down, etc.)
+        let report = check_gate(&budgets, &medians);
+        assert!(!report.all_passed, "missing measurement must fail the gate");
+        let html_result = report
+            .results
+            .iter()
+            .find(|r| r.path == "GET /posts")
+            .unwrap();
+        assert!(!html_result.passed, "path with no measurement must not pass");
     }
 
     #[test]
