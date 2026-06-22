@@ -141,6 +141,7 @@ pub fn plan_scaffold_with_options(
                 &plural,
                 &form_fields,
                 options_with_key.model.sharded,
+                options_with_key.model.soft_delete,
             ),
         );
         let route_mod_path = routes_dir.join("mod.rs");
@@ -484,6 +485,7 @@ fn render_routes_file(
     plural: &str,
     fields: &[Field],
     sharded: bool,
+    soft_delete: bool,
 ) -> String {
     let create_inputs = render_create_form_inputs(fields);
     let edit_inputs = render_edit_form_inputs(fields);
@@ -491,6 +493,23 @@ fn render_routes_file(
     let nullable_field_match = render_nullable_field_match(fields);
     let has_attachments = has_attachment_fields(fields);
     let (decoded_form_struct, decoded_form_mapping) = render_decoded_form(pascal_name, fields);
+    // The destroy handler must honour the resource's delete semantics: when the
+    // scaffold was generated with `--soft-delete`, mark `deleted_at` (matching
+    // the soft-delete repository) instead of issuing a physical `DELETE`.
+    let destroy_stmt = if soft_delete {
+        // Filter on `deleted_at IS NULL` so deleting an already-soft-deleted row
+        // affects zero rows and returns 404, matching the physical-delete path.
+        format!(
+            "let deleted = diesel::update(\n        {plural}::table.find(*id).filter({plural}::deleted_at.is_null()),\n    )\n        \
+                 .set({plural}::deleted_at.eq(Some(chrono::Utc::now().naive_utc())))\n        \
+                 .execute(&mut *db)\n        .await?;"
+        )
+    } else {
+        format!(
+            "let deleted = diesel::delete({plural}::table.find(*id))\n        \
+                 .execute(&mut *db)\n        .await?;"
+        )
+    };
     // Forms remain URL-encoded for compatibility with the generated handlers.
     // File uploads are handled separately via direct-upload URLs generated in
     // a CSRF-protected endpoint (see docs/guide/storage.md#direct-uploads).
@@ -506,11 +525,11 @@ fn render_routes_file(
     ) = if has_attachments {
         (
             format!(
-                "state: autumn_web::extract::State<autumn_web::AppState>, mut db: {db_ty}, body: Bytes"
+                "flash: Flash, state: autumn_web::extract::State<autumn_web::AppState>, mut db: {db_ty}, body: Bytes"
             ),
             "decode_form(&state, body).await?".to_owned(),
             format!(
-                "state: autumn_web::extract::State<autumn_web::AppState>,\n    id: Path<i64>,\n    mut db: {db_ty},\n    body: Bytes,"
+                "flash: Flash,\n    state: autumn_web::extract::State<autumn_web::AppState>,\n    id: Path<i64>,\n    mut db: {db_ty},\n    body: Bytes,"
             ),
             "decode_form(&state, body).await?".to_owned(),
             format!(
@@ -519,9 +538,9 @@ fn render_routes_file(
         )
     } else {
         (
-            format!("mut db: {db_ty}, body: Bytes"),
+            format!("flash: Flash, mut db: {db_ty}, body: Bytes"),
             "decode_form(body)?".to_owned(),
-            format!("id: Path<i64>,\n    mut db: {db_ty},\n    body: Bytes,"),
+            format!("flash: Flash,\n    id: Path<i64>,\n    mut db: {db_ty},\n    body: Bytes,"),
             "decode_form(body)?".to_owned(),
             format!("fn decode_form(body: Bytes) -> AutumnResult<New{pascal_name}>"),
         )
@@ -540,10 +559,11 @@ fn render_routes_file(
 pub async fn index(
     page_req: PageRequest,
     db: ShardedDb,
+    flash: Flash,
 ) -> AutumnResult<Markup> {{
     let repo = Pg{pascal_name}Repository::from_shard(&db);
     let page_data: Page<{pascal_name}> = repo.page(&page_req).await?;
-    Ok(layout("{pascal_name} index", html! {{
+    Ok(layout("{pascal_name} index", flash.render().await, html! {{
         h1 {{ "{pascal_name}s" }}
         a href="/{plural}/new" {{ "New {pascal_name}" }}
         ul {{
@@ -566,9 +586,10 @@ pub async fn index(
 pub async fn index(
     page_req: PageRequest,
     repo: Pg{pascal_name}Repository,
+    flash: Flash,
 ) -> AutumnResult<Markup> {{
     let page_data: Page<{pascal_name}> = repo.page(&page_req).await?;
-    Ok(layout("{pascal_name} index", html! {{
+    Ok(layout("{pascal_name} index", flash.render().await, html! {{
         h1 {{ "{pascal_name}s" }}
         a href="/{plural}/new" {{ "New {pascal_name}" }}
         ul {{
@@ -584,11 +605,13 @@ pub async fn index(
 
     // Imports: when sharded, drop Db from brace-import and add ShardedDb separately.
     let db_import = if sharded {
-        "use autumn_web::sharding::ShardedDb;\n\
+        "use autumn_web::flash::Flash;\n\
+         use autumn_web::sharding::ShardedDb;\n\
          use autumn_web::{AutumnError, AutumnResult, Markup, get, html, post, secured};"
             .to_owned()
     } else {
-        "use autumn_web::{AutumnError, AutumnResult, Db, Markup, get, html, post, secured};"
+        "use autumn_web::flash::Flash;\n\
+         use autumn_web::{AutumnError, AutumnResult, Db, Markup, get, html, post, secured};"
             .to_owned()
     };
 
@@ -640,15 +663,22 @@ fn csrf_input(csrf: Option<&CsrfToken>, field: Option<&CsrfFormField>) -> Markup
 
 /// Wrap content in a minimal HTML layout. Replace with your real layout
 /// once you wire in Tailwind / your design system.
-fn layout(title: &str, content: Markup) -> Markup {{
+///
+/// Pass `flash.render().await` for the `flash` argument so one-shot notices
+/// (set with `flash.success(...)` before a redirect) appear on the next page.
+fn layout(title: &str, flash: Markup, content: Markup) -> Markup {{
     html! {{
         (autumn_web::PreEscaped("<!DOCTYPE html>"))
         html lang="en" {{
             head {{
                 meta charset="utf-8";
                 title {{ (title) }}
+                link rel="stylesheet" href=(autumn_web::flash::FLASH_CSS_PATH);
             }}
-            body {{ (content) }}
+            body {{
+                (flash)
+                (content)
+            }}
         }}
     }}
 }}
@@ -688,16 +718,18 @@ fn pagination_nav<T>(page: &Page<T>, base_url: &str) -> Markup {{
 
 /// `GET /{plural}/{{id}}` — show one {snake_name}.
 #[get("/{plural}/{{id}}")]
-pub async fn show(id: Path<i64>, mut db: {db_ty}) -> AutumnResult<Markup> {{
+pub async fn show(id: Path<i64>, mut db: {db_ty}, flash: Flash) -> AutumnResult<Markup> {{
     let row: {pascal_name} = {plural}::table
         .find(*id)
         .select({pascal_name}::as_select())
         .first(&mut *db)
         .await
         .map_err(AutumnError::not_found)?;
-    Ok(layout(&format!("{pascal_name} #{{}}", row.id), html! {{
+    Ok(layout(&format!("{pascal_name} #{{}}", row.id), flash.render().await, html! {{
         h1 {{ "{pascal_name} #" (row.id) }}
         a href="/{plural}" {{ "Back to list" }}
+        " "
+        a href=(format!("/{plural}/{{}}/edit", row.id)) {{ "Edit" }}
     }}))
 }}
 
@@ -705,10 +737,11 @@ pub async fn show(id: Path<i64>, mut db: {db_ty}) -> AutumnResult<Markup> {{
 #[secured]
 #[get("/{plural}/new")]
 pub async fn new_form(
+    flash: Flash,
     csrf: Option<CsrfToken>,
     csrf_field: Option<CsrfFormField>,
 ) -> AutumnResult<Markup> {{
-    Ok(layout("New {pascal_name}", html! {{
+    Ok(layout("New {pascal_name}", flash.render().await, html! {{
         h1 {{ "New {pascal_name}" }}
         form action="/{plural}" method="post"{form_enctype} {{
             (csrf_input(csrf.as_ref(), csrf_field.as_ref()))
@@ -726,6 +759,7 @@ pub async fn create({create_signature}) -> AutumnResult<Markup> {{
         .values(&new)
         .execute(&mut *db)
         .await?;
+    flash.success("{pascal_name} created").await;
     Ok(redirect_to("/{plural}"))
 }}
 
@@ -738,6 +772,7 @@ pub async fn create({create_signature}) -> AutumnResult<Markup> {{
 pub async fn edit_form(
     id: Path<i64>,
     mut db: {db_ty},
+    flash: Flash,
     csrf: Option<CsrfToken>,
     csrf_field: Option<CsrfFormField>,
 ) -> AutumnResult<Markup> {{
@@ -747,11 +782,17 @@ pub async fn edit_form(
         .first(&mut *db)
         .await
         .map_err(AutumnError::not_found)?;
-    Ok(layout(&format!("Edit {pascal_name} #{{}}", row.id), html! {{
+    Ok(layout(&format!("Edit {pascal_name} #{{}}", row.id), flash.render().await, html! {{
         h1 {{ "Edit {pascal_name} #" (row.id) }}
         form action=(format!("/{plural}/{{}}/update", row.id)) method="post"{form_enctype} {{
             (csrf_input(csrf.as_ref(), csrf_field.as_ref()))
 {edit_inputs}            button type="submit" {{ "Save" }}
+        }}
+        // Delete lives on this secured page (the public show page must not
+        // expose a control that anonymous users can't use).
+        form action=(format!("/{plural}/{{}}/delete", row.id)) method="post" {{
+            (csrf_input(csrf.as_ref(), csrf_field.as_ref()))
+            button type="submit" {{ "Delete" }}
         }}
     }}))
 }}
@@ -775,7 +816,30 @@ pub async fn update(
             "{pascal_name} with id {{}} not found", *id
         )));
     }}
+    flash.success("{pascal_name} updated").await;
     Ok(redirect_to(&format!("/{plural}/{{}}", *id)))
+}}
+
+/// `POST /{plural}/{{id}}/delete` — delete a row, then redirect to the list.
+/// Browsers can't submit `DELETE` without JS, so the show page's delete button
+/// posts here; the JSON `DELETE /api/{plural}/{{id}}` stays available for API
+/// clients via the auto-generated repository handler. Honours the resource's
+/// soft-delete configuration (marks `deleted_at` when `--soft-delete` is set).
+#[secured]
+#[post("/{plural}/{{id}}/delete")]
+pub async fn destroy(
+    id: Path<i64>,
+    mut db: {db_ty},
+    flash: Flash,
+) -> AutumnResult<Markup> {{
+    {destroy_stmt}
+    if deleted == 0 {{
+        return Err(AutumnError::not_found_msg(format!(
+            "{pascal_name} with id {{}} not found", *id
+        )));
+    }}
+    flash.success("{pascal_name} deleted").await;
+    Ok(redirect_to("/{plural}"))
 }}
 
 {decoded_form_struct}
@@ -1119,6 +1183,7 @@ fn main_route_entries(plural: &str, snake_name: &str, api: bool) -> Vec<String> 
             format!("routes::{plural}::create"),
             format!("routes::{plural}::edit_form"),
             format!("routes::{plural}::update"),
+            format!("routes::{plural}::destroy"),
             format!("repositories::{snake_name}::{snake_name}_api_list"),
             format!("repositories::{snake_name}::{snake_name}_api_get"),
         ]
@@ -1351,12 +1416,12 @@ async fn main() {
             "generated routes must be able to inspect raw form bytes: {routes}"
         );
         assert!(
-            routes.contains("pub async fn create(mut db: Db, body: Bytes)"),
+            routes.contains("pub async fn create(flash: Flash, mut db: Db, body: Bytes)"),
             "create must decode after blank nullable normalization: {routes}"
         );
         assert!(
             routes.contains(
-                "pub async fn update(\n    id: Path<i64>,\n    mut db: Db,\n    body: Bytes,\n)"
+                "pub async fn update(\n    flash: Flash,\n    id: Path<i64>,\n    mut db: Db,\n    body: Bytes,\n)"
             ),
             "update must decode after blank nullable normalization: {routes}"
         );
@@ -1414,6 +1479,44 @@ async fn main() {
     }
 
     #[test]
+    fn scaffold_emits_flash_messages_and_destroy_handler() {
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &["title:String".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+        // Flash is imported and set on every mutating action before the redirect.
+        assert!(
+            routes.contains("use autumn_web::flash::Flash;"),
+            "routes file must import Flash: {routes}"
+        );
+        assert!(routes.contains(r#"flash.success("Post created")"#));
+        assert!(routes.contains(r#"flash.success("Post updated")"#));
+        assert!(routes.contains(r#"flash.success("Post deleted")"#));
+        // A destroy handler now exists, wired as a browser-friendly POST.
+        assert!(routes.contains("pub async fn destroy("));
+        assert!(routes.contains(r#"#[post("/posts/{id}/delete")]"#));
+        // The show page exposes a delete control that targets it.
+        assert!(routes.contains("/posts/{}/delete"));
+        // The layout threads flash markup and renders it in one line.
+        assert!(routes.contains("fn layout(title: &str, flash: Markup, content: Markup)"));
+        assert!(routes.contains("flash.render().await"));
+
+        // main.rs registers the new destroy route.
+        let main = fs::read_to_string(tmp.path().join("src/main.rs")).unwrap();
+        assert!(
+            main.contains("routes::posts::destroy"),
+            "main.rs must register the destroy route: {main}"
+        );
+    }
+
+    #[test]
     fn execute_writes_smoke_test() {
         let tmp = project_with_main(default_main());
         let plan = plan_scaffold(tmp.path(), "Post", &[], "20260427000000").unwrap();
@@ -1454,6 +1557,65 @@ async fn main() {
     }
 
     // ── Soft-delete scaffold generation (issue #689) ──────────────
+
+    #[test]
+    fn scaffold_soft_delete_destroy_handler_marks_deleted_at_not_physical_delete() {
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &["title:String".into()],
+            "20260427000000",
+            &ScaffoldOptions {
+                model: ModelOptions {
+                    soft_delete: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+        // The browser delete button must respect soft-delete: mark deleted_at,
+        // matching the soft-delete repository, instead of physically deleting.
+        assert!(
+            routes.contains("posts::deleted_at.eq(Some(chrono::Utc::now().naive_utc()))"),
+            "soft-delete destroy must mark deleted_at: {routes}"
+        );
+        assert!(
+            routes.contains("posts::deleted_at.is_null()"),
+            "soft-delete destroy must skip already-deleted rows so a repeat delete 404s: {routes}"
+        );
+        assert!(
+            !routes.contains("diesel::delete(posts::table.find(*id))"),
+            "soft-delete destroy must not physically delete the row: {routes}"
+        );
+    }
+
+    #[test]
+    fn scaffold_without_soft_delete_destroy_handler_physically_deletes() {
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &["title:String".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+        assert!(
+            routes.contains("diesel::delete(posts::table.find(*id))"),
+            "non-soft-delete destroy must issue a physical delete: {routes}"
+        );
+        assert!(
+            !routes.contains("deleted_at.eq("),
+            "non-soft-delete destroy must not mark deleted_at: {routes}"
+        );
+    }
 
     #[test]
     fn scaffold_soft_delete_repository_annotation_includes_soft_delete() {

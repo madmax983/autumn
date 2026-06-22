@@ -1413,6 +1413,23 @@ fn mount_framework_routes(
         );
     }
 
+    // Framework-provided flash-message stylesheet. Served as a same-origin
+    // asset (rather than inline styles) so the `.flash` classes emitted by
+    // `Flash::render` stay compatible with a strict `style-src 'self'` CSP.
+    #[cfg(feature = "flash")]
+    {
+        router = router.route(
+            crate::flash::FLASH_CSS_PATH,
+            axum::routing::get(flash_css_handler),
+        );
+        tracing::debug!(
+            method = "GET",
+            path = crate::flash::FLASH_CSS_PATH,
+            name = "autumn flash stylesheet",
+            "Mounted route"
+        );
+    }
+
     if dev_reload_enabled {
         router = router.route(
             dev::LIVE_RELOAD_PATH,
@@ -3104,6 +3121,24 @@ pub async fn htmx_handler() -> axum::response::Response {
             ),
         ],
         crate::htmx::HTMX_JS,
+    )
+        .into_response()
+}
+
+/// Serves the framework's default flash-message stylesheet
+/// ([`crate::flash::FLASH_CSS`]) at [`crate::flash::FLASH_CSS_PATH`].
+#[cfg(feature = "flash")]
+pub async fn flash_css_handler() -> axum::response::Response {
+    use axum::response::IntoResponse;
+    (
+        [
+            (http::header::CONTENT_TYPE, "text/css; charset=utf-8"),
+            (
+                http::header::CACHE_CONTROL,
+                "public, max-age=31536000, immutable",
+            ),
+        ],
+        crate::flash::FLASH_CSS,
     )
         .into_response()
 }

@@ -40,6 +40,7 @@ pub async fn front_page(
     repo: PgPostRepository,
     flags: Flags,
     exps: Experiments,
+    flash: Flash,
 ) -> AutumnResult<Markup> {
     let current_user = session.get("username").await;
 
@@ -69,11 +70,15 @@ pub async fn front_page(
         .preload(hot_posts, Post::preload().author().subreddit())
         .await?;
 
+    // Consume the flash only after all fallible work, so a mid-handler error
+    // doesn't drop the one-shot message before it is shown.
+    let flash_html = flash.render().await;
     Ok(layout(
         "Front Page",
         current_user.as_deref(),
         Some(csrf.token()),
         html! {
+            (flash_html)
             // Fragment gating: banner visible only to users in the new_ui_preview rollout cohort.
             @if flags.enabled("new_ui_preview") {
                 div class="mb-4 px-4 py-2 bg-indigo-50 border border-indigo-200 rounded-lg \
@@ -359,6 +364,7 @@ pub struct SubmitPostForm {
 pub async fn submit(
     session: Session,
     mut db: Db,
+    flash: Flash,
     form: Form<SubmitPostForm>,
 ) -> AutumnResult<Redirect> {
     let user_id: i64 = session
@@ -447,6 +453,7 @@ pub async fn submit(
     })
     .await?;
 
+    flash.success("Post created.").await;
     Ok(Redirect::to(&super::subreddits::__autumn_path_show(
         &sub.slug,
     )))
@@ -463,6 +470,7 @@ pub async fn show(
     mut db: Db,
     repo: PgPostRepository,
     flags: Flags,
+    flash: Flash,
 ) -> AutumnResult<Markup> {
     let current_user = session.get("username").await;
     let current_user_id = session.get("user_id").await;
@@ -516,11 +524,14 @@ pub async fn show(
         .and_then(|id| id.parse::<i64>().ok())
         .is_some_and(|id| id == post.author_id);
 
+    // Consume the flash only after all fallible work above.
+    let flash_html = flash.render().await;
     Ok(layout(
         &post.title,
         current_user.as_deref(),
         Some(csrf.token()),
         html! {
+            (flash_html)
             // Breadcrumbs
             div class="text-sm text-gray-500 mb-4" {
                 a href=(super::subreddits::__autumn_path_show(&sub.slug)) class="hover:text-orange-600" {
@@ -733,6 +744,7 @@ pub async fn update(
     State(state): State<AppState>,
     session: Session,
     mut db: Db,
+    flash: Flash,
     form: Form<EditPostForm>,
 ) -> AutumnResult<Redirect> {
     let post: Post = posts::table
@@ -772,6 +784,7 @@ pub async fn update(
         .execute(&mut *db)
         .await?;
 
+    flash.success("Post updated.").await;
     Ok(Redirect::to(&paths::show(&sub_slug, &new_slug)))
 }
 
@@ -784,6 +797,7 @@ pub async fn delete_post(
     State(state): State<AppState>,
     session: Session,
     mut db: Db,
+    flash: Flash,
 ) -> AutumnResult<autumn_web::reexports::axum::response::Response> {
     let post: Post = posts::table
         .inner_join(subreddits::table.on(posts::subreddit_id.eq(subreddits::id)))
@@ -800,6 +814,7 @@ pub async fn delete_post(
         .execute(&mut *db)
         .await?;
 
+    flash.success("Post deleted.").await;
     Ok(super::layout::hx_redirect_to(
         &super::subreddits::__autumn_path_show(&sub_slug),
     ))

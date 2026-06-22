@@ -101,6 +101,7 @@ pub fn layout(
                 @if let Some(token) = csrf_token {
                     meta name="csrf-token" content=(token);
                 }
+                link rel="stylesheet" href=(autumn_web::flash::FLASH_CSS_PATH);
                 link rel="stylesheet" href="/static/css/autumn.css";
                 script src=(HTMX_JS_PATH) {}
                 script src=(HTMX_CSRF_JS_PATH) {}
