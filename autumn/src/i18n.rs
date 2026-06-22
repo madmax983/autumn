@@ -392,6 +392,65 @@ impl Bundle {
         })
     }
 
+    /// Load all `<locale>.ftl` files from a directory embedded into the binary
+    /// at compile time (via [`embed_locales!`](crate::embed_locales)).
+    ///
+    /// The embedded counterpart to [`load_from_dir`](Self::load_from_dir): same
+    /// `.ftl` discovery, same [`parse_ftl`] parsing, and the same fail-fast on a
+    /// missing default locale — but every byte comes from the binary, so no
+    /// `i18n/` sidecar directory is required at runtime.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LoadError::MissingDefaultLocale`] if the default locale's file
+    /// is absent, [`LoadError::InvalidLocaleFilename`] if a file name or its
+    /// contents are not valid UTF-8, or [`LoadError::Parse`] on a syntax error.
+    #[cfg(feature = "embed-assets")]
+    pub fn load_from_embedded(
+        dir: &include_dir::Dir,
+        config: &I18nConfig,
+    ) -> Result<Self, LoadError> {
+        let mut messages: HashMap<String, HashMap<String, String>> = HashMap::new();
+
+        for file in dir.files() {
+            let path = file.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("ftl") {
+                continue;
+            }
+            let stem = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .ok_or_else(|| LoadError::InvalidLocaleFilename {
+                    path: path.to_path_buf(),
+                })?
+                .to_owned();
+            let raw = file
+                .contents_utf8()
+                .ok_or_else(|| LoadError::InvalidLocaleFilename {
+                    path: path.to_path_buf(),
+                })?;
+            let parsed = parse_ftl(raw, path)?;
+            messages.insert(stem, parsed);
+        }
+
+        if !messages.contains_key(&config.default_locale) {
+            return Err(LoadError::MissingDefaultLocale {
+                locale: config.default_locale.clone(),
+                path: PathBuf::from(format!("{}.ftl", config.default_locale)),
+            });
+        }
+
+        Ok(Self {
+            messages,
+            fallback_chain: config.resolved_fallback_chain(),
+            default_locale: config.default_locale.clone(),
+            supported_locales: config.supported_locales.clone(),
+            miss_warnings: std::sync::Mutex::new(HashMap::new()),
+            warn_dedup_window: Duration::from_secs(60),
+            miss_count: AtomicU64::new(0),
+        })
+    }
+
     /// Construct a bundle directly from in-memory translations (test helper).
     #[must_use]
     pub fn from_messages(

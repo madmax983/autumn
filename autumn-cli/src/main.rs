@@ -84,6 +84,11 @@ enum Commands {
         /// Package to build (for workspaces)
         #[arg(short, long)]
         package: Option<String>,
+        /// Embed static assets + i18n locales into the binary for a true
+        /// single-binary deploy (enables the `autumn-web/embed-assets` feature
+        /// and fingerprints before compiling so the manifest is baked in).
+        #[arg(long)]
+        embed: bool,
     },
     /// Start the dev server with hot reload (watch mode)
     Dev {
@@ -1512,7 +1517,11 @@ fn main() {
 #[allow(clippy::too_many_lines)]
 fn run_command(command: Commands) {
     match command {
-        Commands::Build { debug, package } => build::run(debug, package.as_deref()),
+        Commands::Build {
+            debug,
+            package,
+            embed,
+        } => build::run(debug, embed, package.as_deref()),
         Commands::Dev {
             package,
             show_config,
@@ -2349,7 +2358,8 @@ mod tests {
             cli.command,
             Commands::Build {
                 debug: false,
-                package: None
+                package: None,
+                embed: false
             }
         ));
     }
@@ -2361,7 +2371,8 @@ mod tests {
             cli.command,
             Commands::Build {
                 debug: true,
-                package: None
+                package: None,
+                embed: false
             }
         ));
     }
@@ -2370,9 +2381,26 @@ mod tests {
     fn parse_build_with_package() {
         let cli = Cli::try_parse_from(["autumn", "build", "-p", "blog"]).unwrap();
         match cli.command {
-            Commands::Build { debug, package } => {
+            Commands::Build {
+                debug,
+                package,
+                embed,
+            } => {
                 assert!(!debug);
+                assert!(!embed);
                 assert_eq!(package.as_deref(), Some("blog"));
+            }
+            _ => panic!("expected Build command"),
+        }
+    }
+
+    #[test]
+    fn parse_build_with_embed() {
+        let cli = Cli::try_parse_from(["autumn", "build", "--embed"]).unwrap();
+        match cli.command {
+            Commands::Build { embed, debug, .. } => {
+                assert!(embed, "--embed must set the embed flag");
+                assert!(!debug);
             }
             _ => panic!("expected Build command"),
         }
@@ -2382,7 +2410,7 @@ mod tests {
     fn parse_build_with_long_package() {
         let cli = Cli::try_parse_from(["autumn", "build", "--package", "blog", "--debug"]).unwrap();
         match cli.command {
-            Commands::Build { debug, package } => {
+            Commands::Build { debug, package, .. } => {
                 assert!(debug);
                 assert_eq!(package.as_deref(), Some("blog"));
             }

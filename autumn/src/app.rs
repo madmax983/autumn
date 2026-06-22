@@ -116,6 +116,10 @@ pub fn app() -> AppBuilder {
         i18n_bundle: None,
         #[cfg(feature = "i18n")]
         i18n_auto_load: false,
+        #[cfg(feature = "embed-assets")]
+        embedded_static: None,
+        #[cfg(all(feature = "embed-assets", feature = "i18n"))]
+        embedded_locales: None,
         policy_registrations: Vec::new(),
         #[cfg(feature = "mail")]
         mail_delivery_queue_factory: None,
@@ -349,6 +353,18 @@ pub struct AppBuilder {
     /// `.with_config_loader(...)`.
     #[cfg(feature = "i18n")]
     i18n_auto_load: bool,
+    /// Embedded `static/` tree (incl. the fingerprint manifest) registered via
+    /// [`embedded_static`](AppBuilder::embedded_static). When set, `/static/*`
+    /// is served from the binary and `asset_url()` resolves against the embedded
+    /// manifest — no `static/` sidecar directory is read at runtime.
+    #[cfg(feature = "embed-assets")]
+    embedded_static: Option<crate::assets::EmbeddedStaticDir>,
+    /// Embedded i18n locale bundles registered via
+    /// [`embedded_locales`](AppBuilder::embedded_locales). When set (and no
+    /// explicit bundle was provided), the bundle is loaded from the binary
+    /// instead of the `i18n/` directory on disk.
+    #[cfg(all(feature = "embed-assets", feature = "i18n"))]
+    embedded_locales: Option<&'static include_dir::Dir<'static>>,
     /// Deferred [`Policy`](crate::authorization::Policy) and
     /// [`Scope`](crate::authorization::Scope) registrations applied
     /// to [`AppState::policy_registry`] just before the router is
@@ -2392,6 +2408,56 @@ impl AppBuilder {
         self
     }
 
+    /// Embed the app's `static/` tree into the binary for single-binary deploys.
+    ///
+    /// Pass the directory produced by [`embed_static!`](crate::embed_static)
+    /// (requires the `embed-assets` feature). When set, `/static/*` is served
+    /// from the binary and `asset_url()` resolves against the embedded
+    /// fingerprint manifest — copying only the release binary into an empty
+    /// directory serves every referenced asset with no `static/` sidecar.
+    /// Because the manifest and the files are baked from the same build,
+    /// fingerprint-vs-manifest drift is impossible.
+    ///
+    /// This is a release-time concern: leave it unset in development so CSS/JS
+    /// hot-reload keeps serving from disk.
+    ///
+    /// ```rust,ignore
+    /// static STATIC: autumn_web::include_dir::Dir = autumn_web::embed_static!();
+    ///
+    /// #[autumn_web::main]
+    /// async fn main() {
+    ///     autumn_web::app().embedded_static(&STATIC).run().await;
+    /// }
+    /// ```
+    #[cfg(feature = "embed-assets")]
+    #[must_use]
+    pub const fn embedded_static(mut self, dir: &'static include_dir::Dir<'static>) -> Self {
+        self.embedded_static = Some(crate::assets::EmbeddedStaticDir(dir));
+        self
+    }
+
+    /// Embed the app's i18n locale bundles into the binary.
+    ///
+    /// Pass the directory produced by [`embed_locales!`](crate::embed_locales)
+    /// (requires the `embed-assets` and `i18n` features). When set (and no
+    /// explicit [`i18n`](AppBuilder::i18n) bundle was provided), all configured
+    /// locales render from the binary with no `i18n/` sidecar directory.
+    ///
+    /// ```rust,ignore
+    /// static LOCALES: autumn_web::include_dir::Dir = autumn_web::embed_locales!();
+    ///
+    /// #[autumn_web::main]
+    /// async fn main() {
+    ///     autumn_web::app().embedded_locales(&LOCALES).run().await;
+    /// }
+    /// ```
+    #[cfg(all(feature = "embed-assets", feature = "i18n"))]
+    #[must_use]
+    pub const fn embedded_locales(mut self, dir: &'static include_dir::Dir<'static>) -> Self {
+        self.embedded_locales = Some(dir);
+        self
+    }
+
     /// Start the HTTP server.
     ///
     /// This method performs the full application lifecycle:
@@ -2492,6 +2558,10 @@ impl AppBuilder {
             i18n_bundle,
             #[cfg(feature = "i18n")]
             i18n_auto_load,
+            #[cfg(feature = "embed-assets")]
+            embedded_static,
+            #[cfg(all(feature = "embed-assets", feature = "i18n"))]
+            embedded_locales,
             policy_registrations,
             #[cfg(feature = "mail")]
             mail_delivery_queue_factory,
@@ -2544,6 +2614,26 @@ impl AppBuilder {
                 config.idempotency.enabled = Some(true);
             }
         }
+
+        // Register the embedded `static/` tree (if any) before the router is
+        // built so `/static/*` serves from the binary and `asset_url()` resolves
+        // against the embedded manifest.
+        #[cfg(feature = "embed-assets")]
+        if let Some(dir) = embedded_static {
+            crate::assets::register_embedded_static(dir);
+        }
+
+        // Embedded locales win over disk auto-loading when no explicit bundle
+        // was provided; resolve_i18n_bundle then returns this bundle as-is.
+        #[cfg(all(feature = "embed-assets", feature = "i18n"))]
+        let i18n_bundle = i18n_bundle.or_else(|| {
+            embedded_locales.map(|dir| {
+                std::sync::Arc::new(
+                    crate::i18n::Bundle::load_from_embedded(dir, &config.i18n)
+                        .unwrap_or_else(|e| panic!("embedded_locales: {e}")),
+                )
+            })
+        });
 
         #[cfg(feature = "i18n")]
         let i18n_bundle =
@@ -3516,6 +3606,10 @@ impl AppBuilder {
             i18n_bundle,
             #[cfg(feature = "i18n")]
             i18n_auto_load,
+            #[cfg(feature = "embed-assets")]
+            embedded_static,
+            #[cfg(all(feature = "embed-assets", feature = "i18n"))]
+            embedded_locales,
             policy_registrations,
             #[cfg(feature = "mail")]
             mail_delivery_queue_factory,
@@ -3565,6 +3659,26 @@ impl AppBuilder {
                 config.idempotency.enabled = Some(true);
             }
         }
+
+        // Register the embedded `static/` tree (if any) before the router is
+        // built so `/static/*` serves from the binary and `asset_url()` resolves
+        // against the embedded manifest.
+        #[cfg(feature = "embed-assets")]
+        if let Some(dir) = embedded_static {
+            crate::assets::register_embedded_static(dir);
+        }
+
+        // Embedded locales win over disk auto-loading when no explicit bundle
+        // was provided; resolve_i18n_bundle then returns this bundle as-is.
+        #[cfg(all(feature = "embed-assets", feature = "i18n"))]
+        let i18n_bundle = i18n_bundle.or_else(|| {
+            embedded_locales.map(|dir| {
+                std::sync::Arc::new(
+                    crate::i18n::Bundle::load_from_embedded(dir, &config.i18n)
+                        .unwrap_or_else(|e| panic!("embedded_locales: {e}")),
+                )
+            })
+        });
 
         #[cfg(feature = "i18n")]
         let i18n_bundle =
@@ -4071,6 +4185,10 @@ impl AppBuilder {
             i18n_bundle,
             #[cfg(feature = "i18n")]
             i18n_auto_load,
+            #[cfg(feature = "embed-assets")]
+            embedded_static,
+            #[cfg(all(feature = "embed-assets", feature = "i18n"))]
+            embedded_locales,
             policy_registrations,
             cache_backend,
             #[cfg(feature = "mail")]
@@ -4113,6 +4231,26 @@ impl AppBuilder {
 
         let (config, telemetry_guard) =
             load_config_and_telemetry(config_loader_factory, telemetry_provider).await;
+
+        // Register the embedded `static/` tree (if any) before the router is
+        // built so `/static/*` serves from the binary and `asset_url()` resolves
+        // against the embedded manifest.
+        #[cfg(feature = "embed-assets")]
+        if let Some(dir) = embedded_static {
+            crate::assets::register_embedded_static(dir);
+        }
+
+        // Embedded locales win over disk auto-loading when no explicit bundle
+        // was provided; resolve_i18n_bundle then returns this bundle as-is.
+        #[cfg(all(feature = "embed-assets", feature = "i18n"))]
+        let i18n_bundle = i18n_bundle.or_else(|| {
+            embedded_locales.map(|dir| {
+                std::sync::Arc::new(
+                    crate::i18n::Bundle::load_from_embedded(dir, &config.i18n)
+                        .unwrap_or_else(|e| panic!("embedded_locales: {e}")),
+                )
+            })
+        });
 
         #[cfg(feature = "i18n")]
         let i18n_bundle =

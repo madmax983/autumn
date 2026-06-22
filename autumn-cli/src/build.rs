@@ -15,11 +15,12 @@ use std::process::Command;
 
 use sha2::{Digest, Sha256};
 
-/// Run the static build pipeline.
-pub fn run(debug: bool, package: Option<&str>) {
-    eprintln!("\u{1F342} autumn build\n");
-
-    let profile = if debug { "dev" } else { "release" };
+/// Build the `cargo build` command for the static pipeline.
+///
+/// Factored out so the flags are unit-testable. With `embed`, the
+/// `autumn-web/embed-assets` feature is enabled so the binary bakes in the
+/// `static/` tree (and its manifest) plus i18n locales.
+fn build_cargo_command(debug: bool, embed: bool, package: Option<&str>) -> Command {
     let mut cargo = Command::new("cargo");
     cargo.arg("build");
     if !debug {
@@ -28,6 +29,33 @@ pub fn run(debug: bool, package: Option<&str>) {
     if let Some(pkg) = package {
         cargo.args(["-p", pkg]);
     }
+    if embed {
+        // Enable the app crate's `embed-assets` feature, which the scaffold
+        // defines as `["autumn-web/embed-assets"]`. Using the app-crate feature
+        // (rather than `autumn-web/embed-assets` directly) lets app code gate the
+        // `.embedded_static()` / `.embedded_locales()` wiring on
+        // `#[cfg(feature = "embed-assets")]`.
+        cargo.args(["--features", "embed-assets"]);
+    }
+    cargo
+}
+
+/// Run the static build pipeline.
+pub fn run(debug: bool, embed: bool, package: Option<&str>) {
+    eprintln!("\u{1F342} autumn build\n");
+
+    let profile = if debug { "dev" } else { "release" };
+
+    // For embedded builds the fingerprint manifest and the hashed asset copies
+    // must exist on disk *before* the compile, because `include_dir!` bakes the
+    // `static/` tree into the binary at compile time. Fingerprint first so the
+    // embedded manifest and the embedded files come from the same build.
+    if embed && !debug {
+        eprintln!("Fingerprinting static assets (pre-compile, for embedding)...");
+        fingerprint_static_assets();
+    }
+
+    let mut cargo = build_cargo_command(debug, embed, package);
 
     eprintln!("Compiling ({profile} profile)...");
     let status = cargo.status().expect("failed to run cargo build");
@@ -36,12 +64,21 @@ pub fn run(debug: bool, package: Option<&str>) {
         std::process::exit(1);
     }
 
-    // Fingerprint before the static renderer so that `asset_url()` inside
-    // pre-rendered templates resolves to the new hashed URLs rather than
-    // plain paths or stale hashes from a previous build.
-    if !debug {
+    // Non-embedded release builds fingerprint *after* the compile (the runtime
+    // reads the manifest from disk, so order doesn't matter for them, and the
+    // static renderer below then resolves the new hashed URLs).
+    if !debug && !embed {
         eprintln!("\nFingerprinting static assets...");
         fingerprint_static_assets();
+    }
+
+    // Embedding produces a self-contained release binary; it is not static-site
+    // generation. Skip the static renderer (which requires `#[static_get]`
+    // routes and the app's runtime state) so dynamic-server apps can build a
+    // single binary without a database or pre-render step.
+    if embed {
+        eprintln!("\n\u{1F342} Build complete! Assets and locales embedded into the binary.");
+        return;
     }
 
     let (binary, manifest_dir) = find_binary(debug, package);
@@ -384,6 +421,33 @@ fn resolve_binary_from_metadata(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn cargo_args(debug: bool, embed: bool, package: Option<&str>) -> Vec<String> {
+        build_cargo_command(debug, embed, package)
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn embed_build_enables_feature_in_release() {
+        let args = cargo_args(false, true, None);
+        assert!(args.contains(&"--release".to_string()));
+        assert!(
+            args.windows(2).any(|w| w == ["--features", "embed-assets"]),
+            "embed build must enable the embed-assets feature: {args:?}"
+        );
+    }
+
+    #[test]
+    fn non_embed_build_omits_embed_feature() {
+        let args = cargo_args(false, false, Some("blog"));
+        assert!(
+            !args.iter().any(|a| a.contains("embed-assets")),
+            "non-embed build must not enable embed-assets: {args:?}"
+        );
+        assert!(args.windows(2).any(|w| w == ["-p", "blog"]));
+    }
 
     fn expected_binary(path: &str) -> PathBuf {
         let mut p = PathBuf::from(path);

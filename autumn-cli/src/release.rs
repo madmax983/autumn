@@ -405,14 +405,20 @@ mod tests {
     }
 
     #[test]
-    fn dockerfile_copies_static_assets() {
+    fn dockerfile_embeds_assets_instead_of_copying_static() {
         let tmp = TempDir::new().unwrap();
         let dir = make_project(&tmp, "my-app");
         init(&dir, "my-app", false, Target::Default).unwrap();
         let content = fs::read_to_string(dir.join("Dockerfile")).unwrap();
+        // Single-binary deploy: assets are embedded via `autumn build --embed`,
+        // so the runtime image must NOT stage a `static/` sidecar directory.
         assert!(
-            content.contains("static"),
-            "Dockerfile must COPY static/ assets into runtime image"
+            content.contains("autumn build --embed"),
+            "release Dockerfile must build the embedded single binary"
+        );
+        assert!(
+            !content.contains("/app/static"),
+            "embedded build must not COPY a static/ sidecar into the runtime image"
         );
     }
 

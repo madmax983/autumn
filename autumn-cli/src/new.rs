@@ -160,10 +160,7 @@ pub fn generate_with(name: &str, parent_dir: &Path, opts: GenerateOptions) -> Re
     fs::write(project_dir.join("Cargo.toml"), cargo_toml)?;
 
     let mut main_rs = if opts.with_i18n {
-        render(templates::MAIN_RS).replace(
-            "        .routes(routes![index, hello, hello_name])",
-            "        .i18n_auto()\n        .routes(routes![index, hello, hello_name])",
-        )
+        inject_i18n(&render(templates::MAIN_RS))
     } else {
         render(templates::MAIN_RS)
     };
@@ -313,14 +310,36 @@ fn print_scaffold_summary(name: &str, opts: GenerateOptions) {
     }
 }
 
+/// Enable i18n in a generated `main.rs`: call `.i18n_auto()` and embed the
+/// `i18n/` locale bundles alongside the static assets for single-binary deploys.
+fn inject_i18n(main_rs: &str) -> String {
+    main_rs
+        .replace(
+            "        .routes(routes![index, hello, hello_name])",
+            "        .i18n_auto()\n        .routes(routes![index, hello, hello_name])",
+        )
+        .replace(
+            "static EMBEDDED_STATIC: autumn_web::include_dir::Dir = autumn_web::embed_static!();",
+            "static EMBEDDED_STATIC: autumn_web::include_dir::Dir = autumn_web::embed_static!();\n\
+             #[cfg(feature = \"embed-assets\")]\n\
+             static EMBEDDED_LOCALES: autumn_web::include_dir::Dir = autumn_web::embed_locales!();",
+        )
+        .replace(
+            "    let app = app.embedded_static(&EMBEDDED_STATIC);\n",
+            "    let app = app.embedded_static(&EMBEDDED_STATIC);\n\
+             \x20   #[cfg(feature = \"embed-assets\")]\n\
+             \x20   let app = app.embedded_locales(&EMBEDDED_LOCALES);\n",
+        )
+}
+
 /// Inject a managed-Postgres pool provider plus a shutdown hook into a
 /// generated `main.rs` so the bundled cluster is supervised by the daemon.
 fn inject_managed_pg(main_rs: &str) -> String {
     main_rs.replace(
-        "    autumn_web::app()\n",
+        "    let app = autumn_web::app()\n",
         "    let pg = autumn_web::managed_pg::ManagedPostgresPoolProvider::new();\n\
          \x20   let pg_shutdown = pg.clone();\n\
-         \x20   autumn_web::app()\n\
+         \x20   let app = autumn_web::app()\n\
          \x20       .with_pool_provider(pg)\n\
          \x20       .on_shutdown(move || {\n\
          \x20           let pg = pg_shutdown.clone();\n\

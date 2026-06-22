@@ -123,12 +123,11 @@ response looks like:
 rust:1.88.0-bookworm (chef stage)
   └─ cargo chef prepare          # snapshot dependency graph
        └─ cargo chef cook        # build all dependencies (cached layer)
-            └─ cargo build --release
+            └─ autumn build --embed         # fingerprint + embed assets
                  └─ debian:bookworm-slim (runtime stage)
                        libpq5, tini, ca-certificates, curl
-                       /usr/local/bin/myapp     ← your binary
-                       /app/static/             ← compiled Tailwind + assets
-                       /app/migrations/         ← SQL migration files
+                       /usr/local/bin/myapp     ← your binary (assets + locales embedded)
+                       /app/migrations/         ← SQL migration files (one-shot migrate job)
                        /app/autumn.toml         ← production config (host=0.0.0.0)
 
 ENTRYPOINT ["/usr/bin/tini", "--"]
@@ -148,6 +147,71 @@ Key design decisions:
   binary binds to `0.0.0.0` (all interfaces) instead of the dev default
   `127.0.0.1`. Override any value at runtime via `AUTUMN_*` environment
   variables (see the [config reference](getting-started.md#configuration)).
+
+---
+
+## Single-binary deploys (embedded assets)
+
+Autumn's design pillar is **single binary deployment**: copy one file, run it, no
+sidecar directories. The generated release image delivers on this by **embedding**
+the app's `static/` tree (CSS/JS/fonts **and** the fingerprint manifest) and its
+i18n `i18n/` locale bundles into the binary at compile time — the same way Diesel
+migrations are embedded with `embed_migrations!`. With assets embedded:
+
+- `scp ./myapp host && ./myapp` serves styled, localized pages from an empty
+  directory — every referenced asset returns `200`, no `static/`/`i18n/` to stage.
+- `asset_url()` resolves against the embedded manifest (no disk read). The manifest
+  and the files are baked from the **same** build, so fingerprint-vs-manifest drift
+  is impossible.
+
+### How it works
+
+Embedding is an **opt-in, release-time** concern (a Cargo feature). In development
+— or whenever the feature is off — the app serves from disk so CSS/JS/translation
+hot-reload is unaffected.
+
+Generated apps are wired for it out of the box:
+
+```rust
+// src/main.rs (generated)
+#[cfg(feature = "embed-assets")]
+static EMBEDDED_STATIC: autumn_web::include_dir::Dir = autumn_web::embed_static!();
+
+#[autumn_web::main]
+async fn main() {
+    let app = autumn_web::app().routes(routes![/* … */]).migrations(MIGRATIONS);
+
+    #[cfg(feature = "embed-assets")]
+    let app = app.embedded_static(&EMBEDDED_STATIC);
+
+    app.run().await;
+}
+```
+
+```toml
+# Cargo.toml (generated)
+[features]
+embed-assets = ["autumn-web/embed-assets"]
+```
+
+i18n apps additionally embed locales via `embed_locales!()` /
+`.embedded_locales(&EMBEDDED_LOCALES)`.
+
+### Building
+
+```bash
+autumn build --embed
+```
+
+This fingerprints `static/` **before** compiling (so the manifest is baked in) and
+enables the `embed-assets` feature. The release `Dockerfile` runs exactly this and
+therefore **does not** `COPY static`/`i18n` into the runtime image — only
+`migrations/` is staged, for the one-shot `autumn migrate` job (the running server
+never reads it).
+
+> Adding embedding to an existing app: add the `[features]` block above, wire
+> `.embedded_static()` (and `.embedded_locales()` if you use i18n) behind
+> `#[cfg(feature = "embed-assets")]`, then build with `autumn build --embed`.
 
 ---
 
