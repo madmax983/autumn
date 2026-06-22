@@ -177,7 +177,11 @@ impl Flash {
     ///
     /// The output is wrapped in a stable `<div id="flash">` container that is
     /// *always* emitted, even when there are no messages, so it can act as the
-    /// target for htmx out-of-band swaps on later requests.
+    /// target for htmx out-of-band swaps on later requests. Messages carry
+    /// `flash flash-<level>` classes; link [`FLASH_CSS_PATH`] from your layout
+    /// for the default styling.
+    ///
+    /// Requires the `maud` feature (enabled by default).
     ///
     /// ```rust,no_run
     /// use autumn_web::prelude::*;
@@ -210,43 +214,52 @@ impl Flash {
         maud::html! {
             div id="flash" class="flash-messages" role="status" aria-live="polite"
                 hx-swap-oob=[oob.then_some("true")] {
-                @for msg in &messages {
-                    div class={ "flash flash-" (msg.level.as_str()) } role="alert"
-                        style=(level_style(msg.level)) {
-                        (msg.message)
-                    }
-                }
+                (flash_message_divs(&messages))
             }
         }
     }
 }
 
-/// Minimal inline styling per level so a generated app shows a *visible* notice
-/// with zero added CSS. Apps that want full control can target the
-/// `.flash` / `.flash-<level>` classes and ignore these defaults.
+/// Render a list of flash messages as `<div class="flash flash-<level>">` nodes.
+///
+/// Shared by [`Flash::render`] and other surfaces (e.g. the admin panel) so the
+/// message markup and `.flash-<level>` class convention live in one place.
+/// Styling comes from [`FLASH_CSS`] (served at [`FLASH_CSS_PATH`]); this emits
+/// classes only — no inline `style` attributes — so it is compatible with a
+/// strict `style-src 'self'` Content-Security-Policy, including nonce mode.
 #[cfg(feature = "maud")]
-const fn level_style(level: FlashLevel) -> &'static str {
-    // Shared box layout plus a per-level color palette, inlined per variant so
-    // this stays a `const fn` returning a single `&'static str`.
-    match level {
-        FlashLevel::Success => {
-            "padding:0.75rem 1rem;border-radius:0.375rem;margin-bottom:0.5rem;border:1px solid;\
-             background:#ecfdf5;color:#065f46;border-color:#6ee7b7;"
-        }
-        FlashLevel::Info => {
-            "padding:0.75rem 1rem;border-radius:0.375rem;margin-bottom:0.5rem;border:1px solid;\
-             background:#eff6ff;color:#1e3a8a;border-color:#93c5fd;"
-        }
-        FlashLevel::Warning => {
-            "padding:0.75rem 1rem;border-radius:0.375rem;margin-bottom:0.5rem;border:1px solid;\
-             background:#fffbeb;color:#92400e;border-color:#fcd34d;"
-        }
-        FlashLevel::Error => {
-            "padding:0.75rem 1rem;border-radius:0.375rem;margin-bottom:0.5rem;border:1px solid;\
-             background:#fef2f2;color:#991b1b;border-color:#fca5a5;"
+#[must_use]
+pub fn flash_message_divs(messages: &[FlashMessage]) -> maud::Markup {
+    maud::html! {
+        @for msg in messages {
+            div class={ "flash flash-" (msg.level.as_str()) } role="alert" {
+                (msg.message)
+            }
         }
     }
 }
+
+/// URL of the framework-served flash stylesheet.
+///
+/// The default Autumn server mounts this asset automatically. Link it from your
+/// base layout — `link rel="stylesheet" href=(autumn_web::flash::FLASH_CSS_PATH);`
+/// — so the `.flash` / `.flash-<level>` classes emitted by [`Flash::render`] are
+/// styled out of the box.
+pub const FLASH_CSS_PATH: &str = "/static/css/autumn-flash.css";
+
+/// Default flash-message stylesheet served at [`FLASH_CSS_PATH`].
+///
+/// Each rule pairs a `--flash-*` custom property with a hard-coded fallback, so
+/// notices are visible with zero configuration yet apps can re-theme them by
+/// defining the variables on `:root`.
+pub const FLASH_CSS: &str = "\
+.flash-messages:empty{display:none}\
+.flash{padding:.75rem 1rem;border-radius:.375rem;margin-bottom:.5rem;border:1px solid}\
+.flash-success{background:var(--flash-success-bg,#ecfdf5);color:var(--flash-success-fg,#065f46);border-color:var(--flash-success-border,#6ee7b7)}\
+.flash-info{background:var(--flash-info-bg,#eff6ff);color:var(--flash-info-fg,#1e3a8a);border-color:var(--flash-info-border,#93c5fd)}\
+.flash-warning{background:var(--flash-warning-bg,#fffbeb);color:var(--flash-warning-fg,#92400e);border-color:var(--flash-warning-border,#fcd34d)}\
+.flash-error{background:var(--flash-error-bg,#fef2f2);color:var(--flash-error-fg,#991b1b);border-color:var(--flash-error-border,#fca5a5)}\
+";
 
 impl<S> FromRequestParts<S> for Flash
 where
@@ -377,10 +390,11 @@ mod tests {
         assert!(markup.contains("Saved!"));
         assert!(markup.contains("flash flash-error"));
         assert!(markup.contains("Oops"));
-        // Inline styles guarantee visibility with zero CSS plumbing.
+        // Styling is class-based (served stylesheet), not inline — keeps it
+        // compatible with a strict `style-src 'self'` CSP / nonce mode.
         assert!(
-            markup.contains("style="),
-            "expected inline styling: {markup}"
+            !markup.contains("style="),
+            "must not emit inline styles: {markup}"
         );
         // A plain full-page render is not an out-of-band swap.
         assert!(!markup.contains("hx-swap-oob"));

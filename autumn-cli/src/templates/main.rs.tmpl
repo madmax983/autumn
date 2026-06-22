@@ -15,6 +15,7 @@ pub fn layout(title: &str, flash: maud::Markup, content: maud::Markup) -> maud::
                 meta charset="utf-8";
                 meta name="viewport" content="width=device-width, initial-scale=1";
                 title { (title) }
+                link rel="stylesheet" href=(autumn_web::flash::FLASH_CSS_PATH);
                 link rel="stylesheet" href="/static/css/app.css";
             }
             body {

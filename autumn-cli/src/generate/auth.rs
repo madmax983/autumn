@@ -1805,6 +1805,7 @@ fn layout(title: &str, content: Markup) -> Markup {{
             head {{
                 meta charset="utf-8";
                 title {{ (title) }}
+                link rel="stylesheet" href=(autumn_web::flash::FLASH_CSS_PATH);
             }}
             body {{ (content) }}
         }}

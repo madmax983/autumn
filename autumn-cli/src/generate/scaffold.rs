@@ -470,8 +470,10 @@ fn render_routes_file(
     // scaffold was generated with `--soft-delete`, mark `deleted_at` (matching
     // the soft-delete repository) instead of issuing a physical `DELETE`.
     let destroy_stmt = if soft_delete {
+        // Filter on `deleted_at IS NULL` so deleting an already-soft-deleted row
+        // affects zero rows and returns 404, matching the physical-delete path.
         format!(
-            "let deleted = diesel::update({plural}::table.find(*id))\n        \
+            "let deleted = diesel::update(\n        {plural}::table.find(*id).filter({plural}::deleted_at.is_null()),\n    )\n        \
                  .set({plural}::deleted_at.eq(Some(chrono::Utc::now().naive_utc())))\n        \
                  .execute(&mut *db)\n        .await?;"
         )
@@ -644,6 +646,7 @@ fn layout(title: &str, flash: Markup, content: Markup) -> Markup {{
             head {{
                 meta charset="utf-8";
                 title {{ (title) }}
+                link rel="stylesheet" href=(autumn_web::flash::FLASH_CSS_PATH);
             }}
             body {{
                 (flash)
@@ -688,13 +691,7 @@ fn pagination_nav<T>(page: &Page<T>, base_url: &str) -> Markup {{
 
 /// `GET /{plural}/{{id}}` — show one {snake_name}.
 #[get("/{plural}/{{id}}")]
-pub async fn show(
-    id: Path<i64>,
-    mut db: {db_ty},
-    flash: Flash,
-    csrf: Option<CsrfToken>,
-    csrf_field: Option<CsrfFormField>,
-) -> AutumnResult<Markup> {{
+pub async fn show(id: Path<i64>, mut db: {db_ty}, flash: Flash) -> AutumnResult<Markup> {{
     let row: {pascal_name} = {plural}::table
         .find(*id)
         .select({pascal_name}::as_select())
@@ -706,10 +703,6 @@ pub async fn show(
         a href="/{plural}" {{ "Back to list" }}
         " "
         a href=(format!("/{plural}/{{}}/edit", row.id)) {{ "Edit" }}
-        form action=(format!("/{plural}/{{}}/delete", row.id)) method="post" {{
-            (csrf_input(csrf.as_ref(), csrf_field.as_ref()))
-            button type="submit" {{ "Delete" }}
-        }}
     }}))
 }}
 
@@ -767,6 +760,12 @@ pub async fn edit_form(
         form action=(format!("/{plural}/{{}}/update", row.id)) method="post"{form_enctype} {{
             (csrf_input(csrf.as_ref(), csrf_field.as_ref()))
 {edit_inputs}            button type="submit" {{ "Save" }}
+        }}
+        // Delete lives on this secured page (the public show page must not
+        // expose a control that anonymous users can't use).
+        form action=(format!("/{plural}/{{}}/delete", row.id)) method="post" {{
+            (csrf_input(csrf.as_ref(), csrf_field.as_ref()))
+            button type="submit" {{ "Delete" }}
         }}
     }}))
 }}
@@ -1557,6 +1556,10 @@ async fn main() {
         assert!(
             routes.contains("posts::deleted_at.eq(Some(chrono::Utc::now().naive_utc()))"),
             "soft-delete destroy must mark deleted_at: {routes}"
+        );
+        assert!(
+            routes.contains("posts::deleted_at.is_null()"),
+            "soft-delete destroy must skip already-deleted rows so a repeat delete 404s: {routes}"
         );
         assert!(
             !routes.contains("diesel::delete(posts::table.find(*id))"),

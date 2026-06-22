@@ -43,7 +43,6 @@ pub async fn front_page(
     flash: Flash,
 ) -> AutumnResult<Markup> {
     let current_user = session.get("username").await;
-    let flash_html = flash.render().await;
 
     // A/B experiment: compact list (control) vs. card layout (treatment).
     // The Experiments extractor resolves the actor from the session automatically
@@ -71,6 +70,9 @@ pub async fn front_page(
         .preload(hot_posts, Post::preload().author().subreddit())
         .await?;
 
+    // Consume the flash only after all fallible work, so a mid-handler error
+    // doesn't drop the one-shot message before it is shown.
+    let flash_html = flash.render().await;
     Ok(layout(
         "Front Page",
         current_user.as_deref(),
@@ -472,7 +474,6 @@ pub async fn show(
 ) -> AutumnResult<Markup> {
     let current_user = session.get("username").await;
     let current_user_id = session.get("user_id").await;
-    let flash_html = flash.render().await;
 
     let sub: Subreddit = subreddits::table
         .filter(subreddits::slug.eq(&sub_slug))
@@ -523,6 +524,8 @@ pub async fn show(
         .and_then(|id| id.parse::<i64>().ok())
         .is_some_and(|id| id == post.author_id);
 
+    // Consume the flash only after all fallible work above.
+    let flash_html = flash.render().await;
     Ok(layout(
         &post.title,
         current_user.as_deref(),

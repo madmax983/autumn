@@ -53,12 +53,26 @@ fn layout(title: &str, flash: Markup, content: Markup) -> Markup {
 }
 ```
 
-`render()` always emits a stable `<div id="flash">` container — even when there
-are no messages — so it can double as a target for htmx out-of-band swaps (see
-below). Each message carries a `flash flash-<level>` class (`flash-success`,
-`flash-info`, `flash-warning`, `flash-error`) plus minimal inline styling, so the
-notice is visible out of the box. Override the look by targeting those classes in
-your own CSS.
+`render()` requires the `maud` feature (part of the default feature set) and
+always emits a stable `<div id="flash">` container — even when there are no
+messages — so it can double as a target for htmx out-of-band swaps (see below).
+Each message carries a `flash flash-<level>` class (`flash-success`,
+`flash-info`, `flash-warning`, `flash-error`).
+
+### Styling
+
+Default styling ships as a framework-served stylesheet. Link it once in your
+layout's `<head>` (the generators do this for you):
+
+```rust
+link rel="stylesheet" href=(autumn_web::flash::FLASH_CSS_PATH);
+```
+
+It is served as a same-origin asset (not inline `style` attributes), so it works
+under a strict `style-src 'self'` Content-Security-Policy, including nonce mode.
+The default colors are defined with `--flash-*` CSS custom properties (with
+hard-coded fallbacks), so you can re-theme them by setting the variables on
+`:root`, or override the `.flash` / `.flash-<level>` classes in your own CSS.
 
 ## Levels
 

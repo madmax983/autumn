@@ -179,7 +179,6 @@ pub async fn show(
     flash: Flash,
 ) -> AutumnResult<Markup> {
     let current_user = session.get("username").await;
-    let flash_html = flash.render().await;
 
     let subs = repo.find_by_slug(slug.clone()).await?;
     let sub = subs
@@ -205,6 +204,8 @@ pub async fn show(
             .load(&mut *db)
             .await?;
 
+    // Consume the flash only after all fallible work above.
+    let flash_html = flash.render().await;
     Ok(layout(
         &format!("r/{}", sub.name),
         current_user.as_deref(),
