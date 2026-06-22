@@ -160,6 +160,16 @@ fn measure_cold_start_once(shape: ColdStartShape) -> Result<u64, String> {
         .env_remove("CARGO_TARGET_DIR")
         .env_remove("CARGO_BUILD_TARGET_DIR")
         .env_remove("CARGO_BUILD_TARGET")
+        // Disable any compiler wrapper (e.g. `sccache`) so the measurement is a
+        // genuine first clean compile. A `RUSTC_WRAPPER` env var or a config-file
+        // `build.rustc-wrapper` could otherwise serve cached compiler outputs even
+        // into an empty target dir. Setting these to an empty string is Cargo's
+        // documented way to disable wrapping, and an env var overrides config
+        // files — which `env_remove` alone cannot neutralise.
+        .env("RUSTC_WRAPPER", "")
+        .env("RUSTC_WORKSPACE_WRAPPER", "")
+        .env("CARGO_BUILD_RUSTC_WRAPPER", "")
+        .env("CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER", "")
         .output()
         .map_err(|e| format!("cargo build spawn failed: {e}"))?;
     if !output.status.success() {

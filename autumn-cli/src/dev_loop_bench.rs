@@ -652,6 +652,45 @@ pub fn build_cold_start_report(hello_samples: &[u64], db: &DbOutcome) -> FullRep
     }
 }
 
+/// Sanitize a failure message before it is embedded in the archived report.
+///
+/// A raw measurement error can carry the full `cargo` stderr (or other
+/// subprocess output), which embeds local absolute paths — `/home/runner`, the
+/// checkout dir, `~/.cargo/registry/...`, or the throwaway project's temp path.
+/// The report contract is that archived JSON never leaks local paths, usernames,
+/// or secrets, so we keep only the first line, redact filesystem-path-like
+/// tokens, and bound the length.
+fn sanitize_failure_reason(msg: &str) -> String {
+    // Bound the length so a pathological error cannot bloat the report.
+    const MAX: usize = 300;
+    // Only the first line: multi-line subprocess stderr dumps (the usual source
+    // of leaked paths) follow on later lines.
+    let first_line = msg.lines().next().unwrap_or("");
+    let redacted = first_line
+        .split_whitespace()
+        .map(|tok| {
+            let trimmed = tok.trim_start_matches(['(', '"', '`', '\'', '[']);
+            let unix_abs = trimmed.starts_with('/') || trimmed.starts_with("~/");
+            // `C:\` / `C:/` style drive-rooted Windows paths.
+            let win_drive = trimmed.len() >= 3
+                && trimmed.as_bytes()[1] == b':'
+                && matches!(trimmed.as_bytes()[2], b'\\' | b'/');
+            if unix_abs || win_drive || trimmed.contains('\\') {
+                "<path>"
+            } else {
+                tok
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    if redacted.chars().count() > MAX {
+        let truncated: String = redacted.chars().take(MAX).collect();
+        format!("{truncated}…")
+    } else {
+        redacted
+    }
+}
+
 /// Build an informational failure row for a DB-shape measurement that could not
 /// be completed, so an `--include-db` run records the requested-but-failed
 /// result in the report instead of silently omitting it.
@@ -666,7 +705,10 @@ fn db_failure_result(msg: &str) -> BudgetCheckResult {
         p95_exceeded: false,
         max_exceeded: false,
         p95_overage_pct: 0.0,
-        diagnosis: format!("Database-backed cold start could not be measured: {msg}"),
+        diagnosis: format!(
+            "Database-backed cold start could not be measured: {}",
+            sanitize_failure_reason(msg)
+        ),
         next_action: "This shape is informational and does not affect the gate. \
                       Re-run `--include-db` in an environment where the bundled \
                       managed-Postgres prerequisites are available."
@@ -1433,6 +1475,53 @@ mod tests {
         assert!(v.get("all_passed").is_some());
         assert!(!s.contains("/home/"), "must not leak /home/ paths");
         assert!(!s.contains("C:\\Users\\"), "must not leak Windows paths");
+    }
+
+    #[test]
+    fn sanitize_failure_reason_redacts_paths_and_drops_later_lines() {
+        let raw = "cargo build failed for the scaffolded project:\n  \
+                   error: could not compile at /home/runner/work/autumn/x.rs \
+                   (registry /home/runner/.cargo/registry/foo) C:\\Users\\bob\\y.rs";
+        let clean = sanitize_failure_reason(raw);
+        // Only the first line is kept.
+        assert!(clean.starts_with("cargo build failed for the scaffolded project:"));
+        assert!(!clean.contains("error: could not compile"));
+        // And no local paths survive even if they were on the first line.
+        let first_line_case =
+            sanitize_failure_reason("autumn new failed: /home/runner/tmp/p and C:\\Users\\bob\\z");
+        assert!(!first_line_case.contains("/home/"));
+        assert!(!first_line_case.contains("C:\\Users\\"));
+        assert!(first_line_case.contains("<path>"));
+        assert!(first_line_case.starts_with("autumn new failed:"));
+    }
+
+    #[test]
+    fn sanitize_failure_reason_bounds_length() {
+        let long = "x".repeat(1_000);
+        let clean = sanitize_failure_reason(&long);
+        assert!(
+            clean.chars().count() <= 301,
+            "must be bounded (300 + ellipsis)"
+        );
+        assert!(clean.ends_with('…'));
+    }
+
+    #[test]
+    fn build_cold_start_report_db_failure_does_not_leak_paths() {
+        // A DB build failure carrying raw cargo stderr (with absolute paths) must
+        // not leak those paths into the archived JSON report.
+        let report = build_cold_start_report(
+            &[40_000, 41_000, 42_000],
+            &DbOutcome::Failed(
+                "cargo build failed:\nerror at /home/runner/work/app/src/main.rs and \
+                 C:\\Users\\runner\\app"
+                    .to_string(),
+            ),
+        );
+        let s = format_json_report(&report);
+        assert!(!s.contains("/home/"), "must not leak /home/ paths");
+        assert!(!s.contains("C:\\Users\\"), "must not leak Windows paths");
+        assert!(!s.contains("main.rs"), "must not leak source file paths");
     }
 
     // ── cargo artifact path / free port ───────────────────────────────────
