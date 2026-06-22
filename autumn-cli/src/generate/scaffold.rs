@@ -141,6 +141,7 @@ pub fn plan_scaffold_with_options(
                 &plural,
                 &form_fields,
                 options_with_key.model.sharded,
+                options_with_key.model.soft_delete,
             ),
         );
         let route_mod_path = routes_dir.join("mod.rs");
@@ -457,6 +458,7 @@ fn render_routes_file(
     plural: &str,
     fields: &[Field],
     sharded: bool,
+    soft_delete: bool,
 ) -> String {
     let create_inputs = render_create_form_inputs(fields);
     let edit_inputs = render_edit_form_inputs(fields);
@@ -464,6 +466,21 @@ fn render_routes_file(
     let nullable_field_match = render_nullable_field_match(fields);
     let has_attachments = has_attachment_fields(fields);
     let (decoded_form_struct, decoded_form_mapping) = render_decoded_form(pascal_name, fields);
+    // The destroy handler must honour the resource's delete semantics: when the
+    // scaffold was generated with `--soft-delete`, mark `deleted_at` (matching
+    // the soft-delete repository) instead of issuing a physical `DELETE`.
+    let destroy_stmt = if soft_delete {
+        format!(
+            "let deleted = diesel::update({plural}::table.find(*id))\n        \
+                 .set({plural}::deleted_at.eq(Some(chrono::Utc::now().naive_utc())))\n        \
+                 .execute(&mut *db)\n        .await?;"
+        )
+    } else {
+        format!(
+            "let deleted = diesel::delete({plural}::table.find(*id))\n        \
+                 .execute(&mut *db)\n        .await?;"
+        )
+    };
     // Forms remain URL-encoded for compatibility with the generated handlers.
     // File uploads are handled separately via direct-upload URLs generated in
     // a CSRF-protected endpoint (see docs/guide/storage.md#direct-uploads).
@@ -780,7 +797,8 @@ pub async fn update(
 /// `POST /{plural}/{{id}}/delete` — delete a row, then redirect to the list.
 /// Browsers can't submit `DELETE` without JS, so the show page's delete button
 /// posts here; the JSON `DELETE /api/{plural}/{{id}}` stays available for API
-/// clients via the auto-generated repository handler.
+/// clients via the auto-generated repository handler. Honours the resource's
+/// soft-delete configuration (marks `deleted_at` when `--soft-delete` is set).
 #[secured]
 #[post("/{plural}/{{id}}/delete")]
 pub async fn destroy(
@@ -788,9 +806,7 @@ pub async fn destroy(
     mut db: {db_ty},
     flash: Flash,
 ) -> AutumnResult<Markup> {{
-    let deleted = diesel::delete({plural}::table.find(*id))
-        .execute(&mut *db)
-        .await?;
+    {destroy_stmt}
     if deleted == 0 {{
         return Err(AutumnError::not_found_msg(format!(
             "{pascal_name} with id {{}} not found", *id
@@ -1515,6 +1531,61 @@ async fn main() {
     }
 
     // ── Soft-delete scaffold generation (issue #689) ──────────────
+
+    #[test]
+    fn scaffold_soft_delete_destroy_handler_marks_deleted_at_not_physical_delete() {
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &["title:String".into()],
+            "20260427000000",
+            &ScaffoldOptions {
+                model: ModelOptions {
+                    soft_delete: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+        // The browser delete button must respect soft-delete: mark deleted_at,
+        // matching the soft-delete repository, instead of physically deleting.
+        assert!(
+            routes.contains("posts::deleted_at.eq(Some(chrono::Utc::now().naive_utc()))"),
+            "soft-delete destroy must mark deleted_at: {routes}"
+        );
+        assert!(
+            !routes.contains("diesel::delete(posts::table.find(*id))"),
+            "soft-delete destroy must not physically delete the row: {routes}"
+        );
+    }
+
+    #[test]
+    fn scaffold_without_soft_delete_destroy_handler_physically_deletes() {
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &["title:String".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+        assert!(
+            routes.contains("diesel::delete(posts::table.find(*id))"),
+            "non-soft-delete destroy must issue a physical delete: {routes}"
+        );
+        assert!(
+            !routes.contains("deleted_at.eq("),
+            "non-soft-delete destroy must not mark deleted_at: {routes}"
+        );
+    }
 
     #[test]
     fn scaffold_soft_delete_repository_annotation_includes_soft_delete() {
