@@ -123,7 +123,7 @@ response looks like:
 rust:1.88.0-bookworm (chef stage)
   └─ cargo chef prepare          # snapshot dependency graph
        └─ cargo chef cook        # build all dependencies (cached layer)
-            └─ autumn build --embed         # fingerprint + embed assets
+            └─ autumn build --embed         # fingerprint + embed assets (embed-assets feature)
                  └─ debian:bookworm-slim (runtime stage)
                        libpq5, tini, ca-certificates, curl
                        /usr/local/bin/myapp     ← your binary (assets + locales embedded)
@@ -133,6 +133,9 @@ rust:1.88.0-bookworm (chef stage)
 ENTRYPOINT ["/usr/bin/tini", "--"]
 CMD ["/usr/local/bin/myapp"]
 ```
+
+> Projects without the `embed-assets` feature instead build with `cargo build
+> --release` and stage `/app/static/` — see [Single-binary deploys](#single-binary-deploys-embedded-assets).
 
 Key design decisions:
 
@@ -203,15 +206,19 @@ i18n apps additionally embed locales via `embed_locales!()` /
 autumn build --embed
 ```
 
-This fingerprints `static/` **before** compiling (so the manifest is baked in) and
-enables the `embed-assets` feature. The release `Dockerfile` runs exactly this and
-therefore **does not** `COPY static`/`i18n` into the runtime image — only
-`migrations/` is staged, for the one-shot `autumn migrate` job (the running server
-never reads it).
+This compiles your build scripts (e.g. Tailwind), fingerprints `static/`, then
+recompiles with the `embed-assets` feature so the manifest and assets are baked in.
+
+`autumn release init` detects the `embed-assets` feature in your `Cargo.toml`: when
+present it emits a release `Dockerfile` that runs `autumn build --embed` and **does
+not** `COPY static`/`i18n` into the runtime image (only `migrations/` is staged, for
+the one-shot `autumn migrate` job). Projects without the feature get the disk-based
+build (`cargo build --release` + `COPY static`) so their Docker builds keep working.
 
 > Adding embedding to an existing app: add the `[features]` block above, wire
 > `.embedded_static()` (and `.embedded_locales()` if you use i18n) behind
-> `#[cfg(feature = "embed-assets")]`, then build with `autumn build --embed`.
+> `#[cfg(feature = "embed-assets")]`, then re-run `autumn release init --force` and
+> build with `autumn build --embed`.
 
 ---
 

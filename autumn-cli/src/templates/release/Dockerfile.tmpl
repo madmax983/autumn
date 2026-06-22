@@ -34,10 +34,9 @@ RUN mkdir -p target/autumn \
         "https://github.com/tailwindlabs/tailwindcss/releases/download/${TAILWIND_VERSION}/tailwindcss-${suffix}" \
     && chmod +x target/autumn/tailwindcss
 
-# Install the Autumn + Diesel CLIs before the build. The Autumn CLI is needed
-# at build time so `autumn build --embed` can fingerprint the static/ tree and
-# bake it (plus i18n locales) into the binary; Diesel CLI ships in the runtime
-# for the one-shot migration job.
+# Install the Autumn + Diesel CLIs. The Autumn CLI is used at build time for
+# embedded single-binary builds and in the runtime for the one-shot migration
+# job; Diesel CLI is used by that migration job.
 RUN cargo install --locked autumn-cli --version "${AUTUMN_CLI_VERSION}"
 RUN cargo install diesel_cli \
     --version "${DIESEL_CLI_VERSION}" \
@@ -45,11 +44,7 @@ RUN cargo install diesel_cli \
     --features postgres
 
 COPY . .
-# Single-binary build: fingerprint static assets, then compile with the
-# `embed-assets` feature so the binary serves static/ (incl. the fingerprint
-# manifest) and i18n locales from itself — no sidecar directories. The generated
-# app opts in via `.embedded_static()` / `.embedded_locales()` (see src/main.rs).
-RUN autumn build --embed
+{{build_step}}
 
 # ── Stage 3: runtime ──────────────────────────────────────────────────────────
 FROM debian:bookworm-slim AS runtime
@@ -69,10 +64,7 @@ WORKDIR /app
 COPY --chown=autumn:autumn --from=builder /app/target/release/{{project_name}} /usr/local/bin/{{project_name}}
 COPY --chown=autumn:autumn --from=builder /usr/local/cargo/bin/autumn /usr/local/bin/autumn
 COPY --chown=autumn:autumn --from=builder /usr/local/cargo/bin/diesel /usr/local/bin/diesel
-# No `COPY static` / `COPY i18n`: assets and locales are embedded in the binary
-# (`autumn build --embed`). Only `migrations/` is staged, for the one-shot
-# `autumn migrate` job (the running server does not read it).
-COPY --chown=autumn:autumn --from=builder /app/migrations /app/migrations
+{{static_copy}}COPY --chown=autumn:autumn --from=builder /app/migrations /app/migrations
 # Use the production config example as the runtime autumn.toml.
 # It sets host = "0.0.0.0" and leaves migration ownership to an explicit
 # one-shot primary-role job.
