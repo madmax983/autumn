@@ -319,8 +319,120 @@ pub(super) fn ensure_cargo_dependencies(existing: &str, deps: &[(&str, &str)]) -
     out
 }
 
-/// True iff `line` is a TOML table header for `[<table>]`, tolerating leading
-/// whitespace and trailing `# comment` text (which `cargo` itself accepts).
+/// Ensure the `autumn-web` dependency in `Cargo.toml` carries `feature`
+/// (a bare name like `storage`). Returns the toml unchanged if it is already
+/// present. Handles the three forms a fresh Autumn project may use:
+/// - `autumn-web = "x.y"` (simple string)
+/// - `autumn-web = { version = "x.y", ... }` (inline table)
+/// - `[dependencies.autumn-web]` subtable
+pub(super) fn ensure_autumn_web_feature(toml: &str, feature: &str) -> String {
+    const CRATE: &str = "autumn-web";
+    let feature_token = format!("\"{feature}\"");
+    let feature = feature_token.as_str();
+
+    let mut lines: Vec<String> = toml.lines().map(str::to_owned).collect();
+    let trailing_newline = toml.ends_with('\n');
+
+    let simple_prefix = format!("{CRATE} = \"");
+    let table_prefix = format!("{CRATE} = {{");
+    let subtable_header = format!("[dependencies.{CRATE}]");
+
+    let mut i = 0;
+    while i < lines.len() {
+        let trimmed = lines[i].trim().to_owned();
+        let indent: String = lines[i]
+            .chars()
+            .take_while(char::is_ascii_whitespace)
+            .collect();
+
+        if let Some(rest) = trimmed.strip_prefix(&simple_prefix) {
+            let version = rest.trim_end_matches('"');
+            lines[i] =
+                format!("{indent}{CRATE} = {{ version = \"{version}\", features = [{feature}] }}");
+            break;
+        }
+
+        if trimmed.starts_with(&table_prefix) {
+            if trimmed.contains(feature) {
+                break; // already present
+            }
+            if let Some(feat_bracket) = trimmed.find("features = [") {
+                let list_start = feat_bracket + "features = [".len();
+                let list_end = trimmed[list_start..].find(']').unwrap() + list_start;
+                let existing = trimmed[list_start..list_end].trim();
+                let new_list = if existing.is_empty() {
+                    feature.to_owned()
+                } else {
+                    format!("{existing}, {feature}")
+                };
+                lines[i] = format!(
+                    "{indent}{}{}{}",
+                    &trimmed[..list_start],
+                    new_list,
+                    &trimmed[list_end..]
+                );
+            } else {
+                let close = trimmed.rfind('}').unwrap();
+                let before_close = trimmed[..close].trim_end();
+                let sep = if before_close.ends_with('{') {
+                    ""
+                } else {
+                    ", "
+                };
+                lines[i] = format!(
+                    "{indent}{}{sep}features = [{feature}]{}",
+                    &trimmed[..close],
+                    &trimmed[close..]
+                );
+            }
+            break;
+        }
+
+        if trimmed == subtable_header {
+            let mut j = i + 1;
+            let mut found_features = false;
+            while j < lines.len() {
+                let t = lines[j].trim().to_owned();
+                if t.starts_with('[') {
+                    break;
+                }
+                if t.starts_with("features") {
+                    found_features = true;
+                    if !t.contains(feature)
+                        && let (Some(open), Some(close)) = (t.find('['), t.rfind(']'))
+                    {
+                        let inner = t[open + 1..close].trim();
+                        let new_inner = if inner.is_empty() {
+                            feature.to_owned()
+                        } else {
+                            format!("{inner}, {feature}")
+                        };
+                        let indent_j: String = lines[j]
+                            .chars()
+                            .take_while(char::is_ascii_whitespace)
+                            .collect();
+                        lines[j] = format!("{indent_j}features = [{new_inner}]");
+                    }
+                    break;
+                }
+                j += 1;
+            }
+            if !found_features {
+                lines.insert(i + 1, format!("features = [{feature}]"));
+            }
+            break;
+        }
+
+        i += 1;
+    }
+
+    let mut out = lines.join("\n");
+    if trailing_newline && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out
+}
+
 fn is_table_header(line: &str, table: &str) -> bool {
     let trimmed = line.trim_start();
     let Some(rest) = trimmed.strip_prefix('[') else {
@@ -959,6 +1071,35 @@ autumn-web = \"0.3\"\n";
         assert!(updated.contains("autumn-web = \"0.3\""));
         assert!(updated.contains("chrono = \"0.4\""));
         assert_eq!(updated.matches("autumn-web =").count(), 1);
+    }
+
+    #[test]
+    fn ensure_autumn_web_feature_simple_string_form() {
+        let input = "[dependencies]\nautumn-web = \"0.5\"\n";
+        let out = ensure_autumn_web_feature(input, "storage");
+        assert!(out.contains("autumn-web = { version = \"0.5\", features = [\"storage\"] }"));
+    }
+
+    #[test]
+    fn ensure_autumn_web_feature_inline_table_with_existing_features() {
+        let input = "[dependencies]\nautumn-web = { version = \"0.5\", features = [\"db\"] }\n";
+        let out = ensure_autumn_web_feature(input, "storage");
+        assert!(out.contains("features = [\"db\", \"storage\"]"));
+    }
+
+    #[test]
+    fn ensure_autumn_web_feature_subtable_form() {
+        let input = "[dependencies.autumn-web]\nversion = \"0.5\"\n";
+        let out = ensure_autumn_web_feature(input, "storage");
+        assert!(out.contains("features = [\"storage\"]"));
+    }
+
+    #[test]
+    fn ensure_autumn_web_feature_idempotent() {
+        let input =
+            "[dependencies]\nautumn-web = { version = \"0.5\", features = [\"storage\"] }\n";
+        let out = ensure_autumn_web_feature(input, "storage");
+        assert_eq!(out, input, "must not duplicate an already-present feature");
     }
 
     #[test]
