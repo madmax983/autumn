@@ -47,6 +47,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
+use crate::security::constant_time::constant_time_eq_str as constant_time_eq;
 use axum::extract::{FromRequestParts, OptionalFromRequestParts};
 use axum::http::{Request, Response, StatusCode};
 use http::header::HeaderName;
@@ -310,36 +311,6 @@ impl<S> Layer<S> for CsrfLayer {
 pub struct CsrfService<S> {
     inner: S,
     settings: Arc<CsrfSettings>,
-}
-
-use subtle::{Choice, ConstantTimeEq};
-
-/// Constant-time string comparison to prevent timing attacks when verifying CSRF tokens.
-///
-/// The comparison always processes exactly `b.len()` bytes so that execution
-/// time is independent of the length of the submitted token `a`.  Neither a
-/// length mismatch nor a short input causes an early exit.
-#[inline(never)]
-fn constant_time_eq(a: &str, b: &str) -> bool {
-    let a = a.as_bytes();
-    let b = b.as_bytes();
-
-    // Constant-time length check — no early exit.
-    let len_eq = a.len().ct_eq(&b.len());
-
-    // Iterate over `a` (the trusted stored token) so the loop count is fixed
-    // at the server-side token length, regardless of what the caller submits
-    // as `b`.  Callers pass the attacker-controlled value as `b`, so iterating
-    // over `a` ensures every submission — short or long — executes the same
-    // amount of work.  Out-of-range positions in `b` use the sentinel 0xFF,
-    // which can never match a valid ASCII/UTF-8 token byte.
-    let mut bytes_eq = Choice::from(1u8);
-    for (i, &a_byte) in a.iter().enumerate() {
-        let b_byte = *b.get(i).unwrap_or(&0xFF);
-        bytes_eq &= a_byte.ct_eq(&b_byte);
-    }
-
-    (len_eq & bytes_eq).into()
 }
 
 /// Extract the CSRF cookie value from the Cookie header.
@@ -1093,16 +1064,6 @@ mod tests {
             extract_cookie_token(&headers, "autumn-csrf"),
             Some("abc123".to_owned())
         );
-    }
-
-    #[test]
-    fn test_constant_time_eq() {
-        assert!(super::constant_time_eq("abc", "abc"));
-        assert!(!super::constant_time_eq("abc", "ab"));
-        assert!(!super::constant_time_eq("abc", "abd"));
-        assert!(super::constant_time_eq("", ""));
-        assert!(!super::constant_time_eq("a", "b"));
-        assert!(!super::constant_time_eq("a", "A"));
     }
 
     #[tokio::test]
