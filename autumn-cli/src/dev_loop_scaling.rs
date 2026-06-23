@@ -499,7 +499,7 @@ pub fn format_scaling_human(report: &ScalingReport) -> String {
 pub fn format_scaling_budget_table() -> String {
     let mut out = String::new();
     writeln!(out, "Autumn macro-scaling budget (issue #983)\n").unwrap();
-    writeln!(out, "{:<12}  {:>12}  Notes", "Metric", "Budget",).unwrap();
+    writeln!(out, "{:<12}  {:>12}  Notes", "Metric", "Budget").unwrap();
     writeln!(out, "{}", "-".repeat(50)).unwrap();
     writeln!(
         out,
