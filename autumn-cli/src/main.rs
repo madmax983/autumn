@@ -13,7 +13,6 @@ mod db_pull;
 mod dev;
 mod dev_loop_bench;
 mod dev_loop_scaling;
-mod scaling_driver;
 mod doctor;
 mod experiments;
 mod export;
@@ -29,6 +28,7 @@ mod plugin_check;
 mod process;
 mod release;
 mod routes;
+mod scaling_driver;
 mod seed;
 mod serve;
 mod setup;
@@ -4502,8 +4502,7 @@ mod tests {
 
     #[test]
     fn parse_dev_loop_bench_scaling_flag() {
-        let cli =
-            Cli::try_parse_from(["autumn", "dev-loop-bench", "--scaling"]).unwrap();
+        let cli = Cli::try_parse_from(["autumn", "dev-loop-bench", "--scaling"]).unwrap();
         let Commands::DevLoopBench { scaling, .. } = cli.command else {
             panic!("expected dev-loop-bench");
         };
@@ -4512,9 +4511,14 @@ mod tests {
 
     #[test]
     fn parse_dev_loop_bench_scaling_custom_sizes() {
-        let cli =
-            Cli::try_parse_from(["autumn", "dev-loop-bench", "--scaling", "--sizes", "1,10,50"])
-                .unwrap();
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "dev-loop-bench",
+            "--scaling",
+            "--sizes",
+            "1,10,50",
+        ])
+        .unwrap();
         let Commands::DevLoopBench { scaling, sizes, .. } = cli.command else {
             panic!("expected dev-loop-bench");
         };
@@ -4532,7 +4536,10 @@ mod tests {
             "benchmarks/dev-loop-scaling/baseline.json",
         ])
         .unwrap();
-        let Commands::DevLoopBench { scaling, baseline, .. } = cli.command else {
+        let Commands::DevLoopBench {
+            scaling, baseline, ..
+        } = cli.command
+        else {
             panic!("expected dev-loop-bench");
         };
         assert!(scaling);

@@ -12,7 +12,7 @@
 //! excluded from coverage like `cold_start_driver.rs`.
 
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::time::Instant;
 
 use crate::cold_start_driver::{cached_autumn_web, repoint_autumn_web};
@@ -38,7 +38,8 @@ fn scaffold_app(app: &GeneratedApp, project_dir: &Path, autumn_web: &Path) -> Re
     for (relpath, content) in &app.files {
         let dest = project_dir.join(relpath);
         if let Some(parent) = dest.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
         }
         std::fs::write(&dest, content).map_err(|e| format!("write {}: {e}", dest.display()))?;
     }
@@ -62,14 +63,14 @@ fn run_cargo_build(project_dir: &Path, timed: bool) -> Result<u64, String> {
         // project accumulates in its own dedicated directory.
         .env_remove("CARGO_TARGET_DIR")
         .env_remove("CARGO_BUILD_TARGET_DIR")
-        .env_remove("CARGO_BUILD_TARGET")
-        // Suppress output so bench stderr is clean.
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .env_remove("CARGO_BUILD_TARGET");
 
+    // Capture output rather than inheriting it: keeps the benchmark's own
+    // stderr clean on success, but preserves the compiler's diagnostics so a
+    // build failure mid-sweep is actually debuggable.
     let start = Instant::now();
-    let status = cmd
-        .status()
+    let output = cmd
+        .output()
         .map_err(|e| format!("cargo build spawn failed: {e}"))?;
     let elapsed = if timed {
         u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX)
@@ -77,8 +78,12 @@ fn run_cargo_build(project_dir: &Path, timed: bool) -> Result<u64, String> {
         0
     };
 
-    if !status.success() {
-        return Err(format!("cargo build failed (exit: {status})"));
+    if !output.status.success() {
+        return Err(format!(
+            "cargo build failed (exit: {}):\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        ));
     }
     Ok(elapsed)
 }
@@ -112,8 +117,7 @@ fn measure_size(n: usize, runs: u32, autumn_web: &Path) -> Result<Vec<u64>, Stri
         let handlers_src = std::fs::read_to_string(&handlers_path)
             .map_err(|e| format!("read handlers.rs: {e}"))?;
         let edited = apply_handler_edit(&handlers_src, run);
-        std::fs::write(&handlers_path, &edited)
-            .map_err(|e| format!("write handlers.rs: {e}"))?;
+        std::fs::write(&handlers_path, &edited).map_err(|e| format!("write handlers.rs: {e}"))?;
 
         eprintln!("  N={n} run {run}/{runs}: timed incremental build…");
         let ms = run_cargo_build(&project_dir, true)?;
@@ -157,7 +161,10 @@ fn measure_scaling(
         ));
     }
     if !failures.is_empty() {
-        eprintln!("Warning: {} size(s) failed and were skipped: {failures:?}", failures.len());
+        eprintln!(
+            "Warning: {} size(s) failed and were skipped: {failures:?}",
+            failures.len()
+        );
     }
     Ok(results)
 }
@@ -222,7 +229,13 @@ pub fn run_scaling(
         }
     };
 
-    let baseline = load_baseline(baseline_path);
+    let baseline = match load_baseline(baseline_path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            return 1;
+        }
+    };
     let report = build_scaling_report(&measurements, baseline.as_ref());
     emit_scaling_report(&report, json, output, fail_on_regression)
 }
@@ -247,10 +260,16 @@ mod tests {
         let app = generate_synthetic_app(2);
         scaffold_app(&app, tmp.path(), &autumn_web).expect("scaffold must succeed");
 
-        assert!(tmp.path().join("Cargo.toml").is_file(), "Cargo.toml must exist");
+        assert!(
+            tmp.path().join("Cargo.toml").is_file(),
+            "Cargo.toml must exist"
+        );
         let manifest =
             std::fs::read_to_string(tmp.path().join("Cargo.toml")).expect("read manifest");
-        assert!(manifest.contains("[patch.crates-io]"), "patch section must be appended");
+        assert!(
+            manifest.contains("[patch.crates-io]"),
+            "patch section must be appended"
+        );
 
         for (relpath, _) in &app.files {
             assert!(
@@ -262,7 +281,10 @@ mod tests {
 
     #[test]
     fn run_scaling_dry_run_returns_zero() {
-        assert_eq!(run_scaling("1,25,50,100", 3, None, false, false, true, None), 0);
+        assert_eq!(
+            run_scaling("1,25,50,100", 3, None, false, false, true, None),
+            0
+        );
     }
 
     #[test]

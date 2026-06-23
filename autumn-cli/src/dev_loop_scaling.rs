@@ -184,7 +184,9 @@ fn generate_schema(n: usize) -> String {
 }
 
 fn generate_models(n: usize) -> String {
-    let mut out = String::from("// Bring all diesel table DSLs into scope for derive macros.\nuse crate::schema::*;\n\n");
+    let mut out = String::from(
+        "// Bring all diesel table DSLs into scope for derive macros.\nuse crate::schema::*;\n\n",
+    );
     for k in 0..n {
         writeln!(
             out,
@@ -277,13 +279,8 @@ pub fn apply_handler_edit(handlers_src: &str, revision: u32) -> String {
     handlers_src
         .split('\n')
         .map(|line| {
-            if line
-                .trim_start()
-                .starts_with("const BENCH_EDIT_SENTINEL:")
-            {
-                format!(
-                    "const BENCH_EDIT_SENTINEL: &str = \"bench_edit_rev_{revision}\";"
-                )
+            if line.trim_start().starts_with("const BENCH_EDIT_SENTINEL:") {
+                format!("const BENCH_EDIT_SENTINEL: &str = \"bench_edit_rev_{revision}\";")
             } else {
                 line.to_string()
             }
@@ -368,14 +365,14 @@ pub fn build_scaling_report(
     // N rather than by input position. `parse_sizes` preserves caller order, so
     // a sweep passed out of order (e.g. `--sizes 100,50,1`) must not invert the
     // ratio and let a real regression pass the gate.
-    let p95_by_n = |sel: fn(&ScalingPoint, &ScalingPoint) -> bool| {
-        points
-            .iter()
-            .reduce(|a, b| if sel(a, b) { a } else { b })
-            .map_or(0, |p| p.stats.p95_ms)
-    };
-    let min_n_p95 = p95_by_n(|a, b| a.n <= b.n);
-    let max_n_p95 = p95_by_n(|a, b| a.n >= b.n);
+    let min_n_p95 = points
+        .iter()
+        .min_by_key(|p| p.n)
+        .map_or(0, |p| p.stats.p95_ms);
+    let max_n_p95 = points
+        .iter()
+        .max_by_key(|p| p.n)
+        .map_or(0, |p| p.stats.p95_ms);
     let slope = if points.len() < 2 {
         1.0
     } else {
@@ -501,17 +498,8 @@ pub fn format_scaling_human(report: &ScalingReport) -> String {
 /// Render the scaling budget table for `--dry-run` (no build needed).
 pub fn format_scaling_budget_table() -> String {
     let mut out = String::new();
-    writeln!(
-        out,
-        "Autumn macro-scaling budget (issue #983)\n"
-    )
-    .unwrap();
-    writeln!(
-        out,
-        "{:<12}  {:>12}  Notes",
-        "Metric", "Budget",
-    )
-    .unwrap();
+    writeln!(out, "Autumn macro-scaling budget (issue #983)\n").unwrap();
+    writeln!(out, "{:<12}  {:>12}  Notes", "Metric", "Budget",).unwrap();
     writeln!(out, "{}", "-".repeat(50)).unwrap();
     writeln!(
         out,
@@ -528,10 +516,15 @@ pub fn format_scaling_budget_table() -> String {
     writeln!(
         out,
         "{:<12}  {:>10.0}%   vs accepted baseline slope (skipped until baseline established)",
-        "Regression", SCALING_BASELINE_REGRESSION.mul_add(100.0, -100.0),
+        "Regression",
+        SCALING_BASELINE_REGRESSION.mul_add(100.0, -100.0),
     )
     .unwrap();
-    writeln!(out, "\nSee docs/guide/dev-loop-latency.md (§ Scaling) for methodology.").unwrap();
+    writeln!(
+        out,
+        "\nSee docs/guide/dev-loop-latency.md (§ Scaling) for methodology."
+    )
+    .unwrap();
     out
 }
 
@@ -566,9 +559,7 @@ pub fn emit_scaling_report(
     }
 
     if fail_on_regression && !report.all_passed {
-        eprintln!(
-            "Scaling benchmark failed: p95 ceiling or slope budget exceeded. Exiting 1."
-        );
+        eprintln!("Scaling benchmark failed: p95 ceiling or slope budget exceeded. Exiting 1.");
         exit = 1;
     }
 
@@ -588,11 +579,20 @@ pub fn run_scaling_dry_run() -> i32 {
     0
 }
 
-/// Load a `ScalingBaseline` from a JSON file, returning `None` on any error.
-pub fn load_baseline(path: Option<&str>) -> Option<ScalingBaseline> {
-    let path = path?;
-    let content = std::fs::read_to_string(path).ok()?;
-    serde_json::from_str(&content).ok()
+/// Load a `ScalingBaseline` from a JSON file.
+///
+/// Returns `Ok(None)` when no path is given, and `Err` when the file cannot be
+/// read or parsed — surfacing the error rather than silently skipping the
+/// regression gate on a corrupt baseline.
+pub fn load_baseline(path: Option<&str>) -> Result<Option<ScalingBaseline>, String> {
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    let content = std::fs::read_to_string(path)
+        .map_err(|e| format!("failed to read baseline file {path:?}: {e}"))?;
+    let baseline = serde_json::from_str(&content)
+        .map_err(|e| format!("failed to parse baseline file {path:?}: {e}"))?;
+    Ok(Some(baseline))
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -626,7 +626,10 @@ mod tests {
         let paths: Vec<&str> = app.files.iter().map(|(p, _)| p.as_str()).collect();
         assert!(paths.contains(&"src/schema.rs"), "missing schema.rs");
         assert!(paths.contains(&"src/models.rs"), "missing models.rs");
-        assert!(paths.contains(&"src/repositories.rs"), "missing repositories.rs");
+        assert!(
+            paths.contains(&"src/repositories.rs"),
+            "missing repositories.rs"
+        );
         assert!(paths.contains(&"src/handlers.rs"), "missing handlers.rs");
         assert!(paths.contains(&"src/main.rs"), "missing main.rs");
         assert_eq!(paths.len(), 5, "expected exactly 5 source files");
@@ -709,7 +712,10 @@ mod tests {
     fn generate_app_is_deterministic() {
         let a = generate_synthetic_app(10);
         let b = generate_synthetic_app(10);
-        assert_eq!(a.cargo_toml, b.cargo_toml, "Cargo.toml must be deterministic");
+        assert_eq!(
+            a.cargo_toml, b.cargo_toml,
+            "Cargo.toml must be deterministic"
+        );
         assert_eq!(a.files.len(), b.files.len());
         for ((pa, ca), (pb, cb)) in a.files.iter().zip(b.files.iter()) {
             assert_eq!(pa, pb, "file paths must be deterministic");
@@ -783,7 +789,11 @@ mod tests {
         // Lines other than the sentinel line are unchanged.
         let orig_lines: Vec<&str> = handlers.lines().collect();
         let edit_lines: Vec<&str> = edited.lines().collect();
-        assert_eq!(orig_lines.len(), edit_lines.len(), "line count must not change");
+        assert_eq!(
+            orig_lines.len(),
+            edit_lines.len(),
+            "line count must not change"
+        );
         let changed: Vec<usize> = orig_lines
             .iter()
             .zip(edit_lines.iter())
@@ -791,7 +801,11 @@ mod tests {
             .filter(|(_, (a, b))| a != b)
             .map(|(i, _)| i)
             .collect();
-        assert_eq!(changed.len(), 1, "exactly one line must change, changed: {changed:?}");
+        assert_eq!(
+            changed.len(),
+            1,
+            "exactly one line must change, changed: {changed:?}"
+        );
     }
 
     #[test]
@@ -828,28 +842,37 @@ mod tests {
 
     #[test]
     fn parse_sizes_rejects_zero() {
-        assert!(
-            parse_sizes("1,0,100").is_err(),
-            "size 0 must be rejected"
-        );
+        assert!(parse_sizes("1,0,100").is_err(), "size 0 must be rejected");
     }
 
     #[test]
     fn parse_sizes_rejects_empty_string() {
         assert!(parse_sizes("").is_err(), "empty string must be rejected");
-        assert!(parse_sizes("  ").is_err(), "whitespace-only must be rejected");
+        assert!(
+            parse_sizes("  ").is_err(),
+            "whitespace-only must be rejected"
+        );
     }
 
     #[test]
     fn parse_sizes_rejects_non_numeric() {
-        assert!(parse_sizes("1,abc,100").is_err(), "non-numeric token must be rejected");
-        assert!(parse_sizes("foo").is_err(), "all-non-numeric must be rejected");
+        assert!(
+            parse_sizes("1,abc,100").is_err(),
+            "non-numeric token must be rejected"
+        );
+        assert!(
+            parse_sizes("foo").is_err(),
+            "all-non-numeric must be rejected"
+        );
     }
 
     #[test]
     fn parse_sizes_rejects_negative() {
         // usize parse rejects leading "-" so this is an Err.
-        assert!(parse_sizes("1,-5,100").is_err(), "negative must be rejected");
+        assert!(
+            parse_sizes("1,-5,100").is_err(),
+            "negative must be rejected"
+        );
     }
 
     // ── compute_slope ─────────────────────────────────────────────────────
@@ -870,9 +893,15 @@ mod tests {
     fn compute_slope_zero_baseline_returns_one() {
         // Placeholder / empty-sample baseline must not cause divide-by-zero.
         let s = compute_slope(0, 0);
-        assert!((s - 1.0).abs() < 1e-9, "zero baseline → slope 1.0 (flat), got {s}");
+        assert!(
+            (s - 1.0).abs() < 1e-9,
+            "zero baseline → slope 1.0 (flat), got {s}"
+        );
         let s2 = compute_slope(0, 5000);
-        assert!((s2 - 1.0).abs() < 1e-9, "zero baseline (any max) → slope 1.0, got {s2}");
+        assert!(
+            (s2 - 1.0).abs() < 1e-9,
+            "zero baseline (any max) → slope 1.0, got {s2}"
+        );
     }
 
     #[test]
@@ -936,7 +965,10 @@ mod tests {
             note: None,
         };
         let r = build_scaling_report(&m, Some(&baseline));
-        assert!(r.baseline_regression_passed, "non-established baseline must always pass regression");
+        assert!(
+            r.baseline_regression_passed,
+            "non-established baseline must always pass regression"
+        );
         // slope = 3.0 still > 2× so all_passed should be false due to slope gate
         assert!(!r.all_passed, "slope 3× still fails 2× absolute slope gate");
     }
@@ -951,7 +983,10 @@ mod tests {
             note: None,
         };
         let r = build_scaling_report(&m, Some(&baseline));
-        assert!(!r.baseline_regression_passed, "slope 3× vs accepted 1.2 must fail regression");
+        assert!(
+            !r.baseline_regression_passed,
+            "slope 3× vs accepted 1.2 must fail regression"
+        );
         assert!(!r.all_passed);
     }
 
@@ -965,8 +1000,14 @@ mod tests {
             note: None,
         };
         let r = build_scaling_report(&m, Some(&baseline));
-        assert!(r.baseline_regression_passed, "1.6 within 1.5×1.2=1.80 must pass");
-        assert!(r.all_passed, "within abs, slope, and regression → all_passed");
+        assert!(
+            r.baseline_regression_passed,
+            "1.6 within 1.5×1.2=1.80 must pass"
+        );
+        assert!(
+            r.all_passed,
+            "within abs, slope, and regression → all_passed"
+        );
     }
 
     #[test]
@@ -974,7 +1015,10 @@ mod tests {
         // Single size → no meaningful slope → defaults to 1.0 (flat).
         let m = make_measurements(&[50], &[4000]);
         let r = build_scaling_report(&m, None);
-        assert!((r.slope - 1.0).abs() < 1e-9, "single-size slope must be 1.0");
+        assert!(
+            (r.slope - 1.0).abs() < 1e-9,
+            "single-size slope must be 1.0"
+        );
         assert!(r.slope_passed);
         assert!(r.all_passed);
     }
@@ -982,7 +1026,10 @@ mod tests {
     #[test]
     fn build_report_empty_measurements_passes() {
         let r = build_scaling_report(&[], None);
-        assert!(r.all_passed, "empty measurement set must pass (nothing to fail)");
+        assert!(
+            r.all_passed,
+            "empty measurement set must pass (nothing to fail)"
+        );
     }
 
     #[test]
@@ -1002,9 +1049,18 @@ mod tests {
         let ra = build_scaling_report(&ascending, None);
         let rr = build_scaling_report(&reversed, None);
         assert!((ra.slope - 5.0).abs() < 1e-9, "ascending slope must be 5.0");
-        assert!((rr.slope - 5.0).abs() < 1e-9, "reversed-input slope must also be 5.0");
-        assert!(!ra.slope_passed && !rr.slope_passed, "slope 5× must fail either way");
-        assert!(!ra.all_passed && !rr.all_passed, "reversed sweep must not pass the gate");
+        assert!(
+            (rr.slope - 5.0).abs() < 1e-9,
+            "reversed-input slope must also be 5.0"
+        );
+        assert!(
+            !ra.slope_passed && !rr.slope_passed,
+            "slope 5× must fail either way"
+        );
+        assert!(
+            !ra.all_passed && !rr.all_passed,
+            "reversed sweep must not pass the gate"
+        );
     }
 
     #[test]
@@ -1014,8 +1070,14 @@ mod tests {
         let m: Vec<(usize, Vec<u64>)> = vec![(1, vec![2000]), (100, vec![])];
         let r = build_scaling_report(&m, None);
         assert!(r.points[0].abs_passed, "the measured size still passes");
-        assert!(!r.points[1].abs_passed, "an empty-sample size must fail the abs gate");
-        assert!(!r.all_passed, "a missing measurement must fail the overall gate");
+        assert!(
+            !r.points[1].abs_passed,
+            "an empty-sample size must fail the abs gate"
+        );
+        assert!(
+            !r.all_passed,
+            "a missing measurement must fail the overall gate"
+        );
     }
 
     // ── format_scaling_json ───────────────────────────────────────────────
@@ -1037,7 +1099,10 @@ mod tests {
         assert!(v.get("timestamp_utc").is_some(), "must have timestamp_utc");
         assert!(v.get("runner_os").is_some(), "must have runner_os");
         assert!(v.get("rust_version").is_some(), "must have rust_version");
-        assert!(v.get("autumn_version").is_some(), "must have autumn_version");
+        assert!(
+            v.get("autumn_version").is_some(),
+            "must have autumn_version"
+        );
         assert!(v.get("all_passed").is_some(), "must have all_passed");
         assert!(v.get("slope").is_some(), "must have slope");
         assert!(v.get("points").is_some(), "must have points array");
@@ -1159,7 +1224,10 @@ mod tests {
         let r = build_scaling_report(&m, None);
         assert!(r.all_passed);
         let exit = emit_scaling_report(&r, false, None, true);
-        assert_eq!(exit, 0, "--fail-on-regression must not trip on a passing report");
+        assert_eq!(
+            exit, 0,
+            "--fail-on-regression must not trip on a passing report"
+        );
     }
 
     #[test]
@@ -1168,7 +1236,10 @@ mod tests {
         let r = build_scaling_report(&m, None);
         assert!(!r.all_passed);
         let exit = emit_scaling_report(&r, false, None, true);
-        assert_eq!(exit, 1, "--fail-on-regression must return 1 for a failing report");
+        assert_eq!(
+            exit, 1,
+            "--fail-on-regression must return 1 for a failing report"
+        );
     }
 
     // ── run_scaling_dry_run ───────────────────────────────────────────────
@@ -1182,12 +1253,12 @@ mod tests {
 
     #[test]
     fn load_baseline_none_path_returns_none() {
-        assert!(load_baseline(None).is_none());
+        assert!(load_baseline(None).unwrap().is_none());
     }
 
     #[test]
-    fn load_baseline_missing_file_returns_none() {
-        assert!(load_baseline(Some("/nonexistent/path/baseline.json")).is_none());
+    fn load_baseline_missing_file_errors() {
+        assert!(load_baseline(Some("/nonexistent/path/baseline.json")).is_err());
     }
 
     #[test]
@@ -1198,7 +1269,9 @@ mod tests {
             r#"{"established":false,"accepted_slope":null,"note":"initial"}"#,
         )
         .expect("write baseline");
-        let b = load_baseline(Some(tmp.path().to_str().unwrap())).expect("must parse");
+        let b = load_baseline(Some(tmp.path().to_str().unwrap()))
+            .expect("must parse")
+            .expect("must be Some");
         assert!(!b.established);
         assert!(b.accepted_slope.is_none());
     }
@@ -1208,7 +1281,9 @@ mod tests {
         let tmp = tempfile::NamedTempFile::new().expect("tempfile");
         std::fs::write(tmp.path(), r#"{"established":true,"accepted_slope":1.5}"#)
             .expect("write baseline");
-        let b = load_baseline(Some(tmp.path().to_str().unwrap())).expect("must parse");
+        let b = load_baseline(Some(tmp.path().to_str().unwrap()))
+            .expect("must parse")
+            .expect("must be Some");
         assert!(b.established);
         assert!((b.accepted_slope.unwrap() - 1.5).abs() < 1e-9);
     }
@@ -1216,11 +1291,9 @@ mod tests {
     // ── helper ────────────────────────────────────────────────────────────
 
     fn file_content<'a>(app: &'a GeneratedApp, relpath: &str) -> &'a str {
-        app.files
-            .iter()
-            .find(|(p, _)| p == relpath)
-            .map_or_else(|| panic!("file {relpath:?} not found in GeneratedApp"), |(_, c)| {
-                c.as_str()
-            })
+        app.files.iter().find(|(p, _)| p == relpath).map_or_else(
+            || panic!("file {relpath:?} not found in GeneratedApp"),
+            |(_, c)| c.as_str(),
+        )
     }
 }
