@@ -215,118 +215,67 @@ impl<'a> PagerOptions<'a> {
 /// Compute the windowed page-number sequence for the offset pager.
 ///
 /// Always includes page `1` and `total`, the `radius` pages on either side of
-/// `current`, and inserts an [`PageItem::Ellipsis`] wherever a run of pages is
-/// skipped. Returns a compact, de-duplicated sequence like
-/// `1 … 4 5 6 … 20`.
+/// `current`, and inserts a [`PageItem::Ellipsis`] wherever a run of pages is
+/// skipped. Returns a compact sequence like `1 … 4 5 6 … 20`.
 fn page_window(current: u32, total: u32, radius: u32) -> Vec<PageItem> {
     if total <= 1 {
         return vec![PageItem::Page(1)];
     }
     let current = current.clamp(1, total);
-
-    // Collect the distinct page numbers we want to show, in order.
-    let mut pages: Vec<u32> = Vec::new();
     let lo = current.saturating_sub(radius).max(1);
     let hi = current.saturating_add(radius).min(total);
-    pages.push(1);
-    for p in lo..=hi {
-        pages.push(p);
-    }
-    pages.push(total);
-    pages.sort_unstable();
-    pages.dedup();
 
-    // Walk the sorted pages, inserting an ellipsis wherever there is a gap.
-    let mut items = Vec::with_capacity(pages.len());
-    let mut prev: Option<u32> = None;
-    for p in pages {
-        if let Some(prev) = prev {
-            if p > prev + 1 {
-                // A single skipped page is rendered as that page, not a `…`
-                // (an ellipsis hiding one page wastes a click).
-                if p == prev + 2 {
-                    items.push(PageItem::Page(prev + 1));
-                } else {
-                    items.push(PageItem::Ellipsis);
-                }
-            }
+    let mut items: Vec<PageItem> = Vec::with_capacity((hi - lo + 1 + 4) as usize);
+
+    // Prefix: page 1 when not already in the window, plus a gap indicator.
+    if lo > 1 {
+        items.push(PageItem::Page(1));
+        if lo == 3 {
+            // A single skipped page (page 2) is cheaper to show than `…`.
+            items.push(PageItem::Page(2));
+        } else if lo > 2 {
+            items.push(PageItem::Ellipsis);
         }
-        items.push(PageItem::Page(p));
-        prev = Some(p);
+        // lo == 2: pages 1 and 2 are adjacent, no gap.
     }
+
+    for p in lo..=hi {
+        items.push(PageItem::Page(p));
+    }
+
+    // Suffix: gap indicator plus `total` when not already in the window.
+    if hi < total {
+        if hi == total - 2 {
+            items.push(PageItem::Page(total - 1));
+        } else if hi < total - 1 {
+            items.push(PageItem::Ellipsis);
+        }
+        // hi == total - 1: hi and total are adjacent, no gap.
+        items.push(PageItem::Page(total));
+    }
+
     items
 }
 
-/// Build the query string for a page link, preserving the current query.
+/// Strip named params from a query string, returning the preserved remainder.
 ///
-/// Splits `query` on `&`, drops any existing `page_param`/`size_param` pairs,
-/// keeps the rest verbatim (already percent-encoded by the browser/router),
-/// then appends the target page (and size when `include_size`). The leading
-/// `?` is *not* included.
-fn link_query(
-    query: &str,
-    page_param: &str,
-    size_param: &str,
-    include_size: bool,
-    page: u32,
-    size: u32,
-) -> String {
-    let mut parts: Vec<&str> = Vec::new();
-    for pair in query.split('&') {
-        if pair.is_empty() {
-            continue;
-        }
-        let key = pair.split('=').next().unwrap_or(pair);
-        if key == page_param || key == size_param {
-            continue;
-        }
-        parts.push(pair);
-    }
-    let mut out = parts.join("&");
-    if !out.is_empty() {
-        out.push('&');
-    }
-    out.push_str(page_param);
-    out.push('=');
-    out.push_str(&page.to_string());
-    if include_size {
-        out.push('&');
-        out.push_str(size_param);
-        out.push('=');
-        out.push_str(&size.to_string());
-    }
-    out
+/// Splits `query` on `&`, drops pairs whose key matches any entry in
+/// `drop_keys`, and joins the rest verbatim (already percent-encoded). The
+/// leading `?` is *not* included in the input or output.
+fn filter_query<'a>(query: &'a str, drop_keys: &[&str]) -> String {
+    let parts: Vec<&'a str> = query
+        .split('&')
+        .filter(|pair| {
+            if pair.is_empty() {
+                return false;
+            }
+            let key = pair.split('=').next().unwrap_or(pair);
+            !drop_keys.contains(&key)
+        })
+        .collect();
+    parts.join("&")
 }
 
-/// Build the query string for a cursor link, dropping any existing cursor/page
-/// params and appending the new `cursor` token.
-fn cursor_link_query(
-    query: &str,
-    cursor_param: &str,
-    page_param: &str,
-    size_param: &str,
-    token: &str,
-) -> String {
-    let mut parts: Vec<&str> = Vec::new();
-    for pair in query.split('&') {
-        if pair.is_empty() {
-            continue;
-        }
-        let key = pair.split('=').next().unwrap_or(pair);
-        if key == cursor_param || key == page_param || key == size_param {
-            continue;
-        }
-        parts.push(pair);
-    }
-    let mut out = parts.join("&");
-    if !out.is_empty() {
-        out.push('&');
-    }
-    out.push_str(cursor_param);
-    out.push('=');
-    out.push_str(token);
-    out
-}
 
 /// Render a single clickable page/affordance anchor, wiring htmx attributes
 /// only when [`PagerOptions::hx_target`] is set (plain `<a href>` otherwise).
@@ -364,32 +313,35 @@ fn anchor(href: &str, class: &str, content: &str, opts: &PagerOptions<'_>) -> ma
 #[cfg(feature = "maud")]
 #[must_use]
 pub fn pagination_nav<T>(page: &Page<T>, opts: &PagerOptions<'_>) -> maud::Markup {
+    // Pre-compute the invariant filter prefix once; each page link only appends
+    // the new page number, avoiding O(window) repeated query-string parses.
+    let filtered = filter_query(opts.query, &[opts.page_param, opts.size_param]);
+    let prefix = if filtered.is_empty() {
+        String::new()
+    } else {
+        format!("{filtered}&")
+    };
+
     let href = |p: u32| -> String {
-        format!(
-            "{}?{}",
-            opts.base_path,
-            link_query(
-                opts.query,
-                opts.page_param,
-                opts.size_param,
-                opts.include_size,
-                p,
-                page.size,
+        if opts.include_size {
+            format!(
+                "{}?{}{}={p}&{}={}",
+                opts.base_path, prefix, opts.page_param, opts.size_param, page.size
             )
-        )
+        } else {
+            format!("{}?{}{}={p}", opts.base_path, prefix, opts.page_param)
+        }
     };
 
     maud::html! {
         nav aria-label=(opts.aria_label) class="autumn-pager" {
-            // ── Previous ──────────────────────────────────────────────
             @if page.has_previous {
-                (anchor(&href(page.page - 1), "autumn-pager__link autumn-pager__prev", opts.prev_label, opts))
+                (anchor(&href(page.page.saturating_sub(1)), "autumn-pager__link autumn-pager__prev", opts.prev_label, opts))
             } @else {
                 span class="autumn-pager__prev autumn-pager__disabled" aria-disabled="true" {
                     (opts.prev_label)
                 }
             }
-            // ── Windowed page numbers ─────────────────────────────────
             @for item in page_window(page.page, page.total_pages, opts.window) {
                 @match item {
                     PageItem::Page(p) => {
@@ -404,7 +356,6 @@ pub fn pagination_nav<T>(page: &Page<T>, opts: &PagerOptions<'_>) -> maud::Marku
                     }
                 }
             }
-            // ── Next ──────────────────────────────────────────────────
             @if page.has_next {
                 (anchor(&href(page.page + 1), "autumn-pager__link autumn-pager__next", opts.next_label, opts))
             } @else {
@@ -428,25 +379,21 @@ pub fn pagination_nav<T>(page: &Page<T>, opts: &PagerOptions<'_>) -> maud::Marku
 #[cfg(feature = "maud")]
 #[must_use]
 pub fn cursor_pagination_nav<T>(page: &CursorPage<T>, opts: &PagerOptions<'_>) -> maud::Markup {
+    let cursor_filtered =
+        filter_query(opts.query, &[opts.cursor_param, opts.page_param, opts.size_param]);
+    let cursor_prefix = if cursor_filtered.is_empty() {
+        String::new()
+    } else {
+        format!("{cursor_filtered}&")
+    };
     let cursor_href = |token: &str| -> String {
         format!(
-            "{}?{}",
-            opts.base_path,
-            cursor_link_query(
-                opts.query,
-                opts.cursor_param,
-                opts.page_param,
-                opts.size_param,
-                token,
-            )
+            "{}?{}{}={token}",
+            opts.base_path, cursor_prefix, opts.cursor_param
         )
     };
-    // A next page exists only when the data says so *and* carries a token.
-    let next_token = if page.has_next {
-        page.next_cursor.as_deref()
-    } else {
-        None
-    };
+    // Render the Next link whenever a cursor token is available; no token → disabled.
+    let next_token = page.next_cursor.as_deref();
 
     maud::html! {
         nav aria-label=(opts.aria_label) class="autumn-pager autumn-pager--cursor" {
@@ -550,43 +497,47 @@ mod tests {
         assert_eq!(ones, 1, "{items:?}");
     }
 
-    // ── link_query ─────────────────────────────────────────────────────
+    // ── filter_query ───────────────────────────────────────────────────
 
     #[test]
-    fn link_query_preserves_other_params() {
-        let q = link_query("q=foo&sort=name", "page", "size", false, 3, 25);
-        assert!(q.contains("q=foo"), "{q}");
-        assert!(q.contains("sort=name"), "{q}");
-        assert!(q.contains("page=3"), "{q}");
+    fn filter_query_drops_named_params_and_preserves_rest() {
+        let q = filter_query("q=foo&page=3&sort=name", &["page", "size"]);
+        assert_eq!(q, "q=foo&sort=name");
     }
 
     #[test]
-    fn link_query_swaps_existing_page_param() {
-        let q = link_query("q=foo&page=1", "page", "size", false, 7, 25);
-        assert!(q.contains("page=7"), "{q}");
-        assert!(!q.contains("page=1"), "{q}");
-        // exactly one page= occurrence
-        assert_eq!(q.matches("page=").count(), 1, "{q}");
+    fn filter_query_drops_all_listed_keys() {
+        let q = filter_query("q=foo&page=1&size=25", &["page", "size"]);
+        assert_eq!(q, "q=foo");
     }
 
     #[test]
-    fn link_query_omits_size_by_default() {
-        let q = link_query("q=foo", "page", "size", false, 2, 25);
-        assert!(!q.contains("size="), "{q}");
+    fn filter_query_handles_empty_query() {
+        assert_eq!(filter_query("", &["page"]), "");
     }
 
     #[test]
-    fn link_query_includes_size_when_requested() {
-        let q = link_query("q=foo&size=10", "page", "size", true, 2, 25);
-        // old size dropped, new size appended
-        assert!(q.contains("size=25"), "{q}");
-        assert_eq!(q.matches("size=").count(), 1, "{q}");
+    fn filter_query_handles_query_with_only_stripped_params() {
+        assert_eq!(filter_query("page=5&size=10", &["page", "size"]), "");
     }
 
+    // include_size is opt-in: verify via pagination_nav output.
     #[test]
-    fn link_query_handles_empty_query() {
-        let q = link_query("", "page", "size", false, 1, 25);
-        assert_eq!(q, "page=1");
+    fn offset_include_size_appends_size_param_to_links() {
+        let page = offset_page(2, 25, 100);
+        let opts = PagerOptions::new("/posts").include_size();
+        let html = pagination_nav(&page, &opts).into_string();
+        assert!(html.contains("size=25"), "size param missing: {html}");
+        // size= should not appear more than once per link (no duplication).
+        let hrefs: Vec<&str> = html
+            .match_indices("href=\"")
+            .map(|(i, _)| &html[i..])
+            .collect();
+        for h in &hrefs {
+            let end = h[6..].find('"').map(|e| 6 + e).unwrap_or(h.len());
+            let href = &h[6..end];
+            assert!(href.matches("size=").count() <= 1, "duplicate size= in {href}");
+        }
     }
 
     // ── pagination_nav (offset) ────────────────────────────────────────

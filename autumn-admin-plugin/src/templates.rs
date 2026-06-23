@@ -2078,22 +2078,9 @@ fn render_pagination(
     }
 }
 
-/// Build an `autumn_web` [`Page`] carrying just the pagination metadata the
-/// shared [`pagination_nav`] renderer needs — no content rows. Bridges the
-/// admin plugin's `u64`-based counts onto the framework's `Page` type.
 fn page_meta(page: u64, per_page: u64, total: u64, total_pages: u64) -> Page<()> {
     let to_u32 = |v: u64| u32::try_from(v).unwrap_or(u32::MAX);
-    let page = to_u32(page.max(1));
-    let total_pages = to_u32(total_pages.max(1));
-    Page {
-        content: Vec::new(),
-        page,
-        size: to_u32(per_page),
-        total_elements: total,
-        total_pages,
-        has_next: page < total_pages,
-        has_previous: page > 1,
-    }
+    Page::from_raw(to_u32(page), to_u32(per_page), total, to_u32(total_pages))
 }
 
 // -- Version history pane ----------------------------------------------------
