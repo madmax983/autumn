@@ -549,7 +549,7 @@ mod tests {
             .map(|(i, _)| &html[i..])
             .collect();
         for h in &hrefs {
-            let end = h[6..].find('"').map(|e| 6 + e).unwrap_or(h.len());
+            let end = h[6..].find('"').map_or(h.len(), |e| 6 + e);
             let href = &h[6..end];
             assert!(
                 href.matches("size=").count() <= 1,
@@ -587,7 +587,7 @@ mod tests {
         assert!(html.contains(r#"aria-disabled="true""#), "{html}");
         // There must be no anchor whose text is the prev label on page 1.
         assert!(
-            !html.contains(r##"href="/posts?page=0"##),
+            !html.contains(r#"href="/posts?page=0"#),
             "prev link must not point at page 0: {html}"
         );
     }
@@ -614,7 +614,7 @@ mod tests {
             .collect();
         assert!(!hrefs.is_empty(), "expected page links: {html}");
         for h in &hrefs {
-            let end = h[6..].find('"').map(|e| 6 + e).unwrap_or(h.len());
+            let end = h[6..].find('"').map_or(h.len(), |e| 6 + e);
             let href = &h[6..end];
             assert!(href.contains("q=foo"), "missing q in {href}");
             assert!(href.contains("sort=name"), "missing sort in {href}");
@@ -671,9 +671,9 @@ mod tests {
 
     // ── cursor_pagination_nav ──────────────────────────────────────────
 
-    fn cursor_page(size: u32, overfetch: usize) -> CursorPage<u32> {
+    fn cursor_page(size: u32, overfetch: u32) -> CursorPage<u32> {
         let req = CursorRequest::new(None, size);
-        let items: Vec<u32> = (1..=overfetch as u32).collect();
+        let items: Vec<u32> = (1..=overfetch).collect();
         CursorPage::from_overfetched(items, &req, |n| *n)
     }
 
