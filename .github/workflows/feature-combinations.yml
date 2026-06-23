@@ -5,9 +5,9 @@ name: Feature Combination Compile Gate
 # not hit a silent feature-gating regression.
 #
 # Bounded strategy (not the cost-prohibitive 2^N powerset):
-#   Phase A — `cargo hack --each-feature --no-default-features` on autumn-web.
-#             Builds once with NO features (bare-minimum compile), then once per
-#             individual feature.  Linear in the number of features; ~25 builds
+#   Phase A — `cargo hack --each-feature` on autumn-web.
+#             Builds with default features, once with NO features, then once per
+#             individual feature.  Linear in the number of features; ~31 builds
 #             after exclusions.
 #   Phase B — five curated combos that mirror documented user journeys:
 #             db-only API, minimal web (maud+htmx), mail without defaults,
@@ -18,7 +18,8 @@ name: Feature Combination Compile Gate
 #   system-tests                     — pulls chromiumoxide (headless Chromium)
 #   test-support                     — dev-only; pulls testcontainers
 #
-# telemetry-otlp requires protoc (installed below) and is covered in Phase B.
+# telemetry-otlp requires protoc (installed below); it is swept in Phase A and
+# also verified in Phase B.
 #
 # When does this run?
 #   - Every PR to trunk / trunk-dev that touches the autumn-web feature surface,
@@ -70,10 +71,12 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2.7.8
 
-      # protoc is required only for the telemetry-otlp curated combo (Phase B).
-      # It is not available in the standard ubuntu-latest image.
+      # protoc is required by telemetry-otlp in both Phase A (each-feature sweep)
+      # and Phase B (curated combo). It is not available in the standard ubuntu-latest image.
       - name: Install protoc (required for telemetry-otlp)
-        run: sudo apt-get install -y --no-install-recommends protobuf-compiler
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends protobuf-compiler
 
       - name: Install cargo-hack
         uses: taiki-e/install-action@cargo-hack

@@ -2446,12 +2446,6 @@ fn apply_middleware(
         .as_deref()
         .map_or(cfg!(debug_assertions), |p| p == "dev");
 
-    // Encrypted columns (#805) compose into log scrubbing (#697): their names are
-    // always scrubbed from trace/error parameter output so ciphertext-backed
-    // values never leak through logs even if an app forgets to list them.
-    let mut filter_parameters = config.log.filter_parameters.clone();
-    filter_parameters.extend(crate::encryption::registered_encrypted_column_names());
-
     // When the `maud` feature is enabled, an ErrorPageFilter renders styled HTML
     // error pages for browser requests. Without `maud`, only the
     // ProblemDetailsFilter (JSON error normalization) is installed.
@@ -2459,6 +2453,11 @@ fn apply_middleware(
         vec![Arc::new(ProblemDetailsFilter { is_dev })];
     #[cfg(feature = "maud")]
     {
+        // Encrypted columns (#805) compose into log scrubbing (#697): their names are
+        // always scrubbed from trace/error parameter output so ciphertext-backed
+        // values never leak through logs even if an app forgets to list them.
+        let mut filter_parameters = config.log.filter_parameters.clone();
+        filter_parameters.extend(crate::encryption::registered_encrypted_column_names());
         let renderer = error_page_renderer.unwrap_or_else(error_pages::default_renderer);
         let error_page_filter = crate::middleware::error_page_filter::ErrorPageFilter {
             renderer,

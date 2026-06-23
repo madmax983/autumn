@@ -4,9 +4,10 @@
 # without building the full 2^N powerset (which is cost-prohibitive at ~35 flags).
 #
 # Bounded strategy:
-#   Phase A — each-feature sweep via `cargo hack --each-feature --no-default-features`
-#             This builds once with NO features, then once per individual feature.
-#             Linear in the number of features; ~25 builds after exclusions.
+#   Phase A — each-feature sweep via `cargo hack --each-feature`
+#             This builds with default features, once with NO features, then once
+#             per individual feature.  Linear in the number of features; ~31 builds
+#             after exclusions.
 #   Phase B — curated real-world combinations (5 fixed combos that mirror documented
 #             user journeys: db-only API, minimal web, mail, storage+db, telemetry).
 #             Each is a discrete `cargo check` so a failure names the exact
@@ -18,8 +19,9 @@
 #   system-tests        — pulls chromiumoxide (headless Chromium)
 #   test-support        — dev-only; pulls testcontainers
 #
-# telemetry-otlp is explicitly gated in Phase B. It requires protoc; install with:
-#   sudo apt-get install -y protobuf-compiler
+# telemetry-otlp requires protoc; it is swept in Phase A and also verified in
+# Phase B. Install protoc with:
+#   sudo apt-get update && sudo apt-get install -y protobuf-compiler
 # or use the workflow which installs it automatically.
 #
 # Called from the `feature-combinations` workflow. Run locally with:
@@ -54,22 +56,32 @@ echo ""
 # Includes: --no-default-features alone (zero-feature build) + each feature alone.
 # Excluded: system-dep / build-cost heavy features (see header comment).
 
-echo "==> Phase A: each-feature sweep (no features + each feature alone)"
-echo "    Note: --each-feature implies --no-default-features for each sub-build"
+echo "==> Phase A: each-feature sweep (default features + no features + each feature alone)"
 echo "    Excluded: managed-pg,managed-pg-bundled,system-tests,test-support"
 echo ""
 
+# Tee Phase A output to a temp file so we can extract the actual build count
+# from cargo-hack's "(current/total)" progress banner afterward.
+PHASE_A_LOG=$(mktemp)
 if ! cargo hack check \
   -p autumn-web \
   --no-dev-deps \
   --each-feature \
   --exclude-features managed-pg-bundled,managed-pg,system-tests,test-support \
-  2>&1; then
+  2>&1 | tee "$PHASE_A_LOG"; then
+  rm -f "$PHASE_A_LOG"
   echo ""
   echo "::error::Phase A failed — a feature did not compile in isolation."
   echo "         See the cargo-hack output above for the exact --features string."
   exit 1
 fi
+
+# Extract the total build count from cargo-hack's "(N/N)" progress banner.
+# More reliable than parsing Cargo.toml because cargo-hack also runs the
+# default-features build in addition to the no-features and per-feature builds.
+PHASE_A_BUILDS=$(grep -oE '\([0-9]+/[0-9]+\)' "$PHASE_A_LOG" \
+  | tail -1 | tr -d '()' | cut -d'/' -f2 2>/dev/null || echo "?")
+rm -f "$PHASE_A_LOG"
 
 echo ""
 ok "Phase A passed — every gated feature compiles in isolation."
@@ -115,20 +127,15 @@ ok "Phase B passed — all curated real-world combinations compile."
 echo ""
 
 # ── Summary ────────────────────────────────────────────────────────────────────
-# Phase A covers: 1 (no-feature build) + number of non-excluded features.
-# Phase B covers: fixed curated combos.
+# Phase A covers: the actual number of builds cargo-hack ran (default-features +
+# no-features + one per non-excluded feature), as reported by its "(N/N)" banner.
+# Phase B covers: the fixed set of curated combos.
 # Total is printed for the auditable one-line record required by issue #982.
 
-EXCLUDED_FEATURES=(managed-pg-bundled managed-pg system-tests test-support)
-# Count features defined in autumn/Cargo.toml, excluding the ones above.
-# We parse the [features] section by looking for "^<name> =" lines.
-ALL_FEATURES=$(sed -n '/^\[features\]/,/^\[/p' autumn/Cargo.toml \
-  | grep -E '^[a-z][a-z0-9_-]+ *=' \
-  | sed 's/ *=.*//' \
-  | grep -v '^default$')
-EXCLUDED_PATTERN="$(IFS='|'; echo "${EXCLUDED_FEATURES[*]}")"
-SWEPT_FEATURES=$(echo "$ALL_FEATURES" | grep -Ev "^($EXCLUDED_PATTERN)$" | wc -l | tr -d ' ')
-# +1 for the no-feature build; Phase B adds the curated combos
-TOTAL_COMBOS=$(( SWEPT_FEATURES + 1 + ${#CURATED_COMBOS[@]} ))
+if [[ "$PHASE_A_BUILDS" =~ ^[0-9]+$ ]]; then
+  TOTAL_COMBOS=$(( PHASE_A_BUILDS + ${#CURATED_COMBOS[@]} ))
+else
+  TOTAL_COMBOS="?"
+fi
 
-echo "Gated $TOTAL_COMBOS feature combinations (each-feature sweep: $((SWEPT_FEATURES + 1)) builds; curated real-world combos: ${#CURATED_COMBOS[@]})."
+echo "Gated $TOTAL_COMBOS feature combinations (each-feature sweep: $PHASE_A_BUILDS builds; curated real-world combos: ${#CURATED_COMBOS[@]})."
