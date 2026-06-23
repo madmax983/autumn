@@ -707,7 +707,7 @@ pub fn to_json_output(results: &[CheckResult], summary: &Summary) -> String {
 // ─── Check implementations ────────────────────────────────────────────────────
 
 /// Recursively validates TOML content against the derived schema.
-/// Returns a list of errors: (dotted_path, option_suggestion)
+/// Returns a list of errors: (`dotted_path`, `option_suggestion`)
 pub fn validate_toml_content(
     content: &str,
     schema: &HashMap<String, HashSet<String>>,
@@ -720,13 +720,16 @@ fn find_all_profile_files() -> Vec<(String, std::path::PathBuf)> {
     if let Ok(entries) = std::fs::read_dir(".") {
         for entry in entries.filter_map(Result::ok) {
             let path = entry.path();
-            if path.is_file() {
-                if let Some(filename) = path.file_name().and_then(|n| n.to_str()) {
-                    if filename.starts_with("autumn-") && filename.ends_with(".toml") {
-                        let profile =
-                            filename["autumn-".len()..filename.len() - ".toml".len()].to_string();
-                        files.push((profile, path));
-                    }
+            if let Some(filename) = path.file_name().and_then(|n| n.to_str()) {
+                let is_profile = path.is_file()
+                    && filename.starts_with("autumn-")
+                    && std::path::Path::new(filename)
+                        .extension()
+                        .is_some_and(|ext| ext.eq_ignore_ascii_case("toml"));
+                if is_profile {
+                    let profile =
+                        filename["autumn-".len()..filename.len() - ".toml".len()].to_string();
+                    files.push((profile, path));
                 }
             }
         }
@@ -736,60 +739,59 @@ fn find_all_profile_files() -> Vec<(String, std::path::PathBuf)> {
 
 /// Check that `autumn.toml` content parses cleanly (pure, injectable for tests).
 pub fn check_toml_content(content: &str) -> CheckResult {
-    match toml::from_str::<toml::Table>(content) {
-        Err(e) => CheckResult {
+    if let Err(e) = toml::from_str::<toml::Table>(content) {
+        CheckResult {
             name: "autumn_toml",
             status: CheckStatus::Fail,
             detail: Some(e.to_string()),
             hint: Some("Fix the syntax error in autumn.toml"),
-        },
-        Ok(_) => {
-            let schema = autumn_web::config::AutumnConfig::get_schema_keys();
-            let mut errors = Vec::new();
+        }
+    } else {
+        let schema = autumn_web::config::AutumnConfig::get_schema_keys();
+        let mut errors = Vec::new();
 
-            // 1. Validate base autumn.toml
-            let base_errors = validate_toml_content(content, &schema);
-            for (path, sug) in base_errors {
-                errors.push(format!(
-                    "autumn.toml: unknown key \"{path}\"{}",
-                    sug.map(|s| format!(" — did you mean \"{s}\"?"))
-                        .unwrap_or_default()
-                ));
-            }
+        // 1. Validate base autumn.toml
+        let base_errors = validate_toml_content(content, &schema);
+        for (path, sug) in base_errors {
+            errors.push(format!(
+                "autumn.toml: unknown key \"{path}\"{}",
+                sug.map(|s| format!(" — did you mean \"{s}\"?"))
+                    .unwrap_or_default()
+            ));
+        }
 
-            // 2. Validate any autumn-*.toml profile files
-            let profile_files = find_all_profile_files();
-            for (_, path) in profile_files {
-                if let Ok(file_content) = std::fs::read_to_string(&path) {
-                    let profile_errors = validate_toml_content(&file_content, &schema);
-                    let filename = path
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or("profile config");
-                    for (path, sug) in profile_errors {
-                        errors.push(format!(
-                            "{filename}: unknown key \"{path}\"{}",
-                            sug.map(|s| format!(" — did you mean \"{s}\"?"))
-                                .unwrap_or_default()
-                        ));
-                    }
+        // 2. Validate any autumn-*.toml profile files
+        let profile_files = find_all_profile_files();
+        for (_, path) in profile_files {
+            if let Ok(file_content) = std::fs::read_to_string(&path) {
+                let profile_errors = validate_toml_content(&file_content, &schema);
+                let filename = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("profile config");
+                for (path, sug) in profile_errors {
+                    errors.push(format!(
+                        "{filename}: unknown key \"{path}\"{}",
+                        sug.map(|s| format!(" — did you mean \"{s}\"?"))
+                            .unwrap_or_default()
+                    ));
                 }
             }
+        }
 
-            if errors.is_empty() {
-                CheckResult {
-                    name: "autumn_toml",
-                    status: CheckStatus::Pass,
-                    detail: Some("autumn.toml and profile configurations are valid".into()),
-                    hint: None,
-                }
-            } else {
-                CheckResult {
-                    name: "autumn_toml",
-                    status: CheckStatus::Warn,
-                    detail: Some(errors.join(", ")),
-                    hint: Some("Remove or rename unrecognised keys in configuration files"),
-                }
+        if errors.is_empty() {
+            CheckResult {
+                name: "autumn_toml",
+                status: CheckStatus::Pass,
+                detail: Some("autumn.toml and profile configurations are valid".into()),
+                hint: None,
+            }
+        } else {
+            CheckResult {
+                name: "autumn_toml",
+                status: CheckStatus::Warn,
+                detail: Some(errors.join(", ")),
+                hint: Some("Remove or rename unrecognised keys in configuration files"),
             }
         }
     }
@@ -3048,10 +3050,10 @@ mod tests {
         assert!(detail.contains("database.primry_url"));
         assert!(detail.contains("did you mean \"database.primary_url\"?"));
 
-        let unknown_toml = r#"
+        let unknown_toml = r"
             [server]
             xyz_completely_unknown_key = 123
-        "#;
+        ";
         let r = check_toml_content(unknown_toml);
         assert_eq!(r.status, CheckStatus::Warn);
         let detail = r.detail.as_ref().unwrap();

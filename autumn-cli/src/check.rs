@@ -54,7 +54,7 @@ pub fn run_config_check() -> Result<(), String> {
     run_config_check_impl(std::path::Path::new("."))
 }
 
-/// Helper for run_config_check allowing path injection for testing.
+/// Helper for `run_config_check` allowing path injection for testing.
 pub fn run_config_check_impl(dir: &std::path::Path) -> Result<(), String> {
     let toml_path = dir.join("autumn.toml");
     if !toml_path.exists() {
@@ -81,19 +81,22 @@ pub fn run_config_check_impl(dir: &std::path::Path) -> Result<(), String> {
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.filter_map(Result::ok) {
             let path = entry.path();
-            if path.is_file() {
-                if let Some(filename) = path.file_name().and_then(|n| n.to_str()) {
-                    if filename.starts_with("autumn-") && filename.ends_with(".toml") {
-                        if let Ok(file_content) = std::fs::read_to_string(&path) {
-                            let profile_errors =
-                                crate::doctor::validate_toml_content(&file_content, &schema);
-                            for (p_path, sug) in profile_errors {
-                                errors.push(format!(
-                                    "{filename}: unknown key \"{p_path}\"{}",
-                                    sug.map(|s| format!(" — did you mean \"{s}\"?"))
-                                        .unwrap_or_default()
-                                ));
-                            }
+            if let Some(filename) = path.file_name().and_then(|n| n.to_str()) {
+                let is_profile = path.is_file()
+                    && filename.starts_with("autumn-")
+                    && std::path::Path::new(filename)
+                        .extension()
+                        .is_some_and(|ext| ext.eq_ignore_ascii_case("toml"));
+                if is_profile {
+                    if let Ok(file_content) = std::fs::read_to_string(&path) {
+                        let profile_errors =
+                            crate::doctor::validate_toml_content(&file_content, &schema);
+                        for (p_path, sug) in profile_errors {
+                            errors.push(format!(
+                                "{filename}: unknown key \"{p_path}\"{}",
+                                sug.map(|s| format!(" — did you mean \"{s}\"?"))
+                                    .unwrap_or_default()
+                            ));
                         }
                     }
                 }
