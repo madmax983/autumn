@@ -2251,8 +2251,7 @@ fn apply_middleware(
     state: &AppState,
     exception_filters: Vec<Arc<dyn ExceptionFilter>>,
     custom_layers: Vec<crate::app::CustomLayerRegistration>,
-    #[cfg(feature = "maud")]
-    error_page_renderer: Option<SharedRenderer>,
+    #[cfg(feature = "maud")] error_page_renderer: Option<SharedRenderer>,
     session_store: Option<Arc<dyn crate::session::BoxedSessionStore>>,
     route_timeouts: RouteTimeoutTable,
 ) -> Result<axum::Router<AppState>, RouterBuildError> {

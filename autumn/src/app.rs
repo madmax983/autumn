@@ -3575,7 +3575,7 @@ impl AppBuilder {
             extensions: _,
             registered_plugins: _,
             #[cfg(feature = "maud")]
-            error_page_renderer: _,
+                error_page_renderer: _,
             #[cfg(feature = "db")]
                 migrations: _,
             config_loader_factory,
