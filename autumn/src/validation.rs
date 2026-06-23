@@ -285,6 +285,14 @@ mod tests {
         let input = BadInput { value: "hi".into() };
         let result = input.validate();
         assert!(result.is_err());
+        let err = result.err().unwrap();
+        let response = err.into_response();
+        let error_info = response
+            .extensions()
+            .get::<crate::middleware::AutumnErrorInfo>()
+            .unwrap();
+        let details = error_info.details.as_ref().unwrap();
+        assert!(details.contains_key("value"));
     }
 
     #[test]
@@ -317,5 +325,138 @@ mod tests {
 
         assert!(map.contains_key("my_field"));
         assert_eq!(map["my_field"][0], "validation failed: custom_code");
+    }
+
+    #[test]
+    fn as_validatable_axum_json() {
+        let val = axum::Json("test_string".to_string());
+        assert_eq!(val.as_validatable(), "test_string");
+    }
+
+    #[test]
+    fn as_validatable_crate_json() {
+        let val = crate::extract::Json("test_string".to_string());
+        assert_eq!(val.as_validatable(), "test_string");
+    }
+
+    #[test]
+    fn as_validatable_axum_form() {
+        let val = axum::extract::Form("test_string".to_string());
+        assert_eq!(val.as_validatable(), "test_string");
+    }
+
+    #[test]
+    fn as_validatable_crate_form() {
+        let val = crate::extract::Form("test_string".to_string());
+        assert_eq!(val.as_validatable(), "test_string");
+    }
+
+    #[test]
+    fn as_validatable_axum_query() {
+        let val = axum::extract::Query("test_string".to_string());
+        assert_eq!(val.as_validatable(), "test_string");
+    }
+
+    #[test]
+    fn as_validatable_crate_query() {
+        let val = crate::extract::Query("test_string".to_string());
+        assert_eq!(val.as_validatable(), "test_string");
+    }
+
+    #[test]
+    fn validation_errors_to_map_multiple_errors() {
+        #[derive(validator::Validate)]
+        struct MultiForm {
+            #[validate(length(min = 5))]
+            short_str: String,
+            #[validate(range(min = 10, max = 20))]
+            bad_range: i32,
+        }
+
+        let form = MultiForm {
+            short_str: "hi".to_string(),
+            bad_range: 30,
+        };
+        let errors = validator::Validate::validate(&form).unwrap_err();
+        let map = validation_errors_to_map(&errors);
+
+        assert!(map.contains_key("short_str"));
+        assert!(map.contains_key("bad_range"));
+        assert_eq!(map["short_str"][0], "validation failed: length");
+        assert_eq!(map["bad_range"][0], "validation failed: range");
+    }
+
+    #[test]
+    fn validation_errors_convert_to_autumn_error_details() {
+        #[derive(validator::Validate)]
+        struct Form {
+            #[validate(email)]
+            email: String,
+        }
+
+        let form = Form {
+            email: "not-an-email".into(),
+        };
+        let errors = validator::Validate::validate(&form).unwrap_err();
+        let autumn_err = validation_errors_to_autumn_error(&errors);
+
+        assert_eq!(
+            autumn_err.status(),
+            axum::http::StatusCode::UNPROCESSABLE_ENTITY
+        );
+
+        // Ensure error details are actually populated
+        let response = autumn_err.into_response();
+        let error_info = response
+            .extensions()
+            .get::<crate::middleware::AutumnErrorInfo>()
+            .unwrap();
+        let details = error_info.details.as_ref().unwrap();
+        assert!(details.contains_key("email"));
+        assert_eq!(details["email"][0], "validation failed: email");
+    }
+
+    #[tokio::test]
+    async fn valid_extractor_success() {
+        #[derive(serde::Deserialize, validator::Validate)]
+        struct ValidPost {
+            #[validate(length(min = 1))]
+            title: String,
+        }
+
+        let req = Request::builder()
+            .method("POST")
+            .header("Content-Type", "application/json")
+            .body(axum::body::Body::from(r#"{"title": "valid"}"#))
+            .unwrap();
+
+        let state = ();
+        let valid_json = Valid::<axum::Json<ValidPost>>::from_request(req, &state)
+            .await
+            .unwrap();
+
+        assert_eq!(valid_json.0.title, "valid");
+    }
+
+    #[tokio::test]
+    async fn valid_extractor_failure() {
+        #[derive(serde::Deserialize, validator::Validate)]
+        struct InvalidPost {
+            #[validate(length(min = 10))]
+            title: String,
+        }
+
+        let req = Request::builder()
+            .method("POST")
+            .header("Content-Type", "application/json")
+            .body(axum::body::Body::from(r#"{"title": "short"}"#))
+            .unwrap();
+
+        let state = ();
+        let err = Valid::<axum::Json<InvalidPost>>::from_request(req, &state).await;
+
+        let err = err.err().unwrap();
+
+        assert_eq!(err.status(), axum::http::StatusCode::UNPROCESSABLE_ENTITY);
     }
 }
