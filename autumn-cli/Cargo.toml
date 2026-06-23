@@ -16,7 +16,9 @@ name = "autumn"
 path = "src/main.rs"
 
 [dependencies]
-autumn-web = { version = "0.5.0", path = "../autumn", default-features = false, features = ["db", "htmx", "maud"] }
+autumn-web = { version = "0.5.0", path = "../autumn", default-features = false, features = [
+    "db", "htmx", "maud", "mail", "storage", "i18n", "telemetry-otlp", "redis", "cache-moka", "http-client", "reporting"
+] }
 base64 = "0.22"
 clap = { version = "4", features = ["derive", "env"] }
 diesel = { workspace = true }

@@ -584,7 +584,8 @@ fn should_warn_missing_profile_file(profile: &str, has_inline_profile_section: b
 /// ⚡ Bolt Optimization:
 /// Reduces memory allocations by using a single `Vec` instead of two and
 /// iterating directly over `Chars` to avoid `Vec<char>` allocations.
-fn levenshtein(a: &str, b: &str) -> usize {
+#[must_use]
+pub fn levenshtein(a: &str, b: &str) -> usize {
     let n = b.chars().count();
     let mut prev: Vec<usize> = (0..=n).collect();
     for (i, a_ch) in a.chars().enumerate() {
@@ -1616,6 +1617,154 @@ const fn default_jobs_redis_visibility_timeout_ms() -> u64 {
 }
 
 impl AutumnConfig {
+    /// Recursively extracts all valid configuration schema keys and nested fields.
+    #[must_use]
+    pub fn get_schema_keys() -> HashMap<String, HashSet<String>> {
+        let deserializer = SchemaDeserializer::new();
+        let _ = Self::deserialize(deserializer.clone());
+        deserializer.into_schema()
+    }
+
+    /// Recursively validates TOML content against the derived schema.
+    /// Returns a list of errors: (`dotted_path`, `option_suggestion`)
+    #[must_use]
+    pub fn validate_toml(
+        content: &str,
+        schema: &HashMap<String, HashSet<String>>,
+    ) -> Vec<(String, Option<String>)> {
+        let Ok(table) = toml::from_str::<toml::Table>(content) else {
+            return Vec::new();
+        };
+
+        let mut errors = Vec::new();
+        let mut path = Vec::new();
+        Self::validate_toml_table(&table, &mut path, schema, &mut errors);
+        errors
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn validate_toml_table(
+        table: &toml::Table,
+        path: &mut Vec<String>,
+        schema: &HashMap<String, HashSet<String>>,
+        errors: &mut Vec<(String, Option<String>)>,
+    ) {
+        let mut schema_path_parts = Vec::new();
+        if path.len() >= 2 && path[0] == "profile" {
+            schema_path_parts.extend(path[2..].iter().cloned());
+        } else {
+            schema_path_parts.extend(path.iter().cloned());
+        }
+        let schema_path = schema_path_parts.join(".");
+
+        if let Some(valid_keys) = schema.get(&schema_path) {
+            for (k, val) in table {
+                if path.is_empty() && k == "profile" {
+                    path.push(k.clone());
+                    match val {
+                        toml::Value::Table(t) => {
+                            Self::validate_toml_table(t, path, schema, errors);
+                        }
+                        toml::Value::Array(arr) => {
+                            for item in arr {
+                                if let toml::Value::Table(t) = item {
+                                    Self::validate_toml_table(t, path, schema, errors);
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                    path.pop();
+                    continue;
+                }
+
+                if valid_keys.contains(k) {
+                    path.push(k.clone());
+                    match val {
+                        toml::Value::Table(t) => {
+                            Self::validate_toml_table(t, path, schema, errors);
+                        }
+                        toml::Value::Array(arr) => {
+                            for item in arr {
+                                if let toml::Value::Table(t) = item {
+                                    Self::validate_toml_table(t, path, schema, errors);
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                    path.pop();
+                } else {
+                    let mut full_path_parts = path.clone();
+                    full_path_parts.push(k.clone());
+                    let full_path = full_path_parts.join(".");
+
+                    let mut closest: Option<&str> = None;
+                    let mut min_dist = usize::MAX;
+                    for valid_key in valid_keys {
+                        let dist = levenshtein(k, valid_key);
+                        if dist <= 2 && dist < min_dist {
+                            min_dist = dist;
+                            closest = Some(valid_key);
+                        }
+                    }
+
+                    let suggestion = closest.map(|c| {
+                        let mut sug_parts = path.clone();
+                        sug_parts.push(c.to_string());
+                        sug_parts.join(".")
+                    });
+
+                    errors.push((full_path, suggestion));
+                }
+            }
+        } else if path.len() == 1 && path[0] == "profile" {
+            for (k, val) in table {
+                if let toml::Value::Table(t) = val {
+                    path.push(k.clone());
+                    Self::validate_toml_table(t, path, schema, errors);
+                    path.pop();
+                } else {
+                    let mut full_path_parts = path.clone();
+                    full_path_parts.push(k.clone());
+                    errors.push((full_path_parts.join("."), None));
+                }
+            }
+        } else if path.is_empty() {
+            let root_keys = schema.get("").cloned().unwrap_or_default();
+            for (k, val) in table {
+                if k != "profile" && !root_keys.contains(k) {
+                    let mut closest: Option<&str> = None;
+                    let mut min_dist = usize::MAX;
+                    for valid_key in &root_keys {
+                        let dist = levenshtein(k, valid_key);
+                        if dist <= 2 && dist < min_dist {
+                            min_dist = dist;
+                            closest = Some(valid_key);
+                        }
+                    }
+                    errors.push((k.clone(), closest.map(String::from)));
+                } else {
+                    path.push(k.clone());
+                    match val {
+                        toml::Value::Table(t) => {
+                            Self::validate_toml_table(t, path, schema, errors);
+                        }
+                        toml::Value::Array(arr) => {
+                            for item in arr {
+                                if let toml::Value::Table(t) = item {
+                                    Self::validate_toml_table(t, path, schema, errors);
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                    path.pop();
+                }
+            }
+        }
+    }
+
     /// Access the decrypted credentials store.
     ///
     /// Returns an empty store when no credentials file was found (the feature is opt-in).
@@ -1706,6 +1855,29 @@ impl AutumnConfig {
 
         // Layer 6: env var overrides (highest priority)
         config.apply_env_overrides_with_env(env);
+
+        let is_strict_env = env
+            .var("AUTUMN_SERVER__STRICT_CONFIG")
+            .is_ok_and(|v| v == "true" || v == "1");
+        if config.server.strict_config || is_strict_env {
+            let schema = Self::get_schema_keys();
+            let errors = Self::validate_toml(&toml_str, &schema);
+            if !errors.is_empty() {
+                let err_messages: Vec<String> = errors
+                    .into_iter()
+                    .map(|(path, sug)| {
+                        sug.map_or_else(
+                            || format!("unknown key \"{path}\""),
+                            |s| format!("unknown key \"{path}\" — did you mean \"{s}\"?"),
+                        )
+                    })
+                    .collect();
+                return Err(ConfigError::Validation(format!(
+                    "Strict config check failed. Unknown keys in configuration: {}",
+                    err_messages.join(", ")
+                )));
+            }
+        }
 
         #[cfg(feature = "mail")]
         if config.profile.as_deref() == Some("dev") && !has_mail_transport_source(&merged, env) {
@@ -3007,6 +3179,10 @@ pub struct ServerConfig {
     #[serde(default = "default_host")]
     pub host: String,
 
+    /// Exit startup if any unknown config keys are found in autumn.toml/profiles.
+    #[serde(default)]
+    pub strict_config: bool,
+
     /// Seconds to wait for in-flight requests during graceful shutdown.
     /// Default: `30`.
     ///
@@ -4172,6 +4348,7 @@ impl Default for ServerConfig {
         Self {
             port: default_port(),
             host: default_host(),
+            strict_config: false,
             shutdown_timeout_secs: default_shutdown_timeout(),
             prestop_grace_secs: default_prestop_grace(),
             timeouts: RequestTimeoutsConfig::default(),
@@ -4563,10 +4740,452 @@ impl AutumnConfig {
     }
 }
 
+use serde::de::{self, DeserializeSeed, MapAccess, SeqAccess, Visitor};
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
+
+#[derive(Clone)]
+pub struct SchemaDeserializer {
+    path: Vec<String>,
+    schema: Arc<Mutex<HashMap<String, HashSet<String>>>>,
+}
+
+impl Default for SchemaDeserializer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SchemaDeserializer {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            path: Vec::new(),
+            schema: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    #[must_use]
+    pub fn into_schema(self) -> HashMap<String, HashSet<String>> {
+        let lock = self
+            .schema
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        lock.clone()
+    }
+}
+
+impl<'de> de::Deserializer<'de> for SchemaDeserializer {
+    type Error = serde::de::value::Error;
+
+    fn deserialize_any<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+    where
+        V: Visitor<'de>,
+    {
+        visitor.visit_str("")
+    }
+
+    fn deserialize_bool<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+    where
+        V: Visitor<'de>,
+    {
+        visitor.visit_bool(false)
+    }
+
+    fn deserialize_i8<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+    where
+        V: Visitor<'de>,
+    {
+        visitor.visit_i8(0)
+    }
+
+    fn deserialize_i16<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+    where
+        V: Visitor<'de>,
+    {
+        visitor.visit_i16(0)
+    }
+
+    fn deserialize_i32<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+    where
+        V: Visitor<'de>,
+    {
+        visitor.visit_i32(0)
+    }
+
+    fn deserialize_i64<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+    where
+        V: Visitor<'de>,
+    {
+        visitor.visit_i64(0)
+    }
+
+    fn deserialize_u8<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+    where
+        V: Visitor<'de>,
+    {
+        visitor.visit_u8(0)
+    }
+
+    fn deserialize_u16<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+    where
+        V: Visitor<'de>,
+    {
+        visitor.visit_u16(0)
+    }
+
+    fn deserialize_u32<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+    where
+        V: Visitor<'de>,
+    {
+        visitor.visit_u32(0)
+    }
+
+    fn deserialize_u64<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+    where
+        V: Visitor<'de>,
+    {
+        visitor.visit_u64(0)
+    }
+
+    fn deserialize_f32<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+    where
+        V: Visitor<'de>,
+    {
+        visitor.visit_f32(0.0)
+    }
+
+    fn deserialize_f64<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+    where
+        V: Visitor<'de>,
+    {
+        visitor.visit_f64(0.0)
+    }
+
+    fn deserialize_char<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+    where
+        V: Visitor<'de>,
+    {
+        visitor.visit_char('\0')
+    }
+
+    fn deserialize_str<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+    where
+        V: Visitor<'de>,
+    {
+        visitor.visit_str("")
+    }
+
+    fn deserialize_string<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+    where
+        V: Visitor<'de>,
+    {
+        visitor.visit_string(String::new())
+    }
+
+    fn deserialize_bytes<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+    where
+        V: Visitor<'de>,
+    {
+        visitor.visit_bytes(&[])
+    }
+
+    fn deserialize_byte_buf<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+    where
+        V: Visitor<'de>,
+    {
+        visitor.visit_byte_buf(Vec::new())
+    }
+
+    fn deserialize_option<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+    where
+        V: Visitor<'de>,
+    {
+        visitor.visit_some(self)
+    }
+
+    fn deserialize_unit<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+    where
+        V: Visitor<'de>,
+    {
+        visitor.visit_unit()
+    }
+
+    fn deserialize_unit_struct<V>(
+        self,
+        _name: &'static str,
+        visitor: V,
+    ) -> Result<V::Value, Self::Error>
+    where
+        V: Visitor<'de>,
+    {
+        visitor.visit_unit()
+    }
+
+    fn deserialize_newtype_struct<V>(
+        self,
+        _name: &'static str,
+        visitor: V,
+    ) -> Result<V::Value, Self::Error>
+    where
+        V: Visitor<'de>,
+    {
+        visitor.visit_newtype_struct(self)
+    }
+
+    fn deserialize_seq<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+    where
+        V: Visitor<'de>,
+    {
+        visitor.visit_seq(SchemaSeqAccess {
+            done: false,
+            deserializer: self,
+        })
+    }
+
+    fn deserialize_tuple<V>(self, _len: usize, visitor: V) -> Result<V::Value, Self::Error>
+    where
+        V: Visitor<'de>,
+    {
+        self.deserialize_seq(visitor)
+    }
+
+    fn deserialize_tuple_struct<V>(
+        self,
+        _name: &'static str,
+        _len: usize,
+        visitor: V,
+    ) -> Result<V::Value, Self::Error>
+    where
+        V: Visitor<'de>,
+    {
+        self.deserialize_seq(visitor)
+    }
+
+    fn deserialize_map<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+    where
+        V: Visitor<'de>,
+    {
+        visitor.visit_map(SchemaMapAccess {
+            fields: [].iter(),
+            current_field: None,
+            deserializer: self,
+        })
+    }
+
+    fn deserialize_struct<V>(
+        self,
+        _name: &'static str,
+        fields: &'static [&'static str],
+        visitor: V,
+    ) -> Result<V::Value, Self::Error>
+    where
+        V: Visitor<'de>,
+    {
+        let path_str = self.path.join(".");
+        {
+            let mut schema = self.schema.lock().unwrap();
+            schema.insert(path_str, fields.iter().map(|&s| s.to_string()).collect());
+        }
+
+        visitor.visit_map(SchemaMapAccess {
+            fields: fields.iter(),
+            current_field: None,
+            deserializer: self,
+        })
+    }
+
+    fn deserialize_enum<V>(
+        self,
+        _name: &'static str,
+        _variants: &'static [&'static str],
+        visitor: V,
+    ) -> Result<V::Value, Self::Error>
+    where
+        V: Visitor<'de>,
+    {
+        visitor.visit_enum(SchemaEnumAccess)
+    }
+
+    fn deserialize_identifier<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+    where
+        V: Visitor<'de>,
+    {
+        visitor.visit_str("")
+    }
+
+    fn deserialize_ignored_any<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+    where
+        V: Visitor<'de>,
+    {
+        visitor.visit_unit()
+    }
+}
+
+struct SchemaSeqAccess {
+    done: bool,
+    deserializer: SchemaDeserializer,
+}
+
+impl<'de> SeqAccess<'de> for SchemaSeqAccess {
+    type Error = serde::de::value::Error;
+
+    fn next_element_seed<T>(&mut self, seed: T) -> Result<Option<T::Value>, Self::Error>
+    where
+        T: DeserializeSeed<'de>,
+    {
+        if self.done {
+            Ok(None)
+        } else {
+            self.done = true;
+            seed.deserialize(self.deserializer.clone()).map(Some)
+        }
+    }
+}
+
+struct SchemaMapAccess {
+    fields: std::slice::Iter<'static, &'static str>,
+    current_field: Option<&'static str>,
+    deserializer: SchemaDeserializer,
+}
+
+impl<'de> MapAccess<'de> for SchemaMapAccess {
+    type Error = serde::de::value::Error;
+
+    fn next_key_seed<K>(&mut self, seed: K) -> Result<Option<K::Value>, Self::Error>
+    where
+        K: DeserializeSeed<'de>,
+    {
+        if let Some(&field) = self.fields.next() {
+            self.current_field = Some(field);
+            seed.deserialize(de::value::StrDeserializer::new(field))
+                .map(Some)
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn next_value_seed<V>(&mut self, seed: V) -> Result<V::Value, Self::Error>
+    where
+        V: DeserializeSeed<'de>,
+    {
+        let field = self.current_field.take().unwrap();
+        let mut new_path = self.deserializer.path.clone();
+        new_path.push(field.to_string());
+
+        let nested = SchemaDeserializer {
+            path: new_path,
+            schema: self.deserializer.schema.clone(),
+        };
+        seed.deserialize(nested)
+    }
+}
+
+struct SchemaEnumAccess;
+
+impl<'de> de::EnumAccess<'de> for SchemaEnumAccess {
+    type Error = serde::de::value::Error;
+    type Variant = Self;
+
+    fn variant_seed<V>(self, seed: V) -> Result<(V::Value, Self::Variant), Self::Error>
+    where
+        V: de::DeserializeSeed<'de>,
+    {
+        let val = seed.deserialize(de::value::StrDeserializer::new(""))?;
+        Ok((val, self))
+    }
+}
+
+impl<'de> de::VariantAccess<'de> for SchemaEnumAccess {
+    type Error = serde::de::value::Error;
+
+    fn unit_variant(self) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    fn newtype_variant_seed<T>(self, seed: T) -> Result<T::Value, Self::Error>
+    where
+        T: de::DeserializeSeed<'de>,
+    {
+        seed.deserialize(SchemaDeserializer::new())
+    }
+
+    fn tuple_variant<V>(self, _len: usize, visitor: V) -> Result<V::Value, Self::Error>
+    where
+        V: Visitor<'de>,
+    {
+        visitor.visit_unit()
+    }
+
+    fn struct_variant<V>(
+        self,
+        _fields: &'static [&'static str],
+        visitor: V,
+    ) -> Result<V::Value, Self::Error>
+    where
+        V: Visitor<'de>,
+    {
+        visitor.visit_unit()
+    }
+}
+
 #[cfg(test)]
 mod tests {
 
     use super::*;
+
+    struct FakeEnv(std::collections::HashMap<String, String>);
+    impl Env for FakeEnv {
+        fn var(&self, key: &str) -> Result<String, std::env::VarError> {
+            self.0
+                .get(key)
+                .cloned()
+                .ok_or(std::env::VarError::NotPresent)
+        }
+    }
+
+    #[test]
+    fn test_schema_extractor() {
+        let keys = AutumnConfig::get_schema_keys();
+        assert!(keys.contains_key(""));
+        let root_keys = &keys[""];
+        assert!(root_keys.contains("server"));
+        assert!(root_keys.contains("database"));
+
+        assert!(keys.contains_key("server"));
+        assert!(keys["server"].contains("port"));
+        assert!(keys["server"].contains("host"));
+
+        assert!(keys.contains_key("database"));
+        assert!(keys["database"].contains("primary_url"));
+    }
+
+    #[test]
+    fn test_strict_config_startup_fails_on_typo() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("autumn.toml");
+        std::fs::write(
+            &config_path,
+            "[database]\nprimry_url = \"postgres://localhost/db\"",
+        )
+        .unwrap();
+
+        let env = FakeEnv(
+            [
+                ("AUTUMN_SERVER__STRICT_CONFIG".to_owned(), "true".to_owned()),
+                (
+                    "AUTUMN_MANIFEST_DIR".to_owned(),
+                    temp.path().to_str().unwrap().to_owned(),
+                ),
+            ]
+            .into(),
+        );
+
+        let res = AutumnConfig::load_with_env(&env);
+        assert!(res.is_err());
+        let err_str = format!("{:?}", res.err().unwrap());
+        assert!(err_str.contains("primry_url"));
+    }
 
     #[test]
     fn should_warn_total_connections_at_and_above_threshold() {

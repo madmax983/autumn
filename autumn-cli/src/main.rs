@@ -381,6 +381,9 @@ enum Commands {
         /// Fail only on Critical violations; treat Serious as warnings.
         #[arg(long)]
         critical_only: bool,
+        /// Run the config typo/validity check on autumn.toml and profiles.
+        #[arg(long)]
+        config: bool,
 
         #[command(subcommand)]
         subcommand: Option<CheckSubcommands>,
@@ -1845,12 +1848,25 @@ fn run_command(command: Commands) {
             url,
             html,
             critical_only,
+            config,
             subcommand,
         } => {
             if let Some(sub) = subcommand {
                 match sub {
                     CheckSubcommands::Deprecations { package, bin } => {
                         run_deprecations_check(package.as_deref(), bin.as_deref());
+                    }
+                }
+            } else if config {
+                match check::run_config_check() {
+                    Ok(()) => {
+                        println!(
+                            "Configuration check passed: all keys in autumn.toml and profile configurations are valid."
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!("Configuration check failed:\n{e}");
+                        std::process::exit(1);
                     }
                 }
             } else if a11y {
@@ -1872,7 +1888,7 @@ fn run_command(command: Commands) {
                 }
             } else {
                 eprintln!(
-                    "autumn check: specify at least one check flag (e.g. --a11y) or a subcommand (e.g. deprecations)"
+                    "autumn check: specify at least one check flag (e.g. --a11y, --config) or a subcommand (e.g. deprecations)"
                 );
                 std::process::exit(1);
             }
@@ -4814,5 +4830,14 @@ mod tests {
             shard_key.is_none(),
             "shard_key should be None when not specified"
         );
+    }
+
+    #[test]
+    fn parse_check_config() {
+        let cli = Cli::try_parse_from(["autumn", "check", "--config"]).unwrap();
+        let Commands::Check { config, .. } = cli.command else {
+            panic!("expected check");
+        };
+        assert!(config);
     }
 }

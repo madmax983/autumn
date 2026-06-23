@@ -5,6 +5,7 @@
 //! code 0 (all clear) or 1 (any failure detected).
 
 use serde::Serialize;
+use std::collections::{HashMap, HashSet};
 
 // ── Signing secret validation constants (mirrored from autumn-web) ────────────
 
@@ -38,6 +39,7 @@ const SIGNING_SECRET_DEMO_VALUES: &[&str] = &[
 ];
 
 /// Known top-level keys in a valid `autumn.toml`.
+#[cfg(test)]
 const KNOWN_TOML_SECTIONS: &[&str] = &[
     "server",
     "database",
@@ -704,35 +706,92 @@ pub fn to_json_output(results: &[CheckResult], summary: &Summary) -> String {
 
 // ─── Check implementations ────────────────────────────────────────────────────
 
+/// Recursively validates TOML content against the derived schema.
+/// Returns a list of errors: (`dotted_path`, `option_suggestion`)
+pub fn validate_toml_content(
+    content: &str,
+    schema: &HashMap<String, HashSet<String>>,
+) -> Vec<(String, Option<String>)> {
+    autumn_web::config::AutumnConfig::validate_toml(content, schema)
+}
+
+fn find_all_profile_files() -> Vec<(String, std::path::PathBuf)> {
+    let mut files = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(".") {
+        for entry in entries.filter_map(Result::ok) {
+            let path = entry.path();
+            if let Some(filename) = path.file_name().and_then(|n| n.to_str()) {
+                let is_profile = path.is_file()
+                    && filename.starts_with("autumn-")
+                    && std::path::Path::new(filename)
+                        .extension()
+                        .is_some_and(|ext| ext.eq_ignore_ascii_case("toml"));
+                if is_profile {
+                    let profile =
+                        filename["autumn-".len()..filename.len() - ".toml".len()].to_string();
+                    files.push((profile, path));
+                }
+            }
+        }
+    }
+    files
+}
+
 /// Check that `autumn.toml` content parses cleanly (pure, injectable for tests).
 pub fn check_toml_content(content: &str) -> CheckResult {
-    match toml::from_str::<toml::Table>(content) {
-        Err(e) => CheckResult {
+    if let Err(e) = toml::from_str::<toml::Table>(content) {
+        CheckResult {
             name: "autumn_toml",
             status: CheckStatus::Fail,
             detail: Some(e.to_string()),
             hint: Some("Fix the syntax error in autumn.toml"),
-        },
-        Ok(table) => {
-            let unknown: Vec<String> = table
-                .keys()
-                .filter(|k| !KNOWN_TOML_SECTIONS.contains(&k.as_str()))
-                .cloned()
-                .collect();
-            if unknown.is_empty() {
-                CheckResult {
-                    name: "autumn_toml",
-                    status: CheckStatus::Pass,
-                    detail: Some("autumn.toml is valid".into()),
-                    hint: None,
+        }
+    } else {
+        let schema = autumn_web::config::AutumnConfig::get_schema_keys();
+        let mut errors = Vec::new();
+
+        // 1. Validate base autumn.toml
+        let base_errors = validate_toml_content(content, &schema);
+        for (path, sug) in base_errors {
+            errors.push(format!(
+                "autumn.toml: unknown key \"{path}\"{}",
+                sug.map(|s| format!(" — did you mean \"{s}\"?"))
+                    .unwrap_or_default()
+            ));
+        }
+
+        // 2. Validate any autumn-*.toml profile files
+        let profile_files = find_all_profile_files();
+        for (_, path) in profile_files {
+            if let Ok(file_content) = std::fs::read_to_string(&path) {
+                let profile_errors = validate_toml_content(&file_content, &schema);
+                let filename = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("profile config");
+                for (path, sug) in profile_errors {
+                    errors.push(format!(
+                        "{filename}: unknown key \"{path}\"{}",
+                        sug.map(|s| format!(" — did you mean \"{s}\"?"))
+                            .unwrap_or_default()
+                    ));
                 }
-            } else {
-                CheckResult {
-                    name: "autumn_toml",
-                    status: CheckStatus::Warn,
-                    detail: Some(format!("unknown keys: {}", unknown.join(", "))),
-                    hint: Some("Remove or rename unrecognised keys in autumn.toml"),
-                }
+            }
+        }
+
+        if errors.is_empty() {
+            CheckResult {
+                name: "autumn_toml",
+                status: CheckStatus::Pass,
+                detail: Some("autumn.toml and profile configurations are valid".into()),
+                hint: None,
+            }
+        } else {
+            CheckResult {
+                name: "autumn_toml",
+                status: CheckStatus::Warn,
+                detail: Some(errors.join(", ")),
+                hint: Some("Remove or rename unrecognised keys in configuration files"),
             }
         }
     }
@@ -2968,6 +3027,40 @@ pub fn check_gdpr_export_registration_impl(
 mod tests {
     use super::*;
 
+    #[test]
+    fn test_recursive_toml_validation() {
+        let valid_toml = r#"
+            [server]
+            port = 4000
+            host = "0.0.0.0"
+
+            [database]
+            primary_url = "postgres://localhost/db"
+        "#;
+        let r = check_toml_content(valid_toml);
+        assert_eq!(r.status, CheckStatus::Pass);
+
+        let typo_toml = r#"
+            [database]
+            primry_url = "postgres://localhost/db"
+        "#;
+        let r = check_toml_content(typo_toml);
+        assert_eq!(r.status, CheckStatus::Warn);
+        let detail = r.detail.as_ref().unwrap();
+        assert!(detail.contains("database.primry_url"));
+        assert!(detail.contains("did you mean \"database.primary_url\"?"));
+
+        let unknown_toml = r"
+            [server]
+            xyz_completely_unknown_key = 123
+        ";
+        let r = check_toml_content(unknown_toml);
+        assert_eq!(r.status, CheckStatus::Warn);
+        let detail = r.detail.as_ref().unwrap();
+        assert!(detail.contains("server.xyz_completely_unknown_key"));
+        assert!(!detail.contains("did you mean"));
+    }
+
     // ── mail_unsubscribe check ─────────────────────────────────────────────────
 
     #[test]
@@ -3730,7 +3823,11 @@ foo = "bar"
             .flat_map(|&s| ["[", s, "]\n"])
             .collect();
         let r = check_toml_content(&content);
-        assert_eq!(r.status, CheckStatus::Pass);
+        assert_eq!(
+            r.status,
+            CheckStatus::Pass,
+            "Test failed with result: {r:?}"
+        );
     }
 
     // ── check_version_compat ─────────────────────────────────────────────────
