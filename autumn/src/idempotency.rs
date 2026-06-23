@@ -464,10 +464,11 @@ impl IdempotencyStore for MemoryIdempotencyStore {
     }
 
     fn set(&self, key: &str, record: IdempotencyRecord, body_hash: Vec<u8>, ttl: Duration) {
+        let now = Instant::now();
         let entry = IdempotencyEntry {
             record,
             body_hash,
-            expires_at: Instant::now() + ttl,
+            expires_at: now.checked_add(ttl).unwrap_or_else(|| now + Duration::from_secs(365 * 24 * 3600 * 10)),
         };
         let mut entries = self.entries.write().unwrap();
         entries.insert(key.to_owned(), entry);
@@ -504,7 +505,7 @@ impl IdempotencyStore for MemoryIdempotencyStore {
             key.to_owned(),
             MemoryInFlightLock {
                 owner: owner.to_owned(),
-                expires_at: now + ttl,
+                expires_at: now.checked_add(ttl).unwrap_or_else(|| now + Duration::from_secs(365 * 24 * 3600 * 10)),
             },
         );
         true
@@ -2133,5 +2134,22 @@ mod tests {
             observed.1,
             expected_storage_key("POST", "/payments", None, "pay-once")
         );
+    }
+}
+
+#[cfg(test)]
+mod havoc_proptests {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        #[test]
+        fn test_idempotency_fuzz_try_lock(key in "\\PC*", ttl_secs in any::<u64>()) {
+            let store = MemoryIdempotencyStore::new(Duration::from_secs(60));
+            let locked = store.try_lock(&key, Duration::from_secs(ttl_secs));
+            prop_assert!(locked);
+            let locked_again = store.try_lock(&key, Duration::from_secs(ttl_secs));
+            prop_assert!(!locked_again);
+        }
     }
 }
