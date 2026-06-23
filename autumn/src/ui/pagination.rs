@@ -1,6 +1,6 @@
 //! Reusable Maud renderers for pagination controls.
 //!
-//! Autumn ships pagination *data* ([`Page`], [`CursorPage`]) and this module
+//! Autumn ships pagination *data* ([`Page`](crate::pagination::Page), [`CursorPage`](crate::pagination::CursorPage)) and this module
 //! ships the matching *view*: a one-line, accessible, filter-preserving,
 //! htmx-ready pager you drop below any list, feed, table, or search-results
 //! view. No page-window math or query-string juggling in your handlers.
@@ -45,7 +45,7 @@
 //!
 //! # htmx
 //!
-//! htmx is opt-in via [`PagerOptions::hx_target`]. When unset the links are
+//! htmx is opt-in via [`PagerOptions::hx_target`](crate::ui::pagination::PagerOptions::hx_target). When unset the links are
 //! plain `<a href>` so pagination works with zero JavaScript
 //! (progressive-enhancement default).
 
@@ -225,7 +225,8 @@ fn page_window(current: u32, total: u32, radius: u32) -> Vec<PageItem> {
     let lo = current.saturating_sub(radius).max(1);
     let hi = current.saturating_add(radius).min(total);
 
-    let mut items: Vec<PageItem> = Vec::with_capacity((hi - lo + 1 + 4) as usize);
+    let mut items: Vec<PageItem> =
+        Vec::with_capacity((hi as usize).saturating_sub(lo as usize).saturating_add(5));
 
     // Prefix: page 1 when not already in the window, plus a gap indicator.
     if lo > 1 {
@@ -263,6 +264,7 @@ fn page_window(current: u32, total: u32, radius: u32) -> Vec<PageItem> {
 /// `drop_keys`, and joins the rest verbatim (already percent-encoded). The
 /// leading `?` is *not* included in the input or output.
 fn filter_query<'a>(query: &'a str, drop_keys: &[&str]) -> String {
+    let query = query.strip_prefix('?').unwrap_or(query);
     let parts: Vec<&'a str> = query
         .split('&')
         .filter(|pair| {
@@ -275,7 +277,6 @@ fn filter_query<'a>(query: &'a str, drop_keys: &[&str]) -> String {
         .collect();
     parts.join("&")
 }
-
 
 /// Render a single clickable page/affordance anchor, wiring htmx attributes
 /// only when [`PagerOptions::hx_target`] is set (plain `<a href>` otherwise).
@@ -379,8 +380,10 @@ pub fn pagination_nav<T>(page: &Page<T>, opts: &PagerOptions<'_>) -> maud::Marku
 #[cfg(feature = "maud")]
 #[must_use]
 pub fn cursor_pagination_nav<T>(page: &CursorPage<T>, opts: &PagerOptions<'_>) -> maud::Markup {
-    let cursor_filtered =
-        filter_query(opts.query, &[opts.cursor_param, opts.page_param, opts.size_param]);
+    let cursor_filtered = filter_query(
+        opts.query,
+        &[opts.cursor_param, opts.page_param, opts.size_param],
+    );
     let cursor_prefix = if cursor_filtered.is_empty() {
         String::new()
     } else {
@@ -521,6 +524,18 @@ mod tests {
         assert_eq!(filter_query("page=5&size=10", &["page", "size"]), "");
     }
 
+    #[test]
+    fn filter_query_strips_leading_question_mark() {
+        let q = filter_query("?q=foo&page=3", &["page"]);
+        assert_eq!(q, "q=foo");
+    }
+
+    #[test]
+    fn window_total_u32_max_does_not_panic() {
+        // Must not overflow in debug mode.
+        let _ = page_window(1, u32::MAX, 2);
+    }
+
     // include_size is opt-in: verify via pagination_nav output.
     #[test]
     fn offset_include_size_appends_size_param_to_links() {
@@ -536,7 +551,10 @@ mod tests {
         for h in &hrefs {
             let end = h[6..].find('"').map(|e| 6 + e).unwrap_or(h.len());
             let href = &h[6..end];
-            assert!(href.matches("size=").count() <= 1, "duplicate size= in {href}");
+            assert!(
+                href.matches("size=").count() <= 1,
+                "duplicate size= in {href}"
+            );
         }
     }
 
