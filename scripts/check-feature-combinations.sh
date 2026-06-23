@@ -63,13 +63,14 @@ echo ""
 # Tee Phase A output to a temp file so we can extract the actual build count
 # from cargo-hack's "(current/total)" progress banner afterward.
 PHASE_A_LOG=$(mktemp)
+trap 'rm -f "$PHASE_A_LOG"' EXIT
+
 if ! cargo hack check \
   -p autumn-web \
   --no-dev-deps \
   --each-feature \
   --exclude-features managed-pg-bundled,managed-pg,system-tests,test-support \
   2>&1 | tee "$PHASE_A_LOG"; then
-  rm -f "$PHASE_A_LOG"
   echo ""
   echo "::error::Phase A failed — a feature did not compile in isolation."
   echo "         See the cargo-hack output above for the exact --features string."
@@ -80,8 +81,7 @@ fi
 # More reliable than parsing Cargo.toml because cargo-hack also runs the
 # default-features build in addition to the no-features and per-feature builds.
 PHASE_A_BUILDS=$(grep -oE '\([0-9]+/[0-9]+\)' "$PHASE_A_LOG" \
-  | tail -1 | tr -d '()' | cut -d'/' -f2 2>/dev/null || echo "?")
-rm -f "$PHASE_A_LOG"
+  | tail -n 1 | tr -d '()' | cut -d'/' -f2 2>/dev/null || echo "?")
 
 echo ""
 ok "Phase A passed — every gated feature compiles in isolation."
