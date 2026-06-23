@@ -3821,7 +3821,11 @@ foo = "bar"
             .flat_map(|&s| ["[", s, "]\n"])
             .collect();
         let r = check_toml_content(&content);
-        assert_eq!(r.status, CheckStatus::Pass, "Test failed with result: {r:?}");
+        assert_eq!(
+            r.status,
+            CheckStatus::Pass,
+            "Test failed with result: {r:?}"
+        );
     }
 
     // ── check_version_compat ─────────────────────────────────────────────────
