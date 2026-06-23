@@ -88,7 +88,8 @@ pub fn run_config_check_impl(dir: &std::path::Path) -> Result<(), String> {
                         .extension()
                         .is_some_and(|ext| ext.eq_ignore_ascii_case("toml"));
                 if is_profile {
-                    if let Ok(file_content) = std::fs::read_to_string(&path) {
+                    let read_result = std::fs::read_to_string(&path);
+                    if let Ok(file_content) = read_result {
                         let profile_errors =
                             crate::doctor::validate_toml_content(&file_content, &schema);
                         for (p_path, sug) in profile_errors {
