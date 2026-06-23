@@ -831,10 +831,7 @@ impl InboundMailRouter {
 
 // ── Provider parsing ──────────────────────────────────────────────────────────
 
-fn subtle_eq(a: &[u8], b: &[u8]) -> bool {
-    use subtle::ConstantTimeEq as _;
-    a.ct_eq(b).into()
-}
+use crate::security::constant_time::constant_time_eq as subtle_eq;
 
 /// Strip a display-name from an RFC 5322 address, returning only the addr-spec.
 ///

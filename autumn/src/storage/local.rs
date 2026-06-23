@@ -1021,10 +1021,7 @@ fn hex<B: AsRef<[u8]>>(bytes: B) -> String {
     s
 }
 
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    use subtle::ConstantTimeEq;
-    a.ct_eq(b).into()
-}
+use crate::security::constant_time::constant_time_eq;
 
 /// Verify a signed blob URL against `current` and each `previous` key.
 ///

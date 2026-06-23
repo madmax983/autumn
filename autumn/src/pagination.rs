@@ -573,10 +573,7 @@ fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
     mac.finalize().into_bytes().into()
 }
 
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    use subtle::ConstantTimeEq;
-    a.ct_eq(b).into()
-}
+use crate::security::constant_time::constant_time_eq;
 
 // ── CursorRequest ───────────────────────────────────────────────────
 
