@@ -433,3 +433,26 @@ async fn find_page_by_slug(repo: &PgPageRepository, slug: &str) -> AutumnResult<
         .next()
         .ok_or_else(|| AutumnError::not_found_msg(format!("Page '{slug}' not found")))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_pages_list_snippet_renders() {
+        let page = crate::models::Page {
+            id: 1,
+            slug: "test-slug".into(),
+            title: "Test Title".into(),
+            body: "Test Body".into(),
+            status: "published".into(),
+            lock_version: 1,
+            created_at: autumn_web::reexports::chrono::Utc::now().naive_utc(),
+            updated_at: autumn_web::reexports::chrono::Utc::now().naive_utc(),
+        };
+        let markup = pages_list_snippet(&[page]);
+        assert!(markup.into_string().contains("Test Title"));
+        let markup_empty = pages_list_snippet(&[]);
+        assert!(markup_empty.into_string().contains("No pages found"));
+    }
+}

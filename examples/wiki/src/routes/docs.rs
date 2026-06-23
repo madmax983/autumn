@@ -173,4 +173,18 @@ mod tests {
         assert!(html.contains("Getting Started"));
         assert!(html.contains("Configuration"));
     }
+
+    #[tokio::test]
+    async fn test_doc_params_returns_exact_slugs() {
+        let router = autumn_web::reexports::axum::Router::new();
+        let params = doc_params(router).await;
+        assert_eq!(params.len(), 2);
+
+        let mut slugs: Vec<&str> = params
+            .iter()
+            .map(|p| p.get("slug").unwrap().as_str())
+            .collect();
+        slugs.sort();
+        assert_eq!(slugs, vec!["configuration", "getting-started"]);
+    }
 }
