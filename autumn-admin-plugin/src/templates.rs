@@ -8,7 +8,9 @@ use autumn_web::flash::{FlashMessage, flash_message_divs};
 use autumn_web::job::{
     JobAdminPage, JobAdminRecord, JobAdminSnapshot, JobAdminStatus, JobScheduleSummary,
 };
+use autumn_web::pagination::Page;
 use autumn_web::runtime_config::{ConfigChangeRecord, ConfigEntry};
+use autumn_web::ui::pagination::{PagerOptions, pagination_nav};
 use maud::{DOCTYPE, Markup, PreEscaped, html};
 use serde_json::Value;
 
@@ -280,23 +282,25 @@ const ADMIN_CSS: &str = "
         font-size: 0.875rem;
         color: var(--text-muted);
     }
-    .pagination-links {
+    .autumn-pager {
         display: flex;
         gap: 0.25rem;
     }
-    .pagination-links a, .pagination-links span {
+    .autumn-pager a, .autumn-pager span {
         padding: 0.375rem 0.75rem;
         border: 1px solid var(--border);
         border-radius: 0.375rem;
         font-size: 0.8125rem;
         color: var(--text);
     }
-    .pagination-links a:hover { background: var(--bg); text-decoration: none; }
-    .pagination-links .active {
+    .autumn-pager a:hover { background: var(--bg); text-decoration: none; }
+    .autumn-pager .autumn-pager__current {
         background: var(--primary);
         color: white;
         border-color: var(--primary);
     }
+    .autumn-pager .autumn-pager__ellipsis { border: none; color: var(--text-muted); }
+    .autumn-pager .autumn-pager__disabled { color: var(--text-muted); opacity: 0.5; }
 
     /* Dashboard stats */
     .stats-grid {
@@ -743,20 +747,15 @@ fn jobs_pagination(page: &JobAdminPage, page_param: &str, prefix: &str) -> Marku
     if page.total_pages() <= 1 {
         return html! {};
     }
+    let meta = page_meta(page.page, page.per_page, page.total, page.total_pages());
+    let base = format!("{prefix}/jobs");
+    let opts = PagerOptions::new(&base).page_param(page_param).window(1);
     html! {
         div class="pagination" {
             div {
                 "Page " (page.page) " of " (page.total_pages())
             }
-            div class="pagination-links" {
-                @if page.page > 1 {
-                    a href={ (prefix) "/jobs?" (page_param) "=" (page.page - 1) } { "Previous" }
-                }
-                span class="active" { (page.page) }
-                @if page.page < page.total_pages() {
-                    a href={ (prefix) "/jobs?" (page_param) "=" (page.page + 1) } { "Next" }
-                }
-            }
+            (pagination_nav(&meta, &opts))
         }
     }
 }
@@ -2018,26 +2017,35 @@ fn render_pagination(
     filters_enc: &str,
     prefix: &str,
 ) -> Markup {
-    let total_pages = result.total_pages();
     let current = result.page.max(1);
 
-    // The fixed portion of the query string — built once, reused per link.
-    let suffix = {
+    // The fixed portion of the query string — filters, sort, and search to
+    // preserve across page clicks. The shared pager appends the `page` param.
+    let query = {
         let mut s = String::new();
         if !search_enc.is_empty() {
-            s.push_str("&q=");
+            s.push_str("q=");
             s.push_str(search_enc);
         }
         if let Some(sort) = sort_by {
-            s.push_str("&sort=");
+            if !s.is_empty() {
+                s.push('&');
+            }
+            s.push_str("sort=");
             s.push_str(&url_encode(sort));
             s.push_str("&dir=");
             s.push_str(sort_dir.as_str());
         }
-        s.push_str(filters_enc);
+        if !filters_enc.is_empty() {
+            // filters_enc is pre-encoded as `&filter.k=v&…`; merge it in.
+            let trimmed = filters_enc.strip_prefix('&').unwrap_or(filters_enc);
+            if !s.is_empty() {
+                s.push('&');
+            }
+            s.push_str(trimmed);
+        }
         s
     };
-    let base_qs = |page: u64| -> String { format!("{prefix}/{model_slug}?page={page}{suffix}") };
 
     let start = if result.total == 0 {
         0
@@ -2052,54 +2060,40 @@ fn render_pagination(
         .saturating_sub(1)
         .min(result.total);
 
+    let meta = page_meta(current, result.per_page, result.total, result.total_pages());
+    let base = format!("{prefix}/{model_slug}");
+    let opts = PagerOptions::new(&base)
+        .query(&query)
+        .window(1)
+        .prev_label("← Prev")
+        .next_label("Next →");
+
     html! {
         div class="pagination" {
             span {
                 "Showing " (start) "–" (end) " of " (result.total)
             }
-            div class="pagination-links" {
-                @if current > 1 {
-                    a href=(base_qs(current - 1)) { "← Prev" }
-                }
-                @for page in pagination_range(current, total_pages) {
-                    @if page == 0 {
-                        span style="border: none; color: var(--text-muted);" { "…" }
-                    } @else if page == current {
-                        span class="active" { (page) }
-                    } @else {
-                        a href=(base_qs(page)) { (page) }
-                    }
-                }
-                @if current < total_pages {
-                    a href=(base_qs(current + 1)) { "Next →" }
-                }
-            }
+            (pagination_nav(&meta, &opts))
         }
     }
 }
 
-/// Generate a pagination range with ellipsis (0 = ellipsis marker).
-fn pagination_range(current: u64, total: u64) -> Vec<u64> {
-    if total <= 7 {
-        return (1..=total).collect();
+/// Build an `autumn_web` [`Page`] carrying just the pagination metadata the
+/// shared [`pagination_nav`] renderer needs — no content rows. Bridges the
+/// admin plugin's `u64`-based counts onto the framework's `Page` type.
+fn page_meta(page: u64, per_page: u64, total: u64, total_pages: u64) -> Page<()> {
+    let to_u32 = |v: u64| u32::try_from(v).unwrap_or(u32::MAX);
+    let page = to_u32(page.max(1));
+    let total_pages = to_u32(total_pages.max(1));
+    Page {
+        content: Vec::new(),
+        page,
+        size: to_u32(per_page),
+        total_elements: total,
+        total_pages,
+        has_next: page < total_pages,
+        has_previous: page > 1,
     }
-    let mut pages = Vec::new();
-    pages.push(1);
-    if current > 3 {
-        pages.push(0); // ellipsis
-    }
-    let start = current.saturating_sub(1).max(2);
-    let end = current.saturating_add(1).min(total.saturating_sub(1));
-    for p in start..=end {
-        pages.push(p);
-    }
-    if current < total - 2 {
-        pages.push(0); // ellipsis
-    }
-    if *pages.last().unwrap_or(&0) != total {
-        pages.push(total);
-    }
-    pages
 }
 
 // -- Version history pane ----------------------------------------------------
@@ -2339,31 +2333,73 @@ mod tests {
         );
     }
 
-    #[test]
-    fn pagination_range_small() {
-        assert_eq!(pagination_range(1, 5), vec![1, 2, 3, 4, 5]);
+    fn list_result(page: u64, per_page: u64, total: u64) -> crate::traits::ListResult {
+        crate::traits::ListResult {
+            total,
+            per_page,
+            page,
+            records: vec![],
+        }
     }
 
     #[test]
-    fn pagination_range_middle() {
-        let result = pagination_range(5, 10);
-        assert!(result.contains(&1));
-        assert!(result.contains(&5));
-        assert!(result.contains(&10));
-        assert!(result.contains(&0)); // ellipsis
+    fn render_pagination_shows_summary_and_nav() {
+        let result = list_result(2, 10, 100);
+        let html = render_pagination(
+            &result,
+            "users",
+            "",
+            None,
+            crate::traits::SortDirection::Asc,
+            "",
+            "/admin",
+        )
+        .into_string();
+        assert!(html.contains("Showing 11–20 of 100"), "{html}");
+        assert!(html.contains("autumn-pager"), "{html}");
+        // Page links target the model list path.
+        assert!(html.contains("/admin/users?"), "{html}");
     }
 
     #[test]
-    fn pagination_range_start() {
-        let result = pagination_range(1, 10);
-        assert_eq!(result[0], 1);
-        assert_eq!(result[1], 2);
+    fn render_pagination_preserves_search_and_sort() {
+        let result = list_result(5, 10, 200); // 20 pages
+        let html = render_pagination(
+            &result,
+            "users",
+            "foo",
+            Some("name"),
+            crate::traits::SortDirection::Asc,
+            "",
+            "/admin",
+        )
+        .into_string();
+        // Every emitted page link must keep the active filter and sort.
+        for (i, _) in html.match_indices("href=\"") {
+            let rest = &html[i + 6..];
+            let end = rest.find('"').unwrap_or(rest.len());
+            let href = &rest[..end];
+            assert!(href.contains("q=foo"), "missing q in {href}");
+            assert!(href.contains("sort=name"), "missing sort in {href}");
+        }
+        // Middle page of a 20-page set must window with an ellipsis.
+        assert!(html.contains('…'), "{html}");
     }
 
     #[test]
-    fn pagination_range_end() {
-        let result = pagination_range(10, 10);
-        assert_eq!(*result.last().unwrap(), 10);
+    fn render_pagination_marks_active_page() {
+        let result = list_result(3, 10, 100);
+        let html = render_pagination(
+            &result,
+            "users",
+            "",
+            None,
+            crate::traits::SortDirection::Asc,
+            "",
+            "/admin",
+        )
+        .into_string();
+        assert!(html.contains(r#"aria-current="page""#), "{html}");
     }
 
     #[test]

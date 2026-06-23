@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **ui:** reusable Maud pagination-nav renderer — `autumn_web::ui::pagination::{pagination_nav, cursor_pagination_nav, PagerOptions}`,
+  re-exported from the prelude. Renders an accessible (`<nav>` with
+  `aria-current="page"` and non-focusable disabled prev/next), filter-preserving
+  (keeps the current query string, swapping only the `page`/`size` params),
+  htmx-opt-in, windowed pager (`1 … 4 5 6 … 20`) from an existing `Page`, plus a
+  cursor variant for `CursorPage` feeds. The admin plugin's two hand-rolled
+  pagers (`render_pagination`, `jobs_pagination`) now call the shared helper,
+  removing the duplicated page-window logic (#1007).
 - **ci:** feature-combination compile gate covering 35 `autumn-web` feature
   combinations — each individual flag in isolation (`cargo hack --each-feature`)
   plus curated real-world combos (`db`, `mail`, `maud,htmx`, `storage,db`,
