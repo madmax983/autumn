@@ -603,11 +603,11 @@ fn build_placeholder_results(example: &str) -> Vec<BudgetCheckResult> {
         .collect()
 }
 
-fn chrono_utc_now() -> String {
+pub fn chrono_utc_now() -> String {
     std::env::var("AUTUMN_BENCH_TIMESTAMP").unwrap_or_else(|_| "unknown".to_string())
 }
 
-fn rust_version_string() -> String {
+pub fn rust_version_string() -> String {
     std::env::var("AUTUMN_BENCH_RUST_VERSION").unwrap_or_else(|_| "unknown".to_string())
 }
 

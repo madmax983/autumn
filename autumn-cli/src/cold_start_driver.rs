@@ -46,7 +46,7 @@ const fn class_for(shape: ColdStartShape) -> ChangeClass {
 /// Honours the `AUTUMN_BENCH_AUTUMN_WEB_PATH` override, otherwise walks up from
 /// the current directory looking for an `autumn/Cargo.toml` whose package is
 /// `autumn-web`.
-fn locate_autumn_web() -> Option<PathBuf> {
+pub fn locate_autumn_web() -> Option<PathBuf> {
     if let Ok(p) = std::env::var("AUTUMN_BENCH_AUTUMN_WEB_PATH") {
         let pb = PathBuf::from(p);
         if pb.join("Cargo.toml").is_file() {
@@ -71,7 +71,7 @@ fn locate_autumn_web() -> Option<PathBuf> {
 ///
 /// The repo location is invariant across samples, so the ancestor walk + file
 /// reads + canonicalize run only on the first sample and are cached for the rest.
-fn cached_autumn_web() -> Option<PathBuf> {
+pub fn cached_autumn_web() -> Option<PathBuf> {
     static AUTUMN_WEB: OnceLock<Option<PathBuf>> = OnceLock::new();
     AUTUMN_WEB
         .get_or_init(|| locate_autumn_web().and_then(|p| std::fs::canonicalize(p).ok()))
@@ -84,7 +84,7 @@ fn cached_autumn_web() -> Option<PathBuf> {
 /// table, so it is a standalone workspace root and a `[patch]` section is valid
 /// there. The patch applies regardless of whether the dependency is the plain
 /// `autumn-web = "x"` form or the daemon/`features` table form.
-fn repoint_autumn_web(project_dir: &Path, autumn_web: &Path) -> Result<(), String> {
+pub fn repoint_autumn_web(project_dir: &Path, autumn_web: &Path) -> Result<(), String> {
     let manifest = project_dir.join("Cargo.toml");
     let mut content =
         std::fs::read_to_string(&manifest).map_err(|e| format!("read Cargo.toml: {e}"))?;

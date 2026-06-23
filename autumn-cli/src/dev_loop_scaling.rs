@@ -24,7 +24,7 @@ use std::fmt::Write as FmtWrite;
 
 use serde::{Deserialize, Serialize};
 
-use crate::dev_loop_bench::{ClassStats, compute_stats};
+use crate::dev_loop_bench::{ClassStats, chrono_utc_now, compute_stats, rust_version_string};
 
 // ── Budget constants ─────────────────────────────────────────────────────────
 
@@ -138,6 +138,11 @@ pub struct ScalingReport {
 /// in `handler_0` whose value can be changed by [`apply_handler_edit`] to
 /// force a warm incremental recompile of exactly one file.
 pub fn generate_synthetic_app(n: usize) -> GeneratedApp {
+    // `autumn-web = "*"`: the live driver always appends a `[patch.crates-io]`
+    // pointing this dependency at the workspace's local `autumn-web` source, so
+    // the resolved version is whatever the repo currently is. A wildcard avoids
+    // a hardcoded version that would silently break `[patch]` resolution after a
+    // workspace version bump; `publish = false` makes the wildcard valid.
     let cargo_toml = "[package]\n\
          name = \"scaling_bench_app\"\n\
          version = \"0.1.0\"\n\
@@ -147,7 +152,7 @@ pub fn generate_synthetic_app(n: usize) -> GeneratedApp {
          [workspace]\n\
          \n\
          [dependencies]\n\
-         autumn-web = \"0.5.0\"\n"
+         autumn-web = \"*\"\n"
         .to_string();
 
     let files = vec![
@@ -347,7 +352,11 @@ pub fn build_scaling_report(
     let mut points = Vec::new();
     for (n, samples) in measurements {
         let stats = compute_stats(samples);
-        let abs_passed = stats.p95_ms <= SCALING_ABS_P95_MS;
+        // An empty sample vector means the measurement for this size failed:
+        // `compute_stats` yields p95 = 0, which would otherwise sail under the
+        // absolute ceiling and silently report a missing measurement as a pass.
+        // Treat a sample-less point as a hard fail.
+        let abs_passed = !samples.is_empty() && stats.p95_ms <= SCALING_ABS_P95_MS;
         points.push(ScalingPoint {
             n: *n,
             stats,
@@ -355,12 +364,22 @@ pub fn build_scaling_report(
         });
     }
 
-    let first_p95 = points.first().map_or(0, |p| p.stats.p95_ms);
-    let last_p95 = points.last().map_or(0, |p| p.stats.p95_ms);
+    // Compute the slope from the smallest-N to the largest-N point, ordered by
+    // N rather than by input position. `parse_sizes` preserves caller order, so
+    // a sweep passed out of order (e.g. `--sizes 100,50,1`) must not invert the
+    // ratio and let a real regression pass the gate.
+    let p95_by_n = |sel: fn(&ScalingPoint, &ScalingPoint) -> bool| {
+        points
+            .iter()
+            .reduce(|a, b| if sel(a, b) { a } else { b })
+            .map_or(0, |p| p.stats.p95_ms)
+    };
+    let min_n_p95 = p95_by_n(|a, b| a.n <= b.n);
+    let max_n_p95 = p95_by_n(|a, b| a.n >= b.n);
     let slope = if points.len() < 2 {
         1.0
     } else {
-        compute_slope(first_p95, last_p95)
+        compute_slope(min_n_p95, max_n_p95)
     };
     let slope_passed = slope <= SCALING_SLOPE_MAX;
 
@@ -574,16 +593,6 @@ pub fn load_baseline(path: Option<&str>) -> Option<ScalingBaseline> {
     let path = path?;
     let content = std::fs::read_to_string(path).ok()?;
     serde_json::from_str(&content).ok()
-}
-
-// ── Env-var helpers (same vars as dev_loop_bench) ────────────────────────────
-
-fn chrono_utc_now() -> String {
-    std::env::var("AUTUMN_BENCH_TIMESTAMP").unwrap_or_else(|_| "unknown".to_string())
-}
-
-fn rust_version_string() -> String {
-    std::env::var("AUTUMN_BENCH_RUST_VERSION").unwrap_or_else(|_| "unknown".to_string())
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -981,6 +990,32 @@ mod tests {
         let m = make_measurements(&[1, 25, 50, 100], &[1000, 1200, 1500, 2000]);
         let r = build_scaling_report(&m, None);
         assert_eq!(r.sizes, vec![1, 25, 50, 100]);
+    }
+
+    #[test]
+    fn build_report_slope_is_size_ordered_not_input_ordered() {
+        // Same data, ascending vs. reversed input order. The slope must be
+        // p95@N_max / p95@N_min (5000/1000 = 5.0) regardless of input order —
+        // a reversed sweep must not invert the ratio and pass the gate.
+        let ascending = make_measurements(&[1, 100], &[1000, 5000]);
+        let reversed = make_measurements(&[100, 1], &[5000, 1000]);
+        let ra = build_scaling_report(&ascending, None);
+        let rr = build_scaling_report(&reversed, None);
+        assert!((ra.slope - 5.0).abs() < 1e-9, "ascending slope must be 5.0");
+        assert!((rr.slope - 5.0).abs() < 1e-9, "reversed-input slope must also be 5.0");
+        assert!(!ra.slope_passed && !rr.slope_passed, "slope 5× must fail either way");
+        assert!(!ra.all_passed && !rr.all_passed, "reversed sweep must not pass the gate");
+    }
+
+    #[test]
+    fn build_report_empty_samples_point_fails() {
+        // A size whose measurement produced no samples (build failure) must not
+        // be reported as a pass via compute_stats' zero p95.
+        let m: Vec<(usize, Vec<u64>)> = vec![(1, vec![2000]), (100, vec![])];
+        let r = build_scaling_report(&m, None);
+        assert!(r.points[0].abs_passed, "the measured size still passes");
+        assert!(!r.points[1].abs_passed, "an empty-sample size must fail the abs gate");
+        assert!(!r.all_passed, "a missing measurement must fail the overall gate");
     }
 
     // ── format_scaling_json ───────────────────────────────────────────────

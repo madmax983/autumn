@@ -11,60 +11,28 @@
 //! report logic is unit-tested in `dev_loop_scaling.rs`. This file is
 //! excluded from coverage like `cold_start_driver.rs`.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, Stdio};
-use std::sync::OnceLock;
 use std::time::Instant;
 
+use crate::cold_start_driver::{cached_autumn_web, repoint_autumn_web};
 use crate::dev_loop_scaling::{
     GeneratedApp, apply_handler_edit, build_scaling_report, emit_scaling_report,
     generate_synthetic_app, load_baseline, parse_sizes, run_scaling_dry_run,
 };
 
-// ── Workspace location ───────────────────────────────────────────────────────
-
-/// Locate the workspace `autumn-web` crate — reuses the same ancestor-walk
-/// logic as `cold_start_driver`, made `pub(crate)` there for sharing.
-fn locate_autumn_web() -> Option<PathBuf> {
-    if let Ok(p) = std::env::var("AUTUMN_BENCH_AUTUMN_WEB_PATH") {
-        let pb = PathBuf::from(p);
-        if pb.join("Cargo.toml").is_file() {
-            return Some(pb);
-        }
-    }
-    let cwd = std::env::current_dir().ok()?;
-    for ancestor in cwd.ancestors() {
-        let candidate = ancestor.join("autumn");
-        let manifest = candidate.join("Cargo.toml");
-        if manifest.is_file()
-            && let Ok(s) = std::fs::read_to_string(&manifest)
-            && s.contains("name = \"autumn-web\"")
-        {
-            return Some(candidate);
-        }
-    }
-    None
-}
-
-fn cached_autumn_web() -> Option<PathBuf> {
-    static AUTUMN_WEB: OnceLock<Option<PathBuf>> = OnceLock::new();
-    AUTUMN_WEB
-        .get_or_init(|| locate_autumn_web().and_then(|p| std::fs::canonicalize(p).ok()))
-        .clone()
-}
-
 // ── App scaffold ─────────────────────────────────────────────────────────────
 
 /// Write a `GeneratedApp` to `project_dir` and append a
 /// `[patch.crates-io] autumn-web` section pointing at local source.
+///
+/// The `[patch]` append reuses `cold_start_driver::repoint_autumn_web` so both
+/// benchmarks generate byte-identical patch sections.
 fn scaffold_app(app: &GeneratedApp, project_dir: &Path, autumn_web: &Path) -> Result<(), String> {
-    // Write Cargo.toml + [patch]
-    let patch = format!(
-        "\n[patch.crates-io]\nautumn-web = {{ path = {:?} }}\n",
-        autumn_web.display().to_string()
-    );
-    std::fs::write(project_dir.join("Cargo.toml"), format!("{}{patch}", app.cargo_toml))
+    // Write the generated manifest, then repoint autumn-web at local source.
+    std::fs::write(project_dir.join("Cargo.toml"), &app.cargo_toml)
         .map_err(|e| format!("write Cargo.toml: {e}"))?;
+    repoint_autumn_web(project_dir, autumn_web)?;
 
     // Write source files
     for (relpath, content) in &app.files {
@@ -160,16 +128,36 @@ fn measure_size(n: usize, runs: u32, autumn_web: &Path) -> Result<Vec<u64>, Stri
 
 /// Run the full scaling sweep: for each size in `sizes`, measure `runs`
 /// incremental rebuild samples and return `(n, samples)` pairs.
+///
+/// A single size that fails to build (transient OOM, flaky proc-macro, disk
+/// pressure) is logged and skipped rather than aborting the whole sweep, so the
+/// other sizes' samples are still reported. Returns `Err` only if **every** size
+/// failed, leaving no data to build a report from.
 fn measure_scaling(
     sizes: &[usize],
     runs: u32,
     autumn_web: &Path,
 ) -> Result<Vec<(usize, Vec<u64>)>, String> {
     let mut results = Vec::with_capacity(sizes.len());
+    let mut failures = Vec::new();
     for &n in sizes {
         eprintln!("Measuring N={n}…");
-        let samples = measure_size(n, runs, autumn_web)?;
-        results.push((n, samples));
+        match measure_size(n, runs, autumn_web) {
+            Ok(samples) => results.push((n, samples)),
+            Err(e) => {
+                eprintln!("  N={n}: measurement failed, skipping this size: {e}");
+                failures.push(n);
+            }
+        }
+    }
+    if results.is_empty() {
+        return Err(format!(
+            "every size failed to measure ({} attempted: {failures:?})",
+            sizes.len()
+        ));
+    }
+    if !failures.is_empty() {
+        eprintln!("Warning: {} size(s) failed and were skipped: {failures:?}", failures.len());
     }
     Ok(results)
 }
@@ -245,18 +233,9 @@ pub fn run_scaling(
 mod tests {
     use super::*;
 
-    #[test]
-    fn locate_autumn_web_honours_env_override() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        std::fs::write(tmp.path().join("Cargo.toml"), "name = \"autumn-web\"\n")
-            .expect("write manifest");
-        let found = temp_env::with_var(
-            "AUTUMN_BENCH_AUTUMN_WEB_PATH",
-            Some(tmp.path().as_os_str()),
-            locate_autumn_web,
-        );
-        assert_eq!(found.as_deref(), Some(tmp.path()));
-    }
+    // `locate_autumn_web` / `cached_autumn_web` are owned and tested by
+    // `cold_start_driver` (see its `locate_autumn_web_honours_env_override`);
+    // this module reuses them rather than duplicating the logic or its test.
 
     #[test]
     fn scaffold_app_writes_cargo_toml_and_sources() {
