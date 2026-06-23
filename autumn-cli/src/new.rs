@@ -23,6 +23,36 @@ mod templates {
     pub const INTEGRATION_TEST: &str = include_str!("templates/tests/integration_test.rs.tmpl");
 }
 
+/// Variables substituted into project and starter template files.
+///
+/// Shared by the base `autumn new` scaffold and the starter render path so both
+/// honour the exact same substitution tokens (issue #993 reuses the existing
+/// `new` render path for starters).
+pub struct TemplateVars<'a> {
+    /// The project name exactly as given on the CLI (e.g. `my-app`).
+    pub project_name: &'a str,
+    /// The Rust crate name (`project_name` with `-` replaced by `_`).
+    pub crate_name: &'a str,
+    /// The `autumn-web` version this CLI was built against.
+    pub autumn_version: &'a str,
+    /// The MSRV stamped into generated `Cargo.toml` files.
+    pub rust_version: &'a str,
+}
+
+/// Render a single embedded template, substituting the standard `{{…}}` tokens.
+///
+/// Templates are embedded at compile time and may be checked out with CRLF line
+/// endings on Windows (git autocrlf); normalising to LF first keeps the
+/// `\n`-anchored rewrites (and the generated output) deterministic across hosts.
+pub fn render_template(content: &str, vars: &TemplateVars<'_>) -> String {
+    content
+        .replace("\r\n", "\n")
+        .replace("{{project_name}}", vars.project_name)
+        .replace("{{crate_name}}", vars.crate_name)
+        .replace("{{autumn_version}}", vars.autumn_version)
+        .replace("{{rust_version}}", vars.rust_version)
+}
+
 /// Errors that can occur during project generation.
 #[derive(Debug, thiserror::Error)]
 pub enum NewError {
@@ -162,20 +192,13 @@ fn generate_inner(
         fs::create_dir_all(project_dir.join("i18n"))?;
     }
 
-    let render = |template: &str| -> String {
-        // Templates are embedded via `include_str!`; on Windows they may be
-        // checked out with CRLF line endings (git autocrlf), which would break
-        // the `\n`-anchored `.replace()` rewrites below (migration stripping,
-        // dependency edits) and silently emit the wrong scaffold. Normalize to
-        // LF so generation is deterministic — and generated projects use LF —
-        // regardless of the host platform's checkout.
-        template
-            .replace("\r\n", "\n")
-            .replace("{{project_name}}", name)
-            .replace("{{crate_name}}", &crate_name)
-            .replace("{{autumn_version}}", autumn_version)
-            .replace("{{rust_version}}", rust_version)
+    let vars = TemplateVars {
+        project_name: name,
+        crate_name: &crate_name,
+        autumn_version,
+        rust_version,
     };
+    let render = |template: &str| -> String { render_template(template, &vars) };
 
     let cargo_toml = render_cargo_toml(
         opts,
@@ -555,7 +578,7 @@ const KEYWORDS: &[&str] = &[
 ];
 
 /// Validate that a name is a valid Rust package name.
-fn validate_name(name: &str) -> Result<(), NewError> {
+pub fn validate_name(name: &str) -> Result<(), NewError> {
     if name.is_empty() {
         return Err(NewError::InvalidName(
             name.to_owned(),

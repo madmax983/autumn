@@ -31,6 +31,7 @@ mod seed;
 mod serve;
 mod setup;
 mod shard;
+mod starters;
 mod task;
 mod token;
 mod webhook;
@@ -61,8 +62,25 @@ struct Cli {
 enum Commands {
     /// Create a new Autumn project
     New {
-        /// Project name (must be a valid Rust package name)
-        name: String,
+        /// Project name (must be a valid Rust package name). Optional only when
+        /// `--list-starters` is given.
+        name: Option<String>,
+        /// Scaffold from a starter instead of the minimal base project. Accepts
+        /// a built-in name (see `--list-starters`), a local directory, a full
+        /// git URL, or an `owner/repo` GitHub shorthand (optionally `@ref`).
+        #[arg(long)]
+        starter: Option<String>,
+        /// Pin a git starter to a tag, branch, or revision. Mutually exclusive
+        /// with an inline `@ref` suffix on `--starter`.
+        #[arg(long)]
+        starter_ref: Option<String>,
+        /// List the available built-in starters and exit.
+        #[arg(long)]
+        list_starters: bool,
+        /// Skip the provenance confirmation prompt for community (git/local)
+        /// starters. Required to apply a community starter non-interactively.
+        #[arg(long)]
+        yes: bool,
         /// Scaffold the optional i18n module (Project Fluent translations
         /// at `i18n/en.ftl`, the `[i18n]` block in `autumn.toml`, and the
         /// `i18n` feature flag on `autumn-web`).
@@ -1773,20 +1791,57 @@ fn run_command(command: Commands) {
         ),
         Commands::New {
             name,
+            starter,
+            starter_ref,
+            list_starters,
+            yes,
             with_i18n,
             with_seed,
             daemon,
             bundled_pg,
-        } => new::run(
-            &name,
-            new::GenerateOptions {
-                with_i18n,
-                with_seed,
-                // --bundled-pg is a daemon flavor that keeps the database.
-                with_daemon: daemon || bundled_pg,
-                with_bundled_pg: bundled_pg,
-            },
-        ),
+        } => {
+            if list_starters {
+                starters::print_list();
+                return;
+            }
+            let Some(name) = name else {
+                eprintln!(
+                    "Error: a project name is required (e.g. `autumn new my-app`), \
+                     unless --list-starters is given"
+                );
+                std::process::exit(1);
+            };
+            if let Some(starter) = starter {
+                // A starter brings a complete composition; the base-project
+                // scaffolding toggles do not apply.
+                if with_i18n || with_seed || daemon || bundled_pg {
+                    eprintln!(
+                        "Error: --starter cannot be combined with --with-i18n, \
+                         --with-seed, --daemon, or --bundled-pg (a starter brings \
+                         its own composition)"
+                    );
+                    std::process::exit(1);
+                }
+                starters::run(
+                    &name,
+                    &starter,
+                    starter_ref.as_deref(),
+                    yes,
+                    generate::Flags::default(),
+                );
+            } else {
+                new::run(
+                    &name,
+                    new::GenerateOptions {
+                        with_i18n,
+                        with_seed,
+                        // --bundled-pg is a daemon flavor that keeps the database.
+                        with_daemon: daemon || bundled_pg,
+                        with_bundled_pg: bundled_pg,
+                    },
+                );
+            }
+        }
 
         Commands::Webhook(WebhookCommands::Sim {
             provider,
@@ -2390,7 +2445,7 @@ mod tests {
         let cli = Cli::try_parse_from(["autumn", "new", "my-app"]).unwrap();
         match cli.command {
             Commands::New { ref name, .. } => {
-                assert_eq!(name, "my-app");
+                assert_eq!(name.as_deref(), Some("my-app"));
             }
             _ => panic!("expected New command"),
         }
@@ -2401,7 +2456,7 @@ mod tests {
         let cli = Cli::try_parse_from(["autumn", "new", "my_app"]).unwrap();
         match cli.command {
             Commands::New { ref name, .. } => {
-                assert_eq!(name, "my_app");
+                assert_eq!(name.as_deref(), Some("my_app"));
             }
             _ => panic!("expected New command"),
         }
@@ -2416,7 +2471,7 @@ mod tests {
                 with_i18n,
                 ..
             } => {
-                assert_eq!(name, "my-app");
+                assert_eq!(name.as_deref(), Some("my-app"));
                 assert!(with_i18n);
             }
             _ => panic!("expected New command"),
@@ -2428,6 +2483,85 @@ mod tests {
         let cli = Cli::try_parse_from(["autumn", "new", "my-app"]).unwrap();
         match cli.command {
             Commands::New { with_i18n, .. } => assert!(!with_i18n),
+            _ => panic!("expected New command"),
+        }
+    }
+
+    #[test]
+    fn parse_new_starter_flag() {
+        let cli = Cli::try_parse_from(["autumn", "new", "acme", "--starter", "saas"]).unwrap();
+        match cli.command {
+            Commands::New {
+                ref name,
+                ref starter,
+                ..
+            } => {
+                assert_eq!(name.as_deref(), Some("acme"));
+                assert_eq!(starter.as_deref(), Some("saas"));
+            }
+            _ => panic!("expected New command"),
+        }
+    }
+
+    #[test]
+    fn parse_new_list_starters_without_name() {
+        // `--list-starters` makes the positional name optional.
+        let cli = Cli::try_parse_from(["autumn", "new", "--list-starters"]).unwrap();
+        match cli.command {
+            Commands::New {
+                name,
+                list_starters,
+                ..
+            } => {
+                assert!(name.is_none());
+                assert!(list_starters);
+            }
+            _ => panic!("expected New command"),
+        }
+    }
+
+    #[test]
+    fn parse_new_starter_ref_and_yes() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "new",
+            "acme",
+            "--starter",
+            "owner/repo",
+            "--starter-ref",
+            "v1.2.0",
+            "--yes",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::New {
+                starter,
+                starter_ref,
+                yes,
+                ..
+            } => {
+                assert_eq!(starter.as_deref(), Some("owner/repo"));
+                assert_eq!(starter_ref.as_deref(), Some("v1.2.0"));
+                assert!(yes);
+            }
+            _ => panic!("expected New command"),
+        }
+    }
+
+    #[test]
+    fn parse_new_without_starter_defaults_none() {
+        let cli = Cli::try_parse_from(["autumn", "new", "acme"]).unwrap();
+        match cli.command {
+            Commands::New {
+                starter,
+                list_starters,
+                yes,
+                ..
+            } => {
+                assert!(starter.is_none());
+                assert!(!list_starters);
+                assert!(!yes);
+            }
             _ => panic!("expected New command"),
         }
     }
@@ -2483,8 +2617,23 @@ mod tests {
     }
 
     #[test]
-    fn new_missing_name_is_error() {
-        assert!(Cli::try_parse_from(["autumn", "new"]).is_err());
+    fn new_without_name_parses_with_name_none() {
+        // The positional name is optional at the clap level so `--list-starters`
+        // can run without one. When neither a name nor `--list-starters` is
+        // given, the requirement is enforced at dispatch (a clean runtime error),
+        // not by the parser.
+        let cli = Cli::try_parse_from(["autumn", "new"]).unwrap();
+        match cli.command {
+            Commands::New {
+                name,
+                list_starters,
+                ..
+            } => {
+                assert!(name.is_none());
+                assert!(!list_starters);
+            }
+            _ => panic!("expected New command"),
+        }
     }
 
     #[test]
@@ -3530,7 +3679,7 @@ mod tests {
             Commands::New {
                 name, with_seed, ..
             } => {
-                assert_eq!(name, "my-app");
+                assert_eq!(name.as_deref(), Some("my-app"));
                 assert!(!with_seed);
             }
             _ => panic!("expected New command"),
@@ -3544,7 +3693,7 @@ mod tests {
             Commands::New {
                 name, with_seed, ..
             } => {
-                assert_eq!(name, "my-app");
+                assert_eq!(name.as_deref(), Some("my-app"));
                 assert!(with_seed);
             }
             _ => panic!("expected New command"),
@@ -3562,7 +3711,7 @@ mod tests {
                 with_seed,
                 ..
             } => {
-                assert_eq!(name, "my-app");
+                assert_eq!(name.as_deref(), Some("my-app"));
                 assert!(with_i18n);
                 assert!(with_seed);
             }

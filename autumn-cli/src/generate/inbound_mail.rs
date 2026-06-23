@@ -472,6 +472,7 @@ async fn main() {
         let contents = match handler_action {
             super::super::emit::Action::Create { contents, .. }
             | super::super::emit::Action::Modify { contents, .. } => contents,
+            super::super::emit::Action::CreateBytes { .. } => unreachable!("generator emits no binary files"),
         };
         assert!(
             contents.contains("#[inbound_mail"),
@@ -491,6 +492,7 @@ async fn main() {
         let contents = match test_action {
             super::super::emit::Action::Create { contents, .. }
             | super::super::emit::Action::Modify { contents, .. } => contents,
+            super::super::emit::Action::CreateBytes { .. } => unreachable!("generator emits no binary files"),
         };
         assert!(
             contents.contains("compute_mailgun_signature"),
@@ -560,6 +562,7 @@ async fn main() {
         let contents = match handler_action {
             super::super::emit::Action::Create { contents, .. }
             | super::super::emit::Action::Modify { contents, .. } => contents,
+            super::super::emit::Action::CreateBytes { .. } => unreachable!("generator emits no binary files"),
         };
         assert!(
             contents.contains("ReplyThreadMailHandler"),
