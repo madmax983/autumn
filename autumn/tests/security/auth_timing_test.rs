@@ -49,7 +49,7 @@ async fn test_constant_time_slice_comparison_prevents_early_exit() {
     // 1MB is sufficient to measure timing differences without being flaky.
     let a = "a".repeat(100_000);
     let b = "b".repeat(100_000);
-    let c = "b".repeat(1);
+    let c = "b".to_string();
 
     let start_same = Instant::now();
     let _ = autumn_web::security::constant_time::constant_time_eq_str(&a, &b);
@@ -59,8 +59,8 @@ async fn test_constant_time_slice_comparison_prevents_early_exit() {
     let _ = autumn_web::security::constant_time::constant_time_eq_str(&a, &c);
     let elapsed_diff = start_diff.elapsed();
 
-    println!("Same len time: {:?}", elapsed_same);
-    println!("Diff len time: {:?}", elapsed_diff);
+    println!("Same len time: {elapsed_same:?}");
+    println!("Diff len time: {elapsed_diff:?}");
 
     // Instead of asserting strict timing equality which is flaky,
     // we assert the comparison logic successfully evaluated them. The test simply compiling
