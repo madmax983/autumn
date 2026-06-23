@@ -1335,6 +1335,7 @@ impl TestApp {
                 nest_routers: self.nest_routers,
                 custom_layers: self.custom_layers,
                 static_gate_layers: self.static_gate_layers,
+                #[cfg(feature = "maud")]
                 error_page_renderer: None,
                 session_store: None,
                 #[cfg(feature = "openapi")]

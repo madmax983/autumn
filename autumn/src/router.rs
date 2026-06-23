@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use crate::app::ScopedGroup;
 use crate::config::AutumnConfig;
+#[cfg(feature = "maud")]
 use crate::error_pages::{self, SharedRenderer};
 use crate::extract::State;
 use crate::idempotency::{IdempotencyLayer, IdempotencyStore, MemoryIdempotencyStore};
@@ -165,6 +166,7 @@ pub struct RouterContext {
     /// outermost position in both static and fully-dynamic modes, and never
     /// see the session extension.
     pub static_gate_layers: Vec<crate::app::CustomLayerRegistration>,
+    #[cfg(feature = "maud")]
     pub error_page_renderer: Option<SharedRenderer>,
     /// Custom session store installed via
     /// [`AppBuilder::with_session_store`](crate::app::AppBuilder::with_session_store).
@@ -212,6 +214,7 @@ pub fn try_build_router(
             nest_routers: Vec::new(),
             custom_layers: Vec::new(),
             static_gate_layers: Vec::new(),
+            #[cfg(feature = "maud")]
             error_page_renderer: None,
             session_store: None,
             #[cfg(feature = "openapi")]
@@ -276,6 +279,7 @@ pub fn try_build_router_merged(
             nest_routers,
             custom_layers: Vec::new(),
             static_gate_layers: Vec::new(),
+            #[cfg(feature = "maud")]
             error_page_renderer: None,
             session_store: None,
             #[cfg(feature = "openapi")]
@@ -529,6 +533,7 @@ fn build_router_pre_state(
         state,
         ctx.exception_filters,
         ctx.custom_layers,
+        #[cfg(feature = "maud")]
         ctx.error_page_renderer,
         ctx.session_store,
         route_timeouts,
@@ -2246,6 +2251,7 @@ fn apply_middleware(
     state: &AppState,
     exception_filters: Vec<Arc<dyn ExceptionFilter>>,
     custom_layers: Vec<crate::app::CustomLayerRegistration>,
+    #[cfg(feature = "maud")]
     error_page_renderer: Option<SharedRenderer>,
     session_store: Option<Arc<dyn crate::session::BoxedSessionStore>>,
     route_timeouts: RouteTimeoutTable,
@@ -2439,28 +2445,31 @@ fn apply_middleware(
         .profile
         .as_deref()
         .map_or(cfg!(debug_assertions), |p| p == "dev");
-    let renderer = error_page_renderer.unwrap_or_else(error_pages::default_renderer);
+
     // Encrypted columns (#805) compose into log scrubbing (#697): their names are
     // always scrubbed from trace/error parameter output so ciphertext-backed
     // values never leak through logs even if an app forgets to list them.
     let mut filter_parameters = config.log.filter_parameters.clone();
     filter_parameters.extend(crate::encryption::registered_encrypted_column_names());
-    let error_page_filter = crate::middleware::error_page_filter::ErrorPageFilter {
-        renderer,
-        is_dev,
-        parameter_filter: crate::log::filter::ParameterFilter::new(
-            &filter_parameters,
-            &config.log.unfilter_parameters,
-        ),
-    };
 
-    // Combine the Problem Details normalizer and error page filter with user
-    // exception filters. Problem Details runs first so HTML negotiation can
-    // still replace the JSON response for browser requests.
-    let mut all_filters: Vec<Arc<dyn ExceptionFilter>> = vec![
-        Arc::new(ProblemDetailsFilter { is_dev }),
-        Arc::new(error_page_filter),
-    ];
+    // When the `maud` feature is enabled, an ErrorPageFilter renders styled HTML
+    // error pages for browser requests. Without `maud`, only the
+    // ProblemDetailsFilter (JSON error normalization) is installed.
+    let mut all_filters: Vec<Arc<dyn ExceptionFilter>> =
+        vec![Arc::new(ProblemDetailsFilter { is_dev })];
+    #[cfg(feature = "maud")]
+    {
+        let renderer = error_page_renderer.unwrap_or_else(error_pages::default_renderer);
+        let error_page_filter = crate::middleware::error_page_filter::ErrorPageFilter {
+            renderer,
+            is_dev,
+            parameter_filter: crate::log::filter::ParameterFilter::new(
+                &filter_parameters,
+                &config.log.unfilter_parameters,
+            ),
+        };
+        all_filters.push(Arc::new(error_page_filter));
+    }
     all_filters.extend(exception_filters);
 
     let count = all_filters.len();
@@ -2676,6 +2685,7 @@ pub fn try_build_router_with_static(
             nest_routers: Vec::new(),
             custom_layers: Vec::new(),
             static_gate_layers: Vec::new(),
+            #[cfg(feature = "maud")]
             error_page_renderer: None,
             session_store: None,
             #[cfg(feature = "openapi")]
@@ -4091,6 +4101,7 @@ mod tests {
             nest_routers: Vec::new(),
             custom_layers: Vec::new(),
             static_gate_layers: Vec::new(),
+            #[cfg(feature = "maud")]
             error_page_renderer: None,
             session_store: None,
             openapi: Some(openapi),
@@ -4401,6 +4412,7 @@ mod tests {
             nest_routers: Vec::new(),
             custom_layers: Vec::new(),
             static_gate_layers: Vec::new(),
+            #[cfg(feature = "maud")]
             error_page_renderer: None,
             session_store: None,
             openapi: Some(openapi),
@@ -4428,6 +4440,7 @@ mod tests {
             nest_routers: Vec::new(),
             custom_layers: Vec::new(),
             static_gate_layers: Vec::new(),
+            #[cfg(feature = "maud")]
             error_page_renderer: None,
             session_store: None,
             openapi: Some(openapi),
@@ -4477,6 +4490,7 @@ mod tests {
             nest_routers: Vec::new(),
             custom_layers: Vec::new(),
             static_gate_layers: Vec::new(),
+            #[cfg(feature = "maud")]
             error_page_renderer: None,
             session_store: None,
             openapi: Some(openapi),
@@ -4507,6 +4521,7 @@ mod tests {
             nest_routers: Vec::new(),
             custom_layers: Vec::new(),
             static_gate_layers: Vec::new(),
+            #[cfg(feature = "maud")]
             error_page_renderer: None,
             session_store: None,
             openapi: Some(openapi),
@@ -4543,6 +4558,7 @@ mod tests {
             nest_routers: vec![("/api".to_owned(), nested)],
             custom_layers: Vec::new(),
             static_gate_layers: Vec::new(),
+            #[cfg(feature = "maud")]
             error_page_renderer: None,
             session_store: None,
             openapi: Some(openapi),
@@ -4580,6 +4596,7 @@ mod tests {
             nest_routers: Vec::new(),
             custom_layers: Vec::new(),
             static_gate_layers: Vec::new(),
+            #[cfg(feature = "maud")]
             error_page_renderer: None,
             session_store: None,
             openapi: Some(openapi),
@@ -5877,6 +5894,7 @@ mod trusted_host_tests {
             nest_routers: Vec::new(),
             custom_layers: Vec::new(),
             static_gate_layers: vec![gate],
+            #[cfg(feature = "maud")]
             error_page_renderer: None,
             session_store: None,
             #[cfg(feature = "openapi")]

@@ -88,6 +88,7 @@ pub mod credentials;
 pub mod db;
 pub mod encryption;
 pub mod error;
+#[cfg(feature = "maud")]
 pub mod error_pages;
 pub mod extract;
 pub mod health;

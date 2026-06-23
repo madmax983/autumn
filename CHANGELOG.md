@@ -5,6 +5,16 @@ All notable changes to the Autumn framework will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **ci:** feature-combination compile gate covering 35 `autumn-web` feature
+  combinations — each individual flag in isolation (`cargo hack --each-feature`)
+  plus curated real-world combos (`db`, `mail`, `maud,htmx`, `storage,db`,
+  `telemetry-otlp`) — so downstream apps building with a trimmed feature set
+  can't silently break between releases (#982).
+
 ## [0.5.0] - 2026-06-16
 
 ### Added

@@ -202,6 +202,36 @@ Cargo feature flags are part of the public API:
 - The `default` feature set is stable: removing a feature from `default`
   is a breaking change.
 
+### Feature-combination CI gate
+
+Every individual `autumn-web` feature flag is proven to compile in
+isolation (with `--no-default-features`) in CI via a `cargo hack
+--each-feature` sweep.  A curated set of representative real-world
+combinations is also checked on every PR:
+
+| Combination | Rationale |
+|---|---|
+| `--no-default-features` (no flags) | bare-minimum compile |
+| each flag alone | isolation regression guard |
+| `db` | db-only API server |
+| `mail` | mail without the full default set |
+| `storage,db` | file storage backed by database |
+| `maud,htmx` | minimal web front-end |
+| `telemetry-otlp` | standalone telemetry |
+
+### Unsupported feature combinations (CI excluded)
+
+The following features are **not** checked in CI because their build
+requirements make them cost-prohibitive or unsuitable for standard
+runners.  They remain available for users with the necessary environment:
+
+| Feature | Reason excluded |
+|---|---|
+| `managed-pg` | downloads Postgres binaries on first build |
+| `managed-pg-bundled` | embeds Postgres binaries (~150 MB) into the executable |
+| `system-tests` | requires a headless Chromium browser (`chromiumoxide`) |
+| `test-support` | dev-only; pulls `testcontainers` (Docker-dependent) |
+
 ## Deprecation process
 
 We prefer a long deprecation ramp over abrupt removal:
