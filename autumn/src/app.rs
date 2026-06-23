@@ -34,6 +34,7 @@ use futures::FutureExt as _;
 use tracing::Instrument as _;
 
 use crate::config::{AutumnConfig, ConfigLoader};
+#[cfg(feature = "maud")]
 use crate::error_pages::{ErrorPageRenderer, SharedRenderer};
 use crate::middleware::exception_filter::ExceptionFilter;
 #[cfg(feature = "db")]
@@ -86,6 +87,7 @@ pub fn app() -> AppBuilder {
         shutdown_hooks: Vec::new(),
         extensions: HashMap::new(),
         registered_plugins: HashSet::new(),
+        #[cfg(feature = "maud")]
         error_page_renderer: None,
         #[cfg(feature = "db")]
         migrations: Vec::new(),
@@ -275,6 +277,7 @@ pub struct AppBuilder {
     /// Plugin names that have already been applied, for duplicate detection.
     pub(crate) registered_plugins: HashSet<String>,
     /// Custom error page renderer (overrides built-in pages).
+    #[cfg(feature = "maud")]
     error_page_renderer: Option<SharedRenderer>,
     /// Embedded Diesel migrations, registered via `.migrations()`.
     #[cfg(feature = "db")]
@@ -866,6 +869,8 @@ impl AppBuilder {
     /// Only one renderer can be active. Calling this method multiple times
     /// replaces the previous renderer.
     ///
+    /// Requires the `maud` feature.
+    ///
     /// # Examples
     ///
     /// ```rust,no_run
@@ -894,6 +899,7 @@ impl AppBuilder {
     /// # }
     /// ```
     #[must_use]
+    #[cfg(feature = "maud")]
     pub fn error_pages(mut self, renderer: impl ErrorPageRenderer) -> Self {
         self.error_page_renderer = Some(Arc::new(renderer));
         self
@@ -2528,6 +2534,7 @@ impl AppBuilder {
             shutdown_hooks,
             extensions: _,
             registered_plugins: _,
+            #[cfg(feature = "maud")]
             error_page_renderer,
             #[cfg(feature = "db")]
             migrations,
@@ -3074,6 +3081,7 @@ impl AppBuilder {
                 nest_routers,
                 custom_layers,
                 static_gate_layers,
+                #[cfg(feature = "maud")]
                 error_page_renderer,
                 session_store,
                 // Respect the [openapi] profile gate: if disabled in config,
@@ -3566,7 +3574,8 @@ impl AppBuilder {
             shutdown_hooks: _,
             extensions: _,
             registered_plugins: _,
-            error_page_renderer: _,
+            #[cfg(feature = "maud")]
+                error_page_renderer: _,
             #[cfg(feature = "db")]
                 migrations: _,
             config_loader_factory,
@@ -3899,6 +3908,7 @@ impl AppBuilder {
                 nest_routers: Vec::new(),
                 custom_layers,
                 static_gate_layers: Vec::new(),
+                #[cfg(feature = "maud")]
                 error_page_renderer: None,
                 session_store,
                 #[cfg(feature = "openapi")]
@@ -8183,6 +8193,7 @@ mod tests {
                 nest_routers: Vec::new(),
                 custom_layers,
                 static_gate_layers: Vec::new(),
+                #[cfg(feature = "maud")]
                 error_page_renderer: None,
                 session_store: None,
                 #[cfg(feature = "openapi")]

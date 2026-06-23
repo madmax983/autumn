@@ -10,10 +10,16 @@
 
 use axum::response::{IntoResponse, Response};
 
+#[cfg(feature = "maud")]
 use crate::error_pages::dev_badge::{self, DevBadgeContext};
+#[cfg(feature = "maud")]
 use crate::error_pages::renderer::ErrorContext;
+#[cfg(feature = "maud")]
 use crate::error_pages::{self, SharedRenderer};
-use crate::middleware::exception_filter::{AutumnErrorInfo, ExceptionFilter};
+#[cfg(feature = "maud")]
+use crate::middleware::exception_filter::AutumnErrorInfo;
+#[cfg(feature = "maud")]
+use crate::middleware::exception_filter::ExceptionFilter;
 
 /// Exception filter that renders HTML error pages for browser requests.
 ///
@@ -22,12 +28,16 @@ use crate::middleware::exception_filter::{AutumnErrorInfo, ExceptionFilter};
 /// response is replaced with a styled HTML page.
 ///
 /// In dev profile, the HTML page includes a floating error badge overlay.
+///
+/// Only available when the `maud` feature is enabled.
+#[cfg(feature = "maud")]
 pub struct ErrorPageFilter {
     pub renderer: SharedRenderer,
     pub is_dev: bool,
     pub parameter_filter: crate::log::filter::ParameterFilter,
 }
 
+#[cfg(feature = "maud")]
 impl ExceptionFilter for ErrorPageFilter {
     fn filter(&self, error: &AutumnErrorInfo, response: Response) -> Response {
         let wants_html = response
@@ -366,6 +376,7 @@ fn extract_path_params(pattern: &str, uri_path: &str) -> serde_json::Value {
 }
 
 /// Convert an inspector [`QueryRecord`] to the overlay's [`SqlQueryInfo`].
+#[cfg(feature = "maud")]
 fn query_record_to_sql_info(
     r: &crate::inspector::QueryRecord,
 ) -> crate::error_pages::dev_badge::SqlQueryInfo {
@@ -518,6 +529,7 @@ pub async fn fallback_404_handler(method: axum::http::Method, uri: axum::http::U
         .into_response()
 }
 
+#[cfg(feature = "maud")]
 impl ErrorPageFilter {
     fn build_error_context(
         error: &AutumnErrorInfo,
@@ -732,6 +744,7 @@ mod tests {
     use tower::ServiceExt;
 
     use crate::error::AutumnError;
+    #[cfg(feature = "maud")]
     use crate::error_pages;
     use crate::middleware::exception_filter::ExceptionFilterLayer;
 
