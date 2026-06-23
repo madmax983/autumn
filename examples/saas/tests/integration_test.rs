@@ -92,13 +92,11 @@ fn session_cookie(resp: &autumn_web::test::TestResponse) -> String {
         .to_owned()
 }
 
-/// Sign up an organisation and return its session cookie.
-async fn signup(client: &TestClient, organisation: &str, email: &str) -> String {
+/// Sign up a user and return their session cookie.
+async fn signup(client: &TestClient, email: &str) -> String {
     let resp = client
         .post("/signup")
-        .form(&format!(
-            "organisation={organisation}&email={email}&password=password123"
-        ))
+        .form(&format!("email={email}&password=password123"))
         .send()
         .await;
     resp.assert_status(303);
@@ -109,7 +107,7 @@ async fn signup(client: &TestClient, organisation: &str, email: &str) -> String 
 #[ignore = "requires Docker (testcontainers)"]
 async fn signup_login_dashboard_returns_200() {
     let client = db_client().await;
-    let cookie = signup(&client, "Acme", "founder@acme.test").await;
+    let cookie = signup(&client, "founder@acme.test").await;
 
     // The tenant-scoped dashboard renders for the signed-in session.
     client
@@ -141,8 +139,8 @@ async fn signup_login_dashboard_returns_200() {
 async fn tenants_are_isolated() {
     let client = db_client().await;
 
-    let acme = signup(&client, "Acme", "a@acme.test").await;
-    let globex = signup(&client, "Globex", "b@globex.test").await;
+    let acme = signup(&client, "a@acme.test").await;
+    let globex = signup(&client, "b@globex.test").await;
 
     // Acme creates a project.
     client

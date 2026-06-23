@@ -18,7 +18,6 @@ use super::layout::layout;
 
 #[derive(Deserialize)]
 pub struct SignupForm {
-    pub organisation: String,
     pub email: String,
     pub password: String,
 }
@@ -29,22 +28,10 @@ pub struct LoginForm {
     pub password: String,
 }
 
-/// Derive a stable tenant id from an organisation name (e.g. "Acme Inc" →
-/// "acme-inc"). Each distinct organisation becomes its own tenant.
-fn tenant_slug(organisation: &str) -> String {
-    let slug: String = organisation
-        .trim()
-        .to_lowercase()
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-        .collect();
-    let slug = slug.trim_matches('-').to_owned();
-    if slug.is_empty() {
-        "tenant".to_owned()
-    } else {
-        slug
-    }
-}
+// bcrypt hash used as a dummy target when the email is not found, so the
+// login handler takes the same wall time whether or not the account exists.
+const DUMMY_HASH: &str =
+    "$2b$12$Ro0CUfOqk6cXEKf3dyaM7OhSCvnwM9s1Aw6lfLP2.GvpAfNXwi.2K";
 
 // ── Signup ───────────────────────────────────────────────────────────────────
 
@@ -54,13 +41,8 @@ pub async fn signup_form() -> Markup {
         "Sign up",
         false,
         html! {
-            h1 class="text-2xl font-bold mb-6" { "Create your organisation" }
+            h1 class="text-2xl font-bold mb-6" { "Create your account" }
             form action="/signup" method="post" class="space-y-4 bg-white rounded-lg shadow p-6 max-w-md" {
-                div {
-                    label for="organisation" class="block text-sm font-medium mb-1" { "Organisation" }
-                    input #organisation name="organisation" required placeholder="Acme Inc"
-                          class="w-full border rounded px-3 py-2";
-                }
                 div {
                     label for="email" class="block text-sm font-medium mb-1" { "Email" }
                     input #email type="email" name="email" required autocomplete="email"
@@ -99,7 +81,9 @@ pub async fn signup(
         ));
     }
 
-    let tenant_id = tenant_slug(&form.organisation);
+    // Each account gets its own isolated tenant; email is the unique identifier
+    // (already enforced by the UNIQUE constraint on users.email).
+    let tenant_id = email.clone();
     let password_hash = hash_password(&form.password).await?;
 
     let user: User = diesel::insert_into(users::table)
@@ -166,11 +150,16 @@ pub async fn login(
         .await
         .optional()?;
 
-    // Always run a verification (even when the user is missing, against a dummy
-    // hash) so timing does not reveal whether the email exists.
     let invalid = || AutumnError::unauthorized_msg("Invalid email or password");
-    let Some(user) = user else {
-        return Err(invalid());
+    // Always run a bcrypt verification so the response time is constant whether
+    // or not the email exists — prevents a timing side-channel that reveals
+    // which accounts are registered.
+    let user = match user {
+        Some(u) => u,
+        None => {
+            let _ = verify_password(&form.password, DUMMY_HASH).await;
+            return Err(invalid());
+        }
     };
     if !verify_password(&form.password, &user.password_hash).await? {
         return Err(invalid());

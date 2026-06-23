@@ -280,12 +280,20 @@ fn run_inner(
         }
     };
 
+    let crate_name = name.replace('-', "_");
+    let vars = TemplateVars {
+        project_name: name,
+        crate_name: &crate_name,
+        autumn_version: env!("CARGO_PKG_VERSION"),
+        rust_version: option_env!("CARGO_PKG_RUST_VERSION").unwrap_or("1.88.0"),
+    };
+
     println!("\nCreating `{name}`:");
-    scaffold(&contents, name, &project_dir, flags)?;
+    scaffold(&contents, &vars, &project_dir, flags)?;
     drop(clone_guard);
 
     if !flags.dry_run {
-        print_post_scaffold(&contents.manifest, name);
+        print_post_scaffold(&contents.manifest, &vars);
     }
     Ok(())
 }
@@ -322,11 +330,15 @@ fn load_from_embedded(dir: &Dir<'_>) -> Result<StarterContents, StarterError> {
     Ok(finish_contents(manifest, all))
 }
 
-/// Recursively read a starter from the filesystem, skipping `.git`.
+/// Directory names that are always skipped when collecting a community starter
+/// from the local filesystem — they contain build artefacts, not source files.
+const SKIP_DIRS: &[&str] = &[".git", "target", "node_modules", "dist", "build"];
+
+/// Recursively read a starter from the filesystem, skipping common artefact dirs.
 fn collect_dir(root: &Path, cur: &Path, out: &mut Vec<StarterFile>) -> io::Result<()> {
     for entry in fs::read_dir(cur)? {
         let entry = entry?;
-        if entry.file_name() == ".git" {
+        if SKIP_DIRS.contains(&entry.file_name().to_str().unwrap_or("")) {
             continue;
         }
         let path = entry.path();
@@ -380,18 +392,10 @@ fn is_verbatim(manifest: &Manifest, rel_path: &str) -> bool {
 /// Render and emit a loaded starter into `project_dir`.
 fn scaffold(
     contents: &StarterContents,
-    project_name: &str,
+    vars: &TemplateVars<'_>,
     project_dir: &Path,
     flags: Flags,
 ) -> Result<(), StarterError> {
-    let crate_name = project_name.replace('-', "_");
-    let vars = TemplateVars {
-        project_name,
-        crate_name: &crate_name,
-        autumn_version: env!("CARGO_PKG_VERSION"),
-        rust_version: option_env!("CARGO_PKG_RUST_VERSION").unwrap_or("1.88.0"),
-    };
-
     let mut plan = Plan::new(project_dir);
     for file in &contents.files {
         let target = project_dir.join(&file.rel_path);
@@ -411,16 +415,9 @@ fn scaffold(
 }
 
 /// Print the manifest's post-scaffold notes (with `{{…}}` substituted).
-fn print_post_scaffold(manifest: &Manifest, project_name: &str) {
+fn print_post_scaffold(manifest: &Manifest, vars: &TemplateVars<'_>) {
     if let Some(notes) = &manifest.starter.post_scaffold_notes {
-        let crate_name = project_name.replace('-', "_");
-        let vars = TemplateVars {
-            project_name,
-            crate_name: &crate_name,
-            autumn_version: env!("CARGO_PKG_VERSION"),
-            rust_version: option_env!("CARGO_PKG_RUST_VERSION").unwrap_or("1.88.0"),
-        };
-        println!("\n{}", render_template(notes, &vars));
+        println!("\n{}", render_template(notes, vars));
     }
 }
 
@@ -504,7 +501,14 @@ mod tests {
 
         let tmp = tempfile::TempDir::new().unwrap();
         let dest = tmp.path().join("acme-app");
-        scaffold(&contents, "acme-app", &dest, Flags::default()).unwrap();
+        let crate_name = "acme_app".to_owned();
+        let vars = TemplateVars {
+            project_name: "acme-app",
+            crate_name: &crate_name,
+            autumn_version: env!("CARGO_PKG_VERSION"),
+            rust_version: option_env!("CARGO_PKG_RUST_VERSION").unwrap_or("1.88.0"),
+        };
+        scaffold(&contents, &vars, &dest, Flags::default()).unwrap();
 
         // Template tokens substituted in text files.
         let cargo = fs::read_to_string(dest.join("Cargo.toml")).unwrap();
@@ -547,7 +551,14 @@ mod tests {
         let contents = load_from_embedded(&builtin::SAAS).unwrap();
         let tmp = tempfile::TempDir::new().unwrap();
         let dest = tmp.path().join("saas");
-        scaffold(&contents, "saas", &dest, Flags::default()).unwrap();
+        let crate_name = "saas".to_owned();
+        let vars = TemplateVars {
+            project_name: "saas",
+            crate_name: &crate_name,
+            autumn_version: env!("CARGO_PKG_VERSION"),
+            rust_version: option_env!("CARGO_PKG_RUST_VERSION").unwrap_or("1.88.0"),
+        };
+        scaffold(&contents, &vars, &dest, Flags::default()).unwrap();
 
         let example_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../examples/saas");

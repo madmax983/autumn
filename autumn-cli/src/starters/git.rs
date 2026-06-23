@@ -91,38 +91,89 @@ fn expand_shorthand(repo: &str) -> Result<String, StarterError> {
     Ok(format!("https://github.com/{repo}.git"))
 }
 
+/// True when `reference` is a full 40-hex commit SHA.
+///
+/// `git clone --branch` rejects raw commit SHAs; those require a separate
+/// fetch+checkout flow instead of `--branch`.
+fn is_full_sha(r: &str) -> bool {
+    r.len() == 40 && r.chars().all(|c| c.is_ascii_hexdigit())
+}
+
 /// Shallow-clone `source` into `dest`, checking out a pinned ref when present.
 ///
 /// Shells out to the system `git` (consistent with the repo's existing tooling;
 /// no `git2`/`gix` dependency). A missing `git` binary is mapped to a clear,
 /// actionable error.
 ///
+/// Ref handling:
+/// - No ref: `git clone --depth 1 <url> <dest>` (default branch).
+/// - Branch / tag: `git clone --depth 1 --branch <ref> <url> <dest>`.
+/// - Full 40-hex SHA: full clone then `git checkout <sha>`, because
+///   `--branch` does not accept raw commit SHAs.
+///
 /// # Errors
 /// Returns [`StarterError::GitNotInstalled`] when `git` is not on `PATH`, or
-/// [`StarterError::CloneFailed`] when the clone command exits non-zero.
+/// [`StarterError::CloneFailed`] when any git command exits non-zero.
 pub fn clone_into(source: &GitSource, dest: &Path) -> Result<(), StarterError> {
-    let mut cmd = Command::new("git");
-    cmd.arg("clone").arg("--depth").arg("1");
-    if let Some(reference) = &source.reference {
-        cmd.arg("--branch").arg(reference);
-    }
-    cmd.arg(&source.url).arg(dest);
-
-    let output = cmd.output().map_err(|e| {
+    let map_io = |e: std::io::Error| {
         if e.kind() == std::io::ErrorKind::NotFound {
             StarterError::GitNotInstalled
         } else {
             StarterError::CloneFailed(e.to_string())
         }
-    })?;
+    };
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(StarterError::CloneFailed(format!(
-            "git clone of {} failed: {}",
-            source.url,
-            stderr.trim()
-        )));
+    match &source.reference {
+        Some(r) if is_full_sha(r) => {
+            // Full clone then checkout — the only reliable path for raw SHAs.
+            let output = Command::new("git")
+                .args(["clone", &source.url])
+                .arg(dest)
+                .output()
+                .map_err(map_io)?;
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                return Err(StarterError::CloneFailed(format!(
+                    "git clone of {} failed: {}",
+                    source.url,
+                    stderr.trim()
+                )));
+            }
+            let output = Command::new("git")
+                .args(["-C"])
+                .arg(dest)
+                .args(["checkout", r])
+                .output()
+                .map_err(map_io)?;
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                return Err(StarterError::CloneFailed(format!(
+                    "git checkout of {} in {} failed: {}",
+                    r,
+                    dest.display(),
+                    stderr.trim()
+                )));
+            }
+        }
+        ref_ => {
+            // Shallow clone; optionally pin a branch or tag with --branch.
+            let mut cmd = Command::new("git");
+            cmd.arg("clone").arg("--depth").arg("1");
+            if let Some(reference) = ref_ {
+                cmd.arg("--branch").arg(reference);
+            }
+            cmd.arg(&source.url).arg(dest);
+
+            let output = cmd.output().map_err(map_io)?;
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                return Err(StarterError::CloneFailed(format!(
+                    "git clone of {} failed: {}",
+                    source.url,
+                    stderr.trim()
+                )));
+            }
+        }
     }
     Ok(())
 }
