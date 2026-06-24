@@ -54,22 +54,30 @@ pub fn encode_path_segment(value: impl std::fmt::Display) -> String {
 ///
 /// Splitting on `/` allows preserving directory slashes while percent-encoding
 /// other characters in each segment.
+///
+/// ⚡ Bolt: Optimization - Replaced `.collect::<Vec<String>>().join("/")` with a single
+/// pre-allocated string buffer and an iterative approach. This avoids multiple heap
+/// allocations per call by eliminating the intermediate vector and temporary strings.
 #[doc(hidden)]
 #[must_use]
 pub fn encode_catch_all_param(value: impl std::fmt::Display) -> String {
     let s = value.to_string();
-    s.split('/')
-        .map(|segment| {
-            if segment == "." {
-                "%2E".to_string()
-            } else if segment == ".." {
-                "%2E%2E".to_string()
-            } else {
-                percent_encode(segment)
-            }
-        })
-        .collect::<Vec<String>>()
-        .join("/")
+    let mut out = String::with_capacity(s.len());
+    let mut first = true;
+    for segment in s.split('/') {
+        if !first {
+            out.push('/');
+        }
+        first = false;
+        if segment == "." {
+            out.push_str("%2E");
+        } else if segment == ".." {
+            out.push_str("%2E%2E");
+        } else {
+            out.push_str(&percent_encode(segment));
+        }
+    }
+    out
 }
 
 /// Percent-encode a query component per RFC 3986.

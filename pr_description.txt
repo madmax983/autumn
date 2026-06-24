@@ -1,0 +1,4 @@
+💡 What: Replaced the inefficient `.collect::<Vec<String>>().join("/")` chain in `encode_catch_all_param` with a single, pre-allocated `String` and an iterative loop.
+🎯 Why: The original implementation caused multiple heap allocations per call: one for each segment encoded via `to_string()`, one for the intermediate `Vec<String>`, and one final string allocation during `.join("/")`. This created unnecessary allocation pressure on a frequently hit hot path for catch-all parameter encoding.
+📊 Impact: Eliminates the intermediate vector and temporary string allocations. Reduces memory allocation overhead while preserving safe iteration and bounds without unsafe code.
+🔭 Measurement: Verify correct behavior and bounds checks by running `cargo test -p autumn-web --lib paths`.
