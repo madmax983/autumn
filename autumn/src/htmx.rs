@@ -206,6 +206,274 @@ fn append_hx_header<T: IntoResponse>(response: T, name: &'static str, value: &st
     res
 }
 
+#[cfg(feature = "maud")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OobMethod {
+    OuterHTML,
+    InnerHTML,
+    BeforeBegin,
+    AfterBegin,
+    BeforeEnd,
+    AfterEnd,
+    Delete,
+}
+
+#[cfg(feature = "maud")]
+impl OobMethod {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::OuterHTML => "outerHTML",
+            Self::InnerHTML => "innerHTML",
+            Self::BeforeBegin => "beforebegin",
+            Self::AfterBegin => "afterbegin",
+            Self::BeforeEnd => "beforeend",
+            Self::AfterEnd => "afterend",
+            Self::Delete => "delete",
+        }
+    }
+}
+
+#[cfg(feature = "maud")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OobSwap {
+    /// Swap the element outerHTML-style by matching its own ID (`hx-swap-oob="true"`).
+    True,
+    /// Swap using a specific method, targeting the element matching the fragment's ID.
+    OuterHTML,
+    InnerHTML,
+    BeforeBegin,
+    AfterBegin,
+    BeforeEnd,
+    AfterEnd,
+    Delete,
+    /// Swap using a specific method targeting a custom CSS selector.
+    Target(OobMethod, String),
+    /// Already contains `hx-swap-oob` on the root element. Do not wrap in a `<template>` tag.
+    Raw,
+    /// Custom raw string for the `hx-swap-oob` attribute.
+    Custom(String),
+}
+
+#[cfg(feature = "maud")]
+impl OobSwap {
+    pub fn format_value<'a>(&'a self, id: &'a str) -> std::borrow::Cow<'a, str> {
+        let clean_id = id.strip_prefix('#').unwrap_or(id);
+        match self {
+            Self::True => std::borrow::Cow::Borrowed("true"),
+            Self::OuterHTML => std::borrow::Cow::Borrowed("outerHTML"),
+            Self::InnerHTML => std::borrow::Cow::Owned(format!("innerHTML:#{}", clean_id)),
+            Self::BeforeBegin => std::borrow::Cow::Owned(format!("beforebegin:#{}", clean_id)),
+            Self::AfterBegin => std::borrow::Cow::Owned(format!("afterbegin:#{}", clean_id)),
+            Self::BeforeEnd => std::borrow::Cow::Owned(format!("beforeend:#{}", clean_id)),
+            Self::AfterEnd => std::borrow::Cow::Owned(format!("afterend:#{}", clean_id)),
+            Self::Delete => std::borrow::Cow::Owned(format!("delete:#{}", clean_id)),
+            Self::Target(method, selector) => std::borrow::Cow::Owned(format!("{}:{}", method.as_str(), selector)),
+            Self::Custom(val) => std::borrow::Cow::Borrowed(val),
+            Self::Raw => unreachable!("Raw strategy should not be formatted into a template wrapper"),
+        }
+    }
+}
+
+#[cfg(feature = "maud")]
+#[derive(Debug, Clone)]
+struct OobFragment {
+    id: String,
+    strategy: OobSwap,
+    markup: maud::Markup,
+}
+
+#[cfg(feature = "maud")]
+/// A response builder for composing out-of-band multi-region swaps in htmx.
+///
+/// This builder allows a handler to return a primary HTML fragment plus one or
+/// more out-of-band (OOB) fragments that update other disjoint regions of the
+/// page.
+///
+/// # Example
+///
+/// ```rust
+/// use autumn_web::prelude::*;
+/// use autumn_web::htmx::{HtmxFragments, OobSwap};
+/// use maud::Render;
+///
+/// let primary = html! { div { "Task created successfully!" } };
+/// let flash = html! { div id="flash-message" class="alert alert-success" { "Succesfully saved!" } };
+/// let counter = html! { span { "5" } };
+///
+/// let response = HtmxFragments::new(primary)
+///     .oob("flash-message", flash)
+///     .oob_with_strategy("task-count", OobSwap::InnerHTML, counter);
+///
+/// // HtmxFragments implements `IntoResponse` and `maud::Render`
+/// let rendered = response.render().into_string();
+/// assert!(rendered.contains("<div>Task created successfully!</div>"));
+/// assert!(rendered.contains("<template hx-swap-oob=\"true\"><div id=\"flash-message\""));
+/// assert!(rendered.contains("<template hx-swap-oob=\"innerHTML:#task-count\"><span>5</span></template>"));
+/// ```
+#[derive(Debug, Clone)]
+pub struct HtmxFragments {
+    primary: Option<maud::Markup>,
+    oob: Vec<OobFragment>,
+}
+
+#[cfg(feature = "maud")]
+impl HtmxFragments {
+    /// Create a new builder with a primary fragment.
+    pub fn new(primary: maud::Markup) -> Self {
+        Self {
+            primary: Some(primary),
+            oob: Vec::new(),
+        }
+    }
+
+    /// Create a new empty builder (only OOB fragments).
+    pub fn oob_only() -> Self {
+        Self {
+            primary: None,
+            oob: Vec::new(),
+        }
+    }
+
+    /// Attach an out-of-band fragment using the default `OobSwap::True` strategy.
+    pub fn oob(self, id: impl Into<String>, markup: maud::Markup) -> Self {
+        self.oob_with_strategy(id, OobSwap::True, markup)
+    }
+
+    /// Attach an out-of-band fragment with a specific swap strategy.
+    pub fn oob_with_strategy(mut self, id: impl Into<String>, strategy: OobSwap, markup: maud::Markup) -> Self {
+        self.oob.push(OobFragment {
+            id: id.into(),
+            strategy,
+            markup,
+        });
+        self
+    }
+}
+
+#[cfg(feature = "maud")]
+fn escape_attribute(w: &mut String, s: &str) {
+    for c in s.chars() {
+        match c {
+            '&' => w.push_str("&amp;"),
+            '"' => w.push_str("&quot;"),
+            '<' => w.push_str("&lt;"),
+            '>' => w.push_str("&gt;"),
+            _ => w.push(c),
+        }
+    }
+}
+
+#[cfg(feature = "maud")]
+impl maud::Render for HtmxFragments {
+    fn render_to(&self, w: &mut String) {
+        if let Some(primary) = &self.primary {
+            primary.render_to(w);
+        }
+        for oob in &self.oob {
+            let rendered = &oob.markup.0;
+            if has_oob_attribute(rendered) || matches!(oob.strategy, OobSwap::Raw) {
+                w.push_str(rendered);
+            } else {
+                let value = oob.strategy.format_value(&oob.id);
+                w.push_str("<template hx-swap-oob=\"");
+                escape_attribute(w, &value);
+                w.push_str("\">");
+                w.push_str(rendered);
+                w.push_str("</template>");
+            }
+        }
+    }
+}
+
+#[cfg(feature = "maud")]
+impl IntoResponse for HtmxFragments {
+    fn into_response(self) -> Response {
+        let mut capacity = 0;
+        if let Some(primary) = &self.primary {
+            capacity += primary.0.len();
+        }
+        for oob in &self.oob {
+            capacity += oob.markup.0.len() + 64;
+        }
+        let mut w = String::with_capacity(capacity);
+        
+        use maud::Render;
+        self.render_to(&mut w);
+        axum::response::Html(w).into_response()
+    }
+}
+
+#[cfg(feature = "maud")]
+fn has_oob_attribute(html: &str) -> bool {
+    let mut in_tag = false;
+    let mut in_quote = None;
+    let mut chars = html.char_indices().peekable();
+
+    while let Some((idx, c)) = chars.next() {
+        if in_tag {
+            if let Some(q) = in_quote {
+                if c == q {
+                    in_quote = None;
+                }
+            } else if c == '"' || c == '\'' {
+                in_quote = Some(c);
+            } else if c == '>' {
+                in_tag = false;
+            } else {
+                let remaining = &html[idx..];
+                let match_len = if remaining.get(..11).map_or(false, |s| s.eq_ignore_ascii_case("hx-swap-oob")) {
+                    Some(11)
+                } else if remaining.get(..16).map_or(false, |s| s.eq_ignore_ascii_case("data-hx-swap-oob")) {
+                    Some(16)
+                } else {
+                    None
+                };
+
+                if let Some(len) = match_len {
+                    let after = remaining.chars().nth(len);
+                    match after {
+                        None | Some('=') | Some(' ') | Some('\t') | Some('\n') | Some('\r') | Some('>') | Some('/') => {
+                            let is_word_start = if idx == 0 {
+                                true
+                            } else if let Some(prev_char) = html[..idx].chars().next_back() {
+                                prev_char.is_ascii_whitespace() 
+                                    || prev_char == '/' 
+                                    || prev_char == '<' 
+                                    || prev_char == '"' 
+                                    || prev_char == '\''
+                            } else {
+                                true
+                            };
+                            if is_word_start {
+                                return true;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        } else if c == '<' {
+            let remaining = &html[idx..];
+            if remaining.starts_with("<!--") {
+                while let Some((_, next_c)) = chars.next() {
+                    if next_c == '-' {
+                        let rem = &html[chars.peek().map(|&(i, _)| i).unwrap_or(html.len())..];
+                        if rem.starts_with("->") {
+                            chars.next();
+                            chars.next();
+                            break;
+                        }
+                    }
+                }
+            } else {
+                in_tag = true;
+                in_quote = None;
+            }
+        }
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -362,5 +630,108 @@ mod tests {
         assert_eq!(hx.prompt, None);
         assert!(!hx.boosted);
         Ok(())
+    }
+
+    #[cfg(feature = "maud")]
+    #[tokio::test]
+    async fn htmx_fragments_renders_correctly() {
+        use axum::response::IntoResponse;
+
+        let primary = maud::html! { div { "primary body" } };
+        let oob1 = maud::html! { div id="badge" { "3" } };
+        let oob2 = maud::html! { li { "new item" } };
+
+        let response = HtmxFragments::new(primary)
+            .oob("badge", oob1)
+            .oob_with_strategy("list", OobSwap::BeforeEnd, oob2)
+            .into_response();
+
+        let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_str = String::from_utf8(body_bytes.to_vec()).unwrap();
+
+        assert!(body_str.contains("<div>primary body</div>"), "got: {}", body_str);
+        assert!(body_str.contains("<template hx-swap-oob=\"true\"><div id=\"badge\">3</div></template>"), "got: {}", body_str);
+        assert!(body_str.contains("<template hx-swap-oob=\"beforeend:#list\"><li>new item</li></template>"), "got: {}", body_str);
+    }
+
+    #[cfg(feature = "maud")]
+    #[tokio::test]
+    async fn htmx_fragments_empty_primary() {
+        use axum::response::IntoResponse;
+
+        let oob = maud::html! { div id="badge" { "3" } };
+
+        let response = HtmxFragments::oob_only()
+            .oob("badge", oob)
+            .into_response();
+
+        let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_str = String::from_utf8(body_bytes.to_vec()).unwrap();
+
+        // Should not contain any stray wrapper or primary body, only the OOB fragment template
+        assert_eq!(body_str, "<template hx-swap-oob=\"true\"><div id=\"badge\">3</div></template>");
+    }
+
+    #[cfg(feature = "maud")]
+    #[tokio::test]
+    async fn htmx_fragments_no_double_wrap() {
+        use axum::response::IntoResponse;
+
+        // Already contains hx-swap-oob in markup
+        let oob = maud::html! { div id="badge" hx-swap-oob="true" { "3" } };
+
+        let response = HtmxFragments::oob_only()
+            .oob("badge", oob)
+            .into_response();
+
+        let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_str = String::from_utf8(body_bytes.to_vec()).unwrap();
+
+        // Should not be wrapped in template
+        assert_eq!(body_str, "<div id=\"badge\" hx-swap-oob=\"true\">3</div>");
+    }
+
+    #[cfg(feature = "maud")]
+    #[tokio::test]
+    async fn htmx_fragments_composes_with_headers() {
+        use axum::response::IntoResponse;
+
+        let primary = maud::html! { div { "ok" } };
+        let response = HtmxFragments::new(primary)
+            .hx_trigger("custom-event")
+            .into_response();
+
+        let headers = response.headers();
+        assert_eq!(headers.get("hx-trigger").unwrap(), "custom-event");
+
+        let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_str = String::from_utf8(body_bytes.to_vec()).unwrap();
+        assert!(body_str.contains("<div>ok</div>"));
+    }
+
+    #[test]
+    fn test_has_oob_attribute_detector() {
+        // True cases
+        assert!(has_oob_attribute("<div hx-swap-oob=\"true\"></div>"));
+        assert!(has_oob_attribute("<div data-hx-swap-oob=\"true\"></div>"));
+        assert!(has_oob_attribute("<div hx-swap-oob = 'true' ></div>"));
+        assert!(has_oob_attribute("<div hx-swap-oob></div>"));
+        assert!(has_oob_attribute("<div class=\"x\" hx-swap-oob=\"true\"></div>"));
+        assert!(has_oob_attribute("<div hx-swap-oob=\"true\" class=\"x\"></div>"));
+        
+        // False cases
+        assert!(!has_oob_attribute("<div>Learn hx-swap-oob today</div>"));
+        assert!(!has_oob_attribute("<div class=\"hx-swap-oob\"></div>"));
+        assert!(!has_oob_attribute("<div id=\"some-hx-swap-oob-element\"></div>"));
+        assert!(!has_oob_attribute("<!-- <div hx-swap-oob=\"true\"></div> -->"));
+        assert!(!has_oob_attribute("<div class=\"x\">some text hx-swap-oob=\"true\"</div>"));
     }
 }

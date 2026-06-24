@@ -3116,6 +3116,8 @@ impl AppBuilder {
             String,
             Option<(std::path::PathBuf, u64, u64)>,
         ) = if let Some(socket_path) = config.server.unix_socket.as_deref() {
+            #[allow(unused_variables)]
+            let socket_path = socket_path;
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;

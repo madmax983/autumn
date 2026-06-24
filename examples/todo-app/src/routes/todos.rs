@@ -252,6 +252,22 @@ fn pagination_controls(page: &Page<Todo>, base_url: &str) -> Markup {
     }
 }
 
+fn todo_count_badge(total: i64, done: i64) -> Markup {
+    html! {
+        div id="todo-count" class="flex items-center justify-between mb-3 px-1" {
+            @if total > 0 {
+                p class="text-xs text-stone-400" {
+                    (total) " item"
+                    @if total != 1 { "s" }
+                    @if done > 0 {
+                        " \u{2022} " (done) " done this page"
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Render the full list page given a paginated todo result and an optional pending form.
 async fn list_page(
     mut db: Db,
@@ -259,7 +275,7 @@ async fn list_page(
     pending: &ChangesetForm<TodoForm>,
 ) -> AutumnResult<Markup> {
     let page_data = Todo::page(page_req, &mut db).await?;
-    let done_count = page_data.content.iter().filter(|t| t.completed).count();
+    let done_count = page_data.content.iter().filter(|t| t.completed).count() as i64;
 
     Ok(layout(
         "Autumn Todo App",
@@ -275,6 +291,8 @@ async fn list_page(
 
             (new_todo_form(pending))
 
+            (todo_count_badge(page_data.total_elements as i64, done_count))
+
             @if page_data.total_elements == 0 {
                 div class="text-center py-16" {
                     p class="text-stone-400 text-sm" {
@@ -282,15 +300,6 @@ async fn list_page(
                     }
                 }
             } @else {
-                div class="flex items-center justify-between mb-3 px-1" {
-                    p class="text-xs text-stone-400" {
-                        (page_data.total_elements) " item"
-                        @if page_data.total_elements != 1 { "s" }
-                        @if done_count > 0 {
-                            " \u{2022} " (done_count) " done this page"
-                        }
-                    }
-                }
                 ul id="todo-list" class="space-y-2" {
                     @for todo in &page_data.content {
                         (todo_item(todo))
@@ -460,7 +469,7 @@ pub async fn create(db: Db, form: ChangesetForm<TodoForm>) -> AutumnResult<impl 
 /// Uses a single `UPDATE ... SET completed = NOT completed RETURNING *`
 /// query — one round-trip instead of three.
 #[post("/todos/{id}/toggle")]
-pub async fn toggle(id: Path<i64>, mut db: Db) -> AutumnResult<Markup> {
+pub async fn toggle(id: Path<i64>, mut db: Db, hx: HxRequest) -> AutumnResult<impl IntoResponse> {
     let updated: Todo = diesel::update(todos::table.find(*id))
         .set(todos::completed.eq(diesel::dsl::not(todos::completed)))
         .returning(Todo::as_returning())
@@ -468,7 +477,17 @@ pub async fn toggle(id: Path<i64>, mut db: Db) -> AutumnResult<Markup> {
         .await
         .map_err(AutumnError::not_found)?;
 
-    Ok(todo_item(&updated))
+    if hx.is_htmx {
+        let page_data = Todo::page(&PageRequest::default(), &mut *db).await?;
+        let done_count = page_data.content.iter().filter(|t| t.completed).count() as i64;
+        let count_markup = todo_count_badge(page_data.total_elements as i64, done_count);
+
+        Ok(autumn_web::htmx::HtmxFragments::new(todo_item(&updated))
+            .oob("todo-count", count_markup)
+            .into_response())
+    } else {
+        Ok(todo_item(&updated).into_response())
+    }
 }
 
 /// Delete a todo by ID.
@@ -498,7 +517,13 @@ pub async fn delete_todo(
     }
 
     if hx.is_htmx {
-        Ok(String::new().into_response())
+        let page_data = Todo::page(&PageRequest::default(), &mut *db).await?;
+        let done_count = page_data.content.iter().filter(|t| t.completed).count() as i64;
+        let count_markup = todo_count_badge(page_data.total_elements as i64, done_count);
+
+        Ok(autumn_web::htmx::HtmxFragments::oob_only()
+            .oob("todo-count", count_markup)
+            .into_response())
     } else {
         Ok(Redirect::to(&paths::list()).into_response())
     }

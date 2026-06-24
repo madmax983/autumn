@@ -232,7 +232,7 @@ pub use http_client as http;
 #[cfg(feature = "flash")]
 pub mod flash;
 #[cfg(feature = "htmx")]
-pub(crate) mod htmx;
+pub mod htmx;
 pub mod log;
 pub(crate) mod logging;
 /// Project typed JSON endpoints as Model Context Protocol (MCP) tools so AI
@@ -437,6 +437,8 @@ pub use validation::Validated;
 /// minified JS is served automatically at `/static/js/htmx.min.js`.
 #[cfg(feature = "htmx")]
 pub use htmx::{AUTUMN_WIDGETS_JS_PATH, HTMX_CSRF_JS_PATH, HTMX_JS, HTMX_JS_PATH, HTMX_VERSION};
+#[cfg(all(feature = "htmx", feature = "maud"))]
+pub use htmx::{HtmxFragments, OobSwap};
 #[cfg(feature = "mail")]
 pub use mail::{
     Mail, MailConfig, MailDeliveryQueue, MailDeliveryQueueHandle, MailError, MailTransport, Mailer,
