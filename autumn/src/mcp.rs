@@ -1594,11 +1594,18 @@ fn collapse_sse_body(bytes: &[u8]) -> String {
         .into_iter()
         .partition(|e| e.event.as_deref() == Some("result"));
     if results.is_empty() {
-        progress
-            .into_iter()
-            .map(|e| e.data)
-            .collect::<Vec<_>>()
-            .join("\n")
+        let mut len = 0;
+        for e in &progress {
+            len += e.data.len() + 1;
+        }
+        let mut out = String::with_capacity(len);
+        for (i, e) in progress.into_iter().enumerate() {
+            if i > 0 {
+                out.push('\n');
+            }
+            out.push_str(&e.data);
+        }
+        out
     } else {
         results.into_iter().map(|e| e.data).collect()
     }
@@ -1638,11 +1645,7 @@ fn build_request(
         // Use the same full segment encoder the typed path helpers use, so an
         // MCP call accepts the same values a direct HTTP caller could pass.
         let encoded = if is_catch_all {
-            value
-                .split('/')
-                .map(crate::paths::encode_path_segment)
-                .collect::<Vec<_>>()
-                .join("/")
+            crate::paths::encode_catch_all_param(&value)
         } else {
             crate::paths::encode_path_segment(&value)
         };
