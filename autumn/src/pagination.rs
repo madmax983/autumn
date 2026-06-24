@@ -1240,6 +1240,13 @@ mod tests {
     }
 
     #[test]
+    fn cursor_request_limit_is_size() {
+        let r = CursorRequest::new(None, 42);
+        assert_eq!(r.limit(), 42);
+        assert_eq!(r.fetch_limit(), 43);
+    }
+
+    #[test]
     fn cursor_request_decode_helper_returns_none_when_missing() {
         let r = CursorRequest::default();
         let decoded: Option<PostKey> = r.decode();
