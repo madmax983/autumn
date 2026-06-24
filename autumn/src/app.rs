@@ -3115,11 +3115,10 @@ impl AppBuilder {
             BoundListener,
             String,
             Option<(std::path::PathBuf, u64, u64)>,
-        ) = if let Some(socket_path) = config.server.unix_socket.as_deref() {
-            #[allow(unused_variables)]
-            let socket_path = socket_path;
+        ) = if let Some(_socket_path) = config.server.unix_socket.as_deref() {
             #[cfg(unix)]
             {
+                let socket_path = _socket_path;
                 use std::os::unix::fs::PermissionsExt;
                 let path = std::path::Path::new(socket_path);
                 if let Err(e) = prepare_unix_socket_path(path) {

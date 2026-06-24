@@ -220,7 +220,8 @@ pub enum OobMethod {
 
 #[cfg(feature = "maud")]
 impl OobMethod {
-    pub fn as_str(&self) -> &'static str {
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
         match self {
             Self::OuterHTML => "outerHTML",
             Self::InnerHTML => "innerHTML",
@@ -256,6 +257,7 @@ pub enum OobSwap {
 
 #[cfg(feature = "maud")]
 impl OobSwap {
+    #[must_use]
     pub fn format_value<'a>(&'a self, id: &'a str) -> std::borrow::Cow<'a, str> {
         let clean_id = id.strip_prefix('#').unwrap_or(id);
         if clean_id.is_empty() {
@@ -278,12 +280,12 @@ impl OobSwap {
         match self {
             Self::True => std::borrow::Cow::Borrowed("true"),
             Self::OuterHTML => std::borrow::Cow::Borrowed("outerHTML"),
-            Self::InnerHTML => std::borrow::Cow::Owned(format!("innerHTML:#{}", clean_id)),
-            Self::BeforeBegin => std::borrow::Cow::Owned(format!("beforebegin:#{}", clean_id)),
-            Self::AfterBegin => std::borrow::Cow::Owned(format!("afterbegin:#{}", clean_id)),
-            Self::BeforeEnd => std::borrow::Cow::Owned(format!("beforeend:#{}", clean_id)),
-            Self::AfterEnd => std::borrow::Cow::Owned(format!("afterend:#{}", clean_id)),
-            Self::Delete => std::borrow::Cow::Owned(format!("delete:#{}", clean_id)),
+            Self::InnerHTML => std::borrow::Cow::Owned(format!("innerHTML:#{clean_id}")),
+            Self::BeforeBegin => std::borrow::Cow::Owned(format!("beforebegin:#{clean_id}")),
+            Self::AfterBegin => std::borrow::Cow::Owned(format!("afterbegin:#{clean_id}")),
+            Self::BeforeEnd => std::borrow::Cow::Owned(format!("beforeend:#{clean_id}")),
+            Self::AfterEnd => std::borrow::Cow::Owned(format!("afterend:#{clean_id}")),
+            Self::Delete => std::borrow::Cow::Owned(format!("delete:#{clean_id}")),
             Self::Target(method, selector) => {
                 std::borrow::Cow::Owned(format!("{}:{}", method.as_str(), selector))
             }
@@ -340,7 +342,8 @@ pub struct HtmxFragments {
 #[cfg(feature = "maud")]
 impl HtmxFragments {
     /// Create a new builder with a primary fragment.
-    pub fn new(primary: maud::Markup) -> Self {
+    #[must_use]
+    pub const fn new(primary: maud::Markup) -> Self {
         Self {
             primary: Some(primary),
             oob: Vec::new(),
@@ -348,7 +351,8 @@ impl HtmxFragments {
     }
 
     /// Create a new empty builder (only OOB fragments).
-    pub fn oob_only() -> Self {
+    #[must_use]
+    pub const fn oob_only() -> Self {
         Self {
             primary: None,
             oob: Vec::new(),
@@ -356,11 +360,13 @@ impl HtmxFragments {
     }
 
     /// Attach an out-of-band fragment using the default `OobSwap::True` strategy.
+    #[must_use]
     pub fn oob(self, id: impl Into<String>, markup: maud::Markup) -> Self {
         self.oob_with_strategy(id, OobSwap::True, markup)
     }
 
     /// Attach an out-of-band fragment with a specific swap strategy.
+    #[must_use]
     pub fn oob_with_strategy(
         mut self,
         id: impl Into<String>,
@@ -414,6 +420,8 @@ impl maud::Render for HtmxFragments {
 #[cfg(feature = "maud")]
 impl IntoResponse for HtmxFragments {
     fn into_response(self) -> Response {
+        use maud::Render;
+
         let mut capacity = 0;
         if let Some(primary) = &self.primary {
             capacity += primary.0.len();
@@ -423,7 +431,6 @@ impl IntoResponse for HtmxFragments {
         }
         let mut w = String::with_capacity(capacity);
 
-        use maud::Render;
         self.render_to(&mut w);
         axum::response::Html(w).into_response()
     }
@@ -449,12 +456,12 @@ fn has_oob_attribute(html: &str) -> bool {
                 let remaining = &html[idx..];
                 let match_len = if remaining
                     .get(..11)
-                    .map_or(false, |s| s.eq_ignore_ascii_case("hx-swap-oob"))
+                    .is_some_and(|s| s.eq_ignore_ascii_case("hx-swap-oob"))
                 {
                     Some(11)
                 } else if remaining
                     .get(..16)
-                    .map_or(false, |s| s.eq_ignore_ascii_case("data-hx-swap-oob"))
+                    .is_some_and(|s| s.eq_ignore_ascii_case("data-hx-swap-oob"))
                 {
                     Some(16)
                 } else {
@@ -464,8 +471,7 @@ fn has_oob_attribute(html: &str) -> bool {
                 if let Some(len) = match_len {
                     let after = remaining.chars().nth(len);
                     match after {
-                        None | Some('=') | Some(' ') | Some('\t') | Some('\n') | Some('\r')
-                        | Some('>') | Some('/') => {
+                        None | Some('=' | ' ' | '\t' | '\n' | '\r' | '>' | '/') => {
                             let is_word_start = if idx == 0 {
                                 true
                             } else if let Some(prev_char) = html[..idx].chars().next_back() {
@@ -490,7 +496,7 @@ fn has_oob_attribute(html: &str) -> bool {
             if remaining.starts_with("<!--") {
                 while let Some((_, next_c)) = chars.next() {
                     if next_c == '-' {
-                        let rem = &html[chars.peek().map(|&(i, _)| i).unwrap_or(html.len())..];
+                        let rem = &html[chars.peek().map_or(html.len(), |&(i, _)| i)..];
                         if rem.starts_with("->") {
                             chars.next();
                             chars.next();
