@@ -53,6 +53,9 @@
 use std::collections::HashMap;
 use std::io;
 
+use axum::http::header::{CONTENT_DISPOSITION, CONTENT_TYPE};
+use axum::response::{IntoResponse, Response};
+
 // ── Row-level error ───────────────────────────────────────────────────────────
 
 /// A parse or validation error for a single CSV row.
@@ -249,6 +252,59 @@ where
 
     wtr.flush()?;
     Ok(())
+}
+
+/// An Axum response that streams an iterator of [`CsvSchema`] models as a downloadable CSV file.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use autumn_web::prelude::*;
+/// use autumn_web::data::csv::{CsvSchema, CsvResponse};
+///
+/// #[get("/posts/export")]
+/// async fn export_posts(db: Db) -> Result<impl IntoResponse, AutumnError> {
+///     let posts = PostRepository::all(&db).await?;
+///     Ok(CsvResponse::new("posts.csv", posts))
+/// }
+/// ```
+pub struct CsvResponse<T: CsvSchema> {
+    filename: String,
+    records: Vec<T>,
+}
+
+impl<T: CsvSchema> CsvResponse<T> {
+    /// Create a new `CsvResponse` with the given filename and records.
+    #[must_use]
+    pub fn new(filename: impl Into<String>, records: impl IntoIterator<Item = T>) -> Self {
+        Self {
+            filename: filename.into(),
+            records: records.into_iter().collect(),
+        }
+    }
+}
+
+impl<T: CsvSchema> IntoResponse for CsvResponse<T> {
+    fn into_response(self) -> Response {
+        let mut buf = Vec::new();
+        if let Err(e) = export_csv(self.records, &mut buf) {
+            tracing::error!(error = %e, "failed to generate CSV response");
+            return (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to generate CSV file",
+            )
+                .into_response();
+        }
+
+        Response::builder()
+            .header(CONTENT_TYPE, "text/csv; charset=utf-8")
+            .header(
+                CONTENT_DISPOSITION,
+                format!("attachment; filename=\"{}\"", self.filename),
+            )
+            .body(axum::body::Body::from(buf))
+            .unwrap()
+    }
 }
 
 // ── import_csv ────────────────────────────────────────────────────────────────

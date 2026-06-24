@@ -136,6 +136,10 @@ pub use crate::pagination::{CursorPage, CursorRequest, Page, PageRequest};
 #[cfg(feature = "maud")]
 pub use crate::ui::pagination::{PagerOptions, cursor_pagination_nav, pagination_nav};
 
+// ── Data ────────────────────────────────────────────────────────
+#[cfg(feature = "csv")]
+pub use crate::data::csv::{CsvResponse, CsvSchema};
+
 // ── Validation ──────────────────────────────────────────────────
 /// Auto-validating extractor and proof-of-validation newtype.
 pub use crate::validation::{Valid, ValidateExt, Validated};
