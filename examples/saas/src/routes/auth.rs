@@ -30,8 +30,7 @@ pub struct LoginForm {
 
 // bcrypt hash used as a dummy target when the email is not found, so the
 // login handler takes the same wall time whether or not the account exists.
-const DUMMY_HASH: &str =
-    "$2b$12$Ro0CUfOqk6cXEKf3dyaM7OhSCvnwM9s1Aw6lfLP2.GvpAfNXwi.2K";
+const DUMMY_HASH: &str = "$2b$12$Ro0CUfOqk6cXEKf3dyaM7OhSCvnwM9s1Aw6lfLP2.GvpAfNXwi.2K";
 
 // ── Signup ───────────────────────────────────────────────────────────────────
 
@@ -73,7 +72,9 @@ pub async fn signup(
 ) -> AutumnResult<Redirect> {
     let email = form.email.trim().to_lowercase();
     if !email.contains('@') {
-        return Err(AutumnError::unprocessable_msg("Enter a valid email address"));
+        return Err(AutumnError::unprocessable_msg(
+            "Enter a valid email address",
+        ));
     }
     if form.password.len() < 8 {
         return Err(AutumnError::unprocessable_msg(

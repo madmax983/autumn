@@ -73,6 +73,10 @@ pub async fn create_project(
 
     // `tenant_id` is stamped by the tenant_scoped repository from the context
     // below, so it is not part of `NewProject`.
-    with_tenant(tenant_id, async move { repo.save(&NewProject { name }).await }).await?;
+    with_tenant(
+        tenant_id,
+        async move { repo.save(&NewProject { name }).await },
+    )
+    .await?;
     Ok(Redirect::to("/dashboard").into_response())
 }

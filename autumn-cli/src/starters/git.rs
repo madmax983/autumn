@@ -67,7 +67,9 @@ pub fn resolve(value: &str, ref_override: Option<&str>) -> Result<GitSource, Sta
         return Err(StarterError::AmbiguousRef);
     }
 
-    let reference = ref_override.map(str::to_owned).or_else(|| suffix_ref.map(str::to_owned));
+    let reference = ref_override
+        .map(str::to_owned)
+        .or_else(|| suffix_ref.map(str::to_owned));
 
     let url = expand_shorthand(repo)?;
     Ok(GitSource { url, reference })
@@ -185,7 +187,10 @@ mod tests {
     #[test]
     fn shorthand_expands_to_github_https() {
         let s = resolve("madmax983/autumn-starter-blog", None).unwrap();
-        assert_eq!(s.url, "https://github.com/madmax983/autumn-starter-blog.git");
+        assert_eq!(
+            s.url,
+            "https://github.com/madmax983/autumn-starter-blog.git"
+        );
         assert_eq!(s.reference, None);
     }
 

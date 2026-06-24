@@ -85,9 +85,7 @@ impl Plan {
         self.actions
             .iter()
             .filter_map(|a| match a {
-                Action::Create { path, .. } | Action::CreateBytes { path, .. }
-                    if path.exists() =>
-                {
+                Action::Create { path, .. } | Action::CreateBytes { path, .. } if path.exists() => {
                     Some(path.clone())
                 }
                 _ => None,
@@ -154,9 +152,7 @@ impl Plan {
         println!("Dry run — no files written.");
         for action in &self.actions {
             let label = match action {
-                Action::Create { path, .. } | Action::CreateBytes { path, .. }
-                    if path.exists() =>
-                {
+                Action::Create { path, .. } | Action::CreateBytes { path, .. } if path.exists() => {
                     "Would overwrite"
                 }
                 Action::Modify { path, .. } if path.exists() => "Would modify",

@@ -66,7 +66,8 @@ async fn db_client() -> TestClient {
         )",
     )
     .await;
-    db.execute_sql("TRUNCATE users, projects RESTART IDENTITY").await;
+    db.execute_sql("TRUNCATE users, projects RESTART IDENTITY")
+        .await;
 
     // The forms post normally; disable CSRF so the test does not have to scrape
     // a token out of the rendered HTML.

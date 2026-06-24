@@ -218,9 +218,7 @@ pub fn print_list() {
         println!("  {:<width$}  {}", b.name, b.description, width = width);
     }
     println!("\nScaffold one with:   autumn new <name> --starter <starter>");
-    println!(
-        "Community starters:  autumn new <name> --starter <git-url|owner/repo>[@ref] [--yes]"
-    );
+    println!("Community starters:  autumn new <name> --starter <git-url|owner/repo>[@ref] [--yes]");
 }
 
 /// Entry point for `autumn new <name> --starter <value>`.
@@ -246,8 +244,9 @@ fn run_inner(
     flags: Flags,
     parent_dir: &Path,
 ) -> Result<(), StarterError> {
-    validate_name(name)
-        .map_err(|e| StarterError::InvalidName(name.to_owned(), strip_name_error(&e.to_string())))?;
+    validate_name(name).map_err(|e| {
+        StarterError::InvalidName(name.to_owned(), strip_name_error(&e.to_string()))
+    })?;
 
     let project_dir = parent_dir.join(name);
     if project_dir.exists() {
@@ -490,8 +489,7 @@ mod tests {
     }
 
     fn fixture_minimal() -> std::path::PathBuf {
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/starters/minimal")
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/starters/minimal")
     }
 
     #[test]
@@ -515,7 +513,10 @@ mod tests {
         assert!(cargo.contains("name = \"acme_app\""), "got: {cargo}");
         let main_rs = fs::read_to_string(dest.join("src/main.rs")).unwrap();
         assert!(main_rs.contains("acme-app"));
-        assert!(!main_rs.contains("{{"), "no tokens should remain: {main_rs}");
+        assert!(
+            !main_rs.contains("{{"),
+            "no tokens should remain: {main_rs}"
+        );
 
         // The manifest itself is never emitted into the project.
         assert!(!dest.join(MANIFEST_FILE).exists());
@@ -525,8 +526,14 @@ mod tests {
         // bytes are intact).
         let original = fs::read(fixture_minimal().join("static/logo.bin")).unwrap();
         let copied = fs::read(dest.join("static/logo.bin")).unwrap();
-        assert_eq!(copied, original, "verbatim binary asset must not be altered");
-        assert!(std::str::from_utf8(&copied).is_err(), "fixture asset is binary");
+        assert_eq!(
+            copied, original,
+            "verbatim binary asset must not be altered"
+        );
+        assert!(
+            std::str::from_utf8(&copied).is_err(),
+            "fixture asset is binary"
+        );
     }
 
     #[test]
@@ -560,8 +567,8 @@ mod tests {
         };
         scaffold(&contents, &vars, &dest, Flags::default()).unwrap();
 
-        let example_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../examples/saas");
+        let example_root =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../examples/saas");
 
         // Every rendered file matches the committed example.
         for file in &contents.files {
