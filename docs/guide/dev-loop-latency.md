@@ -325,6 +325,111 @@ CSS/Tailwind edit to refreshed stylesheet  1 234  1 450  2 100  FAIL
 
 ---
 
+## Scaling: Macro-Tax Budget
+
+The budget matrix above measures the **warm incremental** loop at a single,
+small app size. Autumn leans heavily on proc-macros (`#[get]`, `#[model]`,
+`#[repository]`, `#[secured]`, `#[scheduled]`). If a one-line handler edit
+forces re-expansion or re-monomorphization proportional to the total
+route/model count, edit-refresh latency rots silently as real apps reach
+50–200 routes — invisible in CI because no example is large enough to surface
+it (issue #983).
+
+### Scaling budget
+
+| Metric | Budget | Notes |
+|---|---|---|
+| p95 per size | ≤ **8 000 ms** | At every N ∈ {1, 25, 50, 100} |
+| Slope (p95@N=100 / p95@N=1) | ≤ **2×** | Near-flat growth guarantee |
+| Slope regression vs baseline | ≤ **20%** | Once a baseline is established; skipped until then |
+
+**Success metric (issue #983):** single-file handler-edit warm incremental
+rebuild p95 grows ≤ 2× from N=1 to N=100 routes **and** stays under 8 s
+absolute on the reference runner.
+
+### Regression allowance
+
+Any release that **exceeds the absolute 8 s ceiling at any size**, or
+**exceeds the 2× slope**, or **regresses an accepted slope baseline by more
+than 20%**, must either fail the documented gate or carry an explicit
+release-note exception — the same escape hatch as the
+[warm-loop regression allowance](#regression-allowance).
+
+### Synthetic-app methodology
+
+`autumn dev-loop-bench --scaling` generates a **deterministic synthetic
+Autumn app** at each requested size N (default: `{1, 25, 50, 100}`) from a
+built-in code generator — not a hand-checked-in fixture. For each N the
+generator produces:
+
+- `Cargo.toml` — standalone workspace root (same `[patch.crates-io]` trick
+  as `--cold-start` to point at local `autumn-web`).
+- `src/schema.rs` — N `autumn_web::reexports::diesel::table!` declarations.
+- `src/models.rs` — N `#[autumn_web::model]` structs.
+- `src/repositories.rs` — N `#[autumn_web::repository]` traits.
+- `src/handlers.rs` — N `#[get]` handlers; `handler_0` contains a
+  `BENCH_EDIT_SENTINEL` constant that is bumped each run to force a
+  single-file warm incremental recompile.
+- `src/main.rs` — `routes![handler_0 … handler_{n-1}]`.
+
+The generated app depends only on `autumn-web` (default features, which
+include `db` + diesel-async). **No Postgres is required** — we `cargo build`
+only; the binary is never started.
+
+**Measurement procedure per size N:**
+
+1. Write the generated app to a fresh `tempdir`.
+2. Run one **warm build** (untimed) to populate the incremental cache with
+   all N routes, models, and repositories compiled.
+3. Repeat `--runs` times (default 5):
+   a. Bump the `BENCH_EDIT_SENTINEL` in `src/handlers.rs` (exactly one
+      line changed in exactly one file).
+   b. Time `cargo build` end-to-end.
+4. Compute p50/p95/max over the `--runs` samples.
+5. Move on to the next N.
+
+The **slope** is `p95@N_max / p95@N_min` (last vs first size in the sweep).
+
+### Running the scaling benchmark
+
+```bash
+# Print the budget table (no build):
+autumn dev-loop-bench --scaling --dry-run
+
+# Run a fast local sweep (2 sizes, 2 runs):
+AUTUMN_BENCH_TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ) \
+AUTUMN_BENCH_RUST_VERSION="$(rustc --version)" \
+autumn dev-loop-bench --scaling \
+  --sizes 1,25 \
+  --runs 2 \
+  --output scaling-report.json
+
+# Full sweep with CI regression gate:
+autumn dev-loop-bench --scaling \
+  --baseline benchmarks/dev-loop-scaling/baseline.json \
+  --fail-on-regression
+
+# JSON output:
+autumn dev-loop-bench --scaling --json
+```
+
+### Scaling CI gate
+
+`.github/workflows/dev-loop-scaling.yml` runs weekly (Monday 08:00 UTC,
+after the warm dev-loop and cold-start gates) and on `workflow_dispatch`.
+Per-PR runs are limited to the dry-run budget table and the module unit tests.
+The `measure` job writes `scaling-report.json`, uploads it as a 90-day
+artifact, and fails closed when `all_passed` is `false`.
+
+The accepted slope baseline lives in
+`benchmarks/dev-loop-scaling/baseline.json`. Until `"established": true` is
+set, the > 20%-regression check is skipped and only the absolute (8 s) and 2×
+slope gates apply. To establish the baseline after the first successful run:
+set `established: true` and `accepted_slope: <measured_slope>` and document
+the decision in `RELEASE_NOTES.md`.
+
+---
+
 ## CI Gate
 
 ### Scheduled job (`.github/workflows/dev-loop-latency.yml`)

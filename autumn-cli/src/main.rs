@@ -12,6 +12,7 @@ mod db;
 mod db_pull;
 mod dev;
 mod dev_loop_bench;
+mod dev_loop_scaling;
 mod doctor;
 mod experiments;
 mod export;
@@ -27,6 +28,7 @@ mod plugin_check;
 mod process;
 mod release;
 mod routes;
+mod scaling_driver;
 mod seed;
 mod serve;
 mod setup;
@@ -578,6 +580,20 @@ enum Commands {
         /// informational (non-gating) result.
         #[arg(long)]
         include_db: bool,
+        /// Run the macro-scaling sweep: measure warm incremental rebuild at
+        /// multiple app sizes (N handlers + model/repository pairs) to gate
+        /// that the edit-refresh loop stays near-flat as the app grows.
+        #[arg(long)]
+        scaling: bool,
+        /// Comma-separated list of app sizes to sweep (e.g. `1,25,50,100`).
+        /// Only used with `--scaling`.
+        #[arg(long, default_value = crate::dev_loop_scaling::DEFAULT_SIZES)]
+        sizes: String,
+        /// Path to `benchmarks/dev-loop-scaling/baseline.json` for the
+        /// `>20%`-slope-regression check. Omit to skip baseline gating.
+        /// Only used with `--scaling`.
+        #[arg(long, value_name = "PATH")]
+        baseline: Option<String>,
     },
 }
 
@@ -2011,8 +2027,21 @@ fn run_command(command: Commands) {
             dry_run,
             cold_start,
             include_db,
+            scaling,
+            sizes,
+            baseline,
         } => {
-            let exit_code = if cold_start {
+            let exit_code = if scaling {
+                scaling_driver::run_scaling(
+                    &sizes,
+                    runs,
+                    output.as_deref(),
+                    json,
+                    fail_on_regression,
+                    dry_run,
+                    baseline.as_deref(),
+                )
+            } else if cold_start {
                 cold_start_driver::run_cold_start(
                     runs,
                     output.as_deref(),
@@ -4376,6 +4405,9 @@ mod tests {
             dry_run,
             cold_start,
             include_db,
+            scaling,
+            sizes,
+            baseline,
         } = cli.command
         else {
             panic!("expected dev-loop-bench");
@@ -4388,6 +4420,9 @@ mod tests {
         assert!(!dry_run);
         assert!(!cold_start);
         assert!(!include_db);
+        assert!(!scaling);
+        assert_eq!(sizes, crate::dev_loop_scaling::DEFAULT_SIZES);
+        assert!(baseline.is_none());
     }
 
     #[test]
@@ -4463,6 +4498,55 @@ mod tests {
             panic!("expected dev-loop-bench");
         };
         assert_eq!(output.as_deref(), Some("report.json"));
+    }
+
+    #[test]
+    fn parse_dev_loop_bench_scaling_flag() {
+        let cli = Cli::try_parse_from(["autumn", "dev-loop-bench", "--scaling"]).unwrap();
+        let Commands::DevLoopBench { scaling, .. } = cli.command else {
+            panic!("expected dev-loop-bench");
+        };
+        assert!(scaling);
+    }
+
+    #[test]
+    fn parse_dev_loop_bench_scaling_custom_sizes() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "dev-loop-bench",
+            "--scaling",
+            "--sizes",
+            "1,10,50",
+        ])
+        .unwrap();
+        let Commands::DevLoopBench { scaling, sizes, .. } = cli.command else {
+            panic!("expected dev-loop-bench");
+        };
+        assert!(scaling);
+        assert_eq!(sizes, "1,10,50");
+    }
+
+    #[test]
+    fn parse_dev_loop_bench_scaling_baseline_path() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "dev-loop-bench",
+            "--scaling",
+            "--baseline",
+            "benchmarks/dev-loop-scaling/baseline.json",
+        ])
+        .unwrap();
+        let Commands::DevLoopBench {
+            scaling, baseline, ..
+        } = cli.command
+        else {
+            panic!("expected dev-loop-bench");
+        };
+        assert!(scaling);
+        assert_eq!(
+            baseline.as_deref(),
+            Some("benchmarks/dev-loop-scaling/baseline.json")
+        );
     }
 
     // ── autumn config tests ────────────────────────────────────────────────────
