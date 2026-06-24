@@ -104,7 +104,7 @@ fn ci_workflow_pins_msrv_toolchain() {
 
     assert!(
         ci.contains(&format!("dtolnay/rust-toolchain@{msrv}")),
-        "ci.yml must pin the Rust toolchain to the MSRV ({msrv}), got:\n{ci}"
+        "ci.yml must pin the Rust toolchain to the MSRV via dtolnay/rust-toolchain@<msrv>"
     );
     assert!(
         !ci.contains("rust-toolchain@stable"),
@@ -136,7 +136,7 @@ fn ci_workflow_has_no_unsubstituted_placeholders() {
 
     assert!(
         !ci.contains("{{"),
-        "ci.yml must not contain unsubstituted template placeholders, got:\n{ci}"
+        "ci.yml must not contain unsubstituted template placeholders"
     );
     assert!(
         ci.contains("ci-placeholder-app"),
