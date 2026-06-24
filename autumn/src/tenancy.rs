@@ -26,6 +26,13 @@ impl axum::extract::FromRequestParts<crate::AppState> for Tenant {
         parts: &mut axum::http::request::Parts,
         state: &crate::AppState,
     ) -> Result<Self, Self::Rejection> {
+        // Fast path: when the tenancy middleware has already resolved and scoped
+        // the tenant for this request, read it from the task-local rather than
+        // performing a second extraction from headers/session/cookies.
+        if let Ok(Some(tenant_id)) = CURRENT_TENANT.try_with(Clone::clone) {
+            return Ok(Self(tenant_id));
+        }
+
         let config = state
             .extension::<crate::config::AutumnConfig>()
             .ok_or_else(|| {
@@ -51,7 +58,9 @@ pub async fn extract_tenant_from_parts(
     config: &crate::config::AutumnConfig,
 ) -> Result<String, crate::AutumnError> {
     if !config.tenancy.enabled {
-        return Err(crate::AutumnError::bad_request_msg("Tenancy is disabled"));
+        return Err(crate::AutumnError::service_unavailable_msg(
+            "Tenancy is not enabled; set [tenancy] enabled = true in autumn.toml",
+        ));
     }
 
     match config.tenancy.source.as_str() {
@@ -296,25 +305,51 @@ pub async fn extract_tenant_from_parts(
     }
 }
 
-/// Returns true when `path` is exempt from tenant resolution: it equals or is a
-/// slash-delimited subpath of any configured public path or health endpoint.
+/// Returns true when `path` is exempt from tenant resolution.
 ///
-/// Mirrors the framework-wide exempt-path semantics (see the CSRF and CAPTCHA
-/// middleware): `/login` matches `/login` and `/login/sso`, but not
-/// `/login-admin`. Health/liveness/readiness/startup probes are always public so
-/// they never require a tenant.
+/// A path is public if:
+/// - it matches any entry in `tenancy.public_paths` (slash-boundary prefix; empty
+///   entries and trailing slashes in the list are normalized away so they can't
+///   accidentally exempt everything),
+/// - it matches the configured health/liveness/readiness/startup probe paths,
+/// - it is under the actuator prefix (e.g. `/actuator/prometheus`) — so Prometheus
+///   scraping and ops tooling are never blocked by tenancy,
+/// - it is the OpenAPI spec path (e.g. `/openapi.json`), or
+/// - it exactly equals `tenancy.login_redirect` — so the redirect target itself is
+///   always reachable even if the operator forgot to add it to `public_paths`,
+///   preventing an infinite redirect loop.
+///
+/// Matching uses the same slash-boundary prefix semantics as the rest of the
+/// framework (CSRF, CAPTCHA): `/login` matches `/login` and `/login/sso` but not
+/// `/login-admin`.
 fn is_public_path(path: &str, config: &crate::config::AutumnConfig) -> bool {
     let matches = |prefix: &str| {
-        path == prefix
-            || path
-                .strip_prefix(prefix)
-                .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+        crate::router::path_matches_route_prefix(path, prefix)
     };
-    config.tenancy.public_paths.iter().any(|p| matches(p))
+
+    // User-configured public paths — skip empty entries and normalize trailing
+    // slashes so `/static/` behaves the same as `/static`.
+    let user_paths_match = config.tenancy.public_paths.iter().any(|p| {
+        let p = p.trim_end_matches('/');
+        !p.is_empty() && matches(p)
+    });
+
+    // The login_redirect target must always be reachable (exact match) to prevent
+    // an infinite redirect loop when a user forgets to add it to public_paths.
+    let redirect_match = config
+        .tenancy
+        .login_redirect
+        .as_deref()
+        .is_some_and(|target| path == target);
+
+    user_paths_match
+        || redirect_match
         || matches(&config.health.path)
         || matches(&config.health.live_path)
         || matches(&config.health.ready_path)
         || matches(&config.health.startup_path)
+        || matches(&config.actuator.prefix)
+        || matches(&config.openapi_runtime.path)
 }
 
 // Tenancy middleware for Axum requests
@@ -617,5 +652,50 @@ mod tests {
         assert!(is_public_path(&c.health.live_path, &c));
         assert!(is_public_path(&c.health.ready_path, &c));
         assert!(is_public_path(&c.health.startup_path, &c));
+    }
+
+    /// Empty-string entries in `public_paths` must not exempt every path.
+    #[test]
+    fn empty_public_path_entry_does_not_exempt_all() {
+        let c = public_paths_config(&[""]);
+        assert!(!is_public_path("/dashboard", &c));
+        assert!(!is_public_path("/secret", &c));
+    }
+
+    /// Trailing-slash entries in `public_paths` behave like their unslashed form.
+    #[test]
+    fn trailing_slash_entry_matches_subtree() {
+        let c = public_paths_config(&["/static/"]);
+        assert!(is_public_path("/static", &c));
+        assert!(is_public_path("/static/css/app.css", &c));
+        assert!(!is_public_path("/dashboard", &c));
+    }
+
+    /// The actuator prefix is always public so Prometheus scraping is never blocked.
+    #[test]
+    fn actuator_prefix_is_always_public() {
+        let c = crate::config::AutumnConfig::default();
+        assert!(is_public_path(&c.actuator.prefix, &c));
+        assert!(is_public_path(&format!("{}/prometheus", c.actuator.prefix), &c));
+        assert!(is_public_path(&format!("{}/health", c.actuator.prefix), &c));
+    }
+
+    /// The OpenAPI spec path is always public.
+    #[test]
+    fn openapi_path_is_always_public() {
+        let c = crate::config::AutumnConfig::default();
+        assert!(is_public_path(&c.openapi_runtime.path, &c));
+    }
+
+    /// The `login_redirect` target is always public even if missing from
+    /// `public_paths`, preventing an infinite redirect loop.
+    #[test]
+    fn login_redirect_target_is_always_public() {
+        let mut c = crate::config::AutumnConfig::default();
+        c.tenancy.login_redirect = Some("/auth/login".to_string());
+        // Not in public_paths — should still be reachable.
+        assert!(is_public_path("/auth/login", &c));
+        // Only the exact target, not adjacent paths.
+        assert!(!is_public_path("/auth/login/sso", &c));
     }
 }
