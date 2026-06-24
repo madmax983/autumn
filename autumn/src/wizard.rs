@@ -2,7 +2,7 @@
 //!
 //! Orchestrates multi-step flows (onboarding, checkout, KYC) on top of the
 //! existing [`crate::session::Session`], [`crate::form::Changeset`], and
-//! [`crate::flash::Flash`] primitives — no new storage machinery.
+//! [`Flash`](crate::flash::Flash) primitives — no new storage machinery.
 //!
 //! ## Session key format
 //!
