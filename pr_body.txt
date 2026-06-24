@@ -1,0 +1,7 @@
+🦠 Threat: `subtle::ConstantTimeEq::ct_eq` on byte slices (`&[u8]`) short-circuits and returns early if the lengths of the two slices differ. This creates an exploitable timing side-channel that leaks the expected length of HMAC signatures and CSRF tokens to an attacker.
+
+🛡️ Defense: Centralize the robust constant-time comparison logic (originally localized in `csrf.rs`) into `security::constant_time::constant_time_eq`. This function computes the length equality using `ct_eq` and folds it into the final `Choice`, while still iterating over the full length of the trusted slice, ensuring execution time is completely independent of the attacker's input length. Applied this fix across CSRF, Webhook Verification, Session/Pagination, and LocalBlobStore.
+
+💥 Severity: Medium (CVSS 3.1). While exploiting a length-based timing leak over the network is noisy and difficult, it provides an oracle to deduce the exact byte length of expected signatures (such as webhook HMACs), which is a cryptographic weakness.
+
+🧪 Verification: Added `eris_webhook_timing_attack` regression test which simulates the length mismatch and ensures it does not short-circuit. Ran `cargo test` and all 34 security regression tests passed successfully.
