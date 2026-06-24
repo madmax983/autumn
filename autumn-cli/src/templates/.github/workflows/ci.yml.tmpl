@@ -22,10 +22,11 @@
 name: CI
 
 on:
+  # Run on every branch push and pull request so CI fires on the first push
+  # regardless of the repository's default branch name. Narrow this to specific
+  # branches (e.g. `branches: [main]`) once your branching model settles.
   push:
-    branches: [main, master]
   pull_request:
-    branches: [main, master]
 
 env:
   CARGO_TERM_COLOR: always

@@ -575,7 +575,8 @@ recovers, so log volume stays low during outages.
 ## Continuous integration
 
 `autumn new` writes `.github/workflows/ci.yml` into every generated project.
-The workflow runs automatically on push and pull requests against `main`/`master`:
+The workflow runs automatically on every branch push and pull request, so CI
+fires on your first push no matter what the default branch is named:
 
 | Step | Command |
 |------|---------|
