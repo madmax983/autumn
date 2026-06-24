@@ -632,6 +632,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn panic_in_future_poll_is_caught_as_500() {
+        use axum::body::Body;
+        use std::convert::Infallible;
+        use tower::ServiceExt;
+
+        struct PanicOnPoll;
+        impl Future for PanicOnPoll {
+            type Output = Result<Response, Infallible>;
+            fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+                panic!("boom in poll");
+            }
+        }
+
+        #[derive(Clone)]
+        struct ReturnPanickingFuture;
+        impl Service<Request<Body>> for ReturnPanickingFuture {
+            type Response = Response;
+            type Error = Infallible;
+            type Future = PanicOnPoll;
+
+            fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+                Poll::Ready(Ok(()))
+            }
+
+            fn call(&mut self, _req: Request<Body>) -> Self::Future {
+                PanicOnPoll
+            }
+        }
+
+        let service = ReportingLayer::new(Vec::new(), true, 1.0).layer(ReturnPanickingFuture);
+        let response = service
+            .oneshot(Request::new(Body::empty()))
+            .await
+            .expect("panic in poll must be converted to a response, not propagated");
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
     async fn disabled_chain_does_not_dispatch() {
         #[derive(Clone)]
         struct Counter(Arc<Mutex<u32>>);
