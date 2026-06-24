@@ -51,9 +51,32 @@ use axum::http::StatusCode;
 use maud::Markup;
 use std::sync::Arc;
 
-/// Render an error page using the given renderer (or defaults).
+/// Renders an error page using the provided renderer.
 ///
-/// Returns the full HTML response body for the given status code.
+/// This function acts as a dispatcher, calling the appropriate specific rendering
+/// method on the [`ErrorPageRenderer`] trait (e.g., [`render_404`](ErrorPageRenderer::render_404))
+/// based on the provided [`StatusCode`]. It returns the full HTML response body.
+///
+/// ## Examples
+///
+/// ```rust,ignore
+/// use axum::http::StatusCode;
+/// use autumn_web::error_pages::{render_error_page, default_renderer, ErrorContext};
+///
+/// let renderer = default_renderer();
+/// let ctx = ErrorContext {
+///     status: StatusCode::NOT_FOUND,
+///     message: "Resource not found".to_string(),
+///     path: "/missing".to_string(),
+///     request_id: None,
+///     details: None,
+///     is_dev: false,
+/// };
+///
+/// let html = render_error_page(&*renderer, StatusCode::NOT_FOUND, &ctx);
+/// assert!(html.into_string().contains("404"));
+/// ```
+#[must_use]
 pub(crate) fn render_error_page(
     renderer: &dyn ErrorPageRenderer,
     status: StatusCode,
@@ -70,7 +93,21 @@ pub(crate) fn render_error_page(
 /// Shared error page renderer stored in app state / middleware.
 pub(crate) type SharedRenderer = Arc<dyn ErrorPageRenderer>;
 
-/// Create the default shared renderer.
+/// Instantiates the default error page renderer.
+///
+/// This constructs a [`DefaultErrorPages`] instance wrapped in an [`Arc`],
+/// which is used by the framework if no custom [`ErrorPageRenderer`] is
+/// provided via [`AppBuilder::error_pages`](crate::app::AppBuilder::error_pages).
+///
+/// ## Examples
+///
+/// ```rust,ignore
+/// use autumn_web::error_pages::default_renderer;
+///
+/// let renderer = default_renderer();
+/// // The renderer is now ready to be injected into the app state or middleware.
+/// ```
+#[must_use]
 pub(crate) fn default_renderer() -> SharedRenderer {
     Arc::new(DefaultErrorPages)
 }
