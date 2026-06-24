@@ -18,6 +18,10 @@ pub enum Action {
     Create { path: PathBuf, contents: String },
     /// Modify an existing file (or create it if absent). Never a collision.
     Modify { path: PathBuf, contents: String },
+    /// Create a new file from raw bytes, with no UTF-8 or template handling.
+    /// Used for verbatim/binary starter assets (e.g. vendored JS). Treated as a
+    /// collision if the file already exists, like [`Action::Create`].
+    CreateBytes { path: PathBuf, bytes: Vec<u8> },
 }
 
 impl Action {
@@ -25,7 +29,9 @@ impl Action {
     #[must_use]
     pub fn path(&self) -> &Path {
         match self {
-            Self::Create { path, .. } | Self::Modify { path, .. } => path,
+            Self::Create { path, .. }
+            | Self::Modify { path, .. }
+            | Self::CreateBytes { path, .. } => path,
         }
     }
 }
@@ -66,12 +72,22 @@ impl Plan {
         });
     }
 
+    /// Push a [`Action::CreateBytes`] action (verbatim/binary file).
+    pub fn create_bytes(&mut self, path: impl Into<PathBuf>, bytes: impl Into<Vec<u8>>) {
+        self.actions.push(Action::CreateBytes {
+            path: path.into(),
+            bytes: bytes.into(),
+        });
+    }
+
     /// All `Create` actions whose target file already exists on disk.
     fn collisions(&self) -> Vec<PathBuf> {
         self.actions
             .iter()
             .filter_map(|a| match a {
-                Action::Create { path, .. } if path.exists() => Some(path.clone()),
+                Action::Create { path, .. } | Action::CreateBytes { path, .. } if path.exists() => {
+                    Some(path.clone())
+                }
                 _ => None,
             })
             .collect()
@@ -113,17 +129,20 @@ impl Plan {
         }
 
         for action in &self.actions {
-            let (path, contents) = match action {
-                Action::Create { path, contents } | Action::Modify { path, contents } => {
-                    (path, contents)
+            let path = action.path();
+            let label = if matches!(action, Action::Modify { .. }) && path.exists() {
+                "Modified"
+            } else {
+                "Created"
+            };
+            match action {
+                Action::Create { contents, .. } | Action::Modify { contents, .. } => {
+                    fs::write(path, contents)?;
                 }
-            };
-            let label = match (action, path.exists()) {
-                (Action::Create { .. }, _) => "Created",
-                (_, true) => "Modified",
-                _ => "Created",
-            };
-            fs::write(path, contents)?;
+                Action::CreateBytes { bytes, .. } => {
+                    fs::write(path, bytes)?;
+                }
+            }
             println!("  {label} {}", relative_display(path, &self.project_root));
         }
         Ok(())
@@ -133,9 +152,13 @@ impl Plan {
         println!("Dry run — no files written.");
         for action in &self.actions {
             let label = match action {
-                Action::Create { path, .. } if path.exists() => "Would overwrite",
+                Action::Create { path, .. } | Action::CreateBytes { path, .. } if path.exists() => {
+                    "Would overwrite"
+                }
                 Action::Modify { path, .. } if path.exists() => "Would modify",
-                Action::Create { .. } | Action::Modify { .. } => "Would create",
+                Action::Create { .. } | Action::Modify { .. } | Action::CreateBytes { .. } => {
+                    "Would create"
+                }
             };
             println!(
                 "  {label} {}",

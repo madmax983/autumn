@@ -142,6 +142,25 @@ blocks publishing `autumn-web` or `autumn-cli`.
 
 ---
 
+### `examples/saas` — Multi-Tenant SaaS Starter
+
+<!-- catalog:example name=saas tier=supported -->
+
+| Field | Value |
+|-------|-------|
+| **Persona** | Developer evaluating Autumn who wants a complete, runnable SaaS archetype rather than hand-assembled primitives |
+| **Journey** | Multi-tenant SaaS: sign up an organisation → log in → a tenant-scoped dashboard that only ever shows the signed-in organisation's projects |
+| **Key capabilities** | Session auth (`Session` + bcrypt `hash_password`/`verify_password`), row-level multi-tenancy (`#[repository(tenant_scoped)]` + `with_tenant`), Maud + htmx UI |
+| **Prerequisites** | Rust 1.88.0+, PostgreSQL |
+| **Run command** | `cargo run -p saas` |
+| **Success proof** | After signing up in the browser, `GET /dashboard` returns `200 OK` with the tenant's projects; a second organisation never sees the first's data |
+
+This is the flagship built-in starter behind `autumn new <name> --starter saas`.
+The committed tree here is the rendered form of the embedded starter; the
+`embedded_saas_matches_example_saas` test in `autumn-cli` keeps the two in lock-step.
+
+---
+
 ## Journey Map
 
 The table below maps each example to a distinct learning journey so evaluators
@@ -157,6 +176,7 @@ can pick the closest starting point without overlap.
 | Horizontal sharding | `bookmarks-sharded` | Tenant → slot → shard routing, control DB, cross-shard fan-out, Docker Compose |
 | Hooks / revisions | `wiki` | Before/after-save hooks, slug lifecycle, full revision trail |
 | Full-stack showcase | `reddit-clone` | Auth, sessions, jobs, channels, email, A/B experiments, signed webhooks, outbound HTTP, error reporting — the complete feature showcase |
+| Multi-tenant SaaS starter | `saas` | Session auth + row-level tenancy + tenant-scoped dashboard — the flagship `autumn new --starter saas` archetype |
 
 ---
 

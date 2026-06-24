@@ -66,7 +66,13 @@ The concrete definition of "breaking" matches the Rust API guidelines and the
   are stable; actuator endpoint payloads follow the actuator docs.
 - The CLI commands shipped by `autumn-cli` (`autumn new`, `autumn setup`,
   `autumn dev`, `autumn build`, `autumn migrate`) and their documented
-  flags.
+  flags. This includes the `autumn new` starter flags — `--starter`,
+  `--list-starters`, `--starter-ref`, and `--yes` — and the
+  `autumn-starter.toml` manifest schema documented in
+  [`docs/guide/starters.md`](docs/guide/starters.md), which built-in and
+  community starters share. Adding new built-in starters or new optional
+  manifest fields is additive (non-breaking); removing or renaming a manifest
+  field, or changing the substitution tokens, is a breaking change.
 
 **Not stable (explicitly excluded from SemVer):**
 
