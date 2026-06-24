@@ -1121,10 +1121,111 @@ pub(crate) fn parse_generic(
     Ok(parse_rfc5322(raw_body))
 }
 
+fn parse_email_headers(
+    header_block: &str,
+    from: &mut String,
+    to: &mut Vec<String>,
+    cc: &mut Vec<String>,
+    subject: &mut String,
+    parsed_headers: &mut HashMap<String, String>,
+) {
+    let mut cur_name = String::new();
+    let mut cur_value = String::new();
+
+    for line in header_block.lines() {
+        if line.starts_with(' ') || line.starts_with('\t') {
+            cur_value.push(' ');
+            cur_value.push_str(line.trim());
+        } else if let Some(colon) = line.find(':') {
+            if !cur_name.is_empty() {
+                apply_header(parsed_headers, from, to, cc, subject, &cur_name, &cur_value);
+            }
+            cur_name = line[..colon].trim().to_ascii_lowercase();
+            cur_value = line[colon + 1..].trim().to_string();
+        }
+    }
+    if !cur_name.is_empty() {
+        apply_header(parsed_headers, from, to, cc, subject, &cur_name, &cur_value);
+    }
+}
+
 /// Minimal RFC 5322 parser.
 ///
 /// Handles folded headers, plain-text and HTML bodies (single-part only).
 /// Multi-part MIME bodies are accepted but only the first part is extracted.
+fn parse_rfc5322_body(
+    body_bytes: &[u8],
+    ct_lower: &str,
+    content_type: &str,
+    cte: &str,
+    parsed_headers: &HashMap<String, String>,
+) -> (Option<String>, Option<String>, Vec<Attachment>) {
+    if body_bytes.iter().all(|b| b.is_ascii_whitespace()) {
+        return (None, None, Vec::new());
+    }
+    if ct_lower.starts_with("multipart/") {
+        // Pass raw bytes so binary attachment parts are not corrupted.
+        return extract_multipart_bodies(body_bytes, content_type);
+    }
+
+    let disposition = parsed_headers
+        .get("content-disposition")
+        .map(|s| s.to_ascii_lowercase())
+        .unwrap_or_default();
+    let is_attachment = disposition.starts_with("attachment")
+        || (!ct_lower.is_empty()
+            && !ct_lower.starts_with("text/")
+            && !ct_lower.starts_with("message/"));
+
+    if is_attachment {
+        let filename = parsed_headers
+            .get("content-disposition")
+            .and_then(|d| mime_param(d, "filename"));
+        let ct_only = ct_lower
+            .split(';')
+            .next()
+            .map_or("application/octet-stream", str::trim)
+            .to_string();
+        let data = if cte == "base64" {
+            let stripped: String = String::from_utf8_lossy(body_bytes)
+                .chars()
+                .filter(|c| !c.is_ascii_whitespace())
+                .collect();
+            base64::engine::general_purpose::STANDARD
+                .decode(stripped.as_bytes())
+                .map_or_else(|_| Bytes::copy_from_slice(body_bytes), Bytes::from)
+        } else if cte == "quoted-printable" {
+            Bytes::from(decode_quoted_printable_bytes(body_bytes))
+        } else {
+            Bytes::copy_from_slice(body_bytes)
+        };
+        (
+            None,
+            None,
+            vec![Attachment {
+                filename,
+                content_type: ct_only,
+                data,
+            }],
+        )
+    } else {
+        let body_str = String::from_utf8_lossy(body_bytes).into_owned();
+        if ct_lower.contains("text/html") {
+            (
+                None,
+                Some(decode_transfer_encoding(&body_str, cte)),
+                Vec::new(),
+            )
+        } else {
+            (
+                Some(decode_transfer_encoding(&body_str, cte)),
+                None,
+                Vec::new(),
+            )
+        }
+    }
+}
+
 fn parse_rfc5322(raw: Bytes) -> InboundEmail {
     // Split at the byte level so body bytes are preserved exactly for binary attachments.
     let (header_bytes, body_bytes): (&[u8], &[u8]) = find_subslice(&raw, b"\r\n\r\n")
@@ -1139,40 +1240,14 @@ fn parse_rfc5322(raw: Bytes) -> InboundEmail {
     let mut subject = String::new();
     let mut parsed_headers: HashMap<String, String> = HashMap::new();
 
-    let mut cur_name = String::new();
-    let mut cur_value = String::new();
-
-    for line in header_block.lines() {
-        if line.starts_with(' ') || line.starts_with('\t') {
-            cur_value.push(' ');
-            cur_value.push_str(line.trim());
-        } else if let Some(colon) = line.find(':') {
-            if !cur_name.is_empty() {
-                apply_header(
-                    &mut parsed_headers,
-                    &mut from,
-                    &mut to,
-                    &mut cc,
-                    &mut subject,
-                    &cur_name,
-                    &cur_value,
-                );
-            }
-            cur_name = line[..colon].trim().to_ascii_lowercase();
-            cur_value = line[colon + 1..].trim().to_string();
-        }
-    }
-    if !cur_name.is_empty() {
-        apply_header(
-            &mut parsed_headers,
-            &mut from,
-            &mut to,
-            &mut cc,
-            &mut subject,
-            &cur_name,
-            &cur_value,
-        );
-    }
+    parse_email_headers(
+        &header_block,
+        &mut from,
+        &mut to,
+        &mut cc,
+        &mut subject,
+        &mut parsed_headers,
+    );
 
     let content_type = parsed_headers
         .get("content-type")
@@ -1186,71 +1261,8 @@ fn parse_rfc5322(raw: Bytes) -> InboundEmail {
     // but pass the original `content_type` value to boundary extraction so that
     // case-sensitive boundary parameter values are preserved.
     let ct_lower = content_type.to_ascii_lowercase();
-    let (text_body, html_body, attachments) = if body_bytes.iter().all(|b| b.is_ascii_whitespace())
-    {
-        (None, None, Vec::new())
-    } else if ct_lower.starts_with("multipart/") {
-        // Pass raw bytes so binary attachment parts are not corrupted.
-        extract_multipart_bodies(body_bytes, &content_type)
-    } else {
-        let disposition = parsed_headers
-            .get("content-disposition")
-            .map(|s| s.to_ascii_lowercase())
-            .unwrap_or_default();
-        let is_attachment = disposition.starts_with("attachment")
-            || (!ct_lower.is_empty()
-                && !ct_lower.starts_with("text/")
-                && !ct_lower.starts_with("message/"));
-        if is_attachment {
-            let filename = parsed_headers
-                .get("content-disposition")
-                .and_then(|d| mime_param(d, "filename"));
-            let ct_only = ct_lower
-                .split(';')
-                .next()
-                .map(str::trim)
-                .unwrap_or("application/octet-stream")
-                .to_string();
-            let data = if cte == "base64" {
-                let stripped: String = String::from_utf8_lossy(body_bytes)
-                    .chars()
-                    .filter(|c| !c.is_ascii_whitespace())
-                    .collect();
-                base64::engine::general_purpose::STANDARD
-                    .decode(stripped.as_bytes())
-                    .map(Bytes::from)
-                    .unwrap_or_else(|_| Bytes::copy_from_slice(body_bytes))
-            } else if cte == "quoted-printable" {
-                Bytes::from(decode_quoted_printable_bytes(body_bytes))
-            } else {
-                Bytes::copy_from_slice(body_bytes)
-            };
-            (
-                None,
-                None,
-                vec![Attachment {
-                    filename,
-                    content_type: ct_only,
-                    data,
-                }],
-            )
-        } else {
-            let body_str = String::from_utf8_lossy(body_bytes).into_owned();
-            if ct_lower.contains("text/html") {
-                (
-                    None,
-                    Some(decode_transfer_encoding(&body_str, &cte)),
-                    Vec::new(),
-                )
-            } else {
-                (
-                    Some(decode_transfer_encoding(&body_str, &cte)),
-                    None,
-                    Vec::new(),
-                )
-            }
-        }
-    };
+    let (text_body, html_body, attachments) =
+        parse_rfc5322_body(body_bytes, &ct_lower, &content_type, &cte, &parsed_headers);
 
     InboundEmail {
         from,
@@ -1408,33 +1420,7 @@ fn extract_boundary(content_type: &str) -> Option<String> {
     })
 }
 
-/// Split a MIME multipart body and return `(text/plain, text/html, attachments)`.
-///
-/// Accepts raw bytes so non-base64 attachment parts are stored without UTF-8
-/// round-trip corruption. Recurses into nested `multipart/*` parts.
-fn extract_multipart_bodies(
-    body: &[u8],
-    content_type: &str,
-) -> (Option<String>, Option<String>, Vec<Attachment>) {
-    let Some(boundary) = extract_boundary(content_type) else {
-        return (
-            Some(String::from_utf8_lossy(body).into_owned()),
-            None,
-            Vec::new(),
-        );
-    };
-    let delimiter = format!("--{boundary}");
-    let delim = delimiter.as_bytes();
-    let mut text_body: Option<String> = None;
-    let mut html_body: Option<String> = None;
-    let mut attachments: Vec<Attachment> = Vec::new();
-
-    // Split body into parts by finding each boundary delimiter.
-    // RFC 2046 §5.1.1: boundaries must appear at the start of a line and be followed by a
-    // valid terminator (CRLF, `-`, SP, HT, or EOF) — not an arbitrary character like a digit.
-    //
-    // `seg_start` tracks the beginning of the current segment independently of `pos` (the
-    // search cursor), so that advancing past a false-positive match does not discard content.
+fn split_multipart_body<'a>(body: &'a [u8], delim: &[u8]) -> Vec<&'a [u8]> {
     let mut raw_parts: Vec<&[u8]> = Vec::new();
     let mut pos = 0;
     let mut seg_start = 0;
@@ -1466,109 +1452,148 @@ fn extract_multipart_bodies(
             }
         }
     }
+    raw_parts
+}
+
+fn process_multipart_part(
+    part: &[u8],
+    text_body: &mut Option<String>,
+    html_body: &mut Option<String>,
+    attachments: &mut Vec<Attachment>,
+) {
+    // End-boundary remainder starts with `--`; blank/whitespace-only parts are noise.
+    if part.starts_with(b"--") || part.iter().all(|b| b.is_ascii_whitespace() || *b == b'-') {
+        return;
+    }
+    // Strip leading CRLF/LF (the newline after the boundary marker line).
+    let part = part
+        .strip_prefix(b"\r\n")
+        .or_else(|| part.strip_prefix(b"\n"))
+        .unwrap_or(part);
+    // Strip trailing CRLF/LF (the line ending before the next boundary).
+    let part = part
+        .strip_suffix(b"\r\n")
+        .or_else(|| part.strip_suffix(b"\n"))
+        .unwrap_or(part);
+
+    // Split part into headers and body at the blank-line separator.
+    // If no blank-line separator exists, the part has no headers — treat the
+    // entire content as the body with empty headers (RFC 2045 §5.2 defaults apply).
+    let (part_header_bytes, part_body_bytes) = find_subslice(part, b"\r\n\r\n")
+        .map(|p| (&part[..p], &part[p + 4..]))
+        .or_else(|| find_subslice(part, b"\n\n").map(|p| (&part[..p], &part[p + 2..])))
+        .unwrap_or_else(|| (&part[..0], part));
+
+    let part_headers = unfold_mime_headers(&String::from_utf8_lossy(part_header_bytes));
+    // Per RFC 2045 §5.2, a missing Content-Type defaults to text/plain.
+    let part_ct_lower = part_headers
+        .lines()
+        .find(|l| l.to_ascii_lowercase().starts_with("content-type:"))
+        .map_or_else(
+            || "text/plain".to_string(),
+            |l| l[13..].trim().to_ascii_lowercase(),
+        );
+    let part_ct_orig = part_headers
+        .lines()
+        .find(|l| l.to_ascii_lowercase().starts_with("content-type:"))
+        .map_or_else(|| "text/plain".to_string(), |l| l[13..].trim().to_string());
+    let part_cte = part_headers
+        .lines()
+        .find(|l| {
+            l.to_ascii_lowercase()
+                .starts_with("content-transfer-encoding:")
+        })
+        .map(|l| l[26..].trim().to_ascii_lowercase())
+        .unwrap_or_default();
+    // Keep original case for value extraction; only compare names case-insensitively.
+    let disposition = part_headers
+        .lines()
+        .find(|l| l.to_ascii_lowercase().starts_with("content-disposition:"))
+        .map(|l| l[l.find(':').map_or(0, |p| p + 1)..].trim().to_string())
+        .unwrap_or_default();
+    let disposition_lower = disposition.to_ascii_lowercase();
+    let is_attachment = disposition_lower.starts_with("attachment")
+        || mime_param(&disposition, "filename").is_some();
+
+    if part_ct_lower.starts_with("multipart/") {
+        // Recurse into nested multipart parts (e.g. multipart/alternative).
+        let (nested_text, nested_html, nested_atts) =
+            extract_multipart_bodies(part_body_bytes, &part_ct_orig);
+        if text_body.is_none() {
+            *text_body = nested_text;
+        }
+        if html_body.is_none() {
+            *html_body = nested_html;
+        }
+        attachments.extend(nested_atts);
+    } else if !is_attachment && part_ct_lower.starts_with("text/plain") && text_body.is_none() {
+        let s = String::from_utf8_lossy(part_body_bytes).into_owned();
+        *text_body = Some(decode_transfer_encoding(&s, &part_cte));
+    } else if !is_attachment && part_ct_lower.starts_with("text/html") && html_body.is_none() {
+        let s = String::from_utf8_lossy(part_body_bytes).into_owned();
+        *html_body = Some(decode_transfer_encoding(&s, &part_cte));
+    } else if is_attachment || !part_ct_lower.starts_with("text/") {
+        // Collect attachment parts; use raw bytes to avoid UTF-8 corruption.
+        let filename = mime_param(&disposition, "filename");
+        let ct_only = part_ct_lower
+            .split(';')
+            .next()
+            .map_or("application/octet-stream", str::trim)
+            .to_string();
+        let data = if part_cte == "base64" {
+            let stripped: String = String::from_utf8_lossy(part_body_bytes)
+                .chars()
+                .filter(|c| !c.is_ascii_whitespace())
+                .collect();
+            base64::engine::general_purpose::STANDARD
+                .decode(stripped.as_bytes())
+                .map_or_else(|_| Bytes::copy_from_slice(part_body_bytes), Bytes::from)
+        } else if part_cte == "quoted-printable" {
+            // Use the byte-returning decoder to avoid UTF-8 replacement for
+            // non-text attachments whose decoded bytes may not be valid UTF-8.
+            Bytes::from(decode_quoted_printable_bytes(part_body_bytes))
+        } else {
+            Bytes::copy_from_slice(part_body_bytes)
+        };
+        attachments.push(Attachment {
+            filename,
+            content_type: ct_only,
+            data,
+        });
+    }
+}
+
+/// Split a MIME multipart body and return `(text/plain, text/html, attachments)`.
+///
+/// Accepts raw bytes so non-base64 attachment parts are stored without UTF-8
+/// round-trip corruption. Recurses into nested `multipart/*` parts.
+fn extract_multipart_bodies(
+    body: &[u8],
+    content_type: &str,
+) -> (Option<String>, Option<String>, Vec<Attachment>) {
+    let Some(boundary) = extract_boundary(content_type) else {
+        return (
+            Some(String::from_utf8_lossy(body).into_owned()),
+            None,
+            Vec::new(),
+        );
+    };
+    let delimiter = format!("--{boundary}");
+    let delim = delimiter.as_bytes();
+    let mut text_body: Option<String> = None;
+    let mut html_body: Option<String> = None;
+    let mut attachments: Vec<Attachment> = Vec::new();
+
+    // Split body into parts by finding each boundary delimiter.
+    // RFC 2046 §5.1.1: boundaries must appear at the start of a line and be followed by a
+    // valid terminator (CRLF, `-`, SP, HT, or EOF) — not an arbitrary character like a digit.
+    //
+    // `seg_start` tracks the beginning of the current segment independently of `pos` (the
+    // search cursor), so that advancing past a false-positive match does not discard content.
+    let raw_parts = split_multipart_body(body, delim);
 
     for part in raw_parts.into_iter().skip(1) {
-        // End-boundary remainder starts with `--`; blank/whitespace-only parts are noise.
-        if part.starts_with(b"--") || part.iter().all(|b| b.is_ascii_whitespace() || *b == b'-') {
-            continue;
-        }
-        // Strip leading CRLF/LF (the newline after the boundary marker line).
-        let part = part
-            .strip_prefix(b"\r\n")
-            .or_else(|| part.strip_prefix(b"\n"))
-            .unwrap_or(part);
-        // Strip trailing CRLF/LF (the line ending before the next boundary).
-        let part = part
-            .strip_suffix(b"\r\n")
-            .or_else(|| part.strip_suffix(b"\n"))
-            .unwrap_or(part);
-
-        // Split part into headers and body at the blank-line separator.
-        // If no blank-line separator exists, the part has no headers — treat the
-        // entire content as the body with empty headers (RFC 2045 §5.2 defaults apply).
-        let (part_header_bytes, part_body_bytes) = find_subslice(part, b"\r\n\r\n")
-            .map(|p| (&part[..p], &part[p + 4..]))
-            .or_else(|| find_subslice(part, b"\n\n").map(|p| (&part[..p], &part[p + 2..])))
-            .unwrap_or((&part[..0], part));
-
-        let part_headers = unfold_mime_headers(&String::from_utf8_lossy(part_header_bytes));
-        // Per RFC 2045 §5.2, a missing Content-Type defaults to text/plain.
-        let part_ct_lower = part_headers
-            .lines()
-            .find(|l| l.to_ascii_lowercase().starts_with("content-type:"))
-            .map(|l| l[13..].trim().to_ascii_lowercase())
-            .unwrap_or_else(|| "text/plain".to_string());
-        let part_ct_orig = part_headers
-            .lines()
-            .find(|l| l.to_ascii_lowercase().starts_with("content-type:"))
-            .map(|l| l[13..].trim().to_string())
-            .unwrap_or_else(|| "text/plain".to_string());
-        let part_cte = part_headers
-            .lines()
-            .find(|l| {
-                l.to_ascii_lowercase()
-                    .starts_with("content-transfer-encoding:")
-            })
-            .map(|l| l[26..].trim().to_ascii_lowercase())
-            .unwrap_or_default();
-        // Keep original case for value extraction; only compare names case-insensitively.
-        let disposition = part_headers
-            .lines()
-            .find(|l| l.to_ascii_lowercase().starts_with("content-disposition:"))
-            .map(|l| l[l.find(':').map_or(0, |p| p + 1)..].trim().to_string())
-            .unwrap_or_default();
-        let disposition_lower = disposition.to_ascii_lowercase();
-        let is_attachment = disposition_lower.starts_with("attachment")
-            || mime_param(&disposition, "filename").is_some();
-
-        if part_ct_lower.starts_with("multipart/") {
-            // Recurse into nested multipart parts (e.g. multipart/alternative).
-            let (nested_text, nested_html, nested_atts) =
-                extract_multipart_bodies(part_body_bytes, &part_ct_orig);
-            if text_body.is_none() {
-                text_body = nested_text;
-            }
-            if html_body.is_none() {
-                html_body = nested_html;
-            }
-            attachments.extend(nested_atts);
-        } else if !is_attachment && part_ct_lower.starts_with("text/plain") && text_body.is_none() {
-            let s = String::from_utf8_lossy(part_body_bytes).into_owned();
-            text_body = Some(decode_transfer_encoding(&s, &part_cte));
-        } else if !is_attachment && part_ct_lower.starts_with("text/html") && html_body.is_none() {
-            let s = String::from_utf8_lossy(part_body_bytes).into_owned();
-            html_body = Some(decode_transfer_encoding(&s, &part_cte));
-        } else if is_attachment || !part_ct_lower.starts_with("text/") {
-            // Collect attachment parts; use raw bytes to avoid UTF-8 corruption.
-            let filename = mime_param(&disposition, "filename");
-            let ct_only = part_ct_lower
-                .split(';')
-                .next()
-                .map(str::trim)
-                .unwrap_or("application/octet-stream")
-                .to_string();
-            let data = if part_cte == "base64" {
-                let stripped: String = String::from_utf8_lossy(part_body_bytes)
-                    .chars()
-                    .filter(|c| !c.is_ascii_whitespace())
-                    .collect();
-                base64::engine::general_purpose::STANDARD
-                    .decode(stripped.as_bytes())
-                    .map(Bytes::from)
-                    .unwrap_or_else(|_| Bytes::copy_from_slice(part_body_bytes))
-            } else if part_cte == "quoted-printable" {
-                // Use the byte-returning decoder to avoid UTF-8 replacement for
-                // non-text attachments whose decoded bytes may not be valid UTF-8.
-                Bytes::from(decode_quoted_printable_bytes(part_body_bytes))
-            } else {
-                Bytes::copy_from_slice(part_body_bytes)
-            };
-            attachments.push(Attachment {
-                filename,
-                content_type: ct_only,
-                data,
-            });
-        }
+        process_multipart_part(part, &mut text_body, &mut html_body, &mut attachments);
     }
     (text_body, html_body, attachments)
 }
@@ -1761,6 +1786,93 @@ fn find_part_end(body: &[u8], crlf_delim: &[u8], lf_delim: &[u8]) -> Option<usiz
 /// Parse a `multipart/form-data` Mailgun webhook body into a field map and attachment list.
 ///
 /// Operates at the byte level so binary file parts are not corrupted by lossy UTF-8 conversion.
+fn parse_mailgun_part(
+    part: &[u8],
+    map: &mut HashMap<String, String>,
+    file_parts: &mut Vec<Attachment>,
+) {
+    // Split part headers from body on the blank line.
+    let (headers_bytes, body_bytes) = if let Some(sep) = find_subslice(part, b"\r\n\r\n") {
+        (&part[..sep], &part[sep + 4..])
+    } else if let Some(sep) = find_subslice(part, b"\n\n") {
+        (&part[..sep], &part[sep + 2..])
+    } else {
+        return;
+    };
+
+    // Headers are ASCII; lossy conversion is safe here.  Unfold before
+    // parsing so a folded Content-Disposition reads as one logical line.
+    let headers_str = unfold_mime_headers(&String::from_utf8_lossy(headers_bytes));
+
+    // Preserve the original disposition value so that filename casing is not
+    // corrupted — parameter values are case-sensitive (RFC 2183 §2).
+    // Key matching (name=, filename=) is done case-insensitively.
+    let disposition = headers_str
+        .lines()
+        .find(|l| l.to_ascii_lowercase().starts_with("content-disposition:"))
+        .map(|l| l[l.find(':').map_or(0, |p| p + 1)..].trim().to_string())
+        .unwrap_or_default();
+
+    // Use the quote-aware parser so that filenames containing semicolons,
+    // e.g. filename="Q1;final.pdf", are not truncated at the semicolon.
+    let Some(name) = mime_param(&disposition, "name") else {
+        return;
+    };
+
+    if let Some(filename) = mime_param(&disposition, "filename") {
+        // File part: use raw bytes from the original buffer to avoid lossy UTF-8 corruption.
+        let part_ct = headers_str
+            .lines()
+            .find(|l| l.to_ascii_lowercase().starts_with("content-type:"))
+            .map_or_else(
+                || "application/octet-stream".to_string(),
+                |l| {
+                    l[13..]
+                        .trim()
+                        .split(';')
+                        .next()
+                        .map_or("application/octet-stream", str::trim)
+                        .to_ascii_lowercase()
+                },
+            );
+        let part_cte = headers_str
+            .lines()
+            .find(|l| {
+                l.to_ascii_lowercase()
+                    .starts_with("content-transfer-encoding:")
+            })
+            .map(|l| l[26..].trim().to_ascii_lowercase())
+            .unwrap_or_default();
+
+        // Some providers send quoted-printable or base64 attachments in form-data.
+        // Decode them before writing out the file so they are stored as raw bytes.
+        let data = if part_cte == "base64" {
+            let stripped: String = String::from_utf8_lossy(body_bytes)
+                .chars()
+                .filter(|c| !c.is_ascii_whitespace())
+                .collect();
+            base64::engine::general_purpose::STANDARD
+                .decode(stripped.as_bytes())
+                .map_or_else(|_| Bytes::copy_from_slice(body_bytes), Bytes::from)
+        } else if part_cte == "quoted-printable" {
+            // Must use a byte-level decode for binary attachments; replacing non-ASCII
+            // bytes with U+FFFD corrupts them.
+            Bytes::from(decode_quoted_printable_bytes(body_bytes))
+        } else {
+            Bytes::copy_from_slice(body_bytes)
+        };
+
+        file_parts.push(Attachment {
+            filename: Some(filename),
+            content_type: part_ct,
+            data,
+        });
+    } else {
+        // Text part (e.g. subject, recipient list).
+        map.insert(name, String::from_utf8_lossy(body_bytes).into_owned());
+    }
+}
+
 fn parse_mailgun_form_data(
     body: &[u8],
     content_type: &str,
@@ -1820,89 +1932,12 @@ fn parse_mailgun_form_data(
         // `find_part_end` validates the terminator byte to avoid false matches on
         // boundary-prefix strings (e.g. "\r\n--abc" inside "\r\n--abc123").
         let part_end = find_part_end(&body[part_start..], crlf_delim_bytes, lf_delim_bytes)
-            .map(|p| part_start + p)
-            .unwrap_or(body.len());
+            .map_or(body.len(), |p| part_start + p);
 
         search_from = part_end;
         let part = &body[part_start..part_end];
 
-        // Split part headers from body on the blank line.
-        let (headers_bytes, body_bytes) = if let Some(sep) = find_subslice(part, b"\r\n\r\n") {
-            (&part[..sep], &part[sep + 4..])
-        } else if let Some(sep) = find_subslice(part, b"\n\n") {
-            (&part[..sep], &part[sep + 2..])
-        } else {
-            continue;
-        };
-
-        // Headers are ASCII; lossy conversion is safe here.  Unfold before
-        // parsing so a folded Content-Disposition reads as one logical line.
-        let headers_str = unfold_mime_headers(&String::from_utf8_lossy(headers_bytes));
-
-        // Preserve the original disposition value so that filename casing is not
-        // corrupted — parameter values are case-sensitive (RFC 2183 §2).
-        // Key matching (name=, filename=) is done case-insensitively.
-        let disposition = headers_str
-            .lines()
-            .find(|l| l.to_ascii_lowercase().starts_with("content-disposition:"))
-            .map(|l| l[l.find(':').map_or(0, |p| p + 1)..].trim().to_string())
-            .unwrap_or_default();
-
-        // Use the quote-aware parser so that filenames containing semicolons,
-        // e.g. filename="Q1;final.pdf", are not truncated at the semicolon.
-        let name = mime_param(&disposition, "name");
-        let Some(name) = name else { continue };
-
-        let filename = mime_param(&disposition, "filename");
-
-        if let Some(filename) = filename {
-            // File part: use raw bytes from the original buffer to avoid lossy UTF-8 corruption.
-            let part_ct = headers_str
-                .lines()
-                .find(|l| l.to_ascii_lowercase().starts_with("content-type:"))
-                .map(|l| {
-                    l[13..]
-                        .trim()
-                        .split(';')
-                        .next()
-                        .map(str::trim)
-                        .unwrap_or("application/octet-stream")
-                        .to_ascii_lowercase()
-                })
-                .unwrap_or_else(|| "application/octet-stream".to_string());
-            let part_cte = headers_str
-                .lines()
-                .find(|l| {
-                    l.to_ascii_lowercase()
-                        .starts_with("content-transfer-encoding:")
-                })
-                .map(|l| l[26..].trim().to_ascii_lowercase())
-                .unwrap_or_default();
-            let data: Bytes = if part_cte == "base64" {
-                // base64 is ASCII; string round-trip is safe.
-                let stripped: String = String::from_utf8_lossy(body_bytes)
-                    .chars()
-                    .filter(|c| !c.is_ascii_whitespace())
-                    .collect();
-                base64::engine::general_purpose::STANDARD
-                    .decode(stripped.as_bytes())
-                    .map(Bytes::from)
-                    .unwrap_or_else(|_| Bytes::copy_from_slice(body_bytes))
-            } else {
-                // Binary (8-bit): copy raw bytes without any string conversion.
-                Bytes::copy_from_slice(body_bytes)
-            };
-            file_parts.push(Attachment {
-                filename: Some(filename),
-                content_type: part_ct,
-                data,
-            });
-        } else {
-            // Text field: lossy conversion is acceptable.
-            // Do not trim trailing newlines — the boundary separator is already excluded
-            // by the line-anchored boundary split, so trailing content is intentional.
-            map.insert(name, String::from_utf8_lossy(body_bytes).into_owned());
-        }
+        parse_mailgun_part(part, &mut map, &mut file_parts);
     }
     (map, file_parts)
 }
