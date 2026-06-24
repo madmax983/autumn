@@ -1227,4 +1227,55 @@ mod tests {
         assert_eq!(hx_trigger, r#"{"autumn:conflict":true}"#);
         Ok(())
     }
+    #[test]
+    fn circuit_breaker_error_maps_to_503() {
+        #[derive(Debug)]
+        struct CircuitBreakerError;
+        impl std::fmt::Display for CircuitBreakerError {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "circuit breaker is open")
+            }
+        }
+        impl std::error::Error for CircuitBreakerError {}
+
+        let err: AutumnError = CircuitBreakerError.into();
+        assert_eq!(err.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn cache_idempotency_response_extension_is_not_set_by_default() {
+        let err = AutumnError::not_found_msg("not found");
+        let response = err.into_response();
+        assert!(response.extensions().get::<crate::idempotency::IdempotencyCacheCommittedErrorResponse>().is_none());
+    }
+
+    #[tokio::test]
+    async fn cache_idempotency_response_extension_is_set() {
+        let mut err = AutumnError::not_found_msg("not found");
+        err.cache_idempotency_response = true;
+        let response = err.into_response();
+        assert!(response.extensions().get::<crate::idempotency::IdempotencyCacheCommittedErrorResponse>().is_some());
+    }
+    #[tokio::test]
+    async fn non_conflict_response_has_no_hx_trigger_header() -> Result<(), axum::Error> {
+        let err = AutumnError::bad_request_msg("bad request");
+        let response = err.into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(response.headers().get("HX-Trigger").is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn query_canceled_into_response_maps_to_503_for_other_patterns() {
+        let err1 = AutumnError::internal_server_error(std::io::Error::other("error 57014 occurred"));
+        assert_eq!(err1.into_response().status(), StatusCode::SERVICE_UNAVAILABLE);
+        let err2 = AutumnError::internal_server_error(std::io::Error::other("Query_canceled"));
+        assert_eq!(err2.into_response().status(), StatusCode::SERVICE_UNAVAILABLE);
+        let err3 = AutumnError::internal_server_error(std::io::Error::other("statement timeout"));
+        assert_eq!(err3.into_response().status(), StatusCode::SERVICE_UNAVAILABLE);
+        let err4 = AutumnError::internal_server_error(std::io::Error::other("canceling statement due to statement timeout"));
+        assert_eq!(err4.into_response().status(), StatusCode::SERVICE_UNAVAILABLE);
+        let err5 = AutumnError::internal_server_error(std::io::Error::other("query canceled"));
+        assert_eq!(err5.into_response().status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
 }
