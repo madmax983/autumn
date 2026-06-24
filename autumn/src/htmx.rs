@@ -258,6 +258,21 @@ pub enum OobSwap {
 impl OobSwap {
     pub fn format_value<'a>(&'a self, id: &'a str) -> std::borrow::Cow<'a, str> {
         let clean_id = id.strip_prefix('#').unwrap_or(id);
+        if clean_id.is_empty() {
+            return match self {
+                Self::True => std::borrow::Cow::Borrowed("true"),
+                Self::OuterHTML => std::borrow::Cow::Borrowed("outerHTML"),
+                Self::InnerHTML => std::borrow::Cow::Borrowed("innerHTML"),
+                Self::BeforeBegin => std::borrow::Cow::Borrowed("beforebegin"),
+                Self::AfterBegin => std::borrow::Cow::Borrowed("afterbegin"),
+                Self::BeforeEnd => std::borrow::Cow::Borrowed("beforeend"),
+                Self::AfterEnd => std::borrow::Cow::Borrowed("afterend"),
+                Self::Delete => std::borrow::Cow::Borrowed("delete"),
+                Self::Target(method, _) => std::borrow::Cow::Borrowed(method.as_str()),
+                Self::Custom(val) => std::borrow::Cow::Borrowed(val),
+                Self::Raw => unreachable!("Raw strategy should not be formatted into a template wrapper"),
+            };
+        }
         match self {
             Self::True => std::borrow::Cow::Borrowed("true"),
             Self::OuterHTML => std::borrow::Cow::Borrowed("outerHTML"),
@@ -733,5 +748,21 @@ mod tests {
         assert!(!has_oob_attribute("<div id=\"some-hx-swap-oob-element\"></div>"));
         assert!(!has_oob_attribute("<!-- <div hx-swap-oob=\"true\"></div> -->"));
         assert!(!has_oob_attribute("<div class=\"x\">some text hx-swap-oob=\"true\"</div>"));
+    }
+
+    #[test]
+    fn test_oob_swap_format_value_empty_id() {
+        assert_eq!(OobSwap::True.format_value(""), "true");
+        assert_eq!(OobSwap::True.format_value("#"), "true");
+        assert_eq!(OobSwap::InnerHTML.format_value(""), "innerHTML");
+        assert_eq!(OobSwap::InnerHTML.format_value("#"), "innerHTML");
+        assert_eq!(OobSwap::BeforeEnd.format_value(""), "beforeend");
+        assert_eq!(OobSwap::BeforeEnd.format_value("#"), "beforeend");
+        assert_eq!(OobSwap::Target(OobMethod::InnerHTML, "#target".to_string()).format_value(""), "innerHTML");
+        assert_eq!(OobSwap::Target(OobMethod::BeforeEnd, "#target".to_string()).format_value("#"), "beforeend");
+        
+        // Non-empty ID case
+        assert_eq!(OobSwap::InnerHTML.format_value("my-id"), "innerHTML:#my-id");
+        assert_eq!(OobSwap::InnerHTML.format_value("#my-id"), "innerHTML:#my-id");
     }
 }
