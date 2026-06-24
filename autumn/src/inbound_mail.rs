@@ -68,13 +68,25 @@ mod sns_verify {
     ///
     /// Accepted form: `https://sns.<region>.amazonaws.com/…` (or `.cn`).
     pub(super) fn is_valid_sns_cert_url(url: &str) -> bool {
-        let Some(host) = url.strip_prefix("https://") else {
+        let Ok(parsed) = url::Url::parse(url) else {
             return false;
         };
-        let host = host.split('/').next().unwrap_or("");
-        // Must be sns.<anything>.amazonaws.com or sns.<anything>.amazonaws.com.cn
+        if parsed.scheme() != "https" {
+            return false;
+        }
+        let Some(host) = parsed.host_str() else {
+            return false;
+        };
         let base = host.strip_suffix(".cn").unwrap_or(host);
-        base.ends_with(".amazonaws.com") && base.starts_with("sns.") && !host.contains("..")
+        let parts: Vec<&str> = base.split('.').collect();
+        if parts.len() != 4 {
+            return false;
+        }
+        if parts[0] != "sns" || parts[2] != "amazonaws" || parts[3] != "com" {
+            return false;
+        }
+        let region = parts[1];
+        !region.is_empty() && region.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
     }
 
     /// Build the canonical string SNS uses for signing.
@@ -2878,6 +2890,20 @@ mod tests {
         // double-dot (path traversal attempt)
         assert!(!sns_verify::is_valid_sns_cert_url(
             "https://sns..amazonaws.com/cert.pem"
+        ));
+        // SSRF URL parsing confusion
+        assert!(!sns_verify::is_valid_sns_cert_url(
+            "https://sns.attacker.com#.amazonaws.com/cert.pem"
+        ));
+        assert!(!sns_verify::is_valid_sns_cert_url(
+            "https://sns.example.com@amazonaws.com/cert.pem"
+        ));
+        // SSRF S3 bucket / API Gateway evasion
+        assert!(!sns_verify::is_valid_sns_cert_url(
+            "https://sns.attacker.s3.amazonaws.com/cert.pem"
+        ));
+        assert!(!sns_verify::is_valid_sns_cert_url(
+            "https://sns.execute-api.us-east-1.amazonaws.com/cert.pem"
         ));
     }
 
