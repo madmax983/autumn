@@ -49,6 +49,8 @@ pub use crate::assets::javascript_include_tag;
 pub use maud::{Markup, PreEscaped, html};
 
 // ── Extractors ───────────────────────────────────────────────────
+/// Primitive response wrapper for returning raw numbers or booleans from handlers.
+pub use crate::Primitive;
 /// Canary traffic-routing extractor (reads the `X-Canary` header).
 pub use crate::canary::CanaryRoute;
 /// Database connection extractor.
@@ -104,6 +106,7 @@ pub use crate::{Presence, PresenceEntry, PresenceEvent, PresenceHandle};
 pub use axum::extract::State;
 /// Trait for types that can be converted into an HTTP response.
 pub use axum::response::IntoResponse;
+
 /// HTTP status codes.
 pub use http::StatusCode;
 
