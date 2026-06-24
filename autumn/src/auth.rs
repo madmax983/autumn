@@ -983,10 +983,7 @@ async fn validate_callback_state(
     let expected_state = session.get(&state_key).await.ok_or_else(|| {
         crate::AutumnError::unauthorized_msg("oauth2 state missing; restart login")
     })?;
-    if subtle::ConstantTimeEq::ct_eq(expected_state.as_bytes(), callback.state.as_bytes())
-        .unwrap_u8()
-        != 1
-    {
+    if !crate::security::config::ct_eq_str(&expected_state, &callback.state) {
         return Err(crate::AutumnError::unauthorized_msg(
             "oauth2 state mismatch",
         ));
@@ -1092,10 +1089,7 @@ async fn validate_oidc_nonce(
             .get("nonce")
             .and_then(serde_json::Value::as_str)
             .ok_or_else(|| crate::AutumnError::unauthorized_msg("missing oidc nonce claim"))?;
-        if subtle::ConstantTimeEq::ct_eq(expected_nonce.as_bytes(), actual_nonce.as_bytes())
-            .unwrap_u8()
-            != 1
-        {
+        if !crate::security::config::ct_eq_str(&expected_nonce, actual_nonce) {
             return Err(crate::AutumnError::unauthorized_msg("oidc nonce mismatch"));
         }
     }

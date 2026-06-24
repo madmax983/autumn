@@ -1023,7 +1023,13 @@ fn hex<B: AsRef<[u8]>>(bytes: B) -> String {
 
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     use subtle::ConstantTimeEq;
-    a.ct_eq(b).into()
+    let len_eq = a.len().ct_eq(&b.len());
+    let mut bytes_eq = subtle::Choice::from(1u8);
+    for (i, &a_byte) in a.iter().enumerate() {
+        let b_byte = *b.get(i).unwrap_or(&0xFF);
+        bytes_eq &= a_byte.ct_eq(&b_byte);
+    }
+    (len_eq & bytes_eq).into()
 }
 
 /// Verify a signed blob URL against `current` and each `previous` key.
