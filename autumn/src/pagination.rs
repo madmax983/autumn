@@ -1218,6 +1218,13 @@ mod tests {
     }
 
     #[test]
+    fn cursor_request_decode_helper_preserves_size() {
+        let req = CursorRequest::new(None, 42);
+        let page: CursorPage<i32> = CursorPage::empty(&req);
+        assert_eq!(page.size, 42);
+    }
+
+    #[test]
     fn cursor_request_clamps_size_to_max() {
         let r = CursorRequest::new(None, 9_999);
         assert_eq!(r.size(), MAX_PAGE_SIZE);
@@ -1315,6 +1322,19 @@ mod tests {
         assert_eq!(page.size, 2);
         assert!(page.next_cursor.is_none());
         assert!(!page.has_next);
+
+        let req_exact = CursorRequest::new(None, 2);
+        let items_exact = vec![1, 2];
+        let page_exact = CursorPage::from_overfetched_inner(
+            items_exact,
+            &req_exact,
+            |&i| i,
+            |_| Some("cursor".to_string()),
+        );
+        assert_eq!(page_exact.content, vec![1, 2]);
+        assert_eq!(page_exact.size, 2);
+        assert!(!page_exact.has_next);
+        assert!(page_exact.next_cursor.is_none());
     }
 
     #[test]
@@ -1329,6 +1349,11 @@ mod tests {
         let req_diff_size = CursorRequest::new(None, 5);
         let page_diff_size: CursorPage<i32> = CursorPage::empty(&req_diff_size);
         assert_eq!(page_diff_size.size, 5);
+
+        let req_diff_size2 = CursorRequest::new(None, 100);
+        let page_diff_size2: CursorPage<i32> = CursorPage::empty(&req_diff_size2);
+        assert_eq!(page_diff_size2.size, 100);
+        assert_eq!(page_diff_size2.content.len(), 0);
     }
 
     #[test]
@@ -1681,6 +1706,16 @@ mod tests {
         let c = Cursor::encode_signed(&p, b"k2").unwrap();
         assert_eq!(a, b);
         assert_ne!(a, c);
+    }
+
+    #[test]
+    fn constant_time_eq_rejects_different_lengths() {
+        let a = b"abc";
+        let b = b"ab";
+        assert!(!constant_time_eq(a, b));
+
+        let c = b"abcd";
+        assert!(!constant_time_eq(a, c));
     }
 
     #[tokio::test]
