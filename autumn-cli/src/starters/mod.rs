@@ -340,8 +340,14 @@ fn collect_dir(root: &Path, cur: &Path, out: &mut Vec<StarterFile>) -> io::Resul
         if SKIP_DIRS.contains(&entry.file_name().to_str().unwrap_or("")) {
             continue;
         }
+        // Skip symlinks entirely: following them risks infinite recursion (a link
+        // to an ancestor) and reading/writing files outside the starter root.
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() {
+            continue;
+        }
         let path = entry.path();
-        if path.is_dir() {
+        if file_type.is_dir() {
             collect_dir(root, &path, out)?;
         } else {
             let rel = path
@@ -397,14 +403,27 @@ fn scaffold(
 ) -> Result<(), StarterError> {
     let mut plan = Plan::new(project_dir);
     for file in &contents.files {
-        let target = project_dir.join(&file.rel_path);
+        // Defence-in-depth: reject absolute paths or `..` components so a
+        // malicious starter cannot write outside the target project directory.
+        let rel_path = Path::new(&file.rel_path);
+        if rel_path.is_absolute()
+            || rel_path
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return Err(StarterError::InvalidSource(format!(
+                "malicious path in starter: {}",
+                file.rel_path
+            )));
+        }
+        let target = project_dir.join(rel_path);
         // Verbatim or non-UTF-8 files are copied byte-for-byte; substituting
         // them would corrupt binary assets.
         if is_verbatim(&contents.manifest, &file.rel_path) {
             plan.create_bytes(target, file.bytes.clone());
         } else {
             match std::str::from_utf8(&file.bytes) {
-                Ok(text) => plan.create(target, render_template(text, &vars)),
+                Ok(text) => plan.create(target, render_template(text, vars)),
                 Err(_) => plan.create_bytes(target, file.bytes.clone()),
             }
         }

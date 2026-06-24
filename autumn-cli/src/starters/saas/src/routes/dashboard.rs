@@ -67,12 +67,20 @@ pub async fn create_project(
     };
 
     let name = form.name.trim().to_owned();
-    if name.is_empty() {
-        return Err(AutumnError::unprocessable_msg("Project name is required"));
+    // Mirror the `#[validate(length(min = 1, max = 200))]` constraint on the
+    // Project model so the route rejects out-of-range names before saving.
+    if name.is_empty() || name.chars().count() > 200 {
+        return Err(AutumnError::unprocessable_msg(
+            "Project name must be between 1 and 200 characters",
+        ));
     }
 
     // `tenant_id` is stamped by the tenant_scoped repository from the context
     // below, so it is not part of `NewProject`.
-    with_tenant(tenant_id, async move { repo.save(&NewProject { name }).await }).await?;
+    with_tenant(
+        tenant_id,
+        async move { repo.save(&NewProject { name }).await },
+    )
+    .await?;
     Ok(Redirect::to("/dashboard").into_response())
 }

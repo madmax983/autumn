@@ -93,12 +93,12 @@ fn expand_shorthand(repo: &str) -> Result<String, StarterError> {
     Ok(format!("https://github.com/{repo}.git"))
 }
 
-/// True when `reference` is a full 40-hex commit SHA.
+/// True when `reference` is a full commit SHA (40-hex SHA-1 or 64-hex SHA-256).
 ///
 /// `git clone --branch` rejects raw commit SHAs; those require a separate
 /// fetch+checkout flow instead of `--branch`.
 fn is_full_sha(r: &str) -> bool {
-    r.len() == 40 && r.chars().all(|c| c.is_ascii_hexdigit())
+    (r.len() == 40 || r.len() == 64) && r.chars().all(|c| c.is_ascii_hexdigit())
 }
 
 /// Shallow-clone `source` into `dest`, checking out a pinned ref when present.

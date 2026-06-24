@@ -71,14 +71,16 @@ pub async fn signup(
     Form(form): Form<SignupForm>,
 ) -> AutumnResult<Redirect> {
     let email = form.email.trim().to_lowercase();
-    if !email.contains('@') {
+    // Cap input lengths so an attacker cannot drive bcrypt/DB work with huge
+    // payloads (254 is the RFC-5321 email maximum; 128 is a generous password cap).
+    if !email.contains('@') || email.len() > 254 {
         return Err(AutumnError::unprocessable_msg(
-            "Enter a valid email address",
+            "Enter a valid email address (max 254 characters)",
         ));
     }
-    if form.password.len() < 8 {
+    if form.password.len() < 8 || form.password.len() > 128 {
         return Err(AutumnError::unprocessable_msg(
-            "Password must be at least 8 characters",
+            "Password must be between 8 and 128 characters",
         ));
     }
 
@@ -143,6 +145,11 @@ pub async fn login(
     Form(form): Form<LoginForm>,
 ) -> AutumnResult<Redirect> {
     let email = form.email.trim().to_lowercase();
+    // Reject over-long inputs before any DB query or bcrypt work — they can never
+    // match a stored account and only waste CPU.
+    if email.len() > 254 || form.password.len() > 128 {
+        return Err(AutumnError::unauthorized_msg("Invalid email or password"));
+    }
 
     let user: Option<User> = users::table
         .filter(users::email.eq(&email))

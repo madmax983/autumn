@@ -2,7 +2,7 @@
 //!
 //! Built-in starters apply with no network fetch and no provenance prompt — the
 //! core set is vetted and shipped with `autumn-cli` (issue #993). Each starter's
-//! template tree is embedded via [`include_dir`]; the tree's root contains an
+//! template tree is embedded via [`include_dir!`]; the tree's root contains an
 //! `autumn-starter.toml` manifest plus the template files.
 
 use include_dir::{Dir, include_dir};
