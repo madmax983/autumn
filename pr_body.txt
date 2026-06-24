@@ -1,0 +1,11 @@
+💡 **The Spark:**
+Admin dashboards lack a real-time way to observe server errors and panics as they happen.
+
+🚀 **The Feature:**
+Introduced `ChannelErrorReporter` which implements the `ErrorReporter` trait. When a server error or panic occurs, it serializes the `ErrorEvent` to JSON and broadcasts it to a specified `Channels` topic (e.g., `system:errors`).
+
+🔮 **The Potential:**
+This can be used to build a real-time "Error Stream" in an admin dashboard, notifying admins immediately when panics occur without requiring them to check server logs.
+
+⚠️ **Risk:**
+Low. The implementation ignores serialization and transmission errors silently (as is standard for channels without active subscribers), meaning it won't impact request handling.
