@@ -1,0 +1,28 @@
+# Autumn configuration for {{project_name}} — a multi-tenant SaaS starter.
+
+[server]
+host = "127.0.0.1"
+port = 3000
+
+[log]
+level = "info"
+
+[health]
+path = "/health"
+
+[database]
+# Matches docker-compose.yml. Point this at your own Postgres in production.
+url = "postgres://autumn:autumn@localhost:5432/{{crate_name}}"
+pool_size = 10
+
+# Tenancy in this starter is established per-request from the session inside the
+# dashboard handler (see src/routes/dashboard.rs) using `with_tenant`, so the
+# public signup/login pages stay reachable. Tenant-scoped repositories then
+# filter every query by the current tenant automatically. To switch to fully
+# automatic, middleware-driven tenant resolution once every route is behind
+# auth, enable:
+#
+#   [tenancy]
+#   enabled = true
+#   source = "session"
+#   session_key = "tenant_id"
