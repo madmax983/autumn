@@ -65,3 +65,81 @@ fn cloud_native_scaffold_dockerfile_is_production_ready() {
     assert!(dockerignore.contains("/.git"));
     assert!(dockerignore.contains("static/css/autumn.css"));
 }
+
+#[test]
+fn ci_workflow_is_scaffolded() {
+    let temp_dir = scaffold("ci-app");
+    let project_dir = temp_dir.path().join("ci-app");
+
+    assert!(
+        project_dir.join(".github/workflows/ci.yml").is_file(),
+        "autumn new must write .github/workflows/ci.yml"
+    );
+}
+
+#[test]
+fn ci_workflow_contains_expected_jobs() {
+    let temp_dir = scaffold("ci-jobs-app");
+    let project_dir = temp_dir.path().join("ci-jobs-app");
+    let ci = fs::read_to_string(project_dir.join(".github/workflows/ci.yml")).unwrap();
+
+    assert!(
+        ci.contains("cargo fmt --all -- --check"),
+        "ci.yml must run cargo fmt --check"
+    );
+    assert!(
+        ci.contains("cargo clippy") && ci.contains("-D warnings"),
+        "ci.yml must run cargo clippy -D warnings"
+    );
+    assert!(ci.contains("cargo build"), "ci.yml must run cargo build");
+    assert!(ci.contains("cargo test"), "ci.yml must run cargo test");
+}
+
+#[test]
+fn ci_workflow_pins_msrv_toolchain() {
+    let temp_dir = scaffold("ci-msrv-app");
+    let project_dir = temp_dir.path().join("ci-msrv-app");
+    let ci = fs::read_to_string(project_dir.join(".github/workflows/ci.yml")).unwrap();
+    let msrv = option_env!("CARGO_PKG_RUST_VERSION").unwrap_or("1.88.0");
+
+    assert!(
+        ci.contains(&format!("dtolnay/rust-toolchain@{msrv}")),
+        "ci.yml must pin the Rust toolchain to the MSRV ({msrv}), got:\n{ci}"
+    );
+    assert!(
+        !ci.contains("rust-toolchain@stable"),
+        "ci.yml must not use rust-toolchain@stable; it must be pinned to MSRV"
+    );
+}
+
+#[test]
+fn ci_workflow_provisions_postgres() {
+    let temp_dir = scaffold("ci-pg-app");
+    let project_dir = temp_dir.path().join("ci-pg-app");
+    let ci = fs::read_to_string(project_dir.join(".github/workflows/ci.yml")).unwrap();
+
+    assert!(
+        ci.contains("postgres"),
+        "ci.yml must provision a Postgres service for DB-dependent tests"
+    );
+    assert!(
+        ci.contains("DATABASE_URL"),
+        "ci.yml must set DATABASE_URL for DB-dependent tests"
+    );
+}
+
+#[test]
+fn ci_workflow_has_no_unsubstituted_placeholders() {
+    let temp_dir = scaffold("ci-placeholder-app");
+    let project_dir = temp_dir.path().join("ci-placeholder-app");
+    let ci = fs::read_to_string(project_dir.join(".github/workflows/ci.yml")).unwrap();
+
+    assert!(
+        !ci.contains("{{"),
+        "ci.yml must not contain unsubstituted template placeholders, got:\n{ci}"
+    );
+    assert!(
+        ci.contains("ci-placeholder-app"),
+        "ci.yml must substitute the project name"
+    );
+}
