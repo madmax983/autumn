@@ -1590,17 +1590,32 @@ fn collapse_sse_body(bytes: &[u8]) -> String {
     let mut parser = SseWireParser::new();
     let mut events = parser.push(bytes);
     events.extend(parser.finish());
-    let (results, progress): (Vec<_>, Vec<_>) = events
-        .into_iter()
-        .partition(|e| e.event.as_deref() == Some("result"));
-    if results.is_empty() {
-        progress
-            .into_iter()
-            .map(|e| e.data)
-            .collect::<Vec<_>>()
-            .join("\n")
+
+    let mut has_result = false;
+    for e in &events {
+        if e.event.as_deref() == Some("result") {
+            has_result = true;
+            break;
+        }
+    }
+
+    if has_result {
+        let mut out = String::new();
+        for e in events {
+            if e.event.as_deref() == Some("result") {
+                out.push_str(&e.data);
+            }
+        }
+        out
     } else {
-        results.into_iter().map(|e| e.data).collect()
+        let mut out = String::new();
+        for (i, e) in events.into_iter().enumerate() {
+            if i > 0 {
+                out.push('\n');
+            }
+            out.push_str(&e.data);
+        }
+        out
     }
 }
 
