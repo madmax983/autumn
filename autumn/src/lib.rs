@@ -107,7 +107,6 @@ pub use crate::i18n::t;
 #[cfg(feature = "inbound-mail")]
 pub mod inbound_mail;
 pub mod inspector;
-pub mod interceptor;
 #[cfg(feature = "mail")]
 pub mod mail;
 pub mod maintenance;

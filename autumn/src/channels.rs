@@ -806,7 +806,7 @@ impl ChannelsBackend for RedisChannelsBackend {
 #[derive(Clone)]
 pub struct InterceptedChannelsBackend {
     inner: Arc<dyn ChannelsBackend>,
-    interceptors: Vec<Arc<dyn crate::interceptor::ChannelsInterceptor>>,
+    interceptors: Vec<Arc<dyn crate::channels::ChannelsInterceptor>>,
 }
 
 #[cfg(feature = "ws")]
@@ -814,7 +814,7 @@ impl InterceptedChannelsBackend {
     #[must_use]
     pub fn new(
         inner: Arc<dyn ChannelsBackend>,
-        interceptors: Vec<Arc<dyn crate::interceptor::ChannelsInterceptor>>,
+        interceptors: Vec<Arc<dyn crate::channels::ChannelsInterceptor>>,
     ) -> Self {
         Self {
             inner,
@@ -827,7 +827,7 @@ impl InterceptedChannelsBackend {
 fn run_chain(
     topic: &str,
     msg: &ChannelMessage,
-    interceptors: &[Arc<dyn crate::interceptor::ChannelsInterceptor>],
+    interceptors: &[Arc<dyn crate::channels::ChannelsInterceptor>],
     inner: &dyn ChannelsBackend,
     idx: usize,
 ) -> Result<usize, ChannelPublishError> {
@@ -1490,4 +1490,19 @@ mod tests {
         tx.send("sse message").unwrap();
         let _stream = sse;
     }
+}
+
+#[cfg(feature = "ws")]
+pub trait ChannelsInterceptor: Send + Sync + 'static {
+    /// Intercepts a channel message publication.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ChannelPublishError`](ChannelPublishError) if publication fails.
+    fn intercept_publish(
+        &self,
+        topic: &str,
+        msg: &ChannelMessage,
+        next: &dyn Fn(&str, &ChannelMessage) -> Result<usize, ChannelPublishError>,
+    ) -> Result<usize, ChannelPublishError>;
 }

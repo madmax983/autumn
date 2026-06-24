@@ -1373,7 +1373,7 @@ impl HttpRequestBuilder {
     /// intercepting the call fails.
     pub async fn send(self) -> Result<reqwest::Response, reqwest::Error> {
         let req = self.builder.build()?;
-        let interceptors = crate::interceptor::ACTIVE_HTTP_INTERCEPTORS
+        let interceptors = crate::http_client::ACTIVE_HTTP_INTERCEPTORS
             .try_with(Clone::clone)
             .unwrap_or_default();
         run_http_chain(req, interceptors, self.client.clone(), 0).await
@@ -1383,7 +1383,7 @@ impl HttpRequestBuilder {
 #[cfg(feature = "oauth2")]
 fn run_http_chain(
     req: reqwest::Request,
-    interceptors: Vec<Arc<dyn crate::interceptor::HttpInterceptor>>,
+    interceptors: Vec<Arc<dyn crate::http_client::HttpInterceptor>>,
     client: reqwest::Client,
     idx: usize,
 ) -> std::pin::Pin<
@@ -3177,7 +3177,7 @@ mod tests {
 #[cfg(feature = "oauth2")]
 #[cfg(test)]
 mod http_interceptor_task_local_tests {
-    use crate::interceptor::{ACTIVE_HTTP_INTERCEPTORS, HttpInterceptor, HttpInterceptorFuture};
+    use crate::http_client::{ACTIVE_HTTP_INTERCEPTORS, HttpInterceptor, HttpInterceptorFuture};
     use std::sync::{
         Arc,
         atomic::{AtomicBool, Ordering},

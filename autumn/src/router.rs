@@ -3342,7 +3342,7 @@ async fn http_interceptor_middleware(
     req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
-    use crate::interceptor::{ACTIVE_HTTP_INTERCEPTORS, HttpInterceptor};
+    use crate::http_client::{ACTIVE_HTTP_INTERCEPTORS, HttpInterceptor};
     if let Some(interceptor_arc) = state.extension::<Arc<dyn HttpInterceptor>>() {
         let interceptor = (*interceptor_arc).clone();
         let interceptors = vec![interceptor];

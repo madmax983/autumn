@@ -124,7 +124,7 @@ pub struct JobClient {
     default_max_attempts: u32,
     default_initial_backoff_ms: u64,
     per_job_settings: HashMap<String, JobRuntimeSettings>,
-    pub interceptor: Option<Arc<dyn crate::interceptor::JobInterceptor>>,
+    pub interceptor: Option<Arc<dyn crate::job::JobInterceptor>>,
     resilience_config: Option<Arc<crate::config::ResilienceConfig>>,
 }
 
@@ -1340,7 +1340,7 @@ async fn run_job_handler(
     // app rather than the process-global bus.
     let event_app = state.clone();
     let interceptor = state
-        .extension::<Arc<dyn crate::interceptor::JobInterceptor>>()
+        .extension::<Arc<dyn crate::job::JobInterceptor>>()
         .map(|arc| (*arc).clone());
 
     let payload_for_handler = payload.clone();
@@ -1402,7 +1402,7 @@ fn format_enqueue_panic(panic: &(dyn std::any::Any + Send)) -> AutumnError {
 }
 
 async fn run_enqueue_interceptor(
-    interceptor: Arc<dyn crate::interceptor::JobInterceptor>,
+    interceptor: Arc<dyn crate::job::JobInterceptor>,
     name: &str,
     payload: &Value,
     actual_enqueue: std::pin::Pin<
@@ -2268,7 +2268,7 @@ pub(crate) fn start_local_runtime(
         default_initial_backoff_ms,
         per_job_settings,
         interceptor: state
-            .extension::<Arc<dyn crate::interceptor::JobInterceptor>>()
+            .extension::<Arc<dyn crate::job::JobInterceptor>>()
             .map(|arc| (*arc).clone()),
         resilience_config: state
             .extension::<crate::config::AutumnConfig>()
@@ -4367,7 +4367,7 @@ fn start_redis_runtime(
             default_initial_backoff_ms: config.initial_backoff_ms,
             per_job_settings,
             interceptor: state
-                .extension::<Arc<dyn crate::interceptor::JobInterceptor>>()
+                .extension::<Arc<dyn crate::job::JobInterceptor>>()
                 .map(|arc| (*arc).clone()),
             resilience_config: state
                 .extension::<crate::config::AutumnConfig>()
@@ -5674,7 +5674,7 @@ fn start_postgres_runtime(
             default_initial_backoff_ms: config.initial_backoff_ms,
             per_job_settings,
             interceptor: state
-                .extension::<Arc<dyn crate::interceptor::JobInterceptor>>()
+                .extension::<Arc<dyn crate::job::JobInterceptor>>()
                 .map(|arc| (*arc).clone()),
             resilience_config: state
                 .extension::<crate::config::AutumnConfig>()
@@ -6104,7 +6104,7 @@ mod tests {
     #[tokio::test]
     async fn run_job_handler_catches_interceptor_setup_panics() {
         struct PanickingJobInterceptor;
-        impl crate::interceptor::JobInterceptor for PanickingJobInterceptor {
+        impl crate::job::JobInterceptor for PanickingJobInterceptor {
             fn intercept_enqueue<'a>(
                 &'a self,
                 _name: &'a str,
@@ -6141,7 +6141,7 @@ mod tests {
 
         let state = AppState::for_test().with_profile("dev");
         state.insert_extension(
-            Arc::new(PanickingJobInterceptor) as Arc<dyn crate::interceptor::JobInterceptor>
+            Arc::new(PanickingJobInterceptor) as Arc<dyn crate::job::JobInterceptor>
         );
 
         let outcome =
@@ -6158,7 +6158,7 @@ mod tests {
     #[tokio::test]
     async fn run_job_handler_interceptor_short_circuit_prevents_sync_execution() {
         struct ShortCircuitInterceptor;
-        impl crate::interceptor::JobInterceptor for ShortCircuitInterceptor {
+        impl crate::job::JobInterceptor for ShortCircuitInterceptor {
             fn intercept_enqueue<'a>(
                 &'a self,
                 _name: &'a str,
@@ -6202,7 +6202,7 @@ mod tests {
 
         let state = AppState::for_test().with_profile("dev");
         state.insert_extension(
-            Arc::new(ShortCircuitInterceptor) as Arc<dyn crate::interceptor::JobInterceptor>
+            Arc::new(ShortCircuitInterceptor) as Arc<dyn crate::job::JobInterceptor>
         );
 
         SYNC_CALLS.store(0, std::sync::atomic::Ordering::SeqCst);
@@ -6226,7 +6226,7 @@ mod tests {
     #[tokio::test]
     async fn job_client_enqueue_catches_interceptor_setup_panic() {
         struct PanickingEnqueueInterceptor;
-        impl crate::interceptor::JobInterceptor for PanickingEnqueueInterceptor {
+        impl crate::job::JobInterceptor for PanickingEnqueueInterceptor {
             fn intercept_enqueue<'a>(
                 &'a self,
                 _name: &'a str,
@@ -6286,7 +6286,7 @@ mod tests {
     #[tokio::test]
     async fn job_client_enqueue_catches_interceptor_async_panic() {
         struct AsyncPanickingEnqueueInterceptor;
-        impl crate::interceptor::JobInterceptor for AsyncPanickingEnqueueInterceptor {
+        impl crate::job::JobInterceptor for AsyncPanickingEnqueueInterceptor {
             fn intercept_enqueue<'a>(
                 &'a self,
                 _name: &'a str,
@@ -6386,7 +6386,7 @@ mod tests {
     #[tokio::test]
     async fn test_interceptor_rejection_rolls_back_enqueue_bookkeeping() {
         struct RejectingInterceptor;
-        impl crate::interceptor::JobInterceptor for RejectingInterceptor {
+        impl crate::job::JobInterceptor for RejectingInterceptor {
             fn intercept_enqueue<'a>(
                 &'a self,
                 _name: &'a str,
@@ -6423,7 +6423,7 @@ mod tests {
 
         let state = AppState::for_test().with_profile("dev");
         state.insert_extension(
-            Arc::new(RejectingInterceptor) as Arc<dyn crate::interceptor::JobInterceptor>
+            Arc::new(RejectingInterceptor) as Arc<dyn crate::job::JobInterceptor>
         );
 
         let shutdown = tokio_util::sync::CancellationToken::new();
@@ -11299,4 +11299,24 @@ mod uniqueness_concurrency_tests {
         shutdown.cancel();
         clear_global_job_client();
     }
+}
+
+pub trait JobInterceptor: Send + Sync + 'static {
+    fn intercept_enqueue<'a>(
+        &'a self,
+        name: &'a str,
+        payload: &'a serde_json::Value,
+        next: std::pin::Pin<
+            Box<dyn std::future::Future<Output = crate::AutumnResult<()>> + Send + 'a>,
+        >,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = crate::AutumnResult<()>> + Send + 'a>>;
+
+    fn intercept_execute<'a>(
+        &'a self,
+        name: &'a str,
+        payload: &'a serde_json::Value,
+        next: std::pin::Pin<
+            Box<dyn std::future::Future<Output = crate::AutumnResult<()>> + Send + 'a>,
+        >,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = crate::AutumnResult<()>> + Send + 'a>>;
 }
