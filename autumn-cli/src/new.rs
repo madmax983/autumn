@@ -257,10 +257,12 @@ fn generate_inner(
         project_dir.join("tests/integration_test.rs"),
         render(templates::INTEGRATION_TEST),
     )?;
-    fs::write(
-        project_dir.join(".github/workflows/ci.yml"),
-        render(templates::CI_WORKFLOW),
-    )?;
+    // Bind the path so the write fits on one line: a multi-line
+    // `fs::write(...)?` leaves the `?` error-propagation region on a bare
+    // `)?;` line that passing tests never hit, which llvm-cov reports as an
+    // uncovered line (as it does for the multi-line writes above).
+    let ci_workflow = project_dir.join(".github/workflows/ci.yml");
+    fs::write(ci_workflow, render(templates::CI_WORKFLOW))?;
 
     write_optional_scaffold_files(&project_dir, name, opts, &render)?;
 
