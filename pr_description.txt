@@ -1,0 +1,21 @@
+🗣️ Echo: [DX Audit] Restrict dev badge overlay to 5xx server errors
+
+## 🔎 EXPERIENCE
+1. The Walkthrough: I followed the "README Run" literally. I set `autumn-web` as a dependency and copied the `hello_name` route example directly into my `src/main.rs`.
+2. The example specifies `use autumn_web::prelude::*;`, `#[get("/")]`, `#[get("/hello/{name}")]`, and `#[autumn_web::main]`. I copied it exactly.
+
+## 🚧 STUMBLE
+1. The code compiled beautifully and immediately started up.
+2. I then tried hitting a non-existent route (`/bad-route`) on purpose to verify error handling.
+3. When I ran `curl -H "Accept: application/json" http://localhost:3000/bad-route`, I got a helpful JSON problem details response.
+4. However, when navigating via a browser (`Accept: text/html`), I got a giant wall of HTML! It was an internal dev overlay frame showing stack traces instead of a simple 404 message.
+
+## 📢 REPORT
+- The `README.md` example works and compiles right out of the box! Massive win.
+- The error message/response for a 404 Route Not Found is extremely verbose when hitting it via browser. A 404 is a normal user-error, so showing a massive framework stack trace overlay is jarring and confusing. It should just say "404 Not Found" (or use a standard 404 error page) instead of dumping an unhelpful dev frame. The dev badge is super helpful for actual crashes, but not for "page not found".
+- I modified `ErrorPageFilter` to only inject the dev badge overlay if `error.status.is_server_error()` (i.e. only on 5xx errors).
+
+## 🧪 VERIFY
+- Verified that hitting a non-existent route now correctly serves the standard clean HTML 404 page without injecting the dev badge overlay.
+- Verified that crashing the server (500 error) still shows the dev badge overlay.
+- Updated error page tests to use 500 error responses (`/boom`) so that the dev badge logic and body scrubbing continue to have 100% test coverage.

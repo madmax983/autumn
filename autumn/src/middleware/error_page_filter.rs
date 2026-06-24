@@ -69,7 +69,7 @@ impl ExceptionFilter for ErrorPageFilter {
             error_pages::render_error_page(self.renderer.as_ref(), error.status, &ctx)
                 .into_string();
 
-        if self.is_dev {
+        if self.is_dev && error.status.is_server_error() {
             self.inject_dev_badge(&mut html_body, error, &ctx, &response);
         }
 
@@ -767,7 +767,7 @@ mod tests {
             )
             .route(
                 "/boom",
-                get(|| async {
+                axum::routing::any(|| async {
                     Err::<String, AutumnError>(AutumnError::from(std::io::Error::other(
                         "internal failure",
                     )))
@@ -963,7 +963,7 @@ mod tests {
         let resp = app
             .oneshot(
                 Request::builder()
-                    .uri("/fail")
+                    .uri("/boom")
                     .header("accept", "application/json")
                     .body(Body::empty())
                     .unwrap(),
@@ -971,7 +971,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
         let ct = resp
             .headers()
             .get("content-type")
@@ -986,17 +986,17 @@ mod tests {
             .await
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["status"], 404);
-        assert_eq!(json["code"], "autumn.not_found");
+        assert_eq!(json["status"], 500);
+        assert_eq!(json["code"], "autumn.internal_server_error");
     }
 
     #[tokio::test]
-    async fn dev_badge_appears_in_dev_mode() {
+    async fn dev_badge_appears_in_dev_mode_for_500() {
         let app = test_router_with_error_pages(true);
         let resp = app
             .oneshot(
                 Request::builder()
-                    .uri("/nonexistent")
+                    .uri("/boom")
                     .header("accept", "text/html")
                     .body(Body::empty())
                     .unwrap(),
@@ -1004,7 +1004,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
             .unwrap();
@@ -1251,7 +1251,7 @@ mod tests {
             app,
             Request::builder()
                 .method("POST")
-                .uri("/nope?debug=true")
+                .uri("/boom?debug=true")
                 .header("accept", "text/html")
                 .header("content-type", "application/x-www-form-urlencoded")
                 .header("authorization", "Bearer super-secret-token")
@@ -1283,6 +1283,14 @@ mod tests {
             vec![Arc::new(error_page_filter)];
 
         let app = Router::new()
+            .route(
+                "/boom",
+                axum::routing::any(|| async {
+                    Err::<String, AutumnError>(AutumnError::from(std::io::Error::other(
+                        "internal failure",
+                    )))
+                }),
+            )
             .fallback(fallback_404_handler)
             .layer(ErrorPageContextLayer { is_dev: true })
             .layer(ExceptionFilterLayer::new(filters));
@@ -1291,7 +1299,7 @@ mod tests {
             app,
             Request::builder()
                 .method("POST")
-                .uri("/nope")
+                .uri("/boom")
                 .header("accept", "text/html")
                 .header("pin", "1234")
                 .body(Body::from("x=1"))
@@ -1377,7 +1385,7 @@ mod tests {
         let resp = tower::ServiceExt::oneshot(
             app,
             Request::builder()
-                .uri("/fail")
+                .uri("/boom")
                 .header("accept", "text/html")
                 .body(Body::empty())
                 .unwrap(),
@@ -1478,18 +1486,24 @@ mod tests {
         axum::Router::new()
             .route(
                 "/fail",
-                get(|| async { Err::<String, AutumnError>(AutumnError::not_found_msg("gone")) }),
+                get(|| async {
+                    Err::<String, AutumnError>(AutumnError::from(std::io::Error::other("gone")))
+                }),
             )
             .route(
                 "/items/{id}",
                 get(|| async {
-                    Err::<String, AutumnError>(AutumnError::not_found_msg("item not found"))
+                    Err::<String, AutumnError>(AutumnError::from(std::io::Error::other(
+                        "item not found",
+                    )))
                 }),
             )
             .route(
                 "/tokens/{token}",
                 get(|| async {
-                    Err::<String, AutumnError>(AutumnError::not_found_msg("token not found"))
+                    Err::<String, AutumnError>(AutumnError::from(std::io::Error::other(
+                        "token not found",
+                    )))
                 }),
             )
             .route_layer(axum::middleware::from_fn(capture_matched_path_middleware))
@@ -1519,7 +1533,7 @@ mod tests {
             app,
             Request::builder()
                 .method("POST")
-                .uri("/nope")
+                .uri("/boom")
                 .header("accept", "text/html")
                 .header("content-type", "application/x-www-form-urlencoded")
                 .header("content-length", "20")
@@ -1552,7 +1566,7 @@ mod tests {
             app,
             Request::builder()
                 .method("POST")
-                .uri("/nope")
+                .uri("/boom")
                 .header("accept", "text/html")
                 .header("content-type", "application/json")
                 .header("content-length", "24")
@@ -1585,7 +1599,7 @@ mod tests {
             app,
             Request::builder()
                 .method("POST")
-                .uri("/nope")
+                .uri("/boom")
                 .header("accept", "text/html")
                 .header("content-type", "application/x-www-form-urlencoded")
                 .header("content-length", "33")
@@ -1622,7 +1636,7 @@ mod tests {
             app,
             Request::builder()
                 .method("POST")
-                .uri("/nope")
+                .uri("/boom")
                 .header("accept", "text/html")
                 .header("content-type", "application/json")
                 .header("content-length", "33")
@@ -1653,7 +1667,7 @@ mod tests {
             app,
             Request::builder()
                 .method("POST")
-                .uri("/nope")
+                .uri("/boom")
                 .header("accept", "text/html")
                 .header("content-type", "application/x-www-form-urlencoded")
                 .body(Body::from("username=alice&age=30"))
@@ -1682,7 +1696,7 @@ mod tests {
             app,
             Request::builder()
                 .method("GET")
-                .uri("/nope")
+                .uri("/boom")
                 .header("accept", "text/html")
                 .body(Body::empty())
                 .expect("request"),
@@ -1721,7 +1735,7 @@ mod tests {
             app,
             Request::builder()
                 .method("POST")
-                .uri("/nope")
+                .uri("/boom")
                 .header("accept", "text/html")
                 .header("content-type", "application/x-www-form-urlencoded")
                 .body(Body::from(large_body))
@@ -1753,7 +1767,7 @@ mod tests {
             app,
             Request::builder()
                 .method("POST")
-                .uri("/nope")
+                .uri("/boom")
                 .header("accept", "text/html")
                 .header("content-type", "application/x-www-form-urlencoded")
                 .header("content-length", over_limit)
@@ -1784,7 +1798,7 @@ mod tests {
             app,
             Request::builder()
                 .method("POST")
-                .uri("/nope")
+                .uri("/boom")
                 .header("accept", "text/html")
                 .header("content-type", "application/x-www-form-urlencoded")
                 .header("content-length", "41")
@@ -1825,7 +1839,7 @@ mod tests {
             app,
             Request::builder()
                 .method("POST")
-                .uri("/nope")
+                .uri("/boom")
                 .header("accept", "text/html")
                 .header("content-type", "application/x-www-form-urlencoded")
                 .header("content-length", body_str_literal.len().to_string())
