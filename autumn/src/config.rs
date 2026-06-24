@@ -4628,6 +4628,23 @@ pub struct TenancyConfig {
     /// Optional base domain for subdomain tenancy.
     #[serde(default)]
     pub base_domain: Option<String>,
+
+    /// Request paths that bypass tenant resolution entirely, so they remain
+    /// reachable without a tenant (e.g. `/login`, `/signup`, static assets).
+    ///
+    /// Matching is exact or slash-delimited prefix: `/login` matches `/login`
+    /// and `/login/sso` but not `/login-admin`. The configured health check
+    /// path is always treated as public regardless of this list.
+    #[serde(default)]
+    pub public_paths: Vec<String>,
+
+    /// Where to redirect when a non-public request has no valid tenant.
+    ///
+    /// When set, a missing/unauthenticated tenant on a protected path returns a
+    /// 302 redirect here instead of a raw 401 — friendlier for browser `SaaS`
+    /// logins. When `None`, the underlying authorization error is returned.
+    #[serde(default)]
+    pub login_redirect: Option<String>,
 }
 
 fn default_tenancy_source() -> String {
@@ -4658,6 +4675,8 @@ impl Default for TenancyConfig {
             jwt_issuer: None,
             jwt_audience: None,
             base_domain: None,
+            public_paths: Vec::new(),
+            login_redirect: None,
         }
     }
 }

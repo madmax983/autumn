@@ -296,6 +296,27 @@ pub async fn extract_tenant_from_parts(
     }
 }
 
+/// Returns true when `path` is exempt from tenant resolution: it equals or is a
+/// slash-delimited subpath of any configured public path or health endpoint.
+///
+/// Mirrors the framework-wide exempt-path semantics (see the CSRF and CAPTCHA
+/// middleware): `/login` matches `/login` and `/login/sso`, but not
+/// `/login-admin`. Health/liveness/readiness/startup probes are always public so
+/// they never require a tenant.
+fn is_public_path(path: &str, config: &crate::config::AutumnConfig) -> bool {
+    let matches = |prefix: &str| {
+        path == prefix
+            || path
+                .strip_prefix(prefix)
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+    };
+    config.tenancy.public_paths.iter().any(|p| matches(p))
+        || matches(&config.health.path)
+        || matches(&config.health.live_path)
+        || matches(&config.health.ready_path)
+        || matches(&config.health.startup_path)
+}
+
 // Tenancy middleware for Axum requests
 pub async fn tenancy_middleware(
     State(state): State<crate::AppState>,
@@ -312,9 +333,28 @@ pub async fn tenancy_middleware(
     }
 
     let (mut parts, body) = request.into_parts();
+
+    // Public paths (login/signup pages, static assets, health probes) stay
+    // reachable without a tenant so unauthenticated visitors can reach them —
+    // otherwise a session/jwt-sourced SaaS could never show a login screen.
+    if is_public_path(parts.uri.path(), &config) {
+        return next.run(Request::from_parts(parts, body)).await;
+    }
+
     let tenant_id = match extract_tenant_from_parts(&mut parts, &config).await {
         Ok(t) => t,
-        Err(e) => return e.into_response(),
+        Err(e) => {
+            // For browser logins, bounce a missing/unauthenticated tenant to the
+            // configured login page instead of returning a raw 401. Other error
+            // classes (e.g. a 500 misconfiguration) are surfaced unchanged so
+            // real bugs are not masked as login redirects.
+            if e.status() == axum::http::StatusCode::UNAUTHORIZED
+                && let Some(target) = &config.tenancy.login_redirect
+            {
+                return axum::response::Redirect::to(target).into_response();
+            }
+            return e.into_response();
+        }
     };
 
     // Tag the request-scoped log context (#1169) so every subsequent event
@@ -543,5 +583,39 @@ mod tests {
         });
         let result = extract_tenant_from_parts(&mut parts, &config).await;
         assert_eq!(result.unwrap(), "tenant3");
+    }
+
+    fn public_paths_config(paths: &[&str]) -> crate::config::AutumnConfig {
+        let mut c = crate::config::AutumnConfig::default();
+        c.tenancy.public_paths = paths.iter().map(|s| (*s).to_string()).collect();
+        c
+    }
+
+    /// A configured public path matches itself and any slash-delimited subpath.
+    #[test]
+    fn public_path_exact_and_subtree_match() {
+        let c = public_paths_config(&["/login", "/static"]);
+        assert!(is_public_path("/login", &c));
+        assert!(is_public_path("/login/sso", &c));
+        assert!(is_public_path("/static/css/app.css", &c));
+    }
+
+    /// Exemptions do not bleed into adjacent prefixes or unrelated routes.
+    #[test]
+    fn public_path_does_not_bleed_to_adjacent_prefix() {
+        let c = public_paths_config(&["/login"]);
+        assert!(!is_public_path("/login-admin", &c));
+        assert!(!is_public_path("/dashboard", &c));
+    }
+
+    /// Health/liveness/readiness/startup probes are public without being listed.
+    #[test]
+    fn health_paths_are_always_public() {
+        let c = crate::config::AutumnConfig::default();
+        assert!(c.tenancy.public_paths.is_empty());
+        assert!(is_public_path(&c.health.path, &c));
+        assert!(is_public_path(&c.health.live_path, &c));
+        assert!(is_public_path(&c.health.ready_path, &c));
+        assert!(is_public_path(&c.health.startup_path, &c));
     }
 }
