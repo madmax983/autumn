@@ -371,6 +371,28 @@ impl<T> Page<T> {
         Self::new(Vec::new(), 0, request)
     }
 
+    /// Build a metadata-only page from raw pagination counters, without a
+    /// `PageRequest`. Useful for bridging external count types (e.g. `u64`)
+    /// into the standard `Page` shape for rendering or serialisation.
+    ///
+    /// `page` is clamped to `[1, u32::MAX]`; `total_pages` is clamped to
+    /// at least `1` so callers don't have to special-case empty result sets.
+    /// `content` is empty — use [`Page::new`] when you have items.
+    #[must_use]
+    pub fn from_raw(page: u32, size: u32, total_elements: u64, total_pages: u32) -> Self {
+        let page = page.max(1);
+        let total_pages = total_pages.max(1);
+        Self {
+            content: Vec::new(),
+            page,
+            size,
+            total_elements,
+            total_pages,
+            has_next: page < total_pages,
+            has_previous: page > 1,
+        }
+    }
+
     /// Transform the content while preserving pagination metadata.
     ///
     /// Typical use: converting database rows into DTOs for JSON output

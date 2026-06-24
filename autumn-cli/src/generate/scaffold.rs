@@ -571,7 +571,7 @@ pub async fn index(
                 li {{ a href=(format!("/{plural}/{{}}", row.id)) {{ (row.id) }} }}
             }}
         }}
-        (pagination_nav(&page_data, "/{plural}"))
+        (pagination_nav(&page_data, &PagerOptions::new("/{plural}")))
     }}))
 }}"#
         )
@@ -597,7 +597,7 @@ pub async fn index(
                 li {{ a href=(format!("/{plural}/{{}}", row.id)) {{ (row.id) }} }}
             }}
         }}
-        (pagination_nav(&page_data, "/{plural}"))
+        (pagination_nav(&page_data, &PagerOptions::new("/{plural}")))
     }}))
 }}"#
         )
@@ -626,6 +626,7 @@ use autumn_web::pagination::{{Page, PageRequest}};
 use autumn_web::reexports::axum::body::Bytes;
 use autumn_web::reexports::serde_json;
 use autumn_web::security::{{CsrfFormField, CsrfToken}};
+use autumn_web::ui::pagination::{{PagerOptions, pagination_nav}};
 {db_import}
 use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
@@ -678,37 +679,6 @@ fn layout(title: &str, flash: Markup, content: Markup) -> Markup {{
             body {{
                 (flash)
                 (content)
-            }}
-        }}
-    }}
-}}
-
-/// Render Previous / page-indicator / Next navigation for a paginated list.
-///
-/// Links are htmx-friendly: the `hx-get` attribute targets the whole page body
-/// so progressive-enhancement apps get smooth partial updates without extra JS.
-fn pagination_nav<T>(page: &Page<T>, base_url: &str) -> Markup {{
-    html! {{
-        nav aria-label="Pagination" {{
-            @if page.has_previous {{
-                a href=(format!("{{}}?page={{}}&size={{}}", base_url, page.page - 1, page.size))
-                   hx-get=(format!("{{}}?page={{}}&size={{}}", base_url, page.page - 1, page.size))
-                   hx-target="body" {{
-                    "← Previous"
-                }}
-                " "
-            }}
-            span {{
-                "Page " (page.page) " of " (page.total_pages)
-                " (" (page.total_elements) " total)"
-            }}
-            @if page.has_next {{
-                " "
-                a href=(format!("{{}}?page={{}}&size={{}}", base_url, page.page + 1, page.size))
-                   hx-get=(format!("{{}}?page={{}}&size={{}}", base_url, page.page + 1, page.size))
-                   hx-target="body" {{
-                    "Next →"
-                }}
             }}
         }}
     }}

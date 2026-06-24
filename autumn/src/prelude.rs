@@ -130,6 +130,11 @@ pub use crate::error::{AutumnError, AutumnResult};
 // ── Pagination ──────────────────────────────────────────────────
 /// Pagination primitives — offset and cursor extractors and wrappers.
 pub use crate::pagination::{CursorPage, CursorRequest, Page, PageRequest};
+/// Reusable Maud pager renderers and options — render an accessible,
+/// filter-preserving, htmx-ready pager from a [`Page`]/[`CursorPage`] in one
+/// line. See [`crate::ui::pagination`] for the full API.
+#[cfg(feature = "maud")]
+pub use crate::ui::pagination::{PagerOptions, cursor_pagination_nav, pagination_nav};
 
 // ── Validation ──────────────────────────────────────────────────
 /// Auto-validating extractor and proof-of-validation newtype.
