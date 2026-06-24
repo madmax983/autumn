@@ -270,7 +270,9 @@ impl OobSwap {
                 Self::Delete => std::borrow::Cow::Borrowed("delete"),
                 Self::Target(method, _) => std::borrow::Cow::Borrowed(method.as_str()),
                 Self::Custom(val) => std::borrow::Cow::Borrowed(val),
-                Self::Raw => unreachable!("Raw strategy should not be formatted into a template wrapper"),
+                Self::Raw => {
+                    unreachable!("Raw strategy should not be formatted into a template wrapper")
+                }
             };
         }
         match self {
@@ -282,9 +284,13 @@ impl OobSwap {
             Self::BeforeEnd => std::borrow::Cow::Owned(format!("beforeend:#{}", clean_id)),
             Self::AfterEnd => std::borrow::Cow::Owned(format!("afterend:#{}", clean_id)),
             Self::Delete => std::borrow::Cow::Owned(format!("delete:#{}", clean_id)),
-            Self::Target(method, selector) => std::borrow::Cow::Owned(format!("{}:{}", method.as_str(), selector)),
+            Self::Target(method, selector) => {
+                std::borrow::Cow::Owned(format!("{}:{}", method.as_str(), selector))
+            }
             Self::Custom(val) => std::borrow::Cow::Borrowed(val),
-            Self::Raw => unreachable!("Raw strategy should not be formatted into a template wrapper"),
+            Self::Raw => {
+                unreachable!("Raw strategy should not be formatted into a template wrapper")
+            }
         }
     }
 }
@@ -355,7 +361,12 @@ impl HtmxFragments {
     }
 
     /// Attach an out-of-band fragment with a specific swap strategy.
-    pub fn oob_with_strategy(mut self, id: impl Into<String>, strategy: OobSwap, markup: maud::Markup) -> Self {
+    pub fn oob_with_strategy(
+        mut self,
+        id: impl Into<String>,
+        strategy: OobSwap,
+        markup: maud::Markup,
+    ) -> Self {
         self.oob.push(OobFragment {
             id: id.into(),
             strategy,
@@ -411,7 +422,7 @@ impl IntoResponse for HtmxFragments {
             capacity += oob.markup.0.len() + 64;
         }
         let mut w = String::with_capacity(capacity);
-        
+
         use maud::Render;
         self.render_to(&mut w);
         axum::response::Html(w).into_response()
@@ -436,9 +447,15 @@ fn has_oob_attribute(html: &str) -> bool {
                 in_tag = false;
             } else {
                 let remaining = &html[idx..];
-                let match_len = if remaining.get(..11).map_or(false, |s| s.eq_ignore_ascii_case("hx-swap-oob")) {
+                let match_len = if remaining
+                    .get(..11)
+                    .map_or(false, |s| s.eq_ignore_ascii_case("hx-swap-oob"))
+                {
                     Some(11)
-                } else if remaining.get(..16).map_or(false, |s| s.eq_ignore_ascii_case("data-hx-swap-oob")) {
+                } else if remaining
+                    .get(..16)
+                    .map_or(false, |s| s.eq_ignore_ascii_case("data-hx-swap-oob"))
+                {
                     Some(16)
                 } else {
                     None
@@ -447,14 +464,15 @@ fn has_oob_attribute(html: &str) -> bool {
                 if let Some(len) = match_len {
                     let after = remaining.chars().nth(len);
                     match after {
-                        None | Some('=') | Some(' ') | Some('\t') | Some('\n') | Some('\r') | Some('>') | Some('/') => {
+                        None | Some('=') | Some(' ') | Some('\t') | Some('\n') | Some('\r')
+                        | Some('>') | Some('/') => {
                             let is_word_start = if idx == 0 {
                                 true
                             } else if let Some(prev_char) = html[..idx].chars().next_back() {
-                                prev_char.is_ascii_whitespace() 
-                                    || prev_char == '/' 
-                                    || prev_char == '<' 
-                                    || prev_char == '"' 
+                                prev_char.is_ascii_whitespace()
+                                    || prev_char == '/'
+                                    || prev_char == '<'
+                                    || prev_char == '"'
                                     || prev_char == '\''
                             } else {
                                 true
@@ -666,9 +684,20 @@ mod tests {
             .unwrap();
         let body_str = String::from_utf8(body_bytes.to_vec()).unwrap();
 
-        assert!(body_str.contains("<div>primary body</div>"), "got: {}", body_str);
-        assert!(body_str.contains("<template hx-swap-oob=\"true\"><div id=\"badge\">3</div></template>"), "got: {}", body_str);
-        assert!(body_str.contains("<template hx-swap-oob=\"beforeend:#list\"><li>new item</li></template>"), "got: {}", body_str);
+        assert!(
+            body_str.contains("<div>primary body</div>"),
+            "got: {body_str}"
+        );
+        assert!(
+            body_str
+                .contains("<template hx-swap-oob=\"true\"><div id=\"badge\">3</div></template>"),
+            "got: {body_str}"
+        );
+        assert!(
+            body_str
+                .contains("<template hx-swap-oob=\"beforeend:#list\"><li>new item</li></template>"),
+            "got: {body_str}"
+        );
     }
 
     #[cfg(feature = "maud")]
@@ -678,9 +707,7 @@ mod tests {
 
         let oob = maud::html! { div id="badge" { "3" } };
 
-        let response = HtmxFragments::oob_only()
-            .oob("badge", oob)
-            .into_response();
+        let response = HtmxFragments::oob_only().oob("badge", oob).into_response();
 
         let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
@@ -688,7 +715,10 @@ mod tests {
         let body_str = String::from_utf8(body_bytes.to_vec()).unwrap();
 
         // Should not contain any stray wrapper or primary body, only the OOB fragment template
-        assert_eq!(body_str, "<template hx-swap-oob=\"true\"><div id=\"badge\">3</div></template>");
+        assert_eq!(
+            body_str,
+            "<template hx-swap-oob=\"true\"><div id=\"badge\">3</div></template>"
+        );
     }
 
     #[cfg(feature = "maud")]
@@ -699,9 +729,7 @@ mod tests {
         // Already contains hx-swap-oob in markup
         let oob = maud::html! { div id="badge" hx-swap-oob="true" { "3" } };
 
-        let response = HtmxFragments::oob_only()
-            .oob("badge", oob)
-            .into_response();
+        let response = HtmxFragments::oob_only().oob("badge", oob).into_response();
 
         let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
@@ -739,15 +767,25 @@ mod tests {
         assert!(has_oob_attribute("<div data-hx-swap-oob=\"true\"></div>"));
         assert!(has_oob_attribute("<div hx-swap-oob = 'true' ></div>"));
         assert!(has_oob_attribute("<div hx-swap-oob></div>"));
-        assert!(has_oob_attribute("<div class=\"x\" hx-swap-oob=\"true\"></div>"));
-        assert!(has_oob_attribute("<div hx-swap-oob=\"true\" class=\"x\"></div>"));
-        
+        assert!(has_oob_attribute(
+            "<div class=\"x\" hx-swap-oob=\"true\"></div>"
+        ));
+        assert!(has_oob_attribute(
+            "<div hx-swap-oob=\"true\" class=\"x\"></div>"
+        ));
+
         // False cases
         assert!(!has_oob_attribute("<div>Learn hx-swap-oob today</div>"));
         assert!(!has_oob_attribute("<div class=\"hx-swap-oob\"></div>"));
-        assert!(!has_oob_attribute("<div id=\"some-hx-swap-oob-element\"></div>"));
-        assert!(!has_oob_attribute("<!-- <div hx-swap-oob=\"true\"></div> -->"));
-        assert!(!has_oob_attribute("<div class=\"x\">some text hx-swap-oob=\"true\"</div>"));
+        assert!(!has_oob_attribute(
+            "<div id=\"some-hx-swap-oob-element\"></div>"
+        ));
+        assert!(!has_oob_attribute(
+            "<!-- <div hx-swap-oob=\"true\"></div> -->"
+        ));
+        assert!(!has_oob_attribute(
+            "<div class=\"x\">some text hx-swap-oob=\"true\"</div>"
+        ));
     }
 
     #[test]
@@ -758,11 +796,20 @@ mod tests {
         assert_eq!(OobSwap::InnerHTML.format_value("#"), "innerHTML");
         assert_eq!(OobSwap::BeforeEnd.format_value(""), "beforeend");
         assert_eq!(OobSwap::BeforeEnd.format_value("#"), "beforeend");
-        assert_eq!(OobSwap::Target(OobMethod::InnerHTML, "#target".to_string()).format_value(""), "innerHTML");
-        assert_eq!(OobSwap::Target(OobMethod::BeforeEnd, "#target".to_string()).format_value("#"), "beforeend");
-        
+        assert_eq!(
+            OobSwap::Target(OobMethod::InnerHTML, "#target".to_string()).format_value(""),
+            "innerHTML"
+        );
+        assert_eq!(
+            OobSwap::Target(OobMethod::BeforeEnd, "#target".to_string()).format_value("#"),
+            "beforeend"
+        );
+
         // Non-empty ID case
         assert_eq!(OobSwap::InnerHTML.format_value("my-id"), "innerHTML:#my-id");
-        assert_eq!(OobSwap::InnerHTML.format_value("#my-id"), "innerHTML:#my-id");
+        assert_eq!(
+            OobSwap::InnerHTML.format_value("#my-id"),
+            "innerHTML:#my-id"
+        );
     }
 }

@@ -1200,8 +1200,7 @@ mod tests {
 
     #[cfg(all(feature = "ws", feature = "maud"))]
     #[tokio::test]
-    async fn broadcast_publish_oob_custom_strategy()
-    -> Result<(), broadcast::error::RecvError> {
+    async fn broadcast_publish_oob_custom_strategy() -> Result<(), broadcast::error::RecvError> {
         let channels = Channels::new(16);
         let broadcast = Broadcast::new(channels.clone());
         let mut rx = channels.subscribe("feed");
@@ -1219,7 +1218,10 @@ mod tests {
 
         assert_eq!(sent, 1);
         let msg = rx.recv().await?;
-        assert_eq!(msg.as_str(), "<template hx-swap-oob=\"beforeend:#badge\"><span>3</span></template>");
+        assert_eq!(
+            msg.as_str(),
+            "<template hx-swap-oob=\"beforeend:#badge\"><span>3</span></template>"
+        );
         Ok(())
     }
 
