@@ -292,8 +292,8 @@ impl SystemTest {
         self
     }
 
-    /// Supply a pre-configured [`AppState`] to use instead of
-    /// [`AppState::for_test()`].
+    /// Supply a pre-configured [`AppState`](crate::state::AppState) to use instead of
+    /// [`AppState::for_test()`](crate::state::AppState::for_test).
     ///
     /// Use this when the routes under test require a real database pool, API
     /// version registrations, authorization policies, or any other state that
