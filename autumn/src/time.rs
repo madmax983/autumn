@@ -204,7 +204,9 @@ impl TickingClock {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Ok(delta) = chrono::Duration::from_std(duration) {
-            *guard += delta;
+            *guard = guard.checked_add_signed(delta).unwrap_or(DateTime::<Utc>::MAX_UTC);
+        } else {
+            *guard = DateTime::<Utc>::MAX_UTC;
         }
     }
 }
@@ -306,5 +308,21 @@ mod tests {
         let pre_epoch = Utc.with_ymd_and_hms(1969, 12, 31, 23, 59, 59).unwrap();
         let clock = FixedClock::at(pre_epoch);
         assert_eq!(clock_unix_duration(&clock), std::time::Duration::ZERO);
+    }
+
+    use proptest::prelude::*;
+
+    proptest! {
+        #[test]
+        fn ticking_clock_never_panics_on_advance(
+            secs in any::<u64>(),
+            nanos in 0..1_000_000_000u32,
+        ) {
+            let start = Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
+            let clock = TickingClock::starting_at(start);
+            let duration = std::time::Duration::new(secs, nanos);
+            clock.advance(duration);
+            // Just asserting it doesn't panic.
+        }
     }
 }
