@@ -675,6 +675,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_ready_handler_degraded_when_indicator_not_ready() {
+        let state = TestProbeState::new();
+        state.mark_startup_complete();
+        let (status, Json(response)) = probe_response(&state, ProbeKind::Ready, false);
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.status, "degraded");
+    }
+
+    #[tokio::test]
+    async fn test_ready_handler_degraded_when_shutting_down_and_startup_incomplete() {
+        let state = TestProbeState::new();
+        state.probes().begin_shutdown();
+        let (status, Json(response)) = probe_response(&state, ProbeKind::Ready, true);
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.status, "degraded");
+    }
+
+    #[tokio::test]
+    async fn dependency_readiness_handles_empty_pool() {
+        struct StateWithoutPool {
+            probes: ProbeState,
+        }
+        impl ProvideProbeState for StateWithoutPool {
+            fn probes(&self) -> &ProbeState {
+                &self.probes
+            }
+            fn health_detailed(&self) -> bool {
+                true
+            }
+            fn profile(&self) -> &str {
+                "test"
+            }
+            fn uptime_display(&self) -> String {
+                "test uptime".to_string()
+            }
+            #[cfg(feature = "db")]
+            fn pool(
+                &self,
+            ) -> Option<
+                &diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>,
+            > {
+                None
+            }
+        }
+        let state = StateWithoutPool {
+            probes: ProbeState::ready_for_test(),
+        };
+        let (ready, status) = dependency_readiness(&state);
+        assert!(ready);
+        assert!(status.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_probe_response_startup_not_complete_returns_starting() {
+        let state = TestProbeState::new();
+        let (status, Json(response)) = probe_response(&state, ProbeKind::Startup, true);
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.status, "starting");
+    }
+
+    #[tokio::test]
     async fn test_ready_handler_complete_startup() {
         let state = TestProbeState::new();
         state.mark_startup_complete();
