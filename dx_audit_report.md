@@ -116,3 +116,39 @@ To make the developer experience more robust ("idiot-proofing"):
 
 ## 4. 🧪 VERIFY - The "idiot proofing"
 - Confirmed that Axum's `IntoResponse` trait is not implemented for `i32`, `i64`, or other plain numbers out-of-the-box, meaning they cannot be returned directly from route handlers without manually converting them to strings or JSON first.
+
+# 🗣️ Echo: DX Audit for Mailer Extractor
+
+## 1. 🔍 EXPERIENCE - The Walkthrough
+- Read the `README.md` and saw that Autumn supports "Transactional email - optional `mail` feature... and a `Mailer` extractor".
+- Created a new route `async fn send_email(mailer: autumn_web::extract::Mailer)` to try out sending an email.
+- Ran `cargo check` to see if it compiles.
+
+## 2. 🚧 STUMBLE - The Friction Points
+- **Error Check**: The compiler output says: `cannot find type Mailer in module autumn_web::extract`.
+- I have the prelude imported (`use autumn_web::prelude::*;`), so I figured I might just need to use the exact path. But the exact path `autumn_web::extract::Mailer` also fails.
+- The `README.md` mentions "optional `mail` feature", but when I generate a new app via `autumn new`, it doesn't give me any comments or hints in `Cargo.toml` about how to enable it, nor does the compiler error suggest anything about feature flags.
+
+## 3. 📢 REPORT - The Complaint
+- "Why does the README tease a `Mailer` extractor but the compiler says it doesn't exist? If it requires a feature flag, either enable it by default, or give me a clear compiler error saying 'hey idiot, you forgot the `mail` feature flag'."
+
+## 4. 🧪 VERIFY - The "idiot proofing"
+- Confirmed that without the `mail` feature explicitly added to `Cargo.toml` (`autumn-web = { version = "0.5.0", features = ["mail"] }`), the `Mailer` type simply does not exist in the crate's public API, leading to a confusing `cannot find type` error instead of a helpful feature-gate error.
+
+# 🗣️ Echo: DX Audit for Background Jobs
+
+## 1. 🔍 EXPERIENCE - The Walkthrough
+- Read the `README.md` and saw the capability: "Background work - `#[scheduled]` tasks, `#[job]` handlers".
+- Tried to define a simple background job using the `#[job]` attribute macro on a basic async function.
+- Ran `cargo check` to verify the code.
+
+## 2. 🚧 STUMBLE - The Friction Points
+- **Error Check**: The compiler failed with a hard error from the macro: `error: #[job] function must have signature async fn(AppState, Args)`.
+- The error tells me the exact signature I need, which is great. However, it requires me to use `AppState` and `Args`. If I don't need `AppState` or any arguments for a simple fire-and-forget job (e.g., just printing a log message), I'm forced to declare them anyway.
+- **Slang Check**: What is `Args`? It's not clear what type that is supposed to be without digging into the source code or docs.
+
+## 3. 📢 REPORT - The Complaint
+- "The compiler error for `#[job]` is helpful, but why do I have to pass `AppState` and `Args` if I'm not going to use them? Also, what exactly is `Args`? A struct? A generic? A JSON payload?"
+
+## 4. 🧪 VERIFY - The "idiot proofing"
+- Confirmed that the `#[job]` macro strictly enforces the presence of exactly two arguments, and the first must be named or structurally look like `AppState`, which limits flexibility for trivial background tasks that don't need application state.
