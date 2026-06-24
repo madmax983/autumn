@@ -30,5 +30,5 @@ fn app_builder_multiple_route_calls() {
 #[tokio::test]
 #[should_panic(expected = "No routes registered")]
 async fn empty_routes_panics() {
-    autumn_web::app().run().await;
+    Box::pin(autumn_web::app().run()).await;
 }

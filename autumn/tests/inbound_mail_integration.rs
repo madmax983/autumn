@@ -1,3 +1,4 @@
+#![allow(clippy::collection_is_never_read, clippy::needless_pass_by_value, clippy::assigning_clones, clippy::redundant_clone, clippy::no_effect_underscore_binding, clippy::iter_on_single_items, clippy::default_trait_access, clippy::doc_markdown)]
 //! Integration tests for first-class inbound email handling (issue #822).
 //!
 //! These tests follow TDD: they drive the public API contract for
