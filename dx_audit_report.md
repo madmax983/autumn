@@ -116,3 +116,38 @@ To make the developer experience more robust ("idiot-proofing"):
 
 ## 4. 🧪 VERIFY - The "idiot proofing"
 - Confirmed that Axum's `IntoResponse` trait is not implemented for `i32`, `i64`, or other plain numbers out-of-the-box, meaning they cannot be returned directly from route handlers without manually converting them to strings or JSON first.
+
+# DX Audit Report: `autumn dev` ignoring `.env` file
+
+## 1. 🔍 EXPERIENCE - The Walkthrough
+- Created a new project with `autumn new test-env`.
+- Created a `.env` file in the project root with `AUTUMN_DATABASE__URL=postgres://localhost/test`.
+- Ran `autumn dev`.
+
+## 2. 🚧 STUMBLE - The Friction Points
+- The server fails to pick up the `AUTUMN_DATABASE__URL` environment variable from the `.env` file.
+- The `autumn` CLI does not seem to automatically load `.env` files.
+
+## 3. 📢 REPORT - The Complaint
+- "Why does `autumn dev` ignore my `.env` file? Almost every other framework ecosystem (Node, Python, Ruby, etc.) automatically loads `.env` when running in development mode."
+
+## 4. 🧪 VERIFY - The "idiot proofing"
+- Confirmed that `autumn dev` doesn't load `.env`.
+- Since `autumn dev` acts as the primary local runner, it should definitely support `.env` loading by default.
+
+# DX Audit Report: Missing Routes returning Blank Content
+
+## 1. 🔍 EXPERIENCE - The Walkthrough
+- Created a project and ran the `autumn dev` server with `cargo run`.
+- Visited a missing route using `curl -v http://localhost:3000/missing`.
+
+## 2. 🚧 STUMBLE - The Friction Points
+- The server responds with `HTTP 404` but `content-length: 0`.
+- The user expected an informative error JSON payload or HTML page, rather than an empty response.
+
+## 3. 📢 REPORT - The Complaint
+- "Why does a 404 give me an empty page? The framework seems to have error handling logic, but it's completely skipping over it for 404s when an `Accept` header is not explicitly set, or under certain default handler setups!"
+
+## 4. 🧪 VERIFY - The "idiot proofing"
+- Confirmed that the `fallback_404_handler` is called but the default setup without specific headers returns a blank payload for generic requests in certain configurations.
+- The `Accept` header needs to be either `application/json` or `text/html` explicitly, otherwise `curl` defaults to `*/*` resulting in an empty response due to content negotiation falling through improperly.
