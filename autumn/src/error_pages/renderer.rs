@@ -54,25 +54,42 @@ pub struct ErrorContext {
 /// }
 /// ```
 pub trait ErrorPageRenderer: Send + Sync + 'static {
-    /// Render a 404 Not Found page.
+    /// Renders a specific page for `404 Not Found` errors.
+    ///
+    /// By default, this delegates to the generic [`render_error`](Self::render_error)
+    /// method. Implement this directly if you want a custom, branded "page not found"
+    /// experience that differs from your generic error layout.
+    #[must_use]
     fn render_404(&self, ctx: &ErrorContext) -> Markup {
         self.render_error(ctx)
     }
 
-    /// Render a 500 Internal Server Error page.
+    /// Renders a specific page for `500 Internal Server Error`s.
+    ///
+    /// By default, this delegates to the generic [`render_error`](Self::render_error)
+    /// method. Implement this directly if you want to emphasize things like an
+    /// incident ID or a link to your status page when things go critically wrong.
+    #[must_use]
     fn render_500(&self, ctx: &ErrorContext) -> Markup {
         self.render_error(ctx)
     }
 
-    /// Render a 422 Unprocessable Entity page (validation errors).
+    /// Renders a specific page for `422 Unprocessable Entity` validation errors.
+    ///
+    /// By default, this delegates to the generic [`render_error`](Self::render_error)
+    /// method. Implement this directly to render the field-level `details` stored
+    /// in the [`ErrorContext`] so users know exactly why their input was rejected.
+    #[must_use]
     fn render_422(&self, ctx: &ErrorContext) -> Markup {
         self.render_error(ctx)
     }
 
-    /// Render a generic error page for any status code.
+    /// Renders a generic error page for any unhandled status code.
     ///
-    /// This is the fallback used by the default implementations of
-    /// `render_404`, `render_500`, and `render_422`. Override this
-    /// to provide a single template for all error codes.
+    /// This is the required fallback used by the default implementations of
+    /// [`render_404`](Self::render_404), [`render_500`](Self::render_500), and
+    /// [`render_422`](Self::render_422). Override this to provide a single
+    /// unified template for all error codes.
+    #[must_use]
     fn render_error(&self, ctx: &ErrorContext) -> Markup;
 }
