@@ -349,15 +349,16 @@ fn is_public_path(path: &str, config: &crate::config::AutumnConfig) -> bool {
 
     // The login_redirect target must always be reachable to prevent an infinite
     // redirect loop when a user forgets to add it to public_paths. Compare against
-    // the target's path component only: a target like `/login?next=/dashboard`
-    // arrives back as `parts.uri.path() == "/login"`, so a raw string comparison
-    // would miss it and re-loop.
+    // the target's path component only, parsed as a URI so it matches regardless
+    // of how the target is written: a relative `/login`, one carrying a query
+    // (`/login?next=/dashboard`), or a same-origin absolute URL
+    // (`https://app.example.com/login`) all reduce to `parts.uri.path() == "/login"`.
     let redirect_match = config
         .tenancy
         .login_redirect
         .as_deref()
-        .and_then(|target| target.split(['?', '#']).next())
-        .is_some_and(|target_path| path == target_path);
+        .and_then(|target| target.parse::<axum::http::Uri>().ok())
+        .is_some_and(|uri| uri.path() == path);
 
     user_paths_match
         || redirect_match
@@ -739,6 +740,16 @@ mod tests {
         let mut c = crate::config::AutumnConfig::default();
         c.tenancy.login_redirect = Some("/login?next=/dashboard".to_string());
         // The follow-up request arrives as just the path.
+        assert!(is_public_path("/login", &c));
+        assert!(!is_public_path("/dashboard", &c));
+    }
+
+    /// A same-origin absolute-URL `login_redirect` target is matched by its path
+    /// component too, so the login page is exempted and the loop is still broken.
+    #[test]
+    fn login_redirect_target_absolute_url_is_public_by_path() {
+        let mut c = crate::config::AutumnConfig::default();
+        c.tenancy.login_redirect = Some("https://app.example.com/login".to_string());
         assert!(is_public_path("/login", &c));
         assert!(!is_public_path("/dashboard", &c));
     }
