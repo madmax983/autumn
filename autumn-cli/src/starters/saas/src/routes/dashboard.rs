@@ -1,9 +1,12 @@
 //! The tenant-scoped dashboard.
 //!
-//! The session carries `tenant_id` (set at signup/login). We read it back and
-//! run the repository calls inside `with_tenant`, which establishes the tenant
-//! context the `tenant_scoped` `PgProjectRepository` filters by — so this page
-//! only ever shows the signed-in organisation's projects.
+//! Tenancy is middleware-driven (see `autumn.toml`): the framework resolves the
+//! tenant from the session on every non-public request and establishes the
+//! tenant context that the `tenant_scoped` `PgProjectRepository` filters by — so
+//! these handlers just query the repository and only ever see the signed-in
+//! organisation's projects. The `Tenant` extractor surfaces the resolved id for
+//! display; an unauthenticated visitor is redirected to `/login` by the
+//! middleware before reaching here.
 
 use autumn_web::prelude::*;
 use autumn_web::reexports::axum::response::Response;
@@ -14,12 +17,13 @@ use crate::repositories::{PgProjectRepository, ProjectRepository};
 use super::layout::layout;
 
 #[get("/dashboard")]
-pub async fn dashboard(session: Session, repo: PgProjectRepository) -> AutumnResult<Response> {
-    let Some(tenant_id) = session.get("tenant_id").await else {
-        return Ok(Redirect::to("/login").into_response());
-    };
-
-    let projects = with_tenant(tenant_id.clone(), async move { repo.find_all().await }).await?;
+pub async fn dashboard(
+    Tenant(tenant_id): Tenant,
+    repo: PgProjectRepository,
+) -> AutumnResult<Response> {
+    // The tenant context is already established by the tenancy middleware, so the
+    // tenant_scoped repository filters by it automatically.
+    let projects = repo.find_all().await?;
 
     let page = layout(
         "Dashboard",
@@ -58,14 +62,9 @@ pub async fn dashboard(session: Session, repo: PgProjectRepository) -> AutumnRes
 
 #[post("/dashboard/projects")]
 pub async fn create_project(
-    session: Session,
     repo: PgProjectRepository,
     Form(form): Form<NewProjectForm>,
 ) -> AutumnResult<Response> {
-    let Some(tenant_id) = session.get("tenant_id").await else {
-        return Ok(Redirect::to("/login").into_response());
-    };
-
     let name = form.name.trim().to_owned();
     // Mirror the `#[validate(length(min = 1, max = 200))]` constraint on the
     // Project model so the route rejects out-of-range names before saving.
@@ -75,12 +74,8 @@ pub async fn create_project(
         ));
     }
 
-    // `tenant_id` is stamped by the tenant_scoped repository from the context
-    // below, so it is not part of `NewProject`.
-    with_tenant(
-        tenant_id,
-        async move { repo.save(&NewProject { name }).await },
-    )
-    .await?;
+    // The tenant_id is stamped by the tenant_scoped repository from the context
+    // established by the tenancy middleware, so it is not part of `NewProject`.
+    repo.save(&NewProject { name }).await?;
     Ok(Redirect::to("/dashboard").into_response())
 }
