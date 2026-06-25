@@ -1455,7 +1455,7 @@ fn extract_multipart_bodies(
                 let after = abs + delim.len();
                 if !matches!(
                     body.get(after),
-                    None | Some(b'\r') | Some(b'\n') | Some(b'-') | Some(b' ') | Some(b'\t')
+                    None | Some(b'\r' | b'\n' | b'-' | b' ' | b'\t')
                 ) {
                     pos += rel + 1;
                     continue;
@@ -1737,7 +1737,7 @@ fn find_part_end(body: &[u8], crlf_delim: &[u8], lf_delim: &[u8]) -> Option<usiz
         let after = abs + crlf_delim.len();
         if matches!(
             body.get(after),
-            None | Some(b'\r') | Some(b'\n') | Some(b'-') | Some(b' ') | Some(b'\t')
+            None | Some(b'\r' | b'\n' | b'-' | b' ' | b'\t')
         ) {
             return Some(abs);
         }
@@ -1749,7 +1749,7 @@ fn find_part_end(body: &[u8], crlf_delim: &[u8], lf_delim: &[u8]) -> Option<usiz
         let after = abs + lf_delim.len();
         if matches!(
             body.get(after),
-            None | Some(b'\r') | Some(b'\n') | Some(b'-') | Some(b' ') | Some(b'\t')
+            None | Some(b'\r' | b'\n' | b'-' | b' ' | b'\t')
         ) {
             return Some(abs);
         }
@@ -1796,7 +1796,7 @@ fn parse_mailgun_form_data(
         // RFC 2046: boundary must be followed by a valid terminator byte.
         if !matches!(
             body.get(after_delim),
-            None | Some(b'\r') | Some(b'\n') | Some(b'-') | Some(b' ') | Some(b'\t')
+            None | Some(b'\r' | b'\n' | b'-' | b' ' | b'\t')
         ) {
             search_from = abs + 1;
             continue;
