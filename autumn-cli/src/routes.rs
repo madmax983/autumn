@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 pub enum OutputFormat {
     Table,
     Json,
+    Tui,
 }
 
 impl std::str::FromStr for OutputFormat {
@@ -24,8 +25,9 @@ impl std::str::FromStr for OutputFormat {
         match s.to_lowercase().as_str() {
             "table" => Ok(Self::Table),
             "json" => Ok(Self::Json),
+            "tui" => Ok(Self::Tui),
             other => Err(format!(
-                "unknown format '{other}'; expected 'table' or 'json'"
+                "unknown format '{other}'; expected 'table', 'json', or 'tui'"
             )),
         }
     }
@@ -95,7 +97,170 @@ pub fn run(opts: &RoutesOptions<'_>) {
     match &opts.format {
         OutputFormat::Table => print_table(&routes),
         OutputFormat::Json => print_json(&routes),
+        OutputFormat::Tui => run_tui(&routes),
     }
+}
+
+/// Run an interactive TUI for route exploration.
+#[allow(clippy::too_many_lines)]
+pub fn run_tui(routes: &[RouteInfo]) {
+    use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+    use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
+    use crossterm::{cursor, execute};
+    use ratatui::Terminal;
+    use ratatui::backend::CrosstermBackend;
+    use ratatui::layout::{Constraint, Direction, Layout};
+    use ratatui::style::{Color, Modifier, Style};
+    use ratatui::text::Span;
+    use ratatui::widgets::{Block, Borders, Cell, Padding, Row, Table, TableState};
+    use std::io;
+    use std::time::Duration;
+
+    if routes.is_empty() {
+        println!("No routes found.");
+        return;
+    }
+
+    terminal::enable_raw_mode().expect("failed to enable raw mode");
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen, cursor::Hide).expect("failed to setup terminal");
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend).expect("failed to create terminal");
+
+    let mut table_state = TableState::default();
+    table_state.select(Some(0));
+
+    loop {
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+
+                let layout = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Min(5), Constraint::Length(1)])
+                    .split(area);
+
+                let header = Row::new(vec![
+                    Cell::from("Method").style(Style::default().add_modifier(Modifier::BOLD)),
+                    Cell::from("Path").style(Style::default().add_modifier(Modifier::BOLD)),
+                    Cell::from("Handler").style(Style::default().add_modifier(Modifier::BOLD)),
+                    Cell::from("Source").style(Style::default().add_modifier(Modifier::BOLD)),
+                ])
+                .style(Style::default().fg(Color::Rgb(204, 120, 50)))
+                .bottom_margin(1);
+
+                let rows: Vec<Row<'_>> = routes
+                    .iter()
+                    .map(|r| {
+                        let method_color = match r.method.as_str() {
+                            "GET" => Color::LightGreen,
+                            "POST" => Color::LightBlue,
+                            "PUT" => Color::LightYellow,
+                            "DELETE" => Color::LightRed,
+                            _ => Color::DarkGray,
+                        };
+                        Row::new(vec![
+                            Cell::from(Span::styled(
+                                r.method.clone(),
+                                Style::default()
+                                    .fg(method_color)
+                                    .add_modifier(Modifier::BOLD),
+                            )),
+                            Cell::from(r.path.clone()),
+                            Cell::from(r.handler.clone()),
+                            Cell::from(r.source.clone()),
+                        ])
+                    })
+                    .collect();
+
+                let table = Table::new(
+                    rows,
+                    [
+                        Constraint::Length(8),
+                        Constraint::Min(30),
+                        Constraint::Min(30),
+                        Constraint::Min(15),
+                    ],
+                )
+                .header(header)
+                .block(
+                    Block::default()
+                        .title(Span::styled(
+                            format!(" Autumn Routes (Total: {}) ", routes.len()),
+                            Style::default()
+                                .fg(Color::Rgb(204, 120, 50))
+                                .add_modifier(Modifier::BOLD),
+                        ))
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(Color::DarkGray))
+                        .padding(Padding::new(1, 1, 0, 0)),
+                )
+                .row_highlight_style(
+                    Style::default()
+                        .bg(Color::Rgb(60, 60, 60))
+                        .add_modifier(Modifier::BOLD),
+                );
+
+                frame.render_stateful_widget(table, layout[0], &mut table_state);
+
+                let footer_text =
+                    " Use \u{2191}/\u{2193} or j/k to navigate | Press q or Ctrl-C to quit ";
+                frame.render_widget(
+                    Block::default().title(Span::styled(
+                        footer_text,
+                        Style::default().fg(Color::DarkGray),
+                    )),
+                    layout[1],
+                );
+            })
+            .expect("failed to draw frame");
+
+        if event::poll(Duration::from_millis(100)).unwrap_or(false) {
+            let evt = event::read().unwrap_or(Event::FocusGained);
+            if let Event::Key(key) = evt {
+                #[allow(clippy::collapsible_if)]
+                if key.kind == KeyEventKind::Press {
+                    match key.code {
+                        KeyCode::Char('q') | KeyCode::Esc => break,
+                        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            break;
+                        }
+                        KeyCode::Down | KeyCode::Char('j') => {
+                            let i = table_state.selected().map_or(0, |i| {
+                                if i >= routes.len().saturating_sub(1) {
+                                    0
+                                } else {
+                                    i + 1
+                                }
+                            });
+                            table_state.select(Some(i));
+                        }
+                        KeyCode::Up | KeyCode::Char('k') => {
+                            let i = table_state.selected().map_or(0, |i| {
+                                if i == 0 {
+                                    routes.len().saturating_sub(1)
+                                } else {
+                                    i - 1
+                                }
+                            });
+                            table_state.select(Some(i));
+                        }
+                        KeyCode::Home | KeyCode::Char('g') => {
+                            table_state.select(Some(0));
+                        }
+                        KeyCode::End | KeyCode::Char('G') => {
+                            table_state.select(Some(routes.len().saturating_sub(1)));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+
+    terminal::disable_raw_mode().expect("failed to disable raw mode");
+    execute!(terminal.backend_mut(), LeaveAlternateScreen, cursor::Show)
+        .expect("failed to restore terminal");
 }
 
 /// Filter routes by path prefix, HTTP methods, and/or source.
