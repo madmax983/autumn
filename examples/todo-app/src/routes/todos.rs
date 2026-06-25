@@ -942,4 +942,36 @@ mod mutant_tests {
         assert_eq!(req.page(), 5);
         assert_eq!(req.size(), 15);
     }
+
+    #[test]
+    fn test_todo_count_badge() {
+        let markup = super::todo_count_badge(2, 1);
+        let html_string = markup.into_string();
+        assert!(html_string.contains("2 item"));
+        assert!(html_string.contains("s"));
+        assert!(html_string.contains("1 done this page"));
+
+        let markup_single = super::todo_count_badge(1, 0);
+        let html_single = markup_single.into_string();
+        assert!(html_single.contains("1 item"));
+        assert!(!html_single.contains("1 items"));
+        assert!(!html_single.contains("done this page"));
+    }
+
+    #[tokio::test]
+    async fn test_validate_title_returns_markup() {
+        use super::TodoForm;
+        use autumn_web::form::ChangesetForm;
+
+        let form = ChangesetForm::blank(
+            TodoForm {
+                title: "Test Title".into(),
+            },
+            "csrf_token_stub",
+        );
+
+        let markup = super::validate_title(form).await;
+        let html_string = markup.into_string();
+        assert!(html_string.contains("Test Title"));
+    }
 }
