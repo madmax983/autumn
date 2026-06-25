@@ -3245,3 +3245,230 @@ fn generated_sharded_scaffold_cargo_checks() {
         String::from_utf8_lossy(&check.stderr),
     );
 }
+
+// ── UUID primary-key option (issue #1400) ──────────────────────────────────
+
+/// AC1 + AC4: `--id uuid` generates UUID PK in model and migration;
+/// default (no flag) still generates BIGSERIAL/i64 byte-for-byte.
+#[test]
+fn generate_model_uuid_id() {
+    let (_tmp, project) = fresh_project("uuid-model-app");
+
+    run_autumn(
+        &project,
+        &["generate", "model", "Post", "title:String", "--id", "uuid"],
+    );
+
+    // AC1: model struct uses uuid::Uuid
+    let model = fs::read_to_string(project.join("src/models/post.rs")).unwrap();
+    assert!(
+        model.contains("pub id: uuid::Uuid,"),
+        "model should have `pub id: uuid::Uuid`; got:\n{model}"
+    );
+    assert!(
+        !model.contains("pub id: i64,"),
+        "model must not have i64 id with --id uuid; got:\n{model}"
+    );
+
+    // AC1: schema.rs uses Uuid type token
+    let schema = fs::read_to_string(project.join("src/schema.rs")).unwrap();
+    assert!(
+        schema.contains("id -> Uuid,"),
+        "schema should have `id -> Uuid`; got:\n{schema}"
+    );
+    assert!(
+        !schema.contains("id -> Int8,"),
+        "schema must not have Int8 with --id uuid; got:\n{schema}"
+    );
+
+    // AC1: migration uses UUID PRIMARY KEY DEFAULT gen_random_uuid()
+    let migrations: Vec<_> = fs::read_dir(project.join("migrations"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|e| e.file_name().to_string_lossy().ends_with("_create_posts"))
+        .collect();
+    assert_eq!(migrations.len(), 1, "expected 1 migration directory");
+    let up = fs::read_to_string(migrations[0].path().join("up.sql")).unwrap();
+    assert!(
+        up.contains("id UUID PRIMARY KEY DEFAULT gen_random_uuid()"),
+        "migration should have UUID PK; got:\n{up}"
+    );
+    assert!(
+        !up.contains("BIGSERIAL"),
+        "migration must not have BIGSERIAL with --id uuid; got:\n{up}"
+    );
+    // migration comment about UUIDv7 trade-off should be present
+    assert!(
+        up.contains("gen_random_uuid()"),
+        "migration should include UUID default; got:\n{up}"
+    );
+}
+
+/// AC4: default (no `--id`) still generates BIGSERIAL and i64.
+#[test]
+fn generate_model_default_id_is_bigserial() {
+    let (_tmp, project) = fresh_project("default-id-app");
+
+    run_autumn(
+        &project,
+        &["generate", "model", "Post", "title:String"],
+    );
+
+    let model = fs::read_to_string(project.join("src/models/post.rs")).unwrap();
+    assert!(
+        model.contains("pub id: i64,"),
+        "default model should have `pub id: i64`; got:\n{model}"
+    );
+
+    let schema = fs::read_to_string(project.join("src/schema.rs")).unwrap();
+    assert!(
+        schema.contains("id -> Int8,"),
+        "default schema should have `id -> Int8`; got:\n{schema}"
+    );
+
+    let migrations: Vec<_> = fs::read_dir(project.join("migrations"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|e| e.file_name().to_string_lossy().ends_with("_create_posts"))
+        .collect();
+    let up = fs::read_to_string(migrations[0].path().join("up.sql")).unwrap();
+    assert!(
+        up.contains("id BIGSERIAL PRIMARY KEY"),
+        "default migration should have BIGSERIAL; got:\n{up}"
+    );
+    assert!(
+        !up.contains("UUID"),
+        "default migration must not have UUID; got:\n{up}"
+    );
+}
+
+/// AC2: scaffold with `--id uuid` threads UUID through model, schema, and routes.
+#[test]
+fn generate_scaffold_uuid_id() {
+    let (_tmp, project) = fresh_project("uuid-scaffold-app");
+
+    // Use full scaffold (no --api) so that HTML routes file is generated.
+    run_autumn(
+        &project,
+        &[
+            "generate",
+            "scaffold",
+            "Post",
+            "title:String",
+            "--id",
+            "uuid",
+        ],
+    );
+
+    // Model uses uuid::Uuid
+    let model = fs::read_to_string(project.join("src/models/post.rs")).unwrap();
+    assert!(
+        model.contains("pub id: uuid::Uuid,"),
+        "scaffold model should have `pub id: uuid::Uuid`; got:\n{model}"
+    );
+
+    // Schema uses Uuid token
+    let schema = fs::read_to_string(project.join("src/schema.rs")).unwrap();
+    assert!(
+        schema.contains("id -> Uuid,"),
+        "scaffold schema should have `id -> Uuid`; got:\n{schema}"
+    );
+
+    // Routes use Path<uuid::Uuid>
+    let routes = fs::read_to_string(project.join("src/routes/posts.rs")).unwrap();
+    assert!(
+        routes.contains("Path<uuid::Uuid>"),
+        "scaffold routes should use Path<uuid::Uuid>; got:\n{routes}"
+    );
+    assert!(
+        !routes.contains("Path<i64>"),
+        "scaffold routes must not use Path<i64> with --id uuid; got:\n{routes}"
+    );
+
+    // Migration uses UUID PK
+    let migrations: Vec<_> = fs::read_dir(project.join("migrations"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|e| e.file_name().to_string_lossy().ends_with("_create_posts"))
+        .collect();
+    let up = fs::read_to_string(migrations[0].path().join("up.sql")).unwrap();
+    assert!(
+        up.contains("id UUID PRIMARY KEY DEFAULT gen_random_uuid()"),
+        "scaffold migration should have UUID PK; got:\n{up}"
+    );
+    assert!(
+        !up.contains("BIGSERIAL"),
+        "scaffold migration must not have BIGSERIAL with --id uuid; got:\n{up}"
+    );
+}
+
+/// AC7: `--id` with an unknown value exits non-zero and lists accepted values.
+#[test]
+fn generate_model_bad_id_type_errors() {
+    let (_tmp, project) = fresh_project("bad-id-app");
+
+    let (_, stderr, code) = run_autumn_failing(
+        &project,
+        &["generate", "model", "Post", "--id", "guid"],
+    );
+    assert_eq!(code, Some(1), "--id guid must fail with exit 1");
+    assert!(
+        stderr.contains("guid") && stderr.contains("uuid") && stderr.contains("bigint"),
+        "error must list the bad value and accepted values; got: {stderr}"
+    );
+}
+
+/// AC7: scaffold `--id` with an unknown value exits non-zero.
+#[test]
+fn generate_scaffold_bad_id_type_errors() {
+    let (_tmp, project) = fresh_project("bad-id-scaffold-app");
+
+    let (_, stderr, code) = run_autumn_failing(
+        &project,
+        &["generate", "scaffold", "Post", "--id", "serial4"],
+    );
+    assert_eq!(code, Some(1), "--id serial4 must fail with exit 1");
+    assert!(
+        stderr.contains("serial4") && stderr.contains("uuid") && stderr.contains("bigint"),
+        "error must list the bad value and accepted values; got: {stderr}"
+    );
+}
+
+/// AC6: project-level `[generate] id = "uuid"` in autumn.generate.toml
+/// propagates into scaffold output when a per-resource section exists but
+/// does not specify its own `id`.
+#[test]
+fn generate_model_project_default_uuid_via_config() {
+    let (_tmp, project) = fresh_project("project-default-uuid-app");
+
+    // [generate] sets the project-wide default; [scaffold.Post] inherits it
+    // because it has no per-resource `id` field.
+    fs::write(
+        project.join("autumn.generate.toml"),
+        "[generate]\nid = \"uuid\"\n\n[scaffold.Post]\nfields = [\"title:String\"]\n",
+    )
+    .unwrap();
+
+    run_autumn(
+        &project,
+        &[
+            "generate",
+            "scaffold",
+            "Post",
+            "--config",
+            "autumn.generate.toml",
+        ],
+    );
+
+    let model = fs::read_to_string(project.join("src/models/post.rs")).unwrap();
+    assert!(
+        model.contains("pub id: uuid::Uuid,"),
+        "project-default uuid scaffold should have `pub id: uuid::Uuid`; got:\n{model}"
+    );
+
+    let routes = fs::read_to_string(project.join("src/routes/posts.rs")).unwrap();
+    assert!(
+        routes.contains("Path<uuid::Uuid>"),
+        "project-default uuid scaffold routes should use Path<uuid::Uuid>; got:\n{routes}"
+    );
+}

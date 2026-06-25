@@ -1324,6 +1324,9 @@ enum GenerateCommands {
         /// Add a `deleted_at` column and use soft-delete in the repository.
         #[arg(long)]
         soft_delete: bool,
+        /// Primary-key type: `bigint` (default) or `uuid`.
+        #[arg(long, value_name = "TYPE")]
+        id: Option<String>,
         /// Print the file plan and exit without writing anything.
         #[arg(long)]
         dry_run: bool,
@@ -1608,6 +1611,9 @@ enum GenerateCommands {
         /// Add a `deleted_at` column and use soft-delete in the repository.
         #[arg(long)]
         soft_delete: bool,
+        /// Primary-key type: `bigint` (default) or `uuid`.
+        #[arg(long, value_name = "TYPE")]
+        id: Option<String>,
         /// Scaffold a JSON-only API resource (no HTML/Maud views, mount CRUD endpoints).
         #[arg(long)]
         api: bool,
@@ -2306,11 +2312,21 @@ fn run_generate_command(cmd: GenerateCommands) {
             name,
             fields,
             soft_delete,
+            id,
             dry_run,
             force,
         } => {
+            let id_type = match id.as_deref().map(generate::dsl::IdType::parse) {
+                Some(Ok(t)) => t,
+                Some(Err(e)) => {
+                    eprintln!("Error: {e}");
+                    std::process::exit(1);
+                }
+                None => generate::dsl::IdType::default(),
+            };
             let options = generate::model::ModelOptions {
                 soft_delete,
+                id_type,
                 ..Default::default()
             };
             let timestamp = generate::timestamp_now();
@@ -2424,6 +2440,7 @@ fn run_generate_command(cmd: GenerateCommands) {
             query,
             config,
             soft_delete,
+            id,
             api,
             sharded,
             shard_key,
@@ -2448,7 +2465,7 @@ fn run_generate_command(cmd: GenerateCommands) {
                     }
                 },
             );
-            let (fields, options) = generate::config::merge_config_with_cli(
+            let (fields, options) = match generate::config::merge_config_with_cli(
                 config_entry,
                 &fields,
                 &index,
@@ -2459,7 +2476,14 @@ fn run_generate_command(cmd: GenerateCommands) {
                 api,
                 sharded,
                 shard_key.as_deref(),
-            );
+                id.as_deref(),
+            ) {
+                Ok(result) => result,
+                Err(e) => {
+                    eprintln!("Error: {e}");
+                    std::process::exit(1);
+                }
+            };
             generate::scaffold::run(&name, &fields, generate::Flags { dry_run, force }, &options);
         }
     }

@@ -10,7 +10,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
-use super::dsl::Field;
+use super::dsl::{Field, IdType};
 
 /// Append a `pub mod <name>;` line to a `mod.rs` file, returning the new
 /// contents. Idempotent: a second call with the same name is a no-op.
@@ -31,12 +31,21 @@ pub fn add_mod_declaration(existing: &str, name: &str) -> String {
 }
 
 /// Build a new `diesel::table!` block for the given table.
+///
+/// This is the BigSerial-default wrapper. Use [`schema_table_block_with_id`]
+/// when the caller needs to control the primary-key type.
 #[must_use]
 pub fn schema_table_block(table: &str, fields: &[Field]) -> String {
+    schema_table_block_with_id(table, fields, IdType::BigSerial)
+}
+
+/// Like [`schema_table_block`] but honours the caller-supplied `id_type`.
+#[must_use]
+pub fn schema_table_block_with_id(table: &str, fields: &[Field], id_type: IdType) -> String {
     let mut out = String::new();
     out.push_str("diesel::table! {\n");
     let _ = writeln!(out, "    {table} (id) {{");
-    out.push_str("        id -> Int8,\n");
+    let _ = writeln!(out, "        id -> {},", id_type.schema_type());
     for f in fields {
         let _ = writeln!(out, "        {} -> {},", f.name, f.schema_type());
     }
@@ -48,12 +57,26 @@ pub fn schema_table_block(table: &str, fields: &[Field]) -> String {
 
 /// Append a new `diesel::table!` block to `src/schema.rs`. Idempotent: if a
 /// block defining `table` already exists, returns `existing` unchanged.
+///
+/// This is the BigSerial-default wrapper. Use [`append_schema_table_with_id`]
+/// when the caller needs to control the primary-key type.
 #[must_use]
 pub fn append_schema_table(existing: &str, table: &str, fields: &[Field]) -> String {
+    append_schema_table_with_id(existing, table, fields, IdType::BigSerial)
+}
+
+/// Like [`append_schema_table`] but honours the caller-supplied `id_type`.
+#[must_use]
+pub fn append_schema_table_with_id(
+    existing: &str,
+    table: &str,
+    fields: &[Field],
+    id_type: IdType,
+) -> String {
     if has_table(existing, table) {
         return existing.to_owned();
     }
-    let block = schema_table_block(table, fields);
+    let block = schema_table_block_with_id(table, fields, id_type);
     if existing.is_empty() {
         return block;
     }
@@ -78,6 +101,10 @@ pub fn schema_has_table(schema: &str, table: &str) -> bool {
 
 /// Build the full SQL for `up.sql` of a `CREATE TABLE` migration with
 /// optional defaults and non-unique indexes.
+///
+/// This is the BigSerial-default wrapper. Use
+/// [`create_table_sql_with_metadata_and_id`] when the caller needs to control
+/// the primary-key type.
 #[must_use]
 pub fn create_table_sql_with_metadata(
     table: &str,
@@ -85,9 +112,27 @@ pub fn create_table_sql_with_metadata(
     indexes: &BTreeSet<String>,
     defaults: &BTreeMap<String, String>,
 ) -> String {
-    let mut sql = String::with_capacity(fields.len() * 64 + indexes.len() * 96 + 128);
+    create_table_sql_with_metadata_and_id(table, fields, indexes, defaults, IdType::BigSerial)
+}
+
+/// Like [`create_table_sql_with_metadata`] but honours the caller-supplied
+/// `id_type`. For `Uuid`, prepends a comment documenting the index-locality
+/// trade-off and the UUIDv7 upgrade path.
+#[must_use]
+pub fn create_table_sql_with_metadata_and_id(
+    table: &str,
+    fields: &[Field],
+    indexes: &BTreeSet<String>,
+    defaults: &BTreeMap<String, String>,
+    id_type: IdType,
+) -> String {
+    let mut sql = String::with_capacity(fields.len() * 64 + indexes.len() * 96 + 256);
+    if let Some(comment) = id_type.migration_comment() {
+        sql.push_str(comment);
+        sql.push('\n');
+    }
     let _ = writeln!(sql, "CREATE TABLE {table} (");
-    sql.push_str("    id BIGSERIAL PRIMARY KEY");
+    let _ = write!(sql, "    id {}", id_type.pk_sql());
     for f in fields {
         sql.push_str(",\n");
         let _ = write!(
@@ -3659,5 +3704,65 @@ pub struct Comment {
             code_part.contains("\"inbound-mailgun\""),
             "feature must be present in the code portion of the dep line: {dep_line}"
         );
+    }
+
+    // ── IdType-aware variants (issue #1400) ────────────────────────────────
+
+    #[test]
+    fn schema_table_block_bigserial_is_byte_equal_to_old_default() {
+        // AC4: the BigSerial wrapper must produce exactly the same output as
+        // the old hardcoded `id -> Int8,` line — regression lock.
+        let fs = fields(&["title:String"]);
+        let via_wrapper = schema_table_block("posts", &fs);
+        let via_explicit = schema_table_block_with_id("posts", &fs, IdType::BigSerial);
+        assert_eq!(via_wrapper, via_explicit);
+        assert!(via_wrapper.contains("id -> Int8,"), "BigSerial must emit Int8");
+    }
+
+    #[test]
+    fn schema_table_block_uuid_emits_uuid_type() {
+        let fs = fields(&["title:String"]);
+        let block = schema_table_block_with_id("posts", &fs, IdType::Uuid);
+        assert!(block.contains("id -> Uuid,"), "Uuid id_type must emit 'id -> Uuid,'");
+        assert!(!block.contains("Int8"), "Uuid block must not contain Int8");
+    }
+
+    #[test]
+    fn create_table_sql_bigserial_is_byte_equal_to_old_default() {
+        // AC4 regression lock for the migration.
+        let fs = fields(&["title:String"]);
+        let via_wrapper = create_table_sql_with_metadata("posts", &fs, &BTreeSet::new(), &BTreeMap::new());
+        let via_explicit = create_table_sql_with_metadata_and_id("posts", &fs, &BTreeSet::new(), &BTreeMap::new(), IdType::BigSerial);
+        assert_eq!(via_wrapper, via_explicit);
+        assert!(via_wrapper.contains("id BIGSERIAL PRIMARY KEY"), "BigSerial must emit BIGSERIAL");
+    }
+
+    #[test]
+    fn create_table_sql_uuid_emits_uuid_pk() {
+        let fs = fields(&["title:String"]);
+        let sql = create_table_sql_with_metadata_and_id("posts", &fs, &BTreeSet::new(), &BTreeMap::new(), IdType::Uuid);
+        assert!(sql.contains("id UUID PRIMARY KEY DEFAULT gen_random_uuid()"), "Uuid must emit UUID PK with default");
+        assert!(!sql.contains("BIGSERIAL"), "Uuid migration must not contain BIGSERIAL");
+    }
+
+    #[test]
+    fn create_table_sql_uuid_prepends_comment_with_uuidv7_path() {
+        let sql = create_table_sql_with_metadata_and_id("posts", &[], &BTreeSet::new(), &BTreeMap::new(), IdType::Uuid);
+        assert!(sql.contains("UUIDv7"), "Uuid migration must document the UUIDv7 upgrade path");
+    }
+
+    #[test]
+    fn append_schema_table_with_id_bigserial_byte_equal_wrapper() {
+        let fs = fields(&["title:String"]);
+        let via_wrapper = append_schema_table("", "posts", &fs);
+        let via_explicit = append_schema_table_with_id("", "posts", &fs, IdType::BigSerial);
+        assert_eq!(via_wrapper, via_explicit);
+    }
+
+    #[test]
+    fn append_schema_table_with_id_uuid_contains_uuid_type() {
+        let fs = fields(&["title:String"]);
+        let schema = append_schema_table_with_id("", "posts", &fs, IdType::Uuid);
+        assert!(schema.contains("id -> Uuid,"));
     }
 }

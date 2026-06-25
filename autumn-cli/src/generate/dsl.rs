@@ -160,6 +160,81 @@ impl FieldKind {
     }
 }
 
+/// The supported primary-key types for `autumn generate model --id`.
+///
+/// Defaults to `BigSerial` (today's `BIGSERIAL`/`i64` behaviour). `Uuid`
+/// opts the model into a `UUID PRIMARY KEY DEFAULT gen_random_uuid()` column.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum IdType {
+    /// `BIGSERIAL PRIMARY KEY` — sequential auto-increment integer (default).
+    #[default]
+    BigSerial,
+    /// `UUID PRIMARY KEY DEFAULT gen_random_uuid()` — non-enumerable.
+    Uuid,
+}
+
+impl IdType {
+    /// Rust type for the `#[id]` struct field.
+    #[must_use]
+    pub const fn rust_type(self) -> &'static str {
+        match self {
+            Self::BigSerial => "i64",
+            Self::Uuid => "uuid::Uuid",
+        }
+    }
+
+    /// Diesel `table!` schema type token.
+    #[must_use]
+    pub const fn schema_type(self) -> &'static str {
+        match self {
+            Self::BigSerial => "Int8",
+            Self::Uuid => "Uuid",
+        }
+    }
+
+    /// The SQL fragment that appears after the column name in `CREATE TABLE`.
+    #[must_use]
+    pub const fn pk_sql(self) -> &'static str {
+        match self {
+            Self::BigSerial => "BIGSERIAL PRIMARY KEY",
+            Self::Uuid => "UUID PRIMARY KEY DEFAULT gen_random_uuid()",
+        }
+    }
+
+    /// An optional migration comment documenting trade-offs. Only `Uuid`
+    /// returns `Some`, pointing developers toward the UUIDv7 upgrade path.
+    #[must_use]
+    pub const fn migration_comment(self) -> Option<&'static str> {
+        match self {
+            Self::BigSerial => None,
+            Self::Uuid => Some(
+                "-- gen_random_uuid() produces UUIDv4 (random, built into Postgres 13+).\n\
+                 -- Trade-off: random UUIDs hurt B-tree insert locality on large tables.\n\
+                 -- To switch to a time-ordered UUIDv7 (better locality, same privacy):\n\
+                 --   1. Enable pgcrypto or use the pg_uuidv7 extension.\n\
+                 --   2. Replace DEFAULT gen_random_uuid() with DEFAULT uuid_generate_v7().\n",
+            ),
+        }
+    }
+
+    /// Parse a CLI `--id` value into an [`IdType`].
+    ///
+    /// Accepts `uuid` (case-insensitive) and `bigint`/`bigserial`/`i64`.
+    ///
+    /// # Errors
+    /// Returns [`GenerateError::Config`] for unknown values, with a message
+    /// listing the accepted tokens (AC7).
+    pub fn parse(s: &str) -> Result<IdType, GenerateError> {
+        match s.to_ascii_lowercase().as_str() {
+            "uuid" => Ok(IdType::Uuid),
+            "bigint" | "bigserial" | "i64" => Ok(IdType::BigSerial),
+            other => Err(GenerateError::Config(format!(
+                "unknown --id value '{other}'; accepted values are: uuid, bigint"
+            ))),
+        }
+    }
+}
+
 /// Comma-separated list of supported types, for error messages and `--help`.
 pub const SUPPORTED_TYPES: &str = "String, Text, i32, i64, bool, f32, f64, \
     Uuid, NaiveDateTime, DateTime, Vec<u8>, Bytea, Attachment, Option<…>";
@@ -685,6 +760,61 @@ mod tests {
             let back = sql_type_to_field_kind(udt).unwrap();
             assert_eq!(back.rust_type(), kind.rust_type());
             assert_eq!(back.schema_type(), kind.schema_type());
+        }
+    }
+
+    // ── IdType (primary-key type, issue #1400) ─────────────────────────────
+
+    #[test]
+    fn id_type_default_is_bigserial() {
+        assert_eq!(IdType::default(), IdType::BigSerial);
+    }
+
+    #[test]
+    fn id_type_bigserial_mappings() {
+        let id = IdType::BigSerial;
+        assert_eq!(id.rust_type(), "i64");
+        assert_eq!(id.schema_type(), "Int8");
+        assert_eq!(id.pk_sql(), "BIGSERIAL PRIMARY KEY");
+        assert!(id.migration_comment().is_none());
+    }
+
+    #[test]
+    fn id_type_uuid_mappings() {
+        let id = IdType::Uuid;
+        assert_eq!(id.rust_type(), "uuid::Uuid");
+        assert_eq!(id.schema_type(), "Uuid");
+        assert_eq!(id.pk_sql(), "UUID PRIMARY KEY DEFAULT gen_random_uuid()");
+        let comment = id.migration_comment().expect("uuid should have a trade-off comment");
+        assert!(comment.contains("UUIDv7"), "comment should mention UUIDv7: {comment}");
+    }
+
+    #[test]
+    fn id_type_parse_accepts_uuid_case_insensitive() {
+        for token in ["uuid", "Uuid", "UUID"] {
+            assert_eq!(IdType::parse(token).unwrap(), IdType::Uuid, "'{token}' should parse to Uuid");
+        }
+    }
+
+    #[test]
+    fn id_type_parse_accepts_bigint_aliases() {
+        for token in ["bigint", "bigserial", "i64", "BigInt"] {
+            assert_eq!(
+                IdType::parse(token).unwrap(),
+                IdType::BigSerial,
+                "'{token}' should parse to BigSerial"
+            );
+        }
+    }
+
+    #[test]
+    fn id_type_parse_rejects_unknown_with_accepted_values_listed() {
+        for bad in ["guid", "serial4", "int", "ulid"] {
+            let err = IdType::parse(bad).unwrap_err();
+            let msg = err.to_string();
+            assert!(msg.contains(bad), "error must echo the bad value '{bad}': {msg}");
+            assert!(msg.contains("uuid"), "error must list 'uuid': {msg}");
+            assert!(msg.contains("bigint"), "error must list 'bigint': {msg}");
         }
     }
 }

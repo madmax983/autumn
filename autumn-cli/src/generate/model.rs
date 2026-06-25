@@ -4,11 +4,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-use super::dsl::{Field, FieldKind, parse_fields};
+use super::dsl::{Field, FieldKind, IdType, parse_fields};
 use super::emit::Plan;
 use super::naming::{pascal, pluralize, snake};
 use super::schema_edit::{
-    add_mod_declaration, append_schema_table, create_table_sql_with_metadata, drop_table_sql,
+    add_mod_declaration, append_schema_table_with_id, create_table_sql_with_metadata_and_id,
+    drop_table_sql,
 };
 use super::{GenerateError, ensure_project_root};
 
@@ -29,6 +30,9 @@ pub struct ModelOptions {
     /// The field used as the sharding key (validated against model fields).
     /// Defaults to `tenant_id` if present, otherwise `id`.
     pub shard_key: Option<String>,
+    /// Primary-key type emitted for the `id` column. Defaults to `BigSerial`
+    /// (`BIGSERIAL`/`i64`); set to `Uuid` for non-enumerable identifiers.
+    pub id_type: IdType,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -139,6 +143,7 @@ pub fn plan_model_with_options(
             } else {
                 None
             },
+            options.id_type,
         ),
     );
 
@@ -149,11 +154,12 @@ pub fn plan_model_with_options(
     // (b) Diesel migration
     let migration_dir_name = format!("{timestamp}_create_{table}");
     let migration_dir = project_root.join("migrations").join(&migration_dir_name);
-    let table_sql = create_table_sql_with_metadata(
+    let table_sql = create_table_sql_with_metadata_and_id(
         &table,
         &schema_fields,
         metadata.indexes(),
         metadata.defaults(),
+        options.id_type,
     );
     let up_sql = if options.sharded {
         format!(
@@ -173,7 +179,7 @@ pub fn plan_model_with_options(
     let schema_existing = read_or_empty(&schema_path);
     plan.modify(
         schema_path,
-        append_schema_table(&schema_existing, &table, &schema_fields),
+        append_schema_table_with_id(&schema_existing, &table, &schema_fields, options.id_type),
     );
 
     // (d) `Cargo.toml` deps — `#[autumn_web::model]` expands to references
@@ -659,7 +665,7 @@ fn sql_default_literal(field: &Field, value: &str) -> Result<String, String> {
 #[cfg(test)]
 #[must_use]
 pub(super) fn render_model_file_for_test(name: &str, table: &str, fields: &[Field]) -> String {
-    render_model_file(name, table, fields, &ModelMetadata::default(), false, None)
+    render_model_file(name, table, fields, &ModelMetadata::default(), false, None, IdType::BigSerial)
 }
 
 fn render_model_file(
@@ -669,6 +675,7 @@ fn render_model_file(
     metadata: &ModelMetadata,
     soft_delete: bool,
     shard_key: Option<&str>,
+    id_type: IdType,
 ) -> String {
     use std::fmt::Write as _;
     let mut out = String::with_capacity(fields.len() * 128 + 256);
@@ -684,7 +691,7 @@ fn render_model_file(
     }
     let _ = writeln!(out, "pub struct {name} {{");
     out.push_str("    #[id]\n");
-    out.push_str("    pub id: i64,\n");
+    let _ = writeln!(out, "    pub id: {},", id_type.rust_type());
     for f in fields {
         if metadata.indexes.contains(&f.name) {
             out.push_str("    #[indexed]\n");
@@ -1393,5 +1400,112 @@ autumn-web = \"0.3\"\n";
             !up_sql.contains("autumn migrate --shard"),
             "non-sharded migration must not have shard comment: {up_sql}"
         );
+    }
+
+    // ── IdType (issue #1400) ───────────────────────────────────────────────
+
+    #[test]
+    fn plan_default_id_type_emits_bigserial_and_i64() {
+        // AC4: the default (BigSerial) must be byte-for-byte identical to today's output.
+        let tmp = project();
+        let plan = plan_model_with_options(
+            tmp.path(),
+            "Post",
+            &["title:String".into()],
+            "20260427000000",
+            &ModelOptions::default(),
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let model = fs::read_to_string(tmp.path().join("src/models/post.rs")).unwrap();
+        assert!(model.contains("pub id: i64,"), "default must emit i64: {model}");
+
+        let up = fs::read_to_string(
+            tmp.path().join("migrations/20260427000000_create_posts/up.sql"),
+        ).unwrap();
+        assert!(up.contains("id BIGSERIAL PRIMARY KEY"), "default must emit BIGSERIAL: {up}");
+
+        let schema = fs::read_to_string(tmp.path().join("src/schema.rs")).unwrap();
+        assert!(schema.contains("id -> Int8,"), "default schema must emit Int8: {schema}");
+    }
+
+    #[test]
+    fn plan_uuid_id_type_emits_uuid_type_in_all_outputs() {
+        // AC1: --id uuid threads through model, migration, and schema.
+        let tmp = project();
+        let plan = plan_model_with_options(
+            tmp.path(),
+            "Post",
+            &["title:String".into()],
+            "20260427000000",
+            &ModelOptions { id_type: IdType::Uuid, ..Default::default() },
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let model = fs::read_to_string(tmp.path().join("src/models/post.rs")).unwrap();
+        assert!(model.contains("pub id: uuid::Uuid,"), "uuid must emit uuid::Uuid: {model}");
+        assert!(!model.contains("pub id: i64"), "uuid model must not contain i64: {model}");
+
+        let up = fs::read_to_string(
+            tmp.path().join("migrations/20260427000000_create_posts/up.sql"),
+        ).unwrap();
+        assert!(up.contains("id UUID PRIMARY KEY DEFAULT gen_random_uuid()"), "uuid migration: {up}");
+        assert!(!up.contains("BIGSERIAL"), "uuid migration must not contain BIGSERIAL: {up}");
+
+        let schema = fs::read_to_string(tmp.path().join("src/schema.rs")).unwrap();
+        assert!(schema.contains("id -> Uuid,"), "uuid schema must emit Uuid type: {schema}");
+        assert!(!schema.contains("id -> Int8"), "uuid schema must not contain Int8: {schema}");
+    }
+
+    #[test]
+    fn plan_uuid_id_migration_has_uuidv7_comment() {
+        let tmp = project();
+        let plan = plan_model_with_options(
+            tmp.path(),
+            "Post",
+            &[],
+            "20260427000000",
+            &ModelOptions { id_type: IdType::Uuid, ..Default::default() },
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let up = fs::read_to_string(
+            tmp.path().join("migrations/20260427000000_create_posts/up.sql"),
+        ).unwrap();
+        assert!(up.contains("UUIDv7"), "uuid migration must document UUIDv7 upgrade path: {up}");
+    }
+
+    #[test]
+    fn uuid_dep_always_present_in_model_deps() {
+        // AC5: the uuid crate is always in MODEL_DEPS regardless of --id.
+        let uuid_dep = MODEL_DEPS.iter().find(|(k, _)| *k == "uuid");
+        assert!(uuid_dep.is_some(), "MODEL_DEPS must always include the uuid crate (AC5)");
+        let (_, spec) = uuid_dep.unwrap();
+        assert!(spec.contains("serde"), "uuid dep must include serde feature");
+    }
+
+    #[test]
+    fn fk_field_uuid_generates_uuid_column() {
+        // AC3: a field like `author_id:Uuid` already works via FieldKind::Uuid.
+        let tmp = project();
+        let plan = plan_model(
+            tmp.path(),
+            "Comment",
+            &["author_id:Uuid".into(), "body:String".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let model = fs::read_to_string(tmp.path().join("src/models/comment.rs")).unwrap();
+        assert!(model.contains("pub author_id: uuid::Uuid,"), "FK Uuid field: {model}");
+
+        let up = fs::read_to_string(
+            tmp.path().join("migrations/20260427000000_create_comments/up.sql"),
+        ).unwrap();
+        assert!(up.contains("author_id UUID NOT NULL"), "FK Uuid migration: {up}");
     }
 }
