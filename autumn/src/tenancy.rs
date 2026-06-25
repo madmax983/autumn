@@ -323,9 +323,7 @@ pub async fn extract_tenant_from_parts(
 /// framework (CSRF, CAPTCHA): `/login` matches `/login` and `/login/sso` but not
 /// `/login-admin`.
 fn is_public_path(path: &str, config: &crate::config::AutumnConfig) -> bool {
-    let matches = |prefix: &str| {
-        crate::router::path_matches_route_prefix(path, prefix)
-    };
+    let matches = |prefix: &str| crate::router::path_matches_route_prefix(path, prefix);
 
     // User-configured public paths — skip empty entries and normalize trailing
     // slashes so `/static/` behaves the same as `/static`.
@@ -676,7 +674,10 @@ mod tests {
     fn actuator_prefix_is_always_public() {
         let c = crate::config::AutumnConfig::default();
         assert!(is_public_path(&c.actuator.prefix, &c));
-        assert!(is_public_path(&format!("{}/prometheus", c.actuator.prefix), &c));
+        assert!(is_public_path(
+            &format!("{}/prometheus", c.actuator.prefix),
+            &c
+        ));
         assert!(is_public_path(&format!("{}/health", c.actuator.prefix), &c));
     }
 
