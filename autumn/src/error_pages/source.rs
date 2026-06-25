@@ -161,25 +161,25 @@ pub fn parse_backtrace_string(
 /// Windows drive-letter colons (e.g. `C:\path\file.rs:42`) are handled
 /// correctly — the drive letter colon is not mistaken for a line/col separator.
 fn parse_location(s: &str) -> (String, u32) {
-    let parts: Vec<&str> = s.split(':').collect();
-    let n = parts.len();
-    if n >= 2
-        && let Some(&last) = parts.last()
-        && last.parse::<u32>().is_ok()
-    {
-        {
+    if let Some(last_colon) = s.rfind(':') {
+        let (rest, last_part) = s.split_at(last_colon);
+        let last_part = &last_part[1..];
+
+        if last_part.parse::<u32>().is_ok() {
             // Last part is numeric — could be COL. Check if second-last is LINE.
-            if n >= 3
-                && let Ok(line_no) = parts[n - 2].parse::<u32>()
-            {
-                let file = parts[..n - 2].join(":");
-                return (file, line_no);
+            if let Some(second_last_colon) = rest.rfind(':') {
+                let (file, second_last_part) = rest.split_at(second_last_colon);
+                let second_last_part = &second_last_part[1..];
+
+                if let Ok(line_no) = second_last_part.parse::<u32>() {
+                    return (file.to_owned(), line_no);
+                }
             }
+
             // No COL: last part is LINE.
-            let line_no = last.parse::<u32>().unwrap_or(0);
+            let line_no = last_part.parse::<u32>().unwrap_or(0);
             if line_no > 0 {
-                let file = parts[..n - 1].join(":");
-                return (file, line_no);
+                return (rest.to_owned(), line_no);
             }
         }
     }
