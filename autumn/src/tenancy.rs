@@ -360,13 +360,22 @@ fn is_public_path(path: &str, config: &crate::config::AutumnConfig) -> bool {
         .and_then(|target| target.parse::<axum::http::Uri>().ok())
         .is_some_and(|uri| uri.path() == path);
 
+    // Match the actuator prefix against its *normalized* form — the same
+    // transformation the actuator router applies before mounting (trim, drop
+    // trailing slashes, ensure a leading slash). Otherwise a non-canonical
+    // config value like `ops/` or `/ops/` would mount endpoints at `/ops/...`
+    // yet never match the raw string here, breaking the probe/scrape bypass.
+    // A prefix that normalizes to empty (`/` or blank — a root mount) yields no
+    // exemption via the empty-prefix guard, which is the safe default.
+    let actuator_prefix = crate::actuator::normalize_actuator_prefix(&config.actuator.prefix);
+
     user_paths_match
         || redirect_match
         || matches(&config.health.path)
         || matches(&config.health.live_path)
         || matches(&config.health.ready_path)
         || matches(&config.health.startup_path)
-        || matches(&config.actuator.prefix)
+        || matches(&actuator_prefix)
 }
 
 // Tenancy middleware for Axum requests
@@ -706,6 +715,25 @@ mod tests {
             &c
         ));
         assert!(is_public_path(&format!("{}/health", c.actuator.prefix), &c));
+    }
+
+    /// A non-canonical actuator prefix (no leading slash, trailing slash) is
+    /// exempted at its *mounted* (normalized) path, matching the actuator router.
+    #[test]
+    fn actuator_prefix_is_normalized_before_exemption() {
+        for raw in ["ops/", "/ops/", "/ops", "ops"] {
+            let mut c = crate::config::AutumnConfig::default();
+            c.actuator.prefix = raw.to_string();
+            assert!(
+                is_public_path("/ops/prometheus", &c),
+                "prefix {raw:?} should exempt the mounted /ops/prometheus path"
+            );
+            assert!(
+                is_public_path("/ops", &c),
+                "prefix {raw:?} should exempt the mounted /ops base path"
+            );
+            assert!(!is_public_path("/dashboard", &c));
+        }
     }
 
     /// The `OpenAPI`/docs spec path is NOT auto-exempted: its real mounted path
