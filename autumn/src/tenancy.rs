@@ -348,26 +348,43 @@ fn is_public_path(path: &str, config: &crate::config::AutumnConfig) -> bool {
     });
 
     // The login_redirect target must always be reachable to prevent an infinite
-    // redirect loop when a user forgets to add it to public_paths. Compare against
-    // the target's path component only, parsed as a URI so it matches regardless
-    // of how the target is written: a relative `/login`, one carrying a query
-    // (`/login?next=/dashboard`), or a same-origin absolute URL
-    // (`https://app.example.com/login`) all reduce to `parts.uri.path() == "/login"`.
+    // redirect loop when a user forgets to add it to public_paths. Only auto-exempt
+    // *relative* targets (no authority): those land back on this app, so a loop is
+    // possible and the exemption is warranted. An absolute target — whether an
+    // external IdP (`https://idp.example.com/login`) or even a same-origin URL —
+    // is not auto-exempted: the external case causes no local loop, and we can't
+    // reliably tell same-origin from external here (server.host is the bind
+    // address, not the public host). A same-origin absolute target that must be
+    // public should be listed in `public_paths`. Parse as a URI so a relative
+    // target with a query (`/login?next=/dashboard`) still matches by path.
     let redirect_match = config
         .tenancy
         .login_redirect
         .as_deref()
         .and_then(|target| target.parse::<axum::http::Uri>().ok())
+        .filter(|uri| uri.authority().is_none())
         .is_some_and(|uri| uri.path() == path);
 
     // Match the actuator prefix against its *normalized* form — the same
     // transformation the actuator router applies before mounting (trim, drop
-    // trailing slashes, ensure a leading slash). Otherwise a non-canonical
-    // config value like `ops/` or `/ops/` would mount endpoints at `/ops/...`
-    // yet never match the raw string here, breaking the probe/scrape bypass.
-    // A prefix that normalizes to empty (`/` or blank — a root mount) yields no
-    // exemption via the empty-prefix guard, which is the safe default.
+    // trailing slashes, ensure a leading slash). Otherwise a non-canonical config
+    // value like `ops/` or `/ops/` would mount endpoints at `/ops/...` yet never
+    // match the raw string here, breaking the probe/scrape bypass.
     let actuator_prefix = crate::actuator::normalize_actuator_prefix(&config.actuator.prefix);
+    let actuator_match = if actuator_prefix.is_empty() {
+        // A prefix that normalizes to empty (`/` or blank) is a root mount: the
+        // ops endpoints sit at `/health`, `/prometheus`, … directly. We can't
+        // exempt the whole root, so exempt the actual mounted endpoint paths.
+        crate::actuator::actuator_endpoint_paths(
+            &actuator_prefix,
+            config.actuator.sensitive,
+            config.actuator.prometheus,
+        )
+        .iter()
+        .any(|p| matches(p))
+    } else {
+        matches(&actuator_prefix)
+    };
 
     user_paths_match
         || redirect_match
@@ -375,7 +392,7 @@ fn is_public_path(path: &str, config: &crate::config::AutumnConfig) -> bool {
         || matches(&config.health.live_path)
         || matches(&config.health.ready_path)
         || matches(&config.health.startup_path)
-        || matches(&actuator_prefix)
+        || actuator_match
 }
 
 // Tenancy middleware for Axum requests
@@ -736,6 +753,20 @@ mod tests {
         }
     }
 
+    /// A root-mounted actuator (`prefix = "/"`, normalizing to empty) exempts its
+    /// actual endpoint paths rather than failing the empty-prefix guard.
+    #[test]
+    fn root_mounted_actuator_endpoints_are_public() {
+        let mut c = crate::config::AutumnConfig::default();
+        c.actuator.prefix = "/".to_string();
+        c.actuator.prometheus = true;
+        // Prometheus + metrics live at root here.
+        assert!(is_public_path("/prometheus", &c));
+        assert!(is_public_path("/metrics", &c));
+        // But the root itself does not exempt the whole app.
+        assert!(!is_public_path("/dashboard", &c));
+    }
+
     /// The `OpenAPI`/docs spec path is NOT auto-exempted: its real mounted path
     /// lives in the programmatic `OpenApiConfig`, not `AutumnConfig`, so apps that
     /// want it public under tenancy must list it in `public_paths`.
@@ -772,14 +803,23 @@ mod tests {
         assert!(!is_public_path("/dashboard", &c));
     }
 
-    /// A same-origin absolute-URL `login_redirect` target is matched by its path
-    /// component too, so the login page is exempted and the loop is still broken.
+    /// An absolute-URL `login_redirect` target (external IdP, or even same-origin)
+    /// is NOT auto-exempted: the local path is only made public for relative
+    /// targets, since we can't validate the authority here. Same-origin absolute
+    /// targets that must be public belong in `public_paths`.
     #[test]
-    fn login_redirect_target_absolute_url_is_public_by_path() {
+    fn login_redirect_absolute_url_is_not_auto_exempt() {
         let mut c = crate::config::AutumnConfig::default();
+        c.tenancy.login_redirect = Some("https://idp.example.com/login".to_string());
+        assert!(!is_public_path("/login", &c));
+
+        // Same-origin absolute is likewise not auto-exempted (authority present).
         c.tenancy.login_redirect = Some("https://app.example.com/login".to_string());
+        assert!(!is_public_path("/login", &c));
+
+        // Listing it explicitly still works.
+        c.tenancy.public_paths = vec!["/login".to_string()];
         assert!(is_public_path("/login", &c));
-        assert!(!is_public_path("/dashboard", &c));
     }
 
     /// A bare `"/"` in `public_paths` exempts the root exactly (a common landing
