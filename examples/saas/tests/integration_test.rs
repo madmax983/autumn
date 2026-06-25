@@ -28,7 +28,23 @@ fn app_routes() -> Vec<autumn_web::Route> {
     ]
 }
 
-// ── Smoke test (no Docker) ───────────────────────────────────────────────────
+/// Mirror the middleware-driven tenancy from `autumn.toml`: tenant resolved from
+/// the session, public pages allowlisted, missing tenant redirected to login.
+fn enable_tenancy(config: &mut AutumnConfig) {
+    config.tenancy.enabled = true;
+    config.tenancy.source = "session".to_string();
+    config.tenancy.session_key = "tenant_id".to_string();
+    config.tenancy.public_paths = vec![
+        "/".to_string(),
+        "/login".to_string(),
+        "/signup".to_string(),
+        "/logout".to_string(),
+        "/static".to_string(),
+    ];
+    config.tenancy.login_redirect = Some("/login".to_string());
+}
+
+// ── Smoke tests (no Docker) ──────────────────────────────────────────────────
 
 /// The login page renders without a database — proving the app wires up.
 #[tokio::test]
@@ -40,6 +56,60 @@ async fn login_page_renders() {
         .await
         .assert_ok()
         .assert_body_contains("Log in");
+}
+
+/// Regression guard for the multi-tenancy fix: with tenancy middleware enabled,
+/// an allowlisted public page like `/login` must still be reachable by an
+/// unauthenticated visitor (no session, no tenant) instead of being 401'd.
+#[tokio::test]
+async fn login_page_is_public_with_tenancy_enabled() {
+    let mut config = AutumnConfig::default();
+    enable_tenancy(&mut config);
+    let client = TestApp::new().routes(app_routes()).config(config).build();
+    client
+        .get("/login")
+        .send()
+        .await
+        .assert_ok()
+        .assert_body_contains("Log in");
+}
+
+/// A protected route hit without a tenant redirects to the configured login page
+/// rather than returning a raw 401. The middleware short-circuits before the
+/// handler, so no database is required.
+#[tokio::test]
+async fn protected_route_redirects_to_login_when_unauthenticated() {
+    let mut config = AutumnConfig::default();
+    enable_tenancy(&mut config);
+    let client = TestApp::new().routes(app_routes()).config(config).build();
+    // A navigating browser advertises `Accept: text/html`, so it is bounced to the
+    // login page rather than shown a raw 401.
+    let resp = client
+        .get("/dashboard")
+        .header("accept", "text/html")
+        .send()
+        .await;
+    resp.assert_status(303);
+    assert_eq!(
+        resp.header("location"),
+        Some("/login"),
+        "missing-tenant protected route should redirect a browser to the login page"
+    );
+}
+
+/// An API client (`Accept: application/json`) hitting a protected route without a
+/// tenant gets a raw 401, not an HTML login redirect, so its error handling works.
+#[tokio::test]
+async fn protected_route_returns_401_for_api_clients() {
+    let mut config = AutumnConfig::default();
+    enable_tenancy(&mut config);
+    let client = TestApp::new().routes(app_routes()).config(config).build();
+    let resp = client
+        .get("/dashboard")
+        .header("accept", "application/json")
+        .send()
+        .await;
+    resp.assert_status(401);
 }
 
 // ── Full flow (requires Docker) ──────────────────────────────────────────────
@@ -73,6 +143,8 @@ async fn db_client() -> TestClient {
     // a token out of the rendered HTML.
     let mut config = AutumnConfig::default();
     config.security.csrf.enabled = false;
+    // Drive tenancy through the middleware exactly as `autumn.toml` does.
+    enable_tenancy(&mut config);
 
     TestApp::new()
         .routes(app_routes())
