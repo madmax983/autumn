@@ -2866,6 +2866,10 @@ pub(crate) fn actuator_endpoint_paths(
         paths.push(actuator_route_path(prefix, "/tasks"));
         paths.push(actuator_route_path(prefix, "/jobs"));
         paths.push(actuator_route_path(prefix, "/ui/tasks"));
+        #[cfg(feature = "system-info")]
+        {
+            paths.push(actuator_route_path(prefix, "/system"));
+        }
         #[cfg(feature = "http-client")]
         {
             paths.push(actuator_route_path(prefix, "/webhooks/dlq"));

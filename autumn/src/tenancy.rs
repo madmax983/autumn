@@ -386,13 +386,16 @@ fn is_public_path(path: &str, config: &crate::config::AutumnConfig) -> bool {
         matches(&actuator_prefix)
     };
 
-    user_paths_match
-        || redirect_match
-        || matches(&config.health.path)
-        || matches(&config.health.live_path)
-        || matches(&config.health.ready_path)
-        || matches(&config.health.startup_path)
-        || actuator_match
+    // Built-in probe endpoints mount at their *exact* configured path
+    // (`mount_probe_endpoints` installs `router.route(&health.path, …)`, not a
+    // subtree), so match them exactly. Prefix matching here would wrongly exempt
+    // an app's own `/health/history` while the probe only serves `/health`.
+    let probe_match = path == config.health.path
+        || path == config.health.live_path
+        || path == config.health.ready_path
+        || path == config.health.startup_path;
+
+    user_paths_match || redirect_match || probe_match || actuator_match
 }
 
 // Tenancy middleware for Axum requests
@@ -703,6 +706,17 @@ mod tests {
         assert!(is_public_path(&c.health.live_path, &c));
         assert!(is_public_path(&c.health.ready_path, &c));
         assert!(is_public_path(&c.health.startup_path, &c));
+    }
+
+    /// Probe exemptions match the configured path *exactly* (the probe mounts at
+    /// that exact path), so an app's own subroute like `/health/history` is still
+    /// tenant-scoped rather than wrongly treated as public.
+    #[test]
+    fn probe_paths_match_exactly_not_as_prefix() {
+        let c = crate::config::AutumnConfig::default();
+        assert!(is_public_path("/health", &c));
+        assert!(!is_public_path("/health/history", &c));
+        assert!(!is_public_path("/live/details", &c));
     }
 
     /// Empty-string entries in `public_paths` must not exempt every path.
