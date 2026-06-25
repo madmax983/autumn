@@ -313,11 +313,16 @@ pub async fn extract_tenant_from_parts(
 ///   accidentally exempt everything),
 /// - it matches the configured health/liveness/readiness/startup probe paths,
 /// - it is under the actuator prefix (e.g. `/actuator/prometheus`) — so Prometheus
-///   scraping and ops tooling are never blocked by tenancy,
-/// - it is the `OpenAPI` spec path (e.g. `/openapi.json`), or
+///   scraping and ops tooling are never blocked by tenancy, or
 /// - it exactly equals `tenancy.login_redirect` — so the redirect target itself is
 ///   always reachable even if the operator forgot to add it to `public_paths`,
 ///   preventing an infinite redirect loop.
+///
+/// The `OpenAPI`/docs endpoint is deliberately **not** auto-exempted: its mounted
+/// path comes from the programmatic `OpenApiConfig::openapi_json_path` (set via
+/// `AppBuilder::openapi(...)`), which is not visible from `AutumnConfig` here and
+/// can differ from the `[openapi]` `path` field. An app that wants its spec public
+/// under tenancy should list that path in `tenancy.public_paths`.
 ///
 /// Matching uses the same slash-boundary prefix semantics as the rest of the
 /// framework (CSRF, CAPTCHA): `/login` matches `/login` and `/login/sso` but not
@@ -361,11 +366,6 @@ fn is_public_path(path: &str, config: &crate::config::AutumnConfig) -> bool {
         || matches(&config.health.ready_path)
         || matches(&config.health.startup_path)
         || matches(&config.actuator.prefix)
-        // Only exempt the OpenAPI spec path when the docs endpoint is actually
-        // mounted. With `enabled = false` the router never serves it, so a
-        // tenant-scoped app that defines its own route at that path must still
-        // go through tenant extraction rather than be silently exempted.
-        || (config.openapi_runtime.enabled && matches(&config.openapi_runtime.path))
 }
 
 // Tenancy middleware for Axum requests
@@ -707,21 +707,17 @@ mod tests {
         assert!(is_public_path(&format!("{}/health", c.actuator.prefix), &c));
     }
 
-    /// The `OpenAPI` spec path is public while the docs endpoint is enabled.
+    /// The `OpenAPI`/docs spec path is NOT auto-exempted: its real mounted path
+    /// lives in the programmatic `OpenApiConfig`, not `AutumnConfig`, so apps that
+    /// want it public under tenancy must list it in `public_paths`.
     #[test]
-    fn openapi_path_is_public_when_enabled() {
+    fn openapi_path_is_not_auto_exempt() {
         let c = crate::config::AutumnConfig::default();
         assert!(c.openapi_runtime.enabled);
-        assert!(is_public_path(&c.openapi_runtime.path, &c));
-    }
-
-    /// With the docs endpoint disabled, the configured spec path is NOT exempt —
-    /// a tenant-scoped app may legitimately define its own route there.
-    #[test]
-    fn openapi_path_not_public_when_disabled() {
-        let mut c = crate::config::AutumnConfig::default();
-        c.openapi_runtime.enabled = false;
         assert!(!is_public_path(&c.openapi_runtime.path, &c));
+        // It becomes public only when explicitly listed.
+        let c = public_paths_config(&["/openapi.json"]);
+        assert!(is_public_path("/openapi.json", &c));
     }
 
     /// The `login_redirect` target is always public even if missing from
@@ -768,7 +764,6 @@ mod tests {
         c.health.ready_path = String::new();
         c.health.startup_path = String::new();
         c.actuator.prefix = String::new();
-        c.openapi_runtime.path = String::new();
         assert!(!is_public_path("/dashboard", &c));
         assert!(!is_public_path("/", &c));
     }
