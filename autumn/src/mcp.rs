@@ -102,7 +102,6 @@ const FORWARDED_HEADERS: &[&str] = &[
     "x-forwarded-host",
     "x-forwarded-proto",
     "x-real-ip",
-    "x-tenant-id",
     // Locale negotiation: the `Locale` extractor falls back to `Accept-Language`
     // when no locale query/cookie is present, so forward it for the tool result
     // to match the localized data a direct HTTP call would return.
