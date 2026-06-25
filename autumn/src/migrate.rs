@@ -679,7 +679,7 @@ where
 pub(crate) enum AttemptError {
     /// The server is not yet reachable (connection refused, starting up, …).
     /// The caller will retry after a backoff delay.
-    Retryable(String),
+    Retryable,
     /// A non-transient failure (auth error, bad URL, missing database, …).
     /// The caller must surface the error immediately without retrying.
     Fatal(String),
@@ -702,6 +702,13 @@ pub(crate) fn is_retryable_connection_error(msg: &str) -> bool {
         || lower.contains("network is unreachable")
         || lower.contains("timed out")
         || lower.contains("connection closed")
+        // DNS resolution failures — common in Docker Compose / Kubernetes
+        // cold-start where the 'db' hostname resolves only after the DNS
+        // service is ready (Linux/glibc, macOS, and generic forms).
+        || lower.contains("name or service not known")
+        || lower.contains("nodename nor servname provided")
+        || lower.contains("failed to lookup")
+        || lower.contains("temporary failure in name resolution")
 }
 
 /// Capped exponential backoff for the startup wait loop.
@@ -712,33 +719,44 @@ pub(crate) fn backoff_delay(attempt: u32) -> std::time::Duration {
     std::time::Duration::from_millis(ms.min(5_000))
 }
 
-/// Redact the password from any `postgres://` URL embedded in `msg`.
+/// Redact the password from any `postgres://` or `postgresql://` URL embedded
+/// in `msg`.
 ///
-/// Mirrors `mask_database_url` in `autumn/src/app.rs`: replaces the password
-/// component with `****`.  Leaves the rest of the message unchanged.
+/// Replaces the password component with `****`, mirroring the approach used
+/// by `mask_database_url` in `autumn/src/app.rs`.  When the URL token cannot
+/// be parsed, the entire token is replaced with `****` as a safe fallback so
+/// a malformed-but-credential-bearing string is never surfaced (also matches
+/// `mask_database_url`'s parse-failure behaviour).  Leaves the rest of the
+/// message unchanged.
 pub(crate) fn redact_db_url_credentials(msg: &str) -> String {
-    // Find all postgres:// substrings and replace their password component.
-    // We do a simple pass that parses each occurrence as a URL and substitutes.
     let mut out = msg.to_owned();
-    // Collect start-positions of `postgres://` in the string (reverse order so
-    // replacements don't shift earlier positions).
-    let positions: Vec<usize> = msg
+    // Collect start positions of both recognised postgres URL schemes.
+    // Reverse order so replacements (which may change token length) don't
+    // invalidate earlier positions.
+    let mut positions: Vec<usize> = msg
         .match_indices("postgres://")
+        .chain(msg.match_indices("postgresql://"))
         .map(|(i, _)| i)
         .collect();
+    positions.sort_unstable();
+    positions.dedup();
     for &start in positions.iter().rev() {
         // Extract the URL-shaped token (everything until the first whitespace
-        // or end of string) and try to parse it.
+        // or end of string).
         let token: &str = msg[start..]
             .split(|c: char| c.is_ascii_whitespace())
             .next()
             .unwrap_or(&msg[start..]);
+        let end = start + token.len();
         if let Ok(mut parsed) = url::Url::parse(token) {
             if parsed.password().is_some() {
                 let _ = parsed.set_password(Some("****"));
-                let end = start + token.len();
                 out.replace_range(start..end, parsed.as_str());
             }
+        } else {
+            // Parse failed — mask the whole token rather than risk leaking a
+            // malformed credential-bearing URL.
+            out.replace_range(start..end, "****");
         }
     }
     out
@@ -753,7 +771,7 @@ pub(crate) fn redact_db_url_credentials(msg: &str) -> String {
 ///
 /// * `max_wait` — maximum total time to spend waiting (> 0 enforced by callers)
 /// * `try_connect` — attempts one connection; returns `Ok(())` on success,
-///   `Err(AttemptError::Retryable(_))` for transient errors, or
+///   `Err(AttemptError::Retryable)` for transient errors, or
 ///   `Err(AttemptError::Fatal(_))` for non-transient failures
 /// * `sleep` — called with the computed backoff delay; may be a no-op in tests
 /// * `elapsed` — returns the total time elapsed since the wait started
@@ -774,7 +792,7 @@ pub(crate) fn wait_for_database_inner(
             Err(AttemptError::Fatal(msg)) => {
                 return Err(MigrationError::Connection(redact_db_url_credentials(&msg)));
             }
-            Err(AttemptError::Retryable(_msg)) => {
+            Err(AttemptError::Retryable) => {
                 let elapsed_now = elapsed();
                 if elapsed_now >= max_wait {
                     return Err(MigrationError::Connection(format!(
@@ -808,19 +826,54 @@ pub(crate) fn wait_for_database_inner(
 /// # Errors
 ///
 /// Returns [`MigrationError::Connection`] on either a fatal error or a timeout.
+/// Append (or replace) a `connect_timeout` query parameter in a libpq
+/// connection URI so that a single `establish` call cannot block longer than
+/// `timeout_secs` seconds.  This bounds each attempt within the startup wait
+/// loop independently of the loop's own elapsed-time check.
+///
+/// Falls back to the original URL unchanged when parsing fails (the `establish`
+/// call will then produce a `Fatal` error).
+fn with_connect_timeout(url: &str, timeout_secs: u64) -> String {
+    if let Ok(mut parsed) = url::Url::parse(url) {
+        let params: Vec<(String, String)> = parsed
+            .query_pairs()
+            .filter(|(k, _)| k != "connect_timeout")
+            .map(|(k, v)| (k.into_owned(), v.into_owned()))
+            .collect();
+        {
+            let mut qs = parsed.query_pairs_mut();
+            qs.clear();
+            for (k, v) in &params {
+                qs.append_pair(k, v);
+            }
+            qs.append_pair("connect_timeout", &timeout_secs.to_string());
+        }
+        parsed.to_string()
+    } else {
+        url.to_owned()
+    }
+}
+
 pub fn wait_for_database(
     database_url: &str,
     max_wait: std::time::Duration,
     mut on_retry: impl FnMut(u32, std::time::Duration),
 ) -> Result<(), MigrationError> {
+    // Set a per-attempt connect_timeout so a single hung establish() call
+    // cannot block longer than max_wait (e.g. a DROP-firewalled host that
+    // accepts the SYN but never completes the handshake).  libpq's
+    // connect_timeout is in whole seconds; clamp to at least 1.
+    let connect_timeout_secs = max_wait.as_secs().max(1);
+    let timed_url = with_connect_timeout(database_url, connect_timeout_secs);
+
     let start = std::time::Instant::now();
     wait_for_database_inner(
         max_wait,
         || {
-            diesel::PgConnection::establish(database_url).map(|_conn| ()).map_err(|e| {
+            diesel::PgConnection::establish(&timed_url).map(|_conn| ()).map_err(|e| {
                 let msg = e.to_string();
                 if is_retryable_connection_error(&msg) {
-                    AttemptError::Retryable(msg)
+                    AttemptError::Retryable
                 } else {
                     AttemptError::Fatal(msg)
                 }
@@ -1568,6 +1621,29 @@ mod tests {
     }
 
     #[test]
+    fn is_retryable_dns_linux() {
+        assert!(is_retryable_connection_error(
+            "could not translate host name \"db\" to address: \
+             Name or service not known"
+        ));
+    }
+
+    #[test]
+    fn is_retryable_dns_macos() {
+        assert!(is_retryable_connection_error(
+            "could not translate host name \"db\" to address: \
+             nodename nor servname provided, or not known"
+        ));
+    }
+
+    #[test]
+    fn is_retryable_dns_temporary_failure() {
+        assert!(is_retryable_connection_error(
+            "Temporary failure in name resolution"
+        ));
+    }
+
+    #[test]
     fn backoff_delay_grows_and_caps() {
         let d = |n| backoff_delay(n).as_millis();
         assert_eq!(d(1), 500);
@@ -1597,6 +1673,26 @@ mod tests {
             "no-cred url should not be mangled: {out}"
         );
         assert!(out.contains("host:5432"), "host should still be present: {out}");
+    }
+
+    #[test]
+    fn redact_removes_password_from_postgresql_scheme() {
+        let msg = "failed: postgresql://user:s3cret@host:5432/db";
+        let out = redact_db_url_credentials(msg);
+        assert!(
+            !out.contains("s3cret"),
+            "password must not appear when scheme is postgresql://: {out}"
+        );
+        assert!(out.contains("****"), "masked marker missing: {out}");
+    }
+
+    #[test]
+    fn redact_masks_whole_token_on_parse_failure() {
+        // A URL with a bare @ in the password fails url::Url::parse; the whole
+        // token must be replaced with **** rather than passed through unredacted.
+        let msg = "error: postgres://user:p@ss@host/db";
+        let out = redact_db_url_credentials(msg);
+        assert!(!out.contains("p@ss"), "unparseable password must not leak: {out}");
     }
 
     #[test]
@@ -1655,7 +1751,7 @@ mod tests {
                 let n = attempts.get() + 1;
                 attempts.set(n);
                 if n < 3 {
-                    Err(AttemptError::Retryable("connection refused".to_string()))
+                    Err(AttemptError::Retryable)
                 } else {
                     Ok(())
                 }
@@ -1681,7 +1777,7 @@ mod tests {
             std::time::Duration::from_secs(5),
             || {
                 attempts.set(attempts.get() + 1);
-                Err(AttemptError::Retryable("connection refused".to_string()))
+                Err(AttemptError::Retryable)
             },
             |_| {},
             || std::time::Duration::from_secs(10), // fake: already past the budget

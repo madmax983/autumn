@@ -115,8 +115,9 @@ pub fn run(
     }
 
     // 1. Resolve migration target databases from autumn.toml (+ profile
-    //    overlay) + env
-    let targets = resolve_targets(target, profile);
+    //    overlay) + env.  The merged config table is returned so that
+    //    resolve_startup_wait can reuse it without a second filesystem read.
+    let (targets, config_table) = resolve_targets(target, profile);
 
     // 2. Resolve migrations directory
     let migrations_dir = resolve_migrations_dir();
@@ -133,7 +134,7 @@ pub fn run(
     match action {
         MigrateAction::Run => {
             // Resolve the effective startup wait (--wait flag > config > 0).
-            let wait = resolve_startup_wait(wait_override, profile);
+            let wait = resolve_startup_wait(wait_override, config_table.as_ref());
             run_all_targets(&targets, &migrations_dir, with_maintenance, wait);
         }
         MigrateAction::Status => {
@@ -153,7 +154,13 @@ pub fn run(
 
 /// Resolve the `(label, database_url)` pairs the command operates on,
 /// in apply order (control first, then shards in declaration order).
-fn resolve_targets(target: &MigrateTarget, profile: Option<&str>) -> Vec<(String, String)> {
+///
+/// Also returns the merged config table so callers can reuse it (e.g. for
+/// `resolve_startup_wait_secs_from_sources`) without a second filesystem read.
+fn resolve_targets(
+    target: &MigrateTarget,
+    profile: Option<&str>,
+) -> (Vec<(String, String)>, Option<toml::Table>) {
     // Read autumn.toml once, deep-merging the `autumn-<profile>.toml` overlay
     // when a profile is selected, so control and shard URLs both resolve from
     // the same effective configuration. Environment overrides still win over
@@ -169,7 +176,7 @@ fn resolve_targets(target: &MigrateTarget, profile: Option<&str>) -> Vec<(String
     let shards =
         resolve_shard_database_urls_from_sources(|key| std::env::var(key), config_table.as_ref());
     match build_targets(control, shards, target) {
-        Ok(targets) => targets,
+        Ok(targets) => (targets, config_table),
         Err(message) => {
             eprintln!("{message}");
             if matches!(target, MigrateTarget::All | MigrateTarget::ControlOnly) {
@@ -955,8 +962,15 @@ where
     F: Fn(&str) -> Result<String, std::env::VarError>,
 {
     if let Ok(val) = env_var("AUTUMN_DATABASE__STARTUP_WAIT_SECS") {
-        if let Ok(n) = val.trim().parse::<u64>() {
-            return n;
+        match val.trim().parse::<u64>() {
+            Ok(n) => return n,
+            Err(_) => {
+                eprintln!(
+                    "  Warning: AUTUMN_DATABASE__STARTUP_WAIT_SECS={:?} is not a valid \
+                     non-negative integer; falling back to config file / default (0).",
+                    val.trim()
+                );
+            }
         }
     }
 
@@ -965,25 +979,31 @@ where
         .and_then(toml::Value::as_table)
         .and_then(|db| db.get("startup_wait_secs"))
         .and_then(toml::Value::as_integer)
-        .map(|n| u64::try_from(n).unwrap_or(0))
+        .map(|n| {
+            u64::try_from(n).unwrap_or_else(|_| {
+                eprintln!(
+                    "  Warning: `database.startup_wait_secs = {n}` in autumn.toml is not a \
+                     valid non-negative integer; falling back to 0 (fail-fast)."
+                );
+                0
+            })
+        })
         .unwrap_or(0)
 }
 
 /// Resolve the effective startup wait: the `--wait` CLI flag (if given) wins;
-/// otherwise fall back to the merged config (env > toml > 0).
+/// otherwise fall back to the merged config table (env > toml > 0).
+///
+/// `config_table` should be the already-merged table returned by
+/// `resolve_targets` so this function does not need a second filesystem read.
 fn resolve_startup_wait(
     flag: Option<u64>,
-    profile: Option<&str>,
+    config_table: Option<&toml::Table>,
 ) -> std::time::Duration {
     let secs = if let Some(n) = flag {
         n
     } else {
-        let effective = effective_profile(profile);
-        let config_table = read_autumn_toml_table_with_profile(Some(&effective));
-        resolve_startup_wait_secs_from_sources(
-            |key| std::env::var(key),
-            config_table.as_ref(),
-        )
+        resolve_startup_wait_secs_from_sources(|key| std::env::var(key), config_table)
     };
     std::time::Duration::from_secs(secs)
 }
@@ -1194,7 +1214,7 @@ fn run_down(
     // 2. Resolve target databases (control + shards / a single shard /
     //    control-only) and the migrations dir. `down` honors --shard /
     //    --control-only exactly like `migrate run`.
-    let targets = resolve_targets(target, profile);
+    let (targets, _) = resolve_targets(target, profile);
     let migrations_dir = resolve_migrations_dir();
     let dir = Path::new(&migrations_dir);
 
