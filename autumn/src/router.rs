@@ -3020,7 +3020,7 @@ async fn startup_barrier(
     }
 }
 
-pub(crate) fn path_matches_route_prefix(path: &str, prefix: &str) -> bool {
+pub fn path_matches_route_prefix(path: &str, prefix: &str) -> bool {
     path == prefix
         || path
             .strip_prefix(prefix)

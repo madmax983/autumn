@@ -314,7 +314,7 @@ pub async fn extract_tenant_from_parts(
 /// - it matches the configured health/liveness/readiness/startup probe paths,
 /// - it is under the actuator prefix (e.g. `/actuator/prometheus`) — so Prometheus
 ///   scraping and ops tooling are never blocked by tenancy,
-/// - it is the OpenAPI spec path (e.g. `/openapi.json`), or
+/// - it is the `OpenAPI` spec path (e.g. `/openapi.json`), or
 /// - it exactly equals `tenancy.login_redirect` — so the redirect target itself is
 ///   always reachable even if the operator forgot to add it to `public_paths`,
 ///   preventing an infinite redirect loop.
@@ -323,22 +323,36 @@ pub async fn extract_tenant_from_parts(
 /// framework (CSRF, CAPTCHA): `/login` matches `/login` and `/login/sso` but not
 /// `/login-admin`.
 fn is_public_path(path: &str, config: &crate::config::AutumnConfig) -> bool {
-    let matches = |prefix: &str| crate::router::path_matches_route_prefix(path, prefix);
+    // Guard against empty prefixes: `path_matches_route_prefix(path, "")` is true
+    // for every absolute path, so an empty entry — whether a stray `public_paths`
+    // item or a misconfigured built-in like `health.path = ""` — would otherwise
+    // exempt the entire application from tenancy.
+    let matches =
+        |prefix: &str| !prefix.is_empty() && crate::router::path_matches_route_prefix(path, prefix);
 
-    // User-configured public paths — skip empty entries and normalize trailing
-    // slashes so `/static/` behaves the same as `/static`.
+    // User-configured public paths — normalize trailing slashes so `/static/`
+    // behaves the same as `/static`, but preserve a bare `"/"` (a common landing
+    // page) rather than trimming it away to an empty, never-matching string.
     let user_paths_match = config.tenancy.public_paths.iter().any(|p| {
-        let p = p.trim_end_matches('/');
-        !p.is_empty() && matches(p)
+        let p = if p.len() > 1 {
+            p.trim_end_matches('/')
+        } else {
+            p.as_str()
+        };
+        matches(p)
     });
 
-    // The login_redirect target must always be reachable (exact match) to prevent
-    // an infinite redirect loop when a user forgets to add it to public_paths.
+    // The login_redirect target must always be reachable to prevent an infinite
+    // redirect loop when a user forgets to add it to public_paths. Compare against
+    // the target's path component only: a target like `/login?next=/dashboard`
+    // arrives back as `parts.uri.path() == "/login"`, so a raw string comparison
+    // would miss it and re-loop.
     let redirect_match = config
         .tenancy
         .login_redirect
         .as_deref()
-        .is_some_and(|target| path == target);
+        .and_then(|target| target.split(['?', '#']).next())
+        .is_some_and(|target_path| path == target_path);
 
     user_paths_match
         || redirect_match
@@ -378,11 +392,19 @@ pub async fn tenancy_middleware(
         Ok(t) => t,
         Err(e) => {
             // For browser logins, bounce a missing/unauthenticated tenant to the
-            // configured login page instead of returning a raw 401. Other error
-            // classes (e.g. a 500 misconfiguration) are surfaced unchanged so
-            // real bugs are not masked as login redirects.
+            // configured login page instead of returning a raw 401. Only do this
+            // for clients that accept HTML (navigating browsers): API clients
+            // (e.g. `Accept: application/json`) expect the 401 so their error
+            // handling isn't broken by a 303 to a login page. Other error classes
+            // (e.g. a 500 misconfiguration) are surfaced unchanged so real bugs
+            // are not masked as login redirects.
             if e.status() == axum::http::StatusCode::UNAUTHORIZED
                 && let Some(target) = &config.tenancy.login_redirect
+                && parts
+                    .headers
+                    .get(axum::http::header::ACCEPT)
+                    .and_then(|v| v.to_str().ok())
+                    .is_some_and(|accept| accept.contains("text/html"))
             {
                 return axum::response::Redirect::to(target).into_response();
             }
@@ -681,7 +703,7 @@ mod tests {
         assert!(is_public_path(&format!("{}/health", c.actuator.prefix), &c));
     }
 
-    /// The OpenAPI spec path is always public.
+    /// The `OpenAPI` spec path is always public.
     #[test]
     fn openapi_path_is_always_public() {
         let c = crate::config::AutumnConfig::default();
@@ -698,5 +720,42 @@ mod tests {
         assert!(is_public_path("/auth/login", &c));
         // Only the exact target, not adjacent paths.
         assert!(!is_public_path("/auth/login/sso", &c));
+    }
+
+    /// A `login_redirect` target carrying a query string is matched by its path
+    /// component, so the login page is still exempted and no loop forms.
+    #[test]
+    fn login_redirect_target_with_query_is_public_by_path() {
+        let mut c = crate::config::AutumnConfig::default();
+        c.tenancy.login_redirect = Some("/login?next=/dashboard".to_string());
+        // The follow-up request arrives as just the path.
+        assert!(is_public_path("/login", &c));
+        assert!(!is_public_path("/dashboard", &c));
+    }
+
+    /// A bare `"/"` in `public_paths` exempts the root exactly (a common landing
+    /// page) and is not silently trimmed away to an empty, never-matching entry.
+    #[test]
+    fn root_public_path_is_preserved() {
+        let c = public_paths_config(&["/"]);
+        assert!(is_public_path("/", &c));
+        // The slash-boundary semantics mean `/` matches only the root, not every
+        // path, so protected routes still require a tenant.
+        assert!(!is_public_path("/dashboard", &c));
+    }
+
+    /// A misconfigured empty built-in path (e.g. `health.path = ""`) must not
+    /// exempt the whole application from tenancy.
+    #[test]
+    fn empty_builtin_path_does_not_exempt_all() {
+        let mut c = crate::config::AutumnConfig::default();
+        c.health.path = String::new();
+        c.health.live_path = String::new();
+        c.health.ready_path = String::new();
+        c.health.startup_path = String::new();
+        c.actuator.prefix = String::new();
+        c.openapi_runtime.path = String::new();
+        assert!(!is_public_path("/dashboard", &c));
+        assert!(!is_public_path("/", &c));
     }
 }

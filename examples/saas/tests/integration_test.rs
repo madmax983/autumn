@@ -82,13 +82,34 @@ async fn protected_route_redirects_to_login_when_unauthenticated() {
     let mut config = AutumnConfig::default();
     enable_tenancy(&mut config);
     let client = TestApp::new().routes(app_routes()).config(config).build();
-    let resp = client.get("/dashboard").send().await;
+    // A navigating browser advertises `Accept: text/html`, so it is bounced to the
+    // login page rather than shown a raw 401.
+    let resp = client
+        .get("/dashboard")
+        .header("accept", "text/html")
+        .send()
+        .await;
     resp.assert_status(303);
     assert_eq!(
         resp.header("location"),
         Some("/login"),
-        "missing-tenant protected route should redirect to the login page"
+        "missing-tenant protected route should redirect a browser to the login page"
     );
+}
+
+/// An API client (`Accept: application/json`) hitting a protected route without a
+/// tenant gets a raw 401, not an HTML login redirect, so its error handling works.
+#[tokio::test]
+async fn protected_route_returns_401_for_api_clients() {
+    let mut config = AutumnConfig::default();
+    enable_tenancy(&mut config);
+    let client = TestApp::new().routes(app_routes()).config(config).build();
+    let resp = client
+        .get("/dashboard")
+        .header("accept", "application/json")
+        .send()
+        .await;
+    resp.assert_status(401);
 }
 
 // ── Full flow (requires Docker) ──────────────────────────────────────────────
