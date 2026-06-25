@@ -1466,9 +1466,12 @@ fn generate_scaffold_rejects_missing_config_file() {
 }
 
 /// When the config file exists but has no entry for the requested resource,
-/// the command must fail with a helpful error message.
+/// the command must succeed using project-level `[generate]` defaults
+/// (or standard defaults if `[generate]` is absent too).
+/// This enables a single `[generate] id = "uuid"` to apply project-wide
+/// without requiring every resource to have its own `[scaffold.X]` section.
 #[test]
-fn generate_scaffold_rejects_config_missing_resource_section() {
+fn generate_scaffold_missing_resource_section_uses_defaults() {
     let (_tmp, project) = fresh_project("scaffold-missing-section-app");
 
     fs::write(
@@ -1477,25 +1480,24 @@ fn generate_scaffold_rejects_config_missing_resource_section() {
     )
     .unwrap();
 
-    let (_, stderr, code) = run_autumn_failing(
+    // No [scaffold.Post] section — should succeed with default settings.
+    run_autumn(
         &project,
         &[
             "generate",
             "scaffold",
             "Post",
+            "title:String",
             "--config",
             "autumn.generate.toml",
         ],
     );
 
-    assert_eq!(code, Some(1), "expected exit code 1; got {code:?}");
+    // Default id type is BigSerial when no [generate] id is set.
+    let model = fs::read_to_string(project.join("src/models/post.rs")).unwrap();
     assert!(
-        stderr.contains("Post"),
-        "error must mention the resource name; got:\n{stderr}"
-    );
-    assert!(
-        stderr.contains("autumn.generate.toml"),
-        "error must mention the config file name; got:\n{stderr}"
+        model.contains("pub id: i64,"),
+        "missing-section scaffold should default to i64 PK; got:\n{model}"
     );
 }
 
@@ -3434,18 +3436,16 @@ fn generate_scaffold_bad_id_type_errors() {
     );
 }
 
-/// AC6: project-level `[generate] id = "uuid"` in autumn.generate.toml
-/// propagates into scaffold output when a per-resource section exists but
-/// does not specify its own `id`.
+/// AC6: `[generate] id = "uuid"` in autumn.generate.toml propagates even when
+/// there is no `[scaffold.Post]` section — the project default applies.
 #[test]
-fn generate_model_project_default_uuid_via_config() {
-    let (_tmp, project) = fresh_project("project-default-uuid-app");
+fn generate_scaffold_project_default_uuid_config_only() {
+    let (_tmp, project) = fresh_project("project-default-uuid-config-app");
 
-    // [generate] sets the project-wide default; [scaffold.Post] inherits it
-    // because it has no per-resource `id` field.
+    // No [scaffold.Post] section — only the project-level [generate] default.
     fs::write(
         project.join("autumn.generate.toml"),
-        "[generate]\nid = \"uuid\"\n\n[scaffold.Post]\nfields = [\"title:String\"]\n",
+        "[generate]\nid = \"uuid\"\n",
     )
     .unwrap();
 
@@ -3455,6 +3455,7 @@ fn generate_model_project_default_uuid_via_config() {
             "generate",
             "scaffold",
             "Post",
+            "title:String",
             "--config",
             "autumn.generate.toml",
         ],
@@ -3463,12 +3464,109 @@ fn generate_model_project_default_uuid_via_config() {
     let model = fs::read_to_string(project.join("src/models/post.rs")).unwrap();
     assert!(
         model.contains("pub id: uuid::Uuid,"),
-        "project-default uuid scaffold should have `pub id: uuid::Uuid`; got:\n{model}"
+        "project-default uuid (no resource section) should use uuid::Uuid; got:\n{model}"
     );
-
     let routes = fs::read_to_string(project.join("src/routes/posts.rs")).unwrap();
     assert!(
         routes.contains("Path<uuid::Uuid>"),
-        "project-default uuid scaffold routes should use Path<uuid::Uuid>; got:\n{routes}"
+        "project-default uuid routes should use Path<uuid::Uuid>; got:\n{routes}"
+    );
+}
+
+/// AC6: `[generate] id = "uuid"` in autumn.generate.toml is auto-discovered
+/// (no --config flag needed) and applies to both scaffold and model generation.
+#[test]
+fn generate_model_project_default_uuid_auto_discovered() {
+    let (_tmp, project) = fresh_project("project-default-uuid-auto-app");
+
+    // Write the project-level default without --config; the generator should
+    // discover autumn.generate.toml automatically.
+    fs::write(
+        project.join("autumn.generate.toml"),
+        "[generate]\nid = \"uuid\"\n",
+    )
+    .unwrap();
+
+    // generate model (no --id flag, no --config)
+    run_autumn(
+        &project,
+        &["generate", "model", "Post", "title:String"],
+    );
+
+    let model = fs::read_to_string(project.join("src/models/post.rs")).unwrap();
+    assert!(
+        model.contains("pub id: uuid::Uuid,"),
+        "auto-discovered [generate] id=uuid should emit uuid::Uuid; got:\n{model}"
+    );
+
+    let migrations: Vec<_> = fs::read_dir(project.join("migrations"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|e| e.file_name().to_string_lossy().ends_with("_create_posts"))
+        .collect();
+    let up = fs::read_to_string(migrations[0].path().join("up.sql")).unwrap();
+    assert!(
+        up.contains("id UUID PRIMARY KEY DEFAULT gen_random_uuid()"),
+        "auto-discovered project default migration should have UUID PK; got:\n{up}"
+    );
+}
+
+/// AC6: auto-discovered [generate] default also applies to `generate scaffold`.
+#[test]
+fn generate_scaffold_project_default_uuid_auto_discovered() {
+    let (_tmp, project) = fresh_project("project-default-uuid-scaffold-auto-app");
+
+    fs::write(
+        project.join("autumn.generate.toml"),
+        "[generate]\nid = \"uuid\"\n",
+    )
+    .unwrap();
+
+    // generate scaffold (no --id flag, no --config)
+    run_autumn(
+        &project,
+        &["generate", "scaffold", "Post", "title:String"],
+    );
+
+    let model = fs::read_to_string(project.join("src/models/post.rs")).unwrap();
+    assert!(
+        model.contains("pub id: uuid::Uuid,"),
+        "auto-discovered scaffold project default should use uuid::Uuid; got:\n{model}"
+    );
+    let routes = fs::read_to_string(project.join("src/routes/posts.rs")).unwrap();
+    assert!(
+        routes.contains("Path<uuid::Uuid>"),
+        "auto-discovered scaffold routes should use Path<uuid::Uuid>; got:\n{routes}"
+    );
+}
+
+/// Slow end-to-end check: scaffold a UUID-id project, patch Cargo.toml to the
+/// local autumn-web, and `cargo check --tests` the result. Verifies that
+/// Path<uuid::Uuid>, uuid::Uuid dep, and the #[repository] macro all compose
+/// correctly when the primary key is non-sequential.
+///
+/// Run with: `cargo test -p autumn-cli -- --ignored generated_scaffold_uuid_id_cargo_checks`
+#[test]
+#[ignore = "slow: cargo-checks a fresh UUID-id project — run with `cargo test -p autumn-cli -- --ignored`"]
+fn generated_scaffold_uuid_id_cargo_checks() {
+    let (_tmp, project) = fresh_project("uuid-build");
+
+    patch_generated_cargo_toml(&project);
+
+    run_autumn(
+        &project,
+        &["generate", "scaffold", "Post", "title:String", "--api", "--id", "uuid"],
+    );
+
+    let check = Command::new("cargo")
+        .args(["check", "--tests"])
+        .current_dir(&project)
+        .output()
+        .unwrap();
+    assert!(
+        check.status.success(),
+        "cargo check on generated UUID scaffold failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&check.stdout),
+        String::from_utf8_lossy(&check.stderr),
     );
 }

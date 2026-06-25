@@ -22,6 +22,10 @@
 //! Fields (positional arguments) follow the same rule: non-empty CLI fields
 //! shadow TOML fields.
 
+/// The conventional config file name that `autumn generate` auto-discovers in
+/// the project root. Also used as the default path for `--config`.
+pub const GENERATE_CONFIG_FILENAME: &str = "autumn.generate.toml";
+
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -108,6 +112,41 @@ pub fn read_scaffold_config(
         if e.id.is_none() {
             e.id = config.generate.id.clone();
         }
+    }
+    Ok(entry)
+}
+
+/// Like [`read_scaffold_config`] but always returns a [`ScaffoldConfigEntry`]
+/// rather than `Option`.
+///
+/// When no `[scaffold.ResourceName]` section exists the function returns a
+/// default entry, applying any `[generate] id` project default so that a
+/// top-level `[generate]` section is honoured even without a per-resource
+/// section.
+///
+/// Use this instead of [`read_scaffold_config`] when a missing section should
+/// silently fall back to project defaults rather than being treated as an error
+/// (e.g. auto-discovered project config and `--config` with only `[generate]`).
+///
+/// # Errors
+///
+/// - [`GenerateError::Io`] if the file cannot be read.
+/// - [`GenerateError::Config`] if the file is not valid TOML.
+pub fn read_scaffold_config_or_defaults(
+    config_path: &Path,
+    resource_name: &str,
+) -> Result<ScaffoldConfigEntry, GenerateError> {
+    let content = std::fs::read_to_string(config_path)
+        .map_err(|e| std::io::Error::new(e.kind(), format!("{}: {e}", config_path.display())))?;
+    let mut config: GeneratorConfig = toml::from_str(&content).map_err(|e| {
+        GenerateError::Config(format!("invalid TOML in {}: {e}", config_path.display()))
+    })?;
+    let mut entry = config
+        .scaffold
+        .remove(pascal(resource_name).as_str())
+        .unwrap_or_default();
+    if entry.id.is_none() {
+        entry.id = config.generate.id;
     }
     Ok(entry)
 }

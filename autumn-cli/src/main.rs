@@ -2316,13 +2316,33 @@ fn run_generate_command(cmd: GenerateCommands) {
             dry_run,
             force,
         } => {
+            // Precedence: CLI --id > [generate] id in autumn.generate.toml > BigSerial.
+            let project_id = {
+                let auto_cfg = std::env::current_dir()
+                    .unwrap_or_default()
+                    .join(generate::config::GENERATE_CONFIG_FILENAME);
+                if auto_cfg.exists() {
+                    match generate::config::read_generate_defaults(&auto_cfg) {
+                        Ok(t) => t,
+                        Err(e) => {
+                            eprintln!(
+                                "Error reading {}: {e}",
+                                generate::config::GENERATE_CONFIG_FILENAME
+                            );
+                            std::process::exit(1);
+                        }
+                    }
+                } else {
+                    generate::dsl::IdType::default()
+                }
+            };
             let id_type = match id.as_deref().map(generate::dsl::IdType::parse) {
                 Some(Ok(t)) => t,
                 Some(Err(e)) => {
                     eprintln!("Error: {e}");
                     std::process::exit(1);
                 }
-                None => generate::dsl::IdType::default(),
+                None => project_id,
             };
             let options = generate::model::ModelOptions {
                 soft_delete,
@@ -2447,24 +2467,40 @@ fn run_generate_command(cmd: GenerateCommands) {
             dry_run,
             force,
         } => {
-            let config_entry = config.as_ref().map_or_else(
-                generate::config::ScaffoldConfigEntry::default,
-                |path| match generate::config::read_scaffold_config(path, &name) {
-                    Ok(Some(e)) => e,
-                    Ok(None) => {
-                        eprintln!(
-                            "Error: no [scaffold.{}] section found in {}",
-                            generate::naming::pascal(&name),
-                            path.display()
-                        );
-                        std::process::exit(1);
-                    }
+            // Resolve the scaffold config entry, applying [generate] project
+            // defaults. Precedence for id_type:
+            //   CLI --id > [scaffold.X] id > [generate] id > BigSerial.
+            let config_entry = if let Some(path) = config.as_ref() {
+                // Explicit --config: read per-resource entry (or default) from
+                // the given file; [generate] id is propagated automatically.
+                match generate::config::read_scaffold_config_or_defaults(path, &name) {
+                    Ok(e) => e,
                     Err(e) => {
                         eprintln!("Error: {e}");
                         std::process::exit(1);
                     }
-                },
-            );
+                }
+            } else {
+                // No --config: auto-discover autumn.generate.toml in the
+                // project root for the [generate] project default.
+                let auto_cfg = std::env::current_dir()
+                    .unwrap_or_default()
+                    .join(generate::config::GENERATE_CONFIG_FILENAME);
+                if auto_cfg.exists() {
+                    match generate::config::read_scaffold_config_or_defaults(&auto_cfg, &name) {
+                        Ok(e) => e,
+                        Err(e) => {
+                            eprintln!(
+                                "Error reading {}: {e}",
+                                generate::config::GENERATE_CONFIG_FILENAME
+                            );
+                            std::process::exit(1);
+                        }
+                    }
+                } else {
+                    generate::config::ScaffoldConfigEntry::default()
+                }
+            };
             let (fields, options) = match generate::config::merge_config_with_cli(
                 config_entry,
                 &fields,
