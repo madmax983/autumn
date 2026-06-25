@@ -600,3 +600,69 @@ mod conformance_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod builder_tests {
+    use super::*;
+
+    #[test]
+    fn test_admin_plugin_prefix_is_set() {
+        let plugin = AdminPlugin::new().prefix("/custom-admin");
+        assert_eq!(plugin.prefix, "/custom-admin");
+    }
+
+    #[test]
+    fn test_admin_plugin_actuator_prefix_is_set() {
+        let plugin = AdminPlugin::new().actuator_prefix("/custom-actuator");
+        assert_eq!(plugin.actuator_prefix, "/custom-actuator");
+    }
+
+    #[test]
+    fn test_admin_plugin_auth_session_key_is_set() {
+        let plugin = AdminPlugin::new().auth_session_key("custom_uid");
+        assert_eq!(plugin.auth_session_key, "custom_uid");
+    }
+
+    #[test]
+    fn test_admin_plugin_require_role_is_set() {
+        let plugin = AdminPlugin::new().require_role("superuser".to_string());
+        assert_eq!(plugin.require_role.as_deref(), Some("superuser"));
+    }
+
+    #[test]
+    fn test_admin_plugin_require_role_none_is_set() {
+        let plugin = AdminPlugin::new().require_role(None);
+        assert_eq!(plugin.require_role, None);
+    }
+
+    #[test]
+    fn test_admin_plugin_with_runtime_config_is_set() {
+        use autumn_web::runtime_config::{
+            ConfigRegistry, InMemoryConfigStore, RuntimeConfigService,
+        };
+        let registry = Arc::new(ConfigRegistry::new());
+        let store = Arc::new(InMemoryConfigStore::new());
+        let svc = Arc::new(RuntimeConfigService::new(registry, store));
+        let plugin = AdminPlugin::new().with_runtime_config(svc);
+        assert!(plugin.runtime_config.is_some());
+    }
+
+    #[test]
+    fn test_admin_plugin_plugin_name() {
+        let plugin = AdminPlugin::new();
+        let name = plugin.name();
+        assert_eq!(name, Cow::Borrowed("autumn-admin-plugin"));
+    }
+
+    #[test]
+    fn test_admin_plugin_register_is_set() {
+        use crate::feature_flags::FeatureFlagAdminModel;
+
+        let model = FeatureFlagAdminModel;
+
+        let mut plugin = AdminPlugin::new();
+        let original_count = plugin.registry.model_count();
+        plugin = plugin.register(model);
+        assert_ne!(original_count, plugin.registry.model_count());
+    }
+}
