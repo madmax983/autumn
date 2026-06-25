@@ -817,7 +817,7 @@ mod tests {
         assert!(!is_public_path("/dashboard", &c));
     }
 
-    /// An absolute-URL `login_redirect` target (external IdP, or even same-origin)
+    /// An absolute-URL `login_redirect` target (external `IdP`, or even same-origin)
     /// is NOT auto-exempted: the local path is only made public for relative
     /// targets, since we can't validate the authority here. Same-origin absolute
     /// targets that must be public belong in `public_paths`.
