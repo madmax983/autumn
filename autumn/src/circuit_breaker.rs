@@ -466,7 +466,7 @@ impl CircuitBreaker {
     }
 }
 
-/// A guard returned by [`CircuitBreaker::before_call`] for manual operation tracking.
+/// A guard returned by `CircuitBreaker::before_call` for manual operation tracking.
 ///
 /// If dropped without calling [`success`](Self::success) or [`failure`](Self::failure),
 /// the operation is recorded as a failure.
