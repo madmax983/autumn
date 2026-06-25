@@ -833,7 +833,13 @@ impl InboundMailRouter {
 
 fn subtle_eq(a: &[u8], b: &[u8]) -> bool {
     use subtle::ConstantTimeEq as _;
-    a.ct_eq(b).into()
+    let len_eq = a.len().ct_eq(&b.len());
+    let mut bytes_eq = subtle::Choice::from(1u8);
+    for (i, &a_byte) in a.iter().enumerate() {
+        let b_byte = *b.get(i).unwrap_or(&0xFF);
+        bytes_eq &= a_byte.ct_eq(&b_byte);
+    }
+    (len_eq & bytes_eq).into()
 }
 
 /// Strip a display-name from an RFC 5322 address, returning only the addr-spec.

@@ -254,9 +254,17 @@ pub fn hmac_sha256_hex(key: &[u8], message: &[u8]) -> String {
 }
 
 /// Constant-time string comparison for HMAC verification.
-fn ct_eq_str(a: &str, b: &str) -> bool {
+pub fn ct_eq_str(a: &str, b: &str) -> bool {
     use subtle::ConstantTimeEq;
-    a.as_bytes().ct_eq(b.as_bytes()).into()
+    let a_bytes = a.as_bytes();
+    let b_bytes = b.as_bytes();
+    let len_eq = a_bytes.len().ct_eq(&b_bytes.len());
+    let mut bytes_eq = subtle::Choice::from(1u8);
+    for (i, &a_byte) in a_bytes.iter().enumerate() {
+        let b_byte = *b_bytes.get(i).unwrap_or(&0xFF);
+        bytes_eq &= a_byte.ct_eq(&b_byte);
+    }
+    (len_eq & bytes_eq).into()
 }
 
 /// Generate a random 32-byte ephemeral key from two UUID v4 values.
