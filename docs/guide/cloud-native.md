@@ -274,6 +274,69 @@ AUTUMN_DATABASE__PRIMARY_URL="postgres://user:pass@primary:5432/app" autumn migr
 `auto_migrate_in_production = false` on web replicas unless you are deliberately
 running a single-process deployment.
 
+### Waiting for the Database at Cold Start
+
+On a fresh Compose stack, a cold managed Postgres, or a Kubernetes pod that
+races ahead of its database, `autumn migrate` may be called before the database
+is accepting connections. Instead of crashing and requiring a bespoke
+`wait-for-it.sh` wrapper, you can tell `autumn migrate` to wait:
+
+```bash
+# Via environment variable (recommended for container deployments):
+AUTUMN_DATABASE__STARTUP_WAIT_SECS=60 autumn migrate
+
+# Via CLI flag (overrides the environment variable and config file):
+autumn migrate --wait 60
+
+# Via autumn.toml:
+# [database]
+# startup_wait_secs = 60
+```
+
+When `startup_wait_secs` is set to a non-zero value, `autumn migrate` retries
+the initial connection with capped exponential backoff (starting at 500 ms,
+doubling each attempt, capped at 5 s) until the database responds or the total
+wait exceeds the configured limit. On each retry, the attempt number and delay
+are printed so you can see progress in container logs.
+
+Only transient "server not yet reachable" errors are retried (connection
+refused, network unreachable, database system starting up, etc.). Authentication
+failures, missing databases, and malformed URLs fail immediately so you do not
+burn the entire wait window on a configuration mistake.
+
+The default is `0`, which preserves today's fail-fast behavior with no
+behavioral change for existing deployments.
+
+**Docker Compose example** — no `depends_on: condition: service_healthy` or
+`wait-for-it.sh` required:
+
+```yaml
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: secret
+      POSTGRES_DB: app
+
+  migrate:
+    image: my-app:latest
+    command: autumn migrate
+    environment:
+      AUTUMN_DATABASE__PRIMARY_URL: postgres://app:secret@db:5432/app
+      AUTUMN_DATABASE__STARTUP_WAIT_SECS: "60"
+    depends_on:
+      - db
+
+  web:
+    image: my-app:latest
+    environment:
+      AUTUMN_DATABASE__PRIMARY_URL: postgres://app:secret@db:5432/app
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+```
+
 ## Migration Safety Preflight
 
 Before applying migrations in production, run the safety check in CI or locally:

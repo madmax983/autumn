@@ -50,6 +50,7 @@
 //! | `AUTUMN_DATABASE__REPLICA_POOL_SIZE` | `database.replica_pool_size` | `usize` |
 //! | `AUTUMN_DATABASE__REPLICA_FALLBACK` | `database.replica_fallback` | `fail_readiness` / `primary` |
 //! | `AUTUMN_DATABASE__CONNECT_TIMEOUT_SECS` | `database.connect_timeout_secs` | `u64` |
+//! | `AUTUMN_DATABASE__STARTUP_WAIT_SECS` | `database.startup_wait_secs` | `u64` |
 //! | `AUTUMN_DATABASE__AUTO_MIGRATE_IN_PRODUCTION` | `database.auto_migrate_in_production` | `bool` |
 //! | `AUTUMN_DATABASE__SHARDS__{i}__NAME` | `database.shards[i].name` | `String` |
 //! | `AUTUMN_DATABASE__SHARDS__{i}__PRIMARY_URL` | `database.shards[i].primary_url` | `String` |
@@ -2060,6 +2061,7 @@ impl AutumnConfig {
     /// - `AUTUMN_DATABASE__URL` → `database.url` (String)
     /// - `AUTUMN_DATABASE__POOL_SIZE` → `database.pool_size` (usize)
     /// - `AUTUMN_DATABASE__CONNECT_TIMEOUT_SECS` → `database.connect_timeout_secs` (u64)
+    /// - `AUTUMN_DATABASE__STARTUP_WAIT_SECS` → `database.startup_wait_secs` (u64)
     /// - `AUTUMN_DATABASE__AUTO_MIGRATE_IN_PRODUCTION` -> `database.auto_migrate_in_production` (bool)
     ///
     /// # Log
@@ -2301,6 +2303,11 @@ impl AutumnConfig {
             env,
             "AUTUMN_DATABASE__CONNECT_TIMEOUT_SECS",
             &mut self.database.connect_timeout_secs,
+        );
+        parse_env(
+            env,
+            "AUTUMN_DATABASE__STARTUP_WAIT_SECS",
+            &mut self.database.startup_wait_secs,
         );
         parse_env_bool(
             env,
@@ -3483,6 +3490,17 @@ pub struct DatabaseConfig {
     #[serde(default = "default_connect_timeout")]
     pub connect_timeout_secs: u64,
 
+    /// Bounded startup wait (seconds) for the database to become reachable
+    /// before the migrator fails. `0` (the default) disables the wait and
+    /// preserves the current fail-fast behaviour — a single connection attempt,
+    /// no retry.  Set a non-zero value (e.g. `60`) to have `autumn migrate`
+    /// retry with capped exponential backoff until either the database accepts
+    /// connections or the window elapses.
+    ///
+    /// Override via `AUTUMN_DATABASE__STARTUP_WAIT_SECS`.
+    #[serde(default)]
+    pub startup_wait_secs: u64,
+
     /// When true, permits automatic migration application while running with
     /// `prod`/`production` profile. Default: `false`.
     ///
@@ -4368,6 +4386,7 @@ impl Default for DatabaseConfig {
             replica_pool_size: None,
             replica_fallback: ReplicaFallback::default(),
             connect_timeout_secs: default_connect_timeout(),
+            startup_wait_secs: 0,
             auto_migrate_in_production: false,
             statement_timeout: None,
             slow_query_threshold: default_slow_query_threshold(),
@@ -6315,6 +6334,28 @@ path = "/healthz"
         let mut config = AutumnConfig::default();
         config.apply_env_overrides_with_env(&env);
         assert_eq!(config.database.pool_size, 10);
+    }
+
+    // ── startup_wait_secs ─────────────────────────────────────────────────────
+
+    #[test]
+    fn startup_wait_secs_default_is_zero() {
+        assert_eq!(DatabaseConfig::default().startup_wait_secs, 0);
+    }
+
+    #[test]
+    fn env_override_startup_wait_secs() {
+        let env = MockEnv::new().with("AUTUMN_DATABASE__STARTUP_WAIT_SECS", "60");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+        assert_eq!(config.database.startup_wait_secs, 60);
+    }
+
+    #[test]
+    fn startup_wait_secs_parses_from_toml() {
+        let config: AutumnConfig =
+            toml::from_str("[database]\nstartup_wait_secs = 30").unwrap();
+        assert_eq!(config.database.startup_wait_secs, 30);
     }
 
     #[cfg(feature = "storage")]

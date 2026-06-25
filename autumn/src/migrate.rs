@@ -672,6 +672,173 @@ where
 /// Returns [`MigrationError::Connection`] if the database is unreachable, or
 /// [`MigrationError::LockTimeout`] if the lock cannot be acquired within
 /// `wait_timeout`.
+// ── Startup wait-for-database ─────────────────────────────────────────────────
+
+/// A single connect attempt returned by the injected `try_connect` closure.
+#[derive(Debug)]
+pub(crate) enum AttemptError {
+    /// The server is not yet reachable (connection refused, starting up, …).
+    /// The caller will retry after a backoff delay.
+    Retryable(String),
+    /// A non-transient failure (auth error, bad URL, missing database, …).
+    /// The caller must surface the error immediately without retrying.
+    Fatal(String),
+}
+
+/// Classify an error message from `PgConnection::establish` as retryable or
+/// fatal so the startup wait loop can decide whether to keep waiting.
+///
+/// The default is **fatal** (deny-list for retry) so that unknown errors always
+/// fail fast rather than silently burning the whole startup-wait window.
+/// Only "server not yet reachable" patterns are allowed to retry (AC #5).
+pub(crate) fn is_retryable_connection_error(msg: &str) -> bool {
+    let lower = msg.to_ascii_lowercase();
+    lower.contains("connection refused")
+        || lower.contains("could not connect to server")
+        || lower.contains("the database system is starting up")
+        || lower.contains("connection reset")
+        || lower.contains("no route to host")
+        || lower.contains("host is unreachable")
+        || lower.contains("network is unreachable")
+        || lower.contains("timed out")
+        || lower.contains("connection closed")
+}
+
+/// Capped exponential backoff for the startup wait loop.
+///
+/// Returns `500ms * 2^(attempt - 1)`, capped at `5s`.
+pub(crate) fn backoff_delay(attempt: u32) -> std::time::Duration {
+    let ms = 500u64.saturating_mul(1u64 << (attempt.saturating_sub(1).min(10)));
+    std::time::Duration::from_millis(ms.min(5_000))
+}
+
+/// Redact the password from any `postgres://` URL embedded in `msg`.
+///
+/// Mirrors `mask_database_url` in `autumn/src/app.rs`: replaces the password
+/// component with `****`.  Leaves the rest of the message unchanged.
+pub(crate) fn redact_db_url_credentials(msg: &str) -> String {
+    // Find all postgres:// substrings and replace their password component.
+    // We do a simple pass that parses each occurrence as a URL and substitutes.
+    let mut out = msg.to_owned();
+    // Collect start-positions of `postgres://` in the string (reverse order so
+    // replacements don't shift earlier positions).
+    let positions: Vec<usize> = msg
+        .match_indices("postgres://")
+        .map(|(i, _)| i)
+        .collect();
+    for &start in positions.iter().rev() {
+        // Extract the URL-shaped token (everything until the first whitespace
+        // or end of string) and try to parse it.
+        let token: &str = msg[start..]
+            .split(|c: char| c.is_ascii_whitespace())
+            .next()
+            .unwrap_or(&msg[start..]);
+        if let Ok(mut parsed) = url::Url::parse(token) {
+            if parsed.password().is_some() {
+                let _ = parsed.set_password(Some("****"));
+                let end = start + token.len();
+                out.replace_range(start..end, parsed.as_str());
+            }
+        }
+    }
+    out
+}
+
+/// Inner (dependency-injected) startup wait loop.
+///
+/// All I/O is supplied via closures so the logic is unit-testable without a
+/// real Postgres instance or wall-clock sleeps (AC #2).
+///
+/// # Arguments
+///
+/// * `max_wait` — maximum total time to spend waiting (> 0 enforced by callers)
+/// * `try_connect` — attempts one connection; returns `Ok(())` on success,
+///   `Err(AttemptError::Retryable(_))` for transient errors, or
+///   `Err(AttemptError::Fatal(_))` for non-transient failures
+/// * `sleep` — called with the computed backoff delay; may be a no-op in tests
+/// * `elapsed` — returns the total time elapsed since the wait started
+/// * `on_retry` — called **before** sleeping with `(attempt, next_delay)` so
+///   the caller can print a user-visible retry message (AC #4)
+pub(crate) fn wait_for_database_inner(
+    max_wait: std::time::Duration,
+    mut try_connect: impl FnMut() -> Result<(), AttemptError>,
+    mut sleep: impl FnMut(std::time::Duration),
+    elapsed: impl Fn() -> std::time::Duration,
+    mut on_retry: impl FnMut(u32, std::time::Duration),
+) -> Result<(), MigrationError> {
+    let mut attempt: u32 = 0;
+    loop {
+        attempt += 1;
+        match try_connect() {
+            Ok(()) => return Ok(()),
+            Err(AttemptError::Fatal(msg)) => {
+                return Err(MigrationError::Connection(redact_db_url_credentials(&msg)));
+            }
+            Err(AttemptError::Retryable(_msg)) => {
+                let elapsed_now = elapsed();
+                if elapsed_now >= max_wait {
+                    return Err(MigrationError::Connection(format!(
+                        "database did not become reachable within {}s \
+                         after {} attempt(s); timed out waiting for startup",
+                        max_wait.as_secs(),
+                        attempt,
+                    )));
+                }
+                let delay = backoff_delay(attempt).min(max_wait.saturating_sub(elapsed_now));
+                on_retry(attempt, delay);
+                sleep(delay);
+            }
+        }
+    }
+}
+
+/// Wait for the database at `database_url` to accept connections, retrying
+/// with capped exponential backoff until either success or `max_wait` elapses.
+///
+/// * `max_wait == Duration::ZERO` — callers **must not** call this function;
+///   skip it and connect directly (preserves today's fail-fast behaviour,
+///   AC #6).
+/// * Non-retryable errors (auth failures, bad URL, missing database) are
+///   surfaced immediately regardless of `max_wait`.
+/// * Connection credentials are never included in retry log output (AC #4).
+///
+/// `on_retry` is invoked **before** each sleep so the CLI can print a visible
+/// `eprintln!` message with attempt count and next delay.
+///
+/// # Errors
+///
+/// Returns [`MigrationError::Connection`] on either a fatal error or a timeout.
+pub fn wait_for_database(
+    database_url: &str,
+    max_wait: std::time::Duration,
+    mut on_retry: impl FnMut(u32, std::time::Duration),
+) -> Result<(), MigrationError> {
+    let start = std::time::Instant::now();
+    wait_for_database_inner(
+        max_wait,
+        || {
+            diesel::PgConnection::establish(database_url).map(|_conn| ()).map_err(|e| {
+                let msg = e.to_string();
+                if is_retryable_connection_error(&msg) {
+                    AttemptError::Retryable(msg)
+                } else {
+                    AttemptError::Fatal(msg)
+                }
+            })
+        },
+        std::thread::sleep,
+        move || start.elapsed(),
+        |attempt, delay| {
+            tracing::warn!(
+                attempt,
+                next_delay_ms = delay.as_millis(),
+                "Database not reachable; retrying after backoff",
+            );
+            on_retry(attempt, delay);
+        },
+    )
+}
+
 pub fn hold_migration_lock(
     database_url: &str,
     wait_timeout: std::time::Duration,
@@ -1342,5 +1509,191 @@ mod tests {
     fn should_auto_apply_returns_false_for_none_profile() {
         assert!(!should_auto_apply(None, false));
         assert!(!should_auto_apply(None, true));
+    }
+
+    // ── startup wait-for-DB (red phase) ───────────────────────────────────────
+
+    #[test]
+    fn is_retryable_connection_refused() {
+        assert!(is_retryable_connection_error("connection refused"));
+        assert!(is_retryable_connection_error("FATAL: connection refused (os error 111)"));
+    }
+
+    #[test]
+    fn is_retryable_server_starting_up() {
+        assert!(is_retryable_connection_error(
+            "the database system is starting up"
+        ));
+    }
+
+    #[test]
+    fn is_retryable_timed_out() {
+        assert!(is_retryable_connection_error("connection timed out"));
+        assert!(is_retryable_connection_error("timed out waiting for server"));
+    }
+
+    #[test]
+    fn is_retryable_could_not_connect() {
+        assert!(is_retryable_connection_error(
+            "could not connect to server: Connection refused"
+        ));
+    }
+
+    #[test]
+    fn is_not_retryable_auth_failure() {
+        assert!(!is_retryable_connection_error(
+            "password authentication failed for user \"app\""
+        ));
+    }
+
+    #[test]
+    fn is_not_retryable_database_does_not_exist() {
+        assert!(!is_retryable_connection_error(
+            "database \"mydb\" does not exist"
+        ));
+    }
+
+    #[test]
+    fn is_not_retryable_invalid_url() {
+        assert!(!is_retryable_connection_error(
+            "invalid connection string syntax"
+        ));
+    }
+
+    #[test]
+    fn is_not_retryable_role_does_not_exist() {
+        assert!(!is_retryable_connection_error(
+            "role \"app\" does not exist"
+        ));
+    }
+
+    #[test]
+    fn backoff_delay_grows_and_caps() {
+        let d = |n| backoff_delay(n).as_millis();
+        assert_eq!(d(1), 500);
+        assert_eq!(d(2), 1000);
+        assert_eq!(d(3), 2000);
+        assert_eq!(d(4), 4000);
+        assert_eq!(d(5), 5000); // capped
+        assert_eq!(d(10), 5000); // still capped
+    }
+
+    #[test]
+    fn redact_removes_password_from_url() {
+        let msg = "failed: postgres://user:secret@host:5432/db";
+        let out = redact_db_url_credentials(msg);
+        assert!(
+            !out.contains("secret"),
+            "password must not appear in output: {out}"
+        );
+    }
+
+    #[test]
+    fn redact_no_creds_url_unchanged_format() {
+        let msg = "connection refused at postgres://host:5432/db";
+        let out = redact_db_url_credentials(msg);
+        assert!(
+            !out.contains("****"),
+            "no-cred url should not be mangled: {out}"
+        );
+        assert!(out.contains("host:5432"), "host should still be present: {out}");
+    }
+
+    #[test]
+    fn wait_for_database_inner_success_first_attempt() {
+        use std::cell::Cell;
+        let attempts = Cell::new(0u32);
+        let sleeps = Cell::new(0u32);
+
+        let result = wait_for_database_inner(
+            std::time::Duration::from_secs(30),
+            || {
+                attempts.set(attempts.get() + 1);
+                Ok(())
+            },
+            |_| sleeps.set(sleeps.get() + 1),
+            || std::time::Duration::ZERO,
+            |_, _| {},
+        );
+        assert!(result.is_ok());
+        assert_eq!(attempts.get(), 1);
+        assert_eq!(sleeps.get(), 0);
+    }
+
+    #[test]
+    fn wait_for_database_inner_fatal_error_no_retry() {
+        use std::cell::Cell;
+        let attempts = Cell::new(0u32);
+        let retried = Cell::new(false);
+
+        let result = wait_for_database_inner(
+            std::time::Duration::from_secs(30),
+            || {
+                attempts.set(attempts.get() + 1);
+                Err(AttemptError::Fatal(
+                    "password authentication failed".to_string(),
+                ))
+            },
+            |_| {},
+            || std::time::Duration::ZERO,
+            |_, _| retried.set(true),
+        );
+        assert!(result.is_err());
+        assert_eq!(attempts.get(), 1, "fatal error must not retry");
+        assert!(!retried.get(), "on_retry must not fire for fatal errors");
+    }
+
+    #[test]
+    fn wait_for_database_inner_success_on_third_attempt() {
+        use std::cell::Cell;
+        let attempts = Cell::new(0u32);
+        let mut sleep_delays = Vec::new();
+
+        let result = wait_for_database_inner(
+            std::time::Duration::from_secs(30),
+            || {
+                let n = attempts.get() + 1;
+                attempts.set(n);
+                if n < 3 {
+                    Err(AttemptError::Retryable("connection refused".to_string()))
+                } else {
+                    Ok(())
+                }
+            },
+            |d| sleep_delays.push(d),
+            || std::time::Duration::ZERO, // always within budget
+            |_, _| {},
+        );
+        assert!(result.is_ok());
+        assert_eq!(attempts.get(), 3);
+        assert_eq!(sleep_delays.len(), 2);
+        // Delays grow with capped exponential backoff
+        assert_eq!(sleep_delays[0], std::time::Duration::from_millis(500));
+        assert_eq!(sleep_delays[1], std::time::Duration::from_millis(1000));
+    }
+
+    #[test]
+    fn wait_for_database_inner_timeout_returns_error() {
+        use std::cell::Cell;
+        let attempts = Cell::new(0u32);
+
+        let result = wait_for_database_inner(
+            std::time::Duration::from_secs(5),
+            || {
+                attempts.set(attempts.get() + 1);
+                Err(AttemptError::Retryable("connection refused".to_string()))
+            },
+            |_| {},
+            || std::time::Duration::from_secs(10), // fake: already past the budget
+            |_, _| {},
+        );
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.to_lowercase().contains("wait")
+                || msg.to_lowercase().contains("timeout")
+                || msg.to_lowercase().contains("timed out"),
+            "error must describe the timeout: {msg}"
+        );
     }
 }
