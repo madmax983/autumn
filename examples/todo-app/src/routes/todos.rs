@@ -465,20 +465,22 @@ pub async fn create(db: Db, form: ChangesetForm<TodoForm>) -> AutumnResult<impl 
 }
 
 fn page_request_from_hx(hx: &HxRequest) -> PageRequest {
-    if let Some(ref current_url) = hx.current_url {
-        if let Ok(parsed_url) = url::Url::parse(current_url) {
-            let mut page = None;
-            let mut size = None;
-            for (key, val) in parsed_url.query_pairs() {
-                if key == "page" {
-                    page = val.parse::<u32>().ok();
-                } else if key == "size" {
-                    size = val.parse::<u32>().ok();
-                }
+    if let Some(parsed_url) = hx
+        .current_url
+        .as_deref()
+        .and_then(|url| url::Url::parse(url).ok())
+    {
+        let mut page = None;
+        let mut size = None;
+        for (key, val) in parsed_url.query_pairs() {
+            if key == "page" {
+                page = val.parse::<u32>().ok();
+            } else if key == "size" {
+                size = val.parse::<u32>().ok();
             }
-            if page.is_some() || size.is_some() {
-                return PageRequest::new(page.unwrap_or(1), size.unwrap_or(20));
-            }
+        }
+        if page.is_some() || size.is_some() {
+            return PageRequest::new(page.unwrap_or(1), size.unwrap_or(20));
         }
     }
     PageRequest::default()
@@ -499,7 +501,7 @@ pub async fn toggle(id: Path<i64>, mut db: Db, hx: HxRequest) -> AutumnResult<im
 
     if hx.is_htmx {
         let page_req = page_request_from_hx(&hx);
-        let page_data = Todo::page(&page_req, &mut *db).await?;
+        let page_data = Todo::page(&page_req, &mut db).await?;
         let done_count = page_data.content.iter().filter(|t| t.completed).count() as i64;
         let count_markup = todo_count_badge(page_data.total_elements as i64, done_count);
 
@@ -539,7 +541,7 @@ pub async fn delete_todo(
 
     if hx.is_htmx {
         let page_req = page_request_from_hx(&hx);
-        let page_data = Todo::page(&page_req, &mut *db).await?;
+        let page_data = Todo::page(&page_req, &mut db).await?;
         let done_count = page_data.content.iter().filter(|t| t.completed).count() as i64;
         let count_markup = todo_count_badge(page_data.total_elements as i64, done_count);
 
