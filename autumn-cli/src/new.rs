@@ -21,6 +21,7 @@ mod templates {
     pub const SEED_RS: &str = include_str!("templates/seed.rs.tmpl");
     pub const SEED_CARGO_TOML: &str = include_str!("templates/seed_Cargo.toml.tmpl");
     pub const INTEGRATION_TEST: &str = include_str!("templates/tests/integration_test.rs.tmpl");
+    pub const CI_WORKFLOW: &str = include_str!("templates/.github/workflows/ci.yml.tmpl");
 }
 
 /// Variables substituted into project and starter template files.
@@ -164,6 +165,7 @@ pub fn generate_with_quiet(
     generate_inner(name, parent_dir, opts, true)
 }
 
+#[allow(clippy::too_many_lines)]
 fn generate_inner(
     name: &str,
     parent_dir: &Path,
@@ -188,6 +190,7 @@ fn generate_inner(
     fs::create_dir_all(project_dir.join("migrations"))?;
     fs::create_dir_all(project_dir.join("tests"))?;
     fs::create_dir_all(project_dir.join("config/credentials"))?;
+    fs::create_dir_all(project_dir.join(".github/workflows"))?;
     if opts.with_i18n {
         fs::create_dir_all(project_dir.join("i18n"))?;
     }
@@ -277,6 +280,12 @@ fn generate_inner(
         project_dir.join("tests/integration_test.rs"),
         render(templates::INTEGRATION_TEST),
     )?;
+    // Bind the path so the write fits on one line: a multi-line
+    // `fs::write(...)?` leaves the `?` error-propagation region on a bare
+    // `)?;` line that passing tests never hit, which llvm-cov reports as an
+    // uncovered line (as it does for the multi-line writes above).
+    let ci_workflow = project_dir.join(".github/workflows/ci.yml");
+    fs::write(ci_workflow, render(templates::CI_WORKFLOW))?;
 
     write_optional_scaffold_files(&project_dir, name, opts, &render)?;
 

@@ -572,6 +572,41 @@ recovers, so log volume stays low during outages.
 
 ---
 
+## Continuous integration
+
+`autumn new` writes `.github/workflows/ci.yml` into every generated project.
+The workflow runs automatically on every branch push and pull request, so CI
+fires on your first push no matter what the default branch is named:
+
+| Step | Command |
+|------|---------|
+| Format check | `cargo fmt --all -- --check` |
+| Lint | `cargo clippy --all-targets -- -D warnings` |
+| Build | `cargo build` |
+| Test | `cargo test` |
+
+The Rust toolchain is pinned to the project MSRV (1.88.0+) via
+`dtolnay/rust-toolchain@<msrv>` so local and CI toolchains can't drift.
+
+A Postgres 16 service container is provisioned and `DATABASE_URL` is wired in
+so DB-dependent tests can opt in. Tests marked `#[ignore]` are skipped in the
+default `cargo test` run; pass `-- --ignored` to include them.
+
+### Extending the CI workflow
+
+**Tailwind CSS**: install the Tailwind CLI (`autumn setup --tailwind`) and add a
+step before `cargo build` to run it. The generated `build.rs` will auto-detect
+it on `PATH` or at `target/autumn/tailwindcss`.
+
+**Coverage**: install `cargo-llvm-cov` (`taiki-e/install-action@cargo-llvm-cov`)
+and upload the LCOV report to Codecov. Coverage gating is out of scope for the
+generated scaffold but straightforward to add.
+
+**Audit**: `cargo install cargo-audit --locked` then `cargo audit` as a separate
+step. Recommended before production deploys.
+
+---
+
 ## Next steps
 
 Once the container is running:
