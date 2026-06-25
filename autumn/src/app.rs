@@ -3116,9 +3116,11 @@ impl AppBuilder {
             String,
             Option<(std::path::PathBuf, u64, u64)>,
         ) = if let Some(socket_path) = config.server.unix_socket.as_deref() {
+            let _ = socket_path;
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
+
                 let path = std::path::Path::new(socket_path);
                 if let Err(e) = prepare_unix_socket_path(path) {
                     tracing::error!(socket = %socket_path, "Failed to prepare unix socket: {e}");

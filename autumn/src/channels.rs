@@ -312,16 +312,51 @@ impl Broadcast {
     ) -> Result<usize, BroadcastError> {
         self.publish(topic, htmx_oob_envelope(fragment))
     }
+
+    /// Publish a Maud fragment wrapped in a custom htmx out-of-band swap strategy.
+    ///
+    /// ```
+    /// use autumn_web::channels::Channels;
+    /// use autumn_web::htmx::OobSwap;
+    /// use maud::html;
+    ///
+    /// let channels = Channels::new(16);
+    /// channels
+    ///     .broadcast()
+    ///     .publish_oob("feed", "notice", OobSwap::OuterHTML, &html! { div id="notice" { "Saved" } })
+    ///     .expect("html publish should succeed");
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BroadcastError::Publish`] when the selected backend rejects
+    /// the publish request.
+    #[cfg(feature = "maud")]
+    pub fn publish_oob(
+        &self,
+        topic: &str,
+        id: &str,
+        strategy: crate::htmx::OobSwap,
+        fragment: &maud::Markup,
+    ) -> Result<usize, BroadcastError> {
+        use crate::htmx::HtmxFragments;
+        use maud::Render;
+        let envelope = HtmxFragments::oob_only()
+            .oob_with_strategy(id, strategy, fragment.clone())
+            .render()
+            .into_string();
+        self.publish(topic, envelope)
+    }
 }
 
 #[cfg(feature = "maud")]
 fn htmx_oob_envelope(fragment: &maud::Markup) -> String {
-    maud::html! {
-        template hx-swap-oob="true" {
-            (fragment)
-        }
-    }
-    .into_string()
+    use crate::htmx::HtmxFragments;
+    use maud::Render;
+    HtmxFragments::oob_only()
+        .oob("", fragment.clone())
+        .render()
+        .into_string()
 }
 
 /// A sender handle for a broadcast channel.
@@ -1160,6 +1195,33 @@ mod tests {
         let msg = rx.recv().await?;
         assert!(msg.as_str().contains("hx-swap-oob"));
         assert!(msg.as_str().contains("<li id=\"item-1\">one</li>"));
+        Ok(())
+    }
+
+    #[cfg(all(feature = "ws", feature = "maud"))]
+    #[tokio::test]
+    async fn broadcast_publish_oob_custom_strategy() -> Result<(), broadcast::error::RecvError> {
+        let channels = Channels::new(16);
+        let broadcast = Broadcast::new(channels.clone());
+        let mut rx = channels.subscribe("feed");
+
+        let sent = broadcast
+            .publish_oob(
+                "feed",
+                "badge",
+                crate::htmx::OobSwap::BeforeEnd,
+                &maud::html! {
+                    span { "3" }
+                },
+            )
+            .expect("oob publish should succeed");
+
+        assert_eq!(sent, 1);
+        let msg = rx.recv().await?;
+        assert_eq!(
+            msg.as_str(),
+            "<template hx-swap-oob=\"beforeend:#badge\"><span>3</span></template>"
+        );
         Ok(())
     }
 
