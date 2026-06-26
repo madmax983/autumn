@@ -149,7 +149,11 @@ mod tests {
                 html! { p { "rendered" } }
             })
         };
-        assert_eq!(counter.load(Ordering::SeqCst), 1, "miss must run closure once");
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "miss must run closure once"
+        );
         assert!(first.into_string().contains("rendered"));
 
         // Second call (same identity + version) → hit; closure must NOT run.
@@ -319,7 +323,11 @@ mod tests {
         // hits its own cache so the closures don't run. The outer itself hits.
         assert_eq!(inner_a.load(Ordering::SeqCst), 1, "inner-a stays cached");
         assert_eq!(inner_b.load(Ordering::SeqCst), 1, "inner-b stays cached");
-        assert_eq!(outer.load(Ordering::SeqCst), 1, "outer hit: not re-rendered");
+        assert_eq!(
+            outer.load(Ordering::SeqCst),
+            1,
+            "outer hit: not re-rendered"
+        );
 
         // --- Pass 3: inner-a changes (v2), outer version bumps. ---
         // inner-a re-renders, inner-b sibling stays cached, outer re-renders.
@@ -332,9 +340,21 @@ mod tests {
                 html! { ul { (a) (b) } }
             });
         }
-        assert_eq!(inner_a.load(Ordering::SeqCst), 2, "inner-a re-renders on version bump");
-        assert_eq!(inner_b.load(Ordering::SeqCst), 1, "inner-b sibling stays cached");
-        assert_eq!(outer.load(Ordering::SeqCst), 2, "outer re-renders when its version bumped");
+        assert_eq!(
+            inner_a.load(Ordering::SeqCst),
+            2,
+            "inner-a re-renders on version bump"
+        );
+        assert_eq!(
+            inner_b.load(Ordering::SeqCst),
+            1,
+            "inner-b sibling stays cached"
+        );
+        assert_eq!(
+            outer.load(Ordering::SeqCst),
+            2,
+            "outer re-renders when its version bumped"
+        );
     }
 
     // ── cache_fragment_global: uses process-global cache ─────────────────
@@ -375,8 +395,7 @@ mod tests {
     fn global_variant_no_global_cache_renders_fallback() {
         clear_global_cache();
 
-        let result =
-            cache_fragment_global("post:fallback", "v1", None, || html! { span { "ok" } });
+        let result = cache_fragment_global("post:fallback", "v1", None, || html! { span { "ok" } });
         assert!(
             result.into_string().contains("ok"),
             "must render when no global cache"

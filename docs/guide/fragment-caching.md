@@ -147,8 +147,9 @@ fn comment_thread(thread: &Thread) -> Markup {
         format_args!("thread:{}", thread.id),
         // outer version derived from the children, so the outer re-renders
         // whenever *any* child changes
-        thread.comments.iter().map(|c| c.updated_at).max().unwrap_or_default()
-            .and_utc().timestamp_micros(),
+        thread.comments.iter().map(|c| c.updated_at).max()
+            .map(|t| t.and_utc().timestamp_micros())
+            .unwrap_or(0),
         None,
         || html! {
             ul {

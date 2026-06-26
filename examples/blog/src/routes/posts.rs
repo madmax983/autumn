@@ -4,10 +4,10 @@
 //! use htmx attributes for interactive publish/delete behaviour.
 
 use autumn_web::assets::asset_url;
+use autumn_web::cache::cache_fragment_global;
 use autumn_web::extract::{Form, Path};
 use autumn_web::i18n::Locale;
 use autumn_web::seo::SeoMeta;
-use autumn_web::cache::cache_fragment_global;
 use autumn_web::{AutumnError, AutumnResult, Db, Markup, Redirect, delete, get, html, post, t};
 use diesel::prelude::*;
 use diesel_async::RunQueryDsl;

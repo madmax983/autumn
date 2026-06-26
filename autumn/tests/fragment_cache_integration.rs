@@ -46,7 +46,11 @@ fn fragment_served_from_app_state_cache_on_hit() {
     let cache = state.cache().expect("cache registered");
 
     let counter = Arc::new(AtomicUsize::new(0));
-    let post = Post { id: 1, title: "Hello", version: 1 };
+    let post = Post {
+        id: 1,
+        title: "Hello",
+        version: 1,
+    };
 
     // First read → miss → render once.
     let first = render_post_card(cache.as_ref(), &post, &counter);
@@ -55,7 +59,11 @@ fn fragment_served_from_app_state_cache_on_hit() {
 
     // Second read of the same version → hit → no re-render.
     let second = render_post_card(cache.as_ref(), &post, &counter);
-    assert_eq!(counter.load(Ordering::SeqCst), 1, "second read is a cache hit");
+    assert_eq!(
+        counter.load(Ordering::SeqCst),
+        1,
+        "second read is a cache hit"
+    );
     assert_eq!(first, second, "cached markup is identical");
 }
 
@@ -68,17 +76,29 @@ fn write_then_read_produces_zero_stale_renders() {
     let counter = Arc::new(AtomicUsize::new(0));
 
     // v1 of the record, warmed into the cache.
-    let v1 = Post { id: 42, title: "Original title", version: 1 };
+    let v1 = Post {
+        id: 42,
+        title: "Original title",
+        version: 1,
+    };
     let rendered_v1 = render_post_card(cache.as_ref(), &v1, &counter);
     assert!(rendered_v1.contains("Original title"));
     assert_eq!(counter.load(Ordering::SeqCst), 1);
 
     // A write bumps the version token (updated_at changes) and the title.
-    let v2 = Post { id: 42, title: "Edited title", version: 2 };
+    let v2 = Post {
+        id: 42,
+        title: "Edited title",
+        version: 2,
+    };
 
     // The very next read must reflect the new content — no stale render.
     let rendered_v2 = render_post_card(cache.as_ref(), &v2, &counter);
-    assert_eq!(counter.load(Ordering::SeqCst), 2, "write must force a re-render");
+    assert_eq!(
+        counter.load(Ordering::SeqCst),
+        2,
+        "write must force a re-render"
+    );
     assert!(
         rendered_v2.contains("Edited title"),
         "next read after a write must show fresh content, not the stale cached fragment"
@@ -99,16 +119,32 @@ fn list_view_reuses_unchanged_rows() {
 
     let counter = Arc::new(AtomicUsize::new(0));
     let posts = [
-        Post { id: 1, title: "One", version: 1 },
-        Post { id: 2, title: "Two", version: 1 },
-        Post { id: 3, title: "Three", version: 1 },
+        Post {
+            id: 1,
+            title: "One",
+            version: 1,
+        },
+        Post {
+            id: 2,
+            title: "Two",
+            version: 1,
+        },
+        Post {
+            id: 3,
+            title: "Three",
+            version: 1,
+        },
     ];
 
     // Cold render of the list: 3 misses.
     for p in &posts {
         render_post_card(cache.as_ref(), p, &counter);
     }
-    assert_eq!(counter.load(Ordering::SeqCst), 3, "cold list renders every row");
+    assert_eq!(
+        counter.load(Ordering::SeqCst),
+        3,
+        "cold list renders every row"
+    );
 
     // Warm render of the same list: 0 additional renders.
     for p in &posts {
@@ -128,7 +164,11 @@ fn no_cache_configured_falls_back_gracefully() {
     assert!(state.cache().is_none());
 
     let counter = Arc::new(AtomicUsize::new(0));
-    let post = Post { id: 1, title: "Dev", version: 1 };
+    let post = Post {
+        id: 1,
+        title: "Dev",
+        version: 1,
+    };
 
     for _ in 0..2 {
         let rendered = render_post_card_optional(state.cache().as_deref(), &post, &counter);
@@ -146,9 +186,15 @@ fn render_post_card_optional(
 ) -> String {
     let counter = counter.clone();
     let title = post.title;
-    cache_fragment(cache, format_args!("post:{}", post.id), post.version, None, move || {
-        counter.fetch_add(1, Ordering::SeqCst);
-        html! { article { h2 { (title) } } }
-    })
+    cache_fragment(
+        cache,
+        format_args!("post:{}", post.id),
+        post.version,
+        None,
+        move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+            html! { article { h2 { (title) } } }
+        },
+    )
     .into_string()
 }
