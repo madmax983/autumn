@@ -106,13 +106,13 @@ mod tests {
         let mut basic_sub = channels.subscribe("broadcast_posts");
         let mut custom_sub = channels.subscribe("post_topic:hello");
 
-        let repo = PgBasicPostRepository::with_pool_untracked(db.pool().clone());
-        let custom_repo = PgCustomPostRepository::with_pool_untracked(db.pool().clone());
+        let repo = PgBasicPostRepository::with_pool_untracked(db.pool());
+        let custom_repo = PgCustomPostRepository::with_pool_untracked(db.pool());
 
         // Start the background commit hook worker
         let shutdown = tokio_util::sync::CancellationToken::new();
         autumn_web::__private::start_repository_commit_hook_worker(
-            db.pool().clone(),
+            db.pool(),
             Some(channels.clone()),
             shutdown.child_token(),
         );
@@ -155,8 +155,10 @@ mod tests {
         // 3. Update on custom repository
         let mut custom_update_sub = channels.subscribe("post_topic:world");
 
-        let mut update_changes = UpdateBroadcastPost::default();
-        update_changes.title = autumn_web::hooks::Patch::Set("world".to_owned());
+        let update_changes = UpdateBroadcastPost {
+            title: autumn_web::hooks::Patch::Set("world".to_owned()),
+            ..Default::default()
+        };
         custom_repo
             .update(custom_post.id, &update_changes)
             .await
