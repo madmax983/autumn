@@ -1045,6 +1045,7 @@ fn collect_claimed_get_paths(
         }
         claimed.insert(crate::htmx::HTMX_CSRF_JS_PATH.to_owned());
         claimed.insert(crate::htmx::AUTUMN_WIDGETS_JS_PATH.to_owned());
+        claimed.insert(crate::htmx::HTMX_SSE_JS_PATH.to_owned());
     }
     // Dev live-reload endpoints are only mounted when the env vars
     // that enable them are set, but reserving the paths regardless
@@ -1420,6 +1421,10 @@ fn mount_framework_routes(
             crate::htmx::AUTUMN_WIDGETS_JS_PATH,
             axum::routing::get(autumn_widgets_handler),
         );
+        router = router.route(
+            crate::htmx::HTMX_SSE_JS_PATH,
+            axum::routing::get(htmx_sse_handler),
+        );
         tracing::debug!(
             method = "GET",
             path = crate::htmx::HTMX_CSRF_JS_PATH,
@@ -1430,6 +1435,12 @@ fn mount_framework_routes(
             method = "GET",
             path = crate::htmx::AUTUMN_WIDGETS_JS_PATH,
             name = "autumn widget runtime",
+            "Mounted route"
+        );
+        tracing::debug!(
+            method = "GET",
+            path = crate::htmx::HTMX_SSE_JS_PATH,
+            name = "htmx sse extension",
             "Mounted route"
         );
     }
@@ -3195,6 +3206,22 @@ pub async fn autumn_widgets_handler() -> axum::response::Response {
             ),
         ],
         crate::htmx::AUTUMN_WIDGETS_JS,
+    )
+        .into_response()
+}
+
+#[cfg(feature = "htmx")]
+pub async fn htmx_sse_handler() -> axum::response::Response {
+    use axum::response::IntoResponse;
+    (
+        [
+            (http::header::CONTENT_TYPE, "application/javascript"),
+            (
+                http::header::CACHE_CONTROL,
+                "public, max-age=31536000, immutable",
+            ),
+        ],
+        crate::htmx::HTMX_SSE_JS,
     )
         .into_response()
 }

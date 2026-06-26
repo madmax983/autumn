@@ -11,12 +11,12 @@
 use std::path::Path;
 
 use super::dsl::{Field, FieldKind, IdType, parse_fields};
-use super::emit::Plan;
+use super::emit::{Action, Plan};
 use super::model::{
     ModelOptions, field_by_name, parse_model_metadata, plan_cargo_deps, plan_model_with_options,
 };
 use super::naming::{pascal, pluralize, snake};
-use super::schema_edit::{add_mod_declaration, update_main_rs};
+use super::schema_edit::{add_mod_declaration, ensure_autumn_web_feature, update_main_rs};
 use super::{Flags, GenerateError, ensure_project_root, timestamp_now};
 
 /// Extra dependencies the *scaffold* generator's output requires on top of
@@ -37,6 +37,8 @@ pub struct ScaffoldOptions {
     pub queries: Vec<String>,
     /// Scaffold a JSON-only API resource.
     pub api: bool,
+    /// Enable live auto-broadcasting using SSE and HTMX extensions.
+    pub live: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -107,6 +109,7 @@ pub fn plan_scaffold_with_options(
         model: model_options_with_key,
         queries: options.queries.clone(),
         api: options.api,
+        live: options.live,
     };
     let mut plan = plan_model_with_options(
         project_root,
@@ -137,6 +140,7 @@ pub fn plan_scaffold_with_options(
             options_with_key.model.soft_delete,
             options_with_key.api,
             options_with_key.model.sharded,
+            options_with_key.live,
         ),
     );
     let repo_mod_path = repos_dir.join("mod.rs");
@@ -157,6 +161,7 @@ pub fn plan_scaffold_with_options(
                 &form_fields,
                 options_with_key.model.sharded,
                 options_with_key.model.soft_delete,
+                options_with_key.live,
                 options_with_key.model.id_type,
             ),
         );
@@ -213,6 +218,33 @@ pub fn plan_scaffold_with_options(
         ));
     }
     plan_cargo_deps(&mut plan, project_root, &combined);
+
+    if options_with_key.live {
+        let cargo_toml_path = project_root.join("Cargo.toml");
+        let mut cargo_content = None;
+        for action in &mut plan.actions {
+            match action {
+                Action::Modify { path, contents } if path == &cargo_toml_path => {
+                    cargo_content = Some(contents);
+                    break;
+                }
+                _ => {}
+            }
+        }
+
+        if let Some(contents) = cargo_content {
+            let with_ws = ensure_autumn_web_feature(contents, "ws");
+            let with_maud = ensure_autumn_web_feature(&with_ws, "maud");
+            *contents = with_maud;
+        } else {
+            let existing = read_or_empty(&cargo_toml_path);
+            let with_ws = ensure_autumn_web_feature(&existing, "ws");
+            let with_maud = ensure_autumn_web_feature(&with_ws, "maud");
+            if with_maud != existing {
+                plan.modify(cargo_toml_path, with_maud);
+            }
+        }
+    }
 
     Ok(plan)
 }
@@ -367,10 +399,12 @@ fn render_repository_file(
     soft_delete: bool,
     api: bool,
     sharded: bool,
+    live: bool,
 ) -> String {
     let plural = pluralize(snake_name);
     let query_body = render_repository_queries(pascal_name, queries);
     let soft_delete_attr = if soft_delete { ", soft_delete" } else { "" };
+    let broadcasts_attr = if live { ", broadcasts = true" } else { "" };
     let sharded_note = if sharded {
         format!(
             "//!\n\
@@ -418,7 +452,7 @@ fn render_repository_file(
          use crate::models::{snake_name}::{{{pascal_name}, New{pascal_name}, Update{pascal_name}}};\n\
          use crate::schema::{plural};\n\
          \n\
-         #[autumn_web::repository({pascal_name}, api = \"/api/{plural}\"{soft_delete_attr})]\n\
+         #[autumn_web::repository({pascal_name}, api = \"/api/{plural}\"{soft_delete_attr}{broadcasts_attr})]\n\
          pub trait {pascal_name}Repository {{\n\
 {query_body}\
          }}\n"
@@ -508,9 +542,15 @@ fn render_routes_file(
     fields: &[Field],
     sharded: bool,
     soft_delete: bool,
+    live: bool,
     id_type: IdType,
 ) -> String {
     let id_rust = id_type.rust_type();
+    let layout_head_scripts = if live {
+        "\n                script src=\"/static/js/htmx.min.js\" {}\n                script src=\"/static/js/sse.js\" {}"
+    } else {
+        ""
+    };
     let create_inputs = render_create_form_inputs(fields);
     let edit_inputs = render_edit_form_inputs(fields);
     let update_columns = render_update_columns(plural, fields);
@@ -520,7 +560,17 @@ fn render_routes_file(
     // The destroy handler must honour the resource's delete semantics: when the
     // scaffold was generated with `--soft-delete`, mark `deleted_at` (matching
     // the soft-delete repository) instead of issuing a physical `DELETE`.
-    let destroy_stmt = if soft_delete {
+    let destroy_stmt = if live {
+        if sharded {
+            format!(
+                "let repo = Pg{pascal_name}Repository::from_shard(&db);\n    \
+                 repo.delete_by_id(*id).await?;\n    \
+                 let deleted = 1;"
+            )
+        } else {
+            "repo.delete_by_id(*id).await?;\n    let deleted = 1;".to_owned()
+        }
+    } else if soft_delete {
         // Filter on `deleted_at IS NULL` so deleting an already-soft-deleted row
         // affects zero rows and returns 404, matching the physical-delete path.
         format!(
@@ -534,27 +584,103 @@ fn render_routes_file(
                  .execute(&mut *db)\n        .await?;"
         )
     };
+
+    let create_stmt = if live {
+        if sharded {
+            format!(
+                "let repo = Pg{pascal_name}Repository::from_shard(&db);\n    \
+                 repo.save(&new).await?;"
+            )
+        } else {
+            "repo.save(&new).await?;".to_owned()
+        }
+    } else {
+        format!(
+            "diesel::insert_into({plural}::table)\n        \
+             .values(&new)\n        \
+             .execute(&mut *db)\n        .await?;"
+        )
+    };
+
+    let update_changeset_expr = render_update_changeset_expr(pascal_name, fields);
+    let update_stmt = if live {
+        if sharded {
+            format!(
+                "let repo = Pg{pascal_name}Repository::from_shard(&db);\n    \
+                 let update_changes = {update_changeset_expr};\n    \
+                 repo.update(*id, &update_changes).await?;\n    \
+                 let updated = 1;"
+            )
+        } else {
+            format!(
+                "let update_changes = {update_changeset_expr};\n    \
+                 repo.update(*id, &update_changes).await?;\n    \
+                 let updated = 1;"
+            )
+        }
+    } else {
+        format!(
+            "let updated = diesel::update({plural}::table.find(*id))\n        \
+             .set(({update_columns}))\n        \
+             .execute(&mut *db)\n        .await?;"
+        )
+    };
+
     // Forms remain URL-encoded for compatibility with the generated handlers.
     // File uploads are handled separately via direct-upload URLs generated in
     // a CSRF-protected endpoint (see docs/guide/storage.md#direct-uploads).
     let form_enctype = "";
 
     let db_ty = if sharded { "ShardedDb" } else { "Db" };
-    let (
-        create_signature,
-        decode_create_call,
-        update_signature,
-        decode_update_call,
-        decode_form_sig,
-    ) = if has_attachments {
-        (
+    let create_signature = if live && !sharded {
+        if has_attachments {
+            format!(
+                "flash: Flash, state: autumn_web::extract::State<autumn_web::AppState>, repo: Pg{pascal_name}Repository, body: Bytes"
+            )
+        } else {
+            format!("flash: Flash, repo: Pg{pascal_name}Repository, body: Bytes")
+        }
+    } else {
+        if has_attachments {
             format!(
                 "flash: Flash, state: autumn_web::extract::State<autumn_web::AppState>, mut db: {db_ty}, body: Bytes"
-            ),
-            "decode_form(&state, body).await?".to_owned(),
+            )
+        } else {
+            format!("flash: Flash, mut db: {db_ty}, body: Bytes")
+        }
+    };
+
+    let update_signature = if live && !sharded {
+        if has_attachments {
+            format!(
+                "flash: Flash,\n    state: autumn_web::extract::State<autumn_web::AppState>,\n    id: Path<{id_rust}>,\n    repo: Pg{pascal_name}Repository,\n    body: Bytes,"
+            )
+        } else {
+            format!(
+                "flash: Flash,\n    id: Path<{id_rust}>,\n    repo: Pg{pascal_name}Repository,\n    body: Bytes,"
+            )
+        }
+    } else {
+        if has_attachments {
             format!(
                 "flash: Flash,\n    state: autumn_web::extract::State<autumn_web::AppState>,\n    id: Path<{id_rust}>,\n    mut db: {db_ty},\n    body: Bytes,"
-            ),
+            )
+        } else {
+            format!(
+                "flash: Flash,\n    id: Path<{id_rust}>,\n    mut db: {db_ty},\n    body: Bytes,"
+            )
+        }
+    };
+
+    let destroy_signature_arg = if live && !sharded {
+        format!("repo: Pg{pascal_name}Repository")
+    } else {
+        format!("mut db: {db_ty}")
+    };
+
+    let (decode_create_call, decode_update_call, decode_form_sig) = if has_attachments {
+        (
+            "decode_form(&state, body).await?".to_owned(),
             "decode_form(&state, body).await?".to_owned(),
             format!(
                 "async fn decode_form(state: &autumn_web::AppState, body: Bytes) -> AutumnResult<New{pascal_name}>"
@@ -562,11 +688,7 @@ fn render_routes_file(
         )
     } else {
         (
-            format!("flash: Flash, mut db: {db_ty}, body: Bytes"),
             "decode_form(body)?".to_owned(),
-            format!(
-                "flash: Flash,\n    id: Path<{id_rust}>,\n    mut db: {db_ty},\n    body: Bytes,"
-            ),
             "decode_form(body)?".to_owned(),
             format!("fn decode_form(body: Bytes) -> AutumnResult<New{pascal_name}>"),
         )
@@ -574,6 +696,22 @@ fn render_routes_file(
 
     // The `index` handler: when sharded, use from_shard explicitly so the
     // generated code shows the canonical sharding pattern.
+    let (ul_tag, li_render) = if live {
+        (
+            format!(
+                r#"ul id="{plural}-list" hx-ext="sse" sse-connect="/{plural}/events" sse-swap="message""#
+            ),
+            format!(
+                r#"li id=(format!("{snake_name}-{{}}", row.id)) {{ a href=(format!("/{plural}/{{}}", row.id)) {{ "{pascal_name} #{{}}" (row.id) }} }}"#
+            ),
+        )
+    } else {
+        (
+            "ul".to_owned(),
+            format!(r#"li {{ a href=(format!("/{plural}/{{}}", row.id)) {{ (row.id) }} }}"#),
+        )
+    };
+
     let index_handler = if sharded {
         format!(
             r#"/// `GET /{plural}` — paginated list of {snake_name}s.
@@ -592,9 +730,9 @@ pub async fn index(
     Ok(layout("{pascal_name} index", flash.render().await, html! {{
         h1 {{ "{pascal_name}s" }}
         a href="/{plural}/new" {{ "New {pascal_name}" }}
-        ul {{
+        {ul_tag} {{
             @for row in &page_data.content {{
-                li {{ a href=(format!("/{plural}/{{}}", row.id)) {{ (row.id) }} }}
+                {li_render}
             }}
         }}
         (pagination_nav(&page_data, &PagerOptions::new("/{plural}")))
@@ -618,9 +756,9 @@ pub async fn index(
     Ok(layout("{pascal_name} index", flash.render().await, html! {{
         h1 {{ "{pascal_name}s" }}
         a href="/{plural}/new" {{ "New {pascal_name}" }}
-        ul {{
+        {ul_tag} {{
             @for row in &page_data.content {{
-                li {{ a href=(format!("/{plural}/{{}}", row.id)) {{ (row.id) }} }}
+                {li_render}
             }}
         }}
         (pagination_nav(&page_data, &PagerOptions::new("/{plural}")))
@@ -657,7 +795,7 @@ use autumn_web::ui::pagination::{{PagerOptions, pagination_nav}};
 use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
 
-use crate::models::{snake_name}::{{{pascal_name}, New{pascal_name}}};
+use crate::models::{snake_name}::{{{pascal_name}, New{pascal_name}, Update{pascal_name}}};
 use crate::repositories::{snake_name}::{{{pascal_name}Repository, Pg{pascal_name}Repository}};
 use crate::schema::{plural};",
         attachment_note = if has_attachments {
@@ -700,7 +838,7 @@ fn layout(title: &str, flash: Markup, content: Markup) -> Markup {{
             head {{
                 meta charset="utf-8";
                 title {{ (title) }}
-                link rel="stylesheet" href=(autumn_web::flash::FLASH_CSS_PATH);
+                link rel="stylesheet" href=(autumn_web::flash::FLASH_CSS_PATH);{layout_head_scripts}
             }}
             body {{
                 (flash)
@@ -751,10 +889,7 @@ pub async fn new_form(
 #[post("/{plural}")]
 pub async fn create({create_signature}) -> AutumnResult<Markup> {{
     let new = {decode_create_call};
-    diesel::insert_into({plural}::table)
-        .values(&new)
-        .execute(&mut *db)
-        .await?;
+    {create_stmt}
     flash.success("{pascal_name} created").await;
     Ok(redirect_to("/{plural}"))
 }}
@@ -803,10 +938,7 @@ pub async fn update(
     {update_signature}
 ) -> AutumnResult<Markup> {{
     let form = {decode_update_call};
-    let updated = diesel::update({plural}::table.find(*id))
-        .set(({update_columns}))
-        .execute(&mut *db)
-        .await?;
+    {update_stmt}
     if updated == 0 {{
         return Err(AutumnError::not_found_msg(format!(
             "{pascal_name} with id {{}} not found", *id
@@ -825,7 +957,7 @@ pub async fn update(
 #[post("/{plural}/{{id}}/delete")]
 pub async fn destroy(
     id: Path<{id_rust}>,
-    mut db: {db_ty},
+    {destroy_signature_arg},
     flash: Flash,
 ) -> AutumnResult<Markup> {{
     {destroy_stmt}
@@ -868,7 +1000,36 @@ fn redirect_to(url: &str) -> Markup {{
     }}
 }}
 "#
-    )
+    ) + &if live {
+        format!(
+            r#"
+
+/// `GET /{plural}/events` — Server-Sent Events stream for live updates.
+#[get("/{plural}/events")]
+pub async fn events(
+    state: autumn_web::extract::State<autumn_web::AppState>,
+) -> impl autumn_web::reexports::axum::response::IntoResponse {{
+    autumn_web::sse::stream(&state, "{plural}")
+}}"#
+        )
+    } else {
+        String::new()
+    }
+}
+
+fn render_update_changeset_expr(pascal_name: &str, fields: &[Field]) -> String {
+    use std::fmt::Write;
+    let mut out = format!("Update{pascal_name} {{\n");
+    for f in fields {
+        let name = &f.name;
+        writeln!(
+            out,
+            "        {name}: autumn_web::hooks::Patch::Set(form.{name}.clone()),"
+        )
+        .unwrap();
+    }
+    out.push_str("    }");
+    out
 }
 
 /// Whether any field in `fields` is a file attachment.
@@ -1298,7 +1459,7 @@ async fn main() {
         plan.execute(Flags::default()).unwrap();
 
         let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
-        assert!(routes.contains("use crate::models::post::{Post, NewPost};"));
+        assert!(routes.contains("use crate::models::post::{Post, NewPost, UpdatePost};"));
         assert!(routes.contains("#[get(\"/posts\")]"));
         assert!(routes.contains("#[get(\"/posts/{id}\")]"));
         assert!(
@@ -1923,7 +2084,7 @@ async fn main() {
 
     #[test]
     fn repository_notes_sharded() {
-        let rendered = render_repository_file("Account", "account", &[], false, false, true);
+        let rendered = render_repository_file("Account", "account", &[], false, false, true, false);
         assert!(
             rendered.contains("shard-aware"),
             "sharded repository doc must mention shard-aware: {rendered}"
@@ -1936,7 +2097,7 @@ async fn main() {
 
     #[test]
     fn repository_notes_api_sharded_caveat() {
-        let rendered = render_repository_file("Account", "account", &[], false, true, true);
+        let rendered = render_repository_file("Account", "account", &[], false, true, true, false);
         assert!(
             rendered.contains("control pool"),
             "sharded api repository doc must note control pool: {rendered}"
@@ -1945,7 +2106,7 @@ async fn main() {
 
     #[test]
     fn repository_no_sharded_note_when_not_sharded() {
-        let rendered = render_repository_file("Post", "post", &[], false, false, false);
+        let rendered = render_repository_file("Post", "post", &[], false, false, false, false);
         assert!(
             !rendered.contains("shard-aware"),
             "non-sharded repository must not mention shard-aware: {rendered}"
@@ -1972,5 +2133,42 @@ async fn main() {
         assert!(test_file.contains("/api/posts"));
         assert!(test_file.contains("DELETE"));
         assert!(!test_file.contains("contains(\"Posts\")"));
+    }
+
+    #[test]
+    fn plan_scaffold_live_views() {
+        let tmp = project_with_main(default_main());
+        fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[package]\nname=\"x\"\n\n[dependencies]\nautumn-web = \"0.5.0\"\n",
+        )
+        .unwrap();
+        let plan = plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &["title:String".into()],
+            "20260427000000",
+            &ScaffoldOptions {
+                live: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+        assert!(routes.contains("/posts/events"));
+        assert!(routes.contains("autumn_web::sse::stream"));
+        assert!(routes.contains("hx-ext=\"sse\""));
+        assert!(routes.contains("sse-connect=\"/posts/events\""));
+        assert!(routes.contains("script src=\"/static/js/htmx.min.js\""));
+        assert!(routes.contains("script src=\"/static/js/sse.js\""));
+        assert!(routes.contains("title: autumn_web::hooks::Patch::Set(form.title.clone())"));
+
+        let repo = fs::read_to_string(tmp.path().join("src/repositories/post.rs")).unwrap();
+        assert!(repo.contains("broadcasts = true"));
+
+        let cargo = fs::read_to_string(tmp.path().join("Cargo.toml")).unwrap();
+        assert!(cargo.contains("\"ws\""));
+        assert!(cargo.contains("\"maud\""));
     }
 }

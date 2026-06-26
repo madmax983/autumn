@@ -31,6 +31,12 @@ pub const HTMX_JS: &[u8] = include_bytes!("../vendor/htmx.min.js");
 /// Same-origin path where Autumn serves embedded htmx.
 pub const HTMX_JS_PATH: &str = "/static/js/htmx.min.js";
 
+/// htmx SSE extension JavaScript, embedded at compile time.
+pub const HTMX_SSE_JS: &[u8] = include_bytes!("../vendor/sse.js");
+
+/// Same-origin path where Autumn serves embedded htmx SSE extension.
+pub const HTMX_SSE_JS_PATH: &str = "/static/js/sse.js";
+
 /// Autumn widget runtime JavaScript, embedded at compile time.
 ///
 /// Provides CSP-compatible event-listener wiring for built-in widgets
@@ -522,6 +528,7 @@ mod tests {
     #[allow(clippy::const_is_empty)]
     fn htmx_js_is_not_empty() {
         assert!(!HTMX_JS.is_empty(), "htmx.min.js should not be empty");
+        assert!(!HTMX_SSE_JS.is_empty(), "sse.js should not be empty");
     }
 
     #[test]
@@ -530,6 +537,14 @@ mod tests {
         assert!(
             start.contains("htmx") || start.contains("function") || start.contains('('),
             "htmx.min.js doesn't look like JavaScript: {start}"
+        );
+        let sse_start = std::str::from_utf8(&HTMX_SSE_JS[..50]).expect("sse should be valid UTF-8");
+        assert!(
+            sse_start.contains("Server")
+                || sse_start.contains("function")
+                || sse_start.contains('/')
+                || sse_start.contains('*'),
+            "sse.js doesn't look like JavaScript: {sse_start}"
         );
     }
 
@@ -542,6 +557,7 @@ mod tests {
     fn htmx_asset_paths_are_same_origin_static_paths() {
         assert_eq!(HTMX_JS_PATH, "/static/js/htmx.min.js");
         assert_eq!(HTMX_CSRF_JS_PATH, "/static/js/autumn-htmx-csrf.js");
+        assert_eq!(HTMX_SSE_JS_PATH, "/static/js/sse.js");
     }
 
     #[test]

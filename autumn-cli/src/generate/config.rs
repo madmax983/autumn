@@ -59,6 +59,8 @@ pub struct ScaffoldConfigEntry {
     pub sharded: bool,
     #[serde(default)]
     pub shard_key: Option<String>,
+    #[serde(default)]
+    pub live: bool,
     /// Primary-key type for this resource (`"uuid"` or `"bigint"`).
     /// Inherits from `[generate] id` when absent.
     #[serde(default)]
@@ -277,6 +279,7 @@ pub fn merge_config_with_cli(
     cli_api: bool,
     cli_sharded: bool,
     cli_shard_key: Option<&str>,
+    cli_live: bool,
     cli_id: Option<&str>,
 ) -> Result<(Vec<String>, ScaffoldOptions), GenerateError> {
     let pick = |cli: &[String], toml: Vec<String>| -> Vec<String> {
@@ -292,6 +295,7 @@ pub fn merge_config_with_cli(
     let api = cli_api || config.api;
     let sharded = cli_sharded || config.sharded;
     let shard_key = cli_shard_key.map(str::to_owned).or(config.shard_key);
+    let live = cli_live || config.live;
     // Precedence: CLI > per-resource TOML > project-default TOML > BigSerial.
     let id_type = if let Some(s) = cli_id {
         IdType::parse(s)?
@@ -314,6 +318,7 @@ pub fn merge_config_with_cli(
             },
             queries,
             api,
+            live,
         },
     ))
 }
@@ -604,6 +609,7 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
             api: false,
             sharded: false,
             shard_key: None,
+            live: false,
             id: None,
         }
     }
@@ -620,6 +626,7 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
             false,
             false,
             None,
+            false,
             None,
         )
         .unwrap()
@@ -648,6 +655,7 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
             false,
             false,
             None,
+            false,
             None,
         )
         .unwrap();
@@ -667,6 +675,7 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
             false,
             false,
             None,
+            false,
             None,
         )
         .unwrap();
@@ -686,6 +695,7 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
             false,
             false,
             None,
+            false,
             None,
         )
         .unwrap();
@@ -707,6 +717,7 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
             false,
             false,
             None,
+            false,
             None,
         )
         .unwrap();
@@ -726,6 +737,7 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
             false,
             false,
             None,
+            false,
             None,
         )
         .unwrap();
@@ -746,6 +758,7 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
             false,
             false,
             None,
+            false,
             None,
         )
         .unwrap();
@@ -769,6 +782,7 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
             false,
             false,
             None,
+            false,
             None,
         )
         .unwrap();
@@ -827,6 +841,7 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
             true,
             false,
             None,
+            false,
             None,
         )
         .unwrap();
@@ -870,6 +885,7 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
             false,
             true,
             None,
+            false,
             None,
         )
         .unwrap();
@@ -905,6 +921,7 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
             false,
             false,
             Some("user_id"),
+            false,
             None,
         )
         .unwrap();
@@ -963,6 +980,7 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
             false,
             false,
             None,
+            false,
             Some("uuid"),
         )
         .unwrap();
@@ -1000,6 +1018,7 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
             false,
             false,
             None,
+            false,
             Some("bigint"),
         )
         .unwrap();
@@ -1033,6 +1052,7 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
             false,
             false,
             None,
+            false,
             Some("guid"),
         )
         .unwrap_err();

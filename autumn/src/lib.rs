@@ -338,7 +338,7 @@ pub mod __private {
         start_repository_commit_hook_pending_finalizer_heartbeat,
         start_repository_commit_hook_worker,
     };
-    #[cfg(all(feature = "db", feature = "ws"))]
+    #[cfg(feature = "db")]
     pub use crate::repository_commit_hooks::{get_global_channels, set_global_channels};
     #[cfg(feature = "db")]
     pub use crate::version_history::VersionedRepositoryDescriptor;
@@ -439,7 +439,10 @@ pub use validation::Validated;
 /// Useful for cache-busting or diagnostic logging. The corresponding
 /// minified JS is served automatically at `/static/js/htmx.min.js`.
 #[cfg(feature = "htmx")]
-pub use htmx::{AUTUMN_WIDGETS_JS_PATH, HTMX_CSRF_JS_PATH, HTMX_JS, HTMX_JS_PATH, HTMX_VERSION};
+pub use htmx::{
+    AUTUMN_WIDGETS_JS_PATH, HTMX_CSRF_JS_PATH, HTMX_JS, HTMX_JS_PATH, HTMX_SSE_JS,
+    HTMX_SSE_JS_PATH, HTMX_VERSION,
+};
 #[cfg(all(feature = "htmx", feature = "maud"))]
 pub use htmx::{HtmxFragments, OobSwap};
 #[cfg(feature = "mail")]

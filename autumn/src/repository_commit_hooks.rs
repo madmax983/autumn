@@ -1394,6 +1394,42 @@ pub fn get_global_channels() -> Option<crate::channels::Channels> {
         .or_else(|| GLOBAL_CHANNELS.read().ok().and_then(|lock| lock.clone()))
 }
 
+#[cfg(not(feature = "ws"))]
+#[derive(Clone)]
+pub struct Channels;
+
+#[cfg(not(feature = "ws"))]
+pub struct DummyBroadcast;
+
+#[cfg(not(feature = "ws"))]
+impl Channels {
+    pub fn broadcast(&self) -> DummyBroadcast {
+        DummyBroadcast
+    }
+}
+
+#[cfg(not(feature = "ws"))]
+impl DummyBroadcast {
+    pub fn publish_oob<T, S>(
+        &self,
+        _topic: &str,
+        _id: &str,
+        _swap: S,
+        _fragment: &T,
+    ) -> Result<(), std::convert::Infallible> {
+        Ok(())
+    }
+}
+
+#[cfg(not(feature = "ws"))]
+pub fn set_global_channels(_channels: Channels) {}
+
+#[cfg(not(feature = "ws"))]
+#[must_use]
+pub fn get_global_channels() -> Option<Channels> {
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

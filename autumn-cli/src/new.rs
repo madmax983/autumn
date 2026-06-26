@@ -306,6 +306,13 @@ fn scaffold_vendor_assets(project_dir: &Path) -> Result<(), NewError> {
 
     fs::write(project_dir.join("static").join(htmx_file), htmx_bytes)?;
 
+    let sse_bytes = autumn_web::HTMX_SSE_JS;
+    let sse_source = "https://unpkg.com/htmx-ext-sse@2.2.2/sse.js".to_owned();
+    let sse_file = "js/sse.js";
+    let sse_integrity = crate::assets::compute_sri(sse_bytes);
+
+    fs::write(project_dir.join("static").join(sse_file), sse_bytes)?;
+
     let mut assets = std::collections::BTreeMap::new();
     assets.insert(
         "htmx".to_owned(),
@@ -314,6 +321,15 @@ fn scaffold_vendor_assets(project_dir: &Path) -> Result<(), NewError> {
             source: htmx_source,
             file: htmx_file.to_owned(),
             integrity,
+        },
+    );
+    assets.insert(
+        "sse".to_owned(),
+        crate::assets::VendorAsset {
+            version: "2.2.2".to_owned(),
+            source: sse_source,
+            file: sse_file.to_owned(),
+            integrity: sse_integrity,
         },
     );
     let manifest = crate::assets::VendorManifest {
@@ -1392,6 +1408,19 @@ mod tests {
             integrity.starts_with("sha384-"),
             "htmx integrity must be a sha384 SRI hash: {integrity}"
         );
+
+        let sse = &manifest["assets"]["sse"];
+        assert!(!sse.is_null(), "manifest must contain an sse entry");
+        assert!(
+            sse["version"].as_str().unwrap_or("").contains('.'),
+            "sse version must look like a semver: {}",
+            sse["version"]
+        );
+        let sse_integrity = sse["integrity"].as_str().unwrap_or("");
+        assert!(
+            sse_integrity.starts_with("sha384-"),
+            "sse integrity must be a sha384 SRI hash: {sse_integrity}"
+        );
     }
 
     #[test]
@@ -1410,6 +1439,15 @@ mod tests {
         assert_eq!(
             computed, recorded,
             "SRI hash in manifest must match the vendored htmx.min.js"
+        );
+
+        let sse_bytes = fs::read(p.join("static/js/sse.js")).unwrap();
+        let computed_sse = crate::assets::compute_sri(&sse_bytes);
+        let recorded_sse = manifest["assets"]["sse"]["integrity"].as_str().unwrap();
+
+        assert_eq!(
+            computed_sse, recorded_sse,
+            "SRI hash in manifest must match the vendored sse.js"
         );
     }
 
