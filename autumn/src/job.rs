@@ -6384,6 +6384,149 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn local_enqueue_in_delays_then_runs_through_normal_path() {
+        let _guard = global_job_runtime_test_lock().lock().await;
+        clear_global_job_client();
+
+        let state = AppState::for_test().with_profile("dev");
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        start_local_runtime(
+            vec![JobInfo {
+                name: "delayed".to_string(),
+                max_attempts: 3,
+                initial_backoff_ms: 10,
+                uniqueness: None,
+                concurrency: None,
+                handler: |_state, _payload| Box::pin(async move { Ok(()) }),
+            }],
+            &state,
+            &shutdown,
+            1,
+            5,
+            250,
+        );
+
+        enqueue_in("delayed", serde_json::json!({}), Duration::from_millis(400))
+            .await
+            .unwrap();
+
+        // Before the due time elapses, the job sits in the "scheduled" list and
+        // must not have executed.
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        let admin = job_admin_backend(&state).unwrap();
+        let snap = admin.snapshot(JobAdminQuery::default()).await.unwrap();
+        assert_eq!(
+            snap.scheduled.total, 1,
+            "delayed job should be listed as scheduled before its due time"
+        );
+        assert_eq!(
+            snap.completed.total, 0,
+            "delayed job must not run before its due time"
+        );
+        assert_eq!(snap.enqueued.total, 0);
+
+        // After the due time it runs through the normal claim/execute path.
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        let snap = admin.snapshot(JobAdminQuery::default()).await.unwrap();
+        assert_eq!(
+            snap.completed.total, 1,
+            "delayed job should run once its due time passes"
+        );
+        assert_eq!(snap.scheduled.total, 0);
+
+        shutdown.cancel();
+        clear_global_job_client();
+    }
+
+    #[tokio::test]
+    async fn local_enqueue_at_in_the_past_runs_immediately() {
+        let _guard = global_job_runtime_test_lock().lock().await;
+        clear_global_job_client();
+
+        let state = AppState::for_test().with_profile("dev");
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        start_local_runtime(
+            vec![JobInfo {
+                name: "past".to_string(),
+                max_attempts: 3,
+                initial_backoff_ms: 10,
+                uniqueness: None,
+                concurrency: None,
+                handler: |_state, _payload| Box::pin(async move { Ok(()) }),
+            }],
+            &state,
+            &shutdown,
+            1,
+            5,
+            250,
+        );
+
+        let when = chrono::Utc::now() - chrono::TimeDelta::seconds(60);
+        enqueue_at("past", serde_json::json!({}), when).await.unwrap();
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let admin = job_admin_backend(&state).unwrap();
+        let snap = admin.snapshot(JobAdminQuery::default()).await.unwrap();
+        assert_eq!(
+            snap.completed.total, 1,
+            "a job scheduled for the past should run immediately"
+        );
+        assert_eq!(snap.scheduled.total, 0);
+
+        shutdown.cancel();
+        clear_global_job_client();
+    }
+
+    #[tokio::test]
+    async fn local_scheduled_job_can_be_canceled_before_due() {
+        let _guard = global_job_runtime_test_lock().lock().await;
+        clear_global_job_client();
+
+        let state = AppState::for_test().with_profile("dev");
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        start_local_runtime(
+            vec![JobInfo {
+                name: "cancelable".to_string(),
+                max_attempts: 3,
+                initial_backoff_ms: 10,
+                uniqueness: None,
+                concurrency: None,
+                handler: |_state, _payload| Box::pin(async move { Ok(()) }),
+            }],
+            &state,
+            &shutdown,
+            1,
+            5,
+            250,
+        );
+
+        enqueue_in(
+            "cancelable",
+            serde_json::json!({}),
+            Duration::from_secs(3600),
+        )
+        .await
+        .unwrap();
+
+        let admin = job_admin_backend(&state).unwrap();
+        let snap = admin.snapshot(JobAdminQuery::default()).await.unwrap();
+        assert_eq!(snap.scheduled.total, 1);
+        let id = snap.scheduled.records[0].id.clone();
+        assert!(snap.scheduled.records[0].scheduled_for.is_some());
+
+        admin.cancel(&id).await.expect("scheduled job should cancel");
+
+        let snap = admin.snapshot(JobAdminQuery::default()).await.unwrap();
+        assert_eq!(
+            snap.scheduled.total, 0,
+            "canceled scheduled job should leave the scheduled list"
+        );
+
+        shutdown.cancel();
+        clear_global_job_client();
+    }
+
+    #[tokio::test]
     async fn test_interceptor_rejection_rolls_back_enqueue_bookkeeping() {
         struct RejectingInterceptor;
         impl crate::interceptor::JobInterceptor for RejectingInterceptor {
