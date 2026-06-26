@@ -2168,7 +2168,10 @@ fn resolve_active_profiles() -> (String, String, Vec<String>) {
         "dev" => Some("development".to_owned()),
         _ => None,
     };
-    let profiles: Vec<String> = alias.into_iter().chain(std::iter::once(canonical.clone())).collect();
+    let profiles: Vec<String> = alias
+        .into_iter()
+        .chain(std::iter::once(canonical.clone()))
+        .collect();
     (canonical, raw_lower, profiles)
 }
 
