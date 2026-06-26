@@ -364,7 +364,7 @@ mod tests {
         clear_global_cache();
 
         let moka = Arc::new(MokaCache::new(100, None));
-        set_global_cache(moka.clone() as Arc<dyn Cache>);
+        set_global_cache(moka as Arc<dyn Cache>);
 
         let counter = Arc::new(AtomicUsize::new(0));
 
