@@ -485,6 +485,9 @@ pub async fn update(id: Path<i64>, mut db: Db, form: Form<NewPost>) -> AutumnRes
         slug: Some(validated.slug),
         body: Some(validated.body),
         published: Some(validated.published),
+        // Bump the version token so the cached post card re-renders on the
+        // next request (Postgres has no ON UPDATE trigger for `updated_at`).
+        updated_at: Some(chrono::Utc::now().naive_utc()),
     };
 
     let updated = diesel::update(posts::table.find(*id))
