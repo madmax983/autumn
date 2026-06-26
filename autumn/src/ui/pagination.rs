@@ -217,10 +217,11 @@ impl<'a> PagerOptions<'a> {
 /// Always includes page `1` and `total`, the `radius` pages on either side of
 /// `current`, and inserts a [`PageItem::Ellipsis`] wherever a run of pages is
 /// skipped. Returns a compact sequence like `1 … 4 5 6 … 20`.
-fn page_window(current: u32, total: u32, radius: u32) -> Vec<PageItem> {
+fn page_window(current: u32, total: u32, mut radius: u32) -> Vec<PageItem> {
     if total <= 1 {
         return vec![PageItem::Page(1)];
     }
+    radius = radius.min(1000);
     let current = current.clamp(1, total);
     let lo = current.saturating_sub(radius).max(1);
     let hi = current.saturating_add(radius).min(total);
@@ -720,5 +721,15 @@ mod tests {
         let opts = PagerOptions::new("/feed").prev_cursor("PREVTOK");
         let html = cursor_pagination_nav(&page, &opts).into_string();
         assert!(html.contains("PREVTOK"), "{html}");
+    }
+}
+
+#[cfg(test)]
+mod havoc_tests {
+    use super::*;
+
+    #[test]
+    fn havoc_pagination_radius_oom() {
+        let _ = page_window(1, u32::MAX, u32::MAX);
     }
 }
