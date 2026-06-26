@@ -602,6 +602,142 @@ pub fn levenshtein(a: &str, b: &str) -> usize {
     prev[n]
 }
 
+// ── Deprecation channel ───────────────────────────────────────────────────────
+
+/// A configuration key (or its corresponding `AUTUMN_*` env var) that is
+/// deprecated but still honored for the current minor-release line.
+///
+/// Register entries in [`DEPRECATED_CONFIG_KEYS`]. The config loader emits a
+/// structured `WARN` for each entry whose key is present in the resolved config,
+/// and `autumn doctor` surfaces them as ⚠️ checks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeprecatedKey {
+    /// Dotted config path, e.g. `"security.rate_limit.trusted_proxies"`.
+    pub path: &'static str,
+    /// The replacement key path, or `None` meaning "remove it; no replacement".
+    pub replacement: Option<&'static str>,
+    /// Version the deprecation was introduced (e.g. `"0.5.0"`).
+    pub since: &'static str,
+    /// Version the key is scheduled for removal (e.g. `"1.0.0"`).
+    pub remove_in: &'static str,
+}
+
+/// The canonical registry of deprecated config keys.
+///
+/// Add entries here when retiring a key; never silently delete a schema field
+/// without first registering it here. The schema-snapshot CI guard
+/// (`autumn/tests/schema_drift_guard.rs`) enforces this rule.
+pub static DEPRECATED_CONFIG_KEYS: &[DeprecatedKey] = &[
+    DeprecatedKey {
+        path: "security.rate_limit.trusted_proxies",
+        replacement: Some("security.trusted_proxies.ranges"),
+        since: "0.5.0",
+        remove_in: "1.0.0",
+    },
+    DeprecatedKey {
+        path: "security.rate_limit.trust_forwarded_headers",
+        replacement: Some("security.trusted_proxies.trust_forwarded_headers"),
+        since: "0.5.0",
+        remove_in: "1.0.0",
+    },
+];
+
+/// Returns the full registry of deprecated config keys.
+#[must_use]
+pub fn deprecated_config_keys() -> &'static [DeprecatedKey] {
+    DEPRECATED_CONFIG_KEYS
+}
+
+/// Converts a dotted config key path to its `AUTUMN_*` env var name.
+///
+/// # Examples
+/// ```
+/// # use autumn_web::config::deprecated_env_var_name;
+/// assert_eq!(
+///     deprecated_env_var_name("security.rate_limit.trusted_proxies"),
+///     "AUTUMN_SECURITY__RATE_LIMIT__TRUSTED_PROXIES"
+/// );
+/// ```
+#[must_use]
+pub fn deprecated_env_var_name(path: &str) -> String {
+    format!("AUTUMN_{}", path.to_uppercase().replace('.', "__"))
+}
+
+/// Where a deprecated key was detected: TOML only, env-var only, or both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeprecationSource {
+    Toml,
+    Env,
+    Both,
+}
+
+/// One detected use of a deprecated config key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeprecationFinding {
+    pub path: String,
+    pub replacement: Option<String>,
+    pub since: String,
+    pub remove_in: String,
+    pub source: DeprecationSource,
+}
+
+/// Tests whether a dotted key path is present in a TOML table (any value type).
+///
+/// Non-table mid-segments are treated as absent (no panic).
+fn toml_path_present(table: &toml::Table, path: &str) -> bool {
+    let mut segments = path.split('.');
+    let Some(first) = segments.next() else {
+        return false;
+    };
+    let remaining: Vec<&str> = segments.collect();
+
+    if remaining.is_empty() {
+        return table.contains_key(first);
+    }
+
+    let Some(toml::Value::Table(next)) = table.get(first) else {
+        return false;
+    };
+    // Rebuild the sub-path and recurse (convert remaining back to a dotted string).
+    let sub = remaining.join(".");
+    toml_path_present(next, &sub)
+}
+
+/// Scans the merged config table and env for any registered deprecated key.
+///
+/// Returns at most one [`DeprecationFinding`] per registry entry (even if the key
+/// is set in both TOML and env, the two sources are collapsed into [`DeprecationSource::Both`]).
+/// Registry order is preserved for deterministic output.
+#[must_use]
+pub fn detect_deprecated_keys(
+    merged: &toml::Table,
+    env: &dyn Env,
+    registry: &[DeprecatedKey],
+) -> Vec<DeprecationFinding> {
+    let mut findings = Vec::new();
+    for entry in registry {
+        let in_toml = toml_path_present(merged, entry.path);
+        let env_name = deprecated_env_var_name(entry.path);
+        let in_env = env.var(&env_name).is_ok();
+
+        let source = match (in_toml, in_env) {
+            (false, false) => continue,
+            (true, false) => DeprecationSource::Toml,
+            (false, true) => DeprecationSource::Env,
+            (true, true) => DeprecationSource::Both,
+        };
+
+        findings.push(DeprecationFinding {
+            path: entry.path.to_owned(),
+            replacement: entry.replacement.map(str::to_owned),
+            since: entry.since.to_owned(),
+            remove_in: entry.remove_in.to_owned(),
+            source,
+        });
+    }
+    findings
+}
+
 /// Errors that can occur when loading or validating configuration.
 ///
 /// Returned by [`AutumnConfig::load`], [`AutumnConfig::load_from`], and
@@ -1626,6 +1762,34 @@ impl AutumnConfig {
         deserializer.into_schema()
     }
 
+    /// Returns a sorted set of all schema leaf key paths (e.g. `"server.port"`).
+    ///
+    /// Used by the schema-snapshot CI guard (`autumn/tests/schema_drift_guard.rs`)
+    /// to detect when a config key disappears without a registered deprecation entry.
+    /// Regenerate the snapshot with:
+    /// ```text
+    /// UPDATE_SCHEMA_SNAPSHOT=1 cargo test -p autumn-web schema_keys_snapshot_guard
+    /// ```
+    ///
+    /// **Note:** Always run the guard under a consistent feature set (e.g. `--all-features`)
+    /// in CI, since feature-gated fields only appear when their feature is enabled.
+    #[must_use]
+    pub fn schema_leaf_paths() -> std::collections::BTreeSet<String> {
+        let schema = Self::get_schema_keys();
+        let mut leaves = std::collections::BTreeSet::new();
+        for (parent, fields) in &schema {
+            for field in fields {
+                let leaf = if parent.is_empty() {
+                    field.clone()
+                } else {
+                    format!("{parent}.{field}")
+                };
+                leaves.insert(leaf);
+            }
+        }
+        leaves
+    }
+
     /// Recursively validates TOML content against the derived schema.
     /// Returns a list of errors: (`dotted_path`, `option_suggestion`)
     #[must_use]
@@ -1878,6 +2042,23 @@ impl AutumnConfig {
                     err_messages.join(", ")
                 )));
             }
+        }
+
+        // ── Deprecation channel (purely additive; never mutates `config`). ──────
+        // Emit exactly one structured WARN per deprecated key that is present in
+        // the resolved config (via TOML or env var). The old value is already
+        // honoured above; this is observation only.
+        let empty_table = toml::Table::new();
+        let merged_table = merged.as_table().unwrap_or(&empty_table);
+        for f in detect_deprecated_keys(merged_table, env, DEPRECATED_CONFIG_KEYS) {
+            tracing::warn!(
+                deprecated_key = f.path.as_str(),
+                replacement = f.replacement.as_deref().unwrap_or("none; remove this key"),
+                since = f.since.as_str(),
+                remove_in = f.remove_in.as_str(),
+                source = ?f.source,
+                "deprecated configuration key in use; it is still honored but scheduled for removal"
+            );
         }
 
         #[cfg(feature = "mail")]
@@ -8276,6 +8457,130 @@ redirect_uri = "http://localhost:3000/auth/github/callback"
                 .defaults
                 .failure_ratio_threshold,
             Some(0.7)
+        );
+    }
+
+    // ── Deprecation channel unit tests ────────────────────────────────────────
+
+    /// A tiny test-only registry so tests are independent of the real entries.
+    const TEST_REGISTRY: &[DeprecatedKey] = &[DeprecatedKey {
+        path: "a.b.c",
+        replacement: Some("a.b.d"),
+        since: "0.1.0",
+        remove_in: "1.0.0",
+    }];
+
+    fn merged_with_abc(value: toml::Value) -> toml::Table {
+        let mut root = toml::Table::new();
+        let mut b = toml::Table::new();
+        b.insert("c".to_owned(), value);
+        let mut a = toml::Table::new();
+        a.insert("b".to_owned(), toml::Value::Table(b));
+        root.insert("a".to_owned(), toml::Value::Table(a));
+        root
+    }
+
+    #[test]
+    fn red_detect_from_toml_present_emits_finding() {
+        let merged = merged_with_abc(toml::Value::Integer(1));
+        let env = MockEnv::new(); // AUTUMN_A__B__C not set
+        let findings = detect_deprecated_keys(&merged, &env, TEST_REGISTRY);
+        assert_eq!(findings.len(), 1);
+        let f = &findings[0];
+        assert_eq!(f.path, "a.b.c");
+        assert_eq!(f.replacement.as_deref(), Some("a.b.d"));
+        assert_eq!(f.since, "0.1.0");
+        assert_eq!(f.remove_in, "1.0.0");
+        assert_eq!(f.source, DeprecationSource::Toml);
+    }
+
+    #[test]
+    fn red_detect_from_env_present_emits_finding() {
+        let merged = toml::Table::new(); // no TOML key
+        let env = MockEnv::new().with("AUTUMN_A__B__C", "val");
+        let findings = detect_deprecated_keys(&merged, &env, TEST_REGISTRY);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].source, DeprecationSource::Env);
+    }
+
+    #[test]
+    fn red_detect_dedupe_toml_and_env_single_finding() {
+        let merged = merged_with_abc(toml::Value::Boolean(true));
+        let env = MockEnv::new().with("AUTUMN_A__B__C", "true");
+        let findings = detect_deprecated_keys(&merged, &env, TEST_REGISTRY);
+        assert_eq!(findings.len(), 1, "TOML+env should collapse to one finding");
+        assert_eq!(findings[0].source, DeprecationSource::Both);
+    }
+
+    #[test]
+    fn red_detect_replacement_only_no_finding() {
+        // Only the new replacement key is set; deprecated key is absent.
+        let mut merged = toml::Table::new();
+        let mut b = toml::Table::new();
+        b.insert("d".to_owned(), toml::Value::Integer(1)); // new key, not deprecated
+        let mut a = toml::Table::new();
+        a.insert("b".to_owned(), toml::Value::Table(b));
+        merged.insert("a".to_owned(), toml::Value::Table(a));
+
+        let env = MockEnv::new();
+        let findings = detect_deprecated_keys(&merged, &env, TEST_REGISTRY);
+        assert!(
+            findings.is_empty(),
+            "only replacement key set — no deprecation warning"
+        );
+    }
+
+    #[test]
+    fn red_detect_absent_everywhere_no_finding() {
+        let merged = toml::Table::new();
+        let env = MockEnv::new();
+        let findings = detect_deprecated_keys(&merged, &env, TEST_REGISTRY);
+        assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn red_env_var_name_mapping() {
+        assert_eq!(
+            deprecated_env_var_name("security.rate_limit.trusted_proxies"),
+            "AUTUMN_SECURITY__RATE_LIMIT__TRUSTED_PROXIES"
+        );
+        assert_eq!(deprecated_env_var_name("a.b.c"), "AUTUMN_A__B__C");
+    }
+
+    #[test]
+    fn red_toml_path_non_table_mid_segment_not_present() {
+        // If a mid-segment is not a Table, must return false without panicking.
+        let mut root = toml::Table::new();
+        root.insert("a".to_owned(), toml::Value::Integer(42)); // "a" is a leaf, not a table
+        assert!(!toml_path_present(&root, "a.b.c"));
+    }
+
+    #[test]
+    fn red_schema_leaf_paths_includes_known_paths() {
+        // The SchemaDeserializer only recurses into structs defined in config.rs itself;
+        // external module types (SecurityConfig, AuthConfig, etc.) appear as root leaves only.
+        let leaves = AutumnConfig::schema_leaf_paths();
+        assert!(
+            leaves.contains("server.port"),
+            "server.port must be a schema leaf"
+        );
+        assert!(
+            leaves.contains("server.host"),
+            "server.host must be a schema leaf"
+        );
+        assert!(
+            leaves.contains("database.url"),
+            "database.url must be a schema leaf"
+        );
+        // Root-level sections appear as single-segment leaves (the schema records them as
+        // fields of the root struct, but doesn't descend into their external-module types).
+        assert!(
+            leaves.contains("security"),
+            "security must appear as a root-level leaf"
+        );
+        assert!(
+            leaves.contains("session"),
+            "session must appear as a root-level leaf"
         );
     }
 }

@@ -250,6 +250,29 @@ We prefer a long deprecation ramp over abrupt removal:
 
 Deprecations never change behavior — only signal intent.
 
+### Config-key deprecations
+
+Config key deprecations (TOML schema and `AUTUMN_*` env vars) are tracked in
+`DEPRECATED_CONFIG_KEYS` in `autumn/src/config.rs`. Each entry records the
+dotted key path, the replacement key path, `since` (the minor version that
+introduced the deprecation), and `remove_in` (the first major version that
+removes it).
+
+At startup `AutumnConfig::load_with_env` emits one structured `WARN` per
+deprecated key that is found in the resolved config (TOML file or environment
+variable). The old value is still honored during the deprecation window — only
+the signal changes. Use `autumn doctor` to check for deprecated config keys
+without starting the full application; the `deprecated_keys` check appears in
+plain-text and `--json` output.
+
+A CI guard (`autumn/tests/schema_drift_guard.rs`) enforces that any key
+removed from the compiled schema has a corresponding entry in the registry.
+Regenerate its snapshot after schema changes:
+
+```
+UPDATE_SCHEMA_SNAPSHOT=1 cargo test -p autumn-web schema_keys_snapshot_guard
+```
+
 ## Migration guides
 
 Every major release ships with a migration guide under
