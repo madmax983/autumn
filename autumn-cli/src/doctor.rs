@@ -2141,11 +2141,12 @@ fn parse_config_bool(value: &str) -> Option<bool> {
 
 /// Resolves the active profile names the runtime would load.
 ///
-/// Normalizes aliases (`production`→`prod`, `development`→`dev`, empty→`dev`)
-/// to match `AutumnConfig::load_with_env`, and returns the canonical profile
-/// plus any alias spelling so callers merge both sets of profile sources
-/// (e.g. `[profile.production]` and `[profile.prod]`).
-fn resolve_active_profiles() -> (String, Vec<String>) {
+/// Returns `(canonical, selected_input, profiles)`:
+/// - `canonical` — normalized name (`"prod"` / `"dev"` / custom)
+/// - `selected_input` — the raw env-var value (used by `override_file_lookup_names`
+///   to pick the right `autumn-{name}.toml` spelling when both exist)
+/// - `profiles` — `[alias, canonical]` list for inline `[profile.{name}]` merging
+fn resolve_active_profiles() -> (String, String, Vec<String>) {
     let raw_profile = std::env::var("AUTUMN_ENV")
         .ok()
         .filter(|v| !v.trim().is_empty())
@@ -2168,13 +2169,13 @@ fn resolve_active_profiles() -> (String, Vec<String>) {
         _ => None,
     };
     let profiles: Vec<String> = alias.into_iter().chain(std::iter::once(canonical.clone())).collect();
-    (canonical, profiles)
+    (canonical, raw_lower, profiles)
 }
 
 fn resolve_proxy_conflict_data() -> ProxyConflictData {
     // Use the profile-merged table so that [profile.prod] / autumn-prod.toml
     // overrides are included — matching the pattern used by resolve_trusted_hosts.
-    let (_canonical, profiles) = resolve_active_profiles();
+    let (_canonical, _selected, profiles) = resolve_active_profiles();
     let profile_refs: Vec<&str> = profiles.iter().map(String::as_str).collect();
     let table = get_merged_toml_table_profiles(&profile_refs);
 
@@ -2246,9 +2247,10 @@ fn resolve_proxy_conflict_data() -> ProxyConflictData {
 fn resolve_deprecations() -> Vec<DoctorDeprecation> {
     use autumn_web::config::{OsEnv, deprecated_config_keys, detect_deprecated_keys_for};
 
-    let (canonical, profiles) = resolve_active_profiles();
-    let profile_refs: Vec<&str> = profiles.iter().map(String::as_str).collect();
-    let file_table = get_merged_toml_table_profiles(&profile_refs);
+    let (canonical, selected, _profiles) = resolve_active_profiles();
+    // Use the same single-file lookup path the runtime uses: only the first
+    // existing autumn-{profile}.toml is loaded, never both alias spellings.
+    let file_table = get_merged_toml_table_runtime(&canonical, &selected);
 
     detect_deprecated_keys_for(&canonical, &file_table, &OsEnv, deprecated_config_keys())
         .into_iter()
