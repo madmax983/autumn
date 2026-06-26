@@ -3311,10 +3311,7 @@ fn generate_model_uuid_id() {
 fn generate_model_default_id_is_bigserial() {
     let (_tmp, project) = fresh_project("default-id-app");
 
-    run_autumn(
-        &project,
-        &["generate", "model", "Post", "title:String"],
-    );
+    run_autumn(&project, &["generate", "model", "Post", "title:String"]);
 
     let model = fs::read_to_string(project.join("src/models/post.rs")).unwrap();
     assert!(
@@ -3409,10 +3406,8 @@ fn generate_scaffold_uuid_id() {
 fn generate_model_bad_id_type_errors() {
     let (_tmp, project) = fresh_project("bad-id-app");
 
-    let (_, stderr, code) = run_autumn_failing(
-        &project,
-        &["generate", "model", "Post", "--id", "guid"],
-    );
+    let (_, stderr, code) =
+        run_autumn_failing(&project, &["generate", "model", "Post", "--id", "guid"]);
     assert_eq!(code, Some(1), "--id guid must fail with exit 1");
     assert!(
         stderr.contains("guid") && stderr.contains("uuid") && stderr.contains("bigint"),
@@ -3488,10 +3483,7 @@ fn generate_model_project_default_uuid_auto_discovered() {
     .unwrap();
 
     // generate model (no --id flag, no --config)
-    run_autumn(
-        &project,
-        &["generate", "model", "Post", "title:String"],
-    );
+    run_autumn(&project, &["generate", "model", "Post", "title:String"]);
 
     let model = fs::read_to_string(project.join("src/models/post.rs")).unwrap();
     assert!(
@@ -3523,10 +3515,7 @@ fn generate_scaffold_project_default_uuid_auto_discovered() {
     .unwrap();
 
     // generate scaffold (no --id flag, no --config)
-    run_autumn(
-        &project,
-        &["generate", "scaffold", "Post", "title:String"],
-    );
+    run_autumn(&project, &["generate", "scaffold", "Post", "title:String"]);
 
     let model = fs::read_to_string(project.join("src/models/post.rs")).unwrap();
     assert!(
@@ -3542,8 +3531,8 @@ fn generate_scaffold_project_default_uuid_auto_discovered() {
 
 /// Slow end-to-end check: scaffold a UUID-id project, patch Cargo.toml to the
 /// local autumn-web, and `cargo check --tests` the result. Verifies that
-/// Path<uuid::Uuid>, uuid::Uuid dep, and the #[repository] macro all compose
-/// correctly when the primary key is non-sequential.
+/// `Path<uuid::Uuid>`, the `uuid::Uuid` dep, and the `#[repository]` macro all
+/// compose correctly when the primary key is non-sequential.
 ///
 /// Run with: `cargo test -p autumn-cli -- --ignored generated_scaffold_uuid_id_cargo_checks`
 #[test]
@@ -3555,7 +3544,15 @@ fn generated_scaffold_uuid_id_cargo_checks() {
 
     run_autumn(
         &project,
-        &["generate", "scaffold", "Post", "title:String", "--api", "--id", "uuid"],
+        &[
+            "generate",
+            "scaffold",
+            "Post",
+            "title:String",
+            "--api",
+            "--id",
+            "uuid",
+        ],
     );
 
     let check = Command::new("cargo")

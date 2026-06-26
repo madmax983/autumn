@@ -2467,40 +2467,28 @@ fn run_generate_command(cmd: GenerateCommands) {
             dry_run,
             force,
         } => {
-            // Resolve the scaffold config entry, applying [generate] project
-            // defaults. Precedence for id_type:
+            // Resolve the config file: an explicit --config path, otherwise an
+            // auto-discovered autumn.generate.toml in the project root (if any).
+            // Precedence for id_type:
             //   CLI --id > [scaffold.X] id > [generate] id > BigSerial.
-            let config_entry = if let Some(path) = config.as_ref() {
-                // Explicit --config: read per-resource entry (or default) from
-                // the given file; [generate] id is propagated automatically.
-                match generate::config::read_scaffold_config_or_defaults(path, &name) {
-                    Ok(e) => e,
-                    Err(e) => {
-                        eprintln!("Error: {e}");
-                        std::process::exit(1);
-                    }
-                }
-            } else {
-                // No --config: auto-discover autumn.generate.toml in the
-                // project root for the [generate] project default.
-                let auto_cfg = std::env::current_dir()
+            let config_path = config.or_else(|| {
+                let auto = std::env::current_dir()
                     .unwrap_or_default()
                     .join(generate::config::GENERATE_CONFIG_FILENAME);
-                if auto_cfg.exists() {
-                    match generate::config::read_scaffold_config_or_defaults(&auto_cfg, &name) {
+                auto.exists().then_some(auto)
+            });
+            // Read the per-resource entry (or a default that still carries the
+            // [generate] id project default); no config file → plain default.
+            let config_entry =
+                config_path.map_or_else(generate::config::ScaffoldConfigEntry::default, |path| {
+                    match generate::config::read_scaffold_config_or_defaults(&path, &name) {
                         Ok(e) => e,
                         Err(e) => {
-                            eprintln!(
-                                "Error reading {}: {e}",
-                                generate::config::GENERATE_CONFIG_FILENAME
-                            );
+                            eprintln!("Error: {e}");
                             std::process::exit(1);
                         }
                     }
-                } else {
-                    generate::config::ScaffoldConfigEntry::default()
-                }
-            };
+                });
             let (fields, options) = match generate::config::merge_config_with_cli(
                 config_entry,
                 &fields,

@@ -202,7 +202,7 @@ impl IdType {
     }
 
     /// An optional migration comment documenting trade-offs. Only `Uuid`
-    /// returns `Some`, pointing developers toward the UUIDv7 upgrade path.
+    /// returns `Some`, pointing developers toward the `UUIDv7` upgrade path.
     #[must_use]
     pub const fn migration_comment(self) -> Option<&'static str> {
         match self {
@@ -224,10 +224,10 @@ impl IdType {
     /// # Errors
     /// Returns [`GenerateError::Config`] for unknown values, with a message
     /// listing the accepted tokens (AC7).
-    pub fn parse(s: &str) -> Result<IdType, GenerateError> {
+    pub fn parse(s: &str) -> Result<Self, GenerateError> {
         match s.to_ascii_lowercase().as_str() {
-            "uuid" => Ok(IdType::Uuid),
-            "bigint" | "bigserial" | "i64" => Ok(IdType::BigSerial),
+            "uuid" => Ok(Self::Uuid),
+            "bigint" | "bigserial" | "i64" => Ok(Self::BigSerial),
             other => Err(GenerateError::Config(format!(
                 "unknown --id value '{other}'; accepted values are: uuid, bigint"
             ))),
@@ -785,14 +785,23 @@ mod tests {
         assert_eq!(id.rust_type(), "uuid::Uuid");
         assert_eq!(id.schema_type(), "Uuid");
         assert_eq!(id.pk_sql(), "UUID PRIMARY KEY DEFAULT gen_random_uuid()");
-        let comment = id.migration_comment().expect("uuid should have a trade-off comment");
-        assert!(comment.contains("UUIDv7"), "comment should mention UUIDv7: {comment}");
+        let comment = id
+            .migration_comment()
+            .expect("uuid should have a trade-off comment");
+        assert!(
+            comment.contains("UUIDv7"),
+            "comment should mention UUIDv7: {comment}"
+        );
     }
 
     #[test]
     fn id_type_parse_accepts_uuid_case_insensitive() {
         for token in ["uuid", "Uuid", "UUID"] {
-            assert_eq!(IdType::parse(token).unwrap(), IdType::Uuid, "'{token}' should parse to Uuid");
+            assert_eq!(
+                IdType::parse(token).unwrap(),
+                IdType::Uuid,
+                "'{token}' should parse to Uuid"
+            );
         }
     }
 
@@ -812,7 +821,10 @@ mod tests {
         for bad in ["guid", "serial4", "int", "ulid"] {
             let err = IdType::parse(bad).unwrap_err();
             let msg = err.to_string();
-            assert!(msg.contains(bad), "error must echo the bad value '{bad}': {msg}");
+            assert!(
+                msg.contains(bad),
+                "error must echo the bad value '{bad}': {msg}"
+            );
             assert!(msg.contains("uuid"), "error must list 'uuid': {msg}");
             assert!(msg.contains("bigint"), "error must list 'bigint': {msg}");
         }

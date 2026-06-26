@@ -665,7 +665,15 @@ fn sql_default_literal(field: &Field, value: &str) -> Result<String, String> {
 #[cfg(test)]
 #[must_use]
 pub(super) fn render_model_file_for_test(name: &str, table: &str, fields: &[Field]) -> String {
-    render_model_file(name, table, fields, &ModelMetadata::default(), false, None, IdType::BigSerial)
+    render_model_file(
+        name,
+        table,
+        fields,
+        &ModelMetadata::default(),
+        false,
+        None,
+        IdType::BigSerial,
+    )
 }
 
 fn render_model_file(
@@ -1419,15 +1427,26 @@ autumn-web = \"0.3\"\n";
         plan.execute(Flags::default()).unwrap();
 
         let model = fs::read_to_string(tmp.path().join("src/models/post.rs")).unwrap();
-        assert!(model.contains("pub id: i64,"), "default must emit i64: {model}");
+        assert!(
+            model.contains("pub id: i64,"),
+            "default must emit i64: {model}"
+        );
 
         let up = fs::read_to_string(
-            tmp.path().join("migrations/20260427000000_create_posts/up.sql"),
-        ).unwrap();
-        assert!(up.contains("id BIGSERIAL PRIMARY KEY"), "default must emit BIGSERIAL: {up}");
+            tmp.path()
+                .join("migrations/20260427000000_create_posts/up.sql"),
+        )
+        .unwrap();
+        assert!(
+            up.contains("id BIGSERIAL PRIMARY KEY"),
+            "default must emit BIGSERIAL: {up}"
+        );
 
         let schema = fs::read_to_string(tmp.path().join("src/schema.rs")).unwrap();
-        assert!(schema.contains("id -> Int8,"), "default schema must emit Int8: {schema}");
+        assert!(
+            schema.contains("id -> Int8,"),
+            "default schema must emit Int8: {schema}"
+        );
     }
 
     #[test]
@@ -1439,24 +1458,47 @@ autumn-web = \"0.3\"\n";
             "Post",
             &["title:String".into()],
             "20260427000000",
-            &ModelOptions { id_type: IdType::Uuid, ..Default::default() },
+            &ModelOptions {
+                id_type: IdType::Uuid,
+                ..Default::default()
+            },
         )
         .unwrap();
         plan.execute(Flags::default()).unwrap();
 
         let model = fs::read_to_string(tmp.path().join("src/models/post.rs")).unwrap();
-        assert!(model.contains("pub id: uuid::Uuid,"), "uuid must emit uuid::Uuid: {model}");
-        assert!(!model.contains("pub id: i64"), "uuid model must not contain i64: {model}");
+        assert!(
+            model.contains("pub id: uuid::Uuid,"),
+            "uuid must emit uuid::Uuid: {model}"
+        );
+        assert!(
+            !model.contains("pub id: i64"),
+            "uuid model must not contain i64: {model}"
+        );
 
         let up = fs::read_to_string(
-            tmp.path().join("migrations/20260427000000_create_posts/up.sql"),
-        ).unwrap();
-        assert!(up.contains("id UUID PRIMARY KEY DEFAULT gen_random_uuid()"), "uuid migration: {up}");
-        assert!(!up.contains("BIGSERIAL"), "uuid migration must not contain BIGSERIAL: {up}");
+            tmp.path()
+                .join("migrations/20260427000000_create_posts/up.sql"),
+        )
+        .unwrap();
+        assert!(
+            up.contains("id UUID PRIMARY KEY DEFAULT gen_random_uuid()"),
+            "uuid migration: {up}"
+        );
+        assert!(
+            !up.contains("BIGSERIAL"),
+            "uuid migration must not contain BIGSERIAL: {up}"
+        );
 
         let schema = fs::read_to_string(tmp.path().join("src/schema.rs")).unwrap();
-        assert!(schema.contains("id -> Uuid,"), "uuid schema must emit Uuid type: {schema}");
-        assert!(!schema.contains("id -> Int8"), "uuid schema must not contain Int8: {schema}");
+        assert!(
+            schema.contains("id -> Uuid,"),
+            "uuid schema must emit Uuid type: {schema}"
+        );
+        assert!(
+            !schema.contains("id -> Int8"),
+            "uuid schema must not contain Int8: {schema}"
+        );
     }
 
     #[test]
@@ -1467,24 +1509,38 @@ autumn-web = \"0.3\"\n";
             "Post",
             &[],
             "20260427000000",
-            &ModelOptions { id_type: IdType::Uuid, ..Default::default() },
+            &ModelOptions {
+                id_type: IdType::Uuid,
+                ..Default::default()
+            },
         )
         .unwrap();
         plan.execute(Flags::default()).unwrap();
 
         let up = fs::read_to_string(
-            tmp.path().join("migrations/20260427000000_create_posts/up.sql"),
-        ).unwrap();
-        assert!(up.contains("UUIDv7"), "uuid migration must document UUIDv7 upgrade path: {up}");
+            tmp.path()
+                .join("migrations/20260427000000_create_posts/up.sql"),
+        )
+        .unwrap();
+        assert!(
+            up.contains("UUIDv7"),
+            "uuid migration must document UUIDv7 upgrade path: {up}"
+        );
     }
 
     #[test]
     fn uuid_dep_always_present_in_model_deps() {
         // AC5: the uuid crate is always in MODEL_DEPS regardless of --id.
         let uuid_dep = MODEL_DEPS.iter().find(|(k, _)| *k == "uuid");
-        assert!(uuid_dep.is_some(), "MODEL_DEPS must always include the uuid crate (AC5)");
+        assert!(
+            uuid_dep.is_some(),
+            "MODEL_DEPS must always include the uuid crate (AC5)"
+        );
         let (_, spec) = uuid_dep.unwrap();
-        assert!(spec.contains("serde"), "uuid dep must include serde feature");
+        assert!(
+            spec.contains("serde"),
+            "uuid dep must include serde feature"
+        );
     }
 
     #[test]
@@ -1501,11 +1557,19 @@ autumn-web = \"0.3\"\n";
         plan.execute(Flags::default()).unwrap();
 
         let model = fs::read_to_string(tmp.path().join("src/models/comment.rs")).unwrap();
-        assert!(model.contains("pub author_id: uuid::Uuid,"), "FK Uuid field: {model}");
+        assert!(
+            model.contains("pub author_id: uuid::Uuid,"),
+            "FK Uuid field: {model}"
+        );
 
         let up = fs::read_to_string(
-            tmp.path().join("migrations/20260427000000_create_comments/up.sql"),
-        ).unwrap();
-        assert!(up.contains("author_id UUID NOT NULL"), "FK Uuid migration: {up}");
+            tmp.path()
+                .join("migrations/20260427000000_create_comments/up.sql"),
+        )
+        .unwrap();
+        assert!(
+            up.contains("author_id UUID NOT NULL"),
+            "FK Uuid migration: {up}"
+        );
     }
 }

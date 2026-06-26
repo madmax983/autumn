@@ -81,6 +81,20 @@ struct GeneratorConfig {
     generate: GenerateDefaults,
 }
 
+/// Read and parse the whole generator config file at `config_path`.
+///
+/// # Errors
+///
+/// - [`GenerateError::Io`] if the file cannot be read.
+/// - [`GenerateError::Config`] if the file is not valid TOML.
+fn parse_config(config_path: &Path) -> Result<GeneratorConfig, GenerateError> {
+    let content = std::fs::read_to_string(config_path)
+        .map_err(|e| std::io::Error::new(e.kind(), format!("{}: {e}", config_path.display())))?;
+    toml::from_str(&content).map_err(|e| {
+        GenerateError::Config(format!("invalid TOML in {}: {e}", config_path.display()))
+    })
+}
+
 /// Read the scaffold config entry for `resource_name` from `config_path`.
 ///
 /// Returns `None` when the file is valid TOML but has no
@@ -98,20 +112,16 @@ pub fn read_scaffold_config(
     config_path: &Path,
     resource_name: &str,
 ) -> Result<Option<ScaffoldConfigEntry>, GenerateError> {
-    let content = std::fs::read_to_string(config_path)
-        .map_err(|e| std::io::Error::new(e.kind(), format!("{}: {e}", config_path.display())))?;
-    let mut config: GeneratorConfig = toml::from_str(&content).map_err(|e| {
-        GenerateError::Config(format!("invalid TOML in {}: {e}", config_path.display()))
-    })?;
+    let mut config = parse_config(config_path)?;
     // Normalize to PascalCase so `bookmark` and `Bookmark` both match
     // `[scaffold.Bookmark]`, consistent with how the generator itself handles
     // resource names passed on the CLI.
-    let mut entry = config.scaffold.remove(pascal(resource_name).as_str());
+    let mut entry = config.scaffold.remove(&pascal(resource_name));
     // Propagate [generate] id default when the per-resource section doesn't override it.
-    if let Some(ref mut e) = entry {
-        if e.id.is_none() {
-            e.id = config.generate.id.clone();
-        }
+    if let Some(e) = entry.as_mut()
+        && e.id.is_none()
+    {
+        e.id = config.generate.id;
     }
     Ok(entry)
 }
@@ -136,19 +146,26 @@ pub fn read_scaffold_config_or_defaults(
     config_path: &Path,
     resource_name: &str,
 ) -> Result<ScaffoldConfigEntry, GenerateError> {
-    let content = std::fs::read_to_string(config_path)
-        .map_err(|e| std::io::Error::new(e.kind(), format!("{}: {e}", config_path.display())))?;
-    let mut config: GeneratorConfig = toml::from_str(&content).map_err(|e| {
-        GenerateError::Config(format!("invalid TOML in {}: {e}", config_path.display()))
-    })?;
-    let mut entry = config
-        .scaffold
-        .remove(pascal(resource_name).as_str())
-        .unwrap_or_default();
-    if entry.id.is_none() {
-        entry.id = config.generate.id;
+    // Delegate to read_scaffold_config for the per-resource section. When it is
+    // absent, fall back to a default entry that still carries the project-level
+    // [generate] id default.
+    if let Some(entry) = read_scaffold_config(config_path, resource_name)? {
+        return Ok(entry);
     }
-    Ok(entry)
+    Ok(ScaffoldConfigEntry {
+        id: read_generate_id(config_path)?,
+        ..ScaffoldConfigEntry::default()
+    })
+}
+
+/// Read the raw project-level `[generate] id` string from `config_path`, if set.
+///
+/// # Errors
+///
+/// - [`GenerateError::Io`] if the file cannot be read.
+/// - [`GenerateError::Config`] if the file is not valid TOML.
+fn read_generate_id(config_path: &Path) -> Result<Option<String>, GenerateError> {
+    Ok(parse_config(config_path)?.generate.id)
 }
 
 /// Read the project-level `[generate]` defaults from `config_path`, returning
@@ -159,16 +176,7 @@ pub fn read_scaffold_config_or_defaults(
 /// - [`GenerateError::Io`] if the file cannot be read.
 /// - [`GenerateError::Config`] if the file is not valid TOML or `id` is invalid.
 pub fn read_generate_defaults(config_path: &Path) -> Result<IdType, GenerateError> {
-    let content = std::fs::read_to_string(config_path)
-        .map_err(|e| std::io::Error::new(e.kind(), format!("{}: {e}", config_path.display())))?;
-    let config: GeneratorConfig = toml::from_str(&content).map_err(|e| {
-        GenerateError::Config(format!("invalid TOML in {}: {e}", config_path.display()))
-    })?;
-    if let Some(id_str) = config.generate.id {
-        IdType::parse(&id_str)
-    } else {
-        Ok(IdType::default())
-    }
+    read_generate_id(config_path)?.map_or_else(|| Ok(IdType::default()), |s| IdType::parse(&s))
 }
 
 /// Merge a TOML config entry with CLI-supplied values.
@@ -177,7 +185,7 @@ pub fn read_generate_defaults(config_path: &Path) -> Result<IdType, GenerateErro
 /// replaces the TOML list; otherwise the TOML list is kept.
 ///
 /// The `cli_id` parameter follows the precedence rule:
-///   `--id` CLI > `[scaffold.X] id` TOML > `[generate] id` TOML > BigSerial.
+///   `--id` CLI > `[scaffold.X] id` TOML > `[generate] id` TOML > `BigSerial`.
 ///
 /// # Errors
 /// Returns [`GenerateError::Config`] if any `--id` value is unrecognised.
@@ -380,7 +388,20 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
     }
 
     fn merge(entry: ScaffoldConfigEntry) -> (Vec<String>, ScaffoldOptions) {
-        merge_config_with_cli(entry, &[], &[], &[], &[], &[], false, false, false, None, None).unwrap()
+        merge_config_with_cli(
+            entry,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            false,
+            false,
+            false,
+            None,
+            None,
+        )
+        .unwrap()
     }
 
     #[test]
@@ -407,7 +428,8 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
             false,
             None,
             None,
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(fields, vec!["title:String", "body:Text"]);
     }
 
@@ -425,7 +447,8 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
             false,
             None,
             None,
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(opts.model.indexes, vec!["tag"]);
     }
 
@@ -443,7 +466,8 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
             false,
             None,
             None,
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(opts.model.validations, vec!["url=email"]);
     }
 
@@ -463,7 +487,8 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
             false,
             None,
             None,
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(opts.model.defaults, vec!["tag=general"]);
     }
 
@@ -481,15 +506,28 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
             false,
             None,
             None,
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(opts.queries, vec!["find_by_tag:tag"]);
     }
 
     #[test]
     fn merge_empty_cli_keeps_empty_toml() {
         let entry = ScaffoldConfigEntry::default();
-        let (fields, opts) =
-            merge_config_with_cli(entry, &[], &[], &[], &[], &[], false, false, false, None, None).unwrap();
+        let (fields, opts) = merge_config_with_cli(
+            entry,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            false,
+            false,
+            false,
+            None,
+            None,
+        )
+        .unwrap();
         assert!(fields.is_empty());
         assert!(opts.model.indexes.is_empty());
         assert!(opts.model.validations.is_empty());
@@ -511,7 +549,8 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
             false,
             None,
             None,
-        ).unwrap();
+        )
+        .unwrap();
         assert!(
             opts.model.soft_delete,
             "cli_soft_delete=true must set soft_delete on the merged options"
@@ -568,7 +607,8 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
             false,
             None,
             None,
-        ).unwrap();
+        )
+        .unwrap();
         assert!(opts.api);
     }
 
@@ -610,7 +650,8 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
             true,
             None,
             None,
-        ).unwrap();
+        )
+        .unwrap();
         assert!(
             opts.model.sharded,
             "cli_sharded=true must set sharded on the merged options"
@@ -644,7 +685,8 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
             false,
             Some("user_id"),
             None,
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(
             opts.model.shard_key.as_deref(),
             Some("user_id"),
@@ -690,9 +732,24 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
     #[test]
     fn merge_cli_id_uuid_sets_uuid_id_type() {
         let (_, opts) = merge_config_with_cli(
-            bookmark_entry(), &[], &[], &[], &[], &[], false, false, false, None, Some("uuid"),
-        ).unwrap();
-        assert_eq!(opts.model.id_type, IdType::Uuid, "cli --id uuid must set Uuid id_type");
+            bookmark_entry(),
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            false,
+            false,
+            false,
+            None,
+            Some("uuid"),
+        )
+        .unwrap();
+        assert_eq!(
+            opts.model.id_type,
+            IdType::Uuid,
+            "cli --id uuid must set Uuid id_type"
+        );
     }
 
     #[test]
@@ -700,7 +757,11 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
         let mut entry = bookmark_entry();
         entry.id = Some("uuid".into());
         let (_, opts) = merge(entry);
-        assert_eq!(opts.model.id_type, IdType::Uuid, "[scaffold.X] id = 'uuid' must propagate");
+        assert_eq!(
+            opts.model.id_type,
+            IdType::Uuid,
+            "[scaffold.X] id = 'uuid' must propagate"
+        );
     }
 
     #[test]
@@ -708,25 +769,61 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
         let mut entry = bookmark_entry();
         entry.id = Some("uuid".into());
         let (_, opts) = merge_config_with_cli(
-            entry, &[], &[], &[], &[], &[], false, false, false, None, Some("bigint"),
-        ).unwrap();
-        assert_eq!(opts.model.id_type, IdType::BigSerial, "CLI --id bigint must override TOML id = 'uuid'");
+            entry,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            false,
+            false,
+            false,
+            None,
+            Some("bigint"),
+        )
+        .unwrap();
+        assert_eq!(
+            opts.model.id_type,
+            IdType::BigSerial,
+            "CLI --id bigint must override TOML id = 'uuid'"
+        );
     }
 
     #[test]
     fn merge_default_id_type_is_bigserial() {
         let (_, opts) = merge(bookmark_entry());
-        assert_eq!(opts.model.id_type, IdType::BigSerial, "default id_type must be BigSerial (AC4)");
+        assert_eq!(
+            opts.model.id_type,
+            IdType::BigSerial,
+            "default id_type must be BigSerial (AC4)"
+        );
     }
 
     #[test]
     fn merge_cli_bad_id_returns_error() {
         let err = merge_config_with_cli(
-            bookmark_entry(), &[], &[], &[], &[], &[], false, false, false, None, Some("guid"),
-        ).unwrap_err();
+            bookmark_entry(),
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            false,
+            false,
+            false,
+            None,
+            Some("guid"),
+        )
+        .unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("guid"), "error must mention the bad value: {msg}");
-        assert!(msg.contains("uuid"), "error must list accepted values: {msg}");
+        assert!(
+            msg.contains("guid"),
+            "error must mention the bad value: {msg}"
+        );
+        assert!(
+            msg.contains("uuid"),
+            "error must list accepted values: {msg}"
+        );
     }
 
     #[test]
@@ -737,7 +834,11 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
             "[generate]\nid = \"uuid\"\n\n[scaffold.Post]\nfields = [\"title:String\"]\n",
         );
         let defaults_id = read_generate_defaults(&path).unwrap();
-        assert_eq!(defaults_id, IdType::Uuid, "[generate] id = 'uuid' must be read as Uuid");
+        assert_eq!(
+            defaults_id,
+            IdType::Uuid,
+            "[generate] id = 'uuid' must be read as Uuid"
+        );
     }
 
     #[test]

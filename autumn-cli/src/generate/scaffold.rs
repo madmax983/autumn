@@ -73,6 +73,7 @@ pub fn plan_scaffold(
 /// # Errors
 /// Surfaces any planning error from the underlying model generation as well
 /// as project-layout, repository query, and metadata problems.
+#[allow(clippy::too_many_lines)]
 pub fn plan_scaffold_with_options(
     project_root: &Path,
     name: &str,
@@ -155,7 +156,13 @@ pub fn plan_scaffold_with_options(
     // Smoke test under `tests/<snake>.rs`
     plan.create(
         project_root.join("tests").join(format!("{snake_name}.rs")),
-        render_smoke_test(&pascal_name, &plural, options_with_key.api, &fields, options_with_key.model.id_type),
+        render_smoke_test(
+            &pascal_name,
+            &plural,
+            options_with_key.api,
+            &fields,
+            options_with_key.model.id_type,
+        ),
     );
 
     // `src/main.rs` updates: declare modules + register all new routes.
@@ -543,7 +550,9 @@ fn render_routes_file(
         (
             format!("flash: Flash, mut db: {db_ty}, body: Bytes"),
             "decode_form(body)?".to_owned(),
-            format!("flash: Flash,\n    id: Path<{id_rust}>,\n    mut db: {db_ty},\n    body: Bytes,"),
+            format!(
+                "flash: Flash,\n    id: Path<{id_rust}>,\n    mut db: {db_ty},\n    body: Bytes,"
+            ),
             "decode_form(body)?".to_owned(),
             format!("fn decode_form(body: Bytes) -> AutumnResult<New{pascal_name}>"),
         )
@@ -973,7 +982,13 @@ fn render_update_columns(plural: &str, fields: &[Field]) -> String {
 }
 
 #[allow(clippy::too_many_lines)]
-fn render_smoke_test(pascal_name: &str, plural: &str, api: bool, fields: &[Field], id_type: IdType) -> String {
+fn render_smoke_test(
+    pascal_name: &str,
+    plural: &str,
+    api: bool,
+    fields: &[Field],
+    id_type: IdType,
+) -> String {
     if api {
         // Build sample JSON values for the fields.
         let mut sample_parts = Vec::new();
