@@ -610,6 +610,17 @@ pub fn levenshtein(a: &str, b: &str) -> usize {
 /// Register entries in [`DEPRECATED_CONFIG_KEYS`]. The config loader emits a
 /// structured `WARN` for each entry whose key is present in the resolved config,
 /// and `autumn doctor` surfaces them as ⚠️ checks.
+///
+/// # Env-var contract
+///
+/// A registered `path` MUST correspond to the mechanical env-var name produced
+/// by [`deprecated_env_var_name`] (`a.b.c` → `AUTUMN_A__B__C`), which is the
+/// same name the loader's `apply_*_env_overrides` reads to honor the value. If
+/// a key's loader override uses a non-mechanical env-var name, env-var detection
+/// here would diverge from what the loader actually applies. The integration
+/// tests in `autumn/tests/config_deprecation.rs` lock this for every entry by
+/// loading config with each key set via its env var and asserting the value is
+/// honored.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DeprecatedKey {
     /// Dotted config path, e.g. `"security.rate_limit.trusted_proxies"`.
@@ -736,6 +747,27 @@ pub fn detect_deprecated_keys(
         });
     }
     findings
+}
+
+/// Detects deprecated keys the way [`AutumnConfig::load_with_env`] would, given a
+/// profile and a file-merged TOML table a tool has already built.
+///
+/// Seeds [`profile_defaults_as_toml`] as the base layer and deep-merges
+/// `file_table` on top before running [`detect_deprecated_keys`], so external
+/// tools (e.g. `autumn doctor`) evaluate the *same* layered config the runtime
+/// loader does — a key set only in a profile default is still detected.
+#[must_use]
+pub fn detect_deprecated_keys_for(
+    profile: &str,
+    file_table: &toml::Table,
+    env: &dyn Env,
+    registry: &[DeprecatedKey],
+) -> Vec<DeprecationFinding> {
+    let mut merged = profile_defaults_as_toml(profile);
+    deep_merge(&mut merged, toml::Value::Table(file_table.clone()));
+    let empty_table = toml::Table::new();
+    let merged_table = merged.as_table().unwrap_or(&empty_table);
+    detect_deprecated_keys(merged_table, env, registry)
 }
 
 /// Errors that can occur when loading or validating configuration.

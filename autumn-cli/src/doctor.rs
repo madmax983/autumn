@@ -111,6 +111,7 @@ pub trait Check {
 pub struct DoctorDeprecation {
     pub path: String,
     pub replacement: Option<String>,
+    pub since: String,
     pub remove_in: String,
 }
 
@@ -136,8 +137,8 @@ pub fn check_deprecated_keys_impl(found: &[DoctorDeprecation]) -> CheckResult {
                 .as_deref()
                 .unwrap_or("remove it (no replacement)");
             format!(
-                "{} is deprecated (use {}; removed in {})",
-                d.path, repl, d.remove_in
+                "{} is deprecated since {} (use {}; removed in {})",
+                d.path, d.since, repl, d.remove_in
             )
         })
         .collect();
@@ -2138,13 +2139,16 @@ fn parse_config_bool(value: &str) -> Option<bool> {
     }
 }
 
-fn resolve_proxy_conflict_data() -> ProxyConflictData {
-    // Use the profile-merged table so that [profile.prod] / autumn-prod.toml
-    // overrides are included — matching the pattern used by resolve_trusted_hosts.
+/// Resolves the active profile names the runtime would load.
+///
+/// Normalizes aliases (`production`→`prod`, `development`→`dev`, empty→`dev`)
+/// to match `AutumnConfig::load_with_env`, and returns the canonical profile
+/// plus any alias spelling so callers merge both sets of profile sources
+/// (e.g. `[profile.production]` and `[profile.prod]`).
+fn resolve_active_profiles() -> (String, Vec<String>) {
     let raw_profile = std::env::var("AUTUMN_ENV")
         .or_else(|_| std::env::var("AUTUMN_PROFILE"))
         .unwrap_or_default();
-    // Normalize aliases to canonical names to match AutumnConfig::load_with_env.
     let raw_lower = raw_profile.trim().to_ascii_lowercase();
     let canonical = match raw_lower.as_str() {
         "production" | "prod" => "prod",
@@ -2152,15 +2156,21 @@ fn resolve_proxy_conflict_data() -> ProxyConflictData {
         other => other,
     }
     .to_owned();
-    // The runtime supports both alias spellings (e.g. "production" and "prod"),
-    // so merge both sets of profile sources to match what the app would load.
     let alias = match raw_lower.as_str() {
-        "production" => Some("production"),
-        "development" => Some("development"),
+        "production" => Some("production".to_owned()),
+        "development" => Some("development".to_owned()),
         _ => None,
     };
-    let profiles: Vec<&str> = std::iter::once(canonical.as_str()).chain(alias).collect();
-    let table = get_merged_toml_table_profiles(&profiles);
+    let profiles: Vec<String> = std::iter::once(canonical.clone()).chain(alias).collect();
+    (canonical, profiles)
+}
+
+fn resolve_proxy_conflict_data() -> ProxyConflictData {
+    // Use the profile-merged table so that [profile.prod] / autumn-prod.toml
+    // overrides are included — matching the pattern used by resolve_trusted_hosts.
+    let (_canonical, profiles) = resolve_active_profiles();
+    let profile_refs: Vec<&str> = profiles.iter().map(String::as_str).collect();
+    let table = get_merged_toml_table_profiles(&profile_refs);
 
     let parse_csv_env = |var: &str| -> Option<Vec<String>> {
         std::env::var(var).ok().map(|v| {
@@ -2223,36 +2233,23 @@ fn resolve_proxy_conflict_data() -> ProxyConflictData {
 
 /// Resolve which deprecated config keys are currently set in this project.
 ///
-/// Uses the same profile-merged TOML table that `resolve_proxy_conflict_data`
-/// uses so doctor evaluates the same config the runtime would load.  For each
-/// entry in the registry, presence is tested in TOML and/or env vars — exactly
-/// mirroring [`autumn_web::config::detect_deprecated_keys`].
+/// Uses [`autumn_web::config::detect_deprecated_keys_for`], which seeds the same
+/// profile-default base layer the runtime loader applies before merging the
+/// file table — so doctor evaluates the *same* layered config the runtime would
+/// load (a key set only in a profile default is still detected).
 fn resolve_deprecations() -> Vec<DoctorDeprecation> {
-    use autumn_web::config::{OsEnv, deprecated_config_keys};
+    use autumn_web::config::{OsEnv, deprecated_config_keys, detect_deprecated_keys_for};
 
-    let raw_profile = std::env::var("AUTUMN_ENV")
-        .or_else(|_| std::env::var("AUTUMN_PROFILE"))
-        .unwrap_or_default();
-    let raw_lower = raw_profile.trim().to_ascii_lowercase();
-    let canonical = match raw_lower.as_str() {
-        "production" | "prod" => "prod",
-        "development" | "dev" | "" => "dev",
-        other => other,
-    }
-    .to_owned();
-    let alias = match raw_lower.as_str() {
-        "production" => Some("production"),
-        "development" => Some("development"),
-        _ => None,
-    };
-    let profiles: Vec<&str> = std::iter::once(canonical.as_str()).chain(alias).collect();
-    let merged = get_merged_toml_table_profiles(&profiles);
+    let (canonical, profiles) = resolve_active_profiles();
+    let profile_refs: Vec<&str> = profiles.iter().map(String::as_str).collect();
+    let file_table = get_merged_toml_table_profiles(&profile_refs);
 
-    autumn_web::config::detect_deprecated_keys(&merged, &OsEnv, deprecated_config_keys())
+    detect_deprecated_keys_for(&canonical, &file_table, &OsEnv, deprecated_config_keys())
         .into_iter()
         .map(|f| DoctorDeprecation {
             path: f.path,
             replacement: f.replacement,
+            since: f.since,
             remove_in: f.remove_in,
         })
         .collect()
@@ -4890,11 +4887,13 @@ redirect_uri = "http://localhost/callback"
             DoctorDeprecation {
                 path: "security.rate_limit.trusted_proxies".into(),
                 replacement: Some("security.trusted_proxies.ranges".into()),
+                since: "0.5.0".into(),
                 remove_in: "1.0.0".into(),
             },
             DoctorDeprecation {
                 path: "security.rate_limit.trust_forwarded_headers".into(),
                 replacement: Some("security.trusted_proxies.trust_forwarded_headers".into()),
+                since: "0.5.0".into(),
                 remove_in: "1.0.0".into(),
             },
         ];
@@ -4906,6 +4905,10 @@ redirect_uri = "http://localhost/callback"
         assert_eq!(lines.len(), 2, "one line per key: {detail:?}");
         assert!(lines[0].contains("security.rate_limit.trusted_proxies"));
         assert!(lines[0].contains("security.trusted_proxies.ranges"));
+        assert!(
+            lines[0].contains("0.5.0"),
+            "detail must include since version"
+        );
         assert!(lines[0].contains("1.0.0"));
         assert!(lines[1].contains("security.rate_limit.trust_forwarded_headers"));
     }
@@ -4915,6 +4918,7 @@ redirect_uri = "http://localhost/callback"
         let found = vec![DoctorDeprecation {
             path: "security.rate_limit.trusted_proxies".into(),
             replacement: Some("security.trusted_proxies.ranges".into()),
+            since: "0.5.0".into(),
             remove_in: "1.0.0".into(),
         }];
         let results = vec![check_deprecated_keys_impl(&found)];
