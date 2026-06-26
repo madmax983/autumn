@@ -66,7 +66,14 @@ pub struct ScaffoldConfigEntry {
 }
 
 /// Project-level generator defaults, read from `[generate]` in the config file.
+///
+/// `deny_unknown_fields` so a typo inside `[generate]` (e.g. `ide = "uuid"` or
+/// `id_type = "uuid"`) is a hard error rather than being silently ignored and
+/// falling back to the default key type. This applies to both the strict
+/// `--config` path and the lenient defaults-only reads (which validate the
+/// `[generate]` table even while ignoring `[scaffold.*]` sections).
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct GenerateDefaults {
     /// Default primary-key type (`"uuid"` or `"bigint"`).
     #[serde(default)]
@@ -465,6 +472,22 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
         let entry = read_explicit_scaffold_config(&path, "Post", true).unwrap();
         assert_eq!(entry.id.as_deref(), Some("uuid"));
         assert!(entry.fields.is_empty());
+    }
+
+    #[test]
+    fn unknown_key_inside_generate_table_errors() {
+        // A typo under [generate] must not be silently ignored (which would
+        // fall back to BigSerial despite the user intending uuid).
+        let tmp = TempDir::new().unwrap();
+        let path = write_config(&tmp, "[generate]\nide = \"uuid\"\n");
+        let err = read_generate_defaults(&path).unwrap_err();
+        assert!(
+            matches!(err, GenerateError::Config(_)),
+            "unknown [generate] key must error, got: {err:?}"
+        );
+        // The same applies to the defaults-only entry reader and the strict path.
+        assert!(read_generate_defaults_entry(&path).is_err());
+        assert!(read_scaffold_config(&path, "Post").is_err());
     }
 
     #[test]
