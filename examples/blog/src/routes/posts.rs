@@ -107,7 +107,10 @@ pub fn layout_with_seo(locale: &Locale, seo: SeoMeta, content: Markup) -> Markup
 fn post_card(post: &Post) -> Markup {
     cache_fragment_global(
         format_args!("blog:post_card:{}", post.id),
-        post.updated_at.and_utc().timestamp(),
+        // Microsecond resolution so two edits in the same wall-clock second
+        // still produce distinct cache keys (a plain `timestamp()` would
+        // collide and serve the first edit's stale markup).
+        post.updated_at.and_utc().timestamp_micros(),
         None,
         || render_post_card(post),
     )

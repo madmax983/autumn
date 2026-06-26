@@ -37,8 +37,10 @@ fn post_card(post: &Post) -> Markup {
     cache_fragment_global(
         // identity: which fragment is this?
         format_args!("post_card:{}", post.id),
-        // version: bump this whenever the record changes
-        post.updated_at.and_utc().timestamp(),
+        // version: bump this whenever the record changes. Use a sub-second
+        // resolution token (micros) so two edits in the same second still
+        // produce distinct keys.
+        post.updated_at.and_utc().timestamp_micros(),
         // optional TTL (None = no expiry)
         None,
         // render closure: only runs on a cache miss
@@ -101,7 +103,7 @@ pub async fn index(state: AppState, mut db: Db) -> AutumnResult<Markup> {
             (cache_fragment(
                 cache.as_deref(),
                 format_args!("post_card:{}", post.id),
-                post.updated_at.and_utc().timestamp(),
+                post.updated_at.and_utc().timestamp_micros(),
                 None,
                 || render_post_card(post),
             ))
@@ -112,7 +114,11 @@ pub async fn index(state: AppState, mut db: Db) -> AutumnResult<Markup> {
 
 ## Choosing the identity and version
 
-The cache key is `"fragment:{identity}:{version}"`. You supply both halves:
+The cache key is `"fragment:{identity}:{version}"`. You supply both halves.
+Keep the `version` token unambiguous (a number or other colon-free value): the
+key is a plain `:`-joined string, so a colon *inside* the version could shift
+the identity/version boundary and alias two distinct fragments. Numeric tokens
+like `timestamp_micros()` or a sequence number are always safe.
 
 - **identity** — anything `Display` that uniquely names the fragment. Include the
   record type and primary key (`format_args!("post_card:{}", post.id)`), and any
@@ -121,7 +127,10 @@ The cache key is `"fragment:{identity}:{version}"`. You supply both halves:
 - **version** — a token that changes whenever the record changes. The natural
   choices are the record's `updated_at` timestamp or a version-history sequence
   number (see [version history](version-history.md)). Bumping it yields a cache
-  miss, so a write naturally re-renders the fragment.
+  miss, so a write naturally re-renders the fragment. Prefer a **sub-second**
+  token — `timestamp_micros()` rather than `timestamp()` — so two writes within
+  the same wall-clock second still produce distinct keys (a sequence number
+  sidesteps this entirely).
 
 > **Important:** if the fragment's appearance depends on data *outside* the
 > record (e.g. the current user's vote state), fold that into the identity or
@@ -139,7 +148,7 @@ fn comment_thread(thread: &Thread) -> Markup {
         // outer version derived from the children, so the outer re-renders
         // whenever *any* child changes
         thread.comments.iter().map(|c| c.updated_at).max().unwrap_or_default()
-            .and_utc().timestamp(),
+            .and_utc().timestamp_micros(),
         None,
         || html! {
             ul {
@@ -154,7 +163,7 @@ fn comment_thread(thread: &Thread) -> Markup {
 fn comment_card(comment: &Comment) -> Markup {
     cache_fragment_global(
         format_args!("comment:{}", comment.id),
-        comment.updated_at.and_utc().timestamp(),
+        comment.updated_at.and_utc().timestamp_micros(),
         None,
         || html! { li { (comment.body) } },
     )
