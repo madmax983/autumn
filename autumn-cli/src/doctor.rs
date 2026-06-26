@@ -105,6 +105,55 @@ pub trait Check {
     fn run(&self) -> CheckResult;
 }
 
+/// A deprecated config key detected in the project's resolved configuration.
+/// Used as input to [`check_deprecated_keys_impl`].
+#[derive(Debug, Clone)]
+pub struct DoctorDeprecation {
+    pub path: String,
+    pub replacement: Option<String>,
+    pub since: String,
+    pub remove_in: String,
+}
+
+/// Check for deprecated config key usage (pure, injectable for tests).
+///
+/// Emits one `⚠️ deprecated_keys` check with one line of `detail` per offending
+/// key, consistent with how `check_toml_content` aggregates unknown-key errors.
+pub fn check_deprecated_keys_impl(found: &[DoctorDeprecation]) -> CheckResult {
+    if found.is_empty() {
+        return CheckResult {
+            name: "deprecated_keys",
+            status: CheckStatus::Pass,
+            detail: Some("no deprecated configuration keys in use".into()),
+            hint: None,
+        };
+    }
+
+    let lines: Vec<String> = found
+        .iter()
+        .map(|d| {
+            let repl = d
+                .replacement
+                .as_deref()
+                .unwrap_or("remove it (no replacement)");
+            format!(
+                "{} is deprecated since {} (use {}; removed in {})",
+                d.path, d.since, repl, d.remove_in
+            )
+        })
+        .collect();
+
+    CheckResult {
+        name: "deprecated_keys",
+        status: CheckStatus::Warn,
+        detail: Some(lines.join("\n")),
+        hint: Some(
+            "Migrate to the replacement keys before the removal version; \
+             deprecated keys are still honored during the deprecation window",
+        ),
+    }
+}
+
 /// Check signing-secret readiness (pure, injectable for tests).
 ///
 /// - **Dev/test** (`is_production = false`): warns when no secret is configured
@@ -2090,29 +2139,56 @@ fn parse_config_bool(value: &str) -> Option<bool> {
     }
 }
 
-fn resolve_proxy_conflict_data() -> ProxyConflictData {
-    // Use the profile-merged table so that [profile.prod] / autumn-prod.toml
-    // overrides are included — matching the pattern used by resolve_trusted_hosts.
+/// Resolves the active profile names the runtime would load.
+///
+/// Returns `(canonical, selected_input, profiles)`:
+/// - `canonical` — normalized name (`"prod"` / `"dev"` / custom)
+/// - `selected_input` — the raw env-var value (used by `override_file_lookup_names`
+///   to pick the right `autumn-{name}.toml` spelling when both exist)
+/// - `profiles` — `[alias, canonical]` list for inline `[profile.{name}]` merging
+fn resolve_active_profiles() -> (String, String, Vec<String>) {
     let raw_profile = std::env::var("AUTUMN_ENV")
-        .or_else(|_| std::env::var("AUTUMN_PROFILE"))
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .or_else(|| std::env::var("AUTUMN_PROFILE").ok())
+        .filter(|v| !v.trim().is_empty())
         .unwrap_or_default();
-    // Normalize aliases to canonical names to match AutumnConfig::load_with_env.
-    let raw_lower = raw_profile.trim().to_ascii_lowercase();
-    let canonical = match raw_lower.as_str() {
-        "production" | "prod" => "prod",
-        "development" | "dev" | "" => "dev",
-        other => other,
-    }
-    .to_owned();
-    // The runtime supports both alias spellings (e.g. "production" and "prod"),
-    // so merge both sets of profile sources to match what the app would load.
-    let alias = match raw_lower.as_str() {
-        "production" => Some("production"),
-        "development" => Some("development"),
+    let raw_trimmed = raw_profile.trim().to_owned();
+    // Mirror normalize_profile_name from config.rs: built-in aliases are
+    // matched case-insensitively; custom profile names preserve the original
+    // user-specified case (so AUTUMN_ENV=QA loads [profile.QA], not [profile.qa]).
+    let canonical = if raw_trimmed.eq_ignore_ascii_case("production")
+        || raw_trimmed.eq_ignore_ascii_case("prod")
+    {
+        "prod".to_owned()
+    } else if raw_trimmed.eq_ignore_ascii_case("development")
+        || raw_trimmed.eq_ignore_ascii_case("dev")
+        || raw_trimmed.is_empty()
+    {
+        "dev".to_owned()
+    } else {
+        raw_trimmed.clone()
+    };
+    // Mirror profile_lookup_names in config.rs: the runtime always loads the
+    // legacy long-form alias first (e.g. "production") then the canonical short
+    // form ("prod"), regardless of which spelling was used in the env var.
+    let alias = match canonical.as_str() {
+        "prod" => Some("production".to_owned()),
+        "dev" => Some("development".to_owned()),
         _ => None,
     };
-    let profiles: Vec<&str> = std::iter::once(canonical.as_str()).chain(alias).collect();
-    let table = get_merged_toml_table_profiles(&profiles);
+    let profiles: Vec<String> = alias
+        .into_iter()
+        .chain(std::iter::once(canonical.clone()))
+        .collect();
+    (canonical, raw_trimmed, profiles)
+}
+
+fn resolve_proxy_conflict_data() -> ProxyConflictData {
+    // Mirror the runtime: load only the first existing override file so a
+    // stale autumn-production.toml doesn't shadow autumn-prod.toml at startup.
+    let (canonical, selected, _profiles) = resolve_active_profiles();
+    let table = get_merged_toml_table_runtime(&canonical, &selected);
 
     let parse_csv_env = |var: &str| -> Option<Vec<String>> {
         std::env::var(var).ok().map(|v| {
@@ -2171,6 +2247,31 @@ fn resolve_proxy_conflict_data() -> ProxyConflictData {
         old_trust_fwd: parse_bool_env("AUTUMN_SECURITY__RATE_LIMIT__TRUST_FORWARDED_HEADERS")
             .unwrap_or_else(|| toml_bool(rl_section, "trust_forwarded_headers")),
     }
+}
+
+/// Resolve which deprecated config keys are currently set in this project.
+///
+/// Uses [`autumn_web::config::detect_deprecated_keys_for`], which seeds the same
+/// profile-default base layer the runtime loader applies before merging the
+/// file table — so doctor evaluates the *same* layered config the runtime would
+/// load (a key set only in a profile default is still detected).
+fn resolve_deprecations() -> Vec<DoctorDeprecation> {
+    use autumn_web::config::{OsEnv, deprecated_config_keys, detect_deprecated_keys_for};
+
+    let (canonical, selected, _profiles) = resolve_active_profiles();
+    // Use the same single-file lookup path the runtime uses: only the first
+    // existing autumn-{profile}.toml is loaded, never both alias spellings.
+    let file_table = get_merged_toml_table_runtime(&canonical, &selected);
+
+    detect_deprecated_keys_for(&canonical, &file_table, &OsEnv, deprecated_config_keys())
+        .into_iter()
+        .map(|f| DoctorDeprecation {
+            path: f.path,
+            replacement: f.replacement,
+            since: f.since,
+            remove_in: f.remove_in,
+        })
+        .collect()
 }
 
 /// Resolve the rate-limit key strategy from config/env.
@@ -2474,6 +2575,12 @@ pub fn run(opts: DoctorOptions) {
     // 8c. Conflicting trusted-proxy configuration (new vs. deprecated fields)
     tasks.push(Box::new(move || {
         check_proxy_conflict_impl(&proxy_conflict_data)
+    }));
+
+    // 8d. Deprecated config key usage
+    let deprecated_keys = resolve_deprecations();
+    tasks.push(Box::new(move || {
+        check_deprecated_keys_impl(&deprecated_keys)
     }));
 
     // 9. OAuth2 provider checks (client_id and client_secret validation)
@@ -4781,6 +4888,69 @@ redirect_uri = "http://localhost/callback"
         assert!(
             !found.contains("not_a_table"),
             "should not contain string before token: {found:?}"
+        );
+    }
+
+    // ── Deprecated-keys check tests ───────────────────────────────────────────
+
+    #[test]
+    fn red_check_deprecated_keys_empty_is_pass() {
+        let result = check_deprecated_keys_impl(&[]);
+        assert_eq!(result.status, CheckStatus::Pass);
+        assert_eq!(result.name, "deprecated_keys");
+    }
+
+    #[test]
+    fn red_check_deprecated_keys_warns_one_line_per_key() {
+        let found = vec![
+            DoctorDeprecation {
+                path: "security.rate_limit.trusted_proxies".into(),
+                replacement: Some("security.trusted_proxies.ranges".into()),
+                since: "0.5.0".into(),
+                remove_in: "1.0.0".into(),
+            },
+            DoctorDeprecation {
+                path: "security.rate_limit.trust_forwarded_headers".into(),
+                replacement: Some("security.trusted_proxies.trust_forwarded_headers".into()),
+                since: "0.5.0".into(),
+                remove_in: "1.0.0".into(),
+            },
+        ];
+        let result = check_deprecated_keys_impl(&found);
+        assert_eq!(result.status, CheckStatus::Warn);
+        assert_eq!(result.name, "deprecated_keys");
+        let detail = result.detail.unwrap();
+        let lines: Vec<&str> = detail.lines().collect();
+        assert_eq!(lines.len(), 2, "one line per key: {detail:?}");
+        assert!(lines[0].contains("security.rate_limit.trusted_proxies"));
+        assert!(lines[0].contains("security.trusted_proxies.ranges"));
+        assert!(
+            lines[0].contains("0.5.0"),
+            "detail must include since version"
+        );
+        assert!(lines[0].contains("1.0.0"));
+        assert!(lines[1].contains("security.rate_limit.trust_forwarded_headers"));
+    }
+
+    #[test]
+    fn red_check_deprecated_keys_json_includes_detail() {
+        let found = vec![DoctorDeprecation {
+            path: "security.rate_limit.trusted_proxies".into(),
+            replacement: Some("security.trusted_proxies.ranges".into()),
+            since: "0.5.0".into(),
+            remove_in: "1.0.0".into(),
+        }];
+        let results = vec![check_deprecated_keys_impl(&found)];
+        let summary = compute_summary(&results);
+        let json = to_json_output(&results, &summary);
+        assert!(
+            json.contains("\"deprecated_keys\""),
+            "JSON must name the check"
+        );
+        assert!(json.contains("\"warn\""), "JSON must include warn status");
+        assert!(
+            json.contains("security.rate_limit.trusted_proxies"),
+            "JSON must contain the deprecated key path"
         );
     }
 }
