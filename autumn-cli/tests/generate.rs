@@ -3549,3 +3549,36 @@ fn generate_scaffold_project_default_uuid_is_rejected() {
         "rejected scaffold must not write a model file"
     );
 }
+
+/// Codex P2: an auto-discovered `autumn.generate.toml` must contribute ONLY the
+/// project-level `[generate]` defaults — a checked-in `[scaffold.Post]` recipe
+/// must NOT silently apply to an ordinary `generate scaffold` run without
+/// `--config`. Here the recipe sets `api = true`; without --config the scaffold
+/// must remain a full HTML scaffold (i.e. the recipe is ignored).
+#[test]
+fn generate_scaffold_auto_discovery_ignores_per_resource_recipe() {
+    let (_tmp, project) = fresh_project("auto-discovery-recipe-app");
+
+    // A checked-in per-resource recipe with api = true (TOML-only option).
+    fs::write(
+        project.join("autumn.generate.toml"),
+        "[scaffold.Post]\nfields = [\"name:String\"]\napi = true\n",
+    )
+    .unwrap();
+
+    // No --config: the [scaffold.Post] recipe must be ignored.
+    run_autumn(&project, &["generate", "scaffold", "Post", "title:String"]);
+
+    // A full (non-api) scaffold generates the HTML routes file; an api scaffold
+    // does not. Its presence proves api = true was NOT inherited.
+    assert!(
+        project.join("src/routes/posts.rs").is_file(),
+        "auto-discovery must not apply the recipe's api=true (HTML routes expected)"
+    );
+    // CLI fields win; the recipe's `name` field must not appear.
+    let model = fs::read_to_string(project.join("src/models/post.rs")).unwrap();
+    assert!(
+        model.contains("pub title: String,") && !model.contains("pub name: String,"),
+        "CLI fields must be used, not the recipe's fields; got:\n{model}"
+    );
+}

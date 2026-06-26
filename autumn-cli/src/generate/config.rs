@@ -126,32 +126,22 @@ pub fn read_scaffold_config(
     Ok(entry)
 }
 
-/// Like [`read_scaffold_config`] but always returns a [`ScaffoldConfigEntry`]
-/// rather than `Option`.
+/// Read ONLY the project-level `[generate]` defaults from `config_path` into a
+/// scaffold entry, ignoring any per-resource `[scaffold.*]` sections.
 ///
-/// When no `[scaffold.ResourceName]` section exists the function returns a
-/// default entry, applying any `[generate] id` project default so that a
-/// top-level `[generate]` section is honoured even without a per-resource
-/// section.
-///
-/// Use this instead of [`read_scaffold_config`] when a missing section should
-/// silently fall back to project defaults rather than being treated as an error
-/// (e.g. auto-discovered project config and `--config` with only `[generate]`).
+/// Used for an **auto-discovered** `autumn.generate.toml` (no explicit
+/// `--config`): a checked-in `[scaffold.Post]` recipe must NOT silently apply
+/// to an ordinary `autumn generate scaffold Post …` invocation. Only the
+/// project-wide defaults (the `id` type) are contributed; the per-resource
+/// recipe is honoured solely when the user opts in with `--config`.
 ///
 /// # Errors
 ///
 /// - [`GenerateError::Io`] if the file cannot be read.
 /// - [`GenerateError::Config`] if the file is not valid TOML.
-pub fn read_scaffold_config_or_defaults(
+pub fn read_generate_defaults_entry(
     config_path: &Path,
-    resource_name: &str,
 ) -> Result<ScaffoldConfigEntry, GenerateError> {
-    // Delegate to read_scaffold_config for the per-resource section. When it is
-    // absent, fall back to a default entry that still carries the project-level
-    // [generate] id default.
-    if let Some(entry) = read_scaffold_config(config_path, resource_name)? {
-        return Ok(entry);
-    }
     Ok(ScaffoldConfigEntry {
         id: read_generate_id(config_path)?,
         ..ScaffoldConfigEntry::default()
@@ -160,8 +150,7 @@ pub fn read_scaffold_config_or_defaults(
 
 /// Resolve a scaffold entry from an **explicit** `--config <path>`.
 ///
-/// Unlike [`read_scaffold_config_or_defaults`] (used for an auto-discovered
-/// project config), this preserves typo protection: when the requested
+/// This preserves typo protection: when the requested
 /// `[scaffold.ResourceName]` section is absent it errors, *unless*
 ///
 /// - the file defines no `[scaffold.*]` sections at all (a pure `[generate]`
@@ -450,6 +439,30 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
         let entry = read_explicit_scaffold_config(&path, "Post", true).unwrap();
         assert_eq!(entry.id.as_deref(), Some("uuid"));
         assert!(entry.fields.is_empty());
+    }
+
+    #[test]
+    fn generate_defaults_entry_ignores_per_resource_recipe() {
+        // Auto-discovery must contribute only [generate] defaults, never a
+        // per-resource [scaffold.X] recipe's fields/booleans.
+        let tmp = TempDir::new().unwrap();
+        let path = write_config(
+            &tmp,
+            "[generate]\nid = \"uuid\"\n\n\
+             [scaffold.Post]\nfields = [\"name:String\"]\napi = true\nsharded = true\n",
+        );
+        let entry = read_generate_defaults_entry(&path).unwrap();
+        assert_eq!(
+            entry.id.as_deref(),
+            Some("uuid"),
+            "[generate] id must carry over"
+        );
+        assert!(
+            entry.fields.is_empty(),
+            "per-resource fields must be ignored"
+        );
+        assert!(!entry.api, "per-resource api must be ignored");
+        assert!(!entry.sharded, "per-resource sharded must be ignored");
     }
 
     #[test]

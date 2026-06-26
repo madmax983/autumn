@@ -2471,11 +2471,14 @@ fn run_generate_command(cmd: GenerateCommands) {
             // Resolve the scaffold config entry. Precedence for id_type:
             //   CLI --id > [scaffold.X] id > [generate] id > BigSerial.
             //
-            // An explicit --config is treated strictly (a missing [scaffold.X]
-            // section is an error unless the file is a pure [generate] defaults
-            // file or the fields came from the CLI), preserving typo protection.
-            // An auto-discovered autumn.generate.toml is lenient — it only
-            // contributes project-level defaults.
+            // An explicit --config opts into the full per-resource recipe and is
+            // treated strictly (a missing [scaffold.X] section is an error unless
+            // the file is a pure [generate] defaults file or the fields came from
+            // the CLI), preserving typo protection.
+            //
+            // An auto-discovered autumn.generate.toml contributes ONLY the
+            // project-level [generate] defaults — a checked-in [scaffold.X]
+            // recipe must not silently change an ordinary CLI scaffold.
             let cli_has_fields = !fields.is_empty();
             let exit_on_err = |result| match result {
                 Ok(e) => e,
@@ -2490,9 +2493,7 @@ fn run_generate_command(cmd: GenerateCommands) {
                         .unwrap_or_default()
                         .join(generate::config::GENERATE_CONFIG_FILENAME);
                     if auto.exists() {
-                        exit_on_err(generate::config::read_scaffold_config_or_defaults(
-                            &auto, &name,
-                        ))
+                        exit_on_err(generate::config::read_generate_defaults_entry(&auto))
                     } else {
                         generate::config::ScaffoldConfigEntry::default()
                     }
