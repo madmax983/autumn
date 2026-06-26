@@ -526,6 +526,20 @@ fn unsupported_reason(table: &TableSchema, resource: &str) -> Option<String> {
         }
     }
     if !has_autumn_id_pk(&table.columns) {
+        // Tailor the message for a UUID `id` PK: that is a shape Autumn can
+        // *generate* (`generate model --id uuid`) but `db pull` cannot yet
+        // round-trip, so point that out specifically rather than implying the
+        // table simply lacks an `id` column.
+        let pks: Vec<&Column> = table.columns.iter().filter(|c| c.is_pk).collect();
+        if matches!(pks.as_slice(), [pk] if pk.name == "id" && pk.kind == FieldKind::Uuid) {
+            return Some(
+                "it uses a UUID `id` primary key, which `db pull` does not yet support \
+                 (introspection currently round-trips only database-generated `id` BIGINT \
+                 (i64) primary keys); UUID-keyed models can still be created with \
+                 `autumn generate model … --id uuid`"
+                    .to_owned(),
+            );
+        }
         return Some(
             "it lacks the Autumn convention of a single database-generated `id` BIGINT (i64) \
              primary key (BIGSERIAL/DEFAULT or GENERATED AS IDENTITY); the #[model] macro \
@@ -903,6 +917,52 @@ mod tests {
         );
         assert!(msg.contains("primary key"), "error must explain why: {msg}");
         assert!(!tmp.path().join("src/models/audit_log.rs").exists());
+    }
+
+    #[test]
+    fn unsupported_reason_explains_uuid_id_pk() {
+        // A UUID `id` PK is a shape Autumn can generate but db pull cannot yet
+        // round-trip; the reason must call that out specifically, and an explicit
+        // pull must fail loudly rather than emit broken code.
+        let uuid_posts = TableSchema {
+            table: "posts".to_owned(),
+            columns: vec![
+                Column {
+                    name: "id".to_owned(),
+                    kind: FieldKind::Uuid,
+                    nullable: false,
+                    is_pk: true,
+                    has_default: true,
+                    has_sequence_default: false,
+                    is_generated: false,
+                    is_identity: false,
+                },
+                col("title", FieldKind::String, false, false),
+                created_at_col(),
+            ],
+        };
+        let reason =
+            unsupported_reason(&uuid_posts, "Post").expect("UUID id PK must be unsupported");
+        assert!(
+            reason.contains("UUID") && reason.contains("db pull"),
+            "reason must call out UUID + db pull: {reason}"
+        );
+
+        let tmp = project();
+        let err = plan_pull(
+            tmp.path(),
+            &[uuid_posts],
+            PullOptions {
+                explicit: true,
+                ..PullOptions::default()
+            },
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("UUID"),
+            "explicit pull error must mention UUID: {err}"
+        );
+        assert!(!tmp.path().join("src/models/post.rs").exists());
     }
 
     #[test]

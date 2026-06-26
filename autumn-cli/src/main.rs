@@ -182,6 +182,13 @@ enum Commands {
         /// app's runtime precedence — so env vars are not overridden by this flag.
         #[arg(long, value_name = "PROFILE")]
         profile: Option<String>,
+        /// Wait up to SECS seconds for the database to become reachable before
+        /// failing, retrying with capped exponential backoff. Overrides
+        /// `database.startup_wait_secs` from the config file and
+        /// `AUTUMN_DATABASE__STARTUP_WAIT_SECS` from the environment.
+        /// When omitted, the config value is used (default `0` = fail fast).
+        #[arg(long, value_name = "SECS")]
+        wait: Option<u64>,
     },
     /// Create, drop, or reset the database itself.
     ///
@@ -1324,6 +1331,9 @@ enum GenerateCommands {
         /// Add a `deleted_at` column and use soft-delete in the repository.
         #[arg(long)]
         soft_delete: bool,
+        /// Primary-key type: `bigint` (default) or `uuid`.
+        #[arg(long, value_name = "TYPE")]
+        id: Option<String>,
         /// Print the file plan and exit without writing anything.
         #[arg(long)]
         dry_run: bool,
@@ -1608,6 +1618,9 @@ enum GenerateCommands {
         /// Add a `deleted_at` column and use soft-delete in the repository.
         #[arg(long)]
         soft_delete: bool,
+        /// Primary-key type: `bigint` (default) or `uuid`.
+        #[arg(long, value_name = "TYPE")]
+        id: Option<String>,
         /// Scaffold a JSON-only API resource (no HTML/Maud views, mount CRUD endpoints).
         #[arg(long)]
         api: bool,
@@ -1680,6 +1693,7 @@ fn run_command(command: Commands) {
             shard,
             control_only,
             profile,
+            wait,
         } => {
             let action = match action {
                 Some(MigrateCommands::Status) => migrate::MigrateAction::Status,
@@ -1700,7 +1714,7 @@ fn run_command(command: Commands) {
                 (None, true) => migrate::MigrateTarget::ControlOnly,
                 (None, false) => migrate::MigrateTarget::All,
             };
-            migrate::run(&action, with_maintenance, &target, profile.as_deref());
+            migrate::run(&action, with_maintenance, &target, profile.as_deref(), wait);
         }
         Commands::Db(cmd) => match cmd {
             DbCommands::Pull {
@@ -2309,11 +2323,42 @@ fn run_generate_command(cmd: GenerateCommands) {
             name,
             fields,
             soft_delete,
+            id,
             dry_run,
             force,
         } => {
+            // Precedence: CLI --id > [generate] id in autumn.generate.toml > BigSerial.
+            // The CLI flag is parsed first and wins outright, so a valid --id
+            // overrides a stale or invalid project default rather than being
+            // blocked by it.
+            let id_type = id.as_deref().map_or_else(
+                || {
+                    // No CLI --id: fall back to the auto-discovered project default.
+                    let auto_cfg = std::env::current_dir()
+                        .unwrap_or_default()
+                        .join(generate::config::GENERATE_CONFIG_FILENAME);
+                    if auto_cfg.exists() {
+                        generate::config::read_generate_defaults(&auto_cfg).unwrap_or_else(|e| {
+                            eprintln!(
+                                "Error reading {}: {e}",
+                                generate::config::GENERATE_CONFIG_FILENAME
+                            );
+                            std::process::exit(1);
+                        })
+                    } else {
+                        generate::dsl::IdType::default()
+                    }
+                },
+                |s| {
+                    generate::dsl::IdType::parse(s).unwrap_or_else(|e| {
+                        eprintln!("Error: {e}");
+                        std::process::exit(1);
+                    })
+                },
+            );
             let options = generate::model::ModelOptions {
                 soft_delete,
+                id_type,
                 ..Default::default()
             };
             let timestamp = generate::timestamp_now();
@@ -2427,6 +2472,7 @@ fn run_generate_command(cmd: GenerateCommands) {
             query,
             config,
             soft_delete,
+            id,
             api,
             sharded,
             shard_key,
@@ -2434,25 +2480,45 @@ fn run_generate_command(cmd: GenerateCommands) {
             dry_run,
             force,
         } => {
-            let config_entry = config.as_ref().map_or_else(
-                generate::config::ScaffoldConfigEntry::default,
-                |path| match generate::config::read_scaffold_config(path, &name) {
-                    Ok(Some(e)) => e,
-                    Ok(None) => {
-                        eprintln!(
-                            "Error: no [scaffold.{}] section found in {}",
-                            generate::naming::pascal(&name),
-                            path.display()
-                        );
-                        std::process::exit(1);
-                    }
-                    Err(e) => {
-                        eprintln!("Error: {e}");
-                        std::process::exit(1);
+            // Resolve the scaffold config entry. Precedence for id_type:
+            //   CLI --id > [scaffold.X] id > [generate] id > BigSerial.
+            //
+            // An explicit --config opts into the full per-resource recipe and is
+            // treated strictly (a missing [scaffold.X] section is an error unless
+            // the file is a pure [generate] defaults file or the fields came from
+            // the CLI), preserving typo protection.
+            //
+            // An auto-discovered autumn.generate.toml contributes ONLY the
+            // project-level [generate] defaults — a checked-in [scaffold.X]
+            // recipe must not silently change an ordinary CLI scaffold.
+            let cli_has_fields = !fields.is_empty();
+            let exit_on_err = |result| match result {
+                Ok(e) => e,
+                Err(e) => {
+                    eprintln!("Error: {e}");
+                    std::process::exit(1);
+                }
+            };
+            let config_entry = config.as_deref().map_or_else(
+                || {
+                    let auto = std::env::current_dir()
+                        .unwrap_or_default()
+                        .join(generate::config::GENERATE_CONFIG_FILENAME);
+                    if auto.exists() {
+                        exit_on_err(generate::config::read_generate_defaults_entry(&auto))
+                    } else {
+                        generate::config::ScaffoldConfigEntry::default()
                     }
                 },
+                |path| {
+                    exit_on_err(generate::config::read_explicit_scaffold_config(
+                        path,
+                        &name,
+                        cli_has_fields,
+                    ))
+                },
             );
-            let (fields, options) = generate::config::merge_config_with_cli(
+            let (fields, options) = match generate::config::merge_config_with_cli(
                 config_entry,
                 &fields,
                 &index,
@@ -2464,7 +2530,14 @@ fn run_generate_command(cmd: GenerateCommands) {
                 sharded,
                 shard_key.as_deref(),
                 live,
-            );
+                id.as_deref(),
+            ) {
+                Ok(result) => result,
+                Err(e) => {
+                    eprintln!("Error: {e}");
+                    std::process::exit(1);
+                }
+            };
             generate::scaffold::run(&name, &fields, generate::Flags { dry_run, force }, &options);
         }
     }
@@ -4545,6 +4618,24 @@ mod tests {
             Cli::try_parse_from(["autumn", "migrate", "--shard", "shard1", "--control-only"])
                 .is_err()
         );
+    }
+
+    #[test]
+    fn parse_migrate_wait_flag() {
+        let cli = Cli::try_parse_from(["autumn", "migrate", "--wait", "60"]).unwrap();
+        let Commands::Migrate { wait, .. } = cli.command else {
+            panic!("expected migrate");
+        };
+        assert_eq!(wait, Some(60u64));
+    }
+
+    #[test]
+    fn parse_migrate_wait_defaults_none() {
+        let cli = Cli::try_parse_from(["autumn", "migrate"]).unwrap();
+        let Commands::Migrate { wait, .. } = cli.command else {
+            panic!("expected migrate");
+        };
+        assert_eq!(wait, None);
     }
 
     #[test]
