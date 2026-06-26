@@ -678,8 +678,9 @@ where
 #[derive(Debug)]
 pub(crate) enum AttemptError {
     /// The server is not yet reachable (connection refused, starting up, …).
+    /// Carries the raw error message so a timeout can include the last error.
     /// The caller will retry after a backoff delay.
-    Retryable,
+    Retryable(String),
     /// A non-transient failure (auth error, bad URL, missing database, …).
     /// The caller must surface the error immediately without retrying.
     Fatal(String),
@@ -729,35 +730,42 @@ pub(crate) fn backoff_delay(attempt: u32) -> std::time::Duration {
 /// `mask_database_url`'s parse-failure behaviour).  Leaves the rest of the
 /// message unchanged.
 pub(crate) fn redact_db_url_credentials(msg: &str) -> String {
-    let mut out = msg.to_owned();
-    // Collect start positions of both recognised postgres URL schemes.
-    // Reverse order so replacements (which may change token length) don't
-    // invalidate earlier positions.
-    let mut positions: Vec<usize> = msg
-        .match_indices("postgres://")
-        .chain(msg.match_indices("postgresql://"))
-        .map(|(i, _)| i)
-        .collect();
-    positions.sort_unstable();
-    positions.dedup();
-    for &start in positions.iter().rev() {
-        // Extract the URL-shaped token (everything until the first whitespace
-        // or end of string).
-        let token: &str = msg[start..]
-            .split(|c: char| c.is_ascii_whitespace())
-            .next()
-            .unwrap_or(&msg[start..]);
-        let end = start + token.len();
+    let mut out = String::with_capacity(msg.len());
+    let mut rest = msg;
+    loop {
+        // Find the leftmost postgres:// or postgresql:// occurrence.
+        let pg = rest.find("postgres://");
+        let pgl = rest.find("postgresql://");
+        let start = match (pg, pgl) {
+            (None, None) => {
+                out.push_str(rest);
+                break;
+            }
+            (Some(a), None) => a,
+            (None, Some(b)) => b,
+            (Some(a), Some(b)) => a.min(b),
+        };
+        // Push everything before the URL token unchanged.
+        out.push_str(&rest[..start]);
+        rest = &rest[start..];
+        // Extract the URL-shaped token (everything until first whitespace or EOS).
+        let token_end = rest
+            .find(|c: char| c.is_ascii_whitespace())
+            .unwrap_or(rest.len());
+        let token = &rest[..token_end];
         if let Ok(mut parsed) = url::Url::parse(token) {
             if parsed.password().is_some() {
                 let _ = parsed.set_password(Some("****"));
-                out.replace_range(start..end, parsed.as_str());
+                out.push_str(parsed.as_str());
+            } else {
+                out.push_str(token);
             }
         } else {
             // Parse failed — mask the whole token rather than risk leaking a
             // malformed credential-bearing URL.
-            out.replace_range(start..end, "****");
+            out.push_str("****");
         }
+        rest = &rest[token_end..];
     }
     out
 }
@@ -771,8 +779,9 @@ pub(crate) fn redact_db_url_credentials(msg: &str) -> String {
 ///
 /// * `max_wait` — maximum total time to spend waiting (> 0 enforced by callers)
 /// * `try_connect` — attempts one connection; returns `Ok(())` on success,
-///   `Err(AttemptError::Retryable)` for transient errors, or
-///   `Err(AttemptError::Fatal(_))` for non-transient failures
+///   `Err(AttemptError::Retryable(msg))` for transient errors (the message is
+///   included in the timeout error), or `Err(AttemptError::Fatal(_))` for
+///   non-transient failures
 /// * `sleep` — called with the computed backoff delay; may be a no-op in tests
 /// * `elapsed` — returns the total time elapsed since the wait started
 /// * `on_retry` — called **before** sleeping with `(attempt, next_delay)` so
@@ -787,25 +796,38 @@ pub(crate) fn wait_for_database_inner(
     let mut attempt: u32 = 0;
     loop {
         attempt += 1;
-        match try_connect() {
+        // Extract the transient error message or return immediately for Ok/Fatal.
+        let retryable_msg = match try_connect() {
             Ok(()) => return Ok(()),
             Err(AttemptError::Fatal(msg)) => {
                 return Err(MigrationError::Connection(redact_db_url_credentials(&msg)));
             }
-            Err(AttemptError::Retryable) => {
-                let elapsed_now = elapsed();
-                if elapsed_now >= max_wait {
-                    return Err(MigrationError::Connection(format!(
-                        "database did not become reachable within {}s \
-                         after {} attempt(s); timed out waiting for startup",
-                        max_wait.as_secs(),
-                        attempt,
-                    )));
-                }
-                let delay = backoff_delay(attempt).min(max_wait.saturating_sub(elapsed_now));
-                on_retry(attempt, delay);
-                sleep(delay);
-            }
+            Err(AttemptError::Retryable(msg)) => msg,
+        };
+        let elapsed_now = elapsed();
+        if elapsed_now >= max_wait {
+            return Err(MigrationError::Connection(format!(
+                "database did not become reachable within {}s after {} attempt(s); \
+                 timed out waiting for startup (last error: {})",
+                max_wait.as_secs(),
+                attempt,
+                redact_db_url_credentials(&retryable_msg),
+            )));
+        }
+        let delay = backoff_delay(attempt).min(max_wait.saturating_sub(elapsed_now));
+        on_retry(attempt, delay);
+        sleep(delay);
+        // Guard against sleep overshoot: if the deadline has now passed, don't
+        // start another connection attempt (which could block for a full
+        // per-attempt connect_timeout before detecting the expiry).
+        if elapsed() >= max_wait {
+            return Err(MigrationError::Connection(format!(
+                "database did not become reachable within {}s after {} attempt(s); \
+                 timed out waiting for startup (last error: {})",
+                max_wait.as_secs(),
+                attempt,
+                redact_db_url_credentials(&retryable_msg),
+            )));
         }
     }
 }
@@ -859,25 +881,28 @@ pub fn wait_for_database(
     max_wait: std::time::Duration,
     mut on_retry: impl FnMut(u32, std::time::Duration),
 ) -> Result<(), MigrationError> {
-    // Set a per-attempt connect_timeout so a single hung establish() call
-    // cannot block longer than max_wait (e.g. a DROP-firewalled host that
-    // accepts the SYN but never completes the handshake).  libpq's
-    // connect_timeout is in whole seconds; clamp to at least 1.
-    let connect_timeout_secs = max_wait.as_secs().max(1);
-    let timed_url = with_connect_timeout(database_url, connect_timeout_secs);
-
     let start = std::time::Instant::now();
     wait_for_database_inner(
         max_wait,
         || {
-            diesel::PgConnection::establish(&timed_url).map(|_conn| ()).map_err(|e| {
-                let msg = e.to_string();
-                if is_retryable_connection_error(&msg) {
-                    AttemptError::Retryable
-                } else {
-                    AttemptError::Fatal(msg)
-                }
-            })
+            // Cap the per-attempt connect_timeout to the remaining budget so
+            // a single hung establish() call cannot extend the total wait beyond
+            // max_wait (e.g. a DROP-firewalled host that accepts the SYN but
+            // never completes the handshake).  libpq's connect_timeout is in
+            // whole seconds; clamp to at least 1.
+            let remaining = max_wait.saturating_sub(start.elapsed());
+            let connect_timeout_secs = remaining.as_secs().max(1);
+            let timed_url = with_connect_timeout(database_url, connect_timeout_secs);
+            diesel::PgConnection::establish(&timed_url)
+                .map(|_conn| ())
+                .map_err(|e| {
+                    let msg = e.to_string();
+                    if is_retryable_connection_error(&msg) {
+                        AttemptError::Retryable(msg)
+                    } else {
+                        AttemptError::Fatal(msg)
+                    }
+                })
         },
         std::thread::sleep,
         move || start.elapsed(),
@@ -1569,7 +1594,9 @@ mod tests {
     #[test]
     fn is_retryable_connection_refused() {
         assert!(is_retryable_connection_error("connection refused"));
-        assert!(is_retryable_connection_error("FATAL: connection refused (os error 111)"));
+        assert!(is_retryable_connection_error(
+            "FATAL: connection refused (os error 111)"
+        ));
     }
 
     #[test]
@@ -1582,7 +1609,9 @@ mod tests {
     #[test]
     fn is_retryable_timed_out() {
         assert!(is_retryable_connection_error("connection timed out"));
-        assert!(is_retryable_connection_error("timed out waiting for server"));
+        assert!(is_retryable_connection_error(
+            "timed out waiting for server"
+        ));
     }
 
     #[test]
@@ -1672,7 +1701,10 @@ mod tests {
             !out.contains("****"),
             "no-cred url should not be mangled: {out}"
         );
-        assert!(out.contains("host:5432"), "host should still be present: {out}");
+        assert!(
+            out.contains("host:5432"),
+            "host should still be present: {out}"
+        );
     }
 
     #[test]
@@ -1692,7 +1724,10 @@ mod tests {
         // token must be replaced with **** rather than passed through unredacted.
         let msg = "error: postgres://user:p@ss@host/db";
         let out = redact_db_url_credentials(msg);
-        assert!(!out.contains("p@ss"), "unparseable password must not leak: {out}");
+        assert!(
+            !out.contains("p@ss"),
+            "unparseable password must not leak: {out}"
+        );
     }
 
     #[test]
@@ -1751,7 +1786,7 @@ mod tests {
                 let n = attempts.get() + 1;
                 attempts.set(n);
                 if n < 3 {
-                    Err(AttemptError::Retryable)
+                    Err(AttemptError::Retryable("connection refused".to_string()))
                 } else {
                     Ok(())
                 }
@@ -1777,7 +1812,7 @@ mod tests {
             std::time::Duration::from_secs(5),
             || {
                 attempts.set(attempts.get() + 1);
-                Err(AttemptError::Retryable)
+                Err(AttemptError::Retryable("connection refused".to_string()))
             },
             |_| {},
             || std::time::Duration::from_secs(10), // fake: already past the budget

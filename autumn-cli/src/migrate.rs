@@ -350,7 +350,10 @@ fn run_single_target(
     // When wait == Duration::ZERO we skip entirely so the existing fail-fast
     // path is preserved byte-for-byte (AC #6).
     if wait > std::time::Duration::ZERO {
-        eprintln!("  Waiting up to {}s for database to become reachable…", wait.as_secs());
+        eprintln!(
+            "  Waiting up to {}s for database to become reachable…",
+            wait.as_secs()
+        );
         match wait_for_database(database_url, wait, |attempt, delay| {
             eprintln!(
                 "  Database not reachable yet (attempt {attempt}); \
@@ -954,10 +957,7 @@ where
 /// 1. `AUTUMN_DATABASE__STARTUP_WAIT_SECS` env var (highest)
 /// 2. `database.startup_wait_secs` in the merged `autumn.toml` table
 /// 3. `0` (default, fail-fast — no wait)
-pub fn resolve_startup_wait_secs_from_sources<F>(
-    env_var: F,
-    table: Option<&toml::Table>,
-) -> u64
+pub fn resolve_startup_wait_secs_from_sources<F>(env_var: F, table: Option<&toml::Table>) -> u64
 where
     F: Fn(&str) -> Result<String, std::env::VarError>,
 {
@@ -3031,10 +3031,8 @@ primary_url = "postgres://prod-s0:5432/app"
 
     #[test]
     fn resolve_startup_wait_secs_defaults_to_zero() {
-        let secs = resolve_startup_wait_secs_from_sources(
-            |_| Err(std::env::VarError::NotPresent),
-            None,
-        );
+        let secs =
+            resolve_startup_wait_secs_from_sources(|_| Err(std::env::VarError::NotPresent), None);
         assert_eq!(secs, 0);
     }
 
@@ -3042,10 +3040,7 @@ primary_url = "postgres://prod-s0:5432/app"
     fn resolve_startup_wait_secs_from_toml() {
         let mut table = toml::Table::new();
         let mut db = toml::Table::new();
-        db.insert(
-            "startup_wait_secs".to_owned(),
-            toml::Value::Integer(45),
-        );
+        db.insert("startup_wait_secs".to_owned(), toml::Value::Integer(45));
         table.insert("database".to_owned(), toml::Value::Table(db));
         let secs = resolve_startup_wait_secs_from_sources(
             |_| Err(std::env::VarError::NotPresent),
@@ -3058,10 +3053,7 @@ primary_url = "postgres://prod-s0:5432/app"
     fn resolve_startup_wait_secs_env_overrides_toml() {
         let mut table = toml::Table::new();
         let mut db = toml::Table::new();
-        db.insert(
-            "startup_wait_secs".to_owned(),
-            toml::Value::Integer(10),
-        );
+        db.insert("startup_wait_secs".to_owned(), toml::Value::Integer(10));
         table.insert("database".to_owned(), toml::Value::Table(db));
         let secs = resolve_startup_wait_secs_from_sources(
             |key| {
@@ -3080,10 +3072,7 @@ primary_url = "postgres://prod-s0:5432/app"
     fn resolve_startup_wait_secs_bad_env_falls_back_to_toml() {
         let mut table = toml::Table::new();
         let mut db = toml::Table::new();
-        db.insert(
-            "startup_wait_secs".to_owned(),
-            toml::Value::Integer(30),
-        );
+        db.insert("startup_wait_secs".to_owned(), toml::Value::Integer(30));
         table.insert("database".to_owned(), toml::Value::Table(db));
         let secs = resolve_startup_wait_secs_from_sources(
             |key| {

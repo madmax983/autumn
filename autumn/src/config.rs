@@ -6353,8 +6353,7 @@ path = "/healthz"
 
     #[test]
     fn startup_wait_secs_parses_from_toml() {
-        let config: AutumnConfig =
-            toml::from_str("[database]\nstartup_wait_secs = 30").unwrap();
+        let config: AutumnConfig = toml::from_str("[database]\nstartup_wait_secs = 30").unwrap();
         assert_eq!(config.database.startup_wait_secs, 30);
     }
 
