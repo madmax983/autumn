@@ -688,6 +688,10 @@ pub(crate) fn is_retryable_connection_error(msg: &str) -> bool {
         || lower.contains("host is unreachable")
         || lower.contains("network is unreachable")
         || lower.contains("timed out")
+        // libpq reports a connect_timeout expiry as "timeout expired" (not
+        // "timed out"), so firewalled hosts that silently drop packets are
+        // also retryable rather than being mis-classified as fatal.
+        || lower.contains("timeout expired")
         || lower.contains("connection closed")
         // DNS resolution failures — common in Docker Compose / Kubernetes
         // cold-start where the 'db' hostname resolves only after the DNS
@@ -1607,6 +1611,11 @@ mod tests {
         assert!(is_retryable_connection_error("connection timed out"));
         assert!(is_retryable_connection_error(
             "timed out waiting for server"
+        ));
+        // libpq reports connect_timeout expiry as "timeout expired"
+        assert!(is_retryable_connection_error("timeout expired"));
+        assert!(is_retryable_connection_error(
+            "ERROR: SSL connection: timeout expired"
         ));
     }
 
