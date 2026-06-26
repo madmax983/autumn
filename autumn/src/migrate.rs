@@ -658,20 +658,6 @@ where
     result
 }
 
-/// Open a new Postgres connection and acquire the migration advisory lock,
-/// returning a [`MigrationLockGuard`] that releases it on drop.
-///
-/// This is the right primitive when migrations are run by an external process
-/// (e.g. the `diesel` CLI subprocess in `autumn migrate run`): the guard keeps
-/// the lock connection alive for the duration of the external run.
-///
-/// Use [`run_pending_locked`] when the Rust harness runs migrations directly.
-///
-/// # Errors
-///
-/// Returns [`MigrationError::Connection`] if the database is unreachable, or
-/// [`MigrationError::LockTimeout`] if the lock cannot be acquired within
-/// `wait_timeout`.
 // ── Startup wait-for-database ─────────────────────────────────────────────────
 
 /// A single connect attempt returned by the injected `try_connect` closure.
@@ -832,50 +818,46 @@ pub(crate) fn wait_for_database_inner(
     }
 }
 
+fn with_connect_timeout(url: &str, timeout_secs: u64) -> String {
+    // Splice `connect_timeout` directly into the raw percent-encoded query
+    // string so existing parameters (e.g. `options=-c%20search_path%3Dapp`)
+    // are preserved byte-for-byte.  Using query_pairs() / append_pair() would
+    // decode and re-encode them via form encoding (spaces → `+`), which libpq
+    // does not accept.
+    url::Url::parse(url).map_or_else(
+        |_| url.to_owned(),
+        |mut parsed| {
+            let pair = format!("connect_timeout={timeout_secs}");
+            let raw = parsed
+                .query()
+                .unwrap_or("")
+                .split('&')
+                .filter(|p| !p.is_empty() && !p.starts_with("connect_timeout="))
+                .chain(std::iter::once(pair.as_str()))
+                .collect::<Vec<_>>()
+                .join("&");
+            parsed.set_query(Some(&raw));
+            parsed.to_string()
+        },
+    )
+}
+
 /// Wait for the database at `database_url` to accept connections, retrying
 /// with capped exponential backoff until either success or `max_wait` elapses.
 ///
 /// * `max_wait == Duration::ZERO` — callers **must not** call this function;
-///   skip it and connect directly (preserves today's fail-fast behaviour,
-///   AC #6).
+///   skip it and connect directly (preserves today's fail-fast behaviour).
 /// * Non-retryable errors (auth failures, bad URL, missing database) are
 ///   surfaced immediately regardless of `max_wait`.
-/// * Connection credentials are never included in retry log output (AC #4).
+/// * Connection credentials are never included in retry log output.
 ///
-/// `on_retry` is invoked **before** each sleep so the CLI can print a visible
-/// `eprintln!` message with attempt count and next delay.
+/// `on_retry` is called **before** each sleep with `(attempt, next_delay)` so
+/// the CLI can print a visible message with attempt count and next delay.
 ///
 /// # Errors
 ///
-/// Returns [`MigrationError::Connection`] on either a fatal error or a timeout.
-/// Append (or replace) a `connect_timeout` query parameter in a libpq
-/// connection URI so that a single `establish` call cannot block longer than
-/// `timeout_secs` seconds.  This bounds each attempt within the startup wait
-/// loop independently of the loop's own elapsed-time check.
-///
-/// Falls back to the original URL unchanged when parsing fails (the `establish`
-/// call will then produce a `Fatal` error).
-fn with_connect_timeout(url: &str, timeout_secs: u64) -> String {
-    if let Ok(mut parsed) = url::Url::parse(url) {
-        let params: Vec<(String, String)> = parsed
-            .query_pairs()
-            .filter(|(k, _)| k != "connect_timeout")
-            .map(|(k, v)| (k.into_owned(), v.into_owned()))
-            .collect();
-        {
-            let mut qs = parsed.query_pairs_mut();
-            qs.clear();
-            for (k, v) in &params {
-                qs.append_pair(k, v);
-            }
-            qs.append_pair("connect_timeout", &timeout_secs.to_string());
-        }
-        parsed.to_string()
-    } else {
-        url.to_owned()
-    }
-}
-
+/// Returns [`MigrationError::Connection`] when a fatal (non-retryable) error
+/// is encountered or when `max_wait` elapses without a successful connection.
 pub fn wait_for_database(
     database_url: &str,
     max_wait: std::time::Duration,
@@ -917,6 +899,20 @@ pub fn wait_for_database(
     )
 }
 
+/// Open a new Postgres connection and acquire the migration advisory lock,
+/// returning a [`MigrationLockGuard`] that releases it on drop.
+///
+/// This is the right primitive when migrations are run by an external process
+/// (e.g. the `diesel` CLI subprocess in `autumn migrate run`): the guard keeps
+/// the lock connection alive for the duration of the external run.
+///
+/// Use [`run_pending_locked`] when the Rust harness runs migrations directly.
+///
+/// # Errors
+///
+/// Returns [`MigrationError::Connection`] if the database is unreachable, or
+/// [`MigrationError::LockTimeout`] if the lock cannot be acquired within
+/// `wait_timeout`.
 pub fn hold_migration_lock(
     database_url: &str,
     wait_timeout: std::time::Duration,
@@ -1800,7 +1796,7 @@ mod tests {
         assert_eq!(sleep_delays.len(), 2);
         // Delays grow with capped exponential backoff
         assert_eq!(sleep_delays[0], std::time::Duration::from_millis(500));
-        assert_eq!(sleep_delays[1], std::time::Duration::from_millis(1000));
+        assert_eq!(sleep_delays[1], std::time::Duration::from_secs(1));
     }
 
     #[test]
