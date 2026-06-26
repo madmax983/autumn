@@ -568,6 +568,24 @@ where
     }
 }
 
+/// Helper trait to display or extract a string representation of the tenant ID.
+pub trait DisplayTenantId {
+    /// Returns the string slice of the tenant ID.
+    fn tenant_id_str(&self) -> &str;
+}
+
+impl DisplayTenantId for String {
+    fn tenant_id_str(&self) -> &str {
+        self
+    }
+}
+
+impl DisplayTenantId for Option<String> {
+    fn tenant_id_str(&self) -> &str {
+        self.as_deref().unwrap_or("default")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

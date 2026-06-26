@@ -192,7 +192,12 @@ pub fn plan_scaffold_with_options(
             format!("missing {}", main_path.display()),
         ))
     })?;
-    let route_entries = main_route_entries(&plural, &snake_name, options_with_key.api);
+    let route_entries = main_route_entries(
+        &plural,
+        &snake_name,
+        options_with_key.api,
+        options_with_key.live,
+    );
     let mut mods = vec!["models", "schema", "repositories"];
     if !options_with_key.api {
         mods.push("routes");
@@ -1337,7 +1342,7 @@ fn render_smoke_test(
     }
 }
 
-fn main_route_entries(plural: &str, snake_name: &str, api: bool) -> Vec<String> {
+fn main_route_entries(plural: &str, snake_name: &str, api: bool, live: bool) -> Vec<String> {
     if api {
         vec![
             format!("repositories::{snake_name}::{snake_name}_api_list"),
@@ -1347,7 +1352,7 @@ fn main_route_entries(plural: &str, snake_name: &str, api: bool) -> Vec<String> 
             format!("repositories::{snake_name}::{snake_name}_api_delete"),
         ]
     } else {
-        vec![
+        let mut entries = vec![
             format!("routes::{plural}::index"),
             format!("routes::{plural}::show"),
             format!("routes::{plural}::new_form"),
@@ -1355,9 +1360,13 @@ fn main_route_entries(plural: &str, snake_name: &str, api: bool) -> Vec<String> 
             format!("routes::{plural}::edit_form"),
             format!("routes::{plural}::update"),
             format!("routes::{plural}::destroy"),
-            format!("repositories::{snake_name}::{snake_name}_api_list"),
-            format!("repositories::{snake_name}::{snake_name}_api_get"),
-        ]
+        ];
+        if live {
+            entries.push(format!("routes::{plural}::events"));
+        }
+        entries.push(format!("repositories::{snake_name}::{snake_name}_api_list"));
+        entries.push(format!("repositories::{snake_name}::{snake_name}_api_get"));
+        entries
     }
 }
 
@@ -2163,6 +2172,9 @@ async fn main() {
         assert!(routes.contains("script src=\"/static/js/htmx.min.js\""));
         assert!(routes.contains("script src=\"/static/js/sse.js\""));
         assert!(routes.contains("title: autumn_web::hooks::Patch::Set(form.title.clone())"));
+
+        let main_rs = fs::read_to_string(tmp.path().join("src/main.rs")).unwrap();
+        assert!(main_rs.contains("routes::posts::events"));
 
         let repo = fs::read_to_string(tmp.path().join("src/repositories/post.rs")).unwrap();
         assert!(repo.contains("broadcasts = true"));

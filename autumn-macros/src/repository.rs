@@ -1396,7 +1396,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             };
 
             let topic_expr = if config.tenant_scoped {
-                quote! { ::std::format!("tenant:{}:{}", __record.tenant_id, #base_topic_expr) }
+                quote! { ::std::format!("tenant:{}:{}", ::autumn_web::tenancy::DisplayTenantId::tenant_id_str(&__record.tenant_id), #base_topic_expr) }
             } else {
                 base_topic_expr
             };
