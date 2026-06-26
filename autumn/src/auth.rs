@@ -2029,6 +2029,45 @@ pub use db_store::DbApiTokenStore;
 mod tests {
     use super::*;
 
+    /// Build a minimal `AppState` for middleware tests, parameterized only by
+    /// the auth session key (the sole field these tests vary). Collapses the
+    /// otherwise-identical struct literal that each test would copy verbatim.
+    fn test_app_state(auth_session_key: &str) -> crate::state::AppState {
+        crate::state::AppState {
+            extensions: std::sync::Arc::new(std::sync::RwLock::new(
+                std::collections::HashMap::new(),
+            )),
+            #[cfg(feature = "db")]
+            pool: None,
+            #[cfg(feature = "db")]
+            replica_pool: None,
+            #[cfg(feature = "db")]
+            shards: None,
+            profile: None,
+            started_at: std::time::Instant::now(),
+            health_detailed: false,
+            probes: crate::probe::ProbeState::ready_for_test(),
+            metrics: crate::middleware::MetricsCollector::new(),
+            log_levels: crate::actuator::LogLevels::new("info"),
+            task_registry: crate::actuator::TaskRegistry::new(),
+            job_registry: crate::actuator::JobRegistry::new(),
+            config_props: crate::actuator::ConfigProperties::default(),
+            metrics_source_registry: crate::actuator::MetricsSourceRegistry::new(),
+            health_indicator_registry: crate::actuator::HealthIndicatorRegistry::new(),
+            #[cfg(feature = "ws")]
+            channels: crate::channels::Channels::new(32),
+            #[cfg(feature = "presence")]
+            presence: crate::presence::Presence::new(crate::channels::Channels::new(32)),
+            #[cfg(feature = "ws")]
+            shutdown: tokio_util::sync::CancellationToken::new(),
+            policy_registry: crate::authorization::PolicyRegistry::default(),
+            forbidden_response: crate::authorization::ForbiddenResponse::default(),
+            auth_session_key: auth_session_key.to_owned(),
+            shared_cache: None,
+            clock: std::sync::Arc::new(crate::time::SystemClock),
+        }
+    }
+
     #[tokio::test]
     async fn hash_and_verify_password() {
         let hash = hash_password("test_password").await.unwrap();
@@ -2278,7 +2317,6 @@ mod tests {
 
     #[tokio::test]
     async fn auth_extractor_returns_401_when_no_user() {
-        use crate::state::AppState;
         use axum::Router;
         use axum::body::Body;
         use axum::routing::get;
@@ -2293,39 +2331,7 @@ mod tests {
             user.name
         }
 
-        let state = AppState {
-            extensions: std::sync::Arc::new(std::sync::RwLock::new(
-                std::collections::HashMap::new(),
-            )),
-            #[cfg(feature = "db")]
-            pool: None,
-            #[cfg(feature = "db")]
-            replica_pool: None,
-            #[cfg(feature = "db")]
-            shards: None,
-            profile: None,
-            started_at: std::time::Instant::now(),
-            health_detailed: false,
-            probes: crate::probe::ProbeState::ready_for_test(),
-            metrics: crate::middleware::MetricsCollector::new(),
-            log_levels: crate::actuator::LogLevels::new("info"),
-            task_registry: crate::actuator::TaskRegistry::new(),
-            job_registry: crate::actuator::JobRegistry::new(),
-            config_props: crate::actuator::ConfigProperties::default(),
-            metrics_source_registry: crate::actuator::MetricsSourceRegistry::new(),
-            health_indicator_registry: crate::actuator::HealthIndicatorRegistry::new(),
-            #[cfg(feature = "ws")]
-            channels: crate::channels::Channels::new(32),
-            #[cfg(feature = "presence")]
-            presence: crate::presence::Presence::new(crate::channels::Channels::new(32)),
-            #[cfg(feature = "ws")]
-            shutdown: tokio_util::sync::CancellationToken::new(),
-            policy_registry: crate::authorization::PolicyRegistry::default(),
-            forbidden_response: crate::authorization::ForbiddenResponse::default(),
-            auth_session_key: "user_id".to_owned(),
-            shared_cache: None,
-            clock: std::sync::Arc::new(crate::time::SystemClock),
-        };
+        let state = test_app_state("user_id");
 
         let app = Router::new().route("/", get(handler)).with_state(state);
 
@@ -2344,7 +2350,6 @@ mod tests {
 
     #[tokio::test]
     async fn auth_extractor_returns_user_when_present() {
-        use crate::state::AppState;
         use axum::Router;
         use axum::body::Body;
         use axum::routing::get;
@@ -2359,39 +2364,7 @@ mod tests {
             user.name
         }
 
-        let state = AppState {
-            extensions: std::sync::Arc::new(std::sync::RwLock::new(
-                std::collections::HashMap::new(),
-            )),
-            #[cfg(feature = "db")]
-            pool: None,
-            #[cfg(feature = "db")]
-            replica_pool: None,
-            #[cfg(feature = "db")]
-            shards: None,
-            profile: None,
-            started_at: std::time::Instant::now(),
-            health_detailed: false,
-            probes: crate::probe::ProbeState::ready_for_test(),
-            metrics: crate::middleware::MetricsCollector::new(),
-            log_levels: crate::actuator::LogLevels::new("info"),
-            task_registry: crate::actuator::TaskRegistry::new(),
-            job_registry: crate::actuator::JobRegistry::new(),
-            config_props: crate::actuator::ConfigProperties::default(),
-            metrics_source_registry: crate::actuator::MetricsSourceRegistry::new(),
-            health_indicator_registry: crate::actuator::HealthIndicatorRegistry::new(),
-            #[cfg(feature = "ws")]
-            channels: crate::channels::Channels::new(32),
-            #[cfg(feature = "presence")]
-            presence: crate::presence::Presence::new(crate::channels::Channels::new(32)),
-            #[cfg(feature = "ws")]
-            shutdown: tokio_util::sync::CancellationToken::new(),
-            policy_registry: crate::authorization::PolicyRegistry::default(),
-            forbidden_response: crate::authorization::ForbiddenResponse::default(),
-            auth_session_key: "user_id".to_owned(),
-            shared_cache: None,
-            clock: std::sync::Arc::new(crate::time::SystemClock),
-        };
+        let state = test_app_state("user_id");
 
         // Middleware that inserts a user into extensions
         let app = Router::new()
@@ -2431,41 +2404,8 @@ mod tests {
         use tower::ServiceExt;
 
         use crate::session::{MemoryStore, SessionConfig, SessionLayer};
-        use crate::state::AppState;
 
-        let state = AppState {
-            extensions: std::sync::Arc::new(std::sync::RwLock::new(
-                std::collections::HashMap::new(),
-            )),
-            #[cfg(feature = "db")]
-            pool: None,
-            #[cfg(feature = "db")]
-            replica_pool: None,
-            #[cfg(feature = "db")]
-            shards: None,
-            profile: None,
-            started_at: std::time::Instant::now(),
-            health_detailed: false,
-            probes: crate::probe::ProbeState::ready_for_test(),
-            metrics: crate::middleware::MetricsCollector::new(),
-            log_levels: crate::actuator::LogLevels::new("info"),
-            task_registry: crate::actuator::TaskRegistry::new(),
-            job_registry: crate::actuator::JobRegistry::new(),
-            config_props: crate::actuator::ConfigProperties::default(),
-            metrics_source_registry: crate::actuator::MetricsSourceRegistry::new(),
-            health_indicator_registry: crate::actuator::HealthIndicatorRegistry::new(),
-            #[cfg(feature = "ws")]
-            channels: crate::channels::Channels::new(32),
-            #[cfg(feature = "presence")]
-            presence: crate::presence::Presence::new(crate::channels::Channels::new(32)),
-            #[cfg(feature = "ws")]
-            shutdown: tokio_util::sync::CancellationToken::new(),
-            policy_registry: crate::authorization::PolicyRegistry::default(),
-            forbidden_response: crate::authorization::ForbiddenResponse::default(),
-            auth_session_key: "user_id".to_owned(),
-            shared_cache: None,
-            clock: std::sync::Arc::new(crate::time::SystemClock),
-        };
+        let state = test_app_state("user_id");
 
         let app = Router::new()
             .route("/protected", get(|| async { "secret" }))
@@ -2556,46 +2496,13 @@ mod tests {
         use tower::ServiceExt;
 
         use crate::session::{MemoryStore, SessionConfig, SessionLayer};
-        use crate::state::AppState;
 
         #[autumn_macros::secured]
         async fn protected_handler() -> crate::AutumnResult<&'static str> {
             Ok("secret")
         }
 
-        let state = AppState {
-            extensions: std::sync::Arc::new(std::sync::RwLock::new(
-                std::collections::HashMap::new(),
-            )),
-            #[cfg(feature = "db")]
-            pool: None,
-            #[cfg(feature = "db")]
-            replica_pool: None,
-            #[cfg(feature = "db")]
-            shards: None,
-            profile: None,
-            started_at: std::time::Instant::now(),
-            health_detailed: false,
-            probes: crate::probe::ProbeState::ready_for_test(),
-            metrics: crate::middleware::MetricsCollector::new(),
-            log_levels: crate::actuator::LogLevels::new("info"),
-            task_registry: crate::actuator::TaskRegistry::new(),
-            job_registry: crate::actuator::JobRegistry::new(),
-            config_props: crate::actuator::ConfigProperties::default(),
-            metrics_source_registry: crate::actuator::MetricsSourceRegistry::new(),
-            health_indicator_registry: crate::actuator::HealthIndicatorRegistry::new(),
-            #[cfg(feature = "ws")]
-            channels: crate::channels::Channels::new(32),
-            #[cfg(feature = "presence")]
-            presence: crate::presence::Presence::new(crate::channels::Channels::new(32)),
-            #[cfg(feature = "ws")]
-            shutdown: tokio_util::sync::CancellationToken::new(),
-            policy_registry: crate::authorization::PolicyRegistry::default(),
-            forbidden_response: crate::authorization::ForbiddenResponse::default(),
-            auth_session_key: "user_id".to_owned(),
-            shared_cache: None,
-            clock: std::sync::Arc::new(crate::time::SystemClock),
-        };
+        let state = test_app_state("user_id");
 
         let app = Router::new()
             .route("/", get(protected_handler))
@@ -2627,7 +2534,6 @@ mod tests {
         use tower::ServiceExt;
 
         use crate::session::{MemoryStore, SessionConfig, SessionLayer, SessionStore};
-        use crate::state::AppState;
 
         #[autumn_macros::secured]
         async fn protected_handler() -> crate::AutumnResult<&'static str> {
@@ -2643,39 +2549,7 @@ mod tests {
             .await
             .unwrap();
 
-        let state = AppState {
-            extensions: std::sync::Arc::new(std::sync::RwLock::new(
-                std::collections::HashMap::new(),
-            )),
-            #[cfg(feature = "db")]
-            pool: None,
-            #[cfg(feature = "db")]
-            replica_pool: None,
-            #[cfg(feature = "db")]
-            shards: None,
-            profile: None,
-            started_at: std::time::Instant::now(),
-            health_detailed: false,
-            probes: crate::probe::ProbeState::ready_for_test(),
-            metrics: crate::middleware::MetricsCollector::new(),
-            log_levels: crate::actuator::LogLevels::new("info"),
-            task_registry: crate::actuator::TaskRegistry::new(),
-            job_registry: crate::actuator::JobRegistry::new(),
-            config_props: crate::actuator::ConfigProperties::default(),
-            metrics_source_registry: crate::actuator::MetricsSourceRegistry::new(),
-            health_indicator_registry: crate::actuator::HealthIndicatorRegistry::new(),
-            #[cfg(feature = "ws")]
-            channels: crate::channels::Channels::new(32),
-            #[cfg(feature = "presence")]
-            presence: crate::presence::Presence::new(crate::channels::Channels::new(32)),
-            #[cfg(feature = "ws")]
-            shutdown: tokio_util::sync::CancellationToken::new(),
-            policy_registry: crate::authorization::PolicyRegistry::default(),
-            forbidden_response: crate::authorization::ForbiddenResponse::default(),
-            auth_session_key: "user_id".to_owned(),
-            shared_cache: None,
-            clock: std::sync::Arc::new(crate::time::SystemClock),
-        };
+        let state = test_app_state("user_id");
 
         let app = Router::new()
             .route("/", get(protected_handler))
@@ -2709,7 +2583,6 @@ mod tests {
         use tower::ServiceExt;
 
         use crate::session::{MemoryStore, SessionConfig, SessionLayer, SessionStore};
-        use crate::state::AppState;
 
         #[autumn_macros::secured]
         async fn account_handler() -> crate::AutumnResult<&'static str> {
@@ -2728,39 +2601,7 @@ mod tests {
             .await
             .unwrap();
 
-        let state = AppState {
-            extensions: std::sync::Arc::new(std::sync::RwLock::new(
-                std::collections::HashMap::new(),
-            )),
-            #[cfg(feature = "db")]
-            pool: None,
-            #[cfg(feature = "db")]
-            replica_pool: None,
-            #[cfg(feature = "db")]
-            shards: None,
-            profile: None,
-            started_at: std::time::Instant::now(),
-            health_detailed: false,
-            probes: crate::probe::ProbeState::ready_for_test(),
-            metrics: crate::middleware::MetricsCollector::new(),
-            log_levels: crate::actuator::LogLevels::new("info"),
-            task_registry: crate::actuator::TaskRegistry::new(),
-            job_registry: crate::actuator::JobRegistry::new(),
-            config_props: crate::actuator::ConfigProperties::default(),
-            metrics_source_registry: crate::actuator::MetricsSourceRegistry::new(),
-            health_indicator_registry: crate::actuator::HealthIndicatorRegistry::new(),
-            #[cfg(feature = "ws")]
-            channels: crate::channels::Channels::new(32),
-            #[cfg(feature = "presence")]
-            presence: crate::presence::Presence::new(crate::channels::Channels::new(32)),
-            #[cfg(feature = "ws")]
-            shutdown: tokio_util::sync::CancellationToken::new(),
-            policy_registry: crate::authorization::PolicyRegistry::default(),
-            forbidden_response: crate::authorization::ForbiddenResponse::default(),
-            auth_session_key: "uid".to_owned(),
-            shared_cache: None,
-            clock: std::sync::Arc::new(crate::time::SystemClock),
-        };
+        let state = test_app_state("uid");
 
         let app = Router::new()
             .route("/account", get(account_handler))
@@ -2794,7 +2635,6 @@ mod tests {
         use tower::ServiceExt;
 
         use crate::session::{MemoryStore, SessionConfig, SessionLayer, SessionStore};
-        use crate::state::AppState;
 
         #[autumn_macros::secured("admin")]
         async fn admin_only() -> crate::AutumnResult<&'static str> {
@@ -2813,39 +2653,7 @@ mod tests {
             .await
             .unwrap();
 
-        let state = AppState {
-            extensions: std::sync::Arc::new(std::sync::RwLock::new(
-                std::collections::HashMap::new(),
-            )),
-            #[cfg(feature = "db")]
-            pool: None,
-            #[cfg(feature = "db")]
-            replica_pool: None,
-            #[cfg(feature = "db")]
-            shards: None,
-            profile: None,
-            started_at: std::time::Instant::now(),
-            health_detailed: false,
-            probes: crate::probe::ProbeState::ready_for_test(),
-            metrics: crate::middleware::MetricsCollector::new(),
-            log_levels: crate::actuator::LogLevels::new("info"),
-            task_registry: crate::actuator::TaskRegistry::new(),
-            job_registry: crate::actuator::JobRegistry::new(),
-            config_props: crate::actuator::ConfigProperties::default(),
-            metrics_source_registry: crate::actuator::MetricsSourceRegistry::new(),
-            health_indicator_registry: crate::actuator::HealthIndicatorRegistry::new(),
-            #[cfg(feature = "ws")]
-            channels: crate::channels::Channels::new(32),
-            #[cfg(feature = "presence")]
-            presence: crate::presence::Presence::new(crate::channels::Channels::new(32)),
-            #[cfg(feature = "ws")]
-            shutdown: tokio_util::sync::CancellationToken::new(),
-            policy_registry: crate::authorization::PolicyRegistry::default(),
-            forbidden_response: crate::authorization::ForbiddenResponse::default(),
-            auth_session_key: "user_id".to_owned(),
-            shared_cache: None,
-            clock: std::sync::Arc::new(crate::time::SystemClock),
-        };
+        let state = test_app_state("user_id");
 
         let app = Router::new()
             .route("/", get(admin_only))
@@ -2875,7 +2683,6 @@ mod tests {
         use tower::ServiceExt;
 
         use crate::session::{MemoryStore, SessionConfig, SessionLayer, SessionStore};
-        use crate::state::AppState;
 
         #[autumn_macros::secured("admin", "editor")]
         async fn content_handler() -> crate::AutumnResult<&'static str> {
@@ -2894,39 +2701,7 @@ mod tests {
             .await
             .unwrap();
 
-        let state = AppState {
-            extensions: std::sync::Arc::new(std::sync::RwLock::new(
-                std::collections::HashMap::new(),
-            )),
-            #[cfg(feature = "db")]
-            pool: None,
-            #[cfg(feature = "db")]
-            replica_pool: None,
-            #[cfg(feature = "db")]
-            shards: None,
-            profile: None,
-            started_at: std::time::Instant::now(),
-            health_detailed: false,
-            probes: crate::probe::ProbeState::ready_for_test(),
-            metrics: crate::middleware::MetricsCollector::new(),
-            log_levels: crate::actuator::LogLevels::new("info"),
-            task_registry: crate::actuator::TaskRegistry::new(),
-            job_registry: crate::actuator::JobRegistry::new(),
-            config_props: crate::actuator::ConfigProperties::default(),
-            metrics_source_registry: crate::actuator::MetricsSourceRegistry::new(),
-            health_indicator_registry: crate::actuator::HealthIndicatorRegistry::new(),
-            #[cfg(feature = "ws")]
-            channels: crate::channels::Channels::new(32),
-            #[cfg(feature = "presence")]
-            presence: crate::presence::Presence::new(crate::channels::Channels::new(32)),
-            #[cfg(feature = "ws")]
-            shutdown: tokio_util::sync::CancellationToken::new(),
-            policy_registry: crate::authorization::PolicyRegistry::default(),
-            forbidden_response: crate::authorization::ForbiddenResponse::default(),
-            auth_session_key: "user_id".to_owned(),
-            shared_cache: None,
-            clock: std::sync::Arc::new(crate::time::SystemClock),
-        };
+        let state = test_app_state("user_id");
 
         let app = Router::new()
             .route("/", get(content_handler))
@@ -2960,7 +2735,6 @@ mod tests {
         use tower::ServiceExt;
 
         use crate::session::{MemoryStore, SessionConfig, SessionLayer, SessionStore};
-        use crate::state::AppState;
 
         let store = MemoryStore::new();
         // Pre-populate a session with user_id
@@ -2968,39 +2742,7 @@ mod tests {
         session_data.insert("user_id".into(), "42".into());
         store.save("valid-session", session_data).await.unwrap();
 
-        let state = AppState {
-            extensions: std::sync::Arc::new(std::sync::RwLock::new(
-                std::collections::HashMap::new(),
-            )),
-            #[cfg(feature = "db")]
-            pool: None,
-            #[cfg(feature = "db")]
-            replica_pool: None,
-            #[cfg(feature = "db")]
-            shards: None,
-            profile: None,
-            started_at: std::time::Instant::now(),
-            health_detailed: false,
-            probes: crate::probe::ProbeState::ready_for_test(),
-            metrics: crate::middleware::MetricsCollector::new(),
-            log_levels: crate::actuator::LogLevels::new("info"),
-            task_registry: crate::actuator::TaskRegistry::new(),
-            job_registry: crate::actuator::JobRegistry::new(),
-            config_props: crate::actuator::ConfigProperties::default(),
-            metrics_source_registry: crate::actuator::MetricsSourceRegistry::new(),
-            health_indicator_registry: crate::actuator::HealthIndicatorRegistry::new(),
-            #[cfg(feature = "ws")]
-            channels: crate::channels::Channels::new(32),
-            #[cfg(feature = "presence")]
-            presence: crate::presence::Presence::new(crate::channels::Channels::new(32)),
-            #[cfg(feature = "ws")]
-            shutdown: tokio_util::sync::CancellationToken::new(),
-            policy_registry: crate::authorization::PolicyRegistry::default(),
-            forbidden_response: crate::authorization::ForbiddenResponse::default(),
-            auth_session_key: "user_id".to_owned(),
-            shared_cache: None,
-            clock: std::sync::Arc::new(crate::time::SystemClock),
-        };
+        let state = test_app_state("user_id");
 
         let app = Router::new()
             .route("/protected", get(|| async { "secret" }))
@@ -3036,7 +2778,6 @@ mod tests {
 
         use crate::security::RateLimitPrincipal;
         use crate::session::{MemoryStore, SessionConfig, SessionLayer, SessionStore};
-        use crate::state::AppState;
 
         async fn handler(
             axum::Extension(principal): axum::Extension<RateLimitPrincipal>,
@@ -3049,39 +2790,7 @@ mod tests {
         session_data.insert("user_id".into(), "42".into());
         store.save("valid-session", session_data).await.unwrap();
 
-        let state = AppState {
-            extensions: std::sync::Arc::new(std::sync::RwLock::new(
-                std::collections::HashMap::new(),
-            )),
-            #[cfg(feature = "db")]
-            pool: None,
-            #[cfg(feature = "db")]
-            replica_pool: None,
-            #[cfg(feature = "db")]
-            shards: None,
-            profile: None,
-            started_at: std::time::Instant::now(),
-            health_detailed: false,
-            probes: crate::probe::ProbeState::ready_for_test(),
-            metrics: crate::middleware::MetricsCollector::new(),
-            log_levels: crate::actuator::LogLevels::new("info"),
-            task_registry: crate::actuator::TaskRegistry::new(),
-            job_registry: crate::actuator::JobRegistry::new(),
-            config_props: crate::actuator::ConfigProperties::default(),
-            metrics_source_registry: crate::actuator::MetricsSourceRegistry::new(),
-            health_indicator_registry: crate::actuator::HealthIndicatorRegistry::new(),
-            #[cfg(feature = "ws")]
-            channels: crate::channels::Channels::new(32),
-            #[cfg(feature = "presence")]
-            presence: crate::presence::Presence::new(crate::channels::Channels::new(32)),
-            #[cfg(feature = "ws")]
-            shutdown: tokio_util::sync::CancellationToken::new(),
-            policy_registry: crate::authorization::PolicyRegistry::default(),
-            forbidden_response: crate::authorization::ForbiddenResponse::default(),
-            auth_session_key: "user_id".to_owned(),
-            shared_cache: None,
-            clock: std::sync::Arc::new(crate::time::SystemClock),
-        };
+        let state = test_app_state("user_id");
 
         let app = Router::new()
             .route("/protected", get(handler))
@@ -3120,7 +2829,6 @@ mod tests {
 
         use crate::security::{KeyStrategy, RateLimitConfig, RateLimitLayer};
         use crate::session::{MemoryStore, SessionConfig, SessionLayer, SessionStore};
-        use crate::state::AppState;
 
         let session_store = MemoryStore::new();
         let mut data_a = std::collections::HashMap::new();
@@ -3138,39 +2846,7 @@ mod tests {
             ..Default::default()
         };
 
-        let state = AppState {
-            extensions: std::sync::Arc::new(std::sync::RwLock::new(
-                std::collections::HashMap::new(),
-            )),
-            #[cfg(feature = "db")]
-            pool: None,
-            #[cfg(feature = "db")]
-            replica_pool: None,
-            #[cfg(feature = "db")]
-            shards: None,
-            profile: None,
-            started_at: std::time::Instant::now(),
-            health_detailed: false,
-            probes: crate::probe::ProbeState::ready_for_test(),
-            metrics: crate::middleware::MetricsCollector::new(),
-            log_levels: crate::actuator::LogLevels::new("info"),
-            task_registry: crate::actuator::TaskRegistry::new(),
-            job_registry: crate::actuator::JobRegistry::new(),
-            config_props: crate::actuator::ConfigProperties::default(),
-            metrics_source_registry: crate::actuator::MetricsSourceRegistry::new(),
-            health_indicator_registry: crate::actuator::HealthIndicatorRegistry::new(),
-            #[cfg(feature = "ws")]
-            channels: crate::channels::Channels::new(32),
-            #[cfg(feature = "presence")]
-            presence: crate::presence::Presence::new(crate::channels::Channels::new(32)),
-            #[cfg(feature = "ws")]
-            shutdown: tokio_util::sync::CancellationToken::new(),
-            policy_registry: crate::authorization::PolicyRegistry::default(),
-            forbidden_response: crate::authorization::ForbiddenResponse::default(),
-            auth_session_key: "user_id".to_owned(),
-            shared_cache: None,
-            clock: std::sync::Arc::new(crate::time::SystemClock),
-        };
+        let state = test_app_state("user_id");
 
         let app = Router::new()
             .route("/protected", get(|| async { "ok" }))

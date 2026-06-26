@@ -677,40 +677,46 @@ async fn principal_strategy_keys_on_session_user_id() {
         .assert_ok();
 }
 
-// ── Global limiter: bearer-token fallback via populate_rate_limit_principal ────
+// ── Global limiter: unverified bearer tokens must NOT key the principal ────────
 
 #[tokio::test]
-async fn principal_strategy_global_limiter_keys_on_bearer_token() {
-    // When key_strategy = "authenticated_principal" is configured globally and
-    // a request carries a bearer token but no session, the framework's
-    // populate_rate_limit_principal shim uses the raw token as the
-    // RateLimitPrincipal so the global limiter applies per-token rather than
-    // per-IP keying.  Two different tokens get separate buckets.
+async fn principal_strategy_global_limiter_ignores_unverified_bearer_token() {
+    // Security regression guard: when key_strategy = "authenticated_principal"
+    // is configured globally, the populate_rate_limit_principal shim runs outer
+    // to any route-scoped auth, so a bearer token seen at that point is still
+    // unverified and attacker-controlled. It must NOT be used as the rate-limit
+    // key — otherwise a caller could rotate the token to mint unlimited buckets
+    // and bypass the IP fallback entirely. Instead, requests without a verified
+    // session principal must fall back to per-IP keying.
     let client = TestApp::new()
         .routes(routes![ping])
         .config(principal_config(0.1, 1))
         .build();
 
-    // Token A first request: allowed.
+    // First request from this IP carrying an arbitrary bearer token: allowed.
     client
         .get("/ping")
+        .header("X-Forwarded-For", "10.1.1.1")
         .header("Authorization", "Bearer token-alpha")
         .send()
         .await
         .assert_status(200);
 
-    // Token A second request: bucket exhausted → 429.
+    // Rotating to a *different* bearer token from the SAME IP must NOT mint a
+    // fresh bucket — the limiter keys on IP, so this is throttled.
     client
         .get("/ping")
-        .header("Authorization", "Bearer token-alpha")
+        .header("X-Forwarded-For", "10.1.1.1")
+        .header("Authorization", "Bearer token-beta")
         .send()
         .await
         .assert_status(429);
 
-    // Token B: separate bucket → allowed.
+    // A different IP gets its own bucket regardless of the token value.
     client
         .get("/ping")
-        .header("Authorization", "Bearer token-beta")
+        .header("X-Forwarded-For", "10.2.2.2")
+        .header("Authorization", "Bearer token-alpha")
         .send()
         .await
         .assert_status(200);

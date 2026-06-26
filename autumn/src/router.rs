@@ -1785,33 +1785,25 @@ async fn populate_rate_limit_principal(
     mut req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
-    // Session principal takes priority: key on the verified user identity.
+    // Populate RateLimitPrincipal from the *verified* session identity only.
+    //
+    // We deliberately do NOT fall back to a raw Authorization header here: this
+    // shim runs as a global layer outer to route-scoped auth (RequireApiToken),
+    // so any bearer token visible at this point is still unverified and fully
+    // attacker-controlled. Keying the limiter on it would let a caller rotate
+    // the token to mint unlimited buckets (defeating the per-IP fallback) or
+    // forge another user's principal to exhaust their bucket. When no verified
+    // principal is available, the limiter's extract_key falls back to IP keying,
+    // which is the correct safe default. API-token routes that want
+    // per-principal limiting should place a RateLimitLayer inner to
+    // RequireApiToken, which sets the verified principal ID (see
+    // RequireApiTokenService::call).
     if let Some(session) = req.extensions().get::<crate::session::Session>() {
         let auth_session_key = state.auth_session_key();
         if let Some(user_id) = session.get(auth_session_key).await {
             req.extensions_mut()
                 .insert(crate::security::RateLimitPrincipal(user_id));
-            return next.run(req).await;
         }
-    }
-    // Bearer-token fallback: for API-token-protected routes the global rate
-    // limiter runs outer to RequireApiToken (which sets the verified principal
-    // ID), so the raw token is used as a stable per-token key.  Verification
-    // still happens downstream in RequireApiToken; a route-scoped limiter inner
-    // to that layer will see the verified principal ID instead.
-    if let Some(token) = req
-        .headers()
-        .get(http::header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|h| {
-            let (scheme, tok) = h.split_once(' ')?;
-            scheme
-                .eq_ignore_ascii_case("Bearer")
-                .then_some(tok.to_owned())
-        })
-    {
-        req.extensions_mut()
-            .insert(crate::security::RateLimitPrincipal(token));
     }
     next.run(req).await
 }
