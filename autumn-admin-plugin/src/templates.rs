@@ -533,6 +533,15 @@ pub fn jobs_page(
             prefix,
         ))
         (job_list_card(
+            "Scheduled",
+            "Delayed one-shot jobs waiting for their due time. Cancel before they run.",
+            &snapshot.scheduled,
+            "scheduled_page",
+            csrf_token,
+            csrf_form_field,
+            prefix,
+        ))
+        (job_list_card(
             "Running",
             "Work currently executing in this runtime.",
             &snapshot.running,
@@ -590,6 +599,7 @@ pub fn jobs_counters(snapshot: &JobAdminSnapshot, prefix: &str) -> Markup {
             hx-trigger="load, every 2s"
             hx-swap="outerHTML" {
             (job_counter("Enqueued", snapshot.enqueued.total))
+            (job_counter("Scheduled", snapshot.scheduled.total))
             (job_counter("Running", snapshot.running.total))
             (job_counter("Completed 24h", snapshot.completed.total))
             (job_counter("Failed 7d", snapshot.failed.total))
@@ -674,6 +684,9 @@ fn job_row(
                 strong { (record.name) }
                 div style="font-size: 0.75rem; color: var(--text-muted);" {
                     (record.status.label()) " · " (record.id)
+                    @if let Some(due) = record.scheduled_for.as_deref() {
+                        " · due " (due)
+                    }
                 }
             }
             td { (optional_text(record.enqueued_at.as_deref())) }
@@ -715,7 +728,7 @@ fn job_actions(
             @if record.status == JobAdminStatus::Failed {
                 (job_action_form(prefix, &record.id, "retry", "Retry", "btn btn-sm btn-primary", csrf_token, csrf_form_field))
                 (job_action_form(prefix, &record.id, "discard", "Discard", "btn btn-sm btn-danger", csrf_token, csrf_form_field))
-            } @else if record.status == JobAdminStatus::Enqueued {
+            } @else if record.status == JobAdminStatus::Enqueued || record.status == JobAdminStatus::Scheduled {
                 (job_action_form(prefix, &record.id, "cancel", "Cancel", "btn btn-sm btn-danger", csrf_token, csrf_form_field))
             } @else {
                 span style="color: var(--text-muted);" { "—" }
@@ -2587,6 +2600,7 @@ mod tests {
                     name: "send_email".to_owned(),
                     status: JobAdminStatus::Enqueued,
                     enqueued_at: Some("2026-05-07T10:00:00Z".to_owned()),
+                    scheduled_for: None,
                     started_at: None,
                     finished_at: None,
                     attempt: 1,
@@ -2599,12 +2613,32 @@ mod tests {
                 1,
                 25,
             ),
+            scheduled: JobAdminPage::new(
+                vec![JobAdminRecord {
+                    id: "job-scheduled".to_owned(),
+                    name: "reminder".to_owned(),
+                    status: JobAdminStatus::Scheduled,
+                    enqueued_at: Some("2026-05-07T10:00:00Z".to_owned()),
+                    scheduled_for: Some("2026-05-08T10:00:00Z".to_owned()),
+                    started_at: None,
+                    finished_at: None,
+                    attempt: 1,
+                    max_attempts: 5,
+                    last_error: None,
+                    principal_id: None,
+                    correlation_id: None,
+                }],
+                1,
+                1,
+                25,
+            ),
             running: JobAdminPage::new(
                 vec![JobAdminRecord {
                     id: "job-running".to_owned(),
                     name: "reindex".to_owned(),
                     status: JobAdminStatus::Running,
                     enqueued_at: Some("2026-05-07T10:01:00Z".to_owned()),
+                    scheduled_for: None,
                     started_at: Some("2026-05-07T10:02:00Z".to_owned()),
                     finished_at: None,
                     attempt: 1,
@@ -2623,6 +2657,7 @@ mod tests {
                     name: "digest".to_owned(),
                     status: JobAdminStatus::Completed,
                     enqueued_at: Some("2026-05-07T09:00:00Z".to_owned()),
+                    scheduled_for: None,
                     started_at: Some("2026-05-07T09:01:00Z".to_owned()),
                     finished_at: Some("2026-05-07T09:02:00Z".to_owned()),
                     attempt: 1,
@@ -2641,6 +2676,7 @@ mod tests {
                     name: "send_email".to_owned(),
                     status: JobAdminStatus::Failed,
                     enqueued_at: Some("2026-05-07T08:00:00Z".to_owned()),
+                    scheduled_for: None,
                     started_at: Some("2026-05-07T08:01:00Z".to_owned()),
                     finished_at: Some("2026-05-07T08:02:00Z".to_owned()),
                     attempt: 5,
@@ -2684,6 +2720,11 @@ mod tests {
         assert!(html.contains(r#"action="/admin/jobs/job-failed/retry""#));
         assert!(html.contains(r#"action="/admin/jobs/job-failed/discard""#));
         assert!(html.contains(r#"action="/admin/jobs/job-enqueued/cancel""#));
+        // Scheduled (delayed) jobs render their own list, show the due time, and
+        // can be canceled before they run.
+        assert!(html.contains("Scheduled"));
+        assert!(html.contains("due 2026-05-08T10:00:00Z"));
+        assert!(html.contains(r#"action="/admin/jobs/job-scheduled/cancel""#));
         assert!(html.contains(r#"name="authenticity_token" value="tok-job""#));
         assert!(!html.contains(r#"name="_csrf" value="tok-job""#));
         assert!(html.contains(r#"hx-get="/admin/jobs/counters""#));

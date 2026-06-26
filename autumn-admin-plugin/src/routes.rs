@@ -265,6 +265,8 @@ struct ListQuery {
 struct JobsQuery {
     #[serde(default = "default_page", rename = "enqueued_page")]
     enqueued: u64,
+    #[serde(default = "default_page", rename = "scheduled_page")]
+    scheduled: u64,
     #[serde(default = "default_page", rename = "running_page")]
     running: u64,
     #[serde(default = "default_page", rename = "completed_page")]
@@ -279,6 +281,7 @@ impl From<JobsQuery> for JobAdminQuery {
     fn from(query: JobsQuery) -> Self {
         Self {
             enqueued_page: query.enqueued.max(1),
+            scheduled_page: query.scheduled.max(1),
             running_page: query.running.max(1),
             completed_page: query.completed.max(1),
             failed_page: query.failed.max(1),

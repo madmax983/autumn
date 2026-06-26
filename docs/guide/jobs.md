@@ -36,6 +36,83 @@ autumn_web::app()
 SendWelcomeEmailJob::enqueue(WelcomeEmailArgs { user_id: 42 }).await?;
 ```
 
+## Delayed and scheduled jobs
+
+Sometimes you want a job to run **once, at a future time** — "email a signup
+reminder in 24h", "expire this cart in 30 minutes", "publish at 9am", "retry
+this external call in 5 minutes". Use `enqueue_in` (relative delay) or
+`enqueue_at` (absolute instant) instead of `enqueue`:
+
+```rust,ignore
+use std::time::Duration;
+
+// Run once, 24 hours from now.
+SendReminderJob::enqueue_in(ReminderArgs { user_id: 42 }, Duration::from_secs(24 * 60 * 60)).await?;
+
+// Run once, at an absolute UTC instant.
+let when = chrono::Utc::now() + chrono::TimeDelta::hours(2);
+PublishPostJob::enqueue_at(PublishArgs { post_id: 7 }, when).await?;
+```
+
+The same free functions exist on the `job` module
+(`autumn_web::job::enqueue_in(name, payload, delay)` /
+`enqueue_at(name, payload, when)`), mirroring `enqueue`.
+
+A delayed job is recorded immediately but is **not delivered to a worker until
+its due time passes**. Once due, it runs through the normal path — the same
+`max_attempts` / `initial_backoff_ms` retry/backoff and dead-letter semantics
+apply unchanged. An `enqueue_at` time in the past runs immediately.
+
+### Transactional delayed enqueue
+
+Delayed enqueue composes with the transactional variants, so a job is invisible
+to workers until **both** the row commits **and** the due time passes:
+
+```rust,ignore
+// Crash-safe on Postgres: the future run time is written inside your tx.
+db.tx(move |conn| scoped_boxed(async move {
+    let cart = carts::create(new_cart, conn).await?;
+    autumn_web::job::enqueue_in_on_conn(
+        "expire_cart",
+        ExpireArgs { cart_id: cart.id },
+        Duration::from_secs(30 * 60),
+        conn,
+    ).await?;
+    Ok(cart)
+})).await?;
+
+// Process-local after-commit defer (not crash-safe), absolute or relative:
+autumn_web::job::enqueue_in_after_commit("send_reminder", args, Duration::from_secs(3600)).await?;
+autumn_web::job::enqueue_at_after_commit("publish_post", args, when).await?;
+```
+
+### Durability
+
+| Backend    | Pending delay survives restart? | How                                   |
+|------------|---------------------------------|---------------------------------------|
+| `postgres` | **Yes** (crash-safe)            | future `run_at` column; claim query skips it until due |
+| `redis`    | **Yes** (crash-safe)            | `:delayed` ZSET scored by due-time; promoted to the queue when due |
+| `local`    | **No** (local-safe only)        | in-process timer; a pending delay is **lost on restart**, consistent with other in-process caveats |
+
+### Pick the right tool
+
+| Need                                            | Use                          |
+|-------------------------------------------------|------------------------------|
+| **Recurring** work on a cron / fixed interval   | `#[scheduled]`               |
+| **One-shot** "run once, later" timer            | delayed `#[job]` (`enqueue_in` / `enqueue_at`) |
+| **Durable multi-step** orchestration, long-horizon timers, history | Autumn Harvest |
+
+`#[scheduled]` is for repeating tasks; it does not do one-shot future work.
+Autumn Harvest is for durable workflows with history and stronger orchestration
+semantics — heavier than a one-shot timer. Delayed `#[job]` fills the gap
+between "now" and "durable workflow".
+
+### Admin dashboard
+
+Delayed jobs appear in a distinct **Scheduled** list on `GET /admin/jobs`
+showing each job's due time, and can be **canceled before they run**. (A job
+that has already become due / started running cannot be canceled.)
+
 ## Backend selection (`autumn.toml`)
 
 ```toml
