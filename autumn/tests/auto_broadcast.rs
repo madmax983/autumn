@@ -29,7 +29,7 @@ mod tests {
     // A model with a custom render function.
     fn render_custom_post(post: &BroadcastPost) -> maud::Markup {
         maud::html! {
-            div id=(format!("custom-post-{}", post.id)) {
+            div data-id="123" id=(format!("custom-post-{}", post.id)) {
                 h2 { (post.title) }
             }
         }

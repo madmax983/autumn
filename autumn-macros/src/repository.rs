@@ -1449,8 +1449,21 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                             let mut __found_id = ::core::option::Option::None;
                             if let ::core::option::Option::Some(__start_tag_end) = __html.find('>') {
                                 let __start_tag = &__html[..__start_tag_end];
-                                if let ::core::option::Option::Some(__id_idx) = __start_tag.find("id=") {
-                                    let __after_id = &__start_tag[__id_idx + 3..];
+                                let mut __id_idx = ::core::option::Option::None;
+                                let mut __search_start = 0;
+                                while let ::core::option::Option::Some(__offset) = __start_tag[__search_start..].find("id=") {
+                                    let __absolute_idx = __search_start + __offset;
+                                    if __absolute_idx > 0 {
+                                        let __prev_char = __start_tag.as_bytes()[__absolute_idx - 1];
+                                        if __prev_char == b' ' || __prev_char == b'\t' || __prev_char == b'\n' || __prev_char == b'\r' {
+                                            __id_idx = ::core::option::Option::Some(__absolute_idx);
+                                            break;
+                                        }
+                                    }
+                                    __search_start = __absolute_idx + 3;
+                                }
+                                if let ::core::option::Option::Some(__idx) = __id_idx {
+                                    let __after_id = &__start_tag[__idx + 3..];
                                     let mut __chars = __after_id.chars();
                                     if let ::core::option::Option::Some(__quote) = __chars.next() {
                                         if __quote == '"' || __quote == '\'' {
@@ -1488,8 +1501,21 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                             let mut __found_id = ::core::option::Option::None;
                             if let ::core::option::Option::Some(__start_tag_end) = __html.find('>') {
                                 let __start_tag = &__html[..__start_tag_end];
-                                if let ::core::option::Option::Some(__id_idx) = __start_tag.find("id=") {
-                                    let __after_id = &__start_tag[__id_idx + 3..];
+                                let mut __id_idx = ::core::option::Option::None;
+                                let mut __search_start = 0;
+                                while let ::core::option::Option::Some(__offset) = __start_tag[__search_start..].find("id=") {
+                                    let __absolute_idx = __search_start + __offset;
+                                    if __absolute_idx > 0 {
+                                        let __prev_char = __start_tag.as_bytes()[__absolute_idx - 1];
+                                        if __prev_char == b' ' || __prev_char == b'\t' || __prev_char == b'\n' || __prev_char == b'\r' {
+                                            __id_idx = ::core::option::Option::Some(__absolute_idx);
+                                            break;
+                                        }
+                                    }
+                                    __search_start = __absolute_idx + 3;
+                                }
+                                if let ::core::option::Option::Some(__idx) = __id_idx {
+                                    let __after_id = &__start_tag[__idx + 3..];
                                     let mut __chars = __after_id.chars();
                                     if let ::core::option::Option::Some(__quote) = __chars.next() {
                                         if __quote == '"' || __quote == '\'' {
