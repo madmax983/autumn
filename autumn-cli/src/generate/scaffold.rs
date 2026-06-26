@@ -82,6 +82,20 @@ pub fn plan_scaffold_with_options(
     options: &ScaffoldOptions,
 ) -> Result<Plan, GenerateError> {
     ensure_project_root(project_root)?;
+    // Gate: UUID primary keys are not yet supported for scaffolds. Every scaffold
+    // emits a `#[autumn_web::repository]`, whose macro-generated REST API is
+    // currently hard-coded to `i64` primary keys (`Path<i64>`, `find_by_id`,
+    // cursor pagination), so a UUID-keyed scaffold would not compile. The model
+    // generator (`generate model --id uuid`) has no such limitation.
+    if options.model.id_type == IdType::Uuid {
+        return Err(GenerateError::Config(
+            "UUID primary keys are not yet supported for `generate scaffold`: the \
+             generated `#[repository]` REST API is currently limited to i64 primary \
+             keys. Use `generate model --id uuid` for the model and migration, or \
+             omit `--id` to use the default BIGSERIAL key."
+                .to_owned(),
+        ));
+    }
     let fields = parse_fields(field_tokens)?;
     // Resolve shard key before planning the model (propagates to model render).
     let resolved_shard_key = resolve_shard_key(&fields, &options.model)?;

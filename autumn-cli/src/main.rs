@@ -2317,33 +2317,34 @@ fn run_generate_command(cmd: GenerateCommands) {
             force,
         } => {
             // Precedence: CLI --id > [generate] id in autumn.generate.toml > BigSerial.
-            let project_id = {
-                let auto_cfg = std::env::current_dir()
-                    .unwrap_or_default()
-                    .join(generate::config::GENERATE_CONFIG_FILENAME);
-                if auto_cfg.exists() {
-                    match generate::config::read_generate_defaults(&auto_cfg) {
-                        Ok(t) => t,
-                        Err(e) => {
+            // The CLI flag is parsed first and wins outright, so a valid --id
+            // overrides a stale or invalid project default rather than being
+            // blocked by it.
+            let id_type = id.as_deref().map_or_else(
+                || {
+                    // No CLI --id: fall back to the auto-discovered project default.
+                    let auto_cfg = std::env::current_dir()
+                        .unwrap_or_default()
+                        .join(generate::config::GENERATE_CONFIG_FILENAME);
+                    if auto_cfg.exists() {
+                        generate::config::read_generate_defaults(&auto_cfg).unwrap_or_else(|e| {
                             eprintln!(
                                 "Error reading {}: {e}",
                                 generate::config::GENERATE_CONFIG_FILENAME
                             );
                             std::process::exit(1);
-                        }
+                        })
+                    } else {
+                        generate::dsl::IdType::default()
                     }
-                } else {
-                    generate::dsl::IdType::default()
-                }
-            };
-            let id_type = match id.as_deref().map(generate::dsl::IdType::parse) {
-                Some(Ok(t)) => t,
-                Some(Err(e)) => {
-                    eprintln!("Error: {e}");
-                    std::process::exit(1);
-                }
-                None => project_id,
-            };
+                },
+                |s| {
+                    generate::dsl::IdType::parse(s).unwrap_or_else(|e| {
+                        eprintln!("Error: {e}");
+                        std::process::exit(1);
+                    })
+                },
+            );
             let options = generate::model::ModelOptions {
                 soft_delete,
                 id_type,

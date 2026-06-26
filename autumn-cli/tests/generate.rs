@@ -3341,13 +3341,15 @@ fn generate_model_default_id_is_bigserial() {
     );
 }
 
-/// AC2: scaffold with `--id uuid` threads UUID through model, schema, and routes.
+/// `--id uuid` is gated for `generate scaffold`: the generated `#[repository]`
+/// REST API is hard-coded to i64 primary keys, so a UUID-keyed scaffold would
+/// not compile. The command must reject it up-front with a clear, actionable
+/// error and write nothing — pointing users to `generate model --id uuid`.
 #[test]
-fn generate_scaffold_uuid_id() {
+fn generate_scaffold_uuid_id_is_rejected() {
     let (_tmp, project) = fresh_project("uuid-scaffold-app");
 
-    // Use full scaffold (no --api) so that HTML routes file is generated.
-    run_autumn(
+    let (_, stderr, code) = run_autumn_failing(
         &project,
         &[
             "generate",
@@ -3358,46 +3360,20 @@ fn generate_scaffold_uuid_id() {
             "uuid",
         ],
     );
-
-    // Model uses uuid::Uuid
-    let model = fs::read_to_string(project.join("src/models/post.rs")).unwrap();
+    assert_eq!(code, Some(1), "scaffold --id uuid must fail with exit 1");
     assert!(
-        model.contains("pub id: uuid::Uuid,"),
-        "scaffold model should have `pub id: uuid::Uuid`; got:\n{model}"
+        stderr.contains("not yet supported") && stderr.contains("generate model"),
+        "error must explain the limitation and point to `generate model`; got:\n{stderr}"
     );
 
-    // Schema uses Uuid token
-    let schema = fs::read_to_string(project.join("src/schema.rs")).unwrap();
+    // Nothing should have been written.
     assert!(
-        schema.contains("id -> Uuid,"),
-        "scaffold schema should have `id -> Uuid`; got:\n{schema}"
-    );
-
-    // Routes use Path<uuid::Uuid>
-    let routes = fs::read_to_string(project.join("src/routes/posts.rs")).unwrap();
-    assert!(
-        routes.contains("Path<uuid::Uuid>"),
-        "scaffold routes should use Path<uuid::Uuid>; got:\n{routes}"
+        !project.join("src/models/post.rs").exists(),
+        "rejected scaffold must not write a model file"
     );
     assert!(
-        !routes.contains("Path<i64>"),
-        "scaffold routes must not use Path<i64> with --id uuid; got:\n{routes}"
-    );
-
-    // Migration uses UUID PK
-    let migrations: Vec<_> = fs::read_dir(project.join("migrations"))
-        .unwrap()
-        .filter_map(Result::ok)
-        .filter(|e| e.file_name().to_string_lossy().ends_with("_create_posts"))
-        .collect();
-    let up = fs::read_to_string(migrations[0].path().join("up.sql")).unwrap();
-    assert!(
-        up.contains("id UUID PRIMARY KEY DEFAULT gen_random_uuid()"),
-        "scaffold migration should have UUID PK; got:\n{up}"
-    );
-    assert!(
-        !up.contains("BIGSERIAL"),
-        "scaffold migration must not have BIGSERIAL with --id uuid; got:\n{up}"
+        !project.join("src/repositories/post.rs").exists(),
+        "rejected scaffold must not write a repository file"
     );
 }
 
@@ -3431,10 +3407,13 @@ fn generate_scaffold_bad_id_type_errors() {
     );
 }
 
-/// AC6: `[generate] id = "uuid"` in autumn.generate.toml propagates even when
-/// there is no `[scaffold.Post]` section — the project default applies.
+/// AC6 (Finding #3 fix): `[generate] id` propagates via `--config` even when
+/// there is no `[scaffold.Post]` section. Since the resolved type is `uuid`,
+/// the scaffold gate then rejects it — proving the project default reaches the
+/// scaffold path (rather than being silently dropped or erroring on the missing
+/// section).
 #[test]
-fn generate_scaffold_project_default_uuid_config_only() {
+fn generate_scaffold_project_default_uuid_config_only_is_rejected() {
     let (_tmp, project) = fresh_project("project-default-uuid-config-app");
 
     // No [scaffold.Post] section — only the project-level [generate] default.
@@ -3444,7 +3423,7 @@ fn generate_scaffold_project_default_uuid_config_only() {
     )
     .unwrap();
 
-    run_autumn(
+    let (_, stderr, code) = run_autumn_failing(
         &project,
         &[
             "generate",
@@ -3455,16 +3434,15 @@ fn generate_scaffold_project_default_uuid_config_only() {
             "autumn.generate.toml",
         ],
     );
-
-    let model = fs::read_to_string(project.join("src/models/post.rs")).unwrap();
-    assert!(
-        model.contains("pub id: uuid::Uuid,"),
-        "project-default uuid (no resource section) should use uuid::Uuid; got:\n{model}"
+    assert_eq!(
+        code,
+        Some(1),
+        "scaffold resolving to uuid must fail with exit 1"
     );
-    let routes = fs::read_to_string(project.join("src/routes/posts.rs")).unwrap();
     assert!(
-        routes.contains("Path<uuid::Uuid>"),
-        "project-default uuid routes should use Path<uuid::Uuid>; got:\n{routes}"
+        stderr.contains("not yet supported") && stderr.contains("generate model"),
+        "error must come from the UUID scaffold gate (proving the [generate] \
+         default reached the scaffold path); got:\n{stderr}"
     );
 }
 
@@ -3503,9 +3481,11 @@ fn generate_model_project_default_uuid_auto_discovered() {
     );
 }
 
-/// AC6: auto-discovered [generate] default also applies to `generate scaffold`.
+/// AC6 + scaffold UUID gate: an auto-discovered `[generate] id = "uuid"` flows
+/// into `generate scaffold`, where it is rejected (UUID scaffolds are gated).
+/// The project-wide default must not silently produce a broken scaffold.
 #[test]
-fn generate_scaffold_project_default_uuid_auto_discovered() {
+fn generate_scaffold_project_default_uuid_is_rejected() {
     let (_tmp, project) = fresh_project("project-default-uuid-scaffold-auto-app");
 
     fs::write(
@@ -3514,56 +3494,20 @@ fn generate_scaffold_project_default_uuid_auto_discovered() {
     )
     .unwrap();
 
-    // generate scaffold (no --id flag, no --config)
-    run_autumn(&project, &["generate", "scaffold", "Post", "title:String"]);
-
-    let model = fs::read_to_string(project.join("src/models/post.rs")).unwrap();
-    assert!(
-        model.contains("pub id: uuid::Uuid,"),
-        "auto-discovered scaffold project default should use uuid::Uuid; got:\n{model}"
+    // generate scaffold (no --id flag, no --config) — auto-discovers the default.
+    let (_, stderr, code) =
+        run_autumn_failing(&project, &["generate", "scaffold", "Post", "title:String"]);
+    assert_eq!(
+        code,
+        Some(1),
+        "scaffold resolving to uuid must fail with exit 1"
     );
-    let routes = fs::read_to_string(project.join("src/routes/posts.rs")).unwrap();
     assert!(
-        routes.contains("Path<uuid::Uuid>"),
-        "auto-discovered scaffold routes should use Path<uuid::Uuid>; got:\n{routes}"
+        stderr.contains("not yet supported") && stderr.contains("generate model"),
+        "error must explain the limitation and point to `generate model`; got:\n{stderr}"
     );
-}
-
-/// Slow end-to-end check: scaffold a UUID-id project, patch Cargo.toml to the
-/// local autumn-web, and `cargo check --tests` the result. Verifies that
-/// `Path<uuid::Uuid>`, the `uuid::Uuid` dep, and the `#[repository]` macro all
-/// compose correctly when the primary key is non-sequential.
-///
-/// Run with: `cargo test -p autumn-cli -- --ignored generated_scaffold_uuid_id_cargo_checks`
-#[test]
-#[ignore = "slow: cargo-checks a fresh UUID-id project — run with `cargo test -p autumn-cli -- --ignored`"]
-fn generated_scaffold_uuid_id_cargo_checks() {
-    let (_tmp, project) = fresh_project("uuid-build");
-
-    patch_generated_cargo_toml(&project);
-
-    run_autumn(
-        &project,
-        &[
-            "generate",
-            "scaffold",
-            "Post",
-            "title:String",
-            "--api",
-            "--id",
-            "uuid",
-        ],
-    );
-
-    let check = Command::new("cargo")
-        .args(["check", "--tests"])
-        .current_dir(&project)
-        .output()
-        .unwrap();
     assert!(
-        check.status.success(),
-        "cargo check on generated UUID scaffold failed:\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&check.stdout),
-        String::from_utf8_lossy(&check.stderr),
+        !project.join("src/models/post.rs").exists(),
+        "rejected scaffold must not write a model file"
     );
 }
