@@ -999,10 +999,9 @@ fn resolve_startup_wait(
     flag: Option<u64>,
     config_table: Option<&toml::Table>,
 ) -> std::time::Duration {
-    let secs = flag.map_or_else(
-        || resolve_startup_wait_secs_from_sources(|key| std::env::var(key), config_table),
-        |n| n,
-    );
+    let secs = flag.unwrap_or_else(|| {
+        resolve_startup_wait_secs_from_sources(|key| std::env::var(key), config_table)
+    });
     std::time::Duration::from_secs(secs)
 }
 
