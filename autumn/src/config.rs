@@ -696,22 +696,19 @@ pub struct DeprecationFinding {
 ///
 /// Non-table mid-segments are treated as absent (no panic).
 fn toml_path_present(table: &toml::Table, path: &str) -> bool {
-    let mut segments = path.split('.');
-    let Some(first) = segments.next() else {
-        return false;
-    };
-    let remaining: Vec<&str> = segments.collect();
+    let mut current_table = table;
+    let mut segments = path.split('.').peekable();
 
-    if remaining.is_empty() {
-        return table.contains_key(first);
+    while let Some(segment) = segments.next() {
+        if segments.peek().is_none() {
+            return current_table.contains_key(segment);
+        }
+        match current_table.get(segment) {
+            Some(toml::Value::Table(next)) => current_table = next,
+            _ => return false,
+        }
     }
-
-    let Some(toml::Value::Table(next)) = table.get(first) else {
-        return false;
-    };
-    // Rebuild the sub-path and recurse (convert remaining back to a dotted string).
-    let sub = remaining.join(".");
-    toml_path_present(next, &sub)
+    false
 }
 
 /// Scans the merged config table and env for any registered deprecated key.
@@ -752,7 +749,7 @@ pub fn detect_deprecated_keys(
 /// Detects deprecated keys the way [`AutumnConfig::load_with_env`] would, given a
 /// profile and a file-merged TOML table a tool has already built.
 ///
-/// Seeds [`profile_defaults_as_toml`] as the base layer and deep-merges
+/// Seeds `profile_defaults_as_toml` as the base layer and deep-merges
 /// `file_table` on top before running [`detect_deprecated_keys`], so external
 /// tools (e.g. `autumn doctor`) evaluate the *same* layered config the runtime
 /// loader does — a key set only in a profile default is still detected.

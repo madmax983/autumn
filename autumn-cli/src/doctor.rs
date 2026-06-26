@@ -2147,7 +2147,10 @@ fn parse_config_bool(value: &str) -> Option<bool> {
 /// (e.g. `[profile.production]` and `[profile.prod]`).
 fn resolve_active_profiles() -> (String, Vec<String>) {
     let raw_profile = std::env::var("AUTUMN_ENV")
-        .or_else(|_| std::env::var("AUTUMN_PROFILE"))
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .or_else(|| std::env::var("AUTUMN_PROFILE").ok())
+        .filter(|v| !v.trim().is_empty())
         .unwrap_or_default();
     let raw_lower = raw_profile.trim().to_ascii_lowercase();
     let canonical = match raw_lower.as_str() {
