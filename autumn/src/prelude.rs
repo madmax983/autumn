@@ -47,6 +47,9 @@ pub use crate::assets::javascript_include_tag;
 /// Maud HTML templating types.
 #[cfg(feature = "maud")]
 pub use maud::{Markup, PreEscaped, html};
+/// Cache a rendered Maud fragment keyed by `(identity, version)`.
+#[cfg(feature = "maud")]
+pub use crate::cache::{cache_fragment, cache_fragment_global};
 
 // ── Extractors ───────────────────────────────────────────────────
 /// Canary traffic-routing extractor (reads the `X-Canary` header).

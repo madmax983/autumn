@@ -36,6 +36,12 @@ impl SitemapSource for BlogSitemapSource {
 async fn main() {
     autumn_web::app()
         .migrations(MIGRATIONS)
+        // In-process fragment cache for the post-list view. Rendered post
+        // cards are cached by `(post.id, post.updated_at)` (see
+        // `routes::posts::post_card`), so unchanged rows skip the `html!{}`
+        // work and editing a post re-renders only that card. Swap in the
+        // Redis backend to share the cache across replicas.
+        .with_cache_backend(autumn_web::cache::MokaCache::new(1_000, None))
         // Auto-load i18n bundle from `i18n/<locale>.ftl` according to the
         // `[i18n]` block in `autumn.toml`. Visit `/greet` to see it work
         // end-to-end with a locale switcher.

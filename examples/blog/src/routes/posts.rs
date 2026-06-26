@@ -7,6 +7,7 @@ use autumn_web::assets::asset_url;
 use autumn_web::extract::{Form, Path};
 use autumn_web::i18n::Locale;
 use autumn_web::seo::SeoMeta;
+use autumn_web::cache::cache_fragment_global;
 use autumn_web::{AutumnError, AutumnResult, Db, Markup, Redirect, delete, get, html, post, t};
 use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
@@ -96,7 +97,24 @@ pub fn layout_with_seo(locale: &Locale, seo: SeoMeta, content: Markup) -> Markup
 // ── Components ──────────────────────────────────────────────────
 
 /// Render a single post card for the listing page.
+///
+/// The rendered markup is cached with [`cache_fragment_global`], keyed by the
+/// post's id **plus** its `updated_at` timestamp. On a warm cache an unchanged
+/// row is served without re-running the `html!{}` work; editing the post bumps
+/// `updated_at`, which changes the cache key and re-renders the card on the
+/// very next request — no manual eviction. When no cache backend is configured
+/// the helper renders directly, so this is safe in any environment.
 fn post_card(post: &Post) -> Markup {
+    cache_fragment_global(
+        format_args!("blog:post_card:{}", post.id),
+        post.updated_at.and_utc().timestamp(),
+        None,
+        || render_post_card(post),
+    )
+}
+
+/// The actual Maud render for a post card (executed only on a cache miss).
+fn render_post_card(post: &Post) -> Markup {
     let date = post.created_at.format("%b %d, %Y");
     let preview: String = post.body.chars().take(200).collect::<String>();
     let preview = if post.body.len() > 200 {
