@@ -50,6 +50,32 @@ mod tests {
     )]
     pub trait CustomPostRepository {}
 
+    // 3. Nullable model with a category (Option<String>)
+    diesel::table! {
+        nullable_posts (id) {
+            id -> Int8,
+            title -> Text,
+            category -> Nullable<Text>,
+        }
+    }
+
+    #[autumn_web::model(table = "nullable_posts")]
+    pub struct NullablePost {
+        #[id]
+        pub id: i64,
+        pub title: String,
+        pub category: Option<String>,
+    }
+
+    #[autumn_web::repository(
+        NullablePost,
+        table = "nullable_posts",
+        broadcasts = true,
+        topic = "category_posts:{category}",
+        container = "category-posts-list"
+    )]
+    pub trait NullablePostRepository {}
+
     // ── Setup ──────────────────────────────────────────────────
 
     async fn setup_db(db: &TestDb) {
@@ -63,6 +89,17 @@ mod tests {
         .execute(&mut *conn)
         .await
         .expect("create broadcast_posts table");
+
+        diesel::sql_query(
+            "CREATE TABLE IF NOT EXISTS nullable_posts (
+                id BIGSERIAL PRIMARY KEY,
+                title TEXT NOT NULL,
+                category TEXT
+            )",
+        )
+        .execute(&mut *conn)
+        .await
+        .expect("create nullable_posts table");
 
         diesel::sql_query(
             "CREATE TABLE IF NOT EXISTS autumn_repository_commit_hooks (
@@ -204,6 +241,81 @@ mod tests {
             "hx-swap-oob=\"delete:#custom-post-{}\"",
             custom_post.id
         )));
+
+        // 5. Test bulk update (update_many) and nullable topic placeholders
+        let nullable_repo = PgNullablePostRepository::with_pool_untracked(db.pool());
+
+        let post_none = nullable_repo
+            .save(&NewNullablePost {
+                title: "post_none".to_owned(),
+                category: None,
+            })
+            .await
+            .expect("save post_none");
+
+        let post_some = nullable_repo
+            .save(&NewNullablePost {
+                title: "post_some".to_owned(),
+                category: Some("rust".to_owned()),
+            })
+            .await
+            .expect("save post_some");
+
+        // We subscribe to the topics
+        let mut none_sub = channels.subscribe("category_posts:none");
+        let mut rust_sub = channels.subscribe("category_posts:rust");
+        let mut go_sub = channels.subscribe("category_posts:go");
+
+        // Drain any initial creation broadcasts
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(500), none_sub.recv()).await;
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(500), rust_sub.recv()).await;
+
+        // Perform a bulk update changing category from None -> Some("go") and Some("rust") -> Some("go")
+        let update_changes = UpdateNullablePost {
+            title: autumn_web::hooks::Patch::Unchanged,
+            category: autumn_web::hooks::Patch::Set(Some("go".to_owned())),
+        };
+        nullable_repo
+            .update_many(&[post_none.id, post_some.id], &update_changes)
+            .await
+            .expect("update_many posts");
+
+        // Wait for OOB deletes on the old topics:
+        // - category_posts:none should receive a delete for post_none.id
+        let msg_none = tokio::time::timeout(std::time::Duration::from_secs(3), none_sub.recv())
+            .await
+            .expect("timeout waiting for delete on none topic")
+            .expect("recv error");
+        assert!(msg_none.into_string().contains(&format!(
+            "hx-swap-oob=\"delete:#nullable_post-{}\"",
+            post_none.id
+        )));
+
+        // - category_posts:rust should receive a delete for post_some.id
+        let msg_rust = tokio::time::timeout(std::time::Duration::from_secs(3), rust_sub.recv())
+            .await
+            .expect("timeout waiting for delete on rust topic")
+            .expect("recv error");
+        assert!(msg_rust.into_string().contains(&format!(
+            "hx-swap-oob=\"delete:#nullable_post-{}\"",
+            post_some.id
+        )));
+
+        // - category_posts:go should receive updates for both
+        let msg_go1 = tokio::time::timeout(std::time::Duration::from_secs(3), go_sub.recv())
+            .await
+            .expect("timeout waiting for go topic update 1")
+            .expect("recv error")
+            .into_string();
+        let msg_go2 = tokio::time::timeout(std::time::Duration::from_secs(3), go_sub.recv())
+            .await
+            .expect("timeout waiting for go topic update 2")
+            .expect("recv error")
+            .into_string();
+
+        let combined = format!("{msg_go1} {msg_go2}");
+        assert!(combined.contains(&format!("nullable_post-{}", post_none.id)));
+        assert!(combined.contains(&format!("nullable_post-{}", post_some.id)));
 
         shutdown.cancel();
     }

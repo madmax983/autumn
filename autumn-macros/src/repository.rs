@@ -101,7 +101,7 @@ fn generate_topic_format(topic: &str, record_ident: &TokenStream) -> syn::Result
                     )
                 })?;
                 format_str.push_str("{}");
-                args.push(quote! { #record_ident.#field_ident });
+                args.push(quote! { ::autumn_web::repository::DisplayTopicField::to_topic_string(&#record_ident.#field_ident) });
             } else {
                 format_str.push('{');
                 format_str.push_str(&field);
@@ -1593,7 +1593,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     let mut __autumn_previous_topic: ::core::option::Option<::std::string::String> = ::core::option::Option::None;
                     let mut __autumn_ctx_val = ::autumn_web::reexports::serde_json::to_value(&ctx)
                         .map_err(|e| ::autumn_web::AutumnError::internal_server_error_msg(format!("serialize context: {e}")))?;
-                    if let ::core::option::Option::Some(ref __record) = __vh_before {
+                    if let ::core::option::Option::Some(__record) = &__vh_before {
                         let __prev_topic = #topic_expr;
                         __autumn_previous_topic = ::core::option::Option::Some(__prev_topic.clone());
                         if let ::core::option::Option::Some(__map) = __autumn_ctx_val.as_object_mut() {
@@ -4152,6 +4152,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         }
 
                         let mut serialized_contexts = Vec::new();
+                        let mut chunk_previous_topics = Vec::new();
                         for (idx, _record) in chunk_updated.iter().enumerate() {
                             let global_idx = offset + idx;
                             let ctx = &contexts[global_idx];
@@ -4160,6 +4161,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
                             let __record = &current_rows[global_idx];
                             let __prev_topic = #topic_expr;
+                            chunk_previous_topics.push(::core::option::Option::Some(__prev_topic.clone()));
                             if let ::core::option::Option::Some(__map) = ctx_val.as_object_mut() {
                                 __map.insert(
                                     "__autumn_previous_topic".to_string(),
@@ -4189,7 +4191,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         .await?;
 
                         for (idx, info) in chunk_hook_infos.into_iter().enumerate() {
-                            hook_infos.push((info.0, info.1, hook_records[idx].0.clone()));
+                            hook_infos.push((info.0, info.1, hook_records[idx].0.clone(), chunk_previous_topics[idx].clone()));
                         }
                     }
                 } else {
@@ -4227,7 +4229,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         .await?;
 
                         for (idx, info) in chunk_hook_infos.into_iter().enumerate() {
-                            hook_infos.push((info.0, info.1, hook_records[idx].0.clone()));
+                            hook_infos.push((info.0, info.1, hook_records[idx].0.clone(), ::core::option::Option::None));
                         }
                     }
                 }
@@ -4236,8 +4238,30 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             };
 
             let after_update_hook_block = if commit_hooks_enabled {
+                let finalize_setup = if config.broadcasts {
+                    quote! {
+                        let mut __autumn_finalized_ctx_val = ::autumn_web::reexports::serde_json::to_value(&ctx)
+                            .map_err(|e| ::autumn_web::AutumnError::internal_server_error_msg(format!("serialize finalized context: {e}")))?;
+                        if let ::core::option::Option::Some(__prev_topic) = __autumn_previous_topic {
+                            if let ::core::option::Option::Some(__map) = __autumn_finalized_ctx_val.as_object_mut() {
+                                __map.insert(
+                                    "__autumn_previous_topic".to_string(),
+                                    ::autumn_web::reexports::serde_json::Value::String(__prev_topic.clone()),
+                                );
+                            }
+                        }
+                    }
+                } else {
+                    quote! {}
+                };
+                let finalize_ref = if config.broadcasts {
+                    quote! { &__autumn_finalized_ctx_val }
+                } else {
+                    quote! { &ctx }
+                };
+
                 quote! {
-                    let (hook_id, hook_owner, hook_record) = &hook_infos[idx];
+                    let (hook_id, hook_owner, hook_record, __autumn_previous_topic) = &hook_infos[idx];
                     let __autumn_pending_heartbeat =
                         ::autumn_web::__private::start_repository_commit_hook_pending_finalizer_heartbeat(
                             self.pool.clone(),
@@ -4251,11 +4275,12 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
                     match __autumn_after_update {
                         ::core::result::Result::Ok(::core::result::Result::Ok(())) => {
+                            #finalize_setup
                             let __autumn_finalize_result = ::autumn_web::__private::finalize_repository_commit_hook_after_hook(
                                 &self.pool,
                                 hook_id,
                                 hook_owner,
-                                &ctx,
+                                #finalize_ref,
                                 hook_record,
                             )
                             .await;
@@ -4396,7 +4421,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         }
 
                         let mut updated_records = Vec::new();
-                        let mut hook_infos: ::std::vec::Vec<(::std::string::String, ::std::string::String, ::serde_json::Value)> = ::std::vec::Vec::new();
+                        let mut hook_infos: ::std::vec::Vec<(::std::string::String, ::std::string::String, ::serde_json::Value, ::core::option::Option<::std::string::String>)> = ::std::vec::Vec::new();
                         let mut offset = 0;
                         for chunk in proposed_rows.chunks(1000) {
                             let mut chunk_updated = Vec::new();

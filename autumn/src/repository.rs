@@ -240,6 +240,95 @@ pub fn repository_upsert_advisory_lock_key(table_name: &str, record_id: i64) -> 
     i64::from_be_bytes(bytes)
 }
 
+/// Trait for formatting repository model fields into SSE broadcast topic segments.
+///
+/// This provides a uniform display format for both primitive types and optional/nullable values.
+pub trait DisplayTopicField {
+    /// Formats the field into a string suitable for a topic name.
+    fn to_topic_string(&self) -> String;
+}
+
+impl DisplayTopicField for String {
+    fn to_topic_string(&self) -> String {
+        self.clone()
+    }
+}
+
+impl DisplayTopicField for &str {
+    fn to_topic_string(&self) -> String {
+        (*self).to_string()
+    }
+}
+
+impl DisplayTopicField for bool {
+    fn to_topic_string(&self) -> String {
+        self.to_string()
+    }
+}
+
+impl DisplayTopicField for char {
+    fn to_topic_string(&self) -> String {
+        self.to_string()
+    }
+}
+
+macro_rules! impl_display_topic_field_num {
+    ($($t:ty),*) => {
+        $(
+            impl DisplayTopicField for $t {
+                fn to_topic_string(&self) -> String {
+                    self.to_string()
+                }
+            }
+        )*
+    };
+}
+
+impl_display_topic_field_num!(i8, i16, i32, i64, isize, u8, u16, u32, u64, usize, f32, f64);
+
+impl DisplayTopicField for ::uuid::Uuid {
+    fn to_topic_string(&self) -> String {
+        self.to_string()
+    }
+}
+
+impl DisplayTopicField for ::chrono::NaiveDateTime {
+    fn to_topic_string(&self) -> String {
+        self.to_string()
+    }
+}
+
+impl DisplayTopicField for ::chrono::NaiveDate {
+    fn to_topic_string(&self) -> String {
+        self.to_string()
+    }
+}
+
+impl DisplayTopicField for ::chrono::NaiveTime {
+    fn to_topic_string(&self) -> String {
+        self.to_string()
+    }
+}
+
+impl<T> DisplayTopicField for ::chrono::DateTime<T>
+where
+    T: ::chrono::TimeZone,
+    T::Offset: std::fmt::Display,
+{
+    fn to_topic_string(&self) -> String {
+        self.to_string()
+    }
+}
+
+impl<T: DisplayTopicField> DisplayTopicField for Option<T> {
+    fn to_topic_string(&self) -> String {
+        match self {
+            Some(val) => val.to_topic_string(),
+            None => "none".to_string(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
