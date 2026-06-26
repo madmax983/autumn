@@ -240,13 +240,15 @@ pub fn plan_scaffold_with_options(
         if let Some(contents) = cargo_content {
             let with_ws = ensure_autumn_web_feature(contents, "ws");
             let with_maud = ensure_autumn_web_feature(&with_ws, "maud");
-            *contents = with_maud;
+            let with_htmx = ensure_autumn_web_feature(&with_maud, "htmx");
+            *contents = with_htmx;
         } else {
             let existing = read_or_empty(&cargo_toml_path);
             let with_ws = ensure_autumn_web_feature(&existing, "ws");
             let with_maud = ensure_autumn_web_feature(&with_ws, "maud");
-            if with_maud != existing {
-                plan.modify(cargo_toml_path, with_maud);
+            let with_htmx = ensure_autumn_web_feature(&with_maud, "htmx");
+            if with_htmx != existing {
+                plan.modify(cargo_toml_path, with_htmx);
             }
         }
     }
@@ -2182,5 +2184,6 @@ async fn main() {
         let cargo = fs::read_to_string(tmp.path().join("Cargo.toml")).unwrap();
         assert!(cargo.contains("\"ws\""));
         assert!(cargo.contains("\"maud\""));
+        assert!(cargo.contains("\"htmx\""));
     }
 }
