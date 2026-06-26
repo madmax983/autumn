@@ -1421,10 +1421,23 @@ fn mount_framework_routes(
             crate::htmx::AUTUMN_WIDGETS_JS_PATH,
             axum::routing::get(autumn_widgets_handler),
         );
-        router = router.route(
-            crate::htmx::HTMX_SSE_JS_PATH,
-            axum::routing::get(htmx_sse_handler),
-        );
+        if crate::assets::sse_is_vendored() {
+            tracing::debug!(
+                path = crate::htmx::HTMX_SSE_JS_PATH,
+                "sse extension vendored via `autumn assets`; built-in handler skipped, ServeDir serves it"
+            );
+        } else {
+            router = router.route(
+                crate::htmx::HTMX_SSE_JS_PATH,
+                axum::routing::get(htmx_sse_handler),
+            );
+            tracing::debug!(
+                method = "GET",
+                path = crate::htmx::HTMX_SSE_JS_PATH,
+                name = "htmx sse extension",
+                "Mounted route"
+            );
+        }
         tracing::debug!(
             method = "GET",
             path = crate::htmx::HTMX_CSRF_JS_PATH,
@@ -1435,12 +1448,6 @@ fn mount_framework_routes(
             method = "GET",
             path = crate::htmx::AUTUMN_WIDGETS_JS_PATH,
             name = "autumn widget runtime",
-            "Mounted route"
-        );
-        tracing::debug!(
-            method = "GET",
-            path = crate::htmx::HTMX_SSE_JS_PATH,
-            name = "htmx sse extension",
             "Mounted route"
         );
     }
