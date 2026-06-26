@@ -783,7 +783,7 @@ pub fn start_repository_commit_hook_worker(
     let worker_id = repository_commit_hook_worker_id();
     tokio::spawn(async move {
         if let Some(ch) = channels {
-            let _ = CURRENT_CHANNELS
+            CURRENT_CHANNELS
                 .scope(ch, async move {
                     loop {
                         tokio::select! {
@@ -889,9 +889,14 @@ fn spawn_repository_commit_hook_kick_worker(
                     if let Some(ch) = get_global_channels() {
                         let pool_clone = pool.clone();
                         let worker_id_clone = worker_id.clone();
-                        let _ = CURRENT_CHANNELS
+                        CURRENT_CHANNELS
                             .scope(ch, async move {
-                                drain_ready_repository_commit_hooks(&pool_clone, &worker_id_clone, 32).await;
+                                drain_ready_repository_commit_hooks(
+                                    &pool_clone,
+                                    &worker_id_clone,
+                                    32,
+                                )
+                                .await;
                             })
                             .await;
                         continue;
@@ -1381,9 +1386,10 @@ pub fn set_global_channels(channels: crate::channels::Channels) {
 }
 
 #[cfg(feature = "ws")]
+#[must_use]
 pub fn get_global_channels() -> Option<crate::channels::Channels> {
     CURRENT_CHANNELS
-        .try_with(|c| c.clone())
+        .try_with(std::clone::Clone::clone)
         .ok()
         .or_else(|| GLOBAL_CHANNELS.read().ok().and_then(|lock| lock.clone()))
 }

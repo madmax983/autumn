@@ -83,9 +83,8 @@ fn generate_topic_format(topic: &str, record_ident: &TokenStream) -> syn::Result
                     chars.next();
                     closed = true;
                     break;
-                } else {
-                    field.push(chars.next().unwrap());
                 }
+                field.push(chars.next().unwrap());
             }
             if closed {
                 let trimmed = field.trim();
@@ -98,10 +97,7 @@ fn generate_topic_format(topic: &str, record_ident: &TokenStream) -> syn::Result
                 let field_ident = syn::parse_str::<syn::Ident>(trimmed).map_err(|e| {
                     syn::Error::new(
                         proc_macro2::Span::call_site(),
-                        format!(
-                            "invalid field name '{}' in topic placeholder: {}",
-                            trimmed, e
-                        ),
+                        format!("invalid field name '{trimmed}' in topic placeholder: {e}"),
                     )
                 })?;
                 format_str.push_str("{}");
@@ -1395,7 +1391,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 Ok(expr) => expr,
                 Err(err) => {
                     let compile_err = err.to_compile_error();
-                    return quote! { #compile_err }.into();
+                    return quote! { #compile_err };
                 }
             };
 

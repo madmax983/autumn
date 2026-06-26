@@ -582,13 +582,17 @@ fn render_routes_file(
     let db_ty = if sharded { "ShardedDb" } else { "Db" };
     let create_signature = if live && !sharded {
         if has_attachments {
-            format!("flash: Flash, state: autumn_web::extract::State<autumn_web::AppState>, repo: Pg{pascal_name}Repository, body: Bytes")
+            format!(
+                "flash: Flash, state: autumn_web::extract::State<autumn_web::AppState>, repo: Pg{pascal_name}Repository, body: Bytes"
+            )
         } else {
             format!("flash: Flash, repo: Pg{pascal_name}Repository, body: Bytes")
         }
     } else {
         if has_attachments {
-            format!("flash: Flash, state: autumn_web::extract::State<autumn_web::AppState>, mut db: {db_ty}, body: Bytes")
+            format!(
+                "flash: Flash, state: autumn_web::extract::State<autumn_web::AppState>, mut db: {db_ty}, body: Bytes"
+            )
         } else {
             format!("flash: Flash, mut db: {db_ty}, body: Bytes")
         }
@@ -596,25 +600,25 @@ fn render_routes_file(
 
     let update_signature = if live && !sharded {
         if has_attachments {
-            format!("flash: Flash,\n    state: autumn_web::extract::State<autumn_web::AppState>,\n    id: Path<i64>,\n    repo: Pg{pascal_name}Repository,\n    body: Bytes,")
+            format!(
+                "flash: Flash,\n    state: autumn_web::extract::State<autumn_web::AppState>,\n    id: Path<i64>,\n    repo: Pg{pascal_name}Repository,\n    body: Bytes,"
+            )
         } else {
-            format!("flash: Flash,\n    id: Path<i64>,\n    repo: Pg{pascal_name}Repository,\n    body: Bytes,")
+            format!(
+                "flash: Flash,\n    id: Path<i64>,\n    repo: Pg{pascal_name}Repository,\n    body: Bytes,"
+            )
         }
     } else {
         if has_attachments {
-            format!("flash: Flash,\n    state: autumn_web::extract::State<autumn_web::AppState>,\n    id: Path<i64>,\n    mut db: {db_ty},\n    body: Bytes,")
+            format!(
+                "flash: Flash,\n    state: autumn_web::extract::State<autumn_web::AppState>,\n    id: Path<i64>,\n    mut db: {db_ty},\n    body: Bytes,"
+            )
         } else {
             format!("flash: Flash,\n    id: Path<i64>,\n    mut db: {db_ty},\n    body: Bytes,")
         }
     };
 
-    let (
-        _,
-        decode_create_call,
-        _,
-        decode_update_call,
-        decode_form_sig,
-    ) = if has_attachments {
+    let (_, decode_create_call, _, decode_update_call, decode_form_sig) = if has_attachments {
         (
             "",
             "decode_form(&state, body).await?".to_owned(),
@@ -654,9 +658,7 @@ fn render_routes_file(
     } else {
         (
             "ul".to_owned(),
-            format!(
-                r#"li {{ a href=(format!("/{plural}/{{}}", row.id)) {{ (row.id) }} }}"#
-            ),
+            format!(r#"li {{ a href=(format!("/{plural}/{{}}", row.id)) {{ (row.id) }} }}"#),
         )
     };
 
