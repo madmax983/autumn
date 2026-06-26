@@ -1386,7 +1386,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     .broadcast_topic
                     .as_deref()
                     .unwrap_or(&config.table_name),
-                &quote! { __record },
+                &quote! { __record_ref },
             ) {
                 Ok(expr) => expr,
                 Err(err) => {
@@ -1396,7 +1396,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             };
 
             let topic_expr = if config.tenant_scoped {
-                quote! { ::std::format!("tenant:{}:{}", ::autumn_web::tenancy::DisplayTenantId::tenant_id_str(&__record.tenant_id), #base_topic_expr) }
+                quote! { ::std::format!("tenant:{}:{}", ::autumn_web::tenancy::DisplayTenantId::tenant_id_str(&__record_ref.tenant_id), #base_topic_expr) }
             } else {
                 base_topic_expr
             };
@@ -1411,13 +1411,13 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             let table_name = &config.table_name;
 
             let render_expr = if let Some(ref render_path) = config.broadcast_render {
-                quote! { #render_path(&__record) }
+                quote! { #render_path(__record_ref) }
             } else {
                 quote! {
                     ::autumn_web::html! {
-                        li id=(::std::format!("{}-{}", #model_prefix, ::autumn_web::repository::ModelPrimaryKey::primary_key_value(&__record))) {
-                            a href=(::std::format!("/{}/{}", #table_name, ::autumn_web::repository::ModelPrimaryKey::primary_key_value(&__record))) {
-                                (::std::format!("{} #{}", #model_name_str, ::autumn_web::repository::ModelPrimaryKey::primary_key_value(&__record)))
+                        li id=(::std::format!("{}-{}", #model_prefix, ::autumn_web::repository::ModelPrimaryKey::primary_key_value(__record_ref))) {
+                            a href=(::std::format!("/{}/{}", #table_name, ::autumn_web::repository::ModelPrimaryKey::primary_key_value(__record_ref))) {
+                                (::std::format!("{} #{}", #model_name_str, ::autumn_web::repository::ModelPrimaryKey::primary_key_value(__record_ref)))
                             }
                         }
                     }
@@ -1426,6 +1426,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
             let create = quote! {
                 {
+                    let __record_ref = &__record;
                     if let ::core::option::Option::Some(__channels) = ::autumn_web::__private::get_global_channels() {
                         let __topic = #topic_expr;
                         let __fragment = #render_expr;
@@ -1441,63 +1442,49 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
             let update = quote! {
                 {
+                    let __record_ref = &__record;
                     if let ::core::option::Option::Some(__channels) = ::autumn_web::__private::get_global_channels() {
                         let __topic = #topic_expr;
                         let __fragment = #render_expr;
-                        let __id = {
-                            let __html = __fragment.clone().into_string();
-                            (|| -> ::core::option::Option<::std::string::String> {
-                                let __start_tag_end = __html.find('>')?;
-                                let __start_tag = &__html[..__start_tag_end];
-                                let mut __id_idx = ::core::option::Option::None;
-                                let mut __search_start = 0;
-                                while let ::core::option::Option::Some(__offset) = __start_tag[__search_start..].find("id=") {
-                                    let __absolute_idx = __search_start + __offset;
-                                    if __absolute_idx > 0 {
-                                        let __prev_char = __start_tag.as_bytes()[__absolute_idx - 1];
-                                        if __prev_char == b' ' || __prev_char == b'\t' || __prev_char == b'\n' || __prev_char == b'\r' {
-                                            __id_idx = ::core::option::Option::Some(__absolute_idx);
-                                            break;
-                                        }
-                                    }
-                                    __search_start = __absolute_idx + 3;
-                                }
-                                let __idx = __id_idx?;
-                                let __after_id = &__start_tag[__idx + 3..];
-                                let mut __chars = __after_id.chars();
-                                let __quote = __chars.next()?;
-                                if __quote == '"' || __quote == '\'' {
-                                    let mut __val = ::std::string::String::new();
-                                    for __c in __chars {
-                                        if __c == __quote {
-                                            break;
-                                        }
-                                        __val.push(__c);
-                                    }
-                                    ::core::option::Option::Some(__val)
-                                } else {
-                                    ::core::option::Option::None
-                                }
-                            })().unwrap_or_else(|| ::std::format!("{}-{}", #model_prefix, ::autumn_web::repository::ModelPrimaryKey::primary_key_value(&__record)))
-                        };
+                        let __id = ::autumn_web::htmx::extract_html_id(&__fragment.clone().into_string())
+                            .unwrap_or_else(|| ::std::format!("{}-{}", #model_prefix, ::autumn_web::repository::ModelPrimaryKey::primary_key_value(__record_ref)));
+
+                        let __prev_id = __ctx_val
+                            .get("__autumn_previous_id")
+                            .and_then(|__v| __v.as_str());
+
                         if let ::core::option::Option::Some(__prev_topic) = __ctx_val
                             .get("__autumn_previous_topic")
                             .and_then(|__v| __v.as_str())
                         {
                             if __prev_topic != __topic {
+                                let __delete_id = __prev_id.unwrap_or(&__id);
                                 let __delete_fragment = ::autumn_web::html! {};
                                 if let ::core::result::Result::Err(__err) = __channels
                                     .broadcast()
-                                    .publish_oob(__prev_topic, &__id, ::autumn_web::htmx::OobSwap::Delete, &__delete_fragment)
+                                    .publish_oob(__prev_topic, __delete_id, ::autumn_web::htmx::OobSwap::Delete, &__delete_fragment)
                                 {
                                     ::autumn_web::reexports::tracing::warn!(error = %__err, "auto-broadcast delete of old topic failed");
                                 }
                             }
                         }
 
+                        let __swap_strategy = if let ::core::option::Option::Some(__prev_id_val) = __prev_id {
+                            if __prev_id_val != &__id {
+                                ::autumn_web::htmx::OobSwap::Target(
+                                    ::autumn_web::htmx::OobMethod::OuterHTML,
+                                    ::std::format!("#{}", __prev_id_val),
+                                )
+                            } else {
+                                ::autumn_web::htmx::OobSwap::OuterHTML
+                            }
+                        } else {
+                            ::autumn_web::htmx::OobSwap::OuterHTML
+                        };
+
                         if let ::core::result::Result::Err(__err) = __channels
                             .broadcast()
-                            .publish_oob(&__topic, &__id, ::autumn_web::htmx::OobSwap::OuterHTML, &__fragment)
+                            .publish_oob(&__topic, &__id, __swap_strategy, &__fragment)
                         {
                             ::autumn_web::reexports::tracing::warn!(error = %__err, "auto-broadcast failed");
                         }
@@ -1507,6 +1494,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
             let delete = quote! {
                 {
+                    let __record_ref = &__record;
                     if let ::core::option::Option::Some(__channels) = ::autumn_web::__private::get_global_channels() {
                         let __topic = #topic_expr;
                         let __id = {
@@ -1544,7 +1532,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                 } else {
                                     ::core::option::Option::None
                                 }
-                            })().unwrap_or_else(|| ::std::format!("{}-{}", #model_prefix, ::autumn_web::repository::ModelPrimaryKey::primary_key_value(&__record)))
+                            })().unwrap_or_else(|| ::std::format!("{}-{}", #model_prefix, ::autumn_web::repository::ModelPrimaryKey::primary_key_value(__record_ref)))
                         };
                         let __fragment = ::autumn_web::html! {};
                         if let ::core::result::Result::Err(__err) = __channels
@@ -1573,7 +1561,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     .broadcast_topic
                     .as_deref()
                     .unwrap_or(&config.table_name),
-                &quote! { __record },
+                &quote! { __record_ref },
             ) {
                 Ok(expr) => expr,
                 Err(err) => {
@@ -1583,17 +1571,36 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             };
 
             let topic_expr = if config.tenant_scoped {
-                quote! { ::std::format!("tenant:{}:{}", ::autumn_web::tenancy::DisplayTenantId::tenant_id_str(&__record.tenant_id), #base_topic_expr) }
+                quote! { ::std::format!("tenant:{}:{}", ::autumn_web::tenancy::DisplayTenantId::tenant_id_str(&__record_ref.tenant_id), #base_topic_expr) }
             } else {
                 base_topic_expr
+            };
+
+            let model_prefix = to_snake_case(&config.model_name.to_string());
+            let model_name_str = config.model_name.to_string();
+            let table_name = &config.table_name;
+            let render_expr = if let Some(ref render_path) = config.broadcast_render {
+                quote! { #render_path(__record_ref) }
+            } else {
+                quote! {
+                    ::autumn_web::html! {
+                        li id=(::std::format!("{}-{}", #model_prefix, ::autumn_web::repository::ModelPrimaryKey::primary_key_value(__record_ref))) {
+                            a href=(::std::format!("/{}/{}", #table_name, ::autumn_web::repository::ModelPrimaryKey::primary_key_value(__record_ref))) {
+                                (::std::format!("{} #{}", #model_name_str, ::autumn_web::repository::ModelPrimaryKey::primary_key_value(__record_ref)))
+                            }
+                        }
+                    }
+                }
             };
 
             (
                 quote! {
                     let mut __autumn_previous_topic: ::core::option::Option<::std::string::String> = ::core::option::Option::None;
+                    let mut __autumn_previous_id: ::core::option::Option<::std::string::String> = ::core::option::Option::None;
                     let mut __autumn_ctx_val = ::autumn_web::reexports::serde_json::to_value(&ctx)
                         .map_err(|e| ::autumn_web::AutumnError::internal_server_error_msg(format!("serialize context: {e}")))?;
-                    if let ::core::option::Option::Some(__record) = &__vh_before {
+                    if let ::core::option::Option::Some(__record_val) = &__vh_before {
+                        let __record_ref = __record_val;
                         let __prev_topic = #topic_expr;
                         __autumn_previous_topic = ::core::option::Option::Some(__prev_topic.clone());
                         if let ::core::option::Option::Some(__map) = __autumn_ctx_val.as_object_mut() {
@@ -1601,6 +1608,18 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                 "__autumn_previous_topic".to_string(),
                                 ::autumn_web::reexports::serde_json::Value::String(__prev_topic),
                             );
+                        }
+
+                        let __prev_fragment = #render_expr;
+                        let __prev_id = ::autumn_web::htmx::extract_html_id(&__prev_fragment.into_string());
+                        __autumn_previous_id = __prev_id.clone();
+                        if let ::core::option::Option::Some(__prev_id_val) = __prev_id {
+                            if let ::core::option::Option::Some(__map) = __autumn_ctx_val.as_object_mut() {
+                                __map.insert(
+                                    "__autumn_previous_id".to_string(),
+                                    ::autumn_web::reexports::serde_json::Value::String(__prev_id_val),
+                                );
+                            }
                         }
                     }
                 },
@@ -1616,12 +1635,23 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                             );
                         }
                     }
+                    if let ::core::option::Option::Some(ref __prev_id) = __autumn_previous_id {
+                        if let ::core::option::Option::Some(__map) = __autumn_finalized_ctx_val.as_object_mut() {
+                            __map.insert(
+                                "__autumn_previous_id".to_string(),
+                                ::autumn_web::reexports::serde_json::Value::String(__prev_id.clone()),
+                            );
+                        }
+                    }
                 },
                 quote! { &__autumn_finalized_ctx_val },
             )
         } else {
             (
-                quote! { let __autumn_previous_topic: ::core::option::Option<::std::string::String> = ::core::option::Option::None; },
+                quote! {
+                    let __autumn_previous_topic: ::core::option::Option<::std::string::String> = ::core::option::Option::None;
+                    let __autumn_previous_id: ::core::option::Option<::std::string::String> = ::core::option::Option::None;
+                },
                 quote! { &ctx },
                 quote! {},
                 quote! { &ctx },
@@ -2184,8 +2214,8 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
                     Self::__autumn_register_repository_commit_hooks();
                     let mut conn = self.__autumn_acquire_conn().await?;
-                    let (record, mut ctx, __autumn_commit_hook_id, __autumn_commit_hook_owner, __autumn_commit_hook_record, __autumn_previous_topic) = conn
-                        .transaction::<(#model_name, MutationContext, ::std::string::String, ::std::string::String, ::autumn_web::reexports::serde_json::Value, ::core::option::Option<::std::string::String>), ::autumn_web::AutumnError, _>(|conn| {
+                    let (record, mut ctx, __autumn_commit_hook_id, __autumn_commit_hook_owner, __autumn_commit_hook_record, __autumn_previous_topic, __autumn_previous_id) = conn
+                        .transaction::<(#model_name, MutationContext, ::std::string::String, ::std::string::String, ::autumn_web::reexports::serde_json::Value, ::core::option::Option<::std::string::String>, ::core::option::Option<::std::string::String>), ::autumn_web::AutumnError, _>(|conn| {
                             async move {
                                 let mut ctx = MutationContext::new(MutationOp::Update);
                                 let mut __autumn_commit_hook_discriminator: ::core::option::Option<::std::string::String> =
@@ -2306,7 +2336,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                 )
                                 .await?;
 
-                                Ok((record, ctx, __autumn_commit_hook_id, __autumn_commit_hook_owner, __autumn_commit_hook_record, __autumn_previous_topic))
+                                Ok((record, ctx, __autumn_commit_hook_id, __autumn_commit_hook_owner, __autumn_commit_hook_record, __autumn_previous_topic, __autumn_previous_id))
                             }
                             .scope_boxed()
                         })
@@ -2528,8 +2558,8 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
                     Self::__autumn_register_repository_commit_hooks();
                     let mut conn = self.__autumn_acquire_conn().await?;
-                    let (record, mut ctx, __autumn_commit_hook_id, __autumn_commit_hook_owner, __autumn_commit_hook_record, __autumn_previous_topic) = conn
-                        .transaction::<(#model_name, MutationContext, ::std::string::String, ::std::string::String, ::autumn_web::reexports::serde_json::Value, ::core::option::Option<::std::string::String>), ::autumn_web::AutumnError, _>(|conn| {
+                    let (record, mut ctx, __autumn_commit_hook_id, __autumn_commit_hook_owner, __autumn_commit_hook_record, __autumn_previous_topic, __autumn_previous_id) = conn
+                        .transaction::<(#model_name, MutationContext, ::std::string::String, ::std::string::String, ::autumn_web::reexports::serde_json::Value, ::core::option::Option<::std::string::String>, ::core::option::Option<::std::string::String>), ::autumn_web::AutumnError, _>(|conn| {
                             async move {
                                 let mut ctx = MutationContext::new(MutationOp::Update);
                                 let mut __autumn_commit_hook_discriminator: ::core::option::Option<::std::string::String> =
@@ -2624,7 +2654,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                 )
                                 .await?;
 
-                                Ok((record, ctx, __autumn_commit_hook_id, __autumn_commit_hook_owner, __autumn_commit_hook_record, __autumn_previous_topic))
+                                Ok((record, ctx, __autumn_commit_hook_id, __autumn_commit_hook_owner, __autumn_commit_hook_record, __autumn_previous_topic, __autumn_previous_id))
                             }
                             .scope_boxed()
                         })
@@ -4123,7 +4153,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                             .broadcast_topic
                             .as_deref()
                             .unwrap_or(&config.table_name),
-                        &quote! { __record },
+                        &quote! { __record_ref },
                     ) {
                         Ok(expr) => expr,
                         Err(err) => {
@@ -4133,9 +4163,26 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     };
 
                     let topic_expr = if config.tenant_scoped {
-                        quote! { ::std::format!("tenant:{}:{}", ::autumn_web::tenancy::DisplayTenantId::tenant_id_str(&__record.tenant_id), #base_topic_expr) }
+                        quote! { ::std::format!("tenant:{}:{}", ::autumn_web::tenancy::DisplayTenantId::tenant_id_str(&__record_ref.tenant_id), #base_topic_expr) }
                     } else {
                         base_topic_expr
+                    };
+
+                    let model_prefix = to_snake_case(&config.model_name.to_string());
+                    let model_name_str = config.model_name.to_string();
+                    let table_name = &config.table_name;
+                    let render_expr = if let Some(ref render_path) = config.broadcast_render {
+                        quote! { #render_path(__record_ref) }
+                    } else {
+                        quote! {
+                            ::autumn_web::html! {
+                                li id=(::std::format!("{}-{}", #model_prefix, ::autumn_web::repository::ModelPrimaryKey::primary_key_value(__record_ref))) {
+                                    a href=(::std::format!("/{}/{}", #table_name, ::autumn_web::repository::ModelPrimaryKey::primary_key_value(__record_ref))) {
+                                        (::std::format!("{} #{}", #model_name_str, ::autumn_web::repository::ModelPrimaryKey::primary_key_value(__record_ref)))
+                                    }
+                                }
+                            }
+                        }
                     };
 
                     quote! {
@@ -4153,15 +4200,31 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
                         let mut serialized_contexts = Vec::new();
                         let mut chunk_previous_topics = Vec::new();
+                        let mut chunk_previous_ids = Vec::new();
                         for (idx, _record) in chunk_updated.iter().enumerate() {
                             let global_idx = offset + idx;
                             let ctx = &contexts[global_idx];
                             let mut ctx_val = ::autumn_web::reexports::serde_json::to_value(ctx)
                                 .map_err(|e| ::autumn_web::AutumnError::internal_server_error_msg(format!("serialize context: {e}")))?;
 
-                            let __record = &current_rows[global_idx];
+                            let __record_val = &current_rows[global_idx];
+                            let __record_ref = __record_val;
                             let __prev_topic = #topic_expr;
                             chunk_previous_topics.push(::core::option::Option::Some(__prev_topic.clone()));
+
+                            let __prev_fragment = #render_expr;
+                            let __prev_id = ::autumn_web::htmx::extract_html_id(&__prev_fragment.into_string());
+                            chunk_previous_ids.push(__prev_id.clone());
+
+                            if let ::core::option::Option::Some(__prev_id_val) = __prev_id {
+                                if let ::core::option::Option::Some(__map) = ctx_val.as_object_mut() {
+                                    __map.insert(
+                                        "__autumn_previous_id".to_string(),
+                                        ::autumn_web::reexports::serde_json::Value::String(__prev_id_val),
+                                    );
+                                }
+                            }
+
                             if let ::core::option::Option::Some(__map) = ctx_val.as_object_mut() {
                                 __map.insert(
                                     "__autumn_previous_topic".to_string(),
@@ -4191,7 +4254,13 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         .await?;
 
                         for (idx, info) in chunk_hook_infos.into_iter().enumerate() {
-                            hook_infos.push((info.0, info.1, hook_records[idx].0.clone(), chunk_previous_topics[idx].clone()));
+                            hook_infos.push((
+                                info.0,
+                                info.1,
+                                hook_records[idx].0.clone(),
+                                chunk_previous_topics[idx].clone(),
+                                chunk_previous_ids[idx].clone(),
+                            ));
                         }
                     }
                 } else {
@@ -4229,7 +4298,13 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         .await?;
 
                         for (idx, info) in chunk_hook_infos.into_iter().enumerate() {
-                            hook_infos.push((info.0, info.1, hook_records[idx].0.clone(), ::core::option::Option::None));
+                            hook_infos.push((
+                                info.0,
+                                info.1,
+                                hook_records[idx].0.clone(),
+                                ::core::option::Option::None,
+                                ::core::option::Option::None,
+                            ));
                         }
                     }
                 }
@@ -4250,6 +4325,14 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                 );
                             }
                         }
+                        if let ::core::option::Option::Some(__prev_id) = __autumn_previous_id {
+                            if let ::core::option::Option::Some(__map) = __autumn_finalized_ctx_val.as_object_mut() {
+                                __map.insert(
+                                    "__autumn_previous_id".to_string(),
+                                    ::autumn_web::reexports::serde_json::Value::String(__prev_id.clone()),
+                                );
+                            }
+                        }
                     }
                 } else {
                     quote! {}
@@ -4261,7 +4344,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 };
 
                 quote! {
-                    let (hook_id, hook_owner, hook_record, __autumn_previous_topic) = &hook_infos[idx];
+                    let (hook_id, hook_owner, hook_record, __autumn_previous_topic, __autumn_previous_id) = &hook_infos[idx];
                     let __autumn_pending_heartbeat =
                         ::autumn_web::__private::start_repository_commit_hook_pending_finalizer_heartbeat(
                             self.pool.clone(),
@@ -4421,7 +4504,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         }
 
                         let mut updated_records = Vec::new();
-                        let mut hook_infos: ::std::vec::Vec<(::std::string::String, ::std::string::String, ::serde_json::Value, ::core::option::Option<::std::string::String>)> = ::std::vec::Vec::new();
+                        let mut hook_infos: ::std::vec::Vec<(::std::string::String, ::std::string::String, ::serde_json::Value, ::core::option::Option<::std::string::String>, ::core::option::Option<::std::string::String>)> = ::std::vec::Vec::new();
                         let mut offset = 0;
                         for chunk in proposed_rows.chunks(1000) {
                             let mut chunk_updated = Vec::new();

@@ -519,6 +519,45 @@ fn has_oob_attribute(html: &str) -> bool {
     false
 }
 
+/// Extracts the `id` attribute value from the root HTML element in the given HTML string.
+///
+/// Looks for an `id` attribute within the root start tag (before the first `>`).
+/// The attribute name must be preceded by a whitespace boundary.
+#[must_use]
+pub fn extract_html_id(html: &str) -> Option<String> {
+    let start_tag_end = html.find('>')?;
+    let start_tag = &html[..start_tag_end];
+    let mut id_idx = None;
+    let mut search_start = 0;
+    while let Some(offset) = start_tag[search_start..].find("id=") {
+        let absolute_idx = search_start + offset;
+        if absolute_idx > 0 {
+            let prev_char = start_tag.as_bytes()[absolute_idx - 1];
+            if prev_char == b' ' || prev_char == b'\t' || prev_char == b'\n' || prev_char == b'\r' {
+                id_idx = Some(absolute_idx);
+                break;
+            }
+        }
+        search_start = absolute_idx + 3;
+    }
+    let idx = id_idx?;
+    let after_id = &start_tag[idx + 3..];
+    let mut chars = after_id.chars();
+    let quote = chars.next()?;
+    if quote == '"' || quote == '\'' {
+        let mut val = String::new();
+        for c in chars {
+            if c == quote {
+                break;
+            }
+            val.push(c);
+        }
+        Some(val)
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
