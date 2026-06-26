@@ -3519,6 +3519,31 @@ fn generate_model_project_default_uuid_auto_discovered() {
     );
 }
 
+/// Codex P2: a defaults-only read (`generate model`, no --config) must parse
+/// only `[generate]` and ignore `[scaffold.*]` recipes — so an unrelated
+/// checked-in recipe with a typo'd/unsupported key does not break it.
+#[test]
+fn generate_model_tolerates_malformed_scaffold_recipe_in_config() {
+    let (_tmp, project) = fresh_project("malformed-recipe-model-app");
+
+    // [scaffold.Other] uses `index` (unsupported; the key is `indexes`). A full
+    // parse would reject it, but `generate model` only reads [generate].
+    fs::write(
+        project.join("autumn.generate.toml"),
+        "[generate]\nid = \"bigint\"\n\n[scaffold.Other]\nfields = [\"x:String\"]\nindex = [\"x\"]\n",
+    )
+    .unwrap();
+
+    // Must succeed despite the malformed [scaffold.Other] recipe.
+    run_autumn(&project, &["generate", "model", "Post", "title:String"]);
+
+    let model = fs::read_to_string(project.join("src/models/post.rs")).unwrap();
+    assert!(
+        model.contains("pub id: i64,"),
+        "[generate] id=bigint should produce an i64 PK; got:\n{model}"
+    );
+}
+
 /// AC6 + scaffold UUID gate: an auto-discovered `[generate] id = "uuid"` flows
 /// into `generate scaffold`, where it is rejected (UUID scaffolds are gated).
 /// The project-wide default must not silently produce a broken scaffold.

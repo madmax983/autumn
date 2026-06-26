@@ -81,6 +81,17 @@ struct GeneratorConfig {
     generate: GenerateDefaults,
 }
 
+/// A defaults-only view of the config file. Parses just the `[generate]` table
+/// and ignores every `[scaffold.*]` section, so a defaults-only read (e.g.
+/// `generate model`, or auto-discovered scaffold) does not fail on an unrelated
+/// per-resource recipe that has a typo or an unsupported key — those are only
+/// validated when the recipe is actually used via `--config`.
+#[derive(Debug, Default, Deserialize)]
+struct GenerateDefaultsConfig {
+    #[serde(default)]
+    generate: GenerateDefaults,
+}
+
 /// Read and parse the whole generator config file at `config_path`.
 ///
 /// # Errors
@@ -193,12 +204,21 @@ pub fn read_explicit_scaffold_config(
 
 /// Read the raw project-level `[generate] id` string from `config_path`, if set.
 ///
+/// Parses only the `[generate]` table (via [`GenerateDefaultsConfig`]), so an
+/// unrelated `[scaffold.*]` recipe with a typo does not break defaults-only
+/// reads.
+///
 /// # Errors
 ///
 /// - [`GenerateError::Io`] if the file cannot be read.
 /// - [`GenerateError::Config`] if the file is not valid TOML.
 fn read_generate_id(config_path: &Path) -> Result<Option<String>, GenerateError> {
-    Ok(parse_config(config_path)?.generate.id)
+    let content = std::fs::read_to_string(config_path)
+        .map_err(|e| std::io::Error::new(e.kind(), format!("{}: {e}", config_path.display())))?;
+    let config: GenerateDefaultsConfig = toml::from_str(&content).map_err(|e| {
+        GenerateError::Config(format!("invalid TOML in {}: {e}", config_path.display()))
+    })?;
+    Ok(config.generate.id)
 }
 
 /// Read the project-level `[generate]` defaults from `config_path`, returning
@@ -439,6 +459,28 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
         let entry = read_explicit_scaffold_config(&path, "Post", true).unwrap();
         assert_eq!(entry.id.as_deref(), Some("uuid"));
         assert!(entry.fields.is_empty());
+    }
+
+    #[test]
+    fn defaults_only_read_tolerates_malformed_scaffold_recipe() {
+        // A checked-in [scaffold.*] recipe with an unsupported/typo'd key must
+        // NOT break defaults-only reads (generate model / auto-discovered
+        // scaffold), which only consult [generate].
+        let tmp = TempDir::new().unwrap();
+        let path = write_config(
+            &tmp,
+            "[generate]\nid = \"uuid\"\n\n\
+             [scaffold.Post]\nfields = [\"title:String\"]\nindex = [\"title\"]\n",
+        );
+        // `index` is an unknown key for ScaffoldConfigEntry (deny_unknown_fields),
+        // so a full parse would fail — but the defaults-only readers must not.
+        assert_eq!(read_generate_defaults(&path).unwrap(), IdType::Uuid);
+        assert_eq!(
+            read_generate_defaults_entry(&path).unwrap().id.as_deref(),
+            Some("uuid")
+        );
+        // The strict, recipe-using reader still rejects the malformed section.
+        assert!(read_scaffold_config(&path, "Post").is_err());
     }
 
     #[test]
