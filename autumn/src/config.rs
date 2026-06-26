@@ -2080,6 +2080,19 @@ impl AutumnConfig {
         let empty_table = toml::Table::new();
         let merged_table = merged.as_table().unwrap_or(&empty_table);
         for f in detect_deprecated_keys(merged_table, env, DEPRECATED_CONFIG_KEYS) {
+            // eprintln! ensures the warning is visible on stderr even before the
+            // tracing subscriber is installed (config loads before telemetry init in
+            // the normal startup path).  The tracing::warn! below is kept so apps
+            // that pre-install their own subscriber still receive structured events.
+            eprintln!(
+                "Warning: deprecated configuration key `{}` is still honored but will be removed \
+                 in {}; deprecated since {} (replacement: {}; source: {:?})",
+                f.path,
+                f.remove_in,
+                f.since,
+                f.replacement.as_deref().unwrap_or("none — remove this key"),
+                f.source,
+            );
             tracing::warn!(
                 deprecated_key = f.path.as_str(),
                 replacement = f.replacement.as_deref().unwrap_or("none; remove this key"),
