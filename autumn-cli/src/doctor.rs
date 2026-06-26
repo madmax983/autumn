@@ -2159,12 +2159,15 @@ fn resolve_active_profiles() -> (String, Vec<String>) {
         other => other,
     }
     .to_owned();
-    let alias = match raw_lower.as_str() {
-        "production" => Some("production".to_owned()),
-        "development" => Some("development".to_owned()),
+    // Mirror profile_lookup_names in config.rs: the runtime always loads the
+    // legacy long-form alias first (e.g. "production") then the canonical short
+    // form ("prod"), regardless of which spelling was used in the env var.
+    let alias = match canonical.as_str() {
+        "prod" => Some("production".to_owned()),
+        "dev" => Some("development".to_owned()),
         _ => None,
     };
-    let profiles: Vec<String> = std::iter::once(canonical.clone()).chain(alias).collect();
+    let profiles: Vec<String> = alias.into_iter().chain(std::iter::once(canonical.clone())).collect();
     (canonical, profiles)
 }
 
