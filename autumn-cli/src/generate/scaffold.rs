@@ -509,7 +509,16 @@ fn render_routes_file(
     // The destroy handler must honour the resource's delete semantics: when the
     // scaffold was generated with `--soft-delete`, mark `deleted_at` (matching
     // the soft-delete repository) instead of issuing a physical `DELETE`.
-    let destroy_stmt = if soft_delete {
+    let destroy_stmt = if live {
+        if sharded {
+            format!(
+                "let repo = Pg{pascal_name}Repository::from_shard(&db);\n    \
+                 let deleted = repo.delete_by_id(*id).await?;"
+            )
+        } else {
+            format!("let deleted = repo.delete_by_id(*id).await?;")
+        }
+    } else if soft_delete {
         // Filter on `deleted_at IS NULL` so deleting an already-soft-deleted row
         // affects zero rows and returns 404, matching the physical-delete path.
         format!(
@@ -523,27 +532,93 @@ fn render_routes_file(
                  .execute(&mut *db)\n        .await?;"
         )
     };
+
+    let create_stmt = if live {
+        if sharded {
+            format!(
+                "let repo = Pg{pascal_name}Repository::from_shard(&db);\n    \
+                 repo.save(&new).await?;"
+            )
+        } else {
+            format!("repo.save(&new).await?;")
+        }
+    } else {
+        format!(
+            "diesel::insert_into({plural}::table)\n        \
+             .values(&new)\n        \
+             .execute(&mut *db)\n        .await?;"
+        )
+    };
+
+    let update_changeset_expr = render_update_changeset_expr(pascal_name, fields);
+    let update_stmt = if live {
+        if sharded {
+            format!(
+                "let repo = Pg{pascal_name}Repository::from_shard(&db);\n    \
+                 let update_changes = {update_changeset_expr};\n    \
+                 repo.update(*id, &update_changes).await?;\n    \
+                 let updated = 1;"
+            )
+        } else {
+            format!(
+                "let update_changes = {update_changeset_expr};\n    \
+                 repo.update(*id, &update_changes).await?;\n    \
+                 let updated = 1;"
+            )
+        }
+    } else {
+        format!(
+            "let updated = diesel::update({plural}::table.find(*id))\n        \
+             .set(({update_columns}))\n        \
+             .execute(&mut *db)\n        .await?;"
+        )
+    };
+
     // Forms remain URL-encoded for compatibility with the generated handlers.
     // File uploads are handled separately via direct-upload URLs generated in
     // a CSRF-protected endpoint (see docs/guide/storage.md#direct-uploads).
     let form_enctype = "";
 
     let db_ty = if sharded { "ShardedDb" } else { "Db" };
+    let create_signature = if live && !sharded {
+        if has_attachments {
+            format!("flash: Flash, state: autumn_web::extract::State<autumn_web::AppState>, repo: Pg{pascal_name}Repository, body: Bytes")
+        } else {
+            format!("flash: Flash, repo: Pg{pascal_name}Repository, body: Bytes")
+        }
+    } else {
+        if has_attachments {
+            format!("flash: Flash, state: autumn_web::extract::State<autumn_web::AppState>, mut db: {db_ty}, body: Bytes")
+        } else {
+            format!("flash: Flash, mut db: {db_ty}, body: Bytes")
+        }
+    };
+
+    let update_signature = if live && !sharded {
+        if has_attachments {
+            format!("flash: Flash,\n    state: autumn_web::extract::State<autumn_web::AppState>,\n    id: Path<i64>,\n    repo: Pg{pascal_name}Repository,\n    body: Bytes,")
+        } else {
+            format!("flash: Flash,\n    id: Path<i64>,\n    repo: Pg{pascal_name}Repository,\n    body: Bytes,")
+        }
+    } else {
+        if has_attachments {
+            format!("flash: Flash,\n    state: autumn_web::extract::State<autumn_web::AppState>,\n    id: Path<i64>,\n    mut db: {db_ty},\n    body: Bytes,")
+        } else {
+            format!("flash: Flash,\n    id: Path<i64>,\n    mut db: {db_ty},\n    body: Bytes,")
+        }
+    };
+
     let (
-        create_signature,
+        _,
         decode_create_call,
-        update_signature,
+        _,
         decode_update_call,
         decode_form_sig,
     ) = if has_attachments {
         (
-            format!(
-                "flash: Flash, state: autumn_web::extract::State<autumn_web::AppState>, mut db: {db_ty}, body: Bytes"
-            ),
+            "",
             "decode_form(&state, body).await?".to_owned(),
-            format!(
-                "flash: Flash,\n    state: autumn_web::extract::State<autumn_web::AppState>,\n    id: Path<i64>,\n    mut db: {db_ty},\n    body: Bytes,"
-            ),
+            "",
             "decode_form(&state, body).await?".to_owned(),
             format!(
                 "async fn decode_form(state: &autumn_web::AppState, body: Bytes) -> AutumnResult<New{pascal_name}>"
@@ -551,12 +626,18 @@ fn render_routes_file(
         )
     } else {
         (
-            format!("flash: Flash, mut db: {db_ty}, body: Bytes"),
+            "",
             "decode_form(body)?".to_owned(),
-            format!("flash: Flash,\n    id: Path<i64>,\n    mut db: {db_ty},\n    body: Bytes,"),
+            "",
             "decode_form(body)?".to_owned(),
             format!("fn decode_form(body: Bytes) -> AutumnResult<New{pascal_name}>"),
         )
+    };
+
+    let destroy_signature_arg = if live && !sharded {
+        format!("repo: Pg{pascal_name}Repository")
+    } else {
+        format!("mut db: {db_ty}")
     };
 
     // The `index` handler: when sharded, use from_shard explicitly so the
@@ -573,7 +654,9 @@ fn render_routes_file(
     } else {
         (
             "ul".to_owned(),
-            r#"li {{ a href=(format!("/{plural}/{{}}", row.id)) {{ (row.id) }} }}"#.to_owned(),
+            format!(
+                r#"li {{ a href=(format!("/{plural}/{{}}", row.id)) {{ (row.id) }} }}"#
+            ),
         )
     };
 
@@ -660,7 +743,7 @@ use autumn_web::ui::pagination::{{PagerOptions, pagination_nav}};
 use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
 
-use crate::models::{snake_name}::{{{pascal_name}, New{pascal_name}}};
+use crate::models::{snake_name}::{{{pascal_name}, New{pascal_name}, Update{pascal_name}}};
 use crate::repositories::{snake_name}::{{{pascal_name}Repository, Pg{pascal_name}Repository}};
 use crate::schema::{plural};",
         attachment_note = if has_attachments {
@@ -754,10 +837,7 @@ pub async fn new_form(
 #[post("/{plural}")]
 pub async fn create({create_signature}) -> AutumnResult<Markup> {{
     let new = {decode_create_call};
-    diesel::insert_into({plural}::table)
-        .values(&new)
-        .execute(&mut *db)
-        .await?;
+    {create_stmt}
     flash.success("{pascal_name} created").await;
     Ok(redirect_to("/{plural}"))
 }}
@@ -806,10 +886,7 @@ pub async fn update(
     {update_signature}
 ) -> AutumnResult<Markup> {{
     let form = {decode_update_call};
-    let updated = diesel::update({plural}::table.find(*id))
-        .set(({update_columns}))
-        .execute(&mut *db)
-        .await?;
+    {update_stmt}
     if updated == 0 {{
         return Err(AutumnError::not_found_msg(format!(
             "{pascal_name} with id {{}} not found", *id
@@ -828,7 +905,7 @@ pub async fn update(
 #[post("/{plural}/{{id}}/delete")]
 pub async fn destroy(
     id: Path<i64>,
-    mut db: {db_ty},
+    {destroy_signature_arg},
     flash: Flash,
 ) -> AutumnResult<Markup> {{
     {destroy_stmt}
@@ -1009,6 +1086,22 @@ fn render_update_columns(plural: &str, fields: &[Field]) -> String {
         )
         .unwrap();
     }
+    out
+}
+
+fn render_update_changeset_expr(pascal_name: &str, fields: &[Field]) -> String {
+    use std::fmt::Write;
+    let mut out = format!("Update{pascal_name} {{\n");
+    for f in fields {
+        let name = &f.name;
+        writeln!(
+            out,
+            "        {name}: Some(form.{name}.clone()),",
+            name = name
+        )
+        .unwrap();
+    }
+    out.push_str("    }");
     out
 }
 
@@ -1305,7 +1398,7 @@ async fn main() {
         plan.execute(Flags::default()).unwrap();
 
         let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
-        assert!(routes.contains("use crate::models::post::{Post, NewPost};"));
+        assert!(routes.contains("use crate::models::post::{Post, NewPost, UpdatePost};"));
         assert!(routes.contains("#[get(\"/posts\")]"));
         assert!(routes.contains("#[get(\"/posts/{id}\")]"));
         assert!(

@@ -880,28 +880,23 @@ fn spawn_repository_commit_hook_kick_worker(
     state: Arc<RepositoryCommitHookKickState>,
 ) {
     let worker_id = repository_commit_hook_worker_id();
-    #[cfg(feature = "ws")]
-    let channels = get_global_channels();
     tokio::spawn(async move {
-        #[cfg(feature = "ws")]
-        {
-            if let Some(ch) = channels {
-                let _ = CURRENT_CHANNELS
-                    .scope(ch, async move {
-                        loop {
-                            state.notify.notified().await;
-                            while state.take_pending_kick() {
-                                drain_ready_repository_commit_hooks(&pool, &worker_id, 32).await;
-                            }
-                        }
-                    })
-                    .await;
-                return;
-            }
-        }
         loop {
             state.notify.notified().await;
             while state.take_pending_kick() {
+                #[cfg(feature = "ws")]
+                {
+                    if let Some(ch) = get_global_channels() {
+                        let pool_clone = pool.clone();
+                        let worker_id_clone = worker_id.clone();
+                        let _ = CURRENT_CHANNELS
+                            .scope(ch, async move {
+                                drain_ready_repository_commit_hooks(&pool_clone, &worker_id_clone, 32).await;
+                            })
+                            .await;
+                        continue;
+                    }
+                }
                 drain_ready_repository_commit_hooks(&pool, &worker_id, 32).await;
             }
         }
