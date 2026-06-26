@@ -157,7 +157,6 @@ mod tests {
 
         let update_changes = UpdateBroadcastPost {
             title: autumn_web::hooks::Patch::Set("world".to_owned()),
-            ..Default::default()
         };
         custom_repo
             .update(custom_post.id, &update_changes)

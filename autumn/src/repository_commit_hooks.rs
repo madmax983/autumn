@@ -153,6 +153,8 @@ static REPOSITORY_COMMIT_HOOK_KICKERS: OnceLock<
 struct RepositoryCommitHookKickState {
     notify: Notify,
     pending: AtomicBool,
+    #[cfg(feature = "ws")]
+    channels: OnceLock<crate::channels::Channels>,
 }
 
 impl Default for RepositoryCommitHookKickState {
@@ -160,6 +162,8 @@ impl Default for RepositoryCommitHookKickState {
         Self {
             notify: Notify::new(),
             pending: AtomicBool::new(false),
+            #[cfg(feature = "ws")]
+            channels: OnceLock::new(),
         }
     }
 }
@@ -780,6 +784,11 @@ pub fn start_repository_commit_hook_worker(
         return;
     }
 
+    if let Some(ch) = channels.clone() {
+        let kick_state = repository_commit_hook_kick_state(&pool);
+        let _ = kick_state.channels.set(ch);
+    }
+
     let worker_id = repository_commit_hook_worker_id();
     tokio::spawn(async move {
         if let Some(ch) = channels {
@@ -886,7 +895,8 @@ fn spawn_repository_commit_hook_kick_worker(
             while state.take_pending_kick() {
                 #[cfg(feature = "ws")]
                 {
-                    if let Some(ch) = get_global_channels() {
+                    let ch_opt = state.channels.get().cloned().or_else(get_global_channels);
+                    if let Some(ch) = ch_opt {
                         let pool_clone = pool.clone();
                         let worker_id_clone = worker_id.clone();
                         CURRENT_CHANNELS
