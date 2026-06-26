@@ -42,7 +42,8 @@ use super::{Cache, get_cached, insert_cached};
 /// - **Miss**: calls `render()`, stores the result, and returns it.
 /// - **No cache** (`cache = None`): calls `render()` on every call — no panic.
 ///
-/// The cache key is `"fragment:{identity}:{version}"`. Storing the rendered
+/// The cache key combines `identity` and `version` (the identity is
+/// length-prefixed so a `:` inside it can't alias two fragments). Storing the rendered
 /// `String` via [`insert_cached`] means the fragment works with both the
 /// moka in-process backend and the Redis shared backend (which serializes via
 /// serde JSON), and honours an optional TTL.
@@ -67,7 +68,12 @@ pub fn cache_fragment(
         return render();
     };
 
-    let key = format!("fragment:{identity}:{version}");
+    // Length-prefix the identity so a `:` inside it cannot shift the
+    // identity/version boundary and alias two distinct fragments — e.g.
+    // (identity="a:b", version="c") must not collide with (identity="a",
+    // version="b:c"). The byte length pins where the identity ends.
+    let identity = identity.to_string();
+    let key = format!("fragment:{}:{identity}:{version}", identity.len());
 
     if let Some(html) = get_cached::<String>(cache, &key) {
         // Hit: reconstruct Markup from the cached String without re-escaping.
@@ -425,5 +431,41 @@ mod tests {
             2,
             "each identity must be cached independently"
         );
+    }
+
+    // ── Key boundary is unambiguous even when identity contains `:` ───────
+
+    #[test]
+    fn colon_in_identity_does_not_alias_distinct_fragments() {
+        let cache = make_cache(100);
+        let counter = Arc::new(AtomicUsize::new(0));
+
+        // These two pairs join to the same naive "fragment:{id}:{ver}" string
+        // ("fragment:a:b:c") but are semantically distinct fragments. The
+        // length prefix must keep them apart.
+        let first = {
+            let counter = counter.clone();
+            cache_fragment(Some(&cache), "a:b", "c", None, move || {
+                counter.fetch_add(1, Ordering::SeqCst);
+                html! { p { "left" } }
+            })
+        };
+        assert_eq!(counter.load(Ordering::SeqCst), 1, "first pair is a miss");
+        assert!(first.into_string().contains("left"));
+
+        let second = {
+            let counter = counter.clone();
+            cache_fragment(Some(&cache), "a", "b:c", None, move || {
+                counter.fetch_add(1, Ordering::SeqCst);
+                html! { p { "right" } }
+            })
+        };
+        // Must be a MISS (distinct key), not a hit serving "left".
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            2,
+            "a `:` in the identity must not collide with a different (identity, version) split"
+        );
+        assert!(second.into_string().contains("right"));
     }
 }

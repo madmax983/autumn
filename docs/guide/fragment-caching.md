@@ -114,11 +114,11 @@ pub async fn index(state: AppState, mut db: Db) -> AutumnResult<Markup> {
 
 ## Choosing the identity and version
 
-The cache key is `"fragment:{identity}:{version}"`. You supply both halves.
-Keep the `version` token unambiguous (a number or other colon-free value): the
-key is a plain `:`-joined string, so a colon *inside* the version could shift
-the identity/version boundary and alias two distinct fragments. Numeric tokens
-like `timestamp_micros()` or a sequence number are always safe.
+The cache key is built from both halves you supply. The identity is
+length-prefixed internally, so a `:` (or any other character) inside it can
+never shift the identity/version boundary or alias two distinct fragments —
+`(identity="a:b", version="c")` and `(identity="a", version="b:c")` stay
+separate. You can put whatever you like in either half.
 
 - **identity** — anything `Display` that uniquely names the fragment. Include the
   record type and primary key (`format_args!("post_card:{}", post.id)`), and any
