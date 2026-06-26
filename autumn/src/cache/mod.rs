@@ -33,10 +33,14 @@
 //! }
 //! ```
 
+#[cfg(feature = "maud")]
+mod fragment;
 mod layer;
 #[cfg(feature = "cache-moka")]
 mod moka_impl;
 
+#[cfg(feature = "maud")]
+pub use fragment::{cache_fragment, cache_fragment_global};
 pub use layer::{CacheResponseLayer, CacheResponseService};
 #[cfg(feature = "cache-moka")]
 pub use moka_impl::MokaCache;
