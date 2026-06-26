@@ -979,7 +979,7 @@ where
         .and_then(toml::Value::as_table)
         .and_then(|db| db.get("startup_wait_secs"))
         .and_then(toml::Value::as_integer)
-        .map(|n| {
+        .map_or(0, |n| {
             u64::try_from(n).unwrap_or_else(|_| {
                 eprintln!(
                     "  Warning: `database.startup_wait_secs = {n}` in autumn.toml is not a \
@@ -988,7 +988,6 @@ where
                 0
             })
         })
-        .unwrap_or(0)
 }
 
 /// Resolve the effective startup wait: the `--wait` CLI flag (if given) wins;
@@ -1000,11 +999,10 @@ fn resolve_startup_wait(
     flag: Option<u64>,
     config_table: Option<&toml::Table>,
 ) -> std::time::Duration {
-    let secs = if let Some(n) = flag {
-        n
-    } else {
-        resolve_startup_wait_secs_from_sources(|key| std::env::var(key), config_table)
-    };
+    let secs = flag.map_or_else(
+        || resolve_startup_wait_secs_from_sources(|key| std::env::var(key), config_table),
+        |n| n,
+    );
     std::time::Duration::from_secs(secs)
 }
 
