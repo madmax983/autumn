@@ -1465,10 +1465,11 @@ fn generate_scaffold_rejects_missing_config_file() {
     );
 }
 
-/// When the config file exists but has no entry for the requested resource,
-/// the command must fail with a helpful error message.
+/// Explicit `--config` with no matching `[scaffold.X]` section but WITH CLI
+/// fields succeeds: the field list comes from the CLI and the config is only
+/// consulted for project defaults.
 #[test]
-fn generate_scaffold_rejects_config_missing_resource_section() {
+fn generate_scaffold_missing_resource_section_uses_defaults() {
     let (_tmp, project) = fresh_project("scaffold-missing-section-app");
 
     fs::write(
@@ -1477,6 +1478,42 @@ fn generate_scaffold_rejects_config_missing_resource_section() {
     )
     .unwrap();
 
+    // No [scaffold.Post] section, but fields supplied on the CLI → succeed.
+    run_autumn(
+        &project,
+        &[
+            "generate",
+            "scaffold",
+            "Post",
+            "title:String",
+            "--config",
+            "autumn.generate.toml",
+        ],
+    );
+
+    // Default id type is BigSerial when no [generate] id is set.
+    let model = fs::read_to_string(project.join("src/models/post.rs")).unwrap();
+    assert!(
+        model.contains("pub id: i64,"),
+        "missing-section scaffold should default to i64 PK; got:\n{model}"
+    );
+}
+
+/// Typo protection (Codex P2): explicit `--config` with no matching
+/// `[scaffold.X]` section, the file DOES define other scaffold resources, and
+/// NO CLI fields were given → the command must error rather than silently
+/// generate an empty resource.
+#[test]
+fn generate_scaffold_explicit_config_missing_section_errors() {
+    let (_tmp, project) = fresh_project("scaffold-typo-section-app");
+
+    fs::write(
+        project.join("autumn.generate.toml"),
+        "[scaffold.OtherResource]\nfields = [\"name:String\"]\n",
+    )
+    .unwrap();
+
+    // Misspelled/missing [scaffold.Post] + no CLI fields → likely a typo.
     let (_, stderr, code) = run_autumn_failing(
         &project,
         &[
@@ -1487,15 +1524,18 @@ fn generate_scaffold_rejects_config_missing_resource_section() {
             "autumn.generate.toml",
         ],
     );
-
-    assert_eq!(code, Some(1), "expected exit code 1; got {code:?}");
-    assert!(
-        stderr.contains("Post"),
-        "error must mention the resource name; got:\n{stderr}"
+    assert_eq!(
+        code,
+        Some(1),
+        "missing section with no CLI fields must fail"
     );
     assert!(
-        stderr.contains("autumn.generate.toml"),
-        "error must mention the config file name; got:\n{stderr}"
+        stderr.contains("no [scaffold.Post] section found"),
+        "error must name the missing section; got:\n{stderr}"
+    );
+    assert!(
+        !project.join("src/models/post.rs").exists(),
+        "errored scaffold must not write a model file"
     );
 }
 
@@ -3243,5 +3283,327 @@ fn generated_sharded_scaffold_cargo_checks() {
         "cargo check on generated sharded scaffold failed:\nstdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&check.stdout),
         String::from_utf8_lossy(&check.stderr),
+    );
+}
+
+// ── UUID primary-key option (issue #1400) ──────────────────────────────────
+
+/// AC1 + AC4: `--id uuid` generates UUID PK in model and migration;
+/// default (no flag) still generates BIGSERIAL/i64 byte-for-byte.
+#[test]
+fn generate_model_uuid_id() {
+    let (_tmp, project) = fresh_project("uuid-model-app");
+
+    run_autumn(
+        &project,
+        &["generate", "model", "Post", "title:String", "--id", "uuid"],
+    );
+
+    // AC1: model struct uses uuid::Uuid
+    let model = fs::read_to_string(project.join("src/models/post.rs")).unwrap();
+    assert!(
+        model.contains("pub id: uuid::Uuid,"),
+        "model should have `pub id: uuid::Uuid`; got:\n{model}"
+    );
+    assert!(
+        !model.contains("pub id: i64,"),
+        "model must not have i64 id with --id uuid; got:\n{model}"
+    );
+
+    // AC1: schema.rs uses Uuid type token
+    let schema = fs::read_to_string(project.join("src/schema.rs")).unwrap();
+    assert!(
+        schema.contains("id -> Uuid,"),
+        "schema should have `id -> Uuid`; got:\n{schema}"
+    );
+    assert!(
+        !schema.contains("id -> Int8,"),
+        "schema must not have Int8 with --id uuid; got:\n{schema}"
+    );
+
+    // AC1: migration uses UUID PRIMARY KEY DEFAULT gen_random_uuid()
+    let migrations: Vec<_> = fs::read_dir(project.join("migrations"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|e| e.file_name().to_string_lossy().ends_with("_create_posts"))
+        .collect();
+    assert_eq!(migrations.len(), 1, "expected 1 migration directory");
+    let up = fs::read_to_string(migrations[0].path().join("up.sql")).unwrap();
+    assert!(
+        up.contains("id UUID PRIMARY KEY DEFAULT gen_random_uuid()"),
+        "migration should have UUID PK; got:\n{up}"
+    );
+    assert!(
+        !up.contains("BIGSERIAL"),
+        "migration must not have BIGSERIAL with --id uuid; got:\n{up}"
+    );
+    // migration comment about UUIDv7 trade-off should be present
+    assert!(
+        up.contains("gen_random_uuid()"),
+        "migration should include UUID default; got:\n{up}"
+    );
+}
+
+/// AC4: default (no `--id`) still generates BIGSERIAL and i64.
+#[test]
+fn generate_model_default_id_is_bigserial() {
+    let (_tmp, project) = fresh_project("default-id-app");
+
+    run_autumn(&project, &["generate", "model", "Post", "title:String"]);
+
+    let model = fs::read_to_string(project.join("src/models/post.rs")).unwrap();
+    assert!(
+        model.contains("pub id: i64,"),
+        "default model should have `pub id: i64`; got:\n{model}"
+    );
+
+    let schema = fs::read_to_string(project.join("src/schema.rs")).unwrap();
+    assert!(
+        schema.contains("id -> Int8,"),
+        "default schema should have `id -> Int8`; got:\n{schema}"
+    );
+
+    let migrations: Vec<_> = fs::read_dir(project.join("migrations"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|e| e.file_name().to_string_lossy().ends_with("_create_posts"))
+        .collect();
+    let up = fs::read_to_string(migrations[0].path().join("up.sql")).unwrap();
+    assert!(
+        up.contains("id BIGSERIAL PRIMARY KEY"),
+        "default migration should have BIGSERIAL; got:\n{up}"
+    );
+    assert!(
+        !up.contains("UUID"),
+        "default migration must not have UUID; got:\n{up}"
+    );
+}
+
+/// `--id uuid` is gated for `generate scaffold`: the generated `#[repository]`
+/// REST API is hard-coded to i64 primary keys, so a UUID-keyed scaffold would
+/// not compile. The command must reject it up-front with a clear, actionable
+/// error and write nothing — pointing users to `generate model --id uuid`.
+#[test]
+fn generate_scaffold_uuid_id_is_rejected() {
+    let (_tmp, project) = fresh_project("uuid-scaffold-app");
+
+    let (_, stderr, code) = run_autumn_failing(
+        &project,
+        &[
+            "generate",
+            "scaffold",
+            "Post",
+            "title:String",
+            "--id",
+            "uuid",
+        ],
+    );
+    assert_eq!(code, Some(1), "scaffold --id uuid must fail with exit 1");
+    assert!(
+        stderr.contains("not yet supported") && stderr.contains("generate model"),
+        "error must explain the limitation and point to `generate model`; got:\n{stderr}"
+    );
+
+    // Nothing should have been written.
+    assert!(
+        !project.join("src/models/post.rs").exists(),
+        "rejected scaffold must not write a model file"
+    );
+    assert!(
+        !project.join("src/repositories/post.rs").exists(),
+        "rejected scaffold must not write a repository file"
+    );
+}
+
+/// AC7: `--id` with an unknown value exits non-zero and lists accepted values.
+#[test]
+fn generate_model_bad_id_type_errors() {
+    let (_tmp, project) = fresh_project("bad-id-app");
+
+    let (_, stderr, code) =
+        run_autumn_failing(&project, &["generate", "model", "Post", "--id", "guid"]);
+    assert_eq!(code, Some(1), "--id guid must fail with exit 1");
+    assert!(
+        stderr.contains("guid") && stderr.contains("uuid") && stderr.contains("bigint"),
+        "error must list the bad value and accepted values; got: {stderr}"
+    );
+}
+
+/// AC7: scaffold `--id` with an unknown value exits non-zero.
+#[test]
+fn generate_scaffold_bad_id_type_errors() {
+    let (_tmp, project) = fresh_project("bad-id-scaffold-app");
+
+    let (_, stderr, code) = run_autumn_failing(
+        &project,
+        &["generate", "scaffold", "Post", "--id", "serial4"],
+    );
+    assert_eq!(code, Some(1), "--id serial4 must fail with exit 1");
+    assert!(
+        stderr.contains("serial4") && stderr.contains("uuid") && stderr.contains("bigint"),
+        "error must list the bad value and accepted values; got: {stderr}"
+    );
+}
+
+/// AC6 (Finding #3 fix): `[generate] id` propagates via `--config` even when
+/// there is no `[scaffold.Post]` section. Since the resolved type is `uuid`,
+/// the scaffold gate then rejects it — proving the project default reaches the
+/// scaffold path (rather than being silently dropped or erroring on the missing
+/// section).
+#[test]
+fn generate_scaffold_project_default_uuid_config_only_is_rejected() {
+    let (_tmp, project) = fresh_project("project-default-uuid-config-app");
+
+    // No [scaffold.Post] section — only the project-level [generate] default.
+    fs::write(
+        project.join("autumn.generate.toml"),
+        "[generate]\nid = \"uuid\"\n",
+    )
+    .unwrap();
+
+    let (_, stderr, code) = run_autumn_failing(
+        &project,
+        &[
+            "generate",
+            "scaffold",
+            "Post",
+            "title:String",
+            "--config",
+            "autumn.generate.toml",
+        ],
+    );
+    assert_eq!(
+        code,
+        Some(1),
+        "scaffold resolving to uuid must fail with exit 1"
+    );
+    assert!(
+        stderr.contains("not yet supported") && stderr.contains("generate model"),
+        "error must come from the UUID scaffold gate (proving the [generate] \
+         default reached the scaffold path); got:\n{stderr}"
+    );
+}
+
+/// AC6: `[generate] id = "uuid"` in autumn.generate.toml is auto-discovered
+/// (no --config flag needed) and applies to both scaffold and model generation.
+#[test]
+fn generate_model_project_default_uuid_auto_discovered() {
+    let (_tmp, project) = fresh_project("project-default-uuid-auto-app");
+
+    // Write the project-level default without --config; the generator should
+    // discover autumn.generate.toml automatically.
+    fs::write(
+        project.join("autumn.generate.toml"),
+        "[generate]\nid = \"uuid\"\n",
+    )
+    .unwrap();
+
+    // generate model (no --id flag, no --config)
+    run_autumn(&project, &["generate", "model", "Post", "title:String"]);
+
+    let model = fs::read_to_string(project.join("src/models/post.rs")).unwrap();
+    assert!(
+        model.contains("pub id: uuid::Uuid,"),
+        "auto-discovered [generate] id=uuid should emit uuid::Uuid; got:\n{model}"
+    );
+
+    let migrations: Vec<_> = fs::read_dir(project.join("migrations"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|e| e.file_name().to_string_lossy().ends_with("_create_posts"))
+        .collect();
+    let up = fs::read_to_string(migrations[0].path().join("up.sql")).unwrap();
+    assert!(
+        up.contains("id UUID PRIMARY KEY DEFAULT gen_random_uuid()"),
+        "auto-discovered project default migration should have UUID PK; got:\n{up}"
+    );
+}
+
+/// Codex P2: a defaults-only read (`generate model`, no --config) must parse
+/// only `[generate]` and ignore `[scaffold.*]` recipes — so an unrelated
+/// checked-in recipe with a typo'd/unsupported key does not break it.
+#[test]
+fn generate_model_tolerates_malformed_scaffold_recipe_in_config() {
+    let (_tmp, project) = fresh_project("malformed-recipe-model-app");
+
+    // [scaffold.Other] uses `index` (unsupported; the key is `indexes`). A full
+    // parse would reject it, but `generate model` only reads [generate].
+    fs::write(
+        project.join("autumn.generate.toml"),
+        "[generate]\nid = \"bigint\"\n\n[scaffold.Other]\nfields = [\"x:String\"]\nindex = [\"x\"]\n",
+    )
+    .unwrap();
+
+    // Must succeed despite the malformed [scaffold.Other] recipe.
+    run_autumn(&project, &["generate", "model", "Post", "title:String"]);
+
+    let model = fs::read_to_string(project.join("src/models/post.rs")).unwrap();
+    assert!(
+        model.contains("pub id: i64,"),
+        "[generate] id=bigint should produce an i64 PK; got:\n{model}"
+    );
+}
+
+/// AC6 + scaffold UUID gate: an auto-discovered `[generate] id = "uuid"` flows
+/// into `generate scaffold`, where it is rejected (UUID scaffolds are gated).
+/// The project-wide default must not silently produce a broken scaffold.
+#[test]
+fn generate_scaffold_project_default_uuid_is_rejected() {
+    let (_tmp, project) = fresh_project("project-default-uuid-scaffold-auto-app");
+
+    fs::write(
+        project.join("autumn.generate.toml"),
+        "[generate]\nid = \"uuid\"\n",
+    )
+    .unwrap();
+
+    // generate scaffold (no --id flag, no --config) — auto-discovers the default.
+    let (_, stderr, code) =
+        run_autumn_failing(&project, &["generate", "scaffold", "Post", "title:String"]);
+    assert_eq!(
+        code,
+        Some(1),
+        "scaffold resolving to uuid must fail with exit 1"
+    );
+    assert!(
+        stderr.contains("not yet supported") && stderr.contains("generate model"),
+        "error must explain the limitation and point to `generate model`; got:\n{stderr}"
+    );
+    assert!(
+        !project.join("src/models/post.rs").exists(),
+        "rejected scaffold must not write a model file"
+    );
+}
+
+/// Codex P2: an auto-discovered `autumn.generate.toml` must contribute ONLY the
+/// project-level `[generate]` defaults — a checked-in `[scaffold.Post]` recipe
+/// must NOT silently apply to an ordinary `generate scaffold` run without
+/// `--config`. Here the recipe sets `api = true`; without --config the scaffold
+/// must remain a full HTML scaffold (i.e. the recipe is ignored).
+#[test]
+fn generate_scaffold_auto_discovery_ignores_per_resource_recipe() {
+    let (_tmp, project) = fresh_project("auto-discovery-recipe-app");
+
+    // A checked-in per-resource recipe with api = true (TOML-only option).
+    fs::write(
+        project.join("autumn.generate.toml"),
+        "[scaffold.Post]\nfields = [\"name:String\"]\napi = true\n",
+    )
+    .unwrap();
+
+    // No --config: the [scaffold.Post] recipe must be ignored.
+    run_autumn(&project, &["generate", "scaffold", "Post", "title:String"]);
+
+    // A full (non-api) scaffold generates the HTML routes file; an api scaffold
+    // does not. Its presence proves api = true was NOT inherited.
+    assert!(
+        project.join("src/routes/posts.rs").is_file(),
+        "auto-discovery must not apply the recipe's api=true (HTML routes expected)"
+    );
+    // CLI fields win; the recipe's `name` field must not appear.
+    let model = fs::read_to_string(project.join("src/models/post.rs")).unwrap();
+    assert!(
+        model.contains("pub title: String,") && !model.contains("pub name: String,"),
+        "CLI fields must be used, not the recipe's fields; got:\n{model}"
     );
 }

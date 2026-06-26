@@ -10,7 +10,7 @@
 
 use std::path::Path;
 
-use super::dsl::{Field, FieldKind, parse_fields};
+use super::dsl::{Field, FieldKind, IdType, parse_fields};
 use super::emit::Plan;
 use super::model::{
     ModelOptions, field_by_name, parse_model_metadata, plan_cargo_deps, plan_model_with_options,
@@ -73,6 +73,7 @@ pub fn plan_scaffold(
 /// # Errors
 /// Surfaces any planning error from the underlying model generation as well
 /// as project-layout, repository query, and metadata problems.
+#[allow(clippy::too_many_lines)]
 pub fn plan_scaffold_with_options(
     project_root: &Path,
     name: &str,
@@ -81,6 +82,20 @@ pub fn plan_scaffold_with_options(
     options: &ScaffoldOptions,
 ) -> Result<Plan, GenerateError> {
     ensure_project_root(project_root)?;
+    // Gate: UUID primary keys are not yet supported for scaffolds. Every scaffold
+    // emits a `#[autumn_web::repository]`, whose macro-generated REST API is
+    // currently hard-coded to `i64` primary keys (`Path<i64>`, `find_by_id`,
+    // cursor pagination), so a UUID-keyed scaffold would not compile. The model
+    // generator (`generate model --id uuid`) has no such limitation.
+    if options.model.id_type == IdType::Uuid {
+        return Err(GenerateError::Config(
+            "UUID primary keys are not yet supported for `generate scaffold`: the \
+             generated `#[repository]` REST API is currently limited to i64 primary \
+             keys. Use `generate model --id uuid` for the model and migration, or \
+             omit `--id` to use the default BIGSERIAL key."
+                .to_owned(),
+        ));
+    }
     let fields = parse_fields(field_tokens)?;
     // Resolve shard key before planning the model (propagates to model render).
     let resolved_shard_key = resolve_shard_key(&fields, &options.model)?;
@@ -142,6 +157,7 @@ pub fn plan_scaffold_with_options(
                 &form_fields,
                 options_with_key.model.sharded,
                 options_with_key.model.soft_delete,
+                options_with_key.model.id_type,
             ),
         );
         let route_mod_path = routes_dir.join("mod.rs");
@@ -154,7 +170,13 @@ pub fn plan_scaffold_with_options(
     // Smoke test under `tests/<snake>.rs`
     plan.create(
         project_root.join("tests").join(format!("{snake_name}.rs")),
-        render_smoke_test(&pascal_name, &plural, options_with_key.api, &fields),
+        render_smoke_test(
+            &pascal_name,
+            &plural,
+            options_with_key.api,
+            &fields,
+            options_with_key.model.id_type,
+        ),
     );
 
     // `src/main.rs` updates: declare modules + register all new routes.
@@ -486,7 +508,9 @@ fn render_routes_file(
     fields: &[Field],
     sharded: bool,
     soft_delete: bool,
+    id_type: IdType,
 ) -> String {
+    let id_rust = id_type.rust_type();
     let create_inputs = render_create_form_inputs(fields);
     let edit_inputs = render_edit_form_inputs(fields);
     let update_columns = render_update_columns(plural, fields);
@@ -529,7 +553,7 @@ fn render_routes_file(
             ),
             "decode_form(&state, body).await?".to_owned(),
             format!(
-                "flash: Flash,\n    state: autumn_web::extract::State<autumn_web::AppState>,\n    id: Path<i64>,\n    mut db: {db_ty},\n    body: Bytes,"
+                "flash: Flash,\n    state: autumn_web::extract::State<autumn_web::AppState>,\n    id: Path<{id_rust}>,\n    mut db: {db_ty},\n    body: Bytes,"
             ),
             "decode_form(&state, body).await?".to_owned(),
             format!(
@@ -540,7 +564,9 @@ fn render_routes_file(
         (
             format!("flash: Flash, mut db: {db_ty}, body: Bytes"),
             "decode_form(body)?".to_owned(),
-            format!("flash: Flash,\n    id: Path<i64>,\n    mut db: {db_ty},\n    body: Bytes,"),
+            format!(
+                "flash: Flash,\n    id: Path<{id_rust}>,\n    mut db: {db_ty},\n    body: Bytes,"
+            ),
             "decode_form(body)?".to_owned(),
             format!("fn decode_form(body: Bytes) -> AutumnResult<New{pascal_name}>"),
         )
@@ -688,7 +714,7 @@ fn layout(title: &str, flash: Markup, content: Markup) -> Markup {{
 
 /// `GET /{plural}/{{id}}` — show one {snake_name}.
 #[get("/{plural}/{{id}}")]
-pub async fn show(id: Path<i64>, mut db: {db_ty}, flash: Flash) -> AutumnResult<Markup> {{
+pub async fn show(id: Path<{id_rust}>, mut db: {db_ty}, flash: Flash) -> AutumnResult<Markup> {{
     let row: {pascal_name} = {plural}::table
         .find(*id)
         .select({pascal_name}::as_select())
@@ -740,7 +766,7 @@ pub async fn create({create_signature}) -> AutumnResult<Markup> {{
 #[secured]
 #[get("/{plural}/{{id}}/edit")]
 pub async fn edit_form(
-    id: Path<i64>,
+    id: Path<{id_rust}>,
     mut db: {db_ty},
     flash: Flash,
     csrf: Option<CsrfToken>,
@@ -798,7 +824,7 @@ pub async fn update(
 #[secured]
 #[post("/{plural}/{{id}}/delete")]
 pub async fn destroy(
-    id: Path<i64>,
+    id: Path<{id_rust}>,
     mut db: {db_ty},
     flash: Flash,
 ) -> AutumnResult<Markup> {{
@@ -970,7 +996,13 @@ fn render_update_columns(plural: &str, fields: &[Field]) -> String {
 }
 
 #[allow(clippy::too_many_lines)]
-fn render_smoke_test(pascal_name: &str, plural: &str, api: bool, fields: &[Field]) -> String {
+fn render_smoke_test(
+    pascal_name: &str,
+    plural: &str,
+    api: bool,
+    fields: &[Field],
+    id_type: IdType,
+) -> String {
     if api {
         // Build sample JSON values for the fields.
         let mut sample_parts = Vec::new();
@@ -989,6 +1021,14 @@ fn render_smoke_test(pascal_name: &str, plural: &str, api: bool, fields: &[Field
             sample_parts.push(format!("\\\"{}\\\": {}", f.name, val));
         }
         let sample_json = format!("{{ {} }}", sample_parts.join(", "));
+        let id_capture = match id_type {
+            IdType::BigSerial => {
+                "let id = json[\"id\"].as_i64().expect(\"expected id in POST response\");".to_owned()
+            }
+            IdType::Uuid => {
+                "let id = json[\"id\"].as_str().expect(\"expected id in POST response\").to_owned();".to_owned()
+            }
+        };
 
         format!(
             "//! Smoke test generated by `autumn generate scaffold --api`.\n\
@@ -1051,7 +1091,7 @@ fn render_smoke_test(pascal_name: &str, plural: &str, api: bool, fields: &[Field
                  let json: autumn_web::reexports::serde_json::Value =\n\
                      autumn_web::reexports::serde_json::from_str(&body)\n\
                          .unwrap_or_else(|_| panic!(\"failed to parse POST response: {{body}}\"));\n\
-                 let id = json[\"id\"].as_i64().expect(\"expected id in POST response\");\n\
+                 {id_capture}\n\
                  let item_path = format!(\"/api/{plural}/{{id}}\");\n\
                  \n\
                  // 2. GET (Read single)\n\

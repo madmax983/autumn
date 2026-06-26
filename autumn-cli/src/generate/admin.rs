@@ -130,6 +130,20 @@ pub fn plan_admin_with_options(
     }
 
     let model_source = std::fs::read_to_string(&model_path).map_err(GenerateError::Io)?;
+
+    // Gate: the generated admin adapter and the admin plugin trait
+    // (`autumn-admin-plugin`) are i64-keyed (`get`/`update`/`delete` take
+    // `id: i64`, `table.find(id)`), so a UUID-keyed model would produce
+    // non-compiling admin code. Reject up-front, mirroring the scaffold gate.
+    if model_has_uuid_id(&model_source, &pascal_name) {
+        return Err(GenerateError::Config(format!(
+            "UUID primary keys are not yet supported for `generate admin`: the admin \
+             adapter and admin plugin trait are limited to i64 primary keys, so the \
+             generated admin for `{pascal_name}` would not compile. Regenerate the \
+             model without `--id uuid` (default BIGSERIAL key) to use the admin generator."
+        )));
+    }
+
     let lock_version_field = detect_lock_version_field(&model_source, &pascal_name);
 
     // Auto-detect at-rest encrypted columns from the model so the generated admin
@@ -207,6 +221,44 @@ pub fn run(name: &str, field_tokens: &[String], flags: Flags, options: &AdminOpt
 
 fn read_or_empty(path: &Path) -> String {
     std::fs::read_to_string(path).unwrap_or_default()
+}
+
+/// Returns true if the model struct `pascal_name` has a primary-key field `id`
+/// whose type is a UUID, written either fully-qualified (`uuid::Uuid`) or bare
+/// (`Uuid`). Parses the model AST (like [`detect_lock_version_field`]) so it is
+/// not fooled by spelling or module-qualification differences — a substring
+/// check would miss `pub id: Uuid`.
+fn model_has_uuid_id(model_source: &str, pascal_name: &str) -> bool {
+    let Ok(parsed) = syn::parse_file(model_source) else {
+        return false;
+    };
+    parsed.items.into_iter().any(|item| {
+        let syn::Item::Struct(item_struct) = item else {
+            return false;
+        };
+        if item_struct.ident != pascal_name {
+            return false;
+        }
+        let syn::Fields::Named(fields) = item_struct.fields else {
+            return false;
+        };
+        fields.named.into_iter().any(|field| {
+            let Some(ident) = field.ident else {
+                return false;
+            };
+            if ident != "id" {
+                return false;
+            }
+            let syn::Type::Path(type_path) = field.ty else {
+                return false;
+            };
+            type_path
+                .path
+                .segments
+                .last()
+                .is_some_and(|seg| seg.ident == "Uuid")
+        })
+    })
 }
 
 fn detect_lock_version_field(model_source: &str, pascal_name: &str) -> Option<String> {
@@ -1092,6 +1144,47 @@ mod tests {
         assert!(
             msg.contains("autumn generate model Post"),
             "error should suggest the fix, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn plan_admin_rejects_uuid_keyed_model() {
+        // The admin adapter + plugin trait are i64-keyed, so a UUID model would
+        // produce non-compiling admin code. plan_admin must reject it up-front —
+        // for both the fully-qualified and the bare `Uuid` spelling.
+        for id_ty in ["uuid::Uuid", "Uuid"] {
+            let model_source = format!(
+                "#[autumn_web::model]\n\
+                 pub struct Post {{\n\
+                 \x20   #[id]\n\
+                 \x20   pub id: {id_ty},\n\
+                 \x20   pub title: String,\n\
+                 }}\n"
+            );
+            let tmp = project_with_model_source("post", &model_source);
+            let err = plan_admin(tmp.path(), "Post", &[]).unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("UUID primary keys are not yet supported")
+                    && msg.contains("generate admin"),
+                "expected a UUID admin-gate error for id type `{id_ty}`, got: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn plan_admin_allows_i64_keyed_model() {
+        // Regression guard: an ordinary i64 PK must NOT trip the UUID gate.
+        let model_source = "#[autumn_web::model]\n\
+            pub struct Post {\n\
+            \x20   #[id]\n\
+            \x20   pub id: i64,\n\
+            \x20   pub title: String,\n\
+            }\n";
+        let tmp = project_with_model_source("post", model_source);
+        assert!(
+            plan_admin(tmp.path(), "Post", &[]).is_ok(),
+            "i64-keyed model must not be rejected by the UUID admin gate"
         );
     }
 
