@@ -53,6 +53,73 @@
 use std::collections::HashMap;
 use std::io;
 
+// ── Response type ─────────────────────────────────────────────────────────────
+
+/// An Axum response type that automatically streams a collection of [`CsvSchema`]
+/// records as a CSV HTTP response (`Content-Type: text/csv`).
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use autumn_web::prelude::*;
+///
+/// #[get("/export.csv")]
+/// async fn export_users() -> Csv<Vec<User>> {
+///     let users = vec![/* ... */];
+///     Csv::new(users).with_filename("users.csv")
+/// }
+/// ```
+pub struct Csv<C> {
+    pub data: C,
+    pub filename: Option<String>,
+}
+
+impl<C> Csv<C> {
+    /// Create a new CSV response for the given data.
+    pub const fn new(data: C) -> Self {
+        Self {
+            data,
+            filename: None,
+        }
+    }
+
+    /// Set an optional filename for the `Content-Disposition` header.
+    #[must_use]
+    pub fn with_filename(mut self, name: impl Into<String>) -> Self {
+        self.filename = Some(name.into());
+        self
+    }
+}
+
+impl<C, T> axum::response::IntoResponse for Csv<C>
+where
+    C: IntoIterator<Item = T>,
+    T: CsvSchema,
+{
+    fn into_response(self) -> axum::response::Response {
+        let mut buf = Vec::new();
+        if let Err(e) = crate::data::csv::export_csv(self.data, &mut buf) {
+            tracing::error!("CSV export failed: {e}");
+            return (http::StatusCode::INTERNAL_SERVER_ERROR, "CSV export failed").into_response();
+        }
+
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::header::CONTENT_TYPE,
+            http::HeaderValue::from_static("text/csv; charset=utf-8"),
+        );
+
+        if let Some(filename) = self.filename {
+            let disp = format!("attachment; filename=\"{filename}\"");
+            if let Ok(val) = http::HeaderValue::from_str(&disp) {
+                headers.insert(http::header::CONTENT_DISPOSITION, val);
+            }
+        }
+
+        (headers, buf).into_response()
+    }
+}
+
 // ── Row-level error ───────────────────────────────────────────────────────────
 
 /// A parse or validation error for a single CSV row.
@@ -663,6 +730,50 @@ mod tests {
         assert_eq!(
             titles_imported,
             vec!["Hello, World", "Goodbye cruel \"world\""]
+        );
+    }
+
+    // ── Csv response type tests ───────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn csv_response_sets_content_type_and_body() {
+        use axum::body::to_bytes;
+        use axum::response::IntoResponse;
+        use http::{StatusCode, header};
+
+        let posts = sample_posts();
+        let response = Csv::new(posts).into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "text/csv; charset=utf-8"
+        );
+        assert!(
+            response
+                .headers()
+                .get(header::CONTENT_DISPOSITION)
+                .is_none()
+        );
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body_str = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body_str.contains("id,title,published\n"));
+        assert!(body_str.contains("1,\"Hello, World\",true\n"));
+    }
+
+    #[tokio::test]
+    async fn csv_response_sets_content_disposition_when_filename_provided() {
+        use axum::response::IntoResponse;
+        use http::{StatusCode, header};
+
+        let posts = sample_posts();
+        let response = Csv::new(posts).with_filename("export.csv").into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_DISPOSITION).unwrap(),
+            "attachment; filename=\"export.csv\""
         );
     }
 }
