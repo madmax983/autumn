@@ -94,15 +94,25 @@ struct GeneratorConfig {
     generate: GenerateDefaults,
 }
 
-/// A defaults-only view of the config file. Parses just the `[generate]` table
-/// and ignores every `[scaffold.*]` section, so a defaults-only read (e.g.
-/// `generate model`, or auto-discovered scaffold) does not fail on an unrelated
-/// per-resource recipe that has a typo or an unsupported key — those are only
-/// validated when the recipe is actually used via `--config`.
+/// A defaults-only view of the config file. Reads the `[generate]` table and
+/// ignores the *contents* of `[scaffold.*]` sections, so a defaults-only read
+/// (e.g. `generate model`, or auto-discovered scaffold) does not fail on an
+/// unrelated per-resource recipe that has a typo or an unsupported key — those
+/// are only validated when the recipe is actually used via `--config`.
+///
+/// `deny_unknown_fields` still rejects *other* mistyped top-level tables/keys
+/// (e.g. `[genrate]` or a stray top-level `id`) so a project-default typo is a
+/// hard error rather than being silently dropped (which would fall back to the
+/// default key type). The `scaffold` field is declared only so those recipe
+/// tables are accepted-but-unvalidated; its contents are intentionally unused.
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct GenerateDefaultsConfig {
     #[serde(default)]
     generate: GenerateDefaults,
+    #[serde(default)]
+    #[allow(dead_code)]
+    scaffold: HashMap<String, toml::Value>,
 }
 
 /// Read and parse the whole generator config file at `config_path`.
@@ -491,6 +501,25 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
     }
 
     #[test]
+    fn defaults_only_read_rejects_misspelled_top_level_table() {
+        // A typo'd defaults table ([genrate]) or a stray top-level `id` key must
+        // not be silently dropped (which would fall back to BigSerial despite the
+        // user intending uuid). [scaffold.*] recipes stay ignored.
+        for bad in [
+            "[genrate]\nid = \"uuid\"\n",
+            "id = \"uuid\"\n",
+            "[generate]\nid = \"uuid\"\n\n[scafold.Post]\nfields = [\"x:String\"]\n",
+        ] {
+            let tmp = TempDir::new().unwrap();
+            let path = write_config(&tmp, bad);
+            assert!(
+                read_generate_defaults(&path).is_err(),
+                "defaults-only read must reject misspelled top-level config: {bad:?}"
+            );
+        }
+    }
+
+    #[test]
     fn defaults_only_read_tolerates_malformed_scaffold_recipe() {
         // A checked-in [scaffold.*] recipe with an unsupported/typo'd key must
         // NOT break defaults-only reads (generate model / auto-discovered
@@ -547,8 +576,9 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
             matches!(err, GenerateError::Config(_)),
             "misspelled top-level table must error, got: {err:?}"
         );
-        // Defaults-only reads stay lenient (they never consult scaffold tables).
-        assert_eq!(read_generate_defaults(&path).unwrap(), IdType::BigSerial);
+        // Defaults-only reads also reject a misspelled top-level table, so a
+        // project-default typo is never silently dropped.
+        assert!(read_generate_defaults(&path).is_err());
     }
 
     #[test]
