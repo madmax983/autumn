@@ -28,6 +28,7 @@ fn app_builder_multiple_route_calls() {
 }
 
 #[tokio::test]
+#[allow(clippy::large_futures)]
 #[should_panic(expected = "No routes registered")]
 async fn empty_routes_panics() {
     autumn_web::app().run().await;
