@@ -228,6 +228,9 @@ pub type JobAdminFuture<'a, T> = Pin<Box<dyn Future<Output = AutumnResult<T>> + 
 pub enum JobAdminStatus {
     /// Waiting to be picked up by a worker.
     Enqueued,
+    /// Enqueued with a future due time (delayed/one-shot scheduled work).
+    /// Not visible to workers until the due time passes.
+    Scheduled,
     /// Currently executing in a worker.
     Running,
     /// Failed but already scheduled for an automatic retry.
@@ -252,6 +255,7 @@ impl JobAdminStatus {
     pub const fn label(self) -> &'static str {
         match self {
             Self::Enqueued => "enqueued",
+            Self::Scheduled => "scheduled",
             Self::Running => "running",
             Self::Retrying => "retrying",
             Self::Completed => "completed",
@@ -275,6 +279,8 @@ pub struct JobAdminRecord {
     pub status: JobAdminStatus,
     /// Time the job entered the queue.
     pub enqueued_at: Option<String>,
+    /// Due time for a delayed/scheduled job, if it is not yet runnable.
+    pub scheduled_for: Option<String>,
     /// Time the job started running.
     pub started_at: Option<String>,
     /// Time the job finished, failed, or was operated on.
@@ -344,6 +350,8 @@ pub struct JobScheduleSummary {
 pub struct JobAdminSnapshot {
     /// Enqueued jobs, newest-first.
     pub enqueued: JobAdminPage,
+    /// Scheduled (delayed) jobs awaiting their due time, soonest-due first.
+    pub scheduled: JobAdminPage,
     /// Running jobs, newest-first.
     pub running: JobAdminPage,
     /// Completed jobs from the last 24 hours, newest-first.
@@ -362,6 +370,7 @@ impl JobAdminSnapshot {
     pub const fn empty() -> Self {
         Self {
             enqueued: JobAdminPage::new(Vec::new(), 0, 1, DEFAULT_JOB_ADMIN_PER_PAGE),
+            scheduled: JobAdminPage::new(Vec::new(), 0, 1, DEFAULT_JOB_ADMIN_PER_PAGE),
             running: JobAdminPage::new(Vec::new(), 0, 1, DEFAULT_JOB_ADMIN_PER_PAGE),
             completed: JobAdminPage::new(Vec::new(), 0, 1, DEFAULT_JOB_ADMIN_PER_PAGE),
             failed: JobAdminPage::new(Vec::new(), 0, 1, DEFAULT_JOB_ADMIN_PER_PAGE),
@@ -376,6 +385,8 @@ impl JobAdminSnapshot {
 pub struct JobAdminQuery {
     /// Page number for enqueued jobs.
     pub enqueued_page: u64,
+    /// Page number for scheduled (delayed) jobs.
+    pub scheduled_page: u64,
     /// Page number for running jobs.
     pub running_page: u64,
     /// Page number for completed jobs.
@@ -390,6 +401,7 @@ impl Default for JobAdminQuery {
     fn default() -> Self {
         Self {
             enqueued_page: 1,
+            scheduled_page: 1,
             running_page: 1,
             completed_page: 1,
             failed_page: 1,
@@ -436,6 +448,7 @@ struct JobAdminStoredRecord {
     payload: Value,
     status: JobAdminStatus,
     enqueued_at: Option<chrono::DateTime<chrono::Utc>>,
+    scheduled_for: Option<chrono::DateTime<chrono::Utc>>,
     started_at: Option<chrono::DateTime<chrono::Utc>>,
     finished_at: Option<chrono::DateTime<chrono::Utc>>,
     attempt: u32,
@@ -459,6 +472,7 @@ impl JobAdminStoredRecord {
             name: self.name.clone(),
             status: self.status,
             enqueued_at: self.enqueued_at.map(format_job_admin_time),
+            scheduled_for: self.scheduled_for.map(format_job_admin_time),
             started_at: self.started_at.map(format_job_admin_time),
             finished_at: self.finished_at.map(format_job_admin_time),
             attempt: self.attempt,
@@ -502,16 +516,26 @@ impl JobAdminMemoryBackend {
         }
     }
 
-    fn record_enqueue(
+    /// Record an enqueue that may carry a future due time. When `due_at` is in
+    /// the future the record starts in the [`JobAdminStatus::Scheduled`] state
+    /// so the dashboard surfaces it as a delayed job until it becomes runnable.
+    fn record_enqueue_due(
         &self,
         id: String,
         name: &str,
         payload: Value,
         attempt: u32,
         max_attempts: u32,
+        due_at: Option<chrono::DateTime<chrono::Utc>>,
     ) {
         let now = chrono::Utc::now();
         let (principal_id, correlation_id) = job_payload_identity(&payload);
+        let scheduled_for = due_at.filter(|due| *due > now);
+        let status = if scheduled_for.is_some() {
+            JobAdminStatus::Scheduled
+        } else {
+            JobAdminStatus::Enqueued
+        };
         if let Ok(mut inner) = self.inner.write() {
             inner.order.push_back(id.clone());
             inner.records.insert(
@@ -520,8 +544,9 @@ impl JobAdminMemoryBackend {
                     id,
                     name: name.to_owned(),
                     payload,
-                    status: JobAdminStatus::Enqueued,
+                    status,
                     enqueued_at: Some(now),
+                    scheduled_for,
                     started_at: None,
                     finished_at: None,
                     attempt,
@@ -541,6 +566,7 @@ impl JobAdminMemoryBackend {
         {
             record.status = JobAdminStatus::Enqueued;
             record.enqueued_at = Some(chrono::Utc::now());
+            record.scheduled_for = None;
             record.started_at = None;
             record.finished_at = None;
             record.attempt = attempt;
@@ -555,9 +581,12 @@ impl JobAdminMemoryBackend {
             return JobAdminStartDecision::Missing;
         };
         match record.status {
-            JobAdminStatus::Enqueued => {
+            // A `Scheduled` job becomes runnable once its delayed-send fires, at
+            // which point it starts like any other enqueued job.
+            JobAdminStatus::Enqueued | JobAdminStatus::Scheduled => {
                 record.status = JobAdminStatus::Running;
                 record.started_at = Some(chrono::Utc::now());
+                record.scheduled_for = None;
                 record.finished_at = None;
                 record.attempt = attempt;
                 JobAdminStartDecision::Started
@@ -697,12 +726,16 @@ impl JobAdminMemoryBackend {
             .records
             .get_mut(id)
             .ok_or_else(|| AutumnError::not_found_msg(format!("job '{id}' not found")))?;
-        if record.status != JobAdminStatus::Enqueued {
+        if !matches!(
+            record.status,
+            JobAdminStatus::Enqueued | JobAdminStatus::Scheduled
+        ) {
             return Err(AutumnError::bad_request_msg(
-                "only enqueued jobs can be canceled",
+                "only enqueued or scheduled jobs can be canceled",
             ));
         }
         record.status = JobAdminStatus::Canceled;
+        record.scheduled_for = None;
         record.finished_at = Some(chrono::Utc::now());
         drop(inner);
         Ok(())
@@ -720,6 +753,13 @@ impl JobAdminMemoryBackend {
                 JobAdminStatus::Enqueued,
                 None,
                 query.enqueued_page,
+                per_page,
+            ),
+            scheduled: paginate_job_admin_records(
+                &inner,
+                JobAdminStatus::Scheduled,
+                None,
+                query.scheduled_page,
                 per_page,
             ),
             running: paginate_job_admin_records(
@@ -762,7 +802,7 @@ impl JobAdminMemoryBackend {
         max_attempts: u32,
     ) -> String {
         let id = uuid::Uuid::new_v4().to_string();
-        self.record_enqueue(id.clone(), name, payload, attempt, max_attempts);
+        self.record_enqueue_due(id.clone(), name, payload, attempt, max_attempts, None);
         id
     }
 
@@ -1478,6 +1518,54 @@ pub async fn enqueue(name: &str, payload: Value) -> AutumnResult<()> {
     client.enqueue(name, payload).await
 }
 
+/// Enqueue a one-shot job to run once after `delay` elapses.
+///
+/// This is the deferred-execution companion to [`enqueue`]: the job is recorded
+/// immediately but is not delivered to a worker until `delay` has passed, then
+/// runs through the normal execution path (retries, backoff, dead-letter).
+///
+/// On the durable backends (`postgres`, `redis`) the due time is persisted, so a
+/// pending delay survives a worker/process restart. The in-process (`local`)
+/// backend is local-safe only: a pending delay is lost if the process restarts
+/// before the job becomes due.
+///
+/// For recurring work use `#[scheduled]`; for durable multi-step orchestration
+/// use Autumn Harvest. See `docs/guide/jobs.md`.
+///
+/// # Errors
+///
+/// Returns an internal error when the jobs runtime is not initialized, when
+/// `name` does not match a registered job, or when the active backend rejects
+/// the enqueue operation.
+pub async fn enqueue_in(name: &str, payload: Value, delay: std::time::Duration) -> AutumnResult<()> {
+    let when = chrono::Utc::now() + chrono::TimeDelta::from_std(delay).unwrap_or(chrono::TimeDelta::MAX);
+    enqueue_at(name, payload, when).await
+}
+
+/// Enqueue a one-shot job to run once at the absolute instant `when`.
+///
+/// Behaves like [`enqueue_in`] but takes an absolute due time. A `when` in the
+/// past runs the job immediately. Calendar/timezone math is the caller's
+/// concern — `when` is an absolute UTC instant.
+///
+/// # Errors
+///
+/// Returns an internal error when the jobs runtime is not initialized, when
+/// `name` does not match a registered job, or when the active backend rejects
+/// the enqueue operation.
+pub async fn enqueue_at(
+    name: &str,
+    payload: Value,
+    when: chrono::DateTime<chrono::Utc>,
+) -> AutumnResult<()> {
+    let Some(client) = global_job_client() else {
+        return Err(AutumnError::internal_server_error(std::io::Error::other(
+            "job runtime is not initialized; register jobs with AppBuilder::jobs()",
+        )));
+    };
+    client.enqueue_due(name, payload, Some(when)).await
+}
+
 /// Enqueue a job using an **already-open connection** so the INSERT
 /// participates in the caller's transaction.
 ///
@@ -1519,6 +1607,56 @@ pub async fn enqueue_on_conn<A: serde::Serialize>(
     client.enqueue_on_conn(name, payload, conn).await
 }
 
+/// Transactional delayed enqueue: like [`enqueue_on_conn`] but the job becomes
+/// runnable only after `delay` elapses (and after the surrounding transaction
+/// commits). On the `postgres` backend this is crash-safe — the future
+/// `run_at` is persisted in the same transaction as the domain write.
+///
+/// # Errors
+///
+/// Returns an error if the job runtime is not initialized, if `args` cannot be
+/// serialized to JSON, or if the database INSERT fails.
+#[cfg(feature = "db")]
+pub async fn enqueue_in_on_conn<A: serde::Serialize>(
+    name: &str,
+    args: A,
+    delay: std::time::Duration,
+    conn: &mut diesel_async::AsyncPgConnection,
+) -> AutumnResult<()> {
+    let when =
+        chrono::Utc::now() + chrono::TimeDelta::from_std(delay).unwrap_or(chrono::TimeDelta::MAX);
+    enqueue_at_on_conn(name, args, when, conn).await
+}
+
+/// Transactional delayed enqueue at an absolute instant. See
+/// [`enqueue_in_on_conn`].
+///
+/// # Errors
+///
+/// Returns an error if the job runtime is not initialized, if `args` cannot be
+/// serialized to JSON, or if the database INSERT fails.
+#[cfg(feature = "db")]
+pub async fn enqueue_at_on_conn<A: serde::Serialize>(
+    name: &str,
+    args: A,
+    when: chrono::DateTime<chrono::Utc>,
+    conn: &mut diesel_async::AsyncPgConnection,
+) -> AutumnResult<()> {
+    let payload = serde_json::to_value(&args).map_err(|e| {
+        AutumnError::internal_server_error(std::io::Error::other(format!(
+            "job args serialization failed: {e}"
+        )))
+    })?;
+    let Some(client) = global_job_client() else {
+        return Err(AutumnError::internal_server_error(std::io::Error::other(
+            "job runtime is not initialized; register jobs with AppBuilder::jobs()",
+        )));
+    };
+    client
+        .enqueue_on_conn_due(name, payload, conn, Some(when))
+        .await
+}
+
 /// Enqueue a job that fires **only after the surrounding transaction commits**.
 ///
 /// This is the module-level companion to [`JobClient::enqueue_after_commit`].
@@ -1552,6 +1690,51 @@ pub async fn enqueue_after_commit<A: serde::Serialize>(name: &str, args: A) -> A
         )));
     };
     client.enqueue_after_commit(name, payload).await
+}
+
+/// Delayed variant of [`enqueue_after_commit`]: after the surrounding
+/// transaction commits, the job is enqueued to become runnable `delay` later.
+///
+/// Like [`enqueue_after_commit`], the after-commit deferral is process-local and
+/// not crash-safe. For a crash-safe transactional delay on the `postgres`
+/// backend, prefer [`enqueue_in_on_conn`].
+///
+/// # Errors
+///
+/// Returns an error if the job runtime is not initialized or if `args` cannot
+/// be serialized to JSON.
+pub async fn enqueue_in_after_commit<A: serde::Serialize>(
+    name: &str,
+    args: A,
+    delay: std::time::Duration,
+) -> AutumnResult<()> {
+    let when =
+        chrono::Utc::now() + chrono::TimeDelta::from_std(delay).unwrap_or(chrono::TimeDelta::MAX);
+    enqueue_at_after_commit(name, args, when).await
+}
+
+/// Absolute-instant variant of [`enqueue_in_after_commit`].
+///
+/// # Errors
+///
+/// Returns an error if the job runtime is not initialized or if `args` cannot
+/// be serialized to JSON.
+pub async fn enqueue_at_after_commit<A: serde::Serialize>(
+    name: &str,
+    args: A,
+    when: chrono::DateTime<chrono::Utc>,
+) -> AutumnResult<()> {
+    let payload = serde_json::to_value(&args).map_err(|e| {
+        AutumnError::internal_server_error(std::io::Error::other(format!(
+            "job args serialization failed: {e}"
+        )))
+    })?;
+    let Some(client) = global_job_client() else {
+        return Err(AutumnError::internal_server_error(std::io::Error::other(
+            "job runtime is not initialized; register jobs with AppBuilder::jobs()",
+        )));
+    };
+    client.enqueue_after_commit_due(name, payload, Some(when)).await
 }
 
 /// Enqueue a job inside an **already-open connection**, writing the job row
@@ -1602,16 +1785,46 @@ impl JobClient {
         self.enqueue_with_outcome(name, payload).await.map(|_| ())
     }
 
+    /// Enqueue a job that becomes runnable at `due_at` (or immediately when
+    /// `due_at` is `None` or in the past). Backs [`enqueue_in`] / [`enqueue_at`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an internal error when `name` does not match a registered job or
+    /// enqueueing fails in the active backend.
+    pub async fn enqueue_due(
+        &self,
+        name: &str,
+        payload: Value,
+        due_at: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> AutumnResult<()> {
+        self.enqueue_with_outcome_due(name, payload, due_at)
+            .await
+            .map(|_| ())
+    }
+
     /// Enqueue like [`Self::enqueue`], reporting whether the job was stored
     /// or coalesced into an existing unique job. Used by operator paths that
     /// must distinguish "queued a retry" from "an equivalent job already
     /// exists".
-    #[allow(clippy::too_many_lines)]
     pub(crate) async fn enqueue_with_outcome(
         &self,
         name: &str,
         payload: Value,
     ) -> AutumnResult<EnqueueOutcome> {
+        self.enqueue_with_outcome_due(name, payload, None).await
+    }
+
+    #[allow(clippy::too_many_lines)]
+    pub(crate) async fn enqueue_with_outcome_due(
+        &self,
+        name: &str,
+        payload: Value,
+        due_at: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> AutumnResult<EnqueueOutcome> {
+        // Only treat a due time strictly in the future as "delayed"; a past or
+        // absent due time enqueues for immediate execution exactly as before.
+        let due_at = due_at.filter(|due| *due > chrono::Utc::now());
         let Some(settings) = self.per_job_settings.get(name) else {
             return Err(AutumnError::internal_server_error(std::io::Error::other(
                 format!("job '{name}' is not registered; add it to AppBuilder::jobs()"),
@@ -1630,8 +1843,14 @@ impl JobClient {
         let constraints = ResolvedJobConstraints::for_payload(settings, &payload);
         let id = uuid::Uuid::new_v4().to_string();
         self.registry.record_enqueue(name);
-        self.job_admin
-            .record_enqueue(id.clone(), name, payload.clone(), 1, job_max_attempts);
+        self.job_admin.record_enqueue_due(
+            id.clone(),
+            name,
+            payload.clone(),
+            1,
+            job_max_attempts,
+            due_at,
+        );
 
         let started = ::std::sync::Arc::new(::std::sync::atomic::AtomicBool::new(false));
         let started_clone = started.clone();
@@ -1655,25 +1874,40 @@ impl JobClient {
                 }
                 #[cfg(feature = "telemetry-otlp")]
                 let (traceparent, tracestate) = capture_job_trace_context();
-                let send_result = sender
-                    .send(QueuedJob {
-                        id: id_for_enqueue.clone(),
-                        name: name.to_string(),
-                        payload: payload_clone.clone(),
-                        attempt: 1,
-                        max_attempts: job_max_attempts,
-                        initial_backoff_ms: job_backoff_ms,
-                        #[cfg(feature = "telemetry-otlp")]
-                        traceparent,
-                        #[cfg(feature = "telemetry-otlp")]
-                        tracestate,
-                    })
-                    .await
-                    .map_err(|e| {
+                let queued = QueuedJob {
+                    id: id_for_enqueue.clone(),
+                    name: name.to_string(),
+                    payload: payload_clone.clone(),
+                    attempt: 1,
+                    max_attempts: job_max_attempts,
+                    initial_backoff_ms: job_backoff_ms,
+                    #[cfg(feature = "telemetry-otlp")]
+                    traceparent,
+                    #[cfg(feature = "telemetry-otlp")]
+                    tracestate,
+                };
+                let send_result = if let Some(due) = due_at {
+                    // Delayed enqueue on the in-process backend: hand the job to
+                    // a detached timer that sleeps until the due time and then
+                    // delivers it to a worker. This is local-safe only — a
+                    // pending delay is lost if the process restarts before the
+                    // job becomes due (durable backends persist the due time).
+                    let delay = (due - chrono::Utc::now())
+                        .to_std()
+                        .unwrap_or(std::time::Duration::ZERO);
+                    let sender = sender.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(delay).await;
+                        let _ = sender.send(queued).await;
+                    });
+                    Ok(())
+                } else {
+                    sender.send(queued).await.map_err(|e| {
                         AutumnError::internal_server_error(std::io::Error::other(format!(
                             "failed to enqueue job: {e}"
                         )))
-                    });
+                    })
+                };
                 if send_result.is_err()
                     && let (Some(unique_key), Some(coordination)) = (
                         constraints.unique_key.as_deref(),
@@ -1690,6 +1924,7 @@ impl JobClient {
                     payload_clone.clone(),
                     job_max_attempts,
                     job_backoff_ms,
+                    due_at,
                     &constraints,
                 )
                 .await
@@ -1772,6 +2007,27 @@ impl JobClient {
         name: &str,
         payload: impl serde::Serialize,
     ) -> AutumnResult<()> {
+        self.enqueue_after_commit_due(name, payload, None).await
+    }
+
+    /// Delayed variant of [`Self::enqueue_after_commit`]: after the transaction
+    /// commits, the job is enqueued to become runnable at `due_at`. When
+    /// `due_at` is `None` or in the past this is exactly `enqueue_after_commit`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `payload` cannot be serialized to JSON, or if the
+    /// underlying enqueue fails (backend error, unregistered job name, etc.).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal after-commit registry mutex is poisoned.
+    pub async fn enqueue_after_commit_due(
+        &self,
+        name: &str,
+        payload: impl serde::Serialize,
+        due_at: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> AutumnResult<()> {
         // Validate name eagerly so a typo/unregistered job fails the
         // transaction (before any DB commit) rather than being silently
         // dropped later when the deferred callback runs.
@@ -1800,7 +2056,7 @@ impl JobClient {
             let client = client.clone();
             let name = name.clone();
             let payload = payload.clone();
-            async move { client.enqueue(&name, payload).await }
+            async move { client.enqueue_due(&name, payload, due_at).await }
         });
 
         #[cfg(feature = "db")]
@@ -1839,6 +2095,7 @@ impl JobClient {
         payload: Value,
         max_attempts: u32,
         backoff_ms: u64,
+        due_at: Option<chrono::DateTime<chrono::Utc>>,
         constraints: &ResolvedJobConstraints,
     ) -> AutumnResult<EnqueueOutcome> {
         let breaker = self.resilience_config.as_ref().map_or_else(
@@ -1864,7 +2121,7 @@ impl JobClient {
         let guard = crate::circuit_breaker::CircuitBreakerGuard::new(breaker.clone());
 
         let res = self
-            .enqueue_durable_inner(id, name, payload, max_attempts, backoff_ms, constraints)
+            .enqueue_durable_inner(id, name, payload, max_attempts, backoff_ms, due_at, constraints)
             .await;
         if res.is_ok() {
             guard.success();
@@ -1881,28 +2138,31 @@ impl JobClient {
         payload: Value,
         max_attempts: u32,
         backoff_ms: u64,
+        due_at: Option<chrono::DateTime<chrono::Utc>>,
         constraints: &ResolvedJobConstraints,
     ) -> AutumnResult<EnqueueOutcome> {
         #[cfg(feature = "redis")]
         if let Some(redis) = &self.redis {
+            let due_at_ms = due_at.map(|due| u64::try_from(due.timestamp_millis()).unwrap_or(0));
             return redis
-                .enqueue(id, name, payload, max_attempts, backoff_ms, constraints)
+                .enqueue(id, name, payload, max_attempts, backoff_ms, due_at_ms, constraints)
                 .await;
         }
         #[cfg(feature = "db")]
         if let Some(pool) = &self.pg_pool {
-            return pg_enqueue_job(
+            return pg_enqueue_job_at(
                 pool,
                 id,
                 name,
                 payload,
                 max_attempts,
                 backoff_ms,
+                due_at,
                 constraints,
             )
             .await;
         }
-        let _ = (id, name, payload, max_attempts, backoff_ms, constraints);
+        let _ = (id, name, payload, max_attempts, backoff_ms, due_at, constraints);
         Err(AutumnError::internal_server_error(std::io::Error::other(
             "job runtime backend is unavailable",
         )))
@@ -1927,6 +2187,28 @@ impl JobClient {
         payload: Value,
         conn: &mut diesel_async::AsyncPgConnection,
     ) -> AutumnResult<()> {
+        self.enqueue_on_conn_due(name, payload, conn, None).await
+    }
+
+    /// Transactional enqueue (see [`Self::enqueue_on_conn`]) with an explicit
+    /// `due_at`. On the Postgres backend the job row is written inside the
+    /// caller's transaction with a future `run_at`, so it is delivered to a
+    /// worker only after **both** the transaction commits **and** the due time
+    /// passes — crash-safe delayed enqueue.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `name` is not a registered job, or if the database
+    /// INSERT fails.
+    #[cfg(feature = "db")]
+    pub async fn enqueue_on_conn_due(
+        &self,
+        name: &str,
+        payload: Value,
+        conn: &mut diesel_async::AsyncPgConnection,
+        due_at: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> AutumnResult<()> {
+        let due_at = due_at.filter(|due| *due > chrono::Utc::now());
         let Some(settings) = self.per_job_settings.get(name) else {
             return Err(AutumnError::internal_server_error(std::io::Error::other(
                 format!("job '{name}' is not registered; add it to AppBuilder::jobs()"),
@@ -1975,13 +2257,14 @@ impl JobClient {
             let payload_for_enqueue = payload.clone();
             let constraints_ref = &constraints;
             let actual_enqueue = async move {
-                let outcome = pg_enqueue_on_conn(
+                let outcome = pg_enqueue_on_conn_at(
                     conn,
                     id_for_enqueue.clone(),
                     name,
                     payload_for_enqueue,
                     job_max_attempts,
                     job_backoff_ms,
+                    due_at,
                     constraints_ref,
                 )
                 .await;
@@ -2017,7 +2300,7 @@ impl JobClient {
         // For the redis and local backends `conn` is irrelevant; the normal
         // enqueue path already applies interceptors, bookkeeping, uniqueness,
         // and concurrency metadata.
-        self.enqueue(name, payload).await
+        self.enqueue_due(name, payload, due_at).await
     }
 }
 
@@ -2550,6 +2833,10 @@ fn finish_local_slot(
 struct RedisClient {
     connection: redis::aio::ConnectionManager,
     queue_key: String,
+    /// ZSET keyed by due-time-ms used for delayed enqueues and retries. A
+    /// future-dated job is `ZADD`-ed here instead of pushed to `queue_key`, and
+    /// the worker's promotion loop moves it onto the queue once due.
+    delayed_key: String,
     record_prefix: String,
     unique_prefix: String,
 }
@@ -2677,7 +2964,11 @@ if ARGV[3] == '1' then
   end
 end
 redis.call('SET', KEYS[1], ARGV[1])
-redis.call('LPUSH', KEYS[2], ARGV[2])
+if ARGV[5] ~= '' and tonumber(ARGV[5]) ~= nil then
+  redis.call('ZADD', KEYS[4], tonumber(ARGV[5]), ARGV[2])
+else
+  redis.call('LPUSH', KEYS[2], ARGV[2])
+end
 return 1
 ";
 
@@ -2690,6 +2981,7 @@ impl RedisClient {
         payload: Value,
         default_max_attempts: u32,
         default_initial_backoff_ms: u64,
+        due_at_ms: Option<u64>,
         constraints: &ResolvedJobConstraints,
     ) -> AutumnResult<EnqueueOutcome> {
         #[cfg(feature = "telemetry-otlp")]
@@ -2733,17 +3025,21 @@ impl RedisClient {
             "0"
         };
         let lock_ttl_ms = redis_unique_lock_ttl_ms(constraints.unique_window);
+        // Empty string => immediate (LPUSH); a millisecond score => delayed (ZADD).
+        let due_at_arg = due_at_ms.map_or_else(String::new, |ms| ms.to_string());
 
         let stored: i64 = redis::cmd("EVAL")
             .arg(REDIS_ENQUEUE_SCRIPT)
-            .arg(3)
+            .arg(4)
             .arg(record_key)
             .arg(&self.queue_key)
             .arg(unique_lock_key)
+            .arg(&self.delayed_key)
             .arg(encoded)
             .arg(id)
             .arg(has_unique)
             .arg(lock_ttl_ms)
+            .arg(due_at_arg)
             .query_async(&mut connection)
             .await
             .map_err(|e| {
@@ -2764,6 +3060,7 @@ impl RedisClient {
 struct RedisJobAdminBackend {
     connection: redis::aio::ConnectionManager,
     queue_key: String,
+    delayed_key: String,
     processing_key: String,
     dead_key: String,
     completed_key: String,
@@ -2780,6 +3077,7 @@ impl RedisJobAdminBackend {
     fn new(
         connection: redis::aio::ConnectionManager,
         queue_key: String,
+        delayed_key: String,
         processing_key: String,
         dead_key: String,
         completed_key: String,
@@ -2792,6 +3090,7 @@ impl RedisJobAdminBackend {
         Self {
             connection,
             queue_key,
+            delayed_key,
             processing_key,
             dead_key,
             completed_key,
@@ -2816,6 +3115,14 @@ impl RedisJobAdminBackend {
             &self.record_prefix,
             JobAdminStatus::Enqueued,
             query.enqueued_page,
+            per_page,
+        )
+        .await?;
+        let scheduled = redis_admin_delayed_page(
+            &mut connection,
+            &self.delayed_key,
+            &self.record_prefix,
+            query.scheduled_page,
             per_page,
         )
         .await?;
@@ -2850,6 +3157,7 @@ impl RedisJobAdminBackend {
 
         Ok(JobAdminSnapshot {
             enqueued,
+            scheduled,
             running,
             completed,
             failed,
@@ -2965,6 +3273,9 @@ if removed == 0 then
   removed = redis.call('ZREM', KEYS[3], ARGV[1])
 end
 if removed == 0 then
+  removed = redis.call('ZREM', KEYS[5], ARGV[1])
+end
+if removed == 0 then
   return -1
 end
 local ok, record = pcall(cjson.decode, body)
@@ -2979,11 +3290,12 @@ redis.call('DEL', KEYS[1])
 return 1
 ",
             )
-            .arg(4)
+            .arg(5)
             .arg(active_record_key)
             .arg(&self.queue_key)
             .arg(&self.blocked_key)
             .arg(&self.unique_prefix)
+            .arg(&self.delayed_key)
             .arg(id)
             .query_async(&mut connection)
             .await
@@ -3065,6 +3377,7 @@ fn redis_record_to_admin_record(record: &RedisJobRecord, status: JobAdminStatus)
         name: record.name.clone(),
         status,
         enqueued_at: redis_admin_time(record.enqueued_at_ms),
+        scheduled_for: None,
         started_at: redis_admin_time(record.started_at_ms),
         finished_at: redis_admin_time(record.finished_at_ms),
         attempt: record.attempt,
@@ -3123,6 +3436,49 @@ async fn redis_admin_active_list_page(
         .map_err(|error| redis_admin_error("read enqueued records", &error))?
         .into_iter()
         .map(|record| redis_record_to_admin_record(&record, status))
+        .collect();
+    Ok(JobAdminPage::new(records, total, page, per_page))
+}
+
+/// Page over the delayed ZSET, surfacing future-due jobs as
+/// [`JobAdminStatus::Scheduled`] with their due time (the ZSET score, in ms),
+/// soonest-due first.
+#[cfg(feature = "redis")]
+async fn redis_admin_delayed_page(
+    connection: &mut redis::aio::ConnectionManager,
+    delayed_key: &str,
+    record_prefix: &str,
+    page: u64,
+    per_page: u64,
+) -> AutumnResult<JobAdminPage> {
+    let page = page.max(1);
+    let start = page.saturating_sub(1).saturating_mul(per_page);
+    let stop = start.saturating_add(per_page).saturating_sub(1);
+    // Fetch (id, score) pairs soonest-due-first, plus the total ZSET size.
+    let (id_scores, total): (Vec<(String, f64)>, u64) = redis::pipe()
+        .cmd("ZRANGE")
+        .arg(delayed_key)
+        .arg(start)
+        .arg(stop)
+        .arg("WITHSCORES")
+        .cmd("ZCARD")
+        .arg(delayed_key)
+        .query_async(connection)
+        .await
+        .map_err(|error| redis_admin_error("read scheduled page", &error))?;
+    let ids: Vec<String> = id_scores.iter().map(|(id, _)| id.clone()).collect();
+    let due_by_id: std::collections::HashMap<String, f64> = id_scores.into_iter().collect();
+    let records = redis_records_for_ids(connection, record_prefix, &ids)
+        .await
+        .map_err(|error| redis_admin_error("read scheduled records", &error))?
+        .into_iter()
+        .map(|record| {
+            let mut admin = redis_record_to_admin_record(&record, JobAdminStatus::Scheduled);
+            if let Some(score) = due_by_id.get(&record.id) {
+                admin.scheduled_for = redis_admin_time(Some(*score as u64));
+            }
+            admin
+        })
         .collect();
     Ok(JobAdminPage::new(records, total, page, per_page))
 }
@@ -4322,6 +4678,7 @@ fn start_redis_runtime(
         state.insert_extension(JobAdminBackendEntry(Arc::new(RedisJobAdminBackend::new(
             admin_connection,
             queue_key.clone(),
+            delayed_key.clone(),
             processing_key.clone(),
             dead_key.clone(),
             completed_key.clone(),
@@ -4356,6 +4713,7 @@ fn start_redis_runtime(
             redis: Some(RedisClient {
                 connection: producer_connection,
                 queue_key: queue_key.clone(),
+                delayed_key: delayed_key.clone(),
                 record_prefix: record_prefix.clone(),
                 unique_prefix: unique_prefix.clone(),
             }),
@@ -4593,7 +4951,7 @@ const PG_MAINTENANCE_INTERVAL: std::time::Duration = std::time::Duration::from_s
 /// Columns returned by every SELECT from `autumn_jobs` when OTLP is disabled.
 #[cfg(all(feature = "db", not(feature = "telemetry-otlp")))]
 const PG_JOB_SELECT_COLS: &str = "id, name, payload::TEXT AS payload, status, attempt, \
-    max_attempts, initial_backoff_ms, enqueued_at, started_at, finished_at, \
+    max_attempts, initial_backoff_ms, enqueued_at, run_at, started_at, finished_at, \
     claimed_by, claimed_at, last_error";
 
 /// Columns returned by every SELECT from `autumn_jobs` when OTLP is enabled.
@@ -4601,7 +4959,7 @@ const PG_JOB_SELECT_COLS: &str = "id, name, payload::TEXT AS payload, status, at
 /// `add_trace_context_to_jobs` migration.
 #[cfg(all(feature = "db", feature = "telemetry-otlp"))]
 const PG_JOB_SELECT_COLS: &str = "id, name, payload::TEXT AS payload, status, attempt, \
-    max_attempts, initial_backoff_ms, enqueued_at, started_at, finished_at, \
+    max_attempts, initial_backoff_ms, enqueued_at, run_at, started_at, finished_at, \
     claimed_by, claimed_at, last_error, traceparent, tracestate";
 
 /// A job row read from the `autumn_jobs` Postgres table.
@@ -4625,6 +4983,8 @@ struct PgJobRow {
     initial_backoff_ms: i64,
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>)]
     enqueued_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>)]
+    run_at: Option<chrono::DateTime<chrono::Utc>>,
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>)]
     started_at: Option<chrono::DateTime<chrono::Utc>>,
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>)]
@@ -4655,6 +5015,11 @@ impl PgJobRow {
             name: self.name.clone(),
             status,
             enqueued_at: self.enqueued_at.map(format_job_admin_time),
+            scheduled_for: if status == JobAdminStatus::Scheduled {
+                self.run_at.map(format_job_admin_time)
+            } else {
+                None
+            },
             started_at: self.started_at.map(format_job_admin_time),
             finished_at: self.finished_at.map(format_job_admin_time),
             attempt: u32::try_from(self.attempt).unwrap_or(0),
@@ -4697,6 +5062,7 @@ async fn pg_insert_job(
     payload: Value,
     max_attempts: u32,
     initial_backoff_ms: u64,
+    run_at: Option<chrono::DateTime<chrono::Utc>>,
     constraints: &ResolvedJobConstraints,
 ) -> AutumnResult<EnqueueOutcome> {
     use diesel_async::RunQueryDsl as _;
@@ -4761,7 +5127,7 @@ async fn pg_insert_job(
         "INSERT INTO autumn_jobs \
          (id, name, payload, status, attempt, max_attempts, initial_backoff_ms, \
           enqueued_at, run_at, unique_key, unique_window, concurrency_key, concurrency_limit) \
-         SELECT $1, $2, $3::JSONB, 'enqueued', 1, $4, $5, NOW(), NOW(), $6, $7, $9, $10 \
+         SELECT $1, $2, $3::JSONB, 'enqueued', 1, $4, $5, NOW(), COALESCE($11, NOW()), $6, $7, $9, $10 \
          WHERE {DEDUP_GUARD} \
          {UNIQUE_CONFLICT}"
     ))
@@ -4776,14 +5142,15 @@ async fn pg_insert_job(
     )
     .bind::<diesel::sql_types::Nullable<diesel::sql_types::BigInt>, _>(unique_ttl_ms)
     .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(concurrency_key)
-    .bind::<diesel::sql_types::Nullable<diesel::sql_types::Integer>, _>(concurrency_limit);
+    .bind::<diesel::sql_types::Nullable<diesel::sql_types::Integer>, _>(concurrency_limit)
+    .bind::<diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>, _>(run_at);
     #[cfg(feature = "telemetry-otlp")]
     let query = diesel::sql_query(format!(
         "INSERT INTO autumn_jobs \
          (id, name, payload, status, attempt, max_attempts, initial_backoff_ms, \
           enqueued_at, run_at, unique_key, unique_window, concurrency_key, concurrency_limit, \
           traceparent, tracestate) \
-         SELECT $1, $2, $3::JSONB, 'enqueued', 1, $4, $5, NOW(), NOW(), $6, $7, $9, $10, $11, $12 \
+         SELECT $1, $2, $3::JSONB, 'enqueued', 1, $4, $5, NOW(), COALESCE($13, NOW()), $6, $7, $9, $10, $11, $12 \
          WHERE {DEDUP_GUARD} \
          {UNIQUE_CONFLICT}"
     ))
@@ -4800,7 +5167,8 @@ async fn pg_insert_job(
     .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(concurrency_key)
     .bind::<diesel::sql_types::Nullable<diesel::sql_types::Integer>, _>(concurrency_limit)
     .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(traceparent)
-    .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(tracestate);
+    .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(tracestate)
+    .bind::<diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>, _>(run_at);
 
     let inserted = query.execute(conn).await.map_err(|e| {
         AutumnError::internal_server_error_msg(format!("pg job enqueue failed: {e}"))
@@ -4811,8 +5179,11 @@ async fn pg_insert_job(
     Ok(EnqueueOutcome::Queued)
 }
 
-/// Insert a new job row into `autumn_jobs`.
-#[cfg(feature = "db")]
+/// Insert a new job row into `autumn_jobs` for immediate execution.
+///
+/// Thin wrapper over [`pg_enqueue_job_at`] with no delay; retained for the
+/// Postgres backend's test suite, which exercises the immediate path directly.
+#[cfg(all(feature = "db", test))]
 async fn pg_enqueue_job(
     pool: &PgPool,
     id: String,
@@ -4820,6 +5191,34 @@ async fn pg_enqueue_job(
     payload: Value,
     max_attempts: u32,
     initial_backoff_ms: u64,
+    constraints: &ResolvedJobConstraints,
+) -> AutumnResult<EnqueueOutcome> {
+    pg_enqueue_job_at(
+        pool,
+        id,
+        name,
+        payload,
+        max_attempts,
+        initial_backoff_ms,
+        None,
+        constraints,
+    )
+    .await
+}
+
+/// Insert a new job row into `autumn_jobs` with an explicit `run_at` due time.
+///
+/// When `run_at` is in the future the row is durable but invisible to the claim
+/// query (`WHERE run_at <= NOW()`) until then — a crash-safe delayed enqueue.
+#[cfg(feature = "db")]
+async fn pg_enqueue_job_at(
+    pool: &PgPool,
+    id: String,
+    name: &str,
+    payload: Value,
+    max_attempts: u32,
+    initial_backoff_ms: u64,
+    run_at: Option<chrono::DateTime<chrono::Utc>>,
     constraints: &ResolvedJobConstraints,
 ) -> AutumnResult<EnqueueOutcome> {
     let mut conn = pool
@@ -4833,6 +5232,7 @@ async fn pg_enqueue_job(
         payload,
         max_attempts,
         initial_backoff_ms,
+        run_at,
         constraints,
     )
     .await
@@ -4840,17 +5240,21 @@ async fn pg_enqueue_job(
 
 /// Insert a job into `autumn_jobs` using an **already-open connection**.
 ///
-/// Unlike [`pg_enqueue_job`], this function does not acquire a new connection
+/// Unlike [`pg_enqueue_job_at`], this function does not acquire a new connection
 /// from the pool. The INSERT participates in whatever transaction the caller
 /// has open, so if the caller rolls back, the job row disappears atomically.
+/// When `run_at` is in the future the row is also a crash-safe delayed enqueue:
+/// invisible to workers until **both** the transaction commits **and** the due
+/// time passes.
 #[cfg(feature = "db")]
-async fn pg_enqueue_on_conn(
+async fn pg_enqueue_on_conn_at(
     conn: &mut diesel_async::AsyncPgConnection,
     id: String,
     name: &str,
     payload: Value,
     max_attempts: u32,
     initial_backoff_ms: u64,
+    run_at: Option<chrono::DateTime<chrono::Utc>>,
     constraints: &ResolvedJobConstraints,
 ) -> AutumnResult<EnqueueOutcome> {
     pg_insert_job(
@@ -4860,6 +5264,7 @@ async fn pg_enqueue_on_conn(
         payload,
         max_attempts,
         initial_backoff_ms,
+        run_at,
         constraints,
     )
     .await
@@ -5374,15 +5779,10 @@ impl PgJobAdminBackend {
         let per_page = i64::try_from(query.per_page.clamp(1, 100)).unwrap_or(10);
         let now = chrono::Utc::now();
 
-        let enqueued = pg_admin_page(
-            &mut conn,
-            PG_STATUS_ENQUEUED,
-            "enqueued_at",
-            None,
-            query.enqueued_page,
-            per_page,
-        )
-        .await?;
+        let enqueued =
+            pg_enqueued_or_scheduled_page(&mut conn, false, query.enqueued_page, per_page).await?;
+        let scheduled =
+            pg_enqueued_or_scheduled_page(&mut conn, true, query.scheduled_page, per_page).await?;
         let running = pg_admin_page(
             &mut conn,
             PG_STATUS_RUNNING,
@@ -5413,6 +5813,7 @@ impl PgJobAdminBackend {
 
         Ok(JobAdminSnapshot {
             enqueued,
+            scheduled,
             running,
             completed,
             failed,
@@ -5612,6 +6013,69 @@ async fn pg_admin_page(
 
         (total, rows)
     };
+
+    let records = rows
+        .iter()
+        .map(|r| r.to_admin_record(admin_status))
+        .collect();
+    Ok(JobAdminPage::new(
+        records,
+        u64::try_from(total).unwrap_or(0),
+        page,
+        u64::try_from(per_page).unwrap_or(10),
+    ))
+}
+
+/// Page over enqueued rows, split by whether they are ready (`run_at <= NOW()`)
+/// or still scheduled for the future (`run_at > NOW()`).
+///
+/// Ready rows surface as [`JobAdminStatus::Enqueued`] (newest-first); scheduled
+/// rows surface as [`JobAdminStatus::Scheduled`] with their `run_at` due time,
+/// soonest-due first. This is how the Postgres backend exposes delayed jobs to
+/// the dashboard — they live as ordinary `enqueued` rows with a future
+/// `run_at`, invisible to the claim query until due.
+#[cfg(feature = "db")]
+async fn pg_enqueued_or_scheduled_page(
+    conn: &mut diesel_async::pooled_connection::deadpool::Object<diesel_async::AsyncPgConnection>,
+    scheduled: bool,
+    page: u64,
+    per_page: i64,
+) -> AutumnResult<JobAdminPage> {
+    use diesel_async::RunQueryDsl as _;
+
+    let page = page.max(1);
+    let offset = i64::try_from((page - 1).saturating_mul(u64::try_from(per_page).unwrap_or(10)))
+        .unwrap_or(0);
+    // Future-dated rows are "scheduled"; due-or-past rows are "enqueued".
+    let (run_at_cmp, order, admin_status) = if scheduled {
+        ("run_at > NOW()", "run_at ASC", JobAdminStatus::Scheduled)
+    } else {
+        (
+            "run_at <= NOW()",
+            "enqueued_at DESC NULLS LAST",
+            JobAdminStatus::Enqueued,
+        )
+    };
+
+    let total = diesel::sql_query(format!(
+        "SELECT COUNT(*) AS count FROM autumn_jobs WHERE status = 'enqueued' AND {run_at_cmp}"
+    ))
+    .get_result::<PgCount>(&mut **conn)
+    .await
+    .map_err(|e| AutumnError::internal_server_error_msg(format!("pg admin count: {e}")))?
+    .count;
+
+    let rows = diesel::sql_query(format!(
+        "SELECT {PG_JOB_SELECT_COLS} FROM autumn_jobs \
+         WHERE status = 'enqueued' AND {run_at_cmp} \
+         ORDER BY {order} \
+         LIMIT $1 OFFSET $2"
+    ))
+    .bind::<diesel::sql_types::BigInt, _>(per_page)
+    .bind::<diesel::sql_types::BigInt, _>(offset)
+    .load::<PgJobRow>(&mut **conn)
+    .await
+    .map_err(|e| AutumnError::internal_server_error_msg(format!("pg admin page: {e}")))?;
 
     let records = rows
         .iter()
@@ -5846,6 +6310,7 @@ mod tests {
         let snapshot = backend
             .snapshot(JobAdminQuery {
                 enqueued_page: 1,
+                scheduled_page: 1,
                 running_page: 1,
                 completed_page: 1,
                 failed_page: 1,
@@ -7131,6 +7596,7 @@ mod tests {
         let producer = RedisClient {
             connection,
             queue_key: worker_config.queue_key.clone(),
+            delayed_key: worker_config.delayed_key.clone(),
             record_prefix: worker_config.record_prefix.clone(),
             unique_prefix: worker_config.unique_prefix.clone(),
         };
@@ -7141,6 +7607,7 @@ mod tests {
                 serde_json::json!({ "user_id": 42 }),
                 max_attempts,
                 1,
+                None,
                 &ResolvedJobConstraints::default(),
             )
             .await
@@ -7165,6 +7632,7 @@ mod tests {
         RedisJobAdminBackend::new(
             admin_connection,
             worker_config.queue_key.clone(),
+            worker_config.delayed_key.clone(),
             worker_config.processing_key.clone(),
             worker_config.dead_key.clone(),
             worker_config.completed_key.clone(),
@@ -7393,6 +7861,7 @@ mod tests {
         let snapshot = backend
             .snapshot(JobAdminQuery {
                 enqueued_page: 1,
+                scheduled_page: 1,
                 running_page: 1,
                 completed_page: 1,
                 failed_page: 1,
@@ -7887,6 +8356,7 @@ mod tests {
         let producer = RedisClient {
             connection,
             queue_key: worker_config.queue_key.clone(),
+            delayed_key: worker_config.delayed_key.clone(),
             record_prefix: worker_config.record_prefix.clone(),
             unique_prefix: worker_config.unique_prefix.clone(),
         };
@@ -7897,6 +8367,7 @@ mod tests {
                 serde_json::json!({ "marker": id }),
                 3,
                 1,
+                None,
                 constraints,
             )
             .await
@@ -8067,6 +8538,7 @@ mod tests {
         let producer = RedisClient {
             connection: connection_producer,
             queue_key: worker_config.queue_key.clone(),
+            delayed_key: worker_config.delayed_key.clone(),
             record_prefix: worker_config.record_prefix.clone(),
             unique_prefix: worker_config.unique_prefix.clone(),
         };
@@ -8079,6 +8551,7 @@ mod tests {
                     serde_json::json!({}),
                     1,
                     1,
+                    None,
                     &constraints,
                 )
                 .await
@@ -8115,6 +8588,7 @@ mod tests {
                     serde_json::json!({}),
                     1,
                     1,
+                    None,
                     &constraints,
                 )
                 .await
@@ -8561,7 +9035,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("only enqueued jobs can be canceled"),
+                .contains("only enqueued or scheduled jobs can be canceled"),
             "unexpected error: {error}"
         );
     }
@@ -8600,6 +9074,7 @@ mod tests {
         let snapshot = backend
             .snapshot(JobAdminQuery {
                 enqueued_page: 2,
+                scheduled_page: 1,
                 running_page: 1,
                 completed_page: 1,
                 failed_page: 1,
@@ -8703,6 +9178,7 @@ mod tests {
                 max_attempts,
                 initial_backoff_ms: 1,
                 enqueued_at: None,
+                run_at: None,
                 started_at: None,
                 finished_at: None,
                 claimed_by: Some("worker".to_owned()),
@@ -10554,6 +11030,7 @@ mod tests {
                     serde_json::Value::Null,
                     1,
                     1000,
+                    None,
                     &ResolvedJobConstraints::default(),
                 )
                 .await;
@@ -10570,6 +11047,7 @@ mod tests {
                 serde_json::Value::Null,
                 1,
                 1000,
+                None,
                 &ResolvedJobConstraints::default(),
             )
             .await;

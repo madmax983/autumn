@@ -286,6 +286,23 @@ pub fn job_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     .map_err(|e| ::autumn_web::AutumnError::internal_server_error(::std::io::Error::other(format!("job args serialization failed: {e}"))))?;
                 ::autumn_web::job::enqueue(#job_name, payload).await
             }
+
+            /// Enqueue this job to run once after `delay` elapses.
+            pub async fn enqueue_in(args: #args_type, delay: ::core::time::Duration) -> ::autumn_web::AutumnResult<()> {
+                let payload = ::autumn_web::reexports::serde_json::to_value(&args)
+                    .map_err(|e| ::autumn_web::AutumnError::internal_server_error(::std::io::Error::other(format!("job args serialization failed: {e}"))))?;
+                ::autumn_web::job::enqueue_in(#job_name, payload, delay).await
+            }
+
+            /// Enqueue this job to run once at the absolute instant `when`.
+            pub async fn enqueue_at(
+                args: #args_type,
+                when: ::autumn_web::reexports::chrono::DateTime<::autumn_web::reexports::chrono::Utc>,
+            ) -> ::autumn_web::AutumnResult<()> {
+                let payload = ::autumn_web::reexports::serde_json::to_value(&args)
+                    .map_err(|e| ::autumn_web::AutumnError::internal_server_error(::std::io::Error::other(format!("job args serialization failed: {e}"))))?;
+                ::autumn_web::job::enqueue_at(#job_name, payload, when).await
+            }
         }
 
         #[doc(hidden)]
@@ -431,6 +448,42 @@ mod tests {
         );
         assert!(expanded.contains("JobConcurrency"), "{expanded}");
         assert!(expanded.contains("limit : 2u32"), "{expanded}");
+    }
+
+    #[test]
+    fn expansion_generates_delayed_enqueue_helpers() {
+        let expanded = job_macro(
+            quote! { name = "reminder" },
+            quote! {
+                async fn reminder(state: AppState, args: ReminderArgs) -> AutumnResult<()> {
+                    Ok(())
+                }
+            },
+        )
+        .to_string();
+        // The per-job helper struct gains enqueue_in / enqueue_at alongside enqueue.
+        assert!(
+            expanded.contains("async fn enqueue_in"),
+            "missing enqueue_in: {expanded}"
+        );
+        assert!(
+            expanded.contains("async fn enqueue_at"),
+            "missing enqueue_at: {expanded}"
+        );
+        // They delegate to the module-level free functions with the job name.
+        assert!(
+            expanded.contains(":: autumn_web :: job :: enqueue_in"),
+            "{expanded}"
+        );
+        assert!(
+            expanded.contains(":: autumn_web :: job :: enqueue_at"),
+            "{expanded}"
+        );
+        // enqueue_at takes a chrono UTC instant.
+        assert!(
+            expanded.contains("chrono :: DateTime"),
+            "enqueue_at should take a DateTime: {expanded}"
+        );
     }
 
     #[test]
