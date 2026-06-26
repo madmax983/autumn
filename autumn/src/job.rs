@@ -527,8 +527,8 @@ impl JobAdminMemoryBackend {
         attempt: u32,
         max_attempts: u32,
         due_at: Option<chrono::DateTime<chrono::Utc>>,
+        now: chrono::DateTime<chrono::Utc>,
     ) {
-        let now = chrono::Utc::now();
         let (principal_id, correlation_id) = job_payload_identity(&payload);
         let scheduled_for = due_at.filter(|due| *due > now);
         let status = if scheduled_for.is_some() {
@@ -802,7 +802,7 @@ impl JobAdminMemoryBackend {
         max_attempts: u32,
     ) -> String {
         let id = uuid::Uuid::new_v4().to_string();
-        self.record_enqueue_due(id.clone(), name, payload, attempt, max_attempts, None);
+        self.record_enqueue_due(id.clone(), name, payload, attempt, max_attempts, None, chrono::Utc::now());
         id
     }
 
@@ -1518,6 +1518,13 @@ pub async fn enqueue(name: &str, payload: Value) -> AutumnResult<()> {
     client.enqueue(name, payload).await
 }
 
+/// Convert a relative delay into an absolute due instant.
+///
+/// Saturates to `DateTime::MAX` on overflow (practically impossible).
+fn delay_to_when(delay: std::time::Duration) -> chrono::DateTime<chrono::Utc> {
+    chrono::Utc::now() + chrono::TimeDelta::from_std(delay).unwrap_or(chrono::TimeDelta::MAX)
+}
+
 /// Enqueue a one-shot job to run once after `delay` elapses.
 ///
 /// This is the deferred-execution companion to [`enqueue`]: the job is recorded
@@ -1542,8 +1549,7 @@ pub async fn enqueue_in(
     payload: Value,
     delay: std::time::Duration,
 ) -> AutumnResult<()> {
-    let when =
-        chrono::Utc::now() + chrono::TimeDelta::from_std(delay).unwrap_or(chrono::TimeDelta::MAX);
+    let when = delay_to_when(delay);
     enqueue_at(name, payload, when).await
 }
 
@@ -1630,8 +1636,7 @@ pub async fn enqueue_in_on_conn<A: serde::Serialize>(
     delay: std::time::Duration,
     conn: &mut diesel_async::AsyncPgConnection,
 ) -> AutumnResult<()> {
-    let when =
-        chrono::Utc::now() + chrono::TimeDelta::from_std(delay).unwrap_or(chrono::TimeDelta::MAX);
+    let when = delay_to_when(delay);
     enqueue_at_on_conn(name, args, when, conn).await
 }
 
@@ -1715,8 +1720,7 @@ pub async fn enqueue_in_after_commit<A: serde::Serialize>(
     args: A,
     delay: std::time::Duration,
 ) -> AutumnResult<()> {
-    let when =
-        chrono::Utc::now() + chrono::TimeDelta::from_std(delay).unwrap_or(chrono::TimeDelta::MAX);
+    let when = delay_to_when(delay);
     enqueue_at_after_commit(name, args, when).await
 }
 
@@ -1831,9 +1835,13 @@ impl JobClient {
         payload: Value,
         due_at: Option<chrono::DateTime<chrono::Utc>>,
     ) -> AutumnResult<EnqueueOutcome> {
+        // Capture the reference instant once so every downstream decision
+        // (filter, admin record status, local-backend sleep) uses a consistent
+        // clock reading and near-due jobs cannot be misclassified.
+        let now = chrono::Utc::now();
         // Only treat a due time strictly in the future as "delayed"; a past or
         // absent due time enqueues for immediate execution exactly as before.
-        let due_at = due_at.filter(|due| *due > chrono::Utc::now());
+        let due_at = due_at.filter(|due| *due > now);
         let Some(settings) = self.per_job_settings.get(name) else {
             return Err(AutumnError::internal_server_error(std::io::Error::other(
                 format!("job '{name}' is not registered; add it to AppBuilder::jobs()"),
@@ -1859,6 +1867,7 @@ impl JobClient {
             1,
             job_max_attempts,
             due_at,
+            now,
         );
 
         let started = ::std::sync::Arc::new(::std::sync::atomic::AtomicBool::new(false));
@@ -1901,7 +1910,7 @@ impl JobClient {
                     // delivers it to a worker. This is local-safe only — a
                     // pending delay is lost if the process restarts before the
                     // job becomes due (durable backends persist the due time).
-                    let delay = (due - chrono::Utc::now())
+                    let delay = (due - now)
                         .to_std()
                         .unwrap_or(std::time::Duration::ZERO);
                     let sender = sender.clone();
@@ -5078,6 +5087,15 @@ struct PgCount {
     count: i64,
 }
 
+#[cfg(feature = "db")]
+#[derive(diesel::QueryableByName)]
+struct PgEnqueuedCounts {
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    enqueued_count: i64,
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    scheduled_count: i64,
+}
+
 /// Exponential backoff delay in ms for attempt `attempt` (1-indexed).
 #[cfg(feature = "db")]
 fn pg_retry_delay_ms(initial_backoff_ms: i64, attempt: i32) -> i64 {
@@ -5821,10 +5839,13 @@ impl PgJobAdminBackend {
         let per_page = i64::try_from(query.per_page.clamp(1, 100)).unwrap_or(10);
         let now = chrono::Utc::now();
 
-        let enqueued =
-            pg_enqueued_or_scheduled_page(&mut conn, false, query.enqueued_page, per_page).await?;
-        let scheduled =
-            pg_enqueued_or_scheduled_page(&mut conn, true, query.scheduled_page, per_page).await?;
+        let (enqueued, scheduled) = pg_enqueued_and_scheduled_pages(
+            &mut conn,
+            query.enqueued_page,
+            query.scheduled_page,
+            per_page,
+        )
+        .await?;
         let running = pg_admin_page(
             &mut conn,
             PG_STATUS_RUNNING,
@@ -6068,67 +6089,84 @@ async fn pg_admin_page(
     ))
 }
 
-/// Page over enqueued rows, split by whether they are ready (`run_at <= NOW()`)
-/// or still scheduled for the future (`run_at > NOW()`).
+/// Fetch both the ready-enqueued page and the scheduled page for the Postgres
+/// admin dashboard in 3 queries (1 shared COUNT, 2 separate SELECTs) rather
+/// than 4.
 ///
 /// Ready rows surface as [`JobAdminStatus::Enqueued`] (newest-first); scheduled
 /// rows surface as [`JobAdminStatus::Scheduled`] with their `run_at` due time,
-/// soonest-due first. This is how the Postgres backend exposes delayed jobs to
-/// the dashboard — they live as ordinary `enqueued` rows with a future
-/// `run_at`, invisible to the claim query until due.
+/// soonest-due first.
 #[cfg(feature = "db")]
-async fn pg_enqueued_or_scheduled_page(
+async fn pg_enqueued_and_scheduled_pages(
     conn: &mut diesel_async::pooled_connection::deadpool::Object<diesel_async::AsyncPgConnection>,
-    scheduled: bool,
-    page: u64,
+    enqueued_page: u64,
+    scheduled_page: u64,
     per_page: i64,
-) -> AutumnResult<JobAdminPage> {
+) -> AutumnResult<(JobAdminPage, JobAdminPage)> {
     use diesel_async::RunQueryDsl as _;
 
-    let page = page.max(1);
-    let offset = i64::try_from((page - 1).saturating_mul(u64::try_from(per_page).unwrap_or(10)))
-        .unwrap_or(0);
-    // Future-dated rows are "scheduled"; due-or-past rows are "enqueued".
-    let (run_at_cmp, order, admin_status) = if scheduled {
-        ("run_at > NOW()", "run_at ASC", JobAdminStatus::Scheduled)
-    } else {
-        (
-            "run_at <= NOW()",
-            "enqueued_at DESC NULLS LAST",
-            JobAdminStatus::Enqueued,
-        )
-    };
-
-    let total = diesel::sql_query(format!(
-        "SELECT COUNT(*) AS count FROM autumn_jobs WHERE status = 'enqueued' AND {run_at_cmp}"
-    ))
-    .get_result::<PgCount>(&mut **conn)
+    // One query for both counts.
+    let counts = diesel::sql_query(
+        "SELECT \
+           COALESCE(SUM(CASE WHEN run_at <= NOW() THEN 1 ELSE 0 END), 0) AS enqueued_count, \
+           COALESCE(SUM(CASE WHEN run_at > NOW()  THEN 1 ELSE 0 END), 0) AS scheduled_count \
+         FROM autumn_jobs WHERE status = 'enqueued'",
+    )
+    .get_result::<PgEnqueuedCounts>(&mut **conn)
     .await
-    .map_err(|e| AutumnError::internal_server_error_msg(format!("pg admin count: {e}")))?
-    .count;
+    .map_err(|e| AutumnError::internal_server_error_msg(format!("pg admin count: {e}")))?;
 
-    let rows = diesel::sql_query(format!(
+    let enq_page = enqueued_page.max(1);
+    let enq_offset =
+        i64::try_from((enq_page - 1).saturating_mul(u64::try_from(per_page).unwrap_or(10)))
+            .unwrap_or(0);
+    let enqueued_rows = diesel::sql_query(format!(
         "SELECT {PG_JOB_SELECT_COLS} FROM autumn_jobs \
-         WHERE status = 'enqueued' AND {run_at_cmp} \
-         ORDER BY {order} \
+         WHERE status = 'enqueued' AND run_at <= NOW() \
+         ORDER BY enqueued_at DESC NULLS LAST \
          LIMIT $1 OFFSET $2"
     ))
     .bind::<diesel::sql_types::BigInt, _>(per_page)
-    .bind::<diesel::sql_types::BigInt, _>(offset)
+    .bind::<diesel::sql_types::BigInt, _>(enq_offset)
     .load::<PgJobRow>(&mut **conn)
     .await
     .map_err(|e| AutumnError::internal_server_error_msg(format!("pg admin page: {e}")))?;
 
-    let records = rows
-        .iter()
-        .map(|r| r.to_admin_record(admin_status))
-        .collect();
-    Ok(JobAdminPage::new(
-        records,
-        u64::try_from(total).unwrap_or(0),
-        page,
-        u64::try_from(per_page).unwrap_or(10),
+    let sch_page = scheduled_page.max(1);
+    let sch_offset =
+        i64::try_from((sch_page - 1).saturating_mul(u64::try_from(per_page).unwrap_or(10)))
+            .unwrap_or(0);
+    let scheduled_rows = diesel::sql_query(format!(
+        "SELECT {PG_JOB_SELECT_COLS} FROM autumn_jobs \
+         WHERE status = 'enqueued' AND run_at > NOW() \
+         ORDER BY run_at ASC \
+         LIMIT $1 OFFSET $2"
     ))
+    .bind::<diesel::sql_types::BigInt, _>(per_page)
+    .bind::<diesel::sql_types::BigInt, _>(sch_offset)
+    .load::<PgJobRow>(&mut **conn)
+    .await
+    .map_err(|e| AutumnError::internal_server_error_msg(format!("pg admin page: {e}")))?;
+
+    let enqueued = JobAdminPage::new(
+        enqueued_rows
+            .iter()
+            .map(|r| r.to_admin_record(JobAdminStatus::Enqueued))
+            .collect(),
+        u64::try_from(counts.enqueued_count).unwrap_or(0),
+        enq_page,
+        u64::try_from(per_page).unwrap_or(10),
+    );
+    let scheduled = JobAdminPage::new(
+        scheduled_rows
+            .iter()
+            .map(|r| r.to_admin_record(JobAdminStatus::Scheduled))
+            .collect(),
+        u64::try_from(counts.scheduled_count).unwrap_or(0),
+        sch_page,
+        u64::try_from(per_page).unwrap_or(10),
+    );
+    Ok((enqueued, scheduled))
 }
 
 /// Start the Postgres job runtime.

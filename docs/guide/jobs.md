@@ -69,8 +69,10 @@ Delayed enqueue composes with the transactional variants, so a job is invisible
 to workers until **both** the row commits **and** the due time passes:
 
 ```rust,ignore
+use scoped_futures::ScopedFutureExt;
+
 // Crash-safe on Postgres: the future run time is written inside your tx.
-db.tx(move |conn| scoped_boxed(async move {
+db.tx(move |conn| async move {
     let cart = carts::create(new_cart, conn).await?;
     autumn_web::job::enqueue_in_on_conn(
         "expire_cart",
@@ -79,7 +81,7 @@ db.tx(move |conn| scoped_boxed(async move {
         conn,
     ).await?;
     Ok(cart)
-})).await?;
+}.scope_boxed()).await?;
 
 // Process-local after-commit defer (not crash-safe), absolute or relative:
 autumn_web::job::enqueue_in_after_commit("send_reminder", args, Duration::from_secs(3600)).await?;
