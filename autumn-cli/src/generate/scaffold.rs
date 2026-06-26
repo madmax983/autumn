@@ -11,12 +11,12 @@
 use std::path::Path;
 
 use super::dsl::{Field, FieldKind, parse_fields};
-use super::emit::Plan;
+use super::emit::{Action, Plan};
 use super::model::{
     ModelOptions, field_by_name, parse_model_metadata, plan_cargo_deps, plan_model_with_options,
 };
 use super::naming::{pascal, pluralize, snake};
-use super::schema_edit::{add_mod_declaration, update_main_rs};
+use super::schema_edit::{add_mod_declaration, ensure_autumn_web_feature, update_main_rs};
 use super::{Flags, GenerateError, ensure_project_root, timestamp_now};
 
 /// Extra dependencies the *scaffold* generator's output requires on top of
@@ -201,6 +201,33 @@ pub fn plan_scaffold_with_options(
         ));
     }
     plan_cargo_deps(&mut plan, project_root, &combined);
+
+    if options_with_key.live {
+        let cargo_toml_path = project_root.join("Cargo.toml");
+        let mut cargo_content = None;
+        for action in &mut plan.actions {
+            match action {
+                Action::Modify { path, contents } if path == &cargo_toml_path => {
+                    cargo_content = Some(contents);
+                    break;
+                }
+                _ => {}
+            }
+        }
+
+        if let Some(contents) = cargo_content {
+            let with_ws = ensure_autumn_web_feature(contents, "ws");
+            let with_maud = ensure_autumn_web_feature(&with_ws, "maud");
+            *contents = with_maud;
+        } else {
+            let existing = read_or_empty(&cargo_toml_path);
+            let with_ws = ensure_autumn_web_feature(&existing, "ws");
+            let with_maud = ensure_autumn_web_feature(&with_ws, "maud");
+            if with_maud != existing {
+                plan.modify(cargo_toml_path, with_maud);
+            }
+        }
+    }
 
     Ok(plan)
 }
@@ -500,6 +527,11 @@ fn render_routes_file(
     soft_delete: bool,
     live: bool,
 ) -> String {
+    let layout_head_scripts = if live {
+        "\n                script src=\"/static/js/htmx.min.js\" {}\n                script src=\"https://unpkg.com/htmx-ext-sse@2.2.2/sse.js\" {}"
+    } else {
+        ""
+    };
     let create_inputs = render_create_form_inputs(fields);
     let edit_inputs = render_edit_form_inputs(fields);
     let update_columns = render_update_columns(plural, fields);
@@ -516,7 +548,7 @@ fn render_routes_file(
                  let deleted = repo.delete_by_id(*id).await?;"
             )
         } else {
-            format!("let deleted = repo.delete_by_id(*id).await?;")
+            "let deleted = repo.delete_by_id(*id).await?;".to_owned()
         }
     } else if soft_delete {
         // Filter on `deleted_at IS NULL` so deleting an already-soft-deleted row
@@ -540,7 +572,7 @@ fn render_routes_file(
                  repo.save(&new).await?;"
             )
         } else {
-            format!("repo.save(&new).await?;")
+            "repo.save(&new).await?;".to_owned()
         }
     } else {
         format!(
@@ -788,7 +820,7 @@ fn layout(title: &str, flash: Markup, content: Markup) -> Markup {{
             head {{
                 meta charset="utf-8";
                 title {{ (title) }}
-                link rel="stylesheet" href=(autumn_web::flash::FLASH_CSS_PATH);
+                link rel="stylesheet" href=(autumn_web::flash::FLASH_CSS_PATH);{layout_head_scripts}
             }}
             body {{
                 (flash)
@@ -1098,8 +1130,7 @@ fn render_update_changeset_expr(pascal_name: &str, fields: &[Field]) -> String {
         let name = &f.name;
         writeln!(
             out,
-            "        {name}: Some(form.{name}.clone()),",
-            name = name
+            "        {name}: autumn_web::hooks::Patch::Set(form.{name}.clone()),"
         )
         .unwrap();
     }
@@ -1310,7 +1341,11 @@ mod tests {
 
     fn project_with_main(template: &str) -> TempDir {
         let tmp = TempDir::new().unwrap();
-        fs::write(tmp.path().join("Cargo.toml"), "[package]\nname=\"x\"\n").unwrap();
+        fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[package]\nname=\"x\"\n\n[dependencies]\nautumn-web = \"0.5.0\"\n",
+        )
+        .unwrap();
         fs::create_dir_all(tmp.path().join("src")).unwrap();
         fs::write(tmp.path().join("src/main.rs"), template).unwrap();
         tmp
@@ -2096,8 +2131,15 @@ async fn main() {
         assert!(routes.contains("autumn_web::sse::stream"));
         assert!(routes.contains("hx-ext=\"sse\""));
         assert!(routes.contains("sse-connect=\"/posts/events\""));
+        assert!(routes.contains("script src=\"/static/js/htmx.min.js\""));
+        assert!(routes.contains("script src=\"https://unpkg.com/htmx-ext-sse@2.2.2/sse.js\""));
+        assert!(routes.contains("title: autumn_web::hooks::Patch::Set(form.title.clone())"));
 
         let repo = fs::read_to_string(tmp.path().join("src/repositories/post.rs")).unwrap();
         assert!(repo.contains("broadcasts = true"));
+
+        let cargo = fs::read_to_string(tmp.path().join("Cargo.toml")).unwrap();
+        assert!(cargo.contains("\"ws\""));
+        assert!(cargo.contains("\"maud\""));
     }
 }

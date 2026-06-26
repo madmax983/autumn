@@ -3226,11 +3226,16 @@ impl AppBuilder {
         }
 
         #[cfg(feature = "db")]
+        {
+            #[cfg(feature = "ws")]
+            crate::repository_commit_hooks::set_global_channels(state.channels().clone());
+        }
+
+        #[cfg(feature = "db")]
         if let Some(pool) = state.pool().cloned() {
             #[cfg(feature = "ws")]
             {
                 let channels = state.channels().clone();
-                crate::repository_commit_hooks::set_global_channels(channels.clone());
                 crate::repository_commit_hooks::start_repository_commit_hook_worker(
                     pool,
                     Some(channels),
@@ -4390,11 +4395,16 @@ impl AppBuilder {
         }
 
         #[cfg(feature = "db")]
+        {
+            #[cfg(feature = "ws")]
+            crate::repository_commit_hooks::set_global_channels(state.channels().clone());
+        }
+
+        #[cfg(feature = "db")]
         if let Some(pool) = state.pool().cloned() {
             #[cfg(feature = "ws")]
             {
                 let channels = state.channels().clone();
-                crate::repository_commit_hooks::set_global_channels(channels.clone());
                 crate::repository_commit_hooks::start_repository_commit_hook_worker(
                     pool,
                     Some(channels),

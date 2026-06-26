@@ -152,6 +152,43 @@ mod tests {
         assert!(html_content.contains(&format!("id=\"custom-post-{}", custom_post.id)));
         assert!(html_content.contains("hello"));
 
+        // 3. Update on custom repository
+        let mut custom_update_sub = channels.subscribe("post_topic:world");
+
+        let mut update_changes = UpdateBroadcastPost::default();
+        update_changes.title = autumn_web::hooks::Patch::Set("world".to_owned());
+        custom_repo
+            .update(custom_post.id, &update_changes)
+            .await
+            .expect("update custom post");
+
+        // Wait for the background worker to drain and publish update on custom topic
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(3), custom_update_sub.recv())
+            .await
+            .expect("timeout waiting for custom update broadcast")
+            .expect("recv error");
+        let html_content = msg.into_string();
+        assert!(html_content.contains("hx-swap-oob=\"outerHTML\""));
+        assert!(html_content.contains(&format!("id=\"custom-post-{}", custom_post.id)));
+        assert!(html_content.contains("world"));
+
+        // 4. Delete on custom repository
+        custom_repo
+            .delete_by_id(custom_post.id)
+            .await
+            .expect("delete custom post");
+
+        // Wait for the background worker to drain and publish delete on custom topic
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(3), custom_update_sub.recv())
+            .await
+            .expect("timeout waiting for custom delete broadcast")
+            .expect("recv error");
+        let html_content = msg.into_string();
+        assert!(html_content.contains(&format!(
+            "hx-swap-oob=\"delete:#custom-post-{}\"",
+            custom_post.id
+        )));
+
         shutdown.cancel();
     }
 }

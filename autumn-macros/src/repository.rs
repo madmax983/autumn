@@ -1425,7 +1425,6 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             };
 
             let create = quote! {
-                #[cfg(all(feature = "ws", feature = "maud"))]
                 {
                     if let ::core::option::Option::Some(__channels) = ::autumn_web::__private::get_global_channels() {
                         let __topic = #topic_expr;
@@ -1441,12 +1440,34 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             };
 
             let update = quote! {
-                #[cfg(all(feature = "ws", feature = "maud"))]
                 {
                     if let ::core::option::Option::Some(__channels) = ::autumn_web::__private::get_global_channels() {
                         let __topic = #topic_expr;
-                        let __id = ::std::format!("{}-{}", #model_prefix, ::autumn_web::repository::ModelPrimaryKey::primary_key_value(&__record));
                         let __fragment = #render_expr;
+                        let __id = {
+                            let __html = __fragment.clone().into_string();
+                            let mut __found_id = ::core::option::Option::None;
+                            if let ::core::option::Option::Some(__start_tag_end) = __html.find('>') {
+                                let __start_tag = &__html[..__start_tag_end];
+                                if let ::core::option::Option::Some(__id_idx) = __start_tag.find("id=") {
+                                    let __after_id = &__start_tag[__id_idx + 3..];
+                                    let mut __chars = __after_id.chars();
+                                    if let ::core::option::Option::Some(__quote) = __chars.next() {
+                                        if __quote == '"' || __quote == '\'' {
+                                            let mut __val = ::std::string::String::new();
+                                            for __c in __chars {
+                                                if __c == __quote {
+                                                    break;
+                                                }
+                                                __val.push(__c);
+                                            }
+                                            __found_id = ::core::option::Option::Some(__val);
+                                        }
+                                    }
+                                }
+                            }
+                            __found_id.unwrap_or_else(|| ::std::format!("{}-{}", #model_prefix, ::autumn_web::repository::ModelPrimaryKey::primary_key_value(&__record)))
+                        };
                         if let ::core::result::Result::Err(__err) = __channels
                             .broadcast()
                             .publish_oob(&__topic, &__id, ::autumn_web::htmx::OobSwap::OuterHTML, &__fragment)
@@ -1458,11 +1479,34 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             };
 
             let delete = quote! {
-                #[cfg(all(feature = "ws", feature = "maud"))]
                 {
                     if let ::core::option::Option::Some(__channels) = ::autumn_web::__private::get_global_channels() {
                         let __topic = #topic_expr;
-                        let __id = ::std::format!("{}-{}", #model_prefix, ::autumn_web::repository::ModelPrimaryKey::primary_key_value(&__record));
+                        let __id = {
+                            let __fragment = #render_expr;
+                            let __html = __fragment.into_string();
+                            let mut __found_id = ::core::option::Option::None;
+                            if let ::core::option::Option::Some(__start_tag_end) = __html.find('>') {
+                                let __start_tag = &__html[..__start_tag_end];
+                                if let ::core::option::Option::Some(__id_idx) = __start_tag.find("id=") {
+                                    let __after_id = &__start_tag[__id_idx + 3..];
+                                    let mut __chars = __after_id.chars();
+                                    if let ::core::option::Option::Some(__quote) = __chars.next() {
+                                        if __quote == '"' || __quote == '\'' {
+                                            let mut __val = ::std::string::String::new();
+                                            for __c in __chars {
+                                                if __c == __quote {
+                                                    break;
+                                                }
+                                                __val.push(__c);
+                                            }
+                                            __found_id = ::core::option::Option::Some(__val);
+                                        }
+                                    }
+                                }
+                            }
+                            __found_id.unwrap_or_else(|| ::std::format!("{}-{}", #model_prefix, ::autumn_web::repository::ModelPrimaryKey::primary_key_value(&__record)))
+                        };
                         let __fragment = ::autumn_web::html! {};
                         if let ::core::result::Result::Err(__err) = __channels
                             .broadcast()
