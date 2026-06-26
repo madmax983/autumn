@@ -223,11 +223,23 @@ pub fn detect_n_plus_one(queries: &[QueryRecord], threshold: usize) -> Option<NP
 }
 
 /// Collapse whitespace and lower-case a SQL string for comparison.
+///
+/// ⚡ Bolt optimization: Pre-allocates a string buffer and formats in place
+/// to avoid intermediate `Vec` allocations from `.collect()` and temporary string
+/// creation from `.join()`, reducing memory pressure during query inspection.
 fn normalize_sql(sql: &str) -> String {
-    sql.split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .to_lowercase()
+    let mut out = String::with_capacity(sql.len());
+    let mut first = true;
+    for word in sql.split_whitespace() {
+        if !first {
+            out.push(' ');
+        }
+        first = false;
+        for c in word.chars() {
+            out.extend(c.to_lowercase());
+        }
+    }
+    out
 }
 
 // ── Per-request query accumulator ─────────────────────────────────────────────
