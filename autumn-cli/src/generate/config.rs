@@ -73,7 +73,13 @@ struct GenerateDefaults {
     id: Option<String>,
 }
 
+// `deny_unknown_fields` so a mistyped top-level table (e.g. `[scafold.Post]`
+// instead of `[scaffold.Post]`, or `[genrate]`) is a hard error when the file is
+// used as an explicit `--config` scaffold source, rather than being silently
+// ignored and producing a fieldless resource. Defaults-only reads use the
+// lenient `GenerateDefaultsConfig` view instead.
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct GeneratorConfig {
     #[serde(default)]
     scaffold: HashMap<String, ScaffoldConfigEntry>,
@@ -505,6 +511,21 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
         );
         assert!(!entry.api, "per-resource api must be ignored");
         assert!(!entry.sharded, "per-resource sharded must be ignored");
+    }
+
+    #[test]
+    fn explicit_config_misspelled_scaffold_table_errors() {
+        // A mistyped top-level table name ([scafold.Post]) must not be silently
+        // ignored as if the file were a pure [generate] defaults file.
+        let tmp = TempDir::new().unwrap();
+        let path = write_config(&tmp, "[scafold.Post]\nfields = [\"title:String\"]\n");
+        let err = read_explicit_scaffold_config(&path, "Post", false).unwrap_err();
+        assert!(
+            matches!(err, GenerateError::Config(_)),
+            "misspelled top-level table must error, got: {err:?}"
+        );
+        // Defaults-only reads stay lenient (they never consult scaffold tables).
+        assert_eq!(read_generate_defaults(&path).unwrap(), IdType::BigSerial);
     }
 
     #[test]
