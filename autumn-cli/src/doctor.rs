@@ -2153,13 +2153,22 @@ fn resolve_active_profiles() -> (String, String, Vec<String>) {
         .or_else(|| std::env::var("AUTUMN_PROFILE").ok())
         .filter(|v| !v.trim().is_empty())
         .unwrap_or_default();
-    let raw_lower = raw_profile.trim().to_ascii_lowercase();
-    let canonical = match raw_lower.as_str() {
-        "production" | "prod" => "prod",
-        "development" | "dev" | "" => "dev",
-        other => other,
-    }
-    .to_owned();
+    let raw_trimmed = raw_profile.trim().to_owned();
+    // Mirror normalize_profile_name from config.rs: built-in aliases are
+    // matched case-insensitively; custom profile names preserve the original
+    // user-specified case (so AUTUMN_ENV=QA loads [profile.QA], not [profile.qa]).
+    let canonical = if raw_trimmed.eq_ignore_ascii_case("production")
+        || raw_trimmed.eq_ignore_ascii_case("prod")
+    {
+        "prod".to_owned()
+    } else if raw_trimmed.eq_ignore_ascii_case("development")
+        || raw_trimmed.eq_ignore_ascii_case("dev")
+        || raw_trimmed.is_empty()
+    {
+        "dev".to_owned()
+    } else {
+        raw_trimmed.clone()
+    };
     // Mirror profile_lookup_names in config.rs: the runtime always loads the
     // legacy long-form alias first (e.g. "production") then the canonical short
     // form ("prod"), regardless of which spelling was used in the env var.
@@ -2172,7 +2181,7 @@ fn resolve_active_profiles() -> (String, String, Vec<String>) {
         .into_iter()
         .chain(std::iter::once(canonical.clone()))
         .collect();
-    (canonical, raw_lower, profiles)
+    (canonical, raw_trimmed, profiles)
 }
 
 fn resolve_proxy_conflict_data() -> ProxyConflictData {
