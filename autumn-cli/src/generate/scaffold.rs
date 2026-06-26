@@ -706,7 +706,7 @@ fn render_routes_file(
     let (ul_tag, li_render) = if live {
         (
             format!(
-                r#"ul id="{plural}-list" hx-ext="sse" sse-connect="/{plural}/events" sse-swap="message""#
+                r#"ul id="{plural}-list" hx-ext="sse" sse-connect="/{plural}/events" sse-swap="message" hx-swap="none""#
             ),
             format!(
                 r#"li id=(format!("{snake_name}-{{}}", row.id)) {{ a href=(format!("/{plural}/{{}}", row.id)) {{ "{pascal_name} #{{}}" (row.id) }} }}"#
@@ -2171,6 +2171,7 @@ async fn main() {
         assert!(routes.contains("autumn_web::sse::stream"));
         assert!(routes.contains("hx-ext=\"sse\""));
         assert!(routes.contains("sse-connect=\"/posts/events\""));
+        assert!(routes.contains("hx-swap=\"none\""));
         assert!(routes.contains("script src=\"/static/js/htmx.min.js\""));
         assert!(routes.contains("script src=\"/static/js/sse.js\""));
         assert!(routes.contains("title: autumn_web::hooks::Patch::Set(form.title.clone())"));

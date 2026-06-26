@@ -94,6 +94,9 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires Docker (testcontainers)"]
     async fn test_auto_broadcast_lifecycle() {
+        let _ = ::tracing_subscriber::fmt()
+            .with_env_filter(::tracing_subscriber::EnvFilter::from_default_env())
+            .try_init();
         let db = TestDb::shared().await;
         setup_db(db).await;
 
@@ -152,7 +155,8 @@ mod tests {
         assert!(html_content.contains(&format!("id=\"custom-post-{}", custom_post.id)));
         assert!(html_content.contains("hello"));
 
-        // 3. Update on custom repository
+        // 3. Update on custom repository (which changes the topic from post_topic:hello to post_topic:world)
+        let mut old_topic_sub = channels.subscribe("post_topic:hello");
         let mut custom_update_sub = channels.subscribe("post_topic:world");
 
         let update_changes = UpdateBroadcastPost {
@@ -162,6 +166,17 @@ mod tests {
             .update(custom_post.id, &update_changes)
             .await
             .expect("update custom post");
+
+        // Wait for the background worker to drain and publish delete on the old topic
+        let msg_old = tokio::time::timeout(std::time::Duration::from_secs(3), old_topic_sub.recv())
+            .await
+            .expect("timeout waiting for delete on old topic broadcast")
+            .expect("recv error");
+        let html_content_old = msg_old.into_string();
+        assert!(html_content_old.contains(&format!(
+            "hx-swap-oob=\"delete:#custom-post-{}\"",
+            custom_post.id
+        )));
 
         // Wait for the background worker to drain and publish update on custom topic
         let msg = tokio::time::timeout(std::time::Duration::from_secs(3), custom_update_sub.recv())

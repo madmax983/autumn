@@ -1480,6 +1480,21 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                 }
                             })().unwrap_or_else(|| ::std::format!("{}-{}", #model_prefix, ::autumn_web::repository::ModelPrimaryKey::primary_key_value(&__record)))
                         };
+                        if let ::core::option::Option::Some(__prev_topic) = __ctx_val
+                            .get("__autumn_previous_topic")
+                            .and_then(|__v| __v.as_str())
+                        {
+                            if __prev_topic != __topic {
+                                let __delete_fragment = ::autumn_web::html! {};
+                                if let ::core::result::Result::Err(__err) = __channels
+                                    .broadcast()
+                                    .publish_oob(__prev_topic, &__id, ::autumn_web::htmx::OobSwap::Delete, &__delete_fragment)
+                                {
+                                    ::autumn_web::reexports::tracing::warn!(error = %__err, "auto-broadcast delete of old topic failed");
+                                }
+                            }
+                        }
+
                         if let ::core::result::Result::Err(__err) = __channels
                             .broadcast()
                             .publish_oob(&__topic, &__id, ::autumn_web::htmx::OobSwap::OuterHTML, &__fragment)
@@ -1547,6 +1562,72 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             (quote! {}, quote! {}, quote! {})
         };
 
+        let (
+            enqueue_context_setup,
+            enqueue_context_ref,
+            finalize_context_setup,
+            finalize_context_ref,
+        ) = if config.broadcasts {
+            let base_topic_expr = match generate_topic_format(
+                config
+                    .broadcast_topic
+                    .as_deref()
+                    .unwrap_or(&config.table_name),
+                &quote! { __record },
+            ) {
+                Ok(expr) => expr,
+                Err(err) => {
+                    let compile_err = err.to_compile_error();
+                    return quote! { #compile_err };
+                }
+            };
+
+            let topic_expr = if config.tenant_scoped {
+                quote! { ::std::format!("tenant:{}:{}", ::autumn_web::tenancy::DisplayTenantId::tenant_id_str(&__record.tenant_id), #base_topic_expr) }
+            } else {
+                base_topic_expr
+            };
+
+            (
+                quote! {
+                    let mut __autumn_previous_topic: ::core::option::Option<::std::string::String> = ::core::option::Option::None;
+                    let mut __autumn_ctx_val = ::autumn_web::reexports::serde_json::to_value(&ctx)
+                        .map_err(|e| ::autumn_web::AutumnError::internal_server_error_msg(format!("serialize context: {e}")))?;
+                    if let ::core::option::Option::Some(ref __record) = __vh_before {
+                        let __prev_topic = #topic_expr;
+                        __autumn_previous_topic = ::core::option::Option::Some(__prev_topic.clone());
+                        if let ::core::option::Option::Some(__map) = __autumn_ctx_val.as_object_mut() {
+                            __map.insert(
+                                "__autumn_previous_topic".to_string(),
+                                ::autumn_web::reexports::serde_json::Value::String(__prev_topic),
+                            );
+                        }
+                    }
+                },
+                quote! { &__autumn_ctx_val },
+                quote! {
+                    let mut __autumn_finalized_ctx_val = ::autumn_web::reexports::serde_json::to_value(&ctx)
+                        .map_err(|e| ::autumn_web::AutumnError::internal_server_error_msg(format!("serialize finalized context: {e}")))?;
+                    if let ::core::option::Option::Some(ref __prev_topic) = __autumn_previous_topic {
+                        if let ::core::option::Option::Some(__map) = __autumn_finalized_ctx_val.as_object_mut() {
+                            __map.insert(
+                                "__autumn_previous_topic".to_string(),
+                                ::autumn_web::reexports::serde_json::Value::String(__prev_topic.clone()),
+                            );
+                        }
+                    }
+                },
+                quote! { &__autumn_finalized_ctx_val },
+            )
+        } else {
+            (
+                quote! { let __autumn_previous_topic: ::core::option::Option<::std::string::String> = ::core::option::Option::None; },
+                quote! { &ctx },
+                quote! {},
+                quote! { &ctx },
+            )
+        };
+
         let hook_support_methods = if commit_hooks_enabled {
             quote! {
             #[doc(hidden)]
@@ -1591,9 +1672,9 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                             #broadcast_create
                             Ok(())
                         },
-                        |__ctx, __record| async move {
+                        |__ctx_val, __record| async move {
                             let mut __ctx: ::autumn_web::hooks::MutationContext =
-                                ::autumn_web::reexports::serde_json::from_value(__ctx)
+                                ::autumn_web::reexports::serde_json::from_value(__ctx_val.clone())
                                     .map_err(|__error| {
                                         ::autumn_web::AutumnError::internal_server_error_msg(
                                             format!("deserialize repository update hook context: {__error}")
@@ -2103,8 +2184,8 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
                     Self::__autumn_register_repository_commit_hooks();
                     let mut conn = self.__autumn_acquire_conn().await?;
-                    let (record, mut ctx, __autumn_commit_hook_id, __autumn_commit_hook_owner, __autumn_commit_hook_record) = conn
-                        .transaction::<(#model_name, MutationContext, ::std::string::String, ::std::string::String, ::autumn_web::reexports::serde_json::Value), ::autumn_web::AutumnError, _>(|conn| {
+                    let (record, mut ctx, __autumn_commit_hook_id, __autumn_commit_hook_owner, __autumn_commit_hook_record, __autumn_previous_topic) = conn
+                        .transaction::<(#model_name, MutationContext, ::std::string::String, ::std::string::String, ::autumn_web::reexports::serde_json::Value, ::core::option::Option<::std::string::String>), ::autumn_web::AutumnError, _>(|conn| {
                             async move {
                                 let mut ctx = MutationContext::new(MutationOp::Update);
                                 let mut __autumn_commit_hook_discriminator: ::core::option::Option<::std::string::String> =
@@ -2212,6 +2293,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                     #vh_update_in_hooks
                                 }
 
+                                #enqueue_context_setup
                                 let __autumn_commit_hook_record = record.__autumn_commit_hook_to_value()?;
                                 let (__autumn_commit_hook_id, __autumn_commit_hook_owner) = ::autumn_web::__private::enqueue_repository_commit_hook_pending_on_conn(
                                     conn,
@@ -2219,12 +2301,12 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                     "update",
                                     ctx.idempotency_key.as_deref(),
                                     __autumn_commit_hook_discriminator.as_deref(),
-                                    &ctx,
+                                    #enqueue_context_ref,
                                     &__autumn_commit_hook_record,
                                 )
                                 .await?;
 
-                                Ok((record, ctx, __autumn_commit_hook_id, __autumn_commit_hook_owner, __autumn_commit_hook_record))
+                                Ok((record, ctx, __autumn_commit_hook_id, __autumn_commit_hook_owner, __autumn_commit_hook_record, __autumn_previous_topic))
                             }
                             .scope_boxed()
                         })
@@ -2275,11 +2357,12 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                             ::std::panic::resume_unwind(__autumn_panic);
                         }
                     }
+                    #finalize_context_setup
                     let __autumn_finalize_result = ::autumn_web::__private::finalize_repository_commit_hook_after_hook(
                         &self.pool,
                         &__autumn_commit_hook_id,
                         &__autumn_commit_hook_owner,
-                        &ctx,
+                        #finalize_context_ref,
                         &__autumn_commit_hook_record,
                     )
                     .await;
@@ -2445,8 +2528,8 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
                     Self::__autumn_register_repository_commit_hooks();
                     let mut conn = self.__autumn_acquire_conn().await?;
-                    let (record, mut ctx, __autumn_commit_hook_id, __autumn_commit_hook_owner, __autumn_commit_hook_record) = conn
-                        .transaction::<(#model_name, MutationContext, ::std::string::String, ::std::string::String, ::autumn_web::reexports::serde_json::Value), ::autumn_web::AutumnError, _>(|conn| {
+                    let (record, mut ctx, __autumn_commit_hook_id, __autumn_commit_hook_owner, __autumn_commit_hook_record, __autumn_previous_topic) = conn
+                        .transaction::<(#model_name, MutationContext, ::std::string::String, ::std::string::String, ::autumn_web::reexports::serde_json::Value, ::core::option::Option<::std::string::String>), ::autumn_web::AutumnError, _>(|conn| {
                             async move {
                                 let mut ctx = MutationContext::new(MutationOp::Update);
                                 let mut __autumn_commit_hook_discriminator: ::core::option::Option<::std::string::String> =
@@ -2528,6 +2611,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                     #vh_update_in_hooks
                                 }
 
+                                #enqueue_context_setup
                                 let __autumn_commit_hook_record = record.__autumn_commit_hook_to_value()?;
                                 let (__autumn_commit_hook_id, __autumn_commit_hook_owner) = ::autumn_web::__private::enqueue_repository_commit_hook_pending_on_conn(
                                     conn,
@@ -2535,12 +2619,12 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                     "update",
                                     ctx.idempotency_key.as_deref(),
                                     __autumn_commit_hook_discriminator.as_deref(),
-                                    &ctx,
+                                    #enqueue_context_ref,
                                     &__autumn_commit_hook_record,
                                 )
                                 .await?;
 
-                                Ok((record, ctx, __autumn_commit_hook_id, __autumn_commit_hook_owner, __autumn_commit_hook_record))
+                                Ok((record, ctx, __autumn_commit_hook_id, __autumn_commit_hook_owner, __autumn_commit_hook_record, __autumn_previous_topic))
                             }
                             .scope_boxed()
                         })
@@ -2591,11 +2675,12 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                             ::std::panic::resume_unwind(__autumn_panic);
                         }
                     }
+                    #finalize_context_setup
                     let __autumn_finalize_result = ::autumn_web::__private::finalize_repository_commit_hook_after_hook(
                         &self.pool,
                         &__autumn_commit_hook_id,
                         &__autumn_commit_hook_owner,
-                        &ctx,
+                        #finalize_context_ref,
                         &__autumn_commit_hook_record,
                     )
                     .await;
@@ -4032,41 +4117,118 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             };
 
             let commit_hooks_enqueue_block = if commit_hooks_enabled {
-                quote! {
-                    let mut hook_records = Vec::new();
-                    for record in &chunk_updated {
-                        let mut __autumn_commit_hook_discriminator: ::core::option::Option<::std::string::String> =
-                            ::core::option::Option::None;
-                        if let ::core::option::Option::Some(__autumn_idempotency) = &self.idempotency {
-                            __autumn_commit_hook_discriminator =
-                                ::core::option::Option::Some(__autumn_idempotency.next_mutation_discriminator());
+                if config.broadcasts {
+                    let base_topic_expr = match generate_topic_format(
+                        config
+                            .broadcast_topic
+                            .as_deref()
+                            .unwrap_or(&config.table_name),
+                        &quote! { __record },
+                    ) {
+                        Ok(expr) => expr,
+                        Err(err) => {
+                            let compile_err = err.to_compile_error();
+                            return quote! { #compile_err };
                         }
-                        let __autumn_commit_hook_record = record.__autumn_commit_hook_to_value()?;
-                        hook_records.push((__autumn_commit_hook_record, __autumn_commit_hook_discriminator));
-                    }
+                    };
 
-                    let hook_inputs: Vec<_> = chunk_updated.iter().enumerate().map(|(idx, _)| {
-                        let global_idx = offset + idx;
-                        let ctx = &contexts[global_idx];
-                        let (ref record_val, ref discriminator) = hook_records[idx];
-                        (
-                            ctx.idempotency_key.clone(),
-                            discriminator.clone(),
-                            ctx,
-                            record_val,
+                    let topic_expr = if config.tenant_scoped {
+                        quote! { ::std::format!("tenant:{}:{}", ::autumn_web::tenancy::DisplayTenantId::tenant_id_str(&__record.tenant_id), #base_topic_expr) }
+                    } else {
+                        base_topic_expr
+                    };
+
+                    quote! {
+                        let mut hook_records = Vec::new();
+                        for record in &chunk_updated {
+                            let mut __autumn_commit_hook_discriminator: ::core::option::Option<::std::string::String> =
+                                ::core::option::Option::None;
+                            if let ::core::option::Option::Some(__autumn_idempotency) = &self.idempotency {
+                                __autumn_commit_hook_discriminator =
+                                    ::core::option::Option::Some(__autumn_idempotency.next_mutation_discriminator());
+                            }
+                            let __autumn_commit_hook_record = record.__autumn_commit_hook_to_value()?;
+                            hook_records.push((__autumn_commit_hook_record, __autumn_commit_hook_discriminator));
+                        }
+
+                        let mut serialized_contexts = Vec::new();
+                        for (idx, _record) in chunk_updated.iter().enumerate() {
+                            let global_idx = offset + idx;
+                            let ctx = &contexts[global_idx];
+                            let mut ctx_val = ::autumn_web::reexports::serde_json::to_value(ctx)
+                                .map_err(|e| ::autumn_web::AutumnError::internal_server_error_msg(format!("serialize context: {e}")))?;
+
+                            let __record = &current_rows[global_idx];
+                            let __prev_topic = #topic_expr;
+                            if let ::core::option::Option::Some(__map) = ctx_val.as_object_mut() {
+                                __map.insert(
+                                    "__autumn_previous_topic".to_string(),
+                                    ::autumn_web::reexports::serde_json::Value::String(__prev_topic),
+                                );
+                            }
+                            serialized_contexts.push(ctx_val);
+                        }
+
+                        let hook_inputs: Vec<_> = chunk_updated.iter().enumerate().map(|(idx, _)| {
+                            let global_idx = offset + idx;
+                            let (ref record_val, ref discriminator) = hook_records[idx];
+                            (
+                                contexts[global_idx].idempotency_key.clone(),
+                                discriminator.clone(),
+                                &serialized_contexts[idx],
+                                record_val,
+                            )
+                        }).collect();
+
+                        let chunk_hook_infos = ::autumn_web::__private::enqueue_repository_commit_hooks_pending_bulk_on_conn(
+                            conn,
+                            Self::__autumn_repository_commit_hook_key(),
+                            "update",
+                            &hook_inputs,
                         )
-                    }).collect();
+                        .await?;
 
-                    let chunk_hook_infos = ::autumn_web::__private::enqueue_repository_commit_hooks_pending_bulk_on_conn(
-                        conn,
-                        Self::__autumn_repository_commit_hook_key(),
-                        "update",
-                        &hook_inputs,
-                    )
-                    .await?;
+                        for (idx, info) in chunk_hook_infos.into_iter().enumerate() {
+                            hook_infos.push((info.0, info.1, hook_records[idx].0.clone()));
+                        }
+                    }
+                } else {
+                    quote! {
+                        let mut hook_records = Vec::new();
+                        for record in &chunk_updated {
+                            let mut __autumn_commit_hook_discriminator: ::core::option::Option<::std::string::String> =
+                                ::core::option::Option::None;
+                            if let ::core::option::Option::Some(__autumn_idempotency) = &self.idempotency {
+                                __autumn_commit_hook_discriminator =
+                                    ::core::option::Option::Some(__autumn_idempotency.next_mutation_discriminator());
+                            }
+                            let __autumn_commit_hook_record = record.__autumn_commit_hook_to_value()?;
+                            hook_records.push((__autumn_commit_hook_record, __autumn_commit_hook_discriminator));
+                        }
 
-                    for (idx, info) in chunk_hook_infos.into_iter().enumerate() {
-                        hook_infos.push((info.0, info.1, hook_records[idx].0.clone()));
+                        let hook_inputs: Vec<_> = chunk_updated.iter().enumerate().map(|(idx, _)| {
+                            let global_idx = offset + idx;
+                            let ctx = &contexts[global_idx];
+                            let (ref record_val, ref discriminator) = hook_records[idx];
+                            (
+                                ctx.idempotency_key.clone(),
+                                discriminator.clone(),
+                                ctx,
+                                record_val,
+                            )
+                        }).collect();
+
+                        let chunk_hook_infos = ::autumn_web::__private::enqueue_repository_commit_hooks_pending_bulk_on_conn(
+                            conn,
+                            Self::__autumn_repository_commit_hook_key(),
+                            "update",
+                            &hook_inputs,
+                        )
+                        .await?;
+
+                        for (idx, info) in chunk_hook_infos.into_iter().enumerate() {
+                            hook_infos.push((info.0, info.1, hook_records[idx].0.clone()));
+                        }
                     }
                 }
             } else {
