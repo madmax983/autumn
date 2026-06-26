@@ -3108,6 +3108,121 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn require_auth_rate_limits_by_session_principal() {
+        // Verifies end-to-end: RequireAuth (outer) sets RateLimitPrincipal so a
+        // route-scoped RateLimitLayer (inner) keys on the principal, not the IP.
+        // Layer composition:  Session → RequireAuth → RateLimitLayer → handler
+        use axum::Router;
+        use axum::body::Body;
+        use axum::routing::get;
+        use http::header::COOKIE;
+        use tower::ServiceExt;
+
+        use crate::security::{KeyStrategy, RateLimitConfig, RateLimitLayer};
+        use crate::session::{MemoryStore, SessionConfig, SessionLayer, SessionStore};
+        use crate::state::AppState;
+
+        let session_store = MemoryStore::new();
+        let mut data_a = std::collections::HashMap::new();
+        data_a.insert("user_id".into(), "user-1".into());
+        session_store.save("sess-a", data_a).await.unwrap();
+        let mut data_b = std::collections::HashMap::new();
+        data_b.insert("user_id".into(), "user-2".into());
+        session_store.save("sess-b", data_b).await.unwrap();
+
+        let rl_config = RateLimitConfig {
+            enabled: true,
+            requests_per_second: 0.1,
+            burst: 1,
+            key_strategy: KeyStrategy::AuthenticatedPrincipal,
+            ..Default::default()
+        };
+
+        let state = AppState {
+            extensions: std::sync::Arc::new(std::sync::RwLock::new(
+                std::collections::HashMap::new(),
+            )),
+            #[cfg(feature = "db")]
+            pool: None,
+            #[cfg(feature = "db")]
+            replica_pool: None,
+            #[cfg(feature = "db")]
+            shards: None,
+            profile: None,
+            started_at: std::time::Instant::now(),
+            health_detailed: false,
+            probes: crate::probe::ProbeState::ready_for_test(),
+            metrics: crate::middleware::MetricsCollector::new(),
+            log_levels: crate::actuator::LogLevels::new("info"),
+            task_registry: crate::actuator::TaskRegistry::new(),
+            job_registry: crate::actuator::JobRegistry::new(),
+            config_props: crate::actuator::ConfigProperties::default(),
+            metrics_source_registry: crate::actuator::MetricsSourceRegistry::new(),
+            health_indicator_registry: crate::actuator::HealthIndicatorRegistry::new(),
+            #[cfg(feature = "ws")]
+            channels: crate::channels::Channels::new(32),
+            #[cfg(feature = "presence")]
+            presence: crate::presence::Presence::new(crate::channels::Channels::new(32)),
+            #[cfg(feature = "ws")]
+            shutdown: tokio_util::sync::CancellationToken::new(),
+            policy_registry: crate::authorization::PolicyRegistry::default(),
+            forbidden_response: crate::authorization::ForbiddenResponse::default(),
+            auth_session_key: "user_id".to_owned(),
+            shared_cache: None,
+            clock: std::sync::Arc::new(crate::time::SystemClock),
+        };
+
+        let app = Router::new()
+            .route("/protected", get(|| async { "ok" }))
+            .layer(RateLimitLayer::from_config(&rl_config)) // inner — reads principal
+            .layer(RequireAuth::new("user_id")) // outer — sets RateLimitPrincipal
+            .layer(SessionLayer::new(session_store, SessionConfig::default()))
+            .with_state(state);
+
+        // user-1 first request: allowed (1 token in bucket).
+        let r = app
+            .clone()
+            .oneshot(
+                http::Request::builder()
+                    .uri("/protected")
+                    .header(COOKIE, "autumn.sid=sess-a")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+
+        // user-1 second request: bucket exhausted → 429.
+        let r = app
+            .clone()
+            .oneshot(
+                http::Request::builder()
+                    .uri("/protected")
+                    .header(COOKIE, "autumn.sid=sess-a")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        // user-2 first request: separate bucket → allowed.
+        let r = app
+            .clone()
+            .oneshot(
+                http::Request::builder()
+                    .uri("/protected")
+                    .header(COOKIE, "autumn.sid=sess-b")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
     async fn require_auth_poll_ready_propagates() {
         use std::task::{Context, Poll};
         use tower::{Layer, Service};
@@ -3912,6 +4027,82 @@ mod api_token_tests {
         let layer2 = RequireApiToken::new(store2);
         let mut svc2 = layer2.layer(MockService { ready: true });
         assert!(svc2.poll_ready(&mut cx).is_ready());
+    }
+
+    #[tokio::test]
+    async fn require_api_token_rate_limits_by_principal() {
+        // Verifies end-to-end: RequireApiToken (outer) sets RateLimitPrincipal
+        // with the VERIFIED principal ID so a route-scoped RateLimitLayer (inner)
+        // keys on the principal — two different tokens for the same principal share
+        // one bucket.  Layer composition: RequireApiToken → RateLimitLayer → handler
+        use axum::body::Body;
+        use tower::ServiceExt;
+
+        use crate::security::{KeyStrategy, RateLimitConfig, RateLimitLayer};
+
+        let rl_config = RateLimitConfig {
+            enabled: true,
+            requests_per_second: 0.1,
+            burst: 1,
+            key_strategy: KeyStrategy::AuthenticatedPrincipal,
+            ..Default::default()
+        };
+
+        let store = Arc::new(InMemoryApiTokenStore::default());
+        let token_a1 = issue_api_token(&*store, "principal-1").await.unwrap();
+        let token_a2 = issue_api_token(&*store, "principal-1").await.unwrap(); // second token, same principal
+        let token_b = issue_api_token(&*store, "principal-2").await.unwrap();
+
+        let app = axum::Router::new()
+            .route("/", axum::routing::get(|| async { "ok" }))
+            .layer(RateLimitLayer::from_config(&rl_config)) // inner — reads principal
+            .layer(RequireApiToken::new(Arc::clone(&store))); // outer — sets RateLimitPrincipal
+
+        // principal-1, first token: allowed.
+        let r = app
+            .clone()
+            .oneshot(
+                http::Request::builder()
+                    .uri("/")
+                    .header("authorization", format!("Bearer {token_a1}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+
+        // principal-1, different token: shares the same bucket → 429.
+        let r = app
+            .clone()
+            .oneshot(
+                http::Request::builder()
+                    .uri("/")
+                    .header("authorization", format!("Bearer {token_a2}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            r.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "second token for the same principal must share the rate-limit bucket"
+        );
+
+        // principal-2: separate bucket → allowed.
+        let r = app
+            .clone()
+            .oneshot(
+                http::Request::builder()
+                    .uri("/")
+                    .header("authorization", format!("Bearer {token_b}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
     }
 
     #[tokio::test]

@@ -1785,12 +1785,33 @@ async fn populate_rate_limit_principal(
     mut req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
+    // Session principal takes priority: key on the verified user identity.
     if let Some(session) = req.extensions().get::<crate::session::Session>() {
         let auth_session_key = state.auth_session_key();
         if let Some(user_id) = session.get(auth_session_key).await {
             req.extensions_mut()
                 .insert(crate::security::RateLimitPrincipal(user_id));
+            return next.run(req).await;
         }
+    }
+    // Bearer-token fallback: for API-token-protected routes the global rate
+    // limiter runs outer to RequireApiToken (which sets the verified principal
+    // ID), so the raw token is used as a stable per-token key.  Verification
+    // still happens downstream in RequireApiToken; a route-scoped limiter inner
+    // to that layer will see the verified principal ID instead.
+    if let Some(token) = req
+        .headers()
+        .get(http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|h| {
+            let (scheme, tok) = h.split_once(' ')?;
+            scheme
+                .eq_ignore_ascii_case("Bearer")
+                .then_some(tok.to_owned())
+        })
+    {
+        req.extensions_mut()
+            .insert(crate::security::RateLimitPrincipal(token));
     }
     next.run(req).await
 }

@@ -676,3 +676,42 @@ async fn principal_strategy_keys_on_session_user_id() {
         .await
         .assert_ok();
 }
+
+// ── Global limiter: bearer-token fallback via populate_rate_limit_principal ────
+
+#[tokio::test]
+async fn principal_strategy_global_limiter_keys_on_bearer_token() {
+    // When key_strategy = "authenticated_principal" is configured globally and
+    // a request carries a bearer token but no session, the framework's
+    // populate_rate_limit_principal shim uses the raw token as the
+    // RateLimitPrincipal so the global limiter applies per-token rather than
+    // per-IP keying.  Two different tokens get separate buckets.
+    let client = TestApp::new()
+        .routes(routes![ping])
+        .config(principal_config(0.1, 1))
+        .build();
+
+    // Token A first request: allowed.
+    client
+        .get("/ping")
+        .header("Authorization", "Bearer token-alpha")
+        .send()
+        .await
+        .assert_status(200);
+
+    // Token A second request: bucket exhausted → 429.
+    client
+        .get("/ping")
+        .header("Authorization", "Bearer token-alpha")
+        .send()
+        .await
+        .assert_status(429);
+
+    // Token B: separate bucket → allowed.
+    client
+        .get("/ping")
+        .header("Authorization", "Bearer token-beta")
+        .send()
+        .await
+        .assert_status(200);
+}
