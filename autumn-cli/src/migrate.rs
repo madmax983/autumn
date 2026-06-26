@@ -89,11 +89,15 @@ pub enum MigrateTarget {
 }
 
 /// Run the migrate command.
+///
+/// `wait_override` comes from the `--wait` CLI flag and, when `Some`, takes
+/// precedence over `database.startup_wait_secs` from the config / environment.
 pub fn run(
     action: &MigrateAction,
     with_maintenance: bool,
     target: &MigrateTarget,
     profile: Option<&str>,
+    wait_override: Option<u64>,
 ) {
     eprintln!("\u{1F342} autumn migrate\n");
 
@@ -111,8 +115,9 @@ pub fn run(
     }
 
     // 1. Resolve migration target databases from autumn.toml (+ profile
-    //    overlay) + env
-    let targets = resolve_targets(target, profile);
+    //    overlay) + env.  The merged config table is returned so that
+    //    resolve_startup_wait can reuse it without a second filesystem read.
+    let (targets, config_table) = resolve_targets(target, profile);
 
     // 2. Resolve migrations directory
     let migrations_dir = resolve_migrations_dir();
@@ -128,7 +133,9 @@ pub fn run(
     // 5. Execute the appropriate diesel command per target
     match action {
         MigrateAction::Run => {
-            run_all_targets(&targets, &migrations_dir, with_maintenance);
+            // Resolve the effective startup wait (--wait flag > config > 0).
+            let wait = resolve_startup_wait(wait_override, config_table.as_ref());
+            run_all_targets(&targets, &migrations_dir, with_maintenance, wait);
         }
         MigrateAction::Status => {
             for (label, url) in &targets {
@@ -147,7 +154,13 @@ pub fn run(
 
 /// Resolve the `(label, database_url)` pairs the command operates on,
 /// in apply order (control first, then shards in declaration order).
-fn resolve_targets(target: &MigrateTarget, profile: Option<&str>) -> Vec<(String, String)> {
+///
+/// Also returns the merged config table so callers can reuse it (e.g. for
+/// `resolve_startup_wait_secs_from_sources`) without a second filesystem read.
+fn resolve_targets(
+    target: &MigrateTarget,
+    profile: Option<&str>,
+) -> (Vec<(String, String)>, Option<toml::Table>) {
     // Read autumn.toml once, deep-merging the `autumn-<profile>.toml` overlay
     // when a profile is selected, so control and shard URLs both resolve from
     // the same effective configuration. Environment overrides still win over
@@ -163,7 +176,7 @@ fn resolve_targets(target: &MigrateTarget, profile: Option<&str>) -> Vec<(String
     let shards =
         resolve_shard_database_urls_from_sources(|key| std::env::var(key), config_table.as_ref());
     match build_targets(control, shards, target) {
-        Ok(targets) => targets,
+        Ok(targets) => (targets, config_table),
         Err(message) => {
             eprintln!("{message}");
             if matches!(target, MigrateTarget::All | MigrateTarget::ControlOnly) {
@@ -236,7 +249,12 @@ fn reject_duplicate_target_urls(targets: &[(String, String)]) -> Result<(), Stri
 
 /// Apply migrations to every target in order, failing fast with a
 /// per-target summary.
-fn run_all_targets(targets: &[(String, String)], migrations_dir: &str, with_maintenance: bool) {
+fn run_all_targets(
+    targets: &[(String, String)],
+    migrations_dir: &str,
+    with_maintenance: bool,
+    wait: std::time::Duration,
+) {
     let mut completed: Vec<&str> = Vec::new();
     for (label, url) in targets {
         eprintln!("\u{2500}\u{2500} Migrating {label} \u{2500}\u{2500}");
@@ -244,7 +262,7 @@ fn run_all_targets(targets: &[(String, String)], migrations_dir: &str, with_main
         // the shard-required framework migrations (version history + commit
         // hook queue), not the full control-plane schema.
         let is_shard = label.starts_with("shard:");
-        if run_single_target(url, migrations_dir, is_shard) {
+        if run_single_target(url, migrations_dir, is_shard, wait) {
             completed.push(label);
             eprintln!();
         } else {
@@ -315,8 +333,41 @@ fn disable_maintenance_after_migrate() {
 /// When `is_shard` is `true`, applies only the shard-required framework
 /// migrations (version history + commit-hook queue) instead of the full
 /// control-plane `FRAMEWORK_MIGRATIONS` set.
-fn run_single_target(database_url: &str, migrations_dir: &str, is_shard: bool) -> bool {
-    use autumn_web::migrate::{DEFAULT_LOCK_WAIT_TIMEOUT, hold_migration_lock};
+///
+/// `wait` controls the startup connectivity wait (AC #2/#6):
+///   * `Duration::ZERO` → skip; behaviour is byte-for-byte identical to today.
+///   * `> Duration::ZERO` → retry with capped exponential backoff until the DB
+///     accepts connections or the window elapses.
+fn run_single_target(
+    database_url: &str,
+    migrations_dir: &str,
+    is_shard: bool,
+    wait: std::time::Duration,
+) -> bool {
+    use autumn_web::migrate::{DEFAULT_LOCK_WAIT_TIMEOUT, hold_migration_lock, wait_for_database};
+
+    // Startup wait — only when enabled (startup_wait_secs > 0 or --wait N).
+    // When wait == Duration::ZERO we skip entirely so the existing fail-fast
+    // path is preserved byte-for-byte (AC #6).
+    if wait > std::time::Duration::ZERO {
+        eprintln!(
+            "  Waiting up to {}s for database to become reachable…",
+            wait.as_secs()
+        );
+        match wait_for_database(database_url, wait, |attempt, delay| {
+            eprintln!(
+                "  Database not reachable yet (attempt {attempt}); \
+                 retrying in {}ms\u{2026}",
+                delay.as_millis(),
+            );
+        }) {
+            Ok(()) => eprintln!("  Database reachable."),
+            Err(e) => {
+                eprintln!("\u{274C} {e}");
+                return false;
+            }
+        }
+    }
 
     // Acquire this target database's Postgres advisory lock before reading
     // the pending-migration list. This serializes concurrent callers
@@ -900,6 +951,60 @@ where
     shards
 }
 
+/// Resolve `database.startup_wait_secs` from env and config, mirroring the
+/// same source precedence as other database config knobs:
+///
+/// 1. `AUTUMN_DATABASE__STARTUP_WAIT_SECS` env var (highest)
+/// 2. `database.startup_wait_secs` in the merged `autumn.toml` table
+/// 3. `0` (default, fail-fast — no wait)
+pub fn resolve_startup_wait_secs_from_sources<F>(env_var: F, table: Option<&toml::Table>) -> u64
+where
+    F: Fn(&str) -> Result<String, std::env::VarError>,
+{
+    if let Ok(val) = env_var("AUTUMN_DATABASE__STARTUP_WAIT_SECS") {
+        match val.trim().parse::<u64>() {
+            Ok(n) => return n,
+            Err(_) => {
+                eprintln!(
+                    "  Warning: AUTUMN_DATABASE__STARTUP_WAIT_SECS={:?} is not a valid \
+                     non-negative integer; falling back to config file / default (0).",
+                    val.trim()
+                );
+            }
+        }
+    }
+
+    table
+        .and_then(|t| t.get("database"))
+        .and_then(toml::Value::as_table)
+        .and_then(|db| db.get("startup_wait_secs"))
+        .and_then(toml::Value::as_integer)
+        .map_or(0, |n| {
+            u64::try_from(n).unwrap_or_else(|_| {
+                eprintln!(
+                    "  Warning: `database.startup_wait_secs = {n}` in autumn.toml is not a \
+                     valid non-negative integer; falling back to 0 (fail-fast)."
+                );
+                0
+            })
+        })
+}
+
+/// Resolve the effective startup wait: the `--wait` CLI flag (if given) wins;
+/// otherwise fall back to the merged config table (env > toml > 0).
+///
+/// `config_table` should be the already-merged table returned by
+/// `resolve_targets` so this function does not need a second filesystem read.
+fn resolve_startup_wait(
+    flag: Option<u64>,
+    config_table: Option<&toml::Table>,
+) -> std::time::Duration {
+    let secs = flag.unwrap_or_else(|| {
+        resolve_startup_wait_secs_from_sources(|key| std::env::var(key), config_table)
+    });
+    std::time::Duration::from_secs(secs)
+}
+
 /// Resolve the migrations directory (default: `./migrations/`).
 fn resolve_migrations_dir() -> String {
     let dir = Path::new(DEFAULT_MIGRATIONS_DIR);
@@ -1106,7 +1211,7 @@ fn run_down(
     // 2. Resolve target databases (control + shards / a single shard /
     //    control-only) and the migrations dir. `down` honors --shard /
     //    --control-only exactly like `migrate run`.
-    let targets = resolve_targets(target, profile);
+    let (targets, _) = resolve_targets(target, profile);
     let migrations_dir = resolve_migrations_dir();
     let dir = Path::new(&migrations_dir);
 
@@ -2917,6 +3022,66 @@ primary_url = "postgres://prod-s0:5432/app"
             findings[0].operation.contains("CONCURRENTLY"),
             "finding should mention CONCURRENTLY"
         );
+    }
+
+    // ── startup wait resolver (red phase) ────────────────────────────────────
+
+    #[test]
+    fn resolve_startup_wait_secs_defaults_to_zero() {
+        let secs =
+            resolve_startup_wait_secs_from_sources(|_| Err(std::env::VarError::NotPresent), None);
+        assert_eq!(secs, 0);
+    }
+
+    #[test]
+    fn resolve_startup_wait_secs_from_toml() {
+        let mut table = toml::Table::new();
+        let mut db = toml::Table::new();
+        db.insert("startup_wait_secs".to_owned(), toml::Value::Integer(45));
+        table.insert("database".to_owned(), toml::Value::Table(db));
+        let secs = resolve_startup_wait_secs_from_sources(
+            |_| Err(std::env::VarError::NotPresent),
+            Some(&table),
+        );
+        assert_eq!(secs, 45);
+    }
+
+    #[test]
+    fn resolve_startup_wait_secs_env_overrides_toml() {
+        let mut table = toml::Table::new();
+        let mut db = toml::Table::new();
+        db.insert("startup_wait_secs".to_owned(), toml::Value::Integer(10));
+        table.insert("database".to_owned(), toml::Value::Table(db));
+        let secs = resolve_startup_wait_secs_from_sources(
+            |key| {
+                if key == "AUTUMN_DATABASE__STARTUP_WAIT_SECS" {
+                    Ok("90".to_owned())
+                } else {
+                    Err(std::env::VarError::NotPresent)
+                }
+            },
+            Some(&table),
+        );
+        assert_eq!(secs, 90);
+    }
+
+    #[test]
+    fn resolve_startup_wait_secs_bad_env_falls_back_to_toml() {
+        let mut table = toml::Table::new();
+        let mut db = toml::Table::new();
+        db.insert("startup_wait_secs".to_owned(), toml::Value::Integer(30));
+        table.insert("database".to_owned(), toml::Value::Table(db));
+        let secs = resolve_startup_wait_secs_from_sources(
+            |key| {
+                if key == "AUTUMN_DATABASE__STARTUP_WAIT_SECS" {
+                    Ok("not_a_number".to_owned())
+                } else {
+                    Err(std::env::VarError::NotPresent)
+                }
+            },
+            Some(&table),
+        );
+        assert_eq!(secs, 30, "bad env value should fall back to toml");
     }
 
     #[test]

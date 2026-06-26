@@ -658,6 +658,251 @@ where
     result
 }
 
+// ── Startup wait-for-database ─────────────────────────────────────────────────
+
+/// A single connect attempt returned by the injected `try_connect` closure.
+#[derive(Debug)]
+pub(crate) enum AttemptError {
+    /// The server is not yet reachable (connection refused, starting up, …).
+    /// Carries the raw error message so a timeout can include the last error.
+    /// The caller will retry after a backoff delay.
+    Retryable(String),
+    /// A non-transient failure (auth error, bad URL, missing database, …).
+    /// The caller must surface the error immediately without retrying.
+    Fatal(String),
+}
+
+/// Classify an error message from `PgConnection::establish` as retryable or
+/// fatal so the startup wait loop can decide whether to keep waiting.
+///
+/// The default is **fatal** (deny-list for retry) so that unknown errors always
+/// fail fast rather than silently burning the whole startup-wait window.
+/// Only "server not yet reachable" patterns are allowed to retry (AC #5).
+pub(crate) fn is_retryable_connection_error(msg: &str) -> bool {
+    let lower = msg.to_ascii_lowercase();
+    lower.contains("connection refused")
+        || lower.contains("could not connect to server")
+        || lower.contains("the database system is starting up")
+        || lower.contains("connection reset")
+        || lower.contains("no route to host")
+        || lower.contains("host is unreachable")
+        || lower.contains("network is unreachable")
+        || lower.contains("timed out")
+        // libpq reports a connect_timeout expiry as "timeout expired" (not
+        // "timed out"), so firewalled hosts that silently drop packets are
+        // also retryable rather than being mis-classified as fatal.
+        || lower.contains("timeout expired")
+        || lower.contains("connection closed")
+        // DNS resolution failures — common in Docker Compose / Kubernetes
+        // cold-start where the 'db' hostname resolves only after the DNS
+        // service is ready (Linux/glibc, macOS, and generic forms).
+        || lower.contains("name or service not known")
+        || lower.contains("nodename nor servname provided")
+        || lower.contains("failed to lookup")
+        || lower.contains("temporary failure in name resolution")
+}
+
+/// Capped exponential backoff for the startup wait loop.
+///
+/// Returns `500ms * 2^(attempt - 1)`, capped at `5s`.
+pub(crate) fn backoff_delay(attempt: u32) -> std::time::Duration {
+    let ms = 500u64.saturating_mul(1u64 << (attempt.saturating_sub(1).min(10)));
+    std::time::Duration::from_millis(ms.min(5_000))
+}
+
+/// Redact the password from any `postgres://` or `postgresql://` URL embedded
+/// in `msg`.
+///
+/// Replaces the password component with `****`, mirroring the approach used
+/// by `mask_database_url` in `autumn/src/app.rs`.  When the URL token cannot
+/// be parsed, the entire token is replaced with `****` as a safe fallback so
+/// a malformed-but-credential-bearing string is never surfaced (also matches
+/// `mask_database_url`'s parse-failure behaviour).  Leaves the rest of the
+/// message unchanged.
+pub(crate) fn redact_db_url_credentials(msg: &str) -> String {
+    let mut out = String::with_capacity(msg.len());
+    let mut rest = msg;
+    loop {
+        // Find the leftmost postgres:// or postgresql:// occurrence.
+        let pg = rest.find("postgres://");
+        let pgl = rest.find("postgresql://");
+        let start = match (pg, pgl) {
+            (None, None) => {
+                out.push_str(rest);
+                break;
+            }
+            (Some(a), None) => a,
+            (None, Some(b)) => b,
+            (Some(a), Some(b)) => a.min(b),
+        };
+        // Push everything before the URL token unchanged.
+        out.push_str(&rest[..start]);
+        rest = &rest[start..];
+        // Extract the URL-shaped token (everything until first whitespace or EOS).
+        let token_end = rest
+            .find(|c: char| c.is_ascii_whitespace())
+            .unwrap_or(rest.len());
+        let token = &rest[..token_end];
+        if let Ok(mut parsed) = url::Url::parse(token) {
+            if parsed.password().is_some() {
+                let _ = parsed.set_password(Some("****"));
+                out.push_str(parsed.as_str());
+            } else {
+                out.push_str(token);
+            }
+        } else {
+            // Parse failed — mask the whole token rather than risk leaking a
+            // malformed credential-bearing URL.
+            out.push_str("****");
+        }
+        rest = &rest[token_end..];
+    }
+    out
+}
+
+/// Inner (dependency-injected) startup wait loop.
+///
+/// All I/O is supplied via closures so the logic is unit-testable without a
+/// real Postgres instance or wall-clock sleeps (AC #2).
+///
+/// # Arguments
+///
+/// * `max_wait` — maximum total time to spend waiting (> 0 enforced by callers)
+/// * `try_connect` — attempts one connection; returns `Ok(())` on success,
+///   `Err(AttemptError::Retryable(msg))` for transient errors (the message is
+///   included in the timeout error), or `Err(AttemptError::Fatal(_))` for
+///   non-transient failures
+/// * `sleep` — called with the computed backoff delay; may be a no-op in tests
+/// * `elapsed` — returns the total time elapsed since the wait started
+/// * `on_retry` — called **before** sleeping with `(attempt, next_delay)` so
+///   the caller can print a user-visible retry message (AC #4)
+pub(crate) fn wait_for_database_inner(
+    max_wait: std::time::Duration,
+    mut try_connect: impl FnMut() -> Result<(), AttemptError>,
+    mut sleep: impl FnMut(std::time::Duration),
+    elapsed: impl Fn() -> std::time::Duration,
+    mut on_retry: impl FnMut(u32, std::time::Duration),
+) -> Result<(), MigrationError> {
+    let mut attempt: u32 = 0;
+    loop {
+        attempt += 1;
+        // Extract the transient error message or return immediately for Ok/Fatal.
+        let retryable_msg = match try_connect() {
+            Ok(()) => return Ok(()),
+            Err(AttemptError::Fatal(msg)) => {
+                return Err(MigrationError::Connection(redact_db_url_credentials(&msg)));
+            }
+            Err(AttemptError::Retryable(msg)) => msg,
+        };
+        let elapsed_now = elapsed();
+        if elapsed_now >= max_wait {
+            return Err(MigrationError::Connection(format!(
+                "database did not become reachable within {}s after {} attempt(s); \
+                 timed out waiting for startup (last error: {})",
+                max_wait.as_secs(),
+                attempt,
+                redact_db_url_credentials(&retryable_msg),
+            )));
+        }
+        let delay = backoff_delay(attempt).min(max_wait.saturating_sub(elapsed_now));
+        on_retry(attempt, delay);
+        sleep(delay);
+        // Guard against sleep overshoot: if the deadline has now passed, don't
+        // start another connection attempt (which could block for a full
+        // per-attempt connect_timeout before detecting the expiry).
+        if elapsed() >= max_wait {
+            return Err(MigrationError::Connection(format!(
+                "database did not become reachable within {}s after {} attempt(s); \
+                 timed out waiting for startup (last error: {})",
+                max_wait.as_secs(),
+                attempt,
+                redact_db_url_credentials(&retryable_msg),
+            )));
+        }
+    }
+}
+
+fn with_connect_timeout(url: &str, timeout_secs: u64) -> String {
+    // Splice `connect_timeout` directly into the raw percent-encoded query
+    // string so existing parameters (e.g. `options=-c%20search_path%3Dapp`)
+    // are preserved byte-for-byte.  Using query_pairs() / append_pair() would
+    // decode and re-encode them via form encoding (spaces → `+`), which libpq
+    // does not accept.
+    url::Url::parse(url).map_or_else(
+        |_| url.to_owned(),
+        |mut parsed| {
+            let pair = format!("connect_timeout={timeout_secs}");
+            let raw = parsed
+                .query()
+                .unwrap_or("")
+                .split('&')
+                .filter(|p| !p.is_empty() && !p.starts_with("connect_timeout="))
+                .chain(std::iter::once(pair.as_str()))
+                .collect::<Vec<_>>()
+                .join("&");
+            parsed.set_query(Some(&raw));
+            parsed.to_string()
+        },
+    )
+}
+
+/// Wait for the database at `database_url` to accept connections, retrying
+/// with capped exponential backoff until either success or `max_wait` elapses.
+///
+/// * `max_wait == Duration::ZERO` — callers **must not** call this function;
+///   skip it and connect directly (preserves today's fail-fast behaviour).
+/// * Non-retryable errors (auth failures, bad URL, missing database) are
+///   surfaced immediately regardless of `max_wait`.
+/// * Connection credentials are never included in retry log output.
+///
+/// `on_retry` is called **before** each sleep with `(attempt, next_delay)` so
+/// the CLI can print a visible message with attempt count and next delay.
+///
+/// # Errors
+///
+/// Returns [`MigrationError::Connection`] when a fatal (non-retryable) error
+/// is encountered or when `max_wait` elapses without a successful connection.
+pub fn wait_for_database(
+    database_url: &str,
+    max_wait: std::time::Duration,
+    mut on_retry: impl FnMut(u32, std::time::Duration),
+) -> Result<(), MigrationError> {
+    let start = std::time::Instant::now();
+    wait_for_database_inner(
+        max_wait,
+        || {
+            // Cap the per-attempt connect_timeout to the remaining budget so
+            // a single hung establish() call cannot extend the total wait beyond
+            // max_wait (e.g. a DROP-firewalled host that accepts the SYN but
+            // never completes the handshake).  libpq's connect_timeout is in
+            // whole seconds; clamp to at least 1.
+            let remaining = max_wait.saturating_sub(start.elapsed());
+            let connect_timeout_secs = remaining.as_secs().max(1);
+            let timed_url = with_connect_timeout(database_url, connect_timeout_secs);
+            diesel::PgConnection::establish(&timed_url)
+                .map(|_conn| ())
+                .map_err(|e| {
+                    let msg = e.to_string();
+                    if is_retryable_connection_error(&msg) {
+                        AttemptError::Retryable(msg)
+                    } else {
+                        AttemptError::Fatal(msg)
+                    }
+                })
+        },
+        std::thread::sleep,
+        move || start.elapsed(),
+        |attempt, delay| {
+            tracing::warn!(
+                attempt,
+                next_delay_ms = delay.as_millis(),
+                "Database not reachable; retrying after backoff",
+            );
+            on_retry(attempt, delay);
+        },
+    )
+}
+
 /// Open a new Postgres connection and acquire the migration advisory lock,
 /// returning a [`MigrationLockGuard`] that releases it on drop.
 ///
@@ -1342,5 +1587,249 @@ mod tests {
     fn should_auto_apply_returns_false_for_none_profile() {
         assert!(!should_auto_apply(None, false));
         assert!(!should_auto_apply(None, true));
+    }
+
+    // ── startup wait-for-DB (red phase) ───────────────────────────────────────
+
+    #[test]
+    fn is_retryable_connection_refused() {
+        assert!(is_retryable_connection_error("connection refused"));
+        assert!(is_retryable_connection_error(
+            "FATAL: connection refused (os error 111)"
+        ));
+    }
+
+    #[test]
+    fn is_retryable_server_starting_up() {
+        assert!(is_retryable_connection_error(
+            "the database system is starting up"
+        ));
+    }
+
+    #[test]
+    fn is_retryable_timed_out() {
+        assert!(is_retryable_connection_error("connection timed out"));
+        assert!(is_retryable_connection_error(
+            "timed out waiting for server"
+        ));
+        // libpq reports connect_timeout expiry as "timeout expired"
+        assert!(is_retryable_connection_error("timeout expired"));
+        assert!(is_retryable_connection_error(
+            "ERROR: SSL connection: timeout expired"
+        ));
+    }
+
+    #[test]
+    fn is_retryable_could_not_connect() {
+        assert!(is_retryable_connection_error(
+            "could not connect to server: Connection refused"
+        ));
+    }
+
+    #[test]
+    fn is_not_retryable_auth_failure() {
+        assert!(!is_retryable_connection_error(
+            "password authentication failed for user \"app\""
+        ));
+    }
+
+    #[test]
+    fn is_not_retryable_database_does_not_exist() {
+        assert!(!is_retryable_connection_error(
+            "database \"mydb\" does not exist"
+        ));
+    }
+
+    #[test]
+    fn is_not_retryable_invalid_url() {
+        assert!(!is_retryable_connection_error(
+            "invalid connection string syntax"
+        ));
+    }
+
+    #[test]
+    fn is_not_retryable_role_does_not_exist() {
+        assert!(!is_retryable_connection_error(
+            "role \"app\" does not exist"
+        ));
+    }
+
+    #[test]
+    fn is_retryable_dns_linux() {
+        assert!(is_retryable_connection_error(
+            "could not translate host name \"db\" to address: \
+             Name or service not known"
+        ));
+    }
+
+    #[test]
+    fn is_retryable_dns_macos() {
+        assert!(is_retryable_connection_error(
+            "could not translate host name \"db\" to address: \
+             nodename nor servname provided, or not known"
+        ));
+    }
+
+    #[test]
+    fn is_retryable_dns_temporary_failure() {
+        assert!(is_retryable_connection_error(
+            "Temporary failure in name resolution"
+        ));
+    }
+
+    #[test]
+    fn backoff_delay_grows_and_caps() {
+        let d = |n| backoff_delay(n).as_millis();
+        assert_eq!(d(1), 500);
+        assert_eq!(d(2), 1000);
+        assert_eq!(d(3), 2000);
+        assert_eq!(d(4), 4000);
+        assert_eq!(d(5), 5000); // capped
+        assert_eq!(d(10), 5000); // still capped
+    }
+
+    #[test]
+    fn redact_removes_password_from_url() {
+        let msg = "failed: postgres://user:secret@host:5432/db";
+        let out = redact_db_url_credentials(msg);
+        assert!(
+            !out.contains("secret"),
+            "password must not appear in output: {out}"
+        );
+    }
+
+    #[test]
+    fn redact_no_creds_url_unchanged_format() {
+        let msg = "connection refused at postgres://host:5432/db";
+        let out = redact_db_url_credentials(msg);
+        assert!(
+            !out.contains("****"),
+            "no-cred url should not be mangled: {out}"
+        );
+        assert!(
+            out.contains("host:5432"),
+            "host should still be present: {out}"
+        );
+    }
+
+    #[test]
+    fn redact_removes_password_from_postgresql_scheme() {
+        let msg = "failed: postgresql://user:s3cret@host:5432/db";
+        let out = redact_db_url_credentials(msg);
+        assert!(
+            !out.contains("s3cret"),
+            "password must not appear when scheme is postgresql://: {out}"
+        );
+        assert!(out.contains("****"), "masked marker missing: {out}");
+    }
+
+    #[test]
+    fn redact_masks_whole_token_on_parse_failure() {
+        // A URL with a bare @ in the password fails url::Url::parse; the whole
+        // token must be replaced with **** rather than passed through unredacted.
+        let msg = "error: postgres://user:p@ss@host/db";
+        let out = redact_db_url_credentials(msg);
+        assert!(
+            !out.contains("p@ss"),
+            "unparseable password must not leak: {out}"
+        );
+    }
+
+    #[test]
+    fn wait_for_database_inner_success_first_attempt() {
+        use std::cell::Cell;
+        let attempts = Cell::new(0u32);
+        let sleeps = Cell::new(0u32);
+
+        let result = wait_for_database_inner(
+            std::time::Duration::from_secs(30),
+            || {
+                attempts.set(attempts.get() + 1);
+                Ok(())
+            },
+            |_| sleeps.set(sleeps.get() + 1),
+            || std::time::Duration::ZERO,
+            |_, _| {},
+        );
+        assert!(result.is_ok());
+        assert_eq!(attempts.get(), 1);
+        assert_eq!(sleeps.get(), 0);
+    }
+
+    #[test]
+    fn wait_for_database_inner_fatal_error_no_retry() {
+        use std::cell::Cell;
+        let attempts = Cell::new(0u32);
+        let retried = Cell::new(false);
+
+        let result = wait_for_database_inner(
+            std::time::Duration::from_secs(30),
+            || {
+                attempts.set(attempts.get() + 1);
+                Err(AttemptError::Fatal(
+                    "password authentication failed".to_string(),
+                ))
+            },
+            |_| {},
+            || std::time::Duration::ZERO,
+            |_, _| retried.set(true),
+        );
+        assert!(result.is_err());
+        assert_eq!(attempts.get(), 1, "fatal error must not retry");
+        assert!(!retried.get(), "on_retry must not fire for fatal errors");
+    }
+
+    #[test]
+    fn wait_for_database_inner_success_on_third_attempt() {
+        use std::cell::Cell;
+        let attempts = Cell::new(0u32);
+        let mut sleep_delays = Vec::new();
+
+        let result = wait_for_database_inner(
+            std::time::Duration::from_secs(30),
+            || {
+                let n = attempts.get() + 1;
+                attempts.set(n);
+                if n < 3 {
+                    Err(AttemptError::Retryable("connection refused".to_string()))
+                } else {
+                    Ok(())
+                }
+            },
+            |d| sleep_delays.push(d),
+            || std::time::Duration::ZERO, // always within budget
+            |_, _| {},
+        );
+        assert!(result.is_ok());
+        assert_eq!(attempts.get(), 3);
+        assert_eq!(sleep_delays.len(), 2);
+        // Delays grow with capped exponential backoff
+        assert_eq!(sleep_delays[0], std::time::Duration::from_millis(500));
+        assert_eq!(sleep_delays[1], std::time::Duration::from_secs(1));
+    }
+
+    #[test]
+    fn wait_for_database_inner_timeout_returns_error() {
+        use std::cell::Cell;
+        let attempts = Cell::new(0u32);
+
+        let result = wait_for_database_inner(
+            std::time::Duration::from_secs(5),
+            || {
+                attempts.set(attempts.get() + 1);
+                Err(AttemptError::Retryable("connection refused".to_string()))
+            },
+            |_| {},
+            || std::time::Duration::from_secs(10), // fake: already past the budget
+            |_, _| {},
+        );
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.to_lowercase().contains("wait")
+                || msg.to_lowercase().contains("timeout")
+                || msg.to_lowercase().contains("timed out"),
+            "error must describe the timeout: {msg}"
+        );
     }
 }

@@ -182,6 +182,13 @@ enum Commands {
         /// app's runtime precedence — so env vars are not overridden by this flag.
         #[arg(long, value_name = "PROFILE")]
         profile: Option<String>,
+        /// Wait up to SECS seconds for the database to become reachable before
+        /// failing, retrying with capped exponential backoff. Overrides
+        /// `database.startup_wait_secs` from the config file and
+        /// `AUTUMN_DATABASE__STARTUP_WAIT_SECS` from the environment.
+        /// When omitted, the config value is used (default `0` = fail fast).
+        #[arg(long, value_name = "SECS")]
+        wait: Option<u64>,
     },
     /// Create, drop, or reset the database itself.
     ///
@@ -1677,6 +1684,7 @@ fn run_command(command: Commands) {
             shard,
             control_only,
             profile,
+            wait,
         } => {
             let action = match action {
                 Some(MigrateCommands::Status) => migrate::MigrateAction::Status,
@@ -1697,7 +1705,7 @@ fn run_command(command: Commands) {
                 (None, true) => migrate::MigrateTarget::ControlOnly,
                 (None, false) => migrate::MigrateTarget::All,
             };
-            migrate::run(&action, with_maintenance, &target, profile.as_deref());
+            migrate::run(&action, with_maintenance, &target, profile.as_deref(), wait);
         }
         Commands::Db(cmd) => match cmd {
             DbCommands::Pull {
@@ -4540,6 +4548,24 @@ mod tests {
             Cli::try_parse_from(["autumn", "migrate", "--shard", "shard1", "--control-only"])
                 .is_err()
         );
+    }
+
+    #[test]
+    fn parse_migrate_wait_flag() {
+        let cli = Cli::try_parse_from(["autumn", "migrate", "--wait", "60"]).unwrap();
+        let Commands::Migrate { wait, .. } = cli.command else {
+            panic!("expected migrate");
+        };
+        assert_eq!(wait, Some(60u64));
+    }
+
+    #[test]
+    fn parse_migrate_wait_defaults_none() {
+        let cli = Cli::try_parse_from(["autumn", "migrate"]).unwrap();
+        let Commands::Migrate { wait, .. } = cli.command else {
+            panic!("expected migrate");
+        };
+        assert_eq!(wait, None);
     }
 
     #[test]
