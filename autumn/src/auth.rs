@@ -276,6 +276,10 @@ impl std::fmt::Display for AuthRejection {
 /// is authenticated. If the key is missing, the request is rejected before
 /// reaching the handler.
 ///
+/// On success, the resolved principal value is also inserted as a
+/// [`crate::security::RateLimitPrincipal`] extension so that
+/// `key_strategy = "authenticated_principal"` works out of the box.
+///
 /// # Examples
 ///
 /// ```rust,no_run
@@ -338,7 +342,7 @@ where
         self.inner.poll_ready(cx)
     }
 
-    fn call(&mut self, req: axum::extract::Request) -> Self::Future {
+    fn call(&mut self, mut req: axum::extract::Request) -> Self::Future {
         let session_key = Arc::clone(&self.session_key);
         let mut inner = self.inner.clone();
         std::mem::swap(&mut self.inner, &mut inner);
@@ -354,6 +358,10 @@ where
             };
 
             if let Some(user_id) = user_id {
+                // Fulfil the RateLimitPrincipal contract so key_strategy =
+                // "authenticated_principal" works without an extra middleware shim.
+                req.extensions_mut()
+                    .insert(crate::security::RateLimitPrincipal(user_id.clone()));
                 // Tag the request-scoped log context (#1169) so handler logs for
                 // middleware-authenticated requests carry `user_id` too, matching
                 // the `#[secured]` path.
@@ -1668,6 +1676,9 @@ where
 /// `401 Unauthorized` using the same Problem Details contract as
 /// [`AuthRejection`].
 ///
+/// Also inserts [`crate::security::RateLimitPrincipal`] so that
+/// `key_strategy = "authenticated_principal"` works out of the box.
+///
 /// Composes with [`RequireAuth`] and session middleware without conflict.
 ///
 /// # Examples
@@ -1756,6 +1767,10 @@ where
 
             match store.verify(&raw_token).await {
                 Ok(Some(principal_id)) => {
+                    // Fulfil the RateLimitPrincipal contract so key_strategy =
+                    // "authenticated_principal" works without an extra middleware shim.
+                    req.extensions_mut()
+                        .insert(crate::security::RateLimitPrincipal(principal_id.clone()));
                     req.extensions_mut().insert(ApiTokenPrincipal(principal_id));
                     inner.call(req).await
                 }
@@ -3012,6 +3027,87 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn require_auth_sets_rate_limit_principal() {
+        use axum::Router;
+        use axum::body::Body;
+        use axum::routing::get;
+        use http::header::COOKIE;
+        use tower::ServiceExt;
+
+        use crate::security::RateLimitPrincipal;
+        use crate::session::{MemoryStore, SessionConfig, SessionLayer, SessionStore};
+        use crate::state::AppState;
+
+        async fn handler(
+            axum::Extension(principal): axum::Extension<RateLimitPrincipal>,
+        ) -> String {
+            principal.0
+        }
+
+        let store = MemoryStore::new();
+        let mut session_data = std::collections::HashMap::new();
+        session_data.insert("user_id".into(), "42".into());
+        store.save("valid-session", session_data).await.unwrap();
+
+        let state = AppState {
+            extensions: std::sync::Arc::new(std::sync::RwLock::new(
+                std::collections::HashMap::new(),
+            )),
+            #[cfg(feature = "db")]
+            pool: None,
+            #[cfg(feature = "db")]
+            replica_pool: None,
+            #[cfg(feature = "db")]
+            shards: None,
+            profile: None,
+            started_at: std::time::Instant::now(),
+            health_detailed: false,
+            probes: crate::probe::ProbeState::ready_for_test(),
+            metrics: crate::middleware::MetricsCollector::new(),
+            log_levels: crate::actuator::LogLevels::new("info"),
+            task_registry: crate::actuator::TaskRegistry::new(),
+            job_registry: crate::actuator::JobRegistry::new(),
+            config_props: crate::actuator::ConfigProperties::default(),
+            metrics_source_registry: crate::actuator::MetricsSourceRegistry::new(),
+            health_indicator_registry: crate::actuator::HealthIndicatorRegistry::new(),
+            #[cfg(feature = "ws")]
+            channels: crate::channels::Channels::new(32),
+            #[cfg(feature = "presence")]
+            presence: crate::presence::Presence::new(crate::channels::Channels::new(32)),
+            #[cfg(feature = "ws")]
+            shutdown: tokio_util::sync::CancellationToken::new(),
+            policy_registry: crate::authorization::PolicyRegistry::default(),
+            forbidden_response: crate::authorization::ForbiddenResponse::default(),
+            auth_session_key: "user_id".to_owned(),
+            shared_cache: None,
+            clock: std::sync::Arc::new(crate::time::SystemClock),
+        };
+
+        let app = Router::new()
+            .route("/protected", get(handler))
+            .layer(RequireAuth::new("user_id"))
+            .layer(SessionLayer::new(store, SessionConfig::default()))
+            .with_state(state);
+
+        let response = app
+            .oneshot(
+                http::Request::builder()
+                    .uri("/protected")
+                    .header(COOKIE, "autumn.sid=valid-session")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(std::str::from_utf8(&body).unwrap(), "42");
+    }
+
+    #[tokio::test]
     async fn require_auth_poll_ready_propagates() {
         use std::task::{Context, Poll};
         use tower::{Layer, Service};
@@ -3816,6 +3912,44 @@ mod api_token_tests {
         let layer2 = RequireApiToken::new(store2);
         let mut svc2 = layer2.layer(MockService { ready: true });
         assert!(svc2.poll_ready(&mut cx).is_ready());
+    }
+
+    #[tokio::test]
+    async fn require_api_token_sets_rate_limit_principal() {
+        use axum::body::Body;
+        use tower::ServiceExt;
+
+        use crate::security::RateLimitPrincipal;
+
+        async fn handler(
+            axum::Extension(principal): axum::Extension<RateLimitPrincipal>,
+        ) -> String {
+            principal.0
+        }
+
+        let store = Arc::new(InMemoryApiTokenStore::default());
+        let raw = issue_api_token(&*store, "agent:bot").await.unwrap();
+
+        let app = axum::Router::new()
+            .route("/", axum::routing::get(handler))
+            .layer(RequireApiToken::new(Arc::clone(&store)));
+
+        let response = app
+            .oneshot(
+                http::Request::builder()
+                    .uri("/")
+                    .header("authorization", format!("Bearer {raw}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(std::str::from_utf8(&body).unwrap(), "agent:bot");
     }
 }
 
