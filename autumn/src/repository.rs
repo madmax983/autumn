@@ -208,6 +208,12 @@ pub trait CanSetTenantId {
     fn set_tenant_id(&mut self, tenant_id: String);
 }
 
+/// Trait implemented by models to expose their primary key value.
+pub trait ModelPrimaryKey {
+    type IdType: ::std::fmt::Display + ::core::clone::Clone + Send + Sync + 'static;
+    fn primary_key_value(&self) -> Self::IdType;
+}
+
 /// Metadata trait implemented for model structs to expose FTS configuration.
 pub trait AutumnSearchableModel {
     const IS_SEARCHABLE: bool;

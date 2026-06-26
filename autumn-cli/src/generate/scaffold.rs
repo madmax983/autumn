@@ -37,6 +37,8 @@ pub struct ScaffoldOptions {
     pub queries: Vec<String>,
     /// Scaffold a JSON-only API resource.
     pub api: bool,
+    /// Enable live auto-broadcasting using SSE and HTMX extensions.
+    pub live: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -92,6 +94,7 @@ pub fn plan_scaffold_with_options(
         model: model_options_with_key,
         queries: options.queries.clone(),
         api: options.api,
+        live: options.live,
     };
     let mut plan = plan_model_with_options(
         project_root,
@@ -122,6 +125,7 @@ pub fn plan_scaffold_with_options(
             options_with_key.model.soft_delete,
             options_with_key.api,
             options_with_key.model.sharded,
+            options_with_key.live,
         ),
     );
     let repo_mod_path = repos_dir.join("mod.rs");
@@ -142,6 +146,7 @@ pub fn plan_scaffold_with_options(
                 &form_fields,
                 options_with_key.model.sharded,
                 options_with_key.model.soft_delete,
+                options_with_key.live,
             ),
         );
         let route_mod_path = routes_dir.join("mod.rs");
@@ -165,7 +170,12 @@ pub fn plan_scaffold_with_options(
             format!("missing {}", main_path.display()),
         ))
     })?;
-    let route_entries = main_route_entries(&plural, &snake_name, options_with_key.api);
+    let route_entries = main_route_entries(
+        &plural,
+        &snake_name,
+        options_with_key.api,
+        options_with_key.live,
+    );
     let mut mods = vec!["models", "schema", "repositories"];
     if !options_with_key.api {
         mods.push("routes");
@@ -345,10 +355,12 @@ fn render_repository_file(
     soft_delete: bool,
     api: bool,
     sharded: bool,
+    live: bool,
 ) -> String {
     let plural = pluralize(snake_name);
     let query_body = render_repository_queries(pascal_name, queries);
     let soft_delete_attr = if soft_delete { ", soft_delete" } else { "" };
+    let live_attr = if live { ", broadcasts = true" } else { "" };
     let sharded_note = if sharded {
         format!(
             "//!\n\
@@ -396,7 +408,7 @@ fn render_repository_file(
          use crate::models::{snake_name}::{{{pascal_name}, New{pascal_name}, Update{pascal_name}}};\n\
          use crate::schema::{plural};\n\
          \n\
-         #[autumn_web::repository({pascal_name}, api = \"/api/{plural}\"{soft_delete_attr})]\n\
+         #[autumn_web::repository({pascal_name}, api = \"/api/{plural}\"{soft_delete_attr}{live_attr})]\n\
          pub trait {pascal_name}Repository {{\n\
 {query_body}\
          }}\n"
@@ -486,6 +498,7 @@ fn render_routes_file(
     fields: &[Field],
     sharded: bool,
     soft_delete: bool,
+    live: bool,
 ) -> String {
     let create_inputs = render_create_form_inputs(fields);
     let edit_inputs = render_edit_form_inputs(fields);
@@ -548,6 +561,22 @@ fn render_routes_file(
 
     // The `index` handler: when sharded, use from_shard explicitly so the
     // generated code shows the canonical sharding pattern.
+    let (ul_tag, li_render) = if live {
+        (
+            format!(
+                r#"ul id="{plural}-list" hx-ext="sse" sse-connect="/{plural}/events" sse-swap="message""#
+            ),
+            format!(
+                r#"li id=(format!("{snake_name}-{{}}", row.id)) {{ a href=(format!("/{plural}/{{}}", row.id)) {{ "{pascal_name} #{{}}" (row.id) }} }}"#
+            ),
+        )
+    } else {
+        (
+            "ul".to_owned(),
+            r#"li {{ a href=(format!("/{plural}/{{}}", row.id)) {{ (row.id) }} }}"#.to_owned(),
+        )
+    };
+
     let index_handler = if sharded {
         format!(
             r#"/// `GET /{plural}` — paginated list of {snake_name}s.
@@ -566,9 +595,9 @@ pub async fn index(
     Ok(layout("{pascal_name} index", flash.render().await, html! {{
         h1 {{ "{pascal_name}s" }}
         a href="/{plural}/new" {{ "New {pascal_name}" }}
-        ul {{
+        {ul_tag} {{
             @for row in &page_data.content {{
-                li {{ a href=(format!("/{plural}/{{}}", row.id)) {{ (row.id) }} }}
+                {li_render}
             }}
         }}
         (pagination_nav(&page_data, &PagerOptions::new("/{plural}")))
@@ -592,9 +621,9 @@ pub async fn index(
     Ok(layout("{pascal_name} index", flash.render().await, html! {{
         h1 {{ "{pascal_name}s" }}
         a href="/{plural}/new" {{ "New {pascal_name}" }}
-        ul {{
+        {ul_tag} {{
             @for row in &page_data.content {{
-                li {{ a href=(format!("/{plural}/{{}}", row.id)) {{ (row.id) }} }}
+                {li_render}
             }}
         }}
         (pagination_nav(&page_data, &PagerOptions::new("/{plural}")))
@@ -842,7 +871,21 @@ fn redirect_to(url: &str) -> Markup {{
     }}
 }}
 "#
-    )
+    ) + &if live {
+        format!(
+            r#"
+
+/// `GET /{plural}/events` — Server-Sent Events stream for live updates.
+#[get("/{plural}/events")]
+pub async fn events(
+    state: autumn_web::extract::State<autumn_web::AppState>,
+) -> impl autumn_web::reexports::axum::response::IntoResponse {{
+    autumn_web::sse::stream(&state, "{plural}")
+}}"#
+        )
+    } else {
+        String::new()
+    }
 }
 
 /// Whether any field in `fields` is a file attachment.
@@ -1136,7 +1179,7 @@ fn render_smoke_test(pascal_name: &str, plural: &str, api: bool, fields: &[Field
     }
 }
 
-fn main_route_entries(plural: &str, snake_name: &str, api: bool) -> Vec<String> {
+fn main_route_entries(plural: &str, snake_name: &str, api: bool, live: bool) -> Vec<String> {
     if api {
         vec![
             format!("repositories::{snake_name}::{snake_name}_api_list"),
@@ -1146,7 +1189,7 @@ fn main_route_entries(plural: &str, snake_name: &str, api: bool) -> Vec<String> 
             format!("repositories::{snake_name}::{snake_name}_api_delete"),
         ]
     } else {
-        vec![
+        let mut entries = vec![
             format!("routes::{plural}::index"),
             format!("routes::{plural}::show"),
             format!("routes::{plural}::new_form"),
@@ -1156,7 +1199,11 @@ fn main_route_entries(plural: &str, snake_name: &str, api: bool) -> Vec<String> 
             format!("routes::{plural}::destroy"),
             format!("repositories::{snake_name}::{snake_name}_api_list"),
             format!("repositories::{snake_name}::{snake_name}_api_get"),
-        ]
+        ];
+        if live {
+            entries.push(format!("routes::{plural}::events"));
+        }
+        entries
     }
 }
 
@@ -1883,7 +1930,7 @@ async fn main() {
 
     #[test]
     fn repository_notes_sharded() {
-        let rendered = render_repository_file("Account", "account", &[], false, false, true);
+        let rendered = render_repository_file("Account", "account", &[], false, false, true, false);
         assert!(
             rendered.contains("shard-aware"),
             "sharded repository doc must mention shard-aware: {rendered}"
@@ -1896,7 +1943,7 @@ async fn main() {
 
     #[test]
     fn repository_notes_api_sharded_caveat() {
-        let rendered = render_repository_file("Account", "account", &[], false, true, true);
+        let rendered = render_repository_file("Account", "account", &[], false, true, true, false);
         assert!(
             rendered.contains("control pool"),
             "sharded api repository doc must note control pool: {rendered}"
@@ -1905,7 +1952,7 @@ async fn main() {
 
     #[test]
     fn repository_no_sharded_note_when_not_sharded() {
-        let rendered = render_repository_file("Post", "post", &[], false, false, false);
+        let rendered = render_repository_file("Post", "post", &[], false, false, false, false);
         assert!(
             !rendered.contains("shard-aware"),
             "non-sharded repository must not mention shard-aware: {rendered}"
@@ -1932,5 +1979,30 @@ async fn main() {
         assert!(test_file.contains("/api/posts"));
         assert!(test_file.contains("DELETE"));
         assert!(!test_file.contains("contains(\"Posts\")"));
+    }
+
+    #[test]
+    fn plan_scaffold_live_views() {
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &["title:String".into()],
+            "20260427000000",
+            &ScaffoldOptions {
+                live: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+        assert!(routes.contains("/posts/events"));
+        assert!(routes.contains("autumn_web::sse::stream"));
+        assert!(routes.contains("hx-ext=\"sse\""));
+        assert!(routes.contains("sse-connect=\"/posts/events\""));
+
+        let repo = fs::read_to_string(tmp.path().join("src/repositories/post.rs")).unwrap();
+        assert!(repo.contains("broadcasts = true"));
     }
 }

@@ -336,7 +336,10 @@ pub mod __private {
         finalize_repository_commit_hook_after_hook, kick_repository_commit_hook_dispatcher,
         mark_repository_commit_hook_after_hook_failed, register_repository_commit_hook_runner,
         start_repository_commit_hook_pending_finalizer_heartbeat,
+        start_repository_commit_hook_worker,
     };
+    #[cfg(all(feature = "db", feature = "ws"))]
+    pub use crate::repository_commit_hooks::{get_global_channels, set_global_channels};
     #[cfg(feature = "db")]
     pub use crate::version_history::VersionedRepositoryDescriptor;
 

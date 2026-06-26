@@ -54,6 +54,8 @@ pub struct ScaffoldConfigEntry {
     pub sharded: bool,
     #[serde(default)]
     pub shard_key: Option<String>,
+    #[serde(default)]
+    pub live: bool,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -102,6 +104,7 @@ pub fn merge_config_with_cli(
     cli_api: bool,
     cli_sharded: bool,
     cli_shard_key: Option<&str>,
+    cli_live: bool,
 ) -> (Vec<String>, ScaffoldOptions) {
     let pick = |cli: &[String], toml: Vec<String>| -> Vec<String> {
         if cli.is_empty() { toml } else { cli.to_vec() }
@@ -116,6 +119,7 @@ pub fn merge_config_with_cli(
     let api = cli_api || config.api;
     let sharded = cli_sharded || config.sharded;
     let shard_key = cli_shard_key.map(str::to_owned).or(config.shard_key);
+    let live = cli_live || config.live;
     (
         fields,
         ScaffoldOptions {
@@ -129,6 +133,7 @@ pub fn merge_config_with_cli(
             },
             queries,
             api,
+            live,
         },
     )
 }
@@ -274,6 +279,7 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
             api: false,
             sharded: false,
             shard_key: None,
+            live: false,
         }
     }
 
@@ -290,6 +296,7 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
             false,
             false,
             None,
+            false,
         );
         assert_eq!(fields, vec!["url:String", "tag:String"]);
         assert_eq!(opts.model.indexes, vec!["url"]);
@@ -311,6 +318,7 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
             false,
             false,
             None,
+            false,
         );
         assert_eq!(fields, vec!["title:String", "body:Text"]);
     }
@@ -328,6 +336,7 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
             false,
             false,
             None,
+            false,
         );
         assert_eq!(opts.model.indexes, vec!["tag"]);
     }
@@ -345,6 +354,7 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
             false,
             false,
             None,
+            false,
         );
         assert_eq!(opts.model.validations, vec!["url=email"]);
     }
@@ -364,6 +374,7 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
             false,
             false,
             None,
+            false,
         );
         assert_eq!(opts.model.defaults, vec!["tag=general"]);
     }
@@ -381,6 +392,7 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
             false,
             false,
             None,
+            false,
         );
         assert_eq!(opts.queries, vec!["find_by_tag:tag"]);
     }
@@ -388,8 +400,19 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
     #[test]
     fn merge_empty_cli_keeps_empty_toml() {
         let entry = ScaffoldConfigEntry::default();
-        let (fields, opts) =
-            merge_config_with_cli(entry, &[], &[], &[], &[], &[], false, false, false, None);
+        let (fields, opts) = merge_config_with_cli(
+            entry,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            false,
+            false,
+            false,
+            None,
+            false,
+        );
         assert!(fields.is_empty());
         assert!(opts.model.indexes.is_empty());
         assert!(opts.model.validations.is_empty());
@@ -410,6 +433,7 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
             false,
             false,
             None,
+            false,
         );
         assert!(
             opts.model.soft_delete,
@@ -421,8 +445,19 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
     fn merge_toml_soft_delete_propagates() {
         let mut entry = bookmark_entry();
         entry.soft_delete = true;
-        let (_, opts) =
-            merge_config_with_cli(entry, &[], &[], &[], &[], &[], false, false, false, None);
+        let (_, opts) = merge_config_with_cli(
+            entry,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            false,
+            false,
+            false,
+            None,
+            false,
+        );
         assert!(
             opts.model.soft_delete,
             "soft_delete=true in TOML config must propagate when CLI flag is false"
@@ -442,6 +477,7 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
             false,
             false,
             None,
+            false,
         );
         assert!(
             !opts.model.soft_delete,
@@ -478,6 +514,7 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
             true,
             false,
             None,
+            false,
         );
         assert!(opts.api);
     }
@@ -486,8 +523,19 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
     fn merge_toml_api_propagates() {
         let mut entry = bookmark_entry();
         entry.api = true;
-        let (_, opts) =
-            merge_config_with_cli(entry, &[], &[], &[], &[], &[], false, false, false, None);
+        let (_, opts) = merge_config_with_cli(
+            entry,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            false,
+            false,
+            false,
+            None,
+            false,
+        );
         assert!(opts.api);
     }
 
@@ -520,6 +568,7 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
             false,
             true,
             None,
+            false,
         );
         assert!(
             opts.model.sharded,
@@ -531,8 +580,19 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
     fn merge_toml_sharded_propagates() {
         let mut entry = bookmark_entry();
         entry.sharded = true;
-        let (_, opts) =
-            merge_config_with_cli(entry, &[], &[], &[], &[], &[], false, false, false, None);
+        let (_, opts) = merge_config_with_cli(
+            entry,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            false,
+            false,
+            false,
+            None,
+            false,
+        );
         assert!(
             opts.model.sharded,
             "sharded=true in TOML config must propagate when CLI flag is false"
@@ -554,6 +614,7 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
             false,
             false,
             Some("user_id"),
+            false,
         );
         assert_eq!(
             opts.model.shard_key.as_deref(),
@@ -566,8 +627,19 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
     fn merge_shard_key_toml_used_when_no_cli() {
         let mut entry = bookmark_entry();
         entry.shard_key = Some("org_id".into());
-        let (_, opts) =
-            merge_config_with_cli(entry, &[], &[], &[], &[], &[], false, false, false, None);
+        let (_, opts) = merge_config_with_cli(
+            entry,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            false,
+            false,
+            false,
+            None,
+            false,
+        );
         assert_eq!(
             opts.model.shard_key.as_deref(),
             Some("org_id"),
@@ -593,6 +665,60 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
             entry.shard_key.as_deref(),
             Some("tenant_id"),
             "shard_key in TOML must be parsed into ScaffoldConfigEntry"
+        );
+    }
+
+    #[test]
+    fn merge_cli_live_flag_wins() {
+        let (_, opts) = merge_config_with_cli(
+            bookmark_entry(),
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            false,
+            false,
+            false,
+            None,
+            true,
+        );
+        assert!(opts.live);
+    }
+
+    #[test]
+    fn merge_toml_live_propagates() {
+        let mut entry = bookmark_entry();
+        entry.live = true;
+        let (_, opts) = merge_config_with_cli(
+            entry,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            false,
+            false,
+            false,
+            None,
+            false,
+        );
+        assert!(opts.live);
+    }
+
+    #[test]
+    fn parse_scaffold_config_with_live() {
+        let tmp = TempDir::new().unwrap();
+        let path = write_config(
+            &tmp,
+            "[scaffold.Article]\nfields = [\"title:String\"]\nlive = true\n",
+        );
+        let entry = read_scaffold_config(&path, "Article")
+            .unwrap()
+            .expect("Article section must be present");
+        assert!(
+            entry.live,
+            "live = true in TOML must be parsed into ScaffoldConfigEntry"
         );
     }
 }

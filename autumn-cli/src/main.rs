@@ -1619,6 +1619,9 @@ enum GenerateCommands {
         /// Defaults to `tenant_id` if that field is present, otherwise `id`.
         #[arg(long, value_name = "FIELD")]
         shard_key: Option<String>,
+        /// Auto-broadcast model mutations to live HTMX views.
+        #[arg(long)]
+        live: bool,
         /// Print the file plan and exit without writing anything.
         #[arg(long)]
         dry_run: bool,
@@ -2427,6 +2430,7 @@ fn run_generate_command(cmd: GenerateCommands) {
             api,
             sharded,
             shard_key,
+            live,
             dry_run,
             force,
         } => {
@@ -2459,6 +2463,7 @@ fn run_generate_command(cmd: GenerateCommands) {
                 api,
                 sharded,
                 shard_key.as_deref(),
+                live,
             );
             generate::scaffold::run(&name, &fields, generate::Flags { dry_run, force }, &options);
         }

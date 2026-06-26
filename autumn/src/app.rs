@@ -3227,6 +3227,17 @@ impl AppBuilder {
 
         #[cfg(feature = "db")]
         if let Some(pool) = state.pool().cloned() {
+            #[cfg(feature = "ws")]
+            {
+                let channels = state.channels().clone();
+                crate::repository_commit_hooks::set_global_channels(channels.clone());
+                crate::repository_commit_hooks::start_repository_commit_hook_worker(
+                    pool,
+                    Some(channels),
+                    server_shutdown.child_token(),
+                );
+            }
+            #[cfg(not(feature = "ws"))]
             crate::repository_commit_hooks::start_repository_commit_hook_worker(
                 pool,
                 server_shutdown.child_token(),
@@ -3237,6 +3248,13 @@ impl AppBuilder {
         #[cfg(feature = "db")]
         if let Some(shards) = state.shards() {
             for shard in shards.iter() {
+                #[cfg(feature = "ws")]
+                crate::repository_commit_hooks::start_repository_commit_hook_worker(
+                    shard.primary_pool().clone(),
+                    Some(state.channels().clone()),
+                    server_shutdown.child_token(),
+                );
+                #[cfg(not(feature = "ws"))]
                 crate::repository_commit_hooks::start_repository_commit_hook_worker(
                     shard.primary_pool().clone(),
                     server_shutdown.child_token(),
@@ -4373,6 +4391,17 @@ impl AppBuilder {
 
         #[cfg(feature = "db")]
         if let Some(pool) = state.pool().cloned() {
+            #[cfg(feature = "ws")]
+            {
+                let channels = state.channels().clone();
+                crate::repository_commit_hooks::set_global_channels(channels.clone());
+                crate::repository_commit_hooks::start_repository_commit_hook_worker(
+                    pool,
+                    Some(channels),
+                    task_shutdown.child_token(),
+                );
+            }
+            #[cfg(not(feature = "ws"))]
             crate::repository_commit_hooks::start_repository_commit_hook_worker(
                 pool,
                 task_shutdown.child_token(),
@@ -4383,6 +4412,13 @@ impl AppBuilder {
         #[cfg(feature = "db")]
         if let Some(shards) = state.shards() {
             for shard in shards.iter() {
+                #[cfg(feature = "ws")]
+                crate::repository_commit_hooks::start_repository_commit_hook_worker(
+                    shard.primary_pool().clone(),
+                    Some(state.channels().clone()),
+                    task_shutdown.child_token(),
+                );
+                #[cfg(not(feature = "ws"))]
                 crate::repository_commit_hooks::start_repository_commit_hook_worker(
                     shard.primary_pool().clone(),
                     task_shutdown.child_token(),

@@ -769,6 +769,48 @@ where
     Ok((context, record))
 }
 
+#[cfg(feature = "ws")]
+pub fn start_repository_commit_hook_worker(
+    pool: PgPool,
+    channels: Option<crate::channels::Channels>,
+    shutdown: CancellationToken,
+) {
+    register_inventory_repository_commit_hook_runners();
+    if !should_start_repository_commit_hook_worker(&registered_handler_keys()) {
+        return;
+    }
+
+    let worker_id = repository_commit_hook_worker_id();
+    tokio::spawn(async move {
+        if let Some(ch) = channels {
+            let _ = CURRENT_CHANNELS
+                .scope(ch, async move {
+                    loop {
+                        tokio::select! {
+                            () = shutdown.cancelled() => break,
+                            () = tokio::time::sleep(HOOK_WORKER_IDLE_SLEEP) => {
+                                recover_stale_repository_commit_hooks(&pool, &worker_id).await;
+                                drain_ready_repository_commit_hooks(&pool, &worker_id, 32).await;
+                            }
+                        }
+                    }
+                })
+                .await;
+        } else {
+            loop {
+                tokio::select! {
+                    () = shutdown.cancelled() => break,
+                    () = tokio::time::sleep(HOOK_WORKER_IDLE_SLEEP) => {
+                        recover_stale_repository_commit_hooks(&pool, &worker_id).await;
+                        drain_ready_repository_commit_hooks(&pool, &worker_id, 32).await;
+                    }
+                }
+            }
+        }
+    });
+}
+
+#[cfg(not(feature = "ws"))]
 pub fn start_repository_commit_hook_worker(pool: PgPool, shutdown: CancellationToken) {
     register_inventory_repository_commit_hook_runners();
     if !should_start_repository_commit_hook_worker(&registered_handler_keys()) {
@@ -838,7 +880,25 @@ fn spawn_repository_commit_hook_kick_worker(
     state: Arc<RepositoryCommitHookKickState>,
 ) {
     let worker_id = repository_commit_hook_worker_id();
+    #[cfg(feature = "ws")]
+    let channels = get_global_channels();
     tokio::spawn(async move {
+        #[cfg(feature = "ws")]
+        {
+            if let Some(ch) = channels {
+                let _ = CURRENT_CHANNELS
+                    .scope(ch, async move {
+                        loop {
+                            state.notify.notified().await;
+                            while state.take_pending_kick() {
+                                drain_ready_repository_commit_hooks(&pool, &worker_id, 32).await;
+                            }
+                        }
+                    })
+                    .await;
+                return;
+            }
+        }
         loop {
             state.notify.notified().await;
             while state.take_pending_kick() {
@@ -1307,6 +1367,30 @@ fn repository_commit_hook_worker_id() -> String {
 
 fn repository_commit_hook_pending_owner_id() -> String {
     format!("repository-hook-pending-{}", uuid::Uuid::new_v4())
+}
+
+#[cfg(feature = "ws")]
+tokio::task_local! {
+    pub static CURRENT_CHANNELS: crate::channels::Channels;
+}
+
+#[cfg(feature = "ws")]
+static GLOBAL_CHANNELS: std::sync::RwLock<Option<crate::channels::Channels>> =
+    std::sync::RwLock::new(None);
+
+#[cfg(feature = "ws")]
+pub fn set_global_channels(channels: crate::channels::Channels) {
+    if let Ok(mut lock) = GLOBAL_CHANNELS.write() {
+        *lock = Some(channels);
+    }
+}
+
+#[cfg(feature = "ws")]
+pub fn get_global_channels() -> Option<crate::channels::Channels> {
+    CURRENT_CHANNELS
+        .try_with(|c| c.clone())
+        .ok()
+        .or_else(|| GLOBAL_CHANNELS.read().ok().and_then(|lock| lock.clone()))
 }
 
 #[cfg(test)]

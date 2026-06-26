@@ -70,6 +70,58 @@ fn to_snake_case(name: &str) -> String {
     result
 }
 
+fn generate_topic_format(topic: &str, record_ident: &TokenStream) -> syn::Result<TokenStream> {
+    let mut format_str = String::new();
+    let mut args = Vec::new();
+    let mut chars = topic.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '{' {
+            let mut field = String::new();
+            let mut closed = false;
+            while let Some(&next_ch) = chars.peek() {
+                if next_ch == '}' {
+                    chars.next();
+                    closed = true;
+                    break;
+                } else {
+                    field.push(chars.next().unwrap());
+                }
+            }
+            if closed {
+                let trimmed = field.trim();
+                if trimmed.is_empty() {
+                    return Err(syn::Error::new(
+                        proc_macro2::Span::call_site(),
+                        "empty topic placeholder '{}' is not allowed",
+                    ));
+                }
+                let field_ident = syn::parse_str::<syn::Ident>(trimmed).map_err(|e| {
+                    syn::Error::new(
+                        proc_macro2::Span::call_site(),
+                        format!(
+                            "invalid field name '{}' in topic placeholder: {}",
+                            trimmed, e
+                        ),
+                    )
+                })?;
+                format_str.push_str("{}");
+                args.push(quote! { #record_ident.#field_ident });
+            } else {
+                format_str.push('{');
+                format_str.push_str(&field);
+            }
+        } else {
+            format_str.push(ch);
+        }
+    }
+    let output = if args.is_empty() {
+        quote! { ::std::string::ToString::to_string(#format_str) }
+    } else {
+        quote! { ::std::format!(#format_str, #(#args),*) }
+    };
+    Ok(output)
+}
+
 #[allow(clippy::struct_excessive_bools)]
 struct RepoConfig {
     model_name: Ident,
@@ -114,6 +166,11 @@ struct RepoConfig {
     /// Works with `tenant_scoped` for per-tenant routing and `across_tenants` for
     /// cross-shard fan-out reads. (issue #1209)
     sharded: bool,
+    broadcasts: bool,
+    broadcast_topic: Option<String>,
+    broadcast_render: Option<syn::Path>,
+    broadcast_container: Option<String>,
+    generated_internal_hooks: bool,
 }
 
 #[allow(clippy::too_many_lines)]
@@ -135,6 +192,10 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
     let mut no_versioned_record_impl = false;
     let mut primary_reads = false;
     let mut sharded = false;
+    let mut broadcasts = false;
+    let mut broadcast_topic: Option<String> = None;
+    let mut broadcast_render: Option<syn::Path> = None;
+    let mut broadcast_container: Option<String> = None;
 
     syn::meta::parser(|meta| {
         // `hooks = Ident` must be checked before the catch-all model_name case,
@@ -146,6 +207,22 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
         } else if meta.path.is_ident("commit_hooks") {
             let value: syn::LitBool = meta.value()?.parse()?;
             commit_hooks = value.value;
+            Ok(())
+        } else if meta.path.is_ident("broadcasts") {
+            let value: syn::LitBool = meta.value()?.parse()?;
+            broadcasts = value.value;
+            Ok(())
+        } else if meta.path.is_ident("topic") {
+            let value: LitStr = meta.value()?.parse()?;
+            broadcast_topic = Some(value.value());
+            Ok(())
+        } else if meta.path.is_ident("render") {
+            let value: syn::Path = meta.value()?.parse()?;
+            broadcast_render = Some(value);
+            Ok(())
+        } else if meta.path.is_ident("container") {
+            let value: LitStr = meta.value()?.parse()?;
+            broadcast_container = Some(value.value());
             Ok(())
         } else if meta.path.is_ident("table") {
             let value: LitStr = meta.value()?.parse()?;
@@ -213,13 +290,17 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
             "expected model name: #[repository(ModelName)]",
         )
     })?;
-    if commit_hooks && hooks_type.is_none() {
+    if broadcasts {
+        commit_hooks = true;
+    }
+    if commit_hooks && hooks_type.is_none() && !broadcasts {
         return Err(syn::Error::new(
             proc_macro2::Span::call_site(),
             "commit_hooks = true requires hooks = Type",
         ));
     }
     let table = table_name.unwrap_or_else(|| infer_table_name(&model));
+    let generated_internal_hooks = false;
 
     Ok(RepoConfig {
         model_name: model,
@@ -239,6 +320,11 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
         no_versioned_record_impl,
         primary_reads,
         sharded,
+        broadcasts,
+        broadcast_topic,
+        broadcast_render,
+        broadcast_container,
+        generated_internal_hooks,
     })
 }
 
@@ -583,7 +669,7 @@ fn vh_insert_ts(
 )]
 #[allow(clippy::cognitive_complexity)]
 pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let config = match parse_repo_args(attr) {
+    let mut config = match parse_repo_args(attr) {
         Ok(c) => c,
         Err(err) => return err.to_compile_error(),
     };
@@ -592,6 +678,11 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         Ok(t) => t,
         Err(err) => return err.to_compile_error(),
     };
+
+    if config.broadcasts && config.hooks_type.is_none() {
+        config.hooks_type = Some(format_ident!("Pg{}InternalHooks", trait_def.ident));
+        config.generated_internal_hooks = true;
+    }
 
     let model_name = &config.model_name;
     let table_name = &config.table_name;
@@ -1293,6 +1384,105 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             }
         };
 
+        let (broadcast_create, broadcast_update, broadcast_delete) = if config.broadcasts {
+            let base_topic_expr = match generate_topic_format(
+                config
+                    .broadcast_topic
+                    .as_deref()
+                    .unwrap_or(&config.table_name),
+                &quote! { __record },
+            ) {
+                Ok(expr) => expr,
+                Err(err) => {
+                    let compile_err = err.to_compile_error();
+                    return quote! { #compile_err }.into();
+                }
+            };
+
+            let topic_expr = if config.tenant_scoped {
+                quote! { ::std::format!("tenant:{}:{}", __record.tenant_id, #base_topic_expr) }
+            } else {
+                base_topic_expr
+            };
+
+            let default_container = format!("{}-list", config.table_name);
+            let container_expr = config
+                .broadcast_container
+                .as_deref()
+                .unwrap_or(&default_container);
+            let model_prefix = to_snake_case(&config.model_name.to_string());
+            let model_name_str = config.model_name.to_string();
+            let table_name = &config.table_name;
+
+            let render_expr = if let Some(ref render_path) = config.broadcast_render {
+                quote! { #render_path(&__record) }
+            } else {
+                quote! {
+                    ::autumn_web::html! {
+                        li id=(::std::format!("{}-{}", #model_prefix, ::autumn_web::repository::ModelPrimaryKey::primary_key_value(&__record))) {
+                            a href=(::std::format!("/{}/{}", #table_name, ::autumn_web::repository::ModelPrimaryKey::primary_key_value(&__record))) {
+                                (::std::format!("{} #{}", #model_name_str, ::autumn_web::repository::ModelPrimaryKey::primary_key_value(&__record)))
+                            }
+                        }
+                    }
+                }
+            };
+
+            let create = quote! {
+                #[cfg(all(feature = "ws", feature = "maud"))]
+                {
+                    if let ::core::option::Option::Some(__channels) = ::autumn_web::__private::get_global_channels() {
+                        let __topic = #topic_expr;
+                        let __fragment = #render_expr;
+                        if let ::core::result::Result::Err(__err) = __channels
+                            .broadcast()
+                            .publish_oob(&__topic, #container_expr, ::autumn_web::htmx::OobSwap::BeforeEnd, &__fragment)
+                        {
+                            ::autumn_web::reexports::tracing::warn!(error = %__err, "auto-broadcast failed");
+                        }
+                    }
+                }
+            };
+
+            let update = quote! {
+                #[cfg(all(feature = "ws", feature = "maud"))]
+                {
+                    if let ::core::option::Option::Some(__channels) = ::autumn_web::__private::get_global_channels() {
+                        let __topic = #topic_expr;
+                        let __id = ::std::format!("{}-{}", #model_prefix, ::autumn_web::repository::ModelPrimaryKey::primary_key_value(&__record));
+                        let __fragment = #render_expr;
+                        if let ::core::result::Result::Err(__err) = __channels
+                            .broadcast()
+                            .publish_oob(&__topic, &__id, ::autumn_web::htmx::OobSwap::OuterHTML, &__fragment)
+                        {
+                            ::autumn_web::reexports::tracing::warn!(error = %__err, "auto-broadcast failed");
+                        }
+                    }
+                }
+            };
+
+            let delete = quote! {
+                #[cfg(all(feature = "ws", feature = "maud"))]
+                {
+                    if let ::core::option::Option::Some(__channels) = ::autumn_web::__private::get_global_channels() {
+                        let __topic = #topic_expr;
+                        let __id = ::std::format!("{}-{}", #model_prefix, ::autumn_web::repository::ModelPrimaryKey::primary_key_value(&__record));
+                        let __fragment = ::autumn_web::html! {};
+                        if let ::core::result::Result::Err(__err) = __channels
+                            .broadcast()
+                            .publish_oob(&__topic, &__id, ::autumn_web::htmx::OobSwap::Delete, &__fragment)
+                        {
+                            ::autumn_web::reexports::tracing::warn!(error = %__err, "auto-broadcast failed");
+                        }
+                    }
+                }
+            };
+
+            (create, update, delete)
+        } else {
+            (quote! {}, quote! {}, quote! {})
+        };
+
         let hook_support_methods = if commit_hooks_enabled {
             quote! {
             #[doc(hidden)]
@@ -1326,14 +1516,16 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                     })?;
                             let __record: #model_name =
                                 #model_name::__autumn_commit_hook_from_value(__record)?;
-                                let __hooks =
-                                    <#hooks_ident as ::autumn_web::hooks::RepositoryHooksDefault>::autumn_default();
-                                <#hooks_ident as ::autumn_web::hooks::MutationHooks>::after_create_commit(
-                                    &__hooks,
-                                    &mut __ctx,
-                                    &__record,
-                                )
-                                .await
+                            let __hooks =
+                                <#hooks_ident as ::autumn_web::hooks::RepositoryHooksDefault>::autumn_default();
+                            <#hooks_ident as ::autumn_web::hooks::MutationHooks>::after_create_commit(
+                                &__hooks,
+                                &mut __ctx,
+                                &__record,
+                            )
+                            .await?;
+                            #broadcast_create
+                            Ok(())
                         },
                         |__ctx, __record| async move {
                             let mut __ctx: ::autumn_web::hooks::MutationContext =
@@ -1345,14 +1537,16 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                     })?;
                             let __record: #model_name =
                                 #model_name::__autumn_commit_hook_from_value(__record)?;
-                                let __hooks =
-                                    <#hooks_ident as ::autumn_web::hooks::RepositoryHooksDefault>::autumn_default();
-                                <#hooks_ident as ::autumn_web::hooks::MutationHooks>::after_update_commit(
-                                    &__hooks,
-                                    &mut __ctx,
-                                    &__record,
-                                )
-                                .await
+                            let __hooks =
+                                <#hooks_ident as ::autumn_web::hooks::RepositoryHooksDefault>::autumn_default();
+                            <#hooks_ident as ::autumn_web::hooks::MutationHooks>::after_update_commit(
+                                &__hooks,
+                                &mut __ctx,
+                                &__record,
+                            )
+                            .await?;
+                            #broadcast_update
+                            Ok(())
                         },
                         |__ctx, __record| async move {
                             let mut __ctx: ::autumn_web::hooks::MutationContext =
@@ -1364,14 +1558,16 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                     })?;
                             let __record: #model_name =
                                 #model_name::__autumn_commit_hook_from_value(__record)?;
-                                let __hooks =
-                                    <#hooks_ident as ::autumn_web::hooks::RepositoryHooksDefault>::autumn_default();
-                                <#hooks_ident as ::autumn_web::hooks::MutationHooks>::after_delete_commit(
-                                    &__hooks,
-                                    &mut __ctx,
-                                    &__record,
-                                )
-                                .await
+                            let __hooks =
+                                <#hooks_ident as ::autumn_web::hooks::RepositoryHooksDefault>::autumn_default();
+                            <#hooks_ident as ::autumn_web::hooks::MutationHooks>::after_delete_commit(
+                                &__hooks,
+                                &mut __ctx,
+                                &__record,
+                            )
+                            .await?;
+                            #broadcast_delete
+                            Ok(())
                         },
                     );
                 });
@@ -8074,6 +8270,22 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         quote! {}
     };
 
+    let internal_hooks_defn = if config.generated_internal_hooks {
+        let hooks_ident = config.hooks_type.as_ref().unwrap();
+        quote! {
+            #[derive(Default, Clone)]
+            pub struct #hooks_ident;
+
+            impl ::autumn_web::hooks::MutationHooks for #hooks_ident {
+                type Model = #model_name;
+                type NewModel = #new_name;
+                type UpdateModel = #update_name;
+            }
+        }
+    } else {
+        quote! {}
+    };
+
     let (search_impl_methods, search_one_shard_helpers) = if config.searchable {
         let tenant_id_setup = if config.tenant_scoped {
             quote! {
@@ -9208,6 +9420,8 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         #versioned_history_impl
 
         #search_compile_check
+
+        #internal_hooks_defn
     }
 }
 
