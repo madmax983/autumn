@@ -1785,6 +1785,19 @@ async fn populate_rate_limit_principal(
     mut req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
+    // Populate RateLimitPrincipal from the *verified* session identity only.
+    //
+    // We deliberately do NOT fall back to a raw Authorization header here: this
+    // shim runs as a global layer outer to route-scoped auth (RequireApiToken),
+    // so any bearer token visible at this point is still unverified and fully
+    // attacker-controlled. Keying the limiter on it would let a caller rotate
+    // the token to mint unlimited buckets (defeating the per-IP fallback) or
+    // forge another user's principal to exhaust their bucket. When no verified
+    // principal is available, the limiter's extract_key falls back to IP keying,
+    // which is the correct safe default. API-token routes that want
+    // per-principal limiting should place a RateLimitLayer inner to
+    // RequireApiToken, which sets the verified principal ID (see
+    // RequireApiTokenService::call).
     if let Some(session) = req.extensions().get::<crate::session::Session>() {
         let auth_session_key = state.auth_session_key();
         if let Some(user_id) = session.get(auth_session_key).await {

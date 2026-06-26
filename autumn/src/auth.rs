@@ -276,6 +276,10 @@ impl std::fmt::Display for AuthRejection {
 /// is authenticated. If the key is missing, the request is rejected before
 /// reaching the handler.
 ///
+/// On success, the resolved principal value is also inserted as a
+/// [`crate::security::RateLimitPrincipal`] extension so that
+/// `key_strategy = "authenticated_principal"` works out of the box.
+///
 /// # Examples
 ///
 /// ```rust,no_run
@@ -338,7 +342,7 @@ where
         self.inner.poll_ready(cx)
     }
 
-    fn call(&mut self, req: axum::extract::Request) -> Self::Future {
+    fn call(&mut self, mut req: axum::extract::Request) -> Self::Future {
         let session_key = Arc::clone(&self.session_key);
         let mut inner = self.inner.clone();
         std::mem::swap(&mut self.inner, &mut inner);
@@ -354,6 +358,10 @@ where
             };
 
             if let Some(user_id) = user_id {
+                // Fulfil the RateLimitPrincipal contract so key_strategy =
+                // "authenticated_principal" works without an extra middleware shim.
+                req.extensions_mut()
+                    .insert(crate::security::RateLimitPrincipal(user_id.clone()));
                 // Tag the request-scoped log context (#1169) so handler logs for
                 // middleware-authenticated requests carry `user_id` too, matching
                 // the `#[secured]` path.
@@ -1668,6 +1676,9 @@ where
 /// `401 Unauthorized` using the same Problem Details contract as
 /// [`AuthRejection`].
 ///
+/// Also inserts [`crate::security::RateLimitPrincipal`] so that
+/// `key_strategy = "authenticated_principal"` works out of the box.
+///
 /// Composes with [`RequireAuth`] and session middleware without conflict.
 ///
 /// # Examples
@@ -1756,6 +1767,10 @@ where
 
             match store.verify(&raw_token).await {
                 Ok(Some(principal_id)) => {
+                    // Fulfil the RateLimitPrincipal contract so key_strategy =
+                    // "authenticated_principal" works without an extra middleware shim.
+                    req.extensions_mut()
+                        .insert(crate::security::RateLimitPrincipal(principal_id.clone()));
                     req.extensions_mut().insert(ApiTokenPrincipal(principal_id));
                     inner.call(req).await
                 }
@@ -2014,6 +2029,45 @@ pub use db_store::DbApiTokenStore;
 mod tests {
     use super::*;
 
+    /// Build a minimal `AppState` for middleware tests, parameterized only by
+    /// the auth session key (the sole field these tests vary). Collapses the
+    /// otherwise-identical struct literal that each test would copy verbatim.
+    fn test_app_state(auth_session_key: &str) -> crate::state::AppState {
+        crate::state::AppState {
+            extensions: std::sync::Arc::new(std::sync::RwLock::new(
+                std::collections::HashMap::new(),
+            )),
+            #[cfg(feature = "db")]
+            pool: None,
+            #[cfg(feature = "db")]
+            replica_pool: None,
+            #[cfg(feature = "db")]
+            shards: None,
+            profile: None,
+            started_at: std::time::Instant::now(),
+            health_detailed: false,
+            probes: crate::probe::ProbeState::ready_for_test(),
+            metrics: crate::middleware::MetricsCollector::new(),
+            log_levels: crate::actuator::LogLevels::new("info"),
+            task_registry: crate::actuator::TaskRegistry::new(),
+            job_registry: crate::actuator::JobRegistry::new(),
+            config_props: crate::actuator::ConfigProperties::default(),
+            metrics_source_registry: crate::actuator::MetricsSourceRegistry::new(),
+            health_indicator_registry: crate::actuator::HealthIndicatorRegistry::new(),
+            #[cfg(feature = "ws")]
+            channels: crate::channels::Channels::new(32),
+            #[cfg(feature = "presence")]
+            presence: crate::presence::Presence::new(crate::channels::Channels::new(32)),
+            #[cfg(feature = "ws")]
+            shutdown: tokio_util::sync::CancellationToken::new(),
+            policy_registry: crate::authorization::PolicyRegistry::default(),
+            forbidden_response: crate::authorization::ForbiddenResponse::default(),
+            auth_session_key: auth_session_key.to_owned(),
+            shared_cache: None,
+            clock: std::sync::Arc::new(crate::time::SystemClock),
+        }
+    }
+
     #[tokio::test]
     async fn hash_and_verify_password() {
         let hash = hash_password("test_password").await.unwrap();
@@ -2263,7 +2317,6 @@ mod tests {
 
     #[tokio::test]
     async fn auth_extractor_returns_401_when_no_user() {
-        use crate::state::AppState;
         use axum::Router;
         use axum::body::Body;
         use axum::routing::get;
@@ -2278,39 +2331,7 @@ mod tests {
             user.name
         }
 
-        let state = AppState {
-            extensions: std::sync::Arc::new(std::sync::RwLock::new(
-                std::collections::HashMap::new(),
-            )),
-            #[cfg(feature = "db")]
-            pool: None,
-            #[cfg(feature = "db")]
-            replica_pool: None,
-            #[cfg(feature = "db")]
-            shards: None,
-            profile: None,
-            started_at: std::time::Instant::now(),
-            health_detailed: false,
-            probes: crate::probe::ProbeState::ready_for_test(),
-            metrics: crate::middleware::MetricsCollector::new(),
-            log_levels: crate::actuator::LogLevels::new("info"),
-            task_registry: crate::actuator::TaskRegistry::new(),
-            job_registry: crate::actuator::JobRegistry::new(),
-            config_props: crate::actuator::ConfigProperties::default(),
-            metrics_source_registry: crate::actuator::MetricsSourceRegistry::new(),
-            health_indicator_registry: crate::actuator::HealthIndicatorRegistry::new(),
-            #[cfg(feature = "ws")]
-            channels: crate::channels::Channels::new(32),
-            #[cfg(feature = "presence")]
-            presence: crate::presence::Presence::new(crate::channels::Channels::new(32)),
-            #[cfg(feature = "ws")]
-            shutdown: tokio_util::sync::CancellationToken::new(),
-            policy_registry: crate::authorization::PolicyRegistry::default(),
-            forbidden_response: crate::authorization::ForbiddenResponse::default(),
-            auth_session_key: "user_id".to_owned(),
-            shared_cache: None,
-            clock: std::sync::Arc::new(crate::time::SystemClock),
-        };
+        let state = test_app_state("user_id");
 
         let app = Router::new().route("/", get(handler)).with_state(state);
 
@@ -2329,7 +2350,6 @@ mod tests {
 
     #[tokio::test]
     async fn auth_extractor_returns_user_when_present() {
-        use crate::state::AppState;
         use axum::Router;
         use axum::body::Body;
         use axum::routing::get;
@@ -2344,39 +2364,7 @@ mod tests {
             user.name
         }
 
-        let state = AppState {
-            extensions: std::sync::Arc::new(std::sync::RwLock::new(
-                std::collections::HashMap::new(),
-            )),
-            #[cfg(feature = "db")]
-            pool: None,
-            #[cfg(feature = "db")]
-            replica_pool: None,
-            #[cfg(feature = "db")]
-            shards: None,
-            profile: None,
-            started_at: std::time::Instant::now(),
-            health_detailed: false,
-            probes: crate::probe::ProbeState::ready_for_test(),
-            metrics: crate::middleware::MetricsCollector::new(),
-            log_levels: crate::actuator::LogLevels::new("info"),
-            task_registry: crate::actuator::TaskRegistry::new(),
-            job_registry: crate::actuator::JobRegistry::new(),
-            config_props: crate::actuator::ConfigProperties::default(),
-            metrics_source_registry: crate::actuator::MetricsSourceRegistry::new(),
-            health_indicator_registry: crate::actuator::HealthIndicatorRegistry::new(),
-            #[cfg(feature = "ws")]
-            channels: crate::channels::Channels::new(32),
-            #[cfg(feature = "presence")]
-            presence: crate::presence::Presence::new(crate::channels::Channels::new(32)),
-            #[cfg(feature = "ws")]
-            shutdown: tokio_util::sync::CancellationToken::new(),
-            policy_registry: crate::authorization::PolicyRegistry::default(),
-            forbidden_response: crate::authorization::ForbiddenResponse::default(),
-            auth_session_key: "user_id".to_owned(),
-            shared_cache: None,
-            clock: std::sync::Arc::new(crate::time::SystemClock),
-        };
+        let state = test_app_state("user_id");
 
         // Middleware that inserts a user into extensions
         let app = Router::new()
@@ -2416,41 +2404,8 @@ mod tests {
         use tower::ServiceExt;
 
         use crate::session::{MemoryStore, SessionConfig, SessionLayer};
-        use crate::state::AppState;
 
-        let state = AppState {
-            extensions: std::sync::Arc::new(std::sync::RwLock::new(
-                std::collections::HashMap::new(),
-            )),
-            #[cfg(feature = "db")]
-            pool: None,
-            #[cfg(feature = "db")]
-            replica_pool: None,
-            #[cfg(feature = "db")]
-            shards: None,
-            profile: None,
-            started_at: std::time::Instant::now(),
-            health_detailed: false,
-            probes: crate::probe::ProbeState::ready_for_test(),
-            metrics: crate::middleware::MetricsCollector::new(),
-            log_levels: crate::actuator::LogLevels::new("info"),
-            task_registry: crate::actuator::TaskRegistry::new(),
-            job_registry: crate::actuator::JobRegistry::new(),
-            config_props: crate::actuator::ConfigProperties::default(),
-            metrics_source_registry: crate::actuator::MetricsSourceRegistry::new(),
-            health_indicator_registry: crate::actuator::HealthIndicatorRegistry::new(),
-            #[cfg(feature = "ws")]
-            channels: crate::channels::Channels::new(32),
-            #[cfg(feature = "presence")]
-            presence: crate::presence::Presence::new(crate::channels::Channels::new(32)),
-            #[cfg(feature = "ws")]
-            shutdown: tokio_util::sync::CancellationToken::new(),
-            policy_registry: crate::authorization::PolicyRegistry::default(),
-            forbidden_response: crate::authorization::ForbiddenResponse::default(),
-            auth_session_key: "user_id".to_owned(),
-            shared_cache: None,
-            clock: std::sync::Arc::new(crate::time::SystemClock),
-        };
+        let state = test_app_state("user_id");
 
         let app = Router::new()
             .route("/protected", get(|| async { "secret" }))
@@ -2541,46 +2496,13 @@ mod tests {
         use tower::ServiceExt;
 
         use crate::session::{MemoryStore, SessionConfig, SessionLayer};
-        use crate::state::AppState;
 
         #[autumn_macros::secured]
         async fn protected_handler() -> crate::AutumnResult<&'static str> {
             Ok("secret")
         }
 
-        let state = AppState {
-            extensions: std::sync::Arc::new(std::sync::RwLock::new(
-                std::collections::HashMap::new(),
-            )),
-            #[cfg(feature = "db")]
-            pool: None,
-            #[cfg(feature = "db")]
-            replica_pool: None,
-            #[cfg(feature = "db")]
-            shards: None,
-            profile: None,
-            started_at: std::time::Instant::now(),
-            health_detailed: false,
-            probes: crate::probe::ProbeState::ready_for_test(),
-            metrics: crate::middleware::MetricsCollector::new(),
-            log_levels: crate::actuator::LogLevels::new("info"),
-            task_registry: crate::actuator::TaskRegistry::new(),
-            job_registry: crate::actuator::JobRegistry::new(),
-            config_props: crate::actuator::ConfigProperties::default(),
-            metrics_source_registry: crate::actuator::MetricsSourceRegistry::new(),
-            health_indicator_registry: crate::actuator::HealthIndicatorRegistry::new(),
-            #[cfg(feature = "ws")]
-            channels: crate::channels::Channels::new(32),
-            #[cfg(feature = "presence")]
-            presence: crate::presence::Presence::new(crate::channels::Channels::new(32)),
-            #[cfg(feature = "ws")]
-            shutdown: tokio_util::sync::CancellationToken::new(),
-            policy_registry: crate::authorization::PolicyRegistry::default(),
-            forbidden_response: crate::authorization::ForbiddenResponse::default(),
-            auth_session_key: "user_id".to_owned(),
-            shared_cache: None,
-            clock: std::sync::Arc::new(crate::time::SystemClock),
-        };
+        let state = test_app_state("user_id");
 
         let app = Router::new()
             .route("/", get(protected_handler))
@@ -2612,7 +2534,6 @@ mod tests {
         use tower::ServiceExt;
 
         use crate::session::{MemoryStore, SessionConfig, SessionLayer, SessionStore};
-        use crate::state::AppState;
 
         #[autumn_macros::secured]
         async fn protected_handler() -> crate::AutumnResult<&'static str> {
@@ -2628,39 +2549,7 @@ mod tests {
             .await
             .unwrap();
 
-        let state = AppState {
-            extensions: std::sync::Arc::new(std::sync::RwLock::new(
-                std::collections::HashMap::new(),
-            )),
-            #[cfg(feature = "db")]
-            pool: None,
-            #[cfg(feature = "db")]
-            replica_pool: None,
-            #[cfg(feature = "db")]
-            shards: None,
-            profile: None,
-            started_at: std::time::Instant::now(),
-            health_detailed: false,
-            probes: crate::probe::ProbeState::ready_for_test(),
-            metrics: crate::middleware::MetricsCollector::new(),
-            log_levels: crate::actuator::LogLevels::new("info"),
-            task_registry: crate::actuator::TaskRegistry::new(),
-            job_registry: crate::actuator::JobRegistry::new(),
-            config_props: crate::actuator::ConfigProperties::default(),
-            metrics_source_registry: crate::actuator::MetricsSourceRegistry::new(),
-            health_indicator_registry: crate::actuator::HealthIndicatorRegistry::new(),
-            #[cfg(feature = "ws")]
-            channels: crate::channels::Channels::new(32),
-            #[cfg(feature = "presence")]
-            presence: crate::presence::Presence::new(crate::channels::Channels::new(32)),
-            #[cfg(feature = "ws")]
-            shutdown: tokio_util::sync::CancellationToken::new(),
-            policy_registry: crate::authorization::PolicyRegistry::default(),
-            forbidden_response: crate::authorization::ForbiddenResponse::default(),
-            auth_session_key: "user_id".to_owned(),
-            shared_cache: None,
-            clock: std::sync::Arc::new(crate::time::SystemClock),
-        };
+        let state = test_app_state("user_id");
 
         let app = Router::new()
             .route("/", get(protected_handler))
@@ -2694,7 +2583,6 @@ mod tests {
         use tower::ServiceExt;
 
         use crate::session::{MemoryStore, SessionConfig, SessionLayer, SessionStore};
-        use crate::state::AppState;
 
         #[autumn_macros::secured]
         async fn account_handler() -> crate::AutumnResult<&'static str> {
@@ -2713,39 +2601,7 @@ mod tests {
             .await
             .unwrap();
 
-        let state = AppState {
-            extensions: std::sync::Arc::new(std::sync::RwLock::new(
-                std::collections::HashMap::new(),
-            )),
-            #[cfg(feature = "db")]
-            pool: None,
-            #[cfg(feature = "db")]
-            replica_pool: None,
-            #[cfg(feature = "db")]
-            shards: None,
-            profile: None,
-            started_at: std::time::Instant::now(),
-            health_detailed: false,
-            probes: crate::probe::ProbeState::ready_for_test(),
-            metrics: crate::middleware::MetricsCollector::new(),
-            log_levels: crate::actuator::LogLevels::new("info"),
-            task_registry: crate::actuator::TaskRegistry::new(),
-            job_registry: crate::actuator::JobRegistry::new(),
-            config_props: crate::actuator::ConfigProperties::default(),
-            metrics_source_registry: crate::actuator::MetricsSourceRegistry::new(),
-            health_indicator_registry: crate::actuator::HealthIndicatorRegistry::new(),
-            #[cfg(feature = "ws")]
-            channels: crate::channels::Channels::new(32),
-            #[cfg(feature = "presence")]
-            presence: crate::presence::Presence::new(crate::channels::Channels::new(32)),
-            #[cfg(feature = "ws")]
-            shutdown: tokio_util::sync::CancellationToken::new(),
-            policy_registry: crate::authorization::PolicyRegistry::default(),
-            forbidden_response: crate::authorization::ForbiddenResponse::default(),
-            auth_session_key: "uid".to_owned(),
-            shared_cache: None,
-            clock: std::sync::Arc::new(crate::time::SystemClock),
-        };
+        let state = test_app_state("uid");
 
         let app = Router::new()
             .route("/account", get(account_handler))
@@ -2779,7 +2635,6 @@ mod tests {
         use tower::ServiceExt;
 
         use crate::session::{MemoryStore, SessionConfig, SessionLayer, SessionStore};
-        use crate::state::AppState;
 
         #[autumn_macros::secured("admin")]
         async fn admin_only() -> crate::AutumnResult<&'static str> {
@@ -2798,39 +2653,7 @@ mod tests {
             .await
             .unwrap();
 
-        let state = AppState {
-            extensions: std::sync::Arc::new(std::sync::RwLock::new(
-                std::collections::HashMap::new(),
-            )),
-            #[cfg(feature = "db")]
-            pool: None,
-            #[cfg(feature = "db")]
-            replica_pool: None,
-            #[cfg(feature = "db")]
-            shards: None,
-            profile: None,
-            started_at: std::time::Instant::now(),
-            health_detailed: false,
-            probes: crate::probe::ProbeState::ready_for_test(),
-            metrics: crate::middleware::MetricsCollector::new(),
-            log_levels: crate::actuator::LogLevels::new("info"),
-            task_registry: crate::actuator::TaskRegistry::new(),
-            job_registry: crate::actuator::JobRegistry::new(),
-            config_props: crate::actuator::ConfigProperties::default(),
-            metrics_source_registry: crate::actuator::MetricsSourceRegistry::new(),
-            health_indicator_registry: crate::actuator::HealthIndicatorRegistry::new(),
-            #[cfg(feature = "ws")]
-            channels: crate::channels::Channels::new(32),
-            #[cfg(feature = "presence")]
-            presence: crate::presence::Presence::new(crate::channels::Channels::new(32)),
-            #[cfg(feature = "ws")]
-            shutdown: tokio_util::sync::CancellationToken::new(),
-            policy_registry: crate::authorization::PolicyRegistry::default(),
-            forbidden_response: crate::authorization::ForbiddenResponse::default(),
-            auth_session_key: "user_id".to_owned(),
-            shared_cache: None,
-            clock: std::sync::Arc::new(crate::time::SystemClock),
-        };
+        let state = test_app_state("user_id");
 
         let app = Router::new()
             .route("/", get(admin_only))
@@ -2860,7 +2683,6 @@ mod tests {
         use tower::ServiceExt;
 
         use crate::session::{MemoryStore, SessionConfig, SessionLayer, SessionStore};
-        use crate::state::AppState;
 
         #[autumn_macros::secured("admin", "editor")]
         async fn content_handler() -> crate::AutumnResult<&'static str> {
@@ -2879,39 +2701,7 @@ mod tests {
             .await
             .unwrap();
 
-        let state = AppState {
-            extensions: std::sync::Arc::new(std::sync::RwLock::new(
-                std::collections::HashMap::new(),
-            )),
-            #[cfg(feature = "db")]
-            pool: None,
-            #[cfg(feature = "db")]
-            replica_pool: None,
-            #[cfg(feature = "db")]
-            shards: None,
-            profile: None,
-            started_at: std::time::Instant::now(),
-            health_detailed: false,
-            probes: crate::probe::ProbeState::ready_for_test(),
-            metrics: crate::middleware::MetricsCollector::new(),
-            log_levels: crate::actuator::LogLevels::new("info"),
-            task_registry: crate::actuator::TaskRegistry::new(),
-            job_registry: crate::actuator::JobRegistry::new(),
-            config_props: crate::actuator::ConfigProperties::default(),
-            metrics_source_registry: crate::actuator::MetricsSourceRegistry::new(),
-            health_indicator_registry: crate::actuator::HealthIndicatorRegistry::new(),
-            #[cfg(feature = "ws")]
-            channels: crate::channels::Channels::new(32),
-            #[cfg(feature = "presence")]
-            presence: crate::presence::Presence::new(crate::channels::Channels::new(32)),
-            #[cfg(feature = "ws")]
-            shutdown: tokio_util::sync::CancellationToken::new(),
-            policy_registry: crate::authorization::PolicyRegistry::default(),
-            forbidden_response: crate::authorization::ForbiddenResponse::default(),
-            auth_session_key: "user_id".to_owned(),
-            shared_cache: None,
-            clock: std::sync::Arc::new(crate::time::SystemClock),
-        };
+        let state = test_app_state("user_id");
 
         let app = Router::new()
             .route("/", get(content_handler))
@@ -2945,7 +2735,6 @@ mod tests {
         use tower::ServiceExt;
 
         use crate::session::{MemoryStore, SessionConfig, SessionLayer, SessionStore};
-        use crate::state::AppState;
 
         let store = MemoryStore::new();
         // Pre-populate a session with user_id
@@ -2953,39 +2742,7 @@ mod tests {
         session_data.insert("user_id".into(), "42".into());
         store.save("valid-session", session_data).await.unwrap();
 
-        let state = AppState {
-            extensions: std::sync::Arc::new(std::sync::RwLock::new(
-                std::collections::HashMap::new(),
-            )),
-            #[cfg(feature = "db")]
-            pool: None,
-            #[cfg(feature = "db")]
-            replica_pool: None,
-            #[cfg(feature = "db")]
-            shards: None,
-            profile: None,
-            started_at: std::time::Instant::now(),
-            health_detailed: false,
-            probes: crate::probe::ProbeState::ready_for_test(),
-            metrics: crate::middleware::MetricsCollector::new(),
-            log_levels: crate::actuator::LogLevels::new("info"),
-            task_registry: crate::actuator::TaskRegistry::new(),
-            job_registry: crate::actuator::JobRegistry::new(),
-            config_props: crate::actuator::ConfigProperties::default(),
-            metrics_source_registry: crate::actuator::MetricsSourceRegistry::new(),
-            health_indicator_registry: crate::actuator::HealthIndicatorRegistry::new(),
-            #[cfg(feature = "ws")]
-            channels: crate::channels::Channels::new(32),
-            #[cfg(feature = "presence")]
-            presence: crate::presence::Presence::new(crate::channels::Channels::new(32)),
-            #[cfg(feature = "ws")]
-            shutdown: tokio_util::sync::CancellationToken::new(),
-            policy_registry: crate::authorization::PolicyRegistry::default(),
-            forbidden_response: crate::authorization::ForbiddenResponse::default(),
-            auth_session_key: "user_id".to_owned(),
-            shared_cache: None,
-            clock: std::sync::Arc::new(crate::time::SystemClock),
-        };
+        let state = test_app_state("user_id");
 
         let app = Router::new()
             .route("/protected", get(|| async { "secret" }))
@@ -3009,6 +2766,136 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(std::str::from_utf8(&body).unwrap(), "secret");
+    }
+
+    #[tokio::test]
+    async fn require_auth_sets_rate_limit_principal() {
+        use axum::Router;
+        use axum::body::Body;
+        use axum::routing::get;
+        use http::header::COOKIE;
+        use tower::ServiceExt;
+
+        use crate::security::RateLimitPrincipal;
+        use crate::session::{MemoryStore, SessionConfig, SessionLayer, SessionStore};
+
+        async fn handler(
+            axum::Extension(principal): axum::Extension<RateLimitPrincipal>,
+        ) -> String {
+            principal.0
+        }
+
+        let store = MemoryStore::new();
+        let mut session_data = std::collections::HashMap::new();
+        session_data.insert("user_id".into(), "42".into());
+        store.save("valid-session", session_data).await.unwrap();
+
+        let state = test_app_state("user_id");
+
+        let app = Router::new()
+            .route("/protected", get(handler))
+            .layer(RequireAuth::new("user_id"))
+            .layer(SessionLayer::new(store, SessionConfig::default()))
+            .with_state(state);
+
+        let response = app
+            .oneshot(
+                http::Request::builder()
+                    .uri("/protected")
+                    .header(COOKIE, "autumn.sid=valid-session")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(std::str::from_utf8(&body).unwrap(), "42");
+    }
+
+    #[tokio::test]
+    async fn require_auth_rate_limits_by_session_principal() {
+        // Verifies end-to-end: RequireAuth (outer) sets RateLimitPrincipal so a
+        // route-scoped RateLimitLayer (inner) keys on the principal, not the IP.
+        // Layer composition:  Session → RequireAuth → RateLimitLayer → handler
+        use axum::Router;
+        use axum::body::Body;
+        use axum::routing::get;
+        use http::header::COOKIE;
+        use tower::ServiceExt;
+
+        use crate::security::{KeyStrategy, RateLimitConfig, RateLimitLayer};
+        use crate::session::{MemoryStore, SessionConfig, SessionLayer, SessionStore};
+
+        let session_store = MemoryStore::new();
+        let mut data_a = std::collections::HashMap::new();
+        data_a.insert("user_id".into(), "user-1".into());
+        session_store.save("sess-a", data_a).await.unwrap();
+        let mut data_b = std::collections::HashMap::new();
+        data_b.insert("user_id".into(), "user-2".into());
+        session_store.save("sess-b", data_b).await.unwrap();
+
+        let rl_config = RateLimitConfig {
+            enabled: true,
+            requests_per_second: 0.1,
+            burst: 1,
+            key_strategy: KeyStrategy::AuthenticatedPrincipal,
+            ..Default::default()
+        };
+
+        let state = test_app_state("user_id");
+
+        let app = Router::new()
+            .route("/protected", get(|| async { "ok" }))
+            .layer(RateLimitLayer::from_config(&rl_config)) // inner — reads principal
+            .layer(RequireAuth::new("user_id")) // outer — sets RateLimitPrincipal
+            .layer(SessionLayer::new(session_store, SessionConfig::default()))
+            .with_state(state);
+
+        // user-1 first request: allowed (1 token in bucket).
+        let r = app
+            .clone()
+            .oneshot(
+                http::Request::builder()
+                    .uri("/protected")
+                    .header(COOKIE, "autumn.sid=sess-a")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+
+        // user-1 second request: bucket exhausted → 429.
+        let r = app
+            .clone()
+            .oneshot(
+                http::Request::builder()
+                    .uri("/protected")
+                    .header(COOKIE, "autumn.sid=sess-a")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        // user-2 first request: separate bucket → allowed.
+        let r = app
+            .clone()
+            .oneshot(
+                http::Request::builder()
+                    .uri("/protected")
+                    .header(COOKIE, "autumn.sid=sess-b")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
     }
 
     #[tokio::test]
@@ -3816,6 +3703,120 @@ mod api_token_tests {
         let layer2 = RequireApiToken::new(store2);
         let mut svc2 = layer2.layer(MockService { ready: true });
         assert!(svc2.poll_ready(&mut cx).is_ready());
+    }
+
+    #[tokio::test]
+    async fn require_api_token_rate_limits_by_principal() {
+        // Verifies end-to-end: RequireApiToken (outer) sets RateLimitPrincipal
+        // with the VERIFIED principal ID so a route-scoped RateLimitLayer (inner)
+        // keys on the principal — two different tokens for the same principal share
+        // one bucket.  Layer composition: RequireApiToken → RateLimitLayer → handler
+        use axum::body::Body;
+        use tower::ServiceExt;
+
+        use crate::security::{KeyStrategy, RateLimitConfig, RateLimitLayer};
+
+        let rl_config = RateLimitConfig {
+            enabled: true,
+            requests_per_second: 0.1,
+            burst: 1,
+            key_strategy: KeyStrategy::AuthenticatedPrincipal,
+            ..Default::default()
+        };
+
+        let store = Arc::new(InMemoryApiTokenStore::default());
+        let token_a1 = issue_api_token(&*store, "principal-1").await.unwrap();
+        let token_a2 = issue_api_token(&*store, "principal-1").await.unwrap(); // second token, same principal
+        let token_b = issue_api_token(&*store, "principal-2").await.unwrap();
+
+        let app = axum::Router::new()
+            .route("/", axum::routing::get(|| async { "ok" }))
+            .layer(RateLimitLayer::from_config(&rl_config)) // inner — reads principal
+            .layer(RequireApiToken::new(Arc::clone(&store))); // outer — sets RateLimitPrincipal
+
+        // principal-1, first token: allowed.
+        let r = app
+            .clone()
+            .oneshot(
+                http::Request::builder()
+                    .uri("/")
+                    .header("authorization", format!("Bearer {token_a1}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+
+        // principal-1, different token: shares the same bucket → 429.
+        let r = app
+            .clone()
+            .oneshot(
+                http::Request::builder()
+                    .uri("/")
+                    .header("authorization", format!("Bearer {token_a2}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            r.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "second token for the same principal must share the rate-limit bucket"
+        );
+
+        // principal-2: separate bucket → allowed.
+        let r = app
+            .clone()
+            .oneshot(
+                http::Request::builder()
+                    .uri("/")
+                    .header("authorization", format!("Bearer {token_b}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn require_api_token_sets_rate_limit_principal() {
+        use axum::body::Body;
+        use tower::ServiceExt;
+
+        use crate::security::RateLimitPrincipal;
+
+        async fn handler(
+            axum::Extension(principal): axum::Extension<RateLimitPrincipal>,
+        ) -> String {
+            principal.0
+        }
+
+        let store = Arc::new(InMemoryApiTokenStore::default());
+        let raw = issue_api_token(&*store, "agent:bot").await.unwrap();
+
+        let app = axum::Router::new()
+            .route("/", axum::routing::get(handler))
+            .layer(RequireApiToken::new(Arc::clone(&store)));
+
+        let response = app
+            .oneshot(
+                http::Request::builder()
+                    .uri("/")
+                    .header("authorization", format!("Bearer {raw}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(std::str::from_utf8(&body).unwrap(), "agent:bot");
     }
 }
 
