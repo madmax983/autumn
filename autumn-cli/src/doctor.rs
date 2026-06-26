@@ -2173,11 +2173,10 @@ fn resolve_active_profiles() -> (String, String, Vec<String>) {
 }
 
 fn resolve_proxy_conflict_data() -> ProxyConflictData {
-    // Use the profile-merged table so that [profile.prod] / autumn-prod.toml
-    // overrides are included — matching the pattern used by resolve_trusted_hosts.
-    let (_canonical, _selected, profiles) = resolve_active_profiles();
-    let profile_refs: Vec<&str> = profiles.iter().map(String::as_str).collect();
-    let table = get_merged_toml_table_profiles(&profile_refs);
+    // Mirror the runtime: load only the first existing override file so a
+    // stale autumn-production.toml doesn't shadow autumn-prod.toml at startup.
+    let (canonical, selected, _profiles) = resolve_active_profiles();
+    let table = get_merged_toml_table_runtime(&canonical, &selected);
 
     let parse_csv_env = |var: &str| -> Option<Vec<String>> {
         std::env::var(var).ok().map(|v| {
