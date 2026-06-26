@@ -526,59 +526,7 @@ pub fn deliver_webhook_job(
             AutumnError::internal_server_error_msg("WebhookOutboundManager not found in extensions")
         })?;
 
-        // Support both self-contained payload structure and legacy log_id lookup (for replays)
-        let (sub, mut log) = if let Some(sub_val) = payload.get("subscription") {
-            let _payload_sub: WebhookSubscription = serde_json::from_value(sub_val.clone())
-                .map_err(|e| {
-                    AutumnError::bad_request_msg(format!("failed to parse subscription: {e}"))
-                })?;
-            let mut log: WebhookDeliveryLog = serde_json::from_value(
-                payload
-                    .get("log")
-                    .cloned()
-                    .ok_or_else(|| AutumnError::bad_request_msg("missing log in job payload"))?,
-            )
-            .map_err(|e| AutumnError::bad_request_msg(format!("failed to parse log: {e}")))?;
-
-            // If this log has already been attempted (i.e. is running a retry from the job runner),
-            // increment the attempt counter and write the pre-send log.
-            if log.response_status.is_some() || log.last_error.is_some() {
-                log.attempt = log.attempt.saturating_add(1);
-                log.response_status = None;
-                log.response_body = None;
-                log.last_error = None;
-                manager.store().log_delivery(log.clone()).await?;
-            }
-
-            let sub = load_current_subscription(&manager, &log).await?;
-            (sub, log)
-        } else {
-            let log_id = payload
-                .get("log_id")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| AutumnError::bad_request_msg("missing log_id in job payload"))?;
-
-            tracing::debug!(log_id = %log_id, "deliver_webhook_job: starting webhook delivery via log lookup");
-
-            let log_opt = manager.store().get_delivery_log(log_id).await?;
-            let mut log = log_opt.ok_or_else(|| {
-                AutumnError::not_found_msg(format!("delivery log {log_id} not found"))
-            })?;
-
-            // If this log has already been attempted (i.e. is running a retry from the job runner),
-            // increment the attempt counter and write the pre-send log.
-            if log.response_status.is_some() || log.last_error.is_some() {
-                log.attempt = log.attempt.saturating_add(1);
-                log.response_status = None;
-                log.response_body = None;
-                log.last_error = None;
-                manager.store().log_delivery(log.clone()).await?;
-            }
-
-            // Load latest subscription state to respect emergency rotations/disable
-            let sub = load_current_subscription(&manager, &log).await?;
-            (sub, log)
-        };
+        let (sub, mut log) = resolve_subscription_and_log(&manager, &payload).await?;
 
         if sub.status == WebhookSubscriptionStatus::Disabled {
             tracing::info!(subscription_id = %sub.id, "Webhook subscription is disabled; skipping delivery");
@@ -669,6 +617,59 @@ pub fn deliver_webhook_job(
             }
         }
     })
+}
+
+async fn prepare_retry_log(
+    manager: &WebhookOutboundManager,
+    log: &mut WebhookDeliveryLog,
+) -> AutumnResult<()> {
+    if log.response_status.is_some() || log.last_error.is_some() {
+        log.attempt = log.attempt.saturating_add(1);
+        log.response_status = None;
+        log.response_body = None;
+        log.last_error = None;
+        manager.store().log_delivery(log.clone()).await?;
+    }
+    Ok(())
+}
+
+async fn resolve_subscription_and_log(
+    manager: &WebhookOutboundManager,
+    payload: &serde_json::Value,
+) -> AutumnResult<(WebhookSubscription, WebhookDeliveryLog)> {
+    if let Some(sub_val) = payload.get("subscription") {
+        let _payload_sub: WebhookSubscription =
+            serde_json::from_value(sub_val.clone()).map_err(|e| {
+                AutumnError::bad_request_msg(format!("failed to parse subscription: {e}"))
+            })?;
+        let mut log: WebhookDeliveryLog = serde_json::from_value(
+            payload
+                .get("log")
+                .cloned()
+                .ok_or_else(|| AutumnError::bad_request_msg("missing log in job payload"))?,
+        )
+        .map_err(|e| AutumnError::bad_request_msg(format!("failed to parse log: {e}")))?;
+
+        prepare_retry_log(manager, &mut log).await?;
+        let sub = load_current_subscription(manager, &log).await?;
+        Ok((sub, log))
+    } else {
+        let log_id = payload
+            .get("log_id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| AutumnError::bad_request_msg("missing log_id in job payload"))?;
+
+        tracing::debug!(log_id = %log_id, "deliver_webhook_job: starting webhook delivery via log lookup");
+
+        let log_opt = manager.store().get_delivery_log(log_id).await?;
+        let mut log = log_opt.ok_or_else(|| {
+            AutumnError::not_found_msg(format!("delivery log {log_id} not found"))
+        })?;
+
+        prepare_retry_log(manager, &mut log).await?;
+        let sub = load_current_subscription(manager, &log).await?;
+        Ok((sub, log))
+    }
 }
 
 async fn load_current_subscription(
