@@ -158,6 +158,50 @@ pub fn read_scaffold_config_or_defaults(
     })
 }
 
+/// Resolve a scaffold entry from an **explicit** `--config <path>`.
+///
+/// Unlike [`read_scaffold_config_or_defaults`] (used for an auto-discovered
+/// project config), this preserves typo protection: when the requested
+/// `[scaffold.ResourceName]` section is absent it errors, *unless*
+///
+/// - the file defines no `[scaffold.*]` sections at all (a pure `[generate]`
+///   defaults file — there is nothing to typo), or
+/// - the caller supplied fields on the CLI (the scaffold definition comes from
+///   the command line, and the config is only consulted for defaults).
+///
+/// In those two cases it returns a default entry carrying the `[generate] id`
+/// project default.
+///
+/// # Errors
+///
+/// - [`GenerateError::Io`] if the file cannot be read.
+/// - [`GenerateError::Config`] if the file is not valid TOML, or the requested
+///   section is missing and neither exception applies.
+pub fn read_explicit_scaffold_config(
+    config_path: &Path,
+    resource_name: &str,
+    cli_has_fields: bool,
+) -> Result<ScaffoldConfigEntry, GenerateError> {
+    // The `[scaffold.X]` section (with `[generate] id` already propagated).
+    if let Some(entry) = read_scaffold_config(config_path, resource_name)? {
+        return Ok(entry);
+    }
+    // Section absent: allow the project-default fallback only when there is no
+    // scaffold table to have mistyped, or the CLI carries the field list.
+    let config = parse_config(config_path)?;
+    if config.scaffold.is_empty() || cli_has_fields {
+        return Ok(ScaffoldConfigEntry {
+            id: config.generate.id,
+            ..ScaffoldConfigEntry::default()
+        });
+    }
+    Err(GenerateError::Config(format!(
+        "no [scaffold.{}] section found in {}",
+        pascal(resource_name),
+        config_path.display()
+    )))
+}
+
 /// Read the raw project-level `[generate] id` string from `config_path`, if set.
 ///
 /// # Errors
@@ -368,6 +412,54 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
             matches!(err, GenerateError::Io(_)),
             "expected Io error for missing file, got: {err:?}"
         );
+    }
+
+    // ── read_explicit_scaffold_config (typo protection, issue #1400) ───────
+
+    #[test]
+    fn explicit_config_uses_matching_section() {
+        let tmp = TempDir::new().unwrap();
+        let path = write_config(&tmp, "[scaffold.Post]\nfields = [\"title:String\"]\n");
+        let entry = read_explicit_scaffold_config(&path, "Post", false).unwrap();
+        assert_eq!(entry.fields, vec!["title:String"]);
+    }
+
+    #[test]
+    fn explicit_config_missing_section_among_others_errors_without_cli_fields() {
+        // Typo protection: the file defines a scaffold resource, but not the
+        // requested one, and the CLI supplied no fields → likely a typo.
+        let tmp = TempDir::new().unwrap();
+        let path = write_config(&tmp, "[scaffold.Other]\nfields = [\"name:String\"]\n");
+        let err = read_explicit_scaffold_config(&path, "Post", false).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("no [scaffold.Post] section"),
+            "missing section with other sections present must error: {msg}"
+        );
+    }
+
+    #[test]
+    fn explicit_config_missing_section_ok_with_cli_fields() {
+        // CLI supplies the field list, so the missing section is not fatal; the
+        // [generate] id default still applies.
+        let tmp = TempDir::new().unwrap();
+        let path = write_config(
+            &tmp,
+            "[generate]\nid = \"uuid\"\n\n[scaffold.Other]\nfields = [\"name:String\"]\n",
+        );
+        let entry = read_explicit_scaffold_config(&path, "Post", true).unwrap();
+        assert_eq!(entry.id.as_deref(), Some("uuid"));
+        assert!(entry.fields.is_empty());
+    }
+
+    #[test]
+    fn explicit_config_pure_generate_file_is_lenient() {
+        // A file with no [scaffold.*] sections is a pure defaults file: there is
+        // nothing to mistype, so a missing section is fine even without fields.
+        let tmp = TempDir::new().unwrap();
+        let path = write_config(&tmp, "[generate]\nid = \"uuid\"\n");
+        let entry = read_explicit_scaffold_config(&path, "Post", false).unwrap();
+        assert_eq!(entry.id.as_deref(), Some("uuid"));
     }
 
     // ── merge_config_with_cli ─────────────────────────────────────────────

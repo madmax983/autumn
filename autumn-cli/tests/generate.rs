@@ -1465,11 +1465,9 @@ fn generate_scaffold_rejects_missing_config_file() {
     );
 }
 
-/// When the config file exists but has no entry for the requested resource,
-/// the command must succeed using project-level `[generate]` defaults
-/// (or standard defaults if `[generate]` is absent too).
-/// This enables a single `[generate] id = "uuid"` to apply project-wide
-/// without requiring every resource to have its own `[scaffold.X]` section.
+/// Explicit `--config` with no matching `[scaffold.X]` section but WITH CLI
+/// fields succeeds: the field list comes from the CLI and the config is only
+/// consulted for project defaults.
 #[test]
 fn generate_scaffold_missing_resource_section_uses_defaults() {
     let (_tmp, project) = fresh_project("scaffold-missing-section-app");
@@ -1480,7 +1478,7 @@ fn generate_scaffold_missing_resource_section_uses_defaults() {
     )
     .unwrap();
 
-    // No [scaffold.Post] section — should succeed with default settings.
+    // No [scaffold.Post] section, but fields supplied on the CLI → succeed.
     run_autumn(
         &project,
         &[
@@ -1498,6 +1496,46 @@ fn generate_scaffold_missing_resource_section_uses_defaults() {
     assert!(
         model.contains("pub id: i64,"),
         "missing-section scaffold should default to i64 PK; got:\n{model}"
+    );
+}
+
+/// Typo protection (Codex P2): explicit `--config` with no matching
+/// `[scaffold.X]` section, the file DOES define other scaffold resources, and
+/// NO CLI fields were given → the command must error rather than silently
+/// generate an empty resource.
+#[test]
+fn generate_scaffold_explicit_config_missing_section_errors() {
+    let (_tmp, project) = fresh_project("scaffold-typo-section-app");
+
+    fs::write(
+        project.join("autumn.generate.toml"),
+        "[scaffold.OtherResource]\nfields = [\"name:String\"]\n",
+    )
+    .unwrap();
+
+    // Misspelled/missing [scaffold.Post] + no CLI fields → likely a typo.
+    let (_, stderr, code) = run_autumn_failing(
+        &project,
+        &[
+            "generate",
+            "scaffold",
+            "Post",
+            "--config",
+            "autumn.generate.toml",
+        ],
+    );
+    assert_eq!(
+        code,
+        Some(1),
+        "missing section with no CLI fields must fail"
+    );
+    assert!(
+        stderr.contains("no [scaffold.Post] section found"),
+        "error must name the missing section; got:\n{stderr}"
+    );
+    assert!(
+        !project.join("src/models/post.rs").exists(),
+        "errored scaffold must not write a model file"
     );
 }
 
