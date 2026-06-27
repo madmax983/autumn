@@ -851,20 +851,9 @@ pub async fn index(
     // The stream handler uses the fully-qualified axum path so no extra IntoResponse
     // import is needed.
     let db_import = if sharded {
-        if live {
-            "use autumn_web::flash::Flash;\n\
-             use autumn_web::sharding::ShardedDb;\n\
-             use autumn_web::{AutumnError, AutumnResult, Markup, get, html, post, secured};"
-                .to_owned()
-        } else {
-            "use autumn_web::flash::Flash;\n\
-             use autumn_web::sharding::ShardedDb;\n\
-             use autumn_web::{AutumnError, AutumnResult, Markup, get, html, post, secured};"
-                .to_owned()
-        }
-    } else if live {
         "use autumn_web::flash::Flash;\n\
-         use autumn_web::{AutumnError, AutumnResult, Db, Markup, get, html, post, secured};"
+         use autumn_web::sharding::ShardedDb;\n\
+         use autumn_web::{AutumnError, AutumnResult, Markup, get, html, post, secured};"
             .to_owned()
     } else {
         "use autumn_web::flash::Flash;\n\
