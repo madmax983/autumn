@@ -939,7 +939,10 @@ fn prune_job_admin_history(inner: &mut JobAdminMemoryInner) {
         let is_active = inner.records.get(&id).is_some_and(|record| {
             matches!(
                 record.status,
-                JobAdminStatus::Enqueued | JobAdminStatus::Running | JobAdminStatus::Retrying
+                JobAdminStatus::Enqueued
+                    | JobAdminStatus::Scheduled
+                    | JobAdminStatus::Running
+                    | JobAdminStatus::Retrying
             )
         });
         if is_active {
