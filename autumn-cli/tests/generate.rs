@@ -2623,7 +2623,7 @@ fn live_validation_emits_validate_handler_with_real_rules() {
         "routes must contain validate_title handler:\n{routes}"
     );
     assert!(
-        routes.contains("value.len() < 1 || value.len() > 200"),
+        routes.contains("value.chars().count() < 1 || value.chars().count() > 200"),
         "validate_title must check length bounds:\n{routes}"
     );
 

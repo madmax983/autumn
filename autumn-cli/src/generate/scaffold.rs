@@ -238,32 +238,28 @@ pub fn plan_scaffold_with_options(
     }
     plan_cargo_deps(&mut plan, project_root, &combined);
 
+    // When --live is used the generated code calls autumn_web::sse::stream (requires
+    // the `ws` feature), uses LiveFragment with maud (requires `maud`), and renders
+    // SSE list containers that reference HTMX OOB (requires `htmx`). Ensure all three
+    // features are present in the project's autumn-web dependency.
     if options_with_key.live {
-        let cargo_toml_path = project_root.join("Cargo.toml");
-        let mut cargo_content = None;
-        for action in &mut plan.actions {
-            match action {
-                Action::Modify { path, contents } if path == &cargo_toml_path => {
-                    cargo_content = Some(contents);
-                    break;
-                }
-                _ => {}
-            }
+        let cargo_path = project_root.join("Cargo.toml");
+        let base = plan
+            .actions
+            .iter()
+            .rev()
+            .find_map(|a| match a {
+                Action::Modify { path, contents } if path == &cargo_path => Some(contents.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| read_or_empty(&cargo_path));
+        let mut updated = base.clone();
+        for feat in ["htmx", "maud", "ws"] {
+            updated = ensure_autumn_web_feature(&updated, feat);
         }
-
-        if let Some(contents) = cargo_content {
-            let with_ws = ensure_autumn_web_feature(contents, "ws");
-            let with_maud = ensure_autumn_web_feature(&with_ws, "maud");
-            let with_htmx = ensure_autumn_web_feature(&with_maud, "htmx");
-            *contents = with_htmx;
-        } else {
-            let existing = read_or_empty(&cargo_toml_path);
-            let with_ws = ensure_autumn_web_feature(&existing, "ws");
-            let with_maud = ensure_autumn_web_feature(&with_ws, "maud");
-            let with_htmx = ensure_autumn_web_feature(&with_maud, "htmx");
-            if with_htmx != existing {
-                plan.modify(cargo_toml_path, with_htmx);
-            }
+        if updated != base {
+            plan.actions.retain(|a| a.path() != cargo_path);
+            plan.modify(cargo_path, updated);
         }
     }
 
@@ -478,8 +474,8 @@ fn render_repository_file(
              \x20\x20\x20\x20fn dom_id(&self) -> String {{\n\
              \x20\x20\x20\x20\x20\x20\x20\x20Self::dom_id_for(self.id)\n\
              \x20\x20\x20\x20}}\n\
-             \x20\x20\x20\x20fn render_fragment(&self) -> autumn_web::maud::Markup {{\n\
-             \x20\x20\x20\x20\x20\x20\x20\x20autumn_web::maud::html! {{\n\
+             \x20\x20\x20\x20fn render_fragment(&self) -> maud::Markup {{\n\
+             \x20\x20\x20\x20\x20\x20\x20\x20maud::html! {{\n\
              \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20li id=(self.dom_id()) {{ (self.id) }}\n\
              \x20\x20\x20\x20\x20\x20\x20\x20}}\n\
              \x20\x20\x20\x20}}\n\
@@ -849,10 +845,18 @@ pub async fn index(
         let mut vh = String::new();
         for (field_name, rules) in validations {
             let rule_comment = rules.join(", ");
-            // Build the error chain: start with the required-check (empty), then
+            // Build the error chain: start with an empty-value check, then
             // append one branch per declared rule (url, email, length).
-            let mut error_chain =
-                String::from("if value.is_empty() {\n        Some(\"required\")\n    }");
+            // Nullable fields are not required — leave them empty → None.
+            let is_required = fields
+                .iter()
+                .find(|f| f.name == *field_name)
+                .map_or(true, |f| !f.nullable);
+            let mut error_chain = if is_required {
+                String::from("if value.is_empty() {\n        Some(\"required\")\n    }")
+            } else {
+                String::from("if value.is_empty() {\n        None\n    }")
+            };
             for rule in rules {
                 if rule == "url" {
                     error_chain.push_str(
@@ -862,8 +866,9 @@ pub async fn index(
                     error_chain.push_str(
                         " else if !value.contains('@')\n            || value.split_once('@').map_or(true, |(_, d)| !d.contains('.')) {\n        Some(\"must be a valid email address\")\n    }",
                     );
-                } else if let Some(args_str) =
-                    rule.strip_prefix("length(").and_then(|s| s.strip_suffix(")"))
+                } else if let Some(args_str) = rule
+                    .strip_prefix("length(")
+                    .and_then(|s| s.strip_suffix(")"))
                 {
                     let mut min: Option<u64> = None;
                     let mut max: Option<u64> = None;
@@ -883,9 +888,11 @@ pub async fn index(
                         continue;
                     }
                     let cond = match (min, max) {
-                        (Some(mn), Some(mx)) => format!("value.len() < {mn} || value.len() > {mx}"),
-                        (Some(mn), None) => format!("value.len() < {mn}"),
-                        (None, Some(mx)) => format!("value.len() > {mx}"),
+                        (Some(mn), Some(mx)) => {
+                            format!("value.chars().count() < {mn} || value.chars().count() > {mx}")
+                        }
+                        (Some(mn), None) => format!("value.chars().count() < {mn}"),
+                        (None, Some(mx)) => format!("value.chars().count() > {mx}"),
                         (None, None) => unreachable!(),
                     };
                     let msg = match (min, max) {
