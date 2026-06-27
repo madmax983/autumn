@@ -599,8 +599,8 @@ impl Client {
         // replaces AutumnConfig/HttpConfig with a different timeout_secs runs
         // after build_state, so without this check the stale inner would
         // silently override the new config's per-request timeout.
-        let effective_timeout_secs = config.as_ref().map_or(
-            crate::config::HttpClientConfig::default().timeout_secs,
+        let effective_timeout_secs = config.as_ref().map_or_else(
+            || crate::config::HttpClientConfig::default().timeout_secs,
             |c| c.client.timeout_secs,
         );
         let shared = state.extension::<SharedReqwestClient>().and_then(|s| {
