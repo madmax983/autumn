@@ -1289,6 +1289,17 @@ fn redis_requeue_unique_action(record: &RedisJobRecord) -> &'static str {
 #[cfg(feature = "redis")]
 const REDIS_WORKER_IDLE_SLEEP_MAX: std::time::Duration = std::time::Duration::from_millis(200);
 
+/// Maximum delay between delayed-ZSET promotion scans.
+///
+/// One-shot delayed jobs (`enqueue_in` / `enqueue_at`) share the same ZSET as
+/// retries.  Without a cap, a deployment whose jobs all have large retry
+/// backoffs (e.g. 60 s) would inherit that long promotion interval, causing
+/// short-delay jobs to run far later than requested.  Capping at 1 s keeps
+/// timing accurate while adding only negligible Redis load (ZRANGEBYSCORE is
+/// O(log N)).
+#[cfg(feature = "redis")]
+const REDIS_DELAYED_PROMOTION_MAX_INTERVAL_MS: u64 = 1_000;
+
 #[cfg(feature = "redis")]
 fn redis_retry_promotion_interval_ms(default_backoff_ms: u64, jobs: &[JobInfo]) -> u64 {
     let mut interval_ms = default_backoff_ms.max(1);
@@ -1297,7 +1308,7 @@ fn redis_retry_promotion_interval_ms(default_backoff_ms: u64, jobs: &[JobInfo]) 
             interval_ms = interval_ms.min(job.initial_backoff_ms);
         }
     }
-    interval_ms
+    interval_ms.min(REDIS_DELAYED_PROMOTION_MAX_INTERVAL_MS)
 }
 
 #[cfg(feature = "redis")]
@@ -7596,6 +7607,21 @@ mod tests {
 
         assert_eq!(redis_retry_promotion_interval_ms(250, &jobs), 25);
         assert_eq!(redis_retry_promotion_interval_ms(0, &[]), 1);
+
+        // Large retry backoffs must not delay one-shot delayed-job promotion.
+        let slow_jobs = vec![JobInfo {
+            name: "very_slow".to_string(),
+            max_attempts: 3,
+            initial_backoff_ms: 60_000,
+            uniqueness: None,
+            concurrency: None,
+            handler: redis_counting_success_handler,
+        }];
+        assert_eq!(
+            redis_retry_promotion_interval_ms(60_000, &slow_jobs),
+            REDIS_DELAYED_PROMOTION_MAX_INTERVAL_MS,
+            "large backoff must be capped so delayed jobs are promoted within ~1s"
+        );
     }
 
     #[cfg(feature = "redis")]
