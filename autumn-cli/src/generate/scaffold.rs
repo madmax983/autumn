@@ -843,36 +843,98 @@ pub async fn index(
     };
 
     // When `--live-validation`, emit one inline-validation handler per validated field.
+    // Each handler runs the actual declared validation rule(s) at runtime, not just
+    // an empty-check stub.
     let validate_handlers = if live_validation {
-        use std::fmt::Write as _;
         let mut vh = String::new();
         for (field_name, rules) in validations {
             let rule_comment = rules.join(", ");
-            let _ = write!(
-                vh,
-                r#"
+            // Build the error chain: start with the required-check (empty), then
+            // append one branch per declared rule (url, email, length).
+            let mut error_chain =
+                String::from("if value.is_empty() {\n        Some(\"required\")\n    }");
+            for rule in rules {
+                if rule == "url" {
+                    error_chain.push_str(
+                        " else if url::Url::parse(&value).is_err() {\n        Some(\"must be a valid URL\")\n    }",
+                    );
+                } else if rule == "email" {
+                    error_chain.push_str(
+                        " else if !value.contains('@')\n            || value.split_once('@').map_or(true, |(_, d)| !d.contains('.')) {\n        Some(\"must be a valid email address\")\n    }",
+                    );
+                } else if let Some(args_str) =
+                    rule.strip_prefix("length(").and_then(|s| s.strip_suffix(")"))
+                {
+                    let mut min: Option<u64> = None;
+                    let mut max: Option<u64> = None;
+                    for part in args_str.split(',') {
+                        let part = part.trim();
+                        if let Some(n_str) = part.strip_prefix("min = ") {
+                            if let Ok(n) = n_str.trim().parse::<u64>() {
+                                min = Some(n);
+                            }
+                        } else if let Some(n_str) = part.strip_prefix("max = ") {
+                            if let Ok(n) = n_str.trim().parse::<u64>() {
+                                max = Some(n);
+                            }
+                        }
+                    }
+                    if min.is_none() && max.is_none() {
+                        continue;
+                    }
+                    let cond = match (min, max) {
+                        (Some(mn), Some(mx)) => format!("value.len() < {mn} || value.len() > {mx}"),
+                        (Some(mn), None) => format!("value.len() < {mn}"),
+                        (None, Some(mx)) => format!("value.len() > {mx}"),
+                        (None, None) => unreachable!(),
+                    };
+                    let msg = match (min, max) {
+                        (Some(mn), Some(mx)) => {
+                            format!("must be between {mn} and {mx} characters")
+                        }
+                        (Some(mn), None) => format!("must be at least {mn} characters"),
+                        (None, Some(mx)) => format!("must be at most {mx} characters"),
+                        (None, None) => unreachable!(),
+                    };
+                    error_chain.push_str(&format!(
+                        " else if {cond} {{\n        Some(\"{msg}\")\n    }}"
+                    ));
+                }
+            }
+            error_chain.push_str(" else {\n        None\n    }");
 
-/// `POST /{plural}/validate/{field_name}` — inline validation fragment.
-///
-/// Returns an `<span id="{field_name}-error">` OOB fragment with an error
-/// message when the value fails the `{rule_comment}` rule, or an empty span
-/// when it passes. Consumed by htmx `hx-swap="outerHTML"` on `hx-trigger="change"`.
-#[post("/{plural}/validate/{field_name}")]
-pub async fn validate_{field_name}(body: autumn_web::reexports::axum::body::Bytes) -> autumn_web::Markup {{
-    let value = url::form_urlencoded::parse(body.as_ref())
-        .find(|(k, _)| k == "{field_name}")
-        .map(|(_, v)| v.to_string())
-        .unwrap_or_default();
-    let error = if value.is_empty() {{ Some("required") }} else {{ None }};
-    autumn_web::html! {{
-        span id="{field_name}-error" {{
-            @if let Some(msg) = error {{
-                span style="color:red" {{ (msg) }}
-            }}
-        }}
-    }}
-}}"#
+            // Build the handler string via push_str to avoid brace-escaping issues
+            // between the format! template and the generated Rust { } delimiters.
+            vh.push_str(&format!(
+                "\n\n/// `POST /{plural}/validate/{field_name}` — inline validation fragment.\n"
+            ));
+            vh.push_str(&format!(
+                "///\n/// Returns an `<span id=\"{field_name}-error\">` OOB fragment with an error\n"
+            ));
+            vh.push_str(&format!(
+                "/// message when the value fails the `{rule_comment}` rule, or an empty span\n"
+            ));
+            vh.push_str(
+                "/// when it passes. Consumed by htmx `hx-swap=\"outerHTML\"` on `hx-trigger=\"change\"`.\n",
             );
+            vh.push_str(&format!("#[post(\"/{plural}/validate/{field_name}\")]\n"));
+            vh.push_str(&format!(
+                "pub async fn validate_{field_name}(body: autumn_web::reexports::axum::body::Bytes) -> autumn_web::Markup {{\n"
+            ));
+            vh.push_str(&format!(
+                "    let value = url::form_urlencoded::parse(body.as_ref())\n        .find(|(k, _)| k == \"{field_name}\")\n"
+            ));
+            vh.push_str("        .map(|(_, v)| v.to_string())\n");
+            vh.push_str("        .unwrap_or_default();\n");
+            vh.push_str(&format!("    let error: Option<&str> = {error_chain};\n"));
+            vh.push_str("    autumn_web::html! {\n");
+            vh.push_str(&format!("        span id=\"{field_name}-error\" {{\n"));
+            vh.push_str("            @if let Some(msg) = error {\n");
+            vh.push_str("                span style=\"color:red\" { (msg) }\n");
+            vh.push_str("            }\n");
+            vh.push_str("        }\n");
+            vh.push_str("    }\n");
+            vh.push_str("}\n");
         }
         vh
     } else {
@@ -915,7 +977,10 @@ use crate::schema::{plural};",
             ""
         },
     ) + &{
-        let live_head_scripts = if live {
+        // Load htmx + SSE extension whenever live features are active.
+        // `--live-validation` alone (without `--live`) still requires htmx for
+        // the `hx-post` / `hx-trigger` / `hx-swap` attributes to fire.
+        let live_head_scripts = if live || live_validation {
             "\n                script src=(autumn_web::htmx::HTMX_JS_PATH) {};\n\
              \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20script src=(autumn_web::htmx::HTMX_SSE_JS_PATH) {};"
                 .to_owned()

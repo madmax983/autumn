@@ -2538,6 +2538,220 @@ fn generate_auth_passkeys_pages_gated_on_tracked_session() {
     }
 }
 
+// ── AC#2: --live and --live-validation scaffold tests (Issue #1445) ─────────
+
+/// `--live-validation` emits `hx-post`, `hx-trigger`, `hx-target`, `hx-swap`
+/// attributes on validated form inputs plus a companion `<span id="…-error">`.
+#[test]
+fn live_validation_emits_hx_post_and_error_slot() {
+    let (_tmp, project) = fresh_project("lv-hx-post");
+    run_autumn(
+        &project,
+        &[
+            "generate",
+            "scaffold",
+            "Post",
+            "title:String",
+            "body:String",
+            "--validate",
+            "title=length:min=1,max=200",
+            "--live-validation",
+        ],
+    );
+
+    let routes = fs::read_to_string(project.join("src/routes/posts.rs")).unwrap();
+
+    // hx-post attr on the title input in the create form
+    assert!(
+        routes.contains("hx-post=\"/posts/validate/title\""),
+        "create form must have hx-post on validated title input:\n{routes}"
+    );
+    // hx-trigger, hx-target, hx-swap attrs
+    assert!(
+        routes.contains("hx-trigger=\"change\""),
+        "create form must have hx-trigger=\"change\":\n{routes}"
+    );
+    assert!(
+        routes.contains("hx-target=\"#title-error\""),
+        "create form must have hx-target pointing at the error slot:\n{routes}"
+    );
+    assert!(
+        routes.contains("hx-swap=\"outerHTML\""),
+        "create form must have hx-swap=\"outerHTML\":\n{routes}"
+    );
+    // error span emitted after the input
+    assert!(
+        routes.contains("span id=\"title-error\""),
+        "create form must have a companion error span:\n{routes}"
+    );
+    // body field (not validated) must NOT have hx-post
+    assert!(
+        !routes.contains("hx-post=\"/posts/validate/body\""),
+        "unvalidated body input must not have hx-post:\n{routes}"
+    );
+}
+
+/// `--live-validation` emits a `validate_{field}` route handler that actually
+/// checks the declared rule (length, url, email) — not just the empty check.
+#[test]
+fn live_validation_emits_validate_handler_with_real_rules() {
+    let (_tmp, project) = fresh_project("lv-validate-handler");
+    run_autumn(
+        &project,
+        &[
+            "generate",
+            "scaffold",
+            "Post",
+            "title:String",
+            "site:String",
+            "email:String",
+            "--validate",
+            "title=length:min=1,max=200",
+            "--validate",
+            "site=url",
+            "--validate",
+            "email=email",
+            "--live-validation",
+        ],
+    );
+
+    let routes = fs::read_to_string(project.join("src/routes/posts.rs")).unwrap();
+
+    // length-validated field checks the length bounds
+    assert!(
+        routes.contains("validate_title"),
+        "routes must contain validate_title handler:\n{routes}"
+    );
+    assert!(
+        routes.contains("value.len() < 1 || value.len() > 200"),
+        "validate_title must check length bounds:\n{routes}"
+    );
+
+    // url-validated field checks with url::Url::parse
+    assert!(
+        routes.contains("validate_site"),
+        "routes must contain validate_site handler:\n{routes}"
+    );
+    assert!(
+        routes.contains("url::Url::parse(&value).is_err()"),
+        "validate_site must check with url::Url::parse:\n{routes}"
+    );
+
+    // email-validated field checks for @ and domain dot
+    assert!(
+        routes.contains("validate_email"),
+        "routes must contain validate_email handler:\n{routes}"
+    );
+    assert!(
+        routes.contains("!value.contains('@')"),
+        "validate_email must check for @ character:\n{routes}"
+    );
+}
+
+/// Without `--live-validation` the routes file contains no validate handlers
+/// and no hx-post attributes on form inputs.
+#[test]
+fn without_live_validation_no_hx_attrs() {
+    let (_tmp, project) = fresh_project("no-lv");
+    run_autumn(
+        &project,
+        &[
+            "generate",
+            "scaffold",
+            "Post",
+            "title:String",
+            "--validate",
+            "title=length:min=1,max=200",
+        ],
+    );
+
+    let routes = fs::read_to_string(project.join("src/routes/posts.rs")).unwrap();
+
+    assert!(
+        !routes.contains("hx-post"),
+        "routes without --live-validation must not have hx-post:\n{routes}"
+    );
+    assert!(
+        !routes.contains("validate_title"),
+        "routes without --live-validation must not have validate_title handler:\n{routes}"
+    );
+}
+
+/// `--live-validation` without `--live` still loads the htmx script tag so
+/// that validation requests can fire.
+#[test]
+fn live_validation_without_live_loads_htmx_script() {
+    let (_tmp, project) = fresh_project("lv-no-live-htmx");
+    run_autumn(
+        &project,
+        &[
+            "generate",
+            "scaffold",
+            "Post",
+            "title:String",
+            "--validate",
+            "title=length:min=1,max=200",
+            "--live-validation",
+        ],
+    );
+
+    let routes = fs::read_to_string(project.join("src/routes/posts.rs")).unwrap();
+
+    assert!(
+        routes.contains("HTMX_JS_PATH"),
+        "layout must include htmx script when --live-validation is set:\n{routes}"
+    );
+}
+
+/// `--live` emits a `LiveFragment` impl for the model and a `broadcasts`
+/// attribute on the repository.
+#[test]
+fn live_scaffold_emits_live_fragment_and_broadcasts() {
+    let (_tmp, project) = fresh_project("live-frag");
+    run_autumn(
+        &project,
+        &["generate", "scaffold", "Post", "title:String", "--live"],
+    );
+
+    let repo = fs::read_to_string(project.join("src/repositories/post.rs")).unwrap();
+    assert!(
+        repo.contains("broadcasts = \"posts\""),
+        "repository must have broadcasts attribute under --live:\n{repo}"
+    );
+    // LiveFragment impl is co-located in the repository file next to the
+    // `#[repository]` annotation that uses it.
+    assert!(
+        repo.contains("impl autumn_web::live::LiveFragment for Post"),
+        "repository must contain LiveFragment impl under --live:\n{repo}"
+    );
+}
+
+/// `--live` wires the index list container to an SSE stream so the list
+/// updates via push events.
+#[test]
+fn live_scaffold_index_uses_sse_list_and_stream_route() {
+    let (_tmp, project) = fresh_project("live-sse");
+    run_autumn(
+        &project,
+        &["generate", "scaffold", "Post", "title:String", "--live"],
+    );
+
+    let routes = fs::read_to_string(project.join("src/routes/posts.rs")).unwrap();
+
+    assert!(
+        routes.contains("hx-ext=\"sse\""),
+        "index list must have hx-ext=\"sse\" under --live:\n{routes}"
+    );
+    assert!(
+        routes.contains("sse-connect=\"/posts/stream\""),
+        "index list must connect to the SSE stream endpoint:\n{routes}"
+    );
+    assert!(
+        routes.contains("pub async fn stream"),
+        "routes must contain the stream handler:\n{routes}"
+    );
+}
+
 /// PR #1176 Codex round 2: login flows must delete the consumed session's
 /// tracked row before rotating (no phantom devices), the password-reset
 /// commit must be atomic with its session revocation (no consumed-token 500
