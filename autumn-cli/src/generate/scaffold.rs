@@ -399,6 +399,7 @@ pub(super) fn render_repository_for_pull(
     )
 }
 
+#[allow(clippy::fn_params_excessive_bools)]
 fn render_repository_file(
     pascal_name: &str,
     snake_name: &str,

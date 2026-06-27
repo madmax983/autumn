@@ -40,6 +40,7 @@ use super::scaffold::ScaffoldOptions;
 /// One resource's scaffold metadata from a TOML config file.
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct ScaffoldConfigEntry {
     #[serde(default)]
     pub fields: Vec<String>,
@@ -267,7 +268,7 @@ pub fn read_generate_defaults(config_path: &Path) -> Result<IdType, GenerateErro
 ///
 /// # Errors
 /// Returns [`GenerateError::Config`] if any `--id` value is unrecognised.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::fn_params_excessive_bools)]
 pub fn merge_config_with_cli(
     config: ScaffoldConfigEntry,
     cli_fields: &[String],
