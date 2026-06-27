@@ -3221,7 +3221,28 @@ impl RedisClient {
         } else {
             "0"
         };
-        let lock_ttl_ms = redis_unique_lock_ttl_ms(constraints.unique_window);
+        let lock_ttl_ms = {
+            let base = redis_unique_lock_ttl_ms(constraints.unique_window);
+            // For non-TTL windows the backstop is sized for pending/running
+            // windows (~24 h). Extend it when a delayed job's due time would
+            // outlast that backstop so the unique lock stays valid until the
+            // job fires and is claimed.  TTL-window jobs keep their explicit
+            // user-specified TTL unchanged.
+            match due_at_ms {
+                Some(due_ms)
+                    if !matches!(
+                        constraints.unique_window,
+                        Some(JobUniquenessWindow::TtlMs(_))
+                    ) =>
+                {
+                    let delay_ms = due_ms.saturating_sub(now_unix_ms());
+                    delay_ms
+                        .saturating_add(REDIS_UNIQUE_LOCK_TTL_BACKSTOP_MS)
+                        .max(base)
+                }
+                _ => base,
+            }
+        };
         // Empty string => immediate (LPUSH); a millisecond score => delayed (ZADD).
         let due_at_arg = due_at_ms.map_or_else(String::new, |ms| ms.to_string());
 
@@ -3266,6 +3287,7 @@ struct RedisJobAdminBackend {
     dead_record_prefix: String,
     unique_prefix: String,
     history_limit: usize,
+    registry: crate::actuator::JobRegistry,
 }
 
 #[cfg(feature = "redis")]
@@ -3283,6 +3305,7 @@ impl RedisJobAdminBackend {
         dead_record_prefix: String,
         unique_prefix: String,
         history_limit: usize,
+        registry: crate::actuator::JobRegistry,
     ) -> Self {
         Self {
             connection,
@@ -3296,6 +3319,7 @@ impl RedisJobAdminBackend {
             dead_record_prefix,
             unique_prefix,
             history_limit: history_limit.max(1),
+            registry,
         }
     }
 
@@ -3455,6 +3479,17 @@ return 1
     async fn cancel_enqueued_redis(&self, id: &str) -> AutumnResult<()> {
         let mut connection = self.connection.clone();
         let active_record_key = redis_record_key(&self.record_prefix, id);
+        // Fetch the record first so we know the job name for gauge accounting.
+        let raw_record: Option<String> = redis::cmd("GET")
+            .arg(&active_record_key)
+            .query_async(&mut connection)
+            .await
+            .ok()
+            .flatten();
+        let job_name: Option<String> = raw_record
+            .as_deref()
+            .and_then(|s| serde_json::from_str::<RedisJobRecord>(s).ok())
+            .map(|r| r.name);
         // A concurrency-parked job lives in the blocked zset rather than the
         // queue list, and a canceled unique job must hand its lock back so
         // future enqueues are not coalesced against work that will never run.
@@ -3488,7 +3523,7 @@ return 1
 ",
             )
             .arg(5)
-            .arg(active_record_key)
+            .arg(&active_record_key)
             .arg(&self.queue_key)
             .arg(&self.blocked_key)
             .arg(&self.unique_prefix)
@@ -3497,6 +3532,11 @@ return 1
             .query_async(&mut connection)
             .await
             .map_err(|error| redis_admin_error("cancel enqueued job", &error))?;
+        if result == 1 {
+            if let Some(name) = job_name {
+                self.registry.record_cancel(&name);
+            }
+        }
         redis_admin_operation_result(result, id, "cancel enqueued job")
     }
 }
@@ -4892,6 +4932,7 @@ fn start_redis_runtime(
             dead_record_prefix.clone(),
             unique_prefix.clone(),
             DEFAULT_JOB_ADMIN_HISTORY_LIMIT,
+            state.job_registry.clone(),
         ))));
     }
 
@@ -7898,6 +7939,7 @@ mod tests {
             worker_config.dead_record_prefix.clone(),
             worker_config.unique_prefix.clone(),
             128,
+            crate::actuator::JobRegistry::new(),
         )
     }
 
@@ -8457,6 +8499,51 @@ mod tests {
             redis_unique_lock_ttl_ms(None),
             REDIS_UNIQUE_LOCK_TTL_BACKSTOP_MS
         );
+    }
+
+    #[cfg(feature = "redis")]
+    #[test]
+    fn redis_delayed_unique_lock_ttl_extends_for_long_delays() {
+        // Helper mirroring the exact formula in RedisClient::enqueue so we
+        // can test it without a live Redis connection.
+        fn compute_lock_ttl(window: Option<JobUniquenessWindow>, due_at_ms: Option<u64>) -> u64 {
+            let base = redis_unique_lock_ttl_ms(window);
+            match due_at_ms {
+                Some(due_ms)
+                    if !matches!(window, Some(JobUniquenessWindow::TtlMs(_))) =>
+                {
+                    let delay_ms = due_ms.saturating_sub(now_unix_ms());
+                    delay_ms
+                        .saturating_add(REDIS_UNIQUE_LOCK_TTL_BACKSTOP_MS)
+                        .max(base)
+                }
+                _ => base,
+            }
+        }
+
+        let two_days_ms: u64 = 2 * 24 * 60 * 60 * 1_000;
+        let due_ms = now_unix_ms() + two_days_ms;
+
+        // Non-TTL window + long delay: lock must outlast the 24h backstop.
+        let ttl_running =
+            compute_lock_ttl(Some(JobUniquenessWindow::Running), Some(due_ms));
+        assert!(
+            ttl_running >= two_days_ms,
+            "Running-window lock {ttl_running}ms must cover the 2-day delay"
+        );
+
+        // TTL-window: lock must stay at the user-specified value regardless.
+        let user_ttl_ms: u64 = 3_600_000; // 1h
+        let ttl_explicit =
+            compute_lock_ttl(Some(JobUniquenessWindow::TtlMs(user_ttl_ms)), Some(due_ms));
+        assert_eq!(
+            ttl_explicit, user_ttl_ms,
+            "TtlMs-window lock must not be extended for delayed jobs"
+        );
+
+        // No delay: lock stays at the 24h backstop.
+        let ttl_immediate = compute_lock_ttl(Some(JobUniquenessWindow::Running), None);
+        assert_eq!(ttl_immediate, REDIS_UNIQUE_LOCK_TTL_BACKSTOP_MS);
     }
 
     #[cfg(feature = "redis")]
