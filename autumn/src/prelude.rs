@@ -97,7 +97,12 @@ pub use crate::mail::{
 };
 #[cfg(all(feature = "presence", feature = "maud"))]
 pub use crate::presence_badge;
-#[cfg(all(feature = "presence", feature = "ws", feature = "maud"))]
+#[cfg(all(
+    feature = "presence",
+    feature = "ws",
+    feature = "maud",
+    feature = "htmx"
+))]
 pub use crate::presence_stream;
 /// Shard routing extractors and types for `[[database.shards]]` apps.
 #[cfg(feature = "db")]

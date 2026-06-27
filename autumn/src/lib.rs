@@ -263,7 +263,12 @@ pub use paths::PathExt;
 pub mod presence;
 #[cfg(all(feature = "presence", feature = "maud"))]
 pub use presence::presence_badge;
-#[cfg(all(feature = "presence", feature = "ws", feature = "maud"))]
+#[cfg(all(
+    feature = "presence",
+    feature = "ws",
+    feature = "maud",
+    feature = "htmx"
+))]
 pub use presence::presence_stream;
 #[cfg(feature = "presence")]
 pub use presence::{Presence, PresenceEntry, PresenceEvent, PresenceHandle};

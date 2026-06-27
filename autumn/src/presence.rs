@@ -395,7 +395,7 @@ impl Drop for PresenceHandle {
 ///     autumn_web::presence::presence_stream(&state, "chat")
 /// }
 /// ```
-#[cfg(all(feature = "ws", feature = "maud"))]
+#[cfg(all(feature = "ws", feature = "maud", feature = "htmx"))]
 pub fn presence_stream(
     state: &crate::state::AppState,
     topic: &str,
@@ -692,7 +692,7 @@ mod tests {
 
     /// Verify that `presence_stream` subscribes to the underlying channel and that
     /// the badge OOB fragment is emitted correctly on a join event.
-    #[cfg(all(feature = "ws", feature = "maud"))]
+    #[cfg(all(feature = "ws", feature = "maud", feature = "htmx"))]
     #[tokio::test]
     async fn presence_stream_emits_join_with_count() {
         let state = crate::AppState::for_test();
