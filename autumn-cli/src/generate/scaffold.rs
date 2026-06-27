@@ -555,7 +555,7 @@ fn render_routes_file(
 ) -> String {
     let id_rust = id_type.rust_type();
     let layout_head_scripts = if live {
-        "\n                script src=\"/static/js/htmx.min.js\" {}\n                script src=\"/static/js/htmx-ext-sse.min.js\" {}"
+        "\n                script src=\"/static/js/htmx.min.js\" {}\n                script src=\"/static/js/sse.js\" {}"
     } else {
         ""
     };
