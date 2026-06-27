@@ -2682,6 +2682,46 @@ mod tests {
     }
 
     #[test]
+    fn extract_boundary_returns_none_for_invalid_content_type() {
+        assert_eq!(extract_boundary(""), None);
+        assert_eq!(extract_boundary("multipart/form-data; boundary"), None);
+    }
+
+    #[test]
+    fn find_part_end_returns_none_when_no_match() {
+        assert_eq!(
+            find_part_end(b"hello world", b"\r\n--bound", b"\n--bound"),
+            None
+        );
+    }
+
+    #[test]
+    fn find_part_end_detects_crlf_boundary() {
+        let body = b"hello\r\n--bound\r\n";
+        assert_eq!(find_part_end(body, b"\r\n--bound", b"\n--bound"), Some(5));
+    }
+
+    #[test]
+    fn find_part_end_detects_lf_boundary() {
+        let body = b"hello\n--bound\n";
+        assert_eq!(find_part_end(body, b"\r\n--bound", b"\n--bound"), Some(5));
+    }
+
+    #[test]
+    fn find_part_end_skips_invalid_terminators() {
+        // "bound123" should be skipped because '1' is not a valid terminator
+        let body = b"hello\r\n--bound123\r\nworld\r\n--bound\r\n";
+        assert_eq!(find_part_end(body, b"\r\n--bound", b"\n--bound"), Some(22));
+    }
+
+    #[test]
+    fn find_part_end_skips_invalid_terminators_lf() {
+        // "bound123" should be skipped because '1' is not a valid terminator
+        let body = b"hello\n--bound123\nworld\n--bound\n";
+        assert_eq!(find_part_end(body, b"\r\n--bound", b"\n--bound"), Some(20));
+    }
+
+    #[test]
     fn extract_boundary_parses_quoted() {
         assert_eq!(
             extract_boundary("multipart/mixed; boundary=\"abc=123\""),
