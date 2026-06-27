@@ -365,6 +365,14 @@ impl MockSetupBuilder {
         self
     }
 
+    /// Match `HEAD <path>`.
+    #[must_use]
+    pub fn head(mut self, path: &str) -> Self {
+        self.method = Some(Method::HEAD);
+        self.path = Some(path.to_owned());
+        self
+    }
+
     /// Register the mock entry and return a [`MockHandle`] for assertions.
     ///
     /// `status` is the HTTP status code to return.
