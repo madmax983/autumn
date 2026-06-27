@@ -389,6 +389,26 @@ impl HtmxFragments {
 }
 
 #[cfg(feature = "maud")]
+fn escape_attribute(w: &mut String, s: &str) {
+    for c in s.chars() {
+        match c {
+            '&' => w.push_str("&amp;"),
+            '"' => w.push_str("&quot;"),
+            '<' => w.push_str("&lt;"),
+            '>' => w.push_str("&gt;"),
+            _ => w.push(c),
+        }
+    }
+}
+
+#[cfg(feature = "maud")]
+pub fn escape_attribute_string(s: &str) -> String {
+    let mut w = String::with_capacity(s.len() + 10);
+    escape_attribute(&mut w, s);
+    w
+}
+
+#[cfg(feature = "maud")]
 pub fn inject_hx_swap_oob(html: &str, oob_value: &str) -> Option<String> {
     let mut idx = 0;
     while let Some(start_pos) = html[idx..].find('<') {
@@ -412,29 +432,17 @@ pub fn inject_hx_swap_oob(html: &str, oob_value: &str) -> Option<String> {
                 return None;
             }
             let insert_pos = abs_start + tag_name_end;
-            let mut result = String::with_capacity(html.len() + oob_value.len() + 30);
+            let escaped_val = escape_attribute_string(oob_value);
+            let mut result = String::with_capacity(html.len() + escaped_val.len() + 30);
             result.push_str(&html[..insert_pos]);
             result.push_str(" hx-swap-oob=\"");
-            result.push_str(oob_value);
+            result.push_str(&escaped_val);
             result.push('"');
             result.push_str(&html[insert_pos..]);
             return Some(result);
         }
     }
     None
-}
-
-#[cfg(feature = "maud")]
-fn escape_attribute(w: &mut String, s: &str) {
-    for c in s.chars() {
-        match c {
-            '&' => w.push_str("&amp;"),
-            '"' => w.push_str("&quot;"),
-            '<' => w.push_str("&lt;"),
-            '>' => w.push_str("&gt;"),
-            _ => w.push(c),
-        }
-    }
 }
 
 #[cfg(feature = "maud")]

@@ -339,21 +339,33 @@ impl Broadcast {
         strategy: crate::htmx::OobSwap,
         fragment: &maud::Markup,
     ) -> Result<usize, BroadcastError> {
-        use crate::htmx::{OobSwap, inject_hx_swap_oob};
+        use crate::htmx::{inject_hx_swap_oob, OobSwap};
         let rendered = &fragment.0;
         let envelope = if strategy == OobSwap::Raw {
             rendered.clone()
         } else {
             let value = strategy.format_value(id);
-            if let Some(injected) = inject_hx_swap_oob(rendered, &value) {
-                injected
+            let escaped_value = crate::htmx::escape_attribute_string(&value);
+
+            let is_outer_html = matches!(strategy, OobSwap::True | OobSwap::OuterHTML)
+                || match strategy {
+                    OobSwap::Target(crate::htmx::OobMethod::OuterHTML, _) => true,
+                    _ => false,
+                };
+
+            if is_outer_html {
+                if let Some(injected) = inject_hx_swap_oob(rendered, &value) {
+                    injected
+                } else {
+                    format!(
+                        "<template hx-swap-oob=\"{}\">{}</template>",
+                        escaped_value, rendered
+                    )
+                }
+            } else if matches!(strategy, OobSwap::Delete) {
+                format!("<div hx-swap-oob=\"{}\"></div>", escaped_value)
             } else {
-                use crate::htmx::HtmxFragments;
-                use maud::Render;
-                HtmxFragments::oob_only()
-                    .oob_with_strategy(id, strategy, fragment.clone())
-                    .render()
-                    .into_string()
+                format!("<div hx-swap-oob=\"{}\">{}</div>", escaped_value, rendered)
             }
         };
         self.publish(topic, envelope)
@@ -1584,7 +1596,57 @@ mod tests {
 
         assert_eq!(
             rx.recv().await?.as_str(),
-            "<li hx-swap-oob=\"beforeend:#list-id\" id=\"item-2\">Value</li>"
+            "<div hx-swap-oob=\"beforeend:#list-id\"><li id=\"item-2\">Value</li></div>"
+        );
+        Ok(())
+    }
+
+    #[cfg(feature = "maud")]
+    #[tokio::test]
+    async fn test_publish_oob_injects_for_outerhtml()
+    -> Result<(), broadcast::error::RecvError> {
+        let channels = Channels::new(16);
+        let mut rx = channels.subscribe("test_publish_oob_outerhtml");
+
+        let oob = maud::html! { li id="item-3" { "Value" } };
+        channels
+            .broadcast()
+            .publish_oob(
+                "test_publish_oob_outerhtml",
+                "item-3",
+                crate::htmx::OobSwap::OuterHTML,
+                &oob,
+            )
+            .unwrap();
+
+        assert_eq!(
+            rx.recv().await?.as_str(),
+            "<li hx-swap-oob=\"outerHTML\" id=\"item-3\">Value</li>"
+        );
+        Ok(())
+    }
+
+    #[cfg(feature = "maud")]
+    #[tokio::test]
+    async fn test_publish_oob_escapes_attributes()
+    -> Result<(), broadcast::error::RecvError> {
+        let channels = Channels::new(16);
+        let mut rx = channels.subscribe("test_publish_oob_escape");
+
+        let oob = maud::html! { li id="item-4" { "Value" } };
+        channels
+            .broadcast()
+            .publish_oob(
+                "test_publish_oob_escape",
+                "\"bad-id\"",
+                crate::htmx::OobSwap::BeforeEnd,
+                &oob,
+            )
+            .unwrap();
+
+        assert_eq!(
+            rx.recv().await?.as_str(),
+            "<div hx-swap-oob=\"beforeend:#&quot;bad-id&quot;\"><li id=\"item-4\">Value</li></div>"
         );
         Ok(())
     }
