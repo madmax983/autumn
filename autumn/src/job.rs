@@ -2024,19 +2024,17 @@ impl JobClient {
                         .unwrap_or(std::time::Duration::ZERO);
                     let sender = sender.clone();
                     let cancel_token = tokio_util::sync::CancellationToken::new();
-                    let already_canceled = self.job_admin.register_delay_canceler(
-                        id_for_enqueue.clone(),
-                        cancel_token.clone(),
-                    );
+                    let already_canceled = self
+                        .job_admin
+                        .register_delay_canceler(id_for_enqueue.clone(), cancel_token.clone());
                     if already_canceled {
                         // The admin canceled this job during an interceptor's
                         // async work, before the token was registered.  The
                         // admin record is already Canceled; just release the
                         // unique lock and decrement the queued gauge.
-                        if let (Some(unique_key), Some(coord)) = (
-                            &constraints.unique_key,
-                            self.local_coordination.as_deref(),
-                        ) {
+                        if let (Some(unique_key), Some(coord)) =
+                            (&constraints.unique_key, self.local_coordination.as_deref())
+                        {
                             coord.release_unique(name, unique_key, &id_for_enqueue);
                         }
                         self.registry.record_cancel(name);
@@ -3566,7 +3564,9 @@ return 1
             .query_async(&mut connection)
             .await
             .map_err(|error| redis_admin_error("cancel enqueued job", &error))?;
-        if result == 1 && let Some(name) = job_name {
+        if result == 1
+            && let Some(name) = job_name
+        {
             self.registry.record_cancel(&name);
         }
         redis_admin_operation_result(result, id, "cancel enqueued job")
@@ -8541,9 +8541,7 @@ mod tests {
         fn compute_lock_ttl(window: Option<JobUniquenessWindow>, due_at_ms: Option<u64>) -> u64 {
             let base = redis_unique_lock_ttl_ms(window);
             match due_at_ms {
-                Some(due_ms)
-                    if !matches!(window, Some(JobUniquenessWindow::TtlMs(_))) =>
-                {
+                Some(due_ms) if !matches!(window, Some(JobUniquenessWindow::TtlMs(_))) => {
                     let delay_ms = due_ms.saturating_sub(now_unix_ms());
                     delay_ms
                         .saturating_add(REDIS_UNIQUE_LOCK_TTL_BACKSTOP_MS)
@@ -8557,8 +8555,7 @@ mod tests {
         let due_ms = now_unix_ms() + two_days_ms;
 
         // Non-TTL window + long delay: lock must outlast the 24h backstop.
-        let ttl_running =
-            compute_lock_ttl(Some(JobUniquenessWindow::Running), Some(due_ms));
+        let ttl_running = compute_lock_ttl(Some(JobUniquenessWindow::Running), Some(due_ms));
         assert!(
             ttl_running >= two_days_ms,
             "Running-window lock {ttl_running}ms must cover the 2-day delay"
@@ -11877,7 +11874,7 @@ mod tests {
 
         // register_delay_canceler must detect the Canceled status and return true.
         let token = tokio_util::sync::CancellationToken::new();
-        let already_canceled = backend.register_delay_canceler(id.clone(), token.clone());
+        let already_canceled = backend.register_delay_canceler(id.clone(), token);
         assert!(
             already_canceled,
             "register_delay_canceler must return true when record is already Canceled"
