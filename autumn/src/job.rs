@@ -187,6 +187,18 @@ pub(crate) enum EnqueueOutcome {
     Deduplicated,
 }
 
+/// Specifies the due instant for an after-commit enqueue.
+///
+/// `At` carries a pre-resolved absolute instant (or `None` for immediate).
+/// `After` carries a relative delay to be converted to an absolute instant
+/// **inside the after-commit callback** so the delay is measured from commit
+/// time rather than from the original API call time.
+#[derive(Debug, Clone, Copy)]
+enum AfterCommitDue {
+    At(Option<chrono::DateTime<chrono::Utc>>),
+    After(std::time::Duration),
+}
+
 #[derive(Debug)]
 struct QueuedJob {
     id: String,
@@ -489,6 +501,11 @@ struct JobAdminMemoryInner {
     records: HashMap<String, JobAdminStoredRecord>,
     order: VecDeque<String>,
     history_limit: usize,
+    /// Cancellation tokens for in-flight local delayed timers, keyed by job id.
+    /// When a Scheduled local job is canceled via the admin API, the token is
+    /// fired so the spawned timer task exits immediately and releases the unique
+    /// lock rather than holding it until the original due time fires.
+    delay_cancelers: HashMap<String, tokio_util::sync::CancellationToken>,
 }
 
 /// Bounded process-local job dashboard backend used by the built-in runtime.
@@ -512,6 +529,7 @@ impl JobAdminMemoryBackend {
                 records: HashMap::new(),
                 order: VecDeque::new(),
                 history_limit: history_limit.max(1),
+                delay_cancelers: HashMap::new(),
             })),
         }
     }
@@ -560,23 +578,34 @@ impl JobAdminMemoryBackend {
         }
     }
 
-    fn record_requeued(&self, id: &str, attempt: u32) {
+    /// Transition a job back to [`JobAdminStatus::Enqueued`] (retry or promotion
+    /// from the delayed ZSET) and return `true` when the prior status was
+    /// `Scheduled`.  Callers use this to avoid double-incrementing the `queued`
+    /// actuator counter for initially-delayed jobs that were already counted at
+    /// enqueue time.
+    fn record_requeued(&self, id: &str, attempt: u32) -> bool {
         if let Ok(mut inner) = self.inner.write()
             && let Some(record) = inner.records.get_mut(id)
         {
+            let was_scheduled = record.status == JobAdminStatus::Scheduled;
             record.status = JobAdminStatus::Enqueued;
             record.enqueued_at = Some(chrono::Utc::now());
             record.scheduled_for = None;
             record.started_at = None;
             record.finished_at = None;
             record.attempt = attempt;
+            return was_scheduled;
         }
+        false
     }
 
     fn try_record_start(&self, id: &str, attempt: u32) -> JobAdminStartDecision {
         let Ok(mut inner) = self.inner.write() else {
             return JobAdminStartDecision::Missing;
         };
+        // Always clean up any delay canceler — the timer has fired so the
+        // token is no longer needed regardless of the transition outcome.
+        inner.delay_cancelers.remove(id);
         let Some(record) = inner.records.get_mut(id) else {
             return JobAdminStartDecision::Missing;
         };
@@ -737,8 +766,24 @@ impl JobAdminMemoryBackend {
         record.status = JobAdminStatus::Canceled;
         record.scheduled_for = None;
         record.finished_at = Some(chrono::Utc::now());
+        // Pull any pending timer canceler out while we still hold the lock.
+        let canceler = inner.delay_cancelers.remove(id);
         drop(inner);
+        // Fire outside the lock so the spawned timer task can release the
+        // unique lock without waiting for the write-lock to clear.
+        if let Some(token) = canceler {
+            token.cancel();
+        }
         Ok(())
+    }
+
+    /// Register a cancellation token for a local delayed timer.  When the
+    /// admin cancels a Scheduled job the token is fired so the timer exits and
+    /// releases the unique lock immediately rather than holding it until due.
+    fn register_delay_canceler(&self, id: String, token: tokio_util::sync::CancellationToken) {
+        if let Ok(mut inner) = self.inner.write() {
+            inner.delay_cancelers.insert(id, token);
+        }
     }
 
     fn snapshot_sync(&self, query: &JobAdminQuery) -> JobAdminSnapshot {
@@ -802,7 +847,15 @@ impl JobAdminMemoryBackend {
         max_attempts: u32,
     ) -> String {
         let id = uuid::Uuid::new_v4().to_string();
-        self.record_enqueue_due(id.clone(), name, payload, attempt, max_attempts, None, chrono::Utc::now());
+        self.record_enqueue_due(
+            id.clone(),
+            name,
+            payload,
+            attempt,
+            max_attempts,
+            None,
+            chrono::Utc::now(),
+        );
         id
     }
 
@@ -1522,7 +1575,14 @@ pub async fn enqueue(name: &str, payload: Value) -> AutumnResult<()> {
 ///
 /// Saturates to `DateTime::MAX` on overflow (practically impossible).
 fn delay_to_when(delay: std::time::Duration) -> chrono::DateTime<chrono::Utc> {
-    chrono::Utc::now() + chrono::TimeDelta::from_std(delay).unwrap_or(chrono::TimeDelta::MAX)
+    // chrono::TimeDelta::from_std returns Err on overflow (>i64::MAX nanoseconds).
+    // Fall back to MAX_UTC rather than panicking.
+    let Ok(delta) = chrono::TimeDelta::from_std(delay) else {
+        return chrono::DateTime::<chrono::Utc>::MAX_UTC;
+    };
+    chrono::Utc::now()
+        .checked_add_signed(delta)
+        .unwrap_or(chrono::DateTime::<chrono::Utc>::MAX_UTC)
 }
 
 /// Enqueue a one-shot job to run once after `delay` elapses.
@@ -1720,8 +1780,21 @@ pub async fn enqueue_in_after_commit<A: serde::Serialize>(
     args: A,
     delay: std::time::Duration,
 ) -> AutumnResult<()> {
-    let when = delay_to_when(delay);
-    enqueue_at_after_commit(name, args, when).await
+    let payload = serde_json::to_value(&args).map_err(|e| {
+        AutumnError::internal_server_error(std::io::Error::other(format!(
+            "job args serialization failed: {e}"
+        )))
+    })?;
+    let Some(client) = global_job_client() else {
+        return Err(AutumnError::internal_server_error(std::io::Error::other(
+            "job runtime is not initialized; register jobs with AppBuilder::jobs()",
+        )));
+    };
+    // `enqueue_after_commit_delay` computes `when` inside the callback so
+    // the delay is measured from commit time, not from this call site.
+    client
+        .enqueue_after_commit_delay(name, payload, delay)
+        .await
 }
 
 /// Absolute-instant variant of [`enqueue_in_after_commit`].
@@ -1910,13 +1983,33 @@ impl JobClient {
                     // delivers it to a worker. This is local-safe only — a
                     // pending delay is lost if the process restarts before the
                     // job becomes due (durable backends persist the due time).
-                    let delay = (due - now)
-                        .to_std()
-                        .unwrap_or(std::time::Duration::ZERO);
+                    let delay = (due - now).to_std().unwrap_or(std::time::Duration::ZERO);
                     let sender = sender.clone();
+                    let cancel_token = tokio_util::sync::CancellationToken::new();
+                    self.job_admin
+                        .register_delay_canceler(id_for_enqueue.clone(), cancel_token.clone());
+                    // Capture what we need to release the unique lock on cancel.
+                    let cancel_unique_key = constraints.unique_key.clone();
+                    let cancel_coordination = self.local_coordination.clone();
+                    let cancel_name = name.to_string();
+                    let cancel_id = id_for_enqueue.clone();
                     tokio::spawn(async move {
-                        tokio::time::sleep(delay).await;
-                        let _ = sender.send(queued).await;
+                        tokio::select! {
+                            biased;
+                            _ = cancel_token.cancelled() => {
+                                // Admin-canceled before the due time: release the
+                                // unique lock immediately so re-enqueueing works
+                                // without waiting for the original timer to fire.
+                                if let (Some(unique_key), Some(coord)) =
+                                    (cancel_unique_key, cancel_coordination)
+                                {
+                                    coord.release_unique(&cancel_name, &unique_key, &cancel_id);
+                                }
+                            }
+                            _ = tokio::time::sleep(delay) => {
+                                let _ = sender.send(queued).await;
+                            }
+                        }
                     });
                     Ok(())
                 } else {
@@ -2046,6 +2139,32 @@ impl JobClient {
         payload: impl serde::Serialize,
         due_at: Option<chrono::DateTime<chrono::Utc>>,
     ) -> AutumnResult<()> {
+        self.enqueue_after_commit_inner(name, payload, AfterCommitDue::At(due_at))
+            .await
+    }
+
+    /// Like [`Self::enqueue_after_commit_due`] but accepts a relative delay that
+    /// is resolved to an absolute instant **at commit time**, not at call time.
+    ///
+    /// This preserves "delay from commit" semantics: even if the surrounding
+    /// transaction takes longer than `delay`, the due time is always measured
+    /// from when the transaction actually commits.
+    pub(crate) async fn enqueue_after_commit_delay(
+        &self,
+        name: &str,
+        payload: impl serde::Serialize,
+        delay: std::time::Duration,
+    ) -> AutumnResult<()> {
+        self.enqueue_after_commit_inner(name, payload, AfterCommitDue::After(delay))
+            .await
+    }
+
+    async fn enqueue_after_commit_inner(
+        &self,
+        name: &str,
+        payload: impl serde::Serialize,
+        due: AfterCommitDue,
+    ) -> AutumnResult<()> {
         // Validate name eagerly so a typo/unregistered job fails the
         // transaction (before any DB commit) rather than being silently
         // dropped later when the deferred callback runs.
@@ -2074,6 +2193,12 @@ impl JobClient {
             let client = client.clone();
             let name = name.clone();
             let payload = payload.clone();
+            // Resolve the due instant here, inside the callback, so that an
+            // AfterCommitDue::After delay is measured from commit time.
+            let due_at = match due {
+                AfterCommitDue::At(at) => at,
+                AfterCommitDue::After(d) => Some(delay_to_when(d)),
+            };
             async move { client.enqueue_due(&name, payload, due_at).await }
         });
 
@@ -3844,8 +3969,13 @@ async fn record_enqueues_for_redis_ids(
                     .query_async::<()>(&mut *connection)
                     .await;
             }
-            state.job_registry.record_enqueue(&record.name);
-            job_admin.record_requeued(&record.id, record.attempt);
+            // Skip record_enqueue for initially-delayed jobs: they were already
+            // counted at enqueue time (queued += 1). Only retries and stale
+            // claim recoveries (prior status != Scheduled) need a fresh count.
+            let was_scheduled = job_admin.record_requeued(&record.id, record.attempt);
+            if !was_scheduled {
+                state.job_registry.record_enqueue(&record.name);
+            }
         }
     }
 
@@ -6108,7 +6238,7 @@ async fn pg_enqueued_and_scheduled_pages(
     // One query for both counts.
     let counts = diesel::sql_query(
         "SELECT \
-           COALESCE(SUM(CASE WHEN run_at <= NOW() THEN 1 ELSE 0 END), 0) AS enqueued_count, \
+           COALESCE(SUM(CASE WHEN run_at IS NULL OR run_at <= NOW() THEN 1 ELSE 0 END), 0) AS enqueued_count, \
            COALESCE(SUM(CASE WHEN run_at > NOW()  THEN 1 ELSE 0 END), 0) AS scheduled_count \
          FROM autumn_jobs WHERE status = 'enqueued'",
     )
@@ -6122,7 +6252,7 @@ async fn pg_enqueued_and_scheduled_pages(
             .unwrap_or(0);
     let enqueued_rows = diesel::sql_query(format!(
         "SELECT {PG_JOB_SELECT_COLS} FROM autumn_jobs \
-         WHERE status = 'enqueued' AND run_at <= NOW() \
+         WHERE status = 'enqueued' AND (run_at IS NULL OR run_at <= NOW()) \
          ORDER BY enqueued_at DESC NULLS LAST \
          LIMIT $1 OFFSET $2"
     ))
