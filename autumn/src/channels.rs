@@ -382,7 +382,7 @@ fn sse_oob_envelope(id: &str, strategy: &crate::htmx::OobSwap, fragment_html: &s
         OobSwap::Raw => fragment_html.to_string(),
         OobSwap::Custom(val) => inject_oob_attr(fragment_html, val),
         _ => {
-            let value = strategy.format_value(id);
+            let value = strategy.format_value(id).replace('"', "&quot;");
             format!("<div hx-swap-oob=\"{value}\">{fragment_html}</div>")
         }
     }

@@ -44,7 +44,7 @@
         // Wire SSE connections after htmx has processed an element.
         case "htmx:afterProcessNode":
           ensureEventSource(elt);
-          api.findAll(elt, "[sse-swap], [sse-close]").forEach(function (child) {
+          api.findAll(elt, "[sse-swap], [sse-close], [sse-connect]").forEach(function (child) {
             ensureEventSource(child);
           });
           break;
