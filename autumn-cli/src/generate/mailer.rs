@@ -415,13 +415,12 @@ fn render_smoke_test(struct_name: &str, snake_name: &str, no_layout: bool) -> St
     let layout_assertions = if no_layout {
         String::new()
     } else {
+        // Assert the layout {{ content }} marker was replaced (composition
+        // happened) without asserting the default layout's HTML structure —
+        // users may customize _layout.html to use divs, custom CSS, etc.
         r#"                assert!(
-                    html.contains("<table"),
-                    "html body must contain a table-based layout wrapper; got: {html}"
-                );
-                assert!(
-                    html.contains("style="),
-                    "html body must contain inline style= attributes; got: {html}"
+                    !html.contains("{{ content }}"),
+                    "layout marker must be replaced after composition; got: {html}"
                 );
 "#
         .to_owned()
@@ -1230,7 +1229,7 @@ async fn main() {
     }
 
     #[test]
-    fn smoke_test_asserts_table_and_style() {
+    fn smoke_test_asserts_layout_composition() {
         let tmp = project_with_main(default_main());
         plan_mailer(tmp.path(), "Welcome", None, false)
             .unwrap()
@@ -1238,13 +1237,12 @@ async fn main() {
             .unwrap();
 
         let mailer = fs::read_to_string(tmp.path().join("src/mailers/welcome.rs")).unwrap();
+        // The smoke test should assert that the {{ content }} marker was
+        // replaced (composition happened), not that the default layout uses
+        // tables — users may customize _layout.html to any structure.
         assert!(
-            mailer.contains("<table") || mailer.contains("\"<table\"") || mailer.contains("table"),
-            "smoke test must assert table-based wrapper is present"
-        );
-        assert!(
-            mailer.contains("style=") || mailer.contains("\"style=\""),
-            "smoke test must assert inline style= is present"
+            mailer.contains("{{ content }}"),
+            "smoke test must assert the layout content marker was replaced"
         );
     }
 
