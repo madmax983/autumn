@@ -578,6 +578,7 @@ impl Client {
     ///
     /// Falls back to `Self::new()` for detached or test state that does not
     /// carry a shared client.
+    #[must_use]
     pub fn from_state(state: &crate::AppState) -> Self {
         let autumn_config = state.extension::<crate::config::AutumnConfig>();
         let config = state
