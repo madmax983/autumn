@@ -1704,11 +1704,40 @@ fn generate_mailer_creates_all_expected_files() {
     assert!(mailer.contains("pub fn welcome("));
     assert!(mailer.contains("deliver_later"));
 
-    // HTML + text templates.
+    // Shared layout files (created on first generate mailer).
+    assert!(project.join("templates/mailers/_layout.html").is_file());
+    let layout_html = fs::read_to_string(project.join("templates/mailers/_layout.html")).unwrap();
+    assert!(
+        layout_html.contains("<!DOCTYPE html>"),
+        "_layout.html must be a full document shell"
+    );
+    assert!(
+        layout_html.contains("<table"),
+        "_layout.html must contain a table-based wrapper"
+    );
+    assert!(
+        layout_html.contains("style="),
+        "_layout.html must use inline styles"
+    );
+    assert!(
+        layout_html.contains("{{ content }}"),
+        "_layout.html must contain the content slot"
+    );
+    assert!(project.join("templates/mailers/_layout.txt").is_file());
+    let layout_txt = fs::read_to_string(project.join("templates/mailers/_layout.txt")).unwrap();
+    assert!(
+        layout_txt.contains("{{ content }}"),
+        "_layout.txt must contain the content slot"
+    );
+
+    // Per-mailer HTML + text templates — body fragment only, no document shell.
     assert!(project.join("templates/mailers/welcome.html").is_file());
     let html = fs::read_to_string(project.join("templates/mailers/welcome.html")).unwrap();
     assert!(html.contains("WelcomeMailer"));
-    assert!(html.contains("<!DOCTYPE html>"));
+    assert!(
+        !html.contains("<!DOCTYPE"),
+        "per-mailer template must be a body fragment, not a full document"
+    );
     assert!(project.join("templates/mailers/welcome.txt").is_file());
     let txt = fs::read_to_string(project.join("templates/mailers/welcome.txt")).unwrap();
     assert!(txt.contains("WelcomeMailer"));

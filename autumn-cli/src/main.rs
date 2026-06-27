@@ -1399,6 +1399,13 @@ enum GenerateCommands {
         /// MFA codes, or security alerts.
         #[arg(long, value_name = "SCOPE")]
         list_unsubscribe: Option<String>,
+        /// Opt out of the shared mailer layout. By default the generator wraps
+        /// the per-mailer body fragment in `templates/mailers/_layout.html` and
+        /// `_layout.txt` at build time. Use `--no-layout` for one-line plaintext
+        /// notifications or fully-custom HTML that must not inherit the shared
+        /// document shell.
+        #[arg(long)]
+        no_layout: bool,
         /// Print the file plan and exit without writing anything.
         #[arg(long)]
         dry_run: bool,
@@ -2389,11 +2396,13 @@ fn run_generate_command(cmd: GenerateCommands) {
         GenerateCommands::Mailer {
             name,
             list_unsubscribe,
+            no_layout,
             dry_run,
             force,
         } => generate::mailer::run(
             &name,
             list_unsubscribe.as_deref(),
+            no_layout,
             generate::Flags { dry_run, force },
         ),
         GenerateCommands::InboundMail {
@@ -4316,6 +4325,25 @@ mod tests {
     #[test]
     fn parse_generate_mailer_without_name_is_error() {
         assert!(Cli::try_parse_from(["autumn", "generate", "mailer"]).is_err());
+    }
+
+    #[test]
+    fn parse_generate_mailer_with_no_layout() {
+        let cli = Cli::try_parse_from(["autumn", "generate", "mailer", "Welcome", "--no-layout"])
+            .unwrap();
+        let Commands::Generate(GenerateCommands::Mailer { no_layout, .. }) = cli.command else {
+            panic!("expected generate mailer");
+        };
+        assert!(no_layout, "--no-layout flag must set no_layout = true");
+    }
+
+    #[test]
+    fn parse_generate_mailer_no_layout_defaults_false() {
+        let cli = Cli::try_parse_from(["autumn", "generate", "mailer", "Welcome"]).unwrap();
+        let Commands::Generate(GenerateCommands::Mailer { no_layout, .. }) = cli.command else {
+            panic!("expected generate mailer");
+        };
+        assert!(!no_layout, "no_layout must default to false");
     }
 
     // ── autumn maintenance tests ───────────────────────────────────────────────

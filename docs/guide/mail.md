@@ -124,6 +124,75 @@ transaction or when you deliberately want fire-and-forget semantics — use
 See [Transactions -> after_commit](transactions.md#after_commit--post-commit-process-local-callbacks)
 for the full story on atomic DB + mail patterns.
 
+## Generator (`autumn generate mailer`)
+
+`autumn generate mailer <Name>` scaffolds a mailer struct, templates, a dev
+preview, and wires everything into `src/main.rs` in one step:
+
+```
+autumn generate mailer Welcome
+```
+
+### Shared layout
+
+By default the generator creates `templates/mailers/_layout.html` and
+`templates/mailers/_layout.txt` on first use. Every subsequently generated
+mailer template is a **body fragment** (no `<head>`, no `<body>`) composed into
+the layout at build time via the `{{ content }}` slot:
+
+```html
+<!-- templates/mailers/_layout.html (created once, never overwritten) -->
+<!DOCTYPE html>
+<html>
+  <body>
+    <!-- your branding, header, footer -->
+    {{ content }}   <!-- per-mailer body goes here -->
+  </body>
+</html>
+```
+
+Edit the layout freely after generation — subsequent `generate mailer` runs
+skip it if it already exists, so your changes are preserved.
+
+Generated mailers call `.layout(...)` to compose the body into the shared
+shell at build time:
+
+```rust
+Mail::builder()
+    .to(to)
+    .subject("Welcome")
+    .html(include_str!("../../templates/mailers/welcome.html"))
+    .text(include_str!("../../templates/mailers/welcome.txt"))
+    .layout(
+        include_str!("../../templates/mailers/_layout.html"),
+        include_str!("../../templates/mailers/_layout.txt"),
+    )
+    .build()
+    .expect("valid mail")
+```
+
+### Opting out of the shared layout
+
+Pass `--no-layout` when a mailer needs a fully-custom HTML document (a
+one-line plaintext alert, an email with a unique design, etc.):
+
+```
+autumn generate mailer Transactional --no-layout
+```
+
+With `--no-layout` the template is emitted as a self-contained full HTML
+document and no `.layout(...)` call is generated.
+
+### List-Unsubscribe
+
+```
+autumn generate mailer Newsletter --list-unsubscribe newsletter
+```
+
+Adds a `#[mailer(list_unsubscribe = "newsletter")]` attribute and creates a
+`mail_unsubscribes` suppression migration. See
+[Mail compliance: List-Unsubscribe](mail-compliance.md).
+
 ## Previewing Emails In Dev
 
 When the active profile is `dev` and `[mail] transport = "file"`, Autumn mounts

@@ -367,6 +367,27 @@ impl IntoMailBody for maud::Markup {
     }
 }
 
+/// Placeholder token in shared mailer layouts marking where the per-mailer body
+/// fragment is inserted.
+///
+/// Layouts that do not contain this marker are ignored and the raw body is
+/// delivered instead (prevents silent content loss).
+pub const MAIL_LAYOUT_CONTENT_MARKER: &str = "{{ content }}";
+
+/// Compose a `layout` string and a `body` fragment by replacing
+/// [`MAIL_LAYOUT_CONTENT_MARKER`] with `body`.
+///
+/// If the layout does not contain the marker, `body` is returned unchanged so
+/// content is never silently dropped.
+#[must_use]
+pub fn compose_layout(layout: &str, body: &str) -> String {
+    if layout.contains(MAIL_LAYOUT_CONTENT_MARKER) {
+        layout.replace(MAIL_LAYOUT_CONTENT_MARKER, body)
+    } else {
+        body.to_owned()
+    }
+}
+
 /// A transactional email.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Mail {
@@ -534,6 +555,8 @@ pub struct MailBuilder {
     subject: Option<String>,
     html: Option<String>,
     text: Option<String>,
+    html_layout: Option<String>,
+    text_layout: Option<String>,
     list_unsubscribe: Option<String>,
     extra_headers: Vec<(String, String)>,
 }
@@ -600,6 +623,27 @@ impl MailBuilder {
         self
     }
 
+    /// Wrap the HTML and text bodies in a shared layout.
+    ///
+    /// The layout strings must contain [`MAIL_LAYOUT_CONTENT_MARKER`]
+    /// (`{{ content }}`) where the per-mailer body fragment should be inserted.
+    /// If a layout does not contain the marker the raw body is delivered
+    /// unchanged (content is never silently dropped).
+    ///
+    /// Call this method with the shared `_layout.html` and `_layout.txt`
+    /// templates. Omitting the call delivers the raw body — use that as the
+    /// per-mailer opt-out for fully-custom or one-line plaintext messages.
+    #[must_use]
+    pub fn layout(
+        mut self,
+        html_layout: impl IntoMailBody,
+        text_layout: impl IntoMailBody,
+    ) -> Self {
+        self.html_layout = Some(html_layout.into_mail_body());
+        self.text_layout = Some(text_layout.into_mail_body());
+        self
+    }
+
     /// Build the mail.
     ///
     /// # Errors
@@ -620,13 +664,25 @@ impl MailBuilder {
                 "mail must include html or text body".to_owned(),
             ));
         }
+        // A layout is only applied when the corresponding body is present.
+        // If only one of html/text is set, the other layout half is intentionally
+        // skipped rather than erroring — a text-only mailer may legitimately pass
+        // an html_layout that has no effect, and vice-versa.
+        let html = match (self.html, self.html_layout) {
+            (Some(body), Some(layout)) => Some(compose_layout(&layout, &body)),
+            (html, _) => html, // layout without a body: silently unused (by design)
+        };
+        let text = match (self.text, self.text_layout) {
+            (Some(body), Some(layout)) => Some(compose_layout(&layout, &body)),
+            (text, _) => text, // layout without a body: silently unused (by design)
+        };
         Ok(Mail {
             from: self.from,
             reply_to: self.reply_to,
             to: self.to,
             subject,
-            html: self.html,
-            text: self.text,
+            html,
+            text,
             list_unsubscribe: self.list_unsubscribe,
             extra_headers: self.extra_headers,
         })

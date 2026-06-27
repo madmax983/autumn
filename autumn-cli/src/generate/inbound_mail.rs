@@ -471,7 +471,8 @@ async fn main() {
             .expect("handler file must be in plan");
         let contents = match handler_action {
             super::super::emit::Action::Create { contents, .. }
-            | super::super::emit::Action::Modify { contents, .. } => contents,
+            | super::super::emit::Action::Modify { contents, .. }
+            | super::super::emit::Action::CreateIfAbsent { contents, .. } => contents,
             super::super::emit::Action::CreateBytes { .. } => {
                 unreachable!("generator emits no binary files")
             }
@@ -493,7 +494,8 @@ async fn main() {
             .expect("integration test must be in plan");
         let contents = match test_action {
             super::super::emit::Action::Create { contents, .. }
-            | super::super::emit::Action::Modify { contents, .. } => contents,
+            | super::super::emit::Action::Modify { contents, .. }
+            | super::super::emit::Action::CreateIfAbsent { contents, .. } => contents,
             super::super::emit::Action::CreateBytes { .. } => {
                 unreachable!("generator emits no binary files")
             }
@@ -565,7 +567,8 @@ async fn main() {
             .expect("handler file must be in plan");
         let contents = match handler_action {
             super::super::emit::Action::Create { contents, .. }
-            | super::super::emit::Action::Modify { contents, .. } => contents,
+            | super::super::emit::Action::Modify { contents, .. }
+            | super::super::emit::Action::CreateIfAbsent { contents, .. } => contents,
             super::super::emit::Action::CreateBytes { .. } => {
                 unreachable!("generator emits no binary files")
             }

@@ -7,6 +7,7 @@
 
 use std::collections::BTreeSet;
 use std::fs;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use super::{Flags, GenerateError};
@@ -22,6 +23,10 @@ pub enum Action {
     /// Used for verbatim/binary starter assets (e.g. vendored JS). Treated as a
     /// collision if the file already exists, like [`Action::Create`].
     CreateBytes { path: PathBuf, bytes: Vec<u8> },
+    /// Create a file only if it does not already exist; skip silently if it
+    /// does. Uses an exclusive-create open (analogous to `O_CREAT|O_EXCL`) so
+    /// concurrent generator invocations cannot both win the race.
+    CreateIfAbsent { path: PathBuf, contents: String },
 }
 
 impl Action {
@@ -31,7 +36,8 @@ impl Action {
         match self {
             Self::Create { path, .. }
             | Self::Modify { path, .. }
-            | Self::CreateBytes { path, .. } => path,
+            | Self::CreateBytes { path, .. }
+            | Self::CreateIfAbsent { path, .. } => path,
         }
     }
 }
@@ -77,6 +83,18 @@ impl Plan {
         self.actions.push(Action::CreateBytes {
             path: path.into(),
             bytes: bytes.into(),
+        });
+    }
+
+    /// Push a [`Action::CreateIfAbsent`] action.
+    ///
+    /// The file is created atomically using an exclusive open; if the file
+    /// already exists (including from a concurrent generator run) the action is
+    /// silently skipped — the existing content is left untouched.
+    pub fn create_if_absent(&mut self, path: impl Into<PathBuf>, contents: impl Into<String>) {
+        self.actions.push(Action::CreateIfAbsent {
+            path: path.into(),
+            contents: contents.into(),
         });
     }
 
@@ -130,20 +148,42 @@ impl Plan {
 
         for action in &self.actions {
             let path = action.path();
-            let label = if matches!(action, Action::Modify { .. }) && path.exists() {
-                "Modified"
-            } else {
-                "Created"
-            };
             match action {
                 Action::Create { contents, .. } | Action::Modify { contents, .. } => {
+                    let label = if matches!(action, Action::Modify { .. }) && path.exists() {
+                        "Modified"
+                    } else {
+                        "Created"
+                    };
                     fs::write(path, contents)?;
+                    println!("  {label} {}", relative_display(path, &self.project_root));
                 }
                 Action::CreateBytes { bytes, .. } => {
                     fs::write(path, bytes)?;
+                    println!("  Created {}", relative_display(path, &self.project_root));
+                }
+                Action::CreateIfAbsent { contents, .. } => {
+                    match fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(path)
+                    {
+                        Ok(mut f) => {
+                            if let Err(e) = f.write_all(contents.as_bytes()) {
+                                // Remove the empty/partial file so the next run
+                                // does not skip creation due to AlreadyExists.
+                                let _ = fs::remove_file(path);
+                                return Err(GenerateError::Io(e));
+                            }
+                            println!("  Created {}", relative_display(path, &self.project_root));
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                            // Another process already created the file; leave it untouched.
+                        }
+                        Err(e) => return Err(GenerateError::Io(e)),
+                    }
                 }
             }
-            println!("  {label} {}", relative_display(path, &self.project_root));
         }
         Ok(())
     }
@@ -156,9 +196,11 @@ impl Plan {
                     "Would overwrite"
                 }
                 Action::Modify { path, .. } if path.exists() => "Would modify",
-                Action::Create { .. } | Action::Modify { .. } | Action::CreateBytes { .. } => {
-                    "Would create"
-                }
+                Action::CreateIfAbsent { path, .. } if path.exists() => "Would skip (exists)",
+                Action::Create { .. }
+                | Action::Modify { .. }
+                | Action::CreateBytes { .. }
+                | Action::CreateIfAbsent { .. } => "Would create",
             };
             println!(
                 "  {label} {}",
