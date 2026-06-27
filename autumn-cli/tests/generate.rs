@@ -2701,6 +2701,19 @@ fn live_validation_without_live_loads_htmx_script() {
         routes.contains("HTMX_JS_PATH"),
         "layout must include htmx script when --live-validation is set:\n{routes}"
     );
+
+    // Cargo.toml must have htmx + maud features even when --live is not set,
+    // because the generated validate handlers return Markup and the layout
+    // references HTMX_JS_PATH.
+    let cargo = fs::read_to_string(project.join("Cargo.toml")).unwrap();
+    assert!(
+        cargo.contains("\"htmx\"") || cargo.contains("htmx"),
+        "Cargo.toml must include autumn-web htmx feature for --live-validation:\n{cargo}"
+    );
+    assert!(
+        cargo.contains("\"maud\"") || cargo.contains("maud"),
+        "Cargo.toml must include autumn-web maud feature for --live-validation:\n{cargo}"
+    );
 }
 
 /// `--live` emits a `LiveFragment` impl for the model and a `broadcasts`

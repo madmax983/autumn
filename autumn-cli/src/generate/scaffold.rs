@@ -239,11 +239,10 @@ pub fn plan_scaffold_with_options(
     }
     plan_cargo_deps(&mut plan, project_root, &combined);
 
-    // When --live is used the generated code calls autumn_web::sse::stream (requires
-    // the `ws` feature), uses LiveFragment with maud (requires `maud`), and renders
-    // SSE list containers that reference HTMX OOB (requires `htmx`). Ensure all three
-    // features are present in the project's autumn-web dependency.
-    if options_with_key.live {
+    // --live requires `ws` (sse::stream), `maud` (LiveFragment/Markup), and `htmx`.
+    // --live-validation alone also emits Markup-returning validate handlers and
+    // references HTMX_JS_PATH, so it requires `htmx` + `maud` even without `ws`.
+    if options_with_key.live || options_with_key.live_validation {
         let cargo_path = project_root.join("Cargo.toml");
         let base = plan
             .actions
@@ -255,7 +254,12 @@ pub fn plan_scaffold_with_options(
             })
             .unwrap_or_else(|| read_or_empty(&cargo_path));
         let mut updated = base.clone();
-        for feat in ["htmx", "maud", "ws"] {
+        let feats: &[&str] = if options.live {
+            &["htmx", "maud", "ws"]
+        } else {
+            &["htmx", "maud"]
+        };
+        for feat in feats {
             updated = ensure_autumn_web_feature(&updated, feat);
         }
         if updated != base {
