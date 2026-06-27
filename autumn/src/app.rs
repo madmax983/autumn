@@ -5952,6 +5952,10 @@ async fn setup_database(
         config.database.has_shards(),
         hook_queue_migration_mode,
     );
+    let shard_map_migration_required = shard_map_migration_is_required(
+        config.database.has_shards(),
+        hook_queue_migration_mode,
+    );
     let check_replica_migrations = !migrations.is_empty();
     let topology = match pool_provider {
         Some(factory) => factory(config.database.clone()).await,
@@ -6004,6 +6008,7 @@ async fn setup_database(
         provider_migration_url,
         migrations,
         directory_migration_required,
+        shard_map_migration_required,
     )
     .await;
 
@@ -6035,6 +6040,19 @@ async fn setup_database(
         check_shard_replica_migration_parity(config, set).await;
     }
 
+    // Boot-time guard: compare the current auto-split slot map against the map
+    // persisted on first boot. Refuses to start if they differ, preventing
+    // silent data misrouting from topology changes. Inert during static builds,
+    // when no control DB is configured, and in explicit-slot mode.
+    #[allow(clippy::question_mark)]
+    if let Err(e) = enforce_shard_map_guard(config, topology.as_ref(), runtime_boot).await {
+        // Needs explicit `if let` (not `?`) so the managed-pg child can be stopped
+        // before unwinding — `?` would skip the cfg-gated emergency stop call.
+        #[cfg(feature = "managed-pg")]
+        crate::managed_pg::emergency_stop_async().await;
+        return Err(e);
+    }
+
     Ok(DatabaseBootstrap {
         topology,
         shards,
@@ -6052,6 +6070,7 @@ async fn setup_database(
 /// contention), so the whole sequence runs off the Tokio worker threads in
 /// one blocking task that owns the embedded migration sets.
 #[cfg(feature = "db")]
+#[allow(clippy::too_many_arguments, clippy::fn_params_excessive_bools)]
 async fn run_startup_migrations(
     config: &AutumnConfig,
     control_configured: bool,
@@ -6059,6 +6078,7 @@ async fn run_startup_migrations(
     provider_migration_url: Option<String>,
     migrations: Vec<crate::migrate::EmbeddedMigrations>,
     directory_migration_required: bool,
+    shard_map_migration_required: bool,
 ) {
     let control_url = if control_configured {
         // Prefer a provider-resolved URL (e.g. managed Postgres, whose socket
@@ -6102,6 +6122,16 @@ async fn run_startup_migrations(
                     profile.as_deref(),
                     auto_in_prod,
                     &crate::sharding::SHARD_DIRECTORY_MIGRATIONS,
+                    "control",
+                );
+            }
+            // The shard-map guard table also lives on the control plane only.
+            if shard_map_migration_required {
+                crate::migrate::auto_migrate(
+                    &url,
+                    profile.as_deref(),
+                    auto_in_prod,
+                    &crate::sharding::SHARD_MAP_MIGRATIONS,
                     "control",
                 );
             }
@@ -6193,6 +6223,153 @@ const fn directory_migration_is_required(
     directory_routing_enabled
         && has_shards
         && matches!(mode, RepositoryCommitHookQueueMigrationMode::Runtime)
+}
+
+/// Whether startup should create the control-plane `_autumn_shard_map` table.
+/// Required whenever shards are configured and we are in a real runtime boot —
+/// never during a static build (`autumn build`, `AUTUMN_BUILD_STATIC=1`).
+/// The guard itself is further gated to auto-split mode inside
+/// `enforce_shard_map_guard`; the table is always created when shards are
+/// present so an app can switch from explicit to auto-split later without a
+/// manual migration.
+#[cfg(feature = "db")]
+const fn shard_map_migration_is_required(
+    has_shards: bool,
+    mode: RepositoryCommitHookQueueMigrationMode,
+) -> bool {
+    has_shards && matches!(mode, RepositoryCommitHookQueueMigrationMode::Runtime)
+}
+
+/// Row type for reading `_autumn_shard_map`.
+#[cfg(feature = "db")]
+#[derive(diesel::QueryableByName)]
+struct ShardMapRow {
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    shard_name: String,
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    slots: String,
+}
+
+/// Check and persist the shard slot map in `_autumn_shard_map`.
+///
+/// This is the DB-backed core of the boot-time guard: it reads existing rows,
+/// delegates to the pure [`crate::config::check_stored_slot_map`] for the
+/// comparison, and persists the map on first boot (no rows yet). Factored out
+/// of [`enforce_shard_map_guard`] so integration tests can drive it directly
+/// without a full `AutumnConfig`.
+///
+/// # Errors
+///
+/// Returns a `String` error when the computed auto-split map differs from the
+/// stored map, indicating a topology change that would silently misroute data.
+#[cfg(feature = "db")]
+#[cfg_attr(not(feature = "test-support"), allow(dead_code))]
+pub async fn run_shard_map_guard(
+    control_pool: &deadpool::managed::Pool<diesel_async::pooled_connection::AsyncDieselConnectionManager<diesel_async::AsyncPgConnection>>,
+    computed: &[crate::config::ShardSlotAssignment],
+    auto_split: bool,
+) -> Result<(), String> {
+    use diesel_async::RunQueryDsl as _;
+
+    if !auto_split {
+        return Ok(());
+    }
+
+    // If the control pool cannot be acquired (e.g. no real DB in unit tests or
+    // a cold-start where the DB is not yet reachable), we cannot read the stored
+    // map. This is equivalent to "no stored map" — there is nothing to compare
+    // against, so the guard is inert and startup proceeds normally.
+    let mut conn = match control_pool.get().await {
+        Ok(conn) => conn,
+        Err(e) => {
+            tracing::warn!(
+                "shard-map guard could not acquire a control connection ({e}); \
+                 skipping slot-map validation — ensure the control database is \
+                 reachable to enforce topology change detection"
+            );
+            return Ok(());
+        }
+    };
+
+    let rows: Vec<ShardMapRow> = match diesel::sql_query(
+        "SELECT shard_name, slots FROM _autumn_shard_map ORDER BY shard_name",
+    )
+    .load::<ShardMapRow>(&mut conn)
+    .await
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::warn!(
+                "shard-map guard could not read _autumn_shard_map ({e}); \
+                 skipping slot-map validation — run `autumn migrate` to create \
+                 the control schema"
+            );
+            return Ok(());
+        }
+    };
+
+    let stored: Vec<crate::config::ShardSlotAssignment> = rows
+        .into_iter()
+        .map(|r| crate::config::ShardSlotAssignment {
+            name: r.shard_name,
+            ranges: r.slots,
+        })
+        .collect();
+    let stored_opt = if stored.is_empty() {
+        None
+    } else {
+        Some(stored.as_slice())
+    };
+
+    crate::config::check_stored_slot_map(auto_split, computed, stored_opt)?;
+
+    // First boot: persist the current map so future boots can compare against it.
+    if stored_opt.is_none() {
+        for assignment in computed {
+            diesel::sql_query(
+                "INSERT INTO _autumn_shard_map (shard_name, slots) VALUES ($1, $2) \
+                 ON CONFLICT (shard_name) DO UPDATE \
+                 SET slots = EXCLUDED.slots, updated_at = NOW()",
+            )
+            .bind::<diesel::sql_types::Text, _>(&assignment.name)
+            .bind::<diesel::sql_types::Text, _>(&assignment.ranges)
+            .execute(&mut conn)
+            .await
+            .map_err(|e| format!("shard-map guard could not persist map: {e}"))?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Boot-time shard-map guard: compare the auto-split slot map against the
+/// persisted map and refuse to start if they differ.
+///
+/// No-op when:
+/// - not a runtime boot (static build),
+/// - no shards configured,
+/// - no control database topology, or
+/// - the slot map uses explicit `slots` declarations (auto-split is inactive).
+#[cfg(feature = "db")]
+async fn enforce_shard_map_guard(
+    config: &AutumnConfig,
+    topology: Option<&crate::db::DatabaseTopology>,
+    runtime_boot: bool,
+) -> Result<(), String> {
+    if !runtime_boot || !config.database.has_shards() {
+        return Ok(());
+    }
+    let Some(topology) = topology else {
+        return Ok(());
+    };
+    if !config.database.shards_auto_split() {
+        return Ok(());
+    }
+    let computed = config
+        .database
+        .resolved_shard_assignments()
+        .map_err(|e| format!("shard-map guard: {e}"))?;
+    run_shard_map_guard(topology.primary(), &computed, true).await
 }
 
 #[cfg(feature = "db")]
@@ -7833,6 +8010,20 @@ mod tests {
         // Routing disabled, or no shards, means no directory table at all.
         assert!(!directory_migration_is_required(false, true, Runtime));
         assert!(!directory_migration_is_required(true, false, Runtime));
+    }
+
+    #[test]
+    fn shard_map_migration_required_only_at_runtime_with_shards() {
+        use RepositoryCommitHookQueueMigrationMode::{Runtime, StaticBuild};
+
+        // The happy path: shards present, real runtime boot.
+        assert!(shard_map_migration_is_required(true, Runtime));
+
+        // A static build must never create the shard-map table.
+        assert!(!shard_map_migration_is_required(true, StaticBuild));
+
+        // No shards means no shard-map table.
+        assert!(!shard_map_migration_is_required(false, Runtime));
     }
 
     #[cfg(feature = "db")]

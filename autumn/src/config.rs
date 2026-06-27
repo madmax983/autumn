@@ -3825,6 +3825,67 @@ fn format_slot_ranges(slots: &[usize]) -> String {
 /// short of 16384 physical shards.
 pub const SLOT_COUNT: u16 = 16384;
 
+/// The resolved slot assignment for a single shard, expressed as a name and a
+/// compact range string (e.g. `"0-8191"` or `"0-5460, 10923-16383"`).
+///
+/// Used by the boot-time shard-map guard to compare the freshly-computed
+/// auto-split against the map stored on first boot. An empty `ranges` string
+/// represents a drained shard (all slots moved away); that only arises in
+/// explicit-slot mode, where the guard is inert.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShardSlotAssignment {
+    pub name: String,
+    pub ranges: String,
+}
+
+/// Guard: compare the freshly-computed slot map against the stored map.
+///
+/// Returns `Ok(())` — no action required — when:
+/// - `auto_split` is `false` (explicit-slot mode: operator-managed, no guard),
+/// - `stored` is `None` (first boot: nothing to compare against), or
+/// - the computed and stored maps are identical (order-insensitive).
+///
+/// Returns `Err` with a human-readable message when auto-split is active, a
+/// stored map exists, and the maps differ.
+///
+/// Pure and sync so it can be unit-tested without a database.
+///
+/// # Errors
+///
+/// Returns a `String` description when the auto-split map differs from the
+/// stored map.
+pub fn check_stored_slot_map(
+    auto_split: bool,
+    computed: &[ShardSlotAssignment],
+    stored: Option<&[ShardSlotAssignment]>,
+) -> Result<(), String> {
+    fn to_map(
+        assignments: &[ShardSlotAssignment],
+    ) -> std::collections::BTreeMap<&str, &str> {
+        assignments
+            .iter()
+            .map(|a| (a.name.as_str(), a.ranges.as_str()))
+            .collect()
+    }
+    if !auto_split {
+        return Ok(());
+    }
+    let Some(stored) = stored else {
+        return Ok(());
+    };
+    if to_map(computed) == to_map(stored) {
+        return Ok(());
+    }
+    Err(format!(
+        "shard slot map mismatch — auto-split with {} shards produces a different map \
+         than the stored map ({} shards). Set explicit [[database.shards]] slot ranges \
+         matching the stored map, then move data between shards deliberately before \
+         changing the topology.",
+        computed.len(),
+        stored.len(),
+    ))
+}
+
 impl DatabaseConfig {
     /// Resolved primary/write database URL.
     #[must_use]
@@ -3935,6 +3996,48 @@ impl DatabaseConfig {
         }
         // Coverage was just verified, so flatten cannot drop entries.
         Ok(map.into_iter().flatten().collect())
+    }
+
+    /// Whether all shards are using auto-split (no shard declares `slots`).
+    ///
+    /// Returns `false` when no shards are configured or any shard has an
+    /// explicit `slots` declaration. Mixed declarations already error in
+    /// [`resolved_slot_map`](Self::resolved_slot_map), so this is a simple
+    /// all-or-none check.
+    #[must_use]
+    pub fn shards_auto_split(&self) -> bool {
+        self.has_shards() && self.shards.iter().all(|s| s.slots.is_none())
+    }
+
+    /// Resolve the per-shard slot assignment as compact range strings.
+    ///
+    /// Inverts [`resolved_slot_map`](Self::resolved_slot_map) (slot→shard-index)
+    /// into per-shard slot lists rendered via the same compact range notation
+    /// used in slot-map error messages. Agrees with runtime routing by
+    /// construction: the output derives from the same slot map that builds the
+    /// live [`ShardSet`](crate::sharding::ShardSet).
+    ///
+    /// # Errors
+    ///
+    /// Propagates any [`ConfigError`] from `resolved_slot_map`.
+    pub fn resolved_shard_assignments(
+        &self,
+    ) -> Result<Vec<ShardSlotAssignment>, ConfigError> {
+        let slot_map = self.resolved_slot_map()?;
+        let n = self.shards.len();
+        let mut per_shard: Vec<Vec<usize>> = vec![Vec::new(); n];
+        for (slot, &owner) in slot_map.iter().enumerate() {
+            per_shard[owner].push(slot);
+        }
+        Ok(self
+            .shards
+            .iter()
+            .enumerate()
+            .map(|(idx, shard)| ShardSlotAssignment {
+                name: shard.name.clone(),
+                ranges: format_slot_ranges(&per_shard[idx]),
+            })
+            .collect())
     }
 
     /// Validate database configuration.
@@ -8624,5 +8727,148 @@ redirect_uri = "http://localhost:3000/auth/github/callback"
             leaves.contains("session"),
             "session must appear as a root-level leaf"
         );
+    }
+
+    // ── ShardSlotAssignment / shards_auto_split / resolved_shard_assignments ──
+
+    #[test]
+    fn shards_auto_split_true_when_all_slots_none() {
+        let config = DatabaseConfig {
+            shards: vec![shard("a", "postgres://a/app"), shard("b", "postgres://b/app")],
+            ..Default::default()
+        };
+        assert!(config.shards_auto_split());
+    }
+
+    #[test]
+    fn shards_auto_split_false_when_no_shards() {
+        assert!(!DatabaseConfig::default().shards_auto_split());
+    }
+
+    #[test]
+    fn shards_auto_split_false_when_any_shard_declares_slots() {
+        let config = DatabaseConfig {
+            shards: vec![
+                shard_with_slots("a", "postgres://a/app", &["0-8191"]),
+                shard_with_slots("b", "postgres://b/app", &["8192-16383"]),
+            ],
+            ..Default::default()
+        };
+        assert!(!config.shards_auto_split());
+    }
+
+    #[test]
+    fn resolved_shard_assignments_two_shards() {
+        let config = DatabaseConfig {
+            shards: vec![shard("s0", "postgres://s0/app"), shard("s1", "postgres://s1/app")],
+            ..Default::default()
+        };
+        let assignments = config
+            .resolved_shard_assignments()
+            .expect("two-shard auto-split should resolve");
+        assert_eq!(assignments.len(), 2);
+        assert_eq!(assignments[0].name, "s0");
+        assert_eq!(assignments[0].ranges, "0-8191");
+        assert_eq!(assignments[1].name, "s1");
+        assert_eq!(assignments[1].ranges, "8192-16383");
+    }
+
+    #[test]
+    fn resolved_shard_assignments_three_shards() {
+        let config = DatabaseConfig {
+            shards: vec![
+                shard("s0", "postgres://s0/app"),
+                shard("s1", "postgres://s1/app"),
+                shard("s2", "postgres://s2/app"),
+            ],
+            ..Default::default()
+        };
+        let assignments = config
+            .resolved_shard_assignments()
+            .expect("three-shard auto-split should resolve");
+        assert_eq!(assignments.len(), 3);
+        assert_eq!(assignments[0].ranges, "0-5461");
+        assert_eq!(assignments[1].ranges, "5462-10922");
+        assert_eq!(assignments[2].ranges, "10923-16383");
+    }
+
+    // ── check_stored_slot_map ──────────────────────────────────────────────────
+
+    fn assignment(name: &str, ranges: &str) -> ShardSlotAssignment {
+        ShardSlotAssignment {
+            name: name.to_owned(),
+            ranges: ranges.to_owned(),
+        }
+    }
+
+    #[test]
+    fn check_stored_slot_map_explicit_mode_always_ok() {
+        // Even with a wildly different stored map, explicit mode is never blocked.
+        let computed = vec![
+            assignment("s0", "0-8191"),
+            assignment("s1", "8192-16383"),
+        ];
+        let stored = vec![
+            assignment("s0", "0-5460"),
+            assignment("s1", "5461-10922"),
+            assignment("s2", "10923-16383"),
+        ];
+        assert!(check_stored_slot_map(false, &computed, Some(&stored)).is_ok());
+    }
+
+    #[test]
+    fn check_stored_slot_map_first_boot_no_stored_ok() {
+        let computed = vec![
+            assignment("s0", "0-8191"),
+            assignment("s1", "8192-16383"),
+        ];
+        assert!(check_stored_slot_map(true, &computed, None).is_ok());
+    }
+
+    #[test]
+    fn check_stored_slot_map_matching_map_ok() {
+        let computed = vec![
+            assignment("s0", "0-8191"),
+            assignment("s1", "8192-16383"),
+        ];
+        // Order-insensitive: stored in reverse order still matches.
+        let stored = vec![
+            assignment("s1", "8192-16383"),
+            assignment("s0", "0-8191"),
+        ];
+        assert!(check_stored_slot_map(true, &computed, Some(&stored)).is_ok());
+    }
+
+    #[test]
+    fn check_stored_slot_map_mismatch_two_to_three_shards_returns_err() {
+        let computed = vec![
+            assignment("s0", "0-5460"),
+            assignment("s1", "5461-10922"),
+            assignment("s2", "10923-16383"),
+        ];
+        let stored = vec![
+            assignment("s0", "0-8191"),
+            assignment("s1", "8192-16383"),
+        ];
+        let err = check_stored_slot_map(true, &computed, Some(&stored))
+            .expect_err("3-shard auto-split vs 2-shard stored map must fail");
+        assert!(err.contains("shard slot map mismatch"), "message: {err}");
+        assert!(err.contains("3 shards"), "message: {err}");
+        assert!(err.contains("2 shards"), "message: {err}");
+    }
+
+    #[test]
+    fn check_stored_slot_map_mismatch_shard_rename_returns_err() {
+        let computed = vec![
+            assignment("alpha", "0-8191"),
+            assignment("beta", "8192-16383"),
+        ];
+        let stored = vec![
+            assignment("s0", "0-8191"),
+            assignment("s1", "8192-16383"),
+        ];
+        let err = check_stored_slot_map(true, &computed, Some(&stored))
+            .expect_err("renamed shards must be detected as mismatch");
+        assert!(err.contains("shard slot map mismatch"), "message: {err}");
     }
 }
