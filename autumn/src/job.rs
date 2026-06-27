@@ -781,10 +781,28 @@ impl JobAdminMemoryBackend {
     /// Register a cancellation token for a local delayed timer.  When the
     /// admin cancels a Scheduled job the token is fired so the timer exits and
     /// releases the unique lock immediately rather than holding it until due.
-    fn register_delay_canceler(&self, id: String, token: tokio_util::sync::CancellationToken) {
+    ///
+    /// Returns `true` when the record is already `Canceled` (the admin canceled
+    /// the job in the window between `record_enqueue_due` and here); the caller
+    /// must then skip the timer entirely and clean up the unique lock and gauge.
+    fn register_delay_canceler(
+        &self,
+        id: String,
+        token: tokio_util::sync::CancellationToken,
+    ) -> bool {
         if let Ok(mut inner) = self.inner.write() {
+            // If admin already canceled during an interceptor, do not register
+            // the token — the caller will do immediate cleanup instead.
+            if inner
+                .records
+                .get(&id)
+                .is_some_and(|r| r.status == JobAdminStatus::Canceled)
+            {
+                return true;
+            }
             inner.delay_cancelers.insert(id, token);
         }
+        false
     }
 
     fn snapshot_sync(&self, query: &JobAdminQuery) -> JobAdminSnapshot {
@@ -2006,8 +2024,24 @@ impl JobClient {
                         .unwrap_or(std::time::Duration::ZERO);
                     let sender = sender.clone();
                     let cancel_token = tokio_util::sync::CancellationToken::new();
-                    self.job_admin
-                        .register_delay_canceler(id_for_enqueue.clone(), cancel_token.clone());
+                    let already_canceled = self.job_admin.register_delay_canceler(
+                        id_for_enqueue.clone(),
+                        cancel_token.clone(),
+                    );
+                    if already_canceled {
+                        // The admin canceled this job during an interceptor's
+                        // async work, before the token was registered.  The
+                        // admin record is already Canceled; just release the
+                        // unique lock and decrement the queued gauge.
+                        if let (Some(unique_key), Some(coord)) = (
+                            &constraints.unique_key,
+                            self.local_coordination.as_deref(),
+                        ) {
+                            coord.release_unique(name, unique_key, &id_for_enqueue);
+                        }
+                        self.registry.record_cancel(name);
+                        return Ok(());
+                    }
                     // Capture what we need on cancel: unique lock release,
                     // admin status update, and queued-gauge decrement.
                     let cancel_unique_key = constraints.unique_key.clone();
@@ -11819,6 +11853,47 @@ mod tests {
 
         let result = backend.cancel_enqueued(&id);
         assert!(result.is_err(), "canceling a Running job must fail");
+    }
+
+    #[test]
+    fn register_delay_canceler_returns_true_when_already_canceled() {
+        // Simulate the race: admin cancels between record_enqueue_due and
+        // register_delay_canceler.
+        let backend = JobAdminMemoryBackend::new_for_test(32);
+        let future_due = chrono::Utc::now() + chrono::TimeDelta::hours(1);
+        let id = uuid::Uuid::new_v4().to_string();
+        backend.record_enqueue_due(
+            id.clone(),
+            "myjob",
+            serde_json::json!({}),
+            1,
+            3,
+            Some(future_due),
+            chrono::Utc::now(),
+        );
+
+        // Admin cancels before the timer is registered.
+        backend
+            .cancel_enqueued(&id)
+            .expect("cancel before token registration must succeed");
+
+        // register_delay_canceler must detect the Canceled status and return true.
+        let token = tokio_util::sync::CancellationToken::new();
+        let already_canceled = backend.register_delay_canceler(id.clone(), token.clone());
+        assert!(
+            already_canceled,
+            "register_delay_canceler must return true when record is already Canceled"
+        );
+        // The token must NOT have been stored (cancel already happened).
+        assert!(
+            !backend
+                .inner
+                .read()
+                .unwrap()
+                .delay_cancelers
+                .contains_key(&id),
+            "token must not be stored for an already-canceled job"
+        );
     }
 
     #[test]
