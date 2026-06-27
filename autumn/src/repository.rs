@@ -322,10 +322,7 @@ where
 
 impl<T: DisplayTopicField> DisplayTopicField for Option<T> {
     fn to_topic_string(&self) -> String {
-        match self {
-            Some(val) => val.to_topic_string(),
-            None => "none".to_string(),
-        }
+        self.as_ref().map_or_else(|| "none".to_string(), DisplayTopicField::to_topic_string)
     }
 }
 

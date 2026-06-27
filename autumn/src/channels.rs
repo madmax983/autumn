@@ -336,36 +336,28 @@ impl Broadcast {
         &self,
         topic: &str,
         id: &str,
-        strategy: crate::htmx::OobSwap,
+        strategy: &crate::htmx::OobSwap,
         fragment: &maud::Markup,
     ) -> Result<usize, BroadcastError> {
-        use crate::htmx::{OobSwap, inject_hx_swap_oob};
+        use crate::htmx::{inject_hx_swap_oob, OobSwap};
         let rendered = &fragment.0;
-        let envelope = if strategy == OobSwap::Raw {
+        let envelope = if strategy == &OobSwap::Raw {
             rendered.clone()
         } else {
             let value = strategy.format_value(id);
             let escaped_value = crate::htmx::escape_attribute_string(&value);
 
-            let is_outer_html = matches!(strategy, OobSwap::True | OobSwap::OuterHTML)
-                || match strategy {
-                    OobSwap::Target(crate::htmx::OobMethod::OuterHTML, _) => true,
-                    _ => false,
-                };
+            let is_outer_html = matches!(strategy, OobSwap::True | OobSwap::OuterHTML | OobSwap::Target(crate::htmx::OobMethod::OuterHTML, _));
 
             if is_outer_html {
-                if let Some(injected) = inject_hx_swap_oob(rendered, &value) {
-                    injected
-                } else {
-                    format!(
-                        "<template hx-swap-oob=\"{}\">{}</template>",
-                        escaped_value, rendered
-                    )
-                }
+                inject_hx_swap_oob(rendered, &value).map_or_else(
+                    || format!("<template hx-swap-oob=\"{escaped_value}\">{rendered}</template>"),
+                    |injected| injected,
+                )
             } else if matches!(strategy, OobSwap::Delete) {
-                format!("<div hx-swap-oob=\"{}\"></div>", escaped_value)
+                format!("<div hx-swap-oob=\"{escaped_value}\"></div>")
             } else {
-                format!("<div hx-swap-oob=\"{}\">{}</div>", escaped_value, rendered)
+                format!("<div hx-swap-oob=\"{escaped_value}\">{rendered}</div>")
             }
         };
         self.publish(topic, envelope)
@@ -1232,7 +1224,7 @@ mod tests {
             .publish_oob(
                 "feed",
                 "badge",
-                crate::htmx::OobSwap::BeforeEnd,
+                &crate::htmx::OobSwap::BeforeEnd,
                 &maud::html! {
                     span { "3" }
                 },
@@ -1589,7 +1581,7 @@ mod tests {
             .publish_oob(
                 "test_publish_oob",
                 "list-id",
-                crate::htmx::OobSwap::BeforeEnd,
+                &crate::htmx::OobSwap::BeforeEnd,
                 &oob,
             )
             .unwrap();
@@ -1613,7 +1605,7 @@ mod tests {
             .publish_oob(
                 "test_publish_oob_outerhtml",
                 "item-3",
-                crate::htmx::OobSwap::OuterHTML,
+                &crate::htmx::OobSwap::OuterHTML,
                 &oob,
             )
             .unwrap();
@@ -1637,7 +1629,7 @@ mod tests {
             .publish_oob(
                 "test_publish_oob_escape",
                 "\"bad-id\"",
-                crate::htmx::OobSwap::BeforeEnd,
+                &crate::htmx::OobSwap::BeforeEnd,
                 &oob,
             )
             .unwrap();

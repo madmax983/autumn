@@ -1413,13 +1413,15 @@ pub struct DummyBroadcast;
 
 #[cfg(not(feature = "ws"))]
 impl Channels {
-    pub fn broadcast(&self) -> DummyBroadcast {
+    #[allow(clippy::unused_self)]
+    pub const fn broadcast(&self) -> DummyBroadcast {
         DummyBroadcast
     }
 }
 
 #[cfg(not(feature = "ws"))]
 impl DummyBroadcast {
+    #[allow(clippy::unused_self, clippy::unnecessary_wraps)]
     pub fn publish_oob<T, S>(
         &self,
         _topic: &str,
@@ -1432,10 +1434,12 @@ impl DummyBroadcast {
 }
 
 #[cfg(not(feature = "ws"))]
+#[allow(clippy::missing_const_for_fn)]
 pub fn set_global_channels(_channels: Channels) {}
 
 #[cfg(not(feature = "ws"))]
 #[must_use]
+#[allow(clippy::missing_const_for_fn)]
 pub fn get_global_channels() -> Option<Channels> {
     None
 }

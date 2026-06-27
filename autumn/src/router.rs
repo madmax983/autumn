@@ -1382,6 +1382,62 @@ const fn is_i18n_bundle_extension_layer(_type_id: std::any::TypeId) -> bool {
     false
 }
 
+#[cfg(feature = "htmx")]
+fn mount_htmx_routes(mut router: axum::Router<AppState>) -> axum::Router<AppState> {
+    if crate::assets::htmx_is_vendored() {
+        tracing::debug!(
+            path = crate::htmx::HTMX_JS_PATH,
+            "htmx vendored via `autumn assets`; built-in handler skipped, ServeDir serves it"
+        );
+    } else {
+        router = router.route(crate::htmx::HTMX_JS_PATH, axum::routing::get(htmx_handler));
+        tracing::debug!(
+            method = "GET",
+            path = crate::htmx::HTMX_JS_PATH,
+            name = format!("htmx {}", crate::htmx::HTMX_VERSION),
+            "Mounted route"
+        );
+    }
+    router = router.route(
+        crate::htmx::HTMX_CSRF_JS_PATH,
+        axum::routing::get(htmx_csrf_handler),
+    );
+    router = router.route(
+        crate::htmx::AUTUMN_WIDGETS_JS_PATH,
+        axum::routing::get(autumn_widgets_handler),
+    );
+    if crate::assets::sse_is_vendored() {
+        tracing::debug!(
+            path = crate::htmx::HTMX_SSE_JS_PATH,
+            "sse extension vendored via `autumn assets`; built-in handler skipped, ServeDir serves it"
+        );
+    } else {
+        router = router.route(
+            crate::htmx::HTMX_SSE_JS_PATH,
+            axum::routing::get(htmx_sse_handler),
+        );
+        tracing::debug!(
+            method = "GET",
+            path = crate::htmx::HTMX_SSE_JS_PATH,
+            name = "htmx sse extension",
+            "Mounted route"
+        );
+    }
+    tracing::debug!(
+        method = "GET",
+        path = crate::htmx::HTMX_CSRF_JS_PATH,
+        name = "htmx csrf helper",
+        "Mounted route"
+    );
+    tracing::debug!(
+        method = "GET",
+        path = crate::htmx::AUTUMN_WIDGETS_JS_PATH,
+        name = "autumn widget runtime",
+        "Mounted route"
+    );
+    router
+}
+
 #[cfg_attr(not(feature = "mail"), allow(unused_variables))]
 #[allow(clippy::cognitive_complexity)]
 fn mount_framework_routes(
@@ -1395,61 +1451,7 @@ fn mount_framework_routes(
     // Framework-provided routes
     #[cfg(feature = "htmx")]
     {
-        // When htmx is vendored via `autumn assets add htmx@…`, skip the
-        // built-in handler so ServeDir serves the correctly-pinned file.
-        // Axum explicit routes beat `nest_service`, so without this guard the
-        // embedded 2.0.4 bytes would shadow any updated vendored version.
-        if crate::assets::htmx_is_vendored() {
-            tracing::debug!(
-                path = crate::htmx::HTMX_JS_PATH,
-                "htmx vendored via `autumn assets`; built-in handler skipped, ServeDir serves it"
-            );
-        } else {
-            router = router.route(crate::htmx::HTMX_JS_PATH, axum::routing::get(htmx_handler));
-            tracing::debug!(
-                method = "GET",
-                path = crate::htmx::HTMX_JS_PATH,
-                name = format!("htmx {}", crate::htmx::HTMX_VERSION),
-                "Mounted route"
-            );
-        }
-        router = router.route(
-            crate::htmx::HTMX_CSRF_JS_PATH,
-            axum::routing::get(htmx_csrf_handler),
-        );
-        router = router.route(
-            crate::htmx::AUTUMN_WIDGETS_JS_PATH,
-            axum::routing::get(autumn_widgets_handler),
-        );
-        if crate::assets::sse_is_vendored() {
-            tracing::debug!(
-                path = crate::htmx::HTMX_SSE_JS_PATH,
-                "sse extension vendored via `autumn assets`; built-in handler skipped, ServeDir serves it"
-            );
-        } else {
-            router = router.route(
-                crate::htmx::HTMX_SSE_JS_PATH,
-                axum::routing::get(htmx_sse_handler),
-            );
-            tracing::debug!(
-                method = "GET",
-                path = crate::htmx::HTMX_SSE_JS_PATH,
-                name = "htmx sse extension",
-                "Mounted route"
-            );
-        }
-        tracing::debug!(
-            method = "GET",
-            path = crate::htmx::HTMX_CSRF_JS_PATH,
-            name = "htmx csrf helper",
-            "Mounted route"
-        );
-        tracing::debug!(
-            method = "GET",
-            path = crate::htmx::AUTUMN_WIDGETS_JS_PATH,
-            name = "autumn widget runtime",
-            "Mounted route"
-        );
+        router = mount_htmx_routes(router);
     }
 
     // Framework-provided flash-message stylesheet. Served as a same-origin

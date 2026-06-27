@@ -402,6 +402,7 @@ fn escape_attribute(w: &mut String, s: &str) {
 }
 
 #[cfg(feature = "maud")]
+#[must_use]
 pub fn escape_attribute_string(s: &str) -> String {
     let mut w = String::with_capacity(s.len() + 10);
     escape_attribute(&mut w, s);
@@ -409,6 +410,7 @@ pub fn escape_attribute_string(s: &str) -> String {
 }
 
 #[cfg(feature = "maud")]
+#[must_use]
 pub fn inject_hx_swap_oob(html: &str, oob_value: &str) -> Option<String> {
     let mut idx = 0;
     while let Some(start_pos) = html[idx..].find('<') {
