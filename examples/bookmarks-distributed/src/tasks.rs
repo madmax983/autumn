@@ -7,6 +7,7 @@
 // Errors are logged at WARN level and the task retries on the
 // next scheduled interval.
 
+use autumn_web::http::Client;
 use autumn_web::prelude::*;
 use futures::FutureExt;
 use reqwest::StatusCode;
@@ -34,7 +35,7 @@ fn probe_outcome(head: Result<StatusCode, ()>, get: Option<Result<StatusCode, ()
     }
 }
 
-async fn probe_reachable(client: &reqwest::Client, url: &str) -> bool {
+async fn probe_reachable(client: &Client, url: &str) -> bool {
     let head = client
         .head(url)
         .send()
@@ -57,7 +58,7 @@ async fn probe_reachable(client: &reqwest::Client, url: &str) -> bool {
 
 async fn process_shard(
     repo: &BookmarkRepository,
-    client: &reqwest::Client,
+    client: &Client,
     shard: u32,
 ) -> AutumnResult<(u32, u32)> {
     let shard_alive = repo.find_alive_in_shard(shard).await?;
@@ -106,12 +107,9 @@ fn process_shard_result(
 }
 
 #[scheduled(every = "1h", name = "link-checker")]
-pub async fn check_links(_state: AppState) -> AutumnResult<()> {
+pub async fn check_links(state: AppState) -> AutumnResult<()> {
     let repo = BookmarkRepository;
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-        .map_err(|e| AutumnError::from(std::io::Error::other(e.to_string())))?;
+    let client = Client::from_state(&state);
 
     let mut dead_count = 0u32;
     let mut checked_count = 0u32;

@@ -270,6 +270,12 @@ impl Default for MockRegistry {
 /// `MockRegistry` `Arc` survives a `build()` without double-wrapping.
 pub struct HttpMockRegistryExt(pub Arc<MockRegistry>);
 
+/// Shared, process-wide `reqwest::Client` registered in [`AppState`] at server
+/// boot. Cloning is O(1) because `reqwest::Client` is internally `Arc`-backed,
+/// and the connection pool is preserved across the clone.
+#[derive(Clone)]
+pub(crate) struct SharedReqwestClient(pub(crate) reqwest::Client);
+
 /// Handle returned by
 /// [`MockSetupBuilder::respond_with`] that lets tests assert call counts.
 pub struct MockHandle {
@@ -490,19 +496,27 @@ impl Client {
         }
     }
 
-    /// Create a client from `[http.client]` framework configuration.
+    /// Build a bare `reqwest::Client` from `[http.client]` config.
+    ///
+    /// Used by `build_state` to create the single shared instance registered
+    /// in `AppState` at server boot, and as the fallback when no shared client
+    /// is available.
     ///
     /// # Panics
     ///
-    /// Panics if the underlying TLS backend cannot be initialised (should not
-    /// happen with the default `rustls-tls` feature).
-    #[must_use]
-    pub fn from_config(config: &crate::config::HttpClientConfig) -> Self {
-        let timeout = Duration::from_secs(config.timeout_secs);
-        let inner = reqwest::ClientBuilder::new()
-            .timeout(timeout)
+    /// Panics if the underlying TLS backend cannot be initialised.
+    pub(crate) fn build_inner(config: &crate::config::HttpClientConfig) -> reqwest::Client {
+        reqwest::ClientBuilder::new()
+            .timeout(Duration::from_secs(config.timeout_secs))
             .build()
-            .expect("failed to build reqwest client");
+            .expect("failed to build reqwest client")
+    }
+
+    /// Assemble a `Client` around an already-built `reqwest::Client` using the
+    /// policy fields from `config`.  The caller supplies the inner client so
+    /// the connection pool can be shared across requests.
+    fn from_config_with_inner(inner: reqwest::Client, config: &crate::config::HttpClientConfig) -> Self {
+        let timeout = Duration::from_secs(config.timeout_secs);
         Self {
             inner,
             alias: None,
@@ -519,6 +533,38 @@ impl Client {
         }
     }
 
+    /// Assemble a `Client` with default policy around an already-built
+    /// `reqwest::Client`.  Used when a shared inner client is available but
+    /// no explicit `[http.client]` config is registered.
+    fn with_inner(inner: reqwest::Client) -> Self {
+        let timeout = Duration::from_secs(30);
+        Self {
+            inner,
+            alias: None,
+            base_url: None,
+            base_urls: HashMap::new(),
+            retry_policy: RetryPolicy {
+                max_retries: 3,
+                retry_idempotent_only: true,
+                max_retry_after: Duration::from_secs(10),
+                request_timeout: Some(timeout),
+            },
+            mock: None,
+            resilience_config: None,
+        }
+    }
+
+    /// Create a client from `[http.client]` framework configuration.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the underlying TLS backend cannot be initialised (should not
+    /// happen with the default `rustls-tls` feature).
+    #[must_use]
+    pub fn from_config(config: &crate::config::HttpClientConfig) -> Self {
+        Self::from_config_with_inner(Self::build_inner(config), config)
+    }
+
     /// Attach a mock registry (used by the test harness).
     pub(crate) fn with_mock(mut self, registry: Arc<MockRegistry>) -> Self {
         self.mock = Some(registry);
@@ -526,13 +572,29 @@ impl Client {
     }
 
     /// Build a client from runtime application state.
-    pub(crate) fn from_state(state: &crate::AppState) -> Self {
+    ///
+    /// When the server was started via `AppBuilder`, a single `reqwest::Client`
+    /// is registered in `AppState` at boot as a `SharedReqwestClient`.  This
+    /// method clones that shared instance (O(1), preserves the connection pool)
+    /// instead of constructing a new one, eliminating per-request TCP/TLS
+    /// handshakes and DNS-resolver-spawn overhead.
+    ///
+    /// Falls back to `Self::new()` for detached or test state that does not
+    /// carry a shared client.
+    pub fn from_state(state: &crate::AppState) -> Self {
         let config = state.extension::<crate::config::HttpConfig>().or_else(|| {
             state
                 .extension::<crate::config::AutumnConfig>()
                 .map(|c| Arc::new(c.http.clone()))
         });
-        let mut client = config.map_or_else(Self::new, |cfg| Self::from_config(&cfg.client));
+        let shared = state.extension::<SharedReqwestClient>().map(|s| s.0.clone());
+
+        let mut client = match (config, shared) {
+            (Some(cfg), Some(inner)) => Self::from_config_with_inner(inner, &cfg.client),
+            (Some(cfg), None) => Self::from_config(&cfg.client),
+            (None, Some(inner)) => Self::with_inner(inner),
+            (None, None) => Self::new(),
+        };
 
         let resilience = state
             .extension::<crate::config::AutumnConfig>()
@@ -636,6 +698,12 @@ impl Client {
     #[must_use]
     pub fn delete(&self, url: impl AsRef<str>) -> RequestBuilder {
         self.build_request(Method::DELETE, url)
+    }
+
+    /// Build a `HEAD` request.
+    #[must_use]
+    pub fn head(&self, url: impl AsRef<str>) -> RequestBuilder {
+        self.build_request(Method::HEAD, url)
     }
 }
 
@@ -1809,6 +1877,71 @@ mod tests {
 
         // Assert that the server was only hit 3 times
         assert_eq!(hit.load(SeqOrdering::SeqCst), 3);
+        crate::circuit_breaker::global_registry().clear();
+    }
+
+    // RED-PHASE TEST 41: SharedReqwestClient round-trips through AppState extensions.
+    #[test]
+    fn shared_reqwest_client_ext_round_trips() {
+        let inner = reqwest::Client::new();
+        let ext = SharedReqwestClient(inner);
+        let state = crate::AppState::for_test();
+        state.insert_extension(ext);
+        let retrieved = state.extension::<SharedReqwestClient>();
+        assert!(retrieved.is_some());
+    }
+
+    // RED-PHASE TEST 42: Client::head() compiles and builds a HEAD RequestBuilder.
+    #[test]
+    fn client_head_method_builds_request_builder() {
+        let client = Client::new();
+        let _builder = client.head("https://example.com/resource");
+    }
+
+    // RED-PHASE TEST 43: from_state reuses the SharedReqwestClient when registered.
+    // Spins up a local echo server that returns the User-Agent header as the body,
+    // then asserts the extracted Client carries the distinctive user-agent we set
+    // on the shared inner client — proving from_state cloned it rather than
+    // building a fresh default.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn from_state_reuses_shared_client() {
+        use axum::{Router, routing::get};
+
+        let _lock = crate::circuit_breaker::TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::circuit_breaker::global_registry().clear();
+
+        let app = Router::new().route(
+            "/ua",
+            get(|req: axum::http::Request<axum::body::Body>| async move {
+                req.headers()
+                    .get("user-agent")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("")
+                    .to_owned()
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let distinctive_inner = reqwest::ClientBuilder::new()
+            .user_agent("autumn-shared-pool-test")
+            .build()
+            .expect("failed to build inner client");
+        let state = crate::AppState::for_test();
+        state.insert_extension(SharedReqwestClient(distinctive_inner));
+
+        let client = Client::from_state(&state);
+        let resp = client
+            .get(format!("http://127.0.0.1:{}/ua", addr.port()))
+            .send()
+            .await
+            .expect("request should succeed");
+
+        assert_eq!(resp.text(), "autumn-shared-pool-test");
         crate::circuit_breaker::global_registry().clear();
     }
 }

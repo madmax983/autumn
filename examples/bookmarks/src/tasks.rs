@@ -10,6 +10,7 @@
 use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
 
+use autumn_web::http::Client;
 use autumn_web::prelude::*;
 
 use crate::schema::bookmarks;
@@ -37,10 +38,7 @@ pub async fn check_links(state: AppState) -> AutumnResult<()> {
 
     tracing::info!("link-checker: checking {} URLs", alive.len());
 
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-        .map_err(|e| AutumnError::from(std::io::Error::other(e.to_string())))?;
+    let client = Client::from_state(&state);
 
     let mut dead_ids = Vec::new();
     for (id, url) in &alive {

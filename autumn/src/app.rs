@@ -7037,6 +7037,10 @@ fn build_state(
     state.insert_extension(crate::step_up::StepUpGlobalConfig {
         default_max_age_secs: config.auth.step_up.default_max_age_secs,
     });
+    #[cfg(feature = "http-client")]
+    state.insert_extension(crate::http_client::SharedReqwestClient(
+        crate::http_client::Client::build_inner(&config.http.client),
+    ));
     state
 }
 
@@ -10622,6 +10626,29 @@ mod tests {
         assert!(
             fast_ran.load(Ordering::SeqCst),
             "fast hook must still run even after slow hook overruns its per-hook budget"
+        );
+    }
+
+    // Verify that build_state registers a SharedReqwestClient so that
+    // Client::from_state can reuse the shared connection pool on every request.
+    #[cfg(feature = "http-client")]
+    #[test]
+    fn build_state_registers_shared_reqwest_client() {
+        let config = AutumnConfig::default();
+        let state = build_state(
+            &config,
+            #[cfg(feature = "db")]
+            None,
+            #[cfg(feature = "db")]
+            None,
+            #[cfg(feature = "ws")]
+            None,
+        );
+        assert!(
+            state
+                .extension::<crate::http_client::SharedReqwestClient>()
+                .is_some(),
+            "build_state must register a SharedReqwestClient for connection-pool sharing"
         );
     }
 }
