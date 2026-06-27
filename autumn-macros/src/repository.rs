@@ -1453,13 +1453,16 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                             .get("__autumn_previous_id")
                             .and_then(|__v| __v.as_str());
 
-                        let mut __topic_changed = false;
-                        if let ::core::option::Option::Some(__prev_topic) = __ctx_val
+                        let __topic_changed = __ctx_val
                             .get("__autumn_previous_topic")
                             .and_then(|__v| __v.as_str())
-                        {
-                            if __prev_topic != __topic {
-                                __topic_changed = true;
+                            .map_or(false, |__prev_topic| __prev_topic != __topic);
+
+                        if __topic_changed {
+                            if let ::core::option::Option::Some(__prev_topic) = __ctx_val
+                                .get("__autumn_previous_topic")
+                                .and_then(|__v| __v.as_str())
+                            {
                                 let __delete_id = __prev_id.unwrap_or(&__id);
                                 let __delete_fragment = ::autumn_web::html! {};
                                 if let ::core::result::Result::Err(__err) = __channels
@@ -1600,33 +1603,36 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 }
             };
 
-            (
+             (
                 quote! {
-                    let mut __autumn_previous_topic: ::core::option::Option<::std::string::String> = ::core::option::Option::None;
-                    let mut __autumn_previous_id: ::core::option::Option<::std::string::String> = ::core::option::Option::None;
-                    let mut __autumn_ctx_val = ::autumn_web::reexports::serde_json::to_value(&ctx)
-                        .map_err(|e| ::autumn_web::AutumnError::internal_server_error_msg(format!("serialize context: {e}")))?;
-                    if let ::core::option::Option::Some(__record_val) = &__vh_before {
+                    let (__autumn_previous_topic, __autumn_previous_id) = if let ::core::option::Option::Some(__record_val) = &__vh_before {
                         let __record_ref = __record_val;
                         let __prev_topic = #topic_expr;
-                        __autumn_previous_topic = ::core::option::Option::Some(__prev_topic.clone());
+                        let __prev_fragment = #render_expr;
+                        let __prev_id = ::autumn_web::htmx::extract_html_id(&__prev_fragment.into_string());
+                        (::core::option::Option::Some(__prev_topic), __prev_id)
+                    } else {
+                        (::core::option::Option::None, ::core::option::Option::None)
+                    };
+
+                    let mut __autumn_ctx_val = ::autumn_web::reexports::serde_json::to_value(&ctx)
+                        .map_err(|e| ::autumn_web::AutumnError::internal_server_error_msg(format!("serialize context: {e}")))?;
+
+                    if let ::core::option::Option::Some(ref __prev_topic) = __autumn_previous_topic {
                         if let ::core::option::Option::Some(__map) = __autumn_ctx_val.as_object_mut() {
                             __map.insert(
                                 "__autumn_previous_topic".to_string(),
-                                ::autumn_web::reexports::serde_json::Value::String(__prev_topic),
+                                ::autumn_web::reexports::serde_json::Value::String(__prev_topic.clone()),
                             );
                         }
+                    }
 
-                        let __prev_fragment = #render_expr;
-                        let __prev_id = ::autumn_web::htmx::extract_html_id(&__prev_fragment.into_string());
-                        __autumn_previous_id = __prev_id.clone();
-                        if let ::core::option::Option::Some(__prev_id_val) = __prev_id {
-                            if let ::core::option::Option::Some(__map) = __autumn_ctx_val.as_object_mut() {
-                                __map.insert(
-                                    "__autumn_previous_id".to_string(),
-                                    ::autumn_web::reexports::serde_json::Value::String(__prev_id_val),
-                                );
-                            }
+                    if let ::core::option::Option::Some(ref __prev_id_val) = __autumn_previous_id {
+                        if let ::core::option::Option::Some(__map) = __autumn_ctx_val.as_object_mut() {
+                            __map.insert(
+                                "__autumn_previous_id".to_string(),
+                                ::autumn_web::reexports::serde_json::Value::String(__prev_id_val.clone()),
+                            );
                         }
                     }
                 },
@@ -9401,6 +9407,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
         #clone_impl
 
+        #[allow(clippy::useless_let_if_seq)]
         impl #trait_name for #pg_name {
             async fn find_by_id(&self, id: i64) -> ::autumn_web::AutumnResult<Option<#model_name>> {
                 use ::autumn_web::reexports::diesel::prelude::*;
@@ -9467,6 +9474,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             #search_impl_methods
         }
 
+        #[allow(clippy::useless_let_if_seq)]
         impl #pg_name {
             #across_tenants_method
             #for_shard_method
