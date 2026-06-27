@@ -1976,4 +1976,47 @@ mod tests {
         assert_eq!(resp.text(), "autumn-shared-pool-test");
         crate::circuit_breaker::global_registry().clear();
     }
+
+    #[cfg(feature = "http-client")]
+    #[test]
+    fn from_state_falls_back_when_timeout_mismatches_shared_client() {
+        // SharedReqwestClient was built with 5s; config says 10s → mismatch
+        // → from_state must not reuse the shared inner (falls through to
+        //   from_config which builds a fresh reqwest::Client).
+        use crate::config::{AutumnConfig, HttpClientConfig};
+        use std::sync::Arc;
+
+        let mut config = AutumnConfig::default();
+        config.http.client = HttpClientConfig {
+            timeout_secs: 10,
+            ..Default::default()
+        };
+
+        let state = crate::AppState::for_test();
+        state.insert_extension(SharedReqwestClient {
+            client: reqwest::Client::new(),
+            timeout_secs: 5, // deliberately different from config
+        });
+        state.insert_extension(Arc::new(config));
+
+        // Should not panic — falls back to building a fresh client.
+        let _client = Client::from_state(&state);
+    }
+
+    #[cfg(feature = "http-client")]
+    #[test]
+    fn from_state_reuses_shared_client_when_no_config() {
+        // No HttpConfig/AutumnConfig in state, but SharedReqwestClient is
+        // present → hits the (None, Some(inner)) arm → with_inner.
+        let state = crate::AppState::for_test();
+        // Default timeout_secs from HttpClientConfig matches the default used
+        // in effective_timeout_secs, so the shared client is reused.
+        let default_timeout = crate::config::HttpClientConfig::default().timeout_secs;
+        state.insert_extension(SharedReqwestClient {
+            client: reqwest::Client::new(),
+            timeout_secs: default_timeout,
+        });
+
+        let _client = Client::from_state(&state);
+    }
 }
