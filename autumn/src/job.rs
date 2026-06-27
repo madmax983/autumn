@@ -1998,14 +1998,22 @@ impl JobClient {
                     // delivers it to a worker. This is local-safe only — a
                     // pending delay is lost if the process restarts before the
                     // job becomes due (durable backends persist the due time).
-                    let delay = (due - now).to_std().unwrap_or(std::time::Duration::ZERO);
+                    // Recompute remaining delay at the moment actual_enqueue
+                    // runs (after any interceptor) so the sleep duration stays
+                    // accurate even if the interceptor took non-trivial time.
+                    let delay = (due - chrono::Utc::now())
+                        .to_std()
+                        .unwrap_or(std::time::Duration::ZERO);
                     let sender = sender.clone();
                     let cancel_token = tokio_util::sync::CancellationToken::new();
                     self.job_admin
                         .register_delay_canceler(id_for_enqueue.clone(), cancel_token.clone());
-                    // Capture what we need to release the unique lock on cancel.
+                    // Capture what we need on cancel: unique lock release,
+                    // admin status update, and queued-gauge decrement.
                     let cancel_unique_key = constraints.unique_key.clone();
                     let cancel_coordination = self.local_coordination.clone();
+                    let cancel_admin = self.job_admin.clone();
+                    let cancel_registry = self.registry.clone();
                     let cancel_name = name.to_string();
                     let cancel_id = id_for_enqueue.clone();
                     tokio::spawn(async move {
@@ -2015,11 +2023,15 @@ impl JobClient {
                                 // Admin-canceled before the due time: release the
                                 // unique lock immediately so re-enqueueing works
                                 // without waiting for the original timer to fire.
+                                // Also update the admin record and queued gauge so
+                                // /actuator does not report phantom queued work.
                                 if let (Some(unique_key), Some(coord)) =
                                     (cancel_unique_key, cancel_coordination)
                                 {
                                     coord.release_unique(&cancel_name, &unique_key, &cancel_id);
                                 }
+                                cancel_registry.record_cancel(&cancel_name);
+                                cancel_admin.record_cancelled(&cancel_id);
                             }
                             () = tokio::time::sleep(delay) => {
                                 let _ = sender.send(queued).await;
