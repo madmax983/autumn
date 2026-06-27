@@ -339,31 +339,9 @@ impl Broadcast {
         strategy: &crate::htmx::OobSwap,
         fragment: &maud::Markup,
     ) -> Result<usize, BroadcastError> {
-        use crate::htmx::{OobSwap, inject_hx_swap_oob};
-        let rendered = &fragment.0;
-        let envelope = if strategy == &OobSwap::Raw {
-            rendered.clone()
-        } else {
-            let value = strategy.format_value(id);
-            let escaped_value = crate::htmx::escape_attribute_string(&value);
-
-            let is_outer_html = matches!(
-                strategy,
-                OobSwap::True
-                    | OobSwap::OuterHTML
-                    | OobSwap::Target(crate::htmx::OobMethod::OuterHTML, _)
-            );
-
-            if is_outer_html {
-                inject_hx_swap_oob(rendered, &value).unwrap_or_else(|| {
-                    format!("<template hx-swap-oob=\"{escaped_value}\">{rendered}</template>")
-                })
-            } else if matches!(strategy, OobSwap::Delete) {
-                format!("<div hx-swap-oob=\"{escaped_value}\"></div>")
-            } else {
-                format!("<div hx-swap-oob=\"{escaped_value}\">{rendered}</div>")
-            }
-        };
+        use maud::Render;
+        let html = fragment.render().into_string();
+        let envelope = sse_oob_envelope(id, strategy, &html);
         self.publish(topic, envelope)
     }
 }
@@ -376,6 +354,58 @@ fn htmx_oob_envelope(fragment: &maud::Markup) -> String {
         .oob("", fragment.clone())
         .render()
         .into_string()
+}
+
+/// Format an OOB fragment for delivery over SSE.
+///
+/// Unlike HTTP responses (where htmx's full swap pipeline unwraps `<template>`
+/// elements), the SSE swap pipeline processes `hx-swap-oob` on the *element
+/// itself*. Wrapping in `<template hx-swap-oob="...">` causes the attribute to
+/// land on the template node, whose `childNodes` is always empty — so htmx
+/// performs the swap on nothing.
+///
+/// Correct SSE formats:
+/// - **`OobSwap::True`** (update) — inject `hx-swap-oob="true"` onto the root
+///   element; htmx replaces the matching DOM element via outerHTML.
+/// - **`OobSwap::Delete`** — emit a tombstone `<div id="{id}" hx-swap-oob="delete"></div>`;
+///   htmx deletes the matching element.
+/// - **All other strategies** — wrap the fragment in a `<div hx-swap-oob="…">`
+///   container so that htmx inserts the container's *children* at the target.
+#[cfg(feature = "maud")]
+fn sse_oob_envelope(id: &str, strategy: &crate::htmx::OobSwap, fragment_html: &str) -> String {
+    use crate::htmx::OobSwap;
+    match strategy {
+        OobSwap::Delete => {
+            format!("<div id=\"{id}\" hx-swap-oob=\"delete\"></div>")
+        }
+        OobSwap::True => inject_oob_attr(fragment_html, "true"),
+        OobSwap::Raw => fragment_html.to_string(),
+        OobSwap::Custom(val) => inject_oob_attr(fragment_html, val),
+        _ => {
+            let value = strategy.format_value(id);
+            format!("<div hx-swap-oob=\"{value}\">{fragment_html}</div>")
+        }
+    }
+}
+
+/// Inject `hx-swap-oob="{value}"` into the opening tag of the root element.
+///
+/// Finds the first tag name boundary (space or `>`) and inserts the attribute
+/// before it, e.g. `<li id="x">` → `<li hx-swap-oob="true" id="x">`.
+#[cfg(feature = "maud")]
+fn inject_oob_attr(html: &str, value: &str) -> String {
+    if let Some(lt) = html.find('<') {
+        let after_lt = &html[lt + 1..];
+        if let Some(pos) = after_lt.find(|c: char| c == ' ' || c == '>') {
+            let insert_at = lt + 1 + pos;
+            return format!(
+                "{} hx-swap-oob=\"{value}\"{}",
+                &html[..insert_at],
+                &html[insert_at..]
+            );
+        }
+    }
+    html.to_string()
 }
 
 /// A sender handle for a broadcast channel.
