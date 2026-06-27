@@ -3566,10 +3566,8 @@ return 1
             .query_async(&mut connection)
             .await
             .map_err(|error| redis_admin_error("cancel enqueued job", &error))?;
-        if result == 1 {
-            if let Some(name) = job_name {
-                self.registry.record_cancel(&name);
-            }
+        if result == 1 && let Some(name) = job_name {
+            self.registry.record_cancel(&name);
         }
         redis_admin_operation_result(result, id, "cancel enqueued job")
     }
