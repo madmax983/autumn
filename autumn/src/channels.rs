@@ -339,7 +339,7 @@ impl Broadcast {
         strategy: crate::htmx::OobSwap,
         fragment: &maud::Markup,
     ) -> Result<usize, BroadcastError> {
-        use crate::htmx::{inject_hx_swap_oob, OobSwap};
+        use crate::htmx::{OobSwap, inject_hx_swap_oob};
         let rendered = &fragment.0;
         let envelope = if strategy == OobSwap::Raw {
             rendered.clone()
@@ -1603,8 +1603,7 @@ mod tests {
 
     #[cfg(feature = "maud")]
     #[tokio::test]
-    async fn test_publish_oob_injects_for_outerhtml()
-    -> Result<(), broadcast::error::RecvError> {
+    async fn test_publish_oob_injects_for_outerhtml() -> Result<(), broadcast::error::RecvError> {
         let channels = Channels::new(16);
         let mut rx = channels.subscribe("test_publish_oob_outerhtml");
 
@@ -1628,8 +1627,7 @@ mod tests {
 
     #[cfg(feature = "maud")]
     #[tokio::test]
-    async fn test_publish_oob_escapes_attributes()
-    -> Result<(), broadcast::error::RecvError> {
+    async fn test_publish_oob_escapes_attributes() -> Result<(), broadcast::error::RecvError> {
         let channels = Channels::new(16);
         let mut rx = channels.subscribe("test_publish_oob_escape");
 
