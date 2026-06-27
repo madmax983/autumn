@@ -2,9 +2,9 @@
 //!
 //! Run with:
 //!
-//!     cargo test --test auto_broadcast --features "ws,db"
+//!     cargo test --test auto_broadcast --features "ws,db,test-support"
 
-#[cfg(all(feature = "db", feature = "ws"))]
+#[cfg(all(feature = "db", feature = "ws", feature = "test-support"))]
 mod tests {
     use autumn_web::prelude::*;
     use autumn_web::test::TestDb;
