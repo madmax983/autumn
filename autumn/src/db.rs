@@ -41,7 +41,7 @@ use std::time::Duration;
 use tracing::Instrument as _;
 
 use crate::config::DatabaseConfig;
-use crate::error::AutumnError;
+use crate::error::{AutumnError, AutumnResult};
 
 // ── After-commit callback infrastructure ─────────────────────────────────────
 
@@ -79,7 +79,7 @@ pub(crate) fn record_after_commit_failure() -> u64 {
     AFTER_COMMIT_FAILURES_TOTAL.fetch_add(1, Ordering::Relaxed) + 1
 }
 
-pub(crate) fn reject_ambient_after_commit_registry_for_tx() -> Result<(), AutumnError> {
+pub(crate) fn reject_ambient_after_commit_registry_for_tx() -> AutumnResult<()> {
     if AFTER_COMMIT_REGISTRY.try_with(|_| ()).is_ok() {
         return Err(AutumnError::bad_request_msg(
             "Nested Db::tx calls are not supported",
@@ -492,7 +492,7 @@ pub async fn run_instrumented<F, Fut, T>(
     slow_threshold: std::time::Duration,
     metrics: &crate::middleware::metrics::MetricsCollector,
     query: F,
-) -> Result<T, AutumnError>
+) -> AutumnResult<T>
 where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = Result<T, diesel::result::Error>>,
@@ -869,11 +869,11 @@ impl Db {
     ///
     /// Panics if the internal after-commit registry mutex is poisoned (only
     /// possible if a previous thread holding the lock panicked).
-    pub async fn tx<'a, T, E, F>(&'a mut self, f: F) -> Result<T, crate::error::AutumnError>
+    pub async fn tx<'a, T, E, F>(&'a mut self, f: F) -> AutumnResult<T>
     where
         T: Send + 'a,
         E: From<diesel::result::Error> + Send + Sync + 'a,
-        crate::error::AutumnError: From<E>,
+        AutumnError: From<E>,
         F: for<'r> FnOnce(
                 &'r mut PooledConnection,
             ) -> scoped_futures::ScopedBoxFuture<'a, 'r, Result<T, E>>
@@ -883,12 +883,12 @@ impl Db {
         use diesel_async::AsyncConnection as _;
 
         if self.tx_poisoned {
-            return Err(crate::error::AutumnError::service_unavailable_msg(
+            return Err(AutumnError::service_unavailable_msg(
                 "Database connection is in an invalid transaction state",
             ));
         }
         if self.tx_depth > 0 {
-            return Err(crate::error::AutumnError::bad_request_msg(
+            return Err(AutumnError::bad_request_msg(
                 "Nested Db::tx calls are not supported",
             ));
         }
@@ -985,7 +985,7 @@ impl Db {
     /// shard-routed checkouts: span creation, checkout interceptors,
     /// `SET statement_timeout`, and the metrics captured for the
     /// slow-query warning on `Drop`.
-    pub(crate) async fn checkout(params: DbCheckoutParams<'_>) -> Result<Self, AutumnError> {
+    pub(crate) async fn checkout(params: DbCheckoutParams<'_>) -> AutumnResult<Self> {
         const PG_TIMEOUT_MAX_MS: u64 = i32::MAX as u64;
         use diesel_async::RunQueryDsl as _;
 
@@ -1007,9 +1007,7 @@ impl Db {
 
         let pool = params.pool;
         let mut checkout_future: std::pin::Pin<
-            Box<
-                dyn std::future::Future<Output = Result<PooledConnection, AutumnError>> + Send + '_,
-            >,
+            Box<dyn std::future::Future<Output = AutumnResult<PooledConnection>> + Send + '_>,
         > = Box::pin(async move {
             pool.get().await.map_err(|e| {
                 tracing::error!("Failed to acquire database connection: {e}");
