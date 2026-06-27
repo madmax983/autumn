@@ -2,7 +2,7 @@
 
 use autumn_web::reexports::axum::response::{IntoResponse, Response};
 use autumn_web::reexports::http;
-use autumn_web::{HTMX_CSRF_JS_PATH, HTMX_JS_PATH, Markup, PreEscaped, html};
+use autumn_web::{HTMX_CSRF_JS_PATH, HTMX_JS_PATH, HTMX_SSE_JS_PATH, Markup, PreEscaped, html};
 
 /// Redirect that works for both regular and htmx requests.
 ///
@@ -104,6 +104,7 @@ pub fn layout(
                 link rel="stylesheet" href=(autumn_web::flash::FLASH_CSS_PATH);
                 link rel="stylesheet" href="/static/css/autumn.css";
                 script src=(HTMX_JS_PATH) {}
+                script src=(HTMX_SSE_JS_PATH) {}
                 script src=(HTMX_CSRF_JS_PATH) {}
             }
             body class="bg-gray-100 min-h-screen text-gray-900" {

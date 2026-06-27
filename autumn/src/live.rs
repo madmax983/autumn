@@ -44,20 +44,27 @@
 //! | `update` | `OobSwap::True` (replace element by matching id) |
 //! | `delete` | `OobSwap::Delete` (remove element from DOM) |
 //!
-//! Override `insert_swap()` to use a different strategy for new records.
-//! For example, to append new items to a list container:
+//! Override `insert_swap()` to append new items to a list container.
+//! **Always target a container** — `OobSwap::True` tries to replace an element
+//! with the new record's id, which does not exist yet on remote clients and is
+//! silently dropped. Use `OobSwap::Target` with the list container's id instead:
 //!
 //! ```rust,no_run
-//! # use autumn_web::htmx::OobSwap;
+//! # use autumn_web::htmx::{OobMethod, OobSwap};
 //! # struct Task;
 //! # impl autumn_web::live::LiveFragment for Task {
 //! #   fn dom_id_for(_: i64) -> String { String::new() }
 //! #   fn dom_id(&self) -> String { String::new() }
 //! #   fn render_fragment(&self) -> maud::Markup { maud::html!{} }
 //!     fn insert_swap() -> OobSwap {
-//!         OobSwap::BeforeEnd
+//!         OobSwap::Target(OobMethod::BeforeEnd, "#tasks-list".to_string())
 //!     }
 //! # }
+//! ```
+//!
+//! Wire the matching container in your index template:
+//! ```html
+//! <ul id="tasks-list" hx-ext="sse" sse-connect="/tasks/stream" sse-swap="message"></ul>
 //! ```
 //!
 //! # Note on `commit_hooks`
@@ -95,9 +102,17 @@ pub trait LiveFragment {
 
     /// Htmx swap strategy to use when a new record is inserted.
     ///
-    /// Defaults to [`crate::htmx::OobSwap::True`] (replace an element with the
-    /// matching id). Override to use `OobSwap::BeforeEnd` (append to a list
-    /// container) or any other strategy.
+    /// Defaults to [`crate::htmx::OobSwap::True`], which replaces an element
+    /// with the matching DOM id. **For inserts this means the fragment is
+    /// silently dropped on clients that don't have the element yet.**
+    /// Override with [`crate::htmx::OobSwap::Target`] targeting a list
+    /// container so new rows are appended rather than dropped:
+    ///
+    /// ```rust,ignore
+    /// fn insert_swap() -> OobSwap {
+    ///     OobSwap::Target(OobMethod::BeforeEnd, "#tasks-list".to_string())
+    /// }
+    /// ```
     #[must_use]
     fn insert_swap() -> crate::htmx::OobSwap {
         crate::htmx::OobSwap::True
