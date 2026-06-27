@@ -555,7 +555,7 @@ fn render_routes_file(
 ) -> String {
     let id_rust = id_type.rust_type();
     let layout_head_scripts = if live {
-        "\n                script src=\"/static/js/htmx.min.js\" {}\n                script src=\"/static/js/sse.js\" {}"
+        "\n                script src=\"/static/js/htmx.min.js\" {}\n                script src=\"/static/js/htmx-ext-sse.min.js\" {}"
     } else {
         ""
     };
@@ -704,19 +704,37 @@ fn render_routes_file(
 
     // The `index` handler: when sharded, use from_shard explicitly so the
     // generated code shows the canonical sharding pattern.
-    let (ul_tag, li_render) = if live {
-        (
-            format!(
-                r#"ul id="{plural}-list" hx-ext="sse" sse-connect="/{plural}/events" sse-swap="message" hx-swap="none""#
-            ),
-            format!(
-                r#"li id=(format!("{snake_name}-{{}}", row.id)) {{ a href=(format!("/{plural}/{{}}", row.id)) {{ "{pascal_name} #{{}}" (row.id) }} }}"#
-            ),
+    let li_render = if live {
+        format!(
+            r#"li id=(format!("{snake_name}-{{}}", row.id)) {{ a href=(format!("/{plural}/{{}}", row.id)) {{ "{pascal_name} #{{}}" (row.id) }} }}"#
         )
     } else {
-        (
-            "ul".to_owned(),
-            format!(r#"li {{ a href=(format!("/{plural}/{{}}", row.id)) {{ (row.id) }} }}"#),
+        format!(r#"li {{ a href=(format!("/{plural}/{{}}", row.id)) {{ (row.id) }} }}"#)
+    };
+
+    let ul_list_render = if live {
+        format!(
+            r#"@if page_req.page() == 1 {{
+            ul id="{plural}-list" hx-ext="sse" sse-connect="/{plural}/events" sse-swap="message" hx-swap="none" {{
+                @for row in &page_data.content {{
+                    {li_render}
+                }}
+            }}
+        }} @else {{
+            ul id="{plural}-list" {{
+                @for row in &page_data.content {{
+                    {li_render}
+                }}
+            }}
+        }}"#
+        )
+    } else {
+        format!(
+            r#"ul id="{plural}-list" {{
+            @for row in &page_data.content {{
+                {li_render}
+            }}
+        }}"#
         )
     };
 
@@ -738,11 +756,7 @@ pub async fn index(
     Ok(layout("{pascal_name} index", flash.render().await, html! {{
         h1 {{ "{pascal_name}s" }}
         a href="/{plural}/new" {{ "New {pascal_name}" }}
-        {ul_tag} {{
-            @for row in &page_data.content {{
-                {li_render}
-            }}
-        }}
+        {ul_list_render}
         (pagination_nav(&page_data, &PagerOptions::new("/{plural}")))
     }}))
 }}"#
@@ -764,11 +778,7 @@ pub async fn index(
     Ok(layout("{pascal_name} index", flash.render().await, html! {{
         h1 {{ "{pascal_name}s" }}
         a href="/{plural}/new" {{ "New {pascal_name}" }}
-        {ul_tag} {{
-            @for row in &page_data.content {{
-                {li_render}
-            }}
-        }}
+        {ul_list_render}
         (pagination_nav(&page_data, &PagerOptions::new("/{plural}")))
     }}))
 }}"#
@@ -2174,7 +2184,7 @@ async fn main() {
         assert!(routes.contains("sse-connect=\"/posts/events\""));
         assert!(routes.contains("hx-swap=\"none\""));
         assert!(routes.contains("script src=\"/static/js/htmx.min.js\""));
-        assert!(routes.contains("script src=\"/static/js/sse.js\""));
+        assert!(routes.contains("script src=\"/static/js/htmx-ext-sse.min.js\""));
         assert!(routes.contains("title: autumn_web::hooks::Patch::Set(form.title.clone())"));
 
         let main_rs = fs::read_to_string(tmp.path().join("src/main.rs")).unwrap();
