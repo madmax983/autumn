@@ -578,7 +578,7 @@ impl Cursor {
         let (payload_b64, sig_b64) = token.split_once('.')?;
         let expected_sig = base64url_decode(sig_b64)?;
         let actual_sig = hmac_sha256(key, payload_b64.as_bytes());
-        if !constant_time_eq(&expected_sig, &actual_sig) {
+        if !crate::security::constant_time::constant_time_eq(&expected_sig, &actual_sig) {
             return None;
         }
         let payload = base64url_decode(payload_b64)?;
@@ -593,11 +593,6 @@ fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
     let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(key).expect("HMAC accepts any key length");
     mac.update(message);
     mac.finalize().into_bytes().into()
-}
-
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    use subtle::ConstantTimeEq;
-    a.ct_eq(b).into()
 }
 
 // ── CursorRequest ───────────────────────────────────────────────────

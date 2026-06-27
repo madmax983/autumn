@@ -579,11 +579,11 @@ pub fn verify_upload_with_now(
         return Err(BlobStoreError::Signature("upload token expired".into()));
     }
     let expected = sign_upload(signing_key, blob_key, content_type, expires_at);
-    if constant_time_eq(expected.as_bytes(), signature.as_bytes()) {
+    if crate::security::constant_time::constant_time_eq(expected.as_bytes(), signature.as_bytes()) {
         return Ok(());
     }
     let expected_legacy = sign_upload_legacy(signing_key, blob_key, content_type, expires_at);
-    if constant_time_eq(expected_legacy.as_bytes(), signature.as_bytes()) {
+    if crate::security::constant_time::constant_time_eq(expected_legacy.as_bytes(), signature.as_bytes()) {
         return Ok(());
     }
     Err(BlobStoreError::Signature(
@@ -654,22 +654,22 @@ pub(crate) fn verify_upload_rotation_with_now(
         return Err(BlobStoreError::Signature("upload token expired".into()));
     }
     let expected_current = sign_upload(current.as_bytes(), blob_key, content_type, expires_at);
-    if constant_time_eq(expected_current.as_bytes(), signature.as_bytes()) {
+    if crate::security::constant_time::constant_time_eq(expected_current.as_bytes(), signature.as_bytes()) {
         return Ok(());
     }
     let expected_current_legacy =
         sign_upload_legacy(current.as_bytes(), blob_key, content_type, expires_at);
-    if constant_time_eq(expected_current_legacy.as_bytes(), signature.as_bytes()) {
+    if crate::security::constant_time::constant_time_eq(expected_current_legacy.as_bytes(), signature.as_bytes()) {
         return Ok(());
     }
     for prev in previous {
         let expected = sign_upload(prev.as_bytes(), blob_key, content_type, expires_at);
-        if constant_time_eq(expected.as_bytes(), signature.as_bytes()) {
+        if crate::security::constant_time::constant_time_eq(expected.as_bytes(), signature.as_bytes()) {
             return Ok(());
         }
         let expected_legacy =
             sign_upload_legacy(prev.as_bytes(), blob_key, content_type, expires_at);
-        if constant_time_eq(expected_legacy.as_bytes(), signature.as_bytes()) {
+        if crate::security::constant_time::constant_time_eq(expected_legacy.as_bytes(), signature.as_bytes()) {
             return Ok(());
         }
     }
@@ -764,7 +764,7 @@ pub fn verify_with_now(
     now_unix: u64,
 ) -> Result<(), BlobStoreError> {
     let expected = sign(signing_key, blob_key, expires_at);
-    if !constant_time_eq(expected.as_bytes(), signature.as_bytes()) {
+    if !crate::security::constant_time::constant_time_eq(expected.as_bytes(), signature.as_bytes()) {
         return Err(BlobStoreError::Signature("signature mismatch".into()));
     }
     if expires_at < now_unix {
@@ -1021,11 +1021,6 @@ fn hex<B: AsRef<[u8]>>(bytes: B) -> String {
     s
 }
 
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    use subtle::ConstantTimeEq;
-    a.ct_eq(b).into()
-}
-
 /// Verify a signed blob URL against `current` and each `previous` key.
 ///
 /// Expiry is checked first (same for all keys). The signature is then compared
@@ -1059,12 +1054,12 @@ pub(crate) fn verify_with_rotation_with_now(
         return Err(BlobStoreError::Signature("signed url expired".into()));
     }
     let expected_current = sign(current.as_bytes(), blob_key, expires_at);
-    if constant_time_eq(expected_current.as_bytes(), signature.as_bytes()) {
+    if crate::security::constant_time::constant_time_eq(expected_current.as_bytes(), signature.as_bytes()) {
         return Ok(());
     }
     for prev in previous {
         let expected = sign(prev.as_bytes(), blob_key, expires_at);
-        if constant_time_eq(expected.as_bytes(), signature.as_bytes()) {
+        if crate::security::constant_time::constant_time_eq(expected.as_bytes(), signature.as_bytes()) {
             return Ok(());
         }
     }
