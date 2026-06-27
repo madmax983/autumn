@@ -515,7 +515,10 @@ impl Client {
     /// Assemble a `Client` around an already-built `reqwest::Client` using the
     /// policy fields from `config`.  The caller supplies the inner client so
     /// the connection pool can be shared across requests.
-    fn from_config_with_inner(inner: reqwest::Client, config: &crate::config::HttpClientConfig) -> Self {
+    fn from_config_with_inner(
+        inner: reqwest::Client,
+        config: &crate::config::HttpClientConfig,
+    ) -> Self {
         let timeout = Duration::from_secs(config.timeout_secs);
         Self {
             inner,
@@ -577,12 +580,12 @@ impl Client {
     /// carry a shared client.
     pub fn from_state(state: &crate::AppState) -> Self {
         let autumn_config = state.extension::<crate::config::AutumnConfig>();
-        let config = state.extension::<crate::config::HttpConfig>().or_else(|| {
-            autumn_config
-                .as_ref()
-                .map(|c| Arc::new(c.http.clone()))
-        });
-        let shared = state.extension::<SharedReqwestClient>().map(|s| s.0.clone());
+        let config = state
+            .extension::<crate::config::HttpConfig>()
+            .or_else(|| autumn_config.as_ref().map(|c| Arc::new(c.http.clone())));
+        let shared = state
+            .extension::<SharedReqwestClient>()
+            .map(|s| s.0.clone());
 
         let mut client = match (config, shared) {
             (Some(cfg), Some(inner)) => Self::from_config_with_inner(inner, &cfg.client),
