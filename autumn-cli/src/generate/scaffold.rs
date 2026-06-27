@@ -8,6 +8,7 @@
 //! - A `tests/<snake>.rs` smoke test that asserts the index route returns 200.
 //! - Updates to `src/main.rs` registering all new routes in `routes![ … ]`.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use super::dsl::{Field, FieldKind, IdType, parse_fields};
@@ -37,8 +38,12 @@ pub struct ScaffoldOptions {
     pub queries: Vec<String>,
     /// Scaffold a JSON-only API resource.
     pub api: bool,
-    /// Enable live auto-broadcasting using SSE and HTMX extensions.
+    /// Emit `broadcasts = true` on the repository, a `LiveFragment` impl,
+    /// an SSE events route, and an SSE-wired list container in the index view.
     pub live: bool,
+    /// Emit per-field inline validation endpoints and `hx-post` attributes on
+    /// form inputs (requires `--live`).
+    pub live_validation: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -110,6 +115,7 @@ pub fn plan_scaffold_with_options(
         queries: options.queries.clone(),
         api: options.api,
         live: options.live,
+        live_validation: options.live_validation,
     };
     let mut plan = plan_model_with_options(
         project_root,
@@ -161,8 +167,10 @@ pub fn plan_scaffold_with_options(
                 &form_fields,
                 options_with_key.model.sharded,
                 options_with_key.model.soft_delete,
-                options_with_key.live,
                 options_with_key.model.id_type,
+                options_with_key.live,
+                options_with_key.live_validation,
+                metadata.validations(),
             ),
         );
         let route_mod_path = routes_dir.join("mod.rs");
@@ -192,11 +200,17 @@ pub fn plan_scaffold_with_options(
             format!("missing {}", main_path.display()),
         ))
     })?;
+    let validated_field_names: Vec<String> = if options_with_key.live_validation {
+        metadata.validations().keys().cloned().collect()
+    } else {
+        Vec::new()
+    };
     let route_entries = main_route_entries(
         &plural,
         &snake_name,
         options_with_key.api,
         options_with_key.live,
+        &validated_field_names,
     );
     let mut mods = vec!["models", "schema", "repositories"];
     if !options_with_key.api {
@@ -455,6 +469,25 @@ fn render_repository_file(
              {sharded_note}"
         )
     };
+    let live_fragment_impl = if live {
+        format!(
+            "\nimpl autumn_web::live::LiveFragment for {pascal_name} {{\n\
+             \x20\x20\x20\x20fn dom_id_for(id: i64) -> String {{\n\
+             \x20\x20\x20\x20\x20\x20\x20\x20format!(\"{snake_name}-{{id}}\")\n\
+             \x20\x20\x20\x20}}\n\
+             \x20\x20\x20\x20fn dom_id(&self) -> String {{\n\
+             \x20\x20\x20\x20\x20\x20\x20\x20Self::dom_id_for(self.id)\n\
+             \x20\x20\x20\x20}}\n\
+             \x20\x20\x20\x20fn render_fragment(&self) -> autumn_web::maud::Markup {{\n\
+             \x20\x20\x20\x20\x20\x20\x20\x20autumn_web::maud::html! {{\n\
+             \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20li id=(self.dom_id()) {{ (self.id) }}\n\
+             \x20\x20\x20\x20\x20\x20\x20\x20}}\n\
+             \x20\x20\x20\x20}}\n\
+             }}\n"
+        )
+    } else {
+        String::new()
+    };
     format!(
         "{doc_comment}\n\
          use crate::models::{snake_name}::{{{pascal_name}, New{pascal_name}, Update{pascal_name}}};\n\
@@ -463,7 +496,8 @@ fn render_repository_file(
          #[autumn_web::repository({pascal_name}, api = \"/api/{plural}\"{soft_delete_attr}{broadcasts_attr})]\n\
          pub trait {pascal_name}Repository {{\n\
 {query_body}\
-         }}\n"
+         }}\n\
+{live_fragment_impl}"
     )
 }
 
@@ -550,17 +584,16 @@ fn render_routes_file(
     fields: &[Field],
     sharded: bool,
     soft_delete: bool,
-    live: bool,
     id_type: IdType,
+    live: bool,
+    live_validation: bool,
+    validations: &BTreeMap<String, Vec<String>>,
 ) -> String {
     let id_rust = id_type.rust_type();
-    let layout_head_scripts = if live {
-        "\n                script src=\"/static/js/htmx.min.js\" {}\n                script src=\"/static/js/sse.js\" {}"
-    } else {
-        ""
-    };
-    let create_inputs = render_create_form_inputs(fields);
-    let edit_inputs = render_edit_form_inputs(fields);
+    let validated_fields: Vec<&str> = validations.keys().map(String::as_str).collect();
+    let create_inputs =
+        render_create_form_inputs(fields, live_validation, &validated_fields, plural);
+    let edit_inputs = render_edit_form_inputs(fields, live_validation, &validated_fields, plural);
     let update_columns = render_update_columns(plural, fields);
     let nullable_field_match = render_nullable_field_match(fields);
     let has_attachments = has_attachment_fields(fields);
@@ -786,15 +819,64 @@ pub async fn index(
     };
 
     // Imports: when sharded, drop Db from brace-import and add ShardedDb separately.
+    // When `--live`, add IntoResponse for the SSE stream handler.
     let db_import = if sharded {
+        if live {
+            "use autumn_web::flash::Flash;\n\
+             use autumn_web::sharding::ShardedDb;\n\
+             use autumn_web::{AutumnError, AutumnResult, IntoResponse, Markup, get, html, post, secured};"
+                .to_owned()
+        } else {
+            "use autumn_web::flash::Flash;\n\
+             use autumn_web::sharding::ShardedDb;\n\
+             use autumn_web::{AutumnError, AutumnResult, Markup, get, html, post, secured};"
+                .to_owned()
+        }
+    } else if live {
         "use autumn_web::flash::Flash;\n\
-         use autumn_web::sharding::ShardedDb;\n\
-         use autumn_web::{AutumnError, AutumnResult, Markup, get, html, post, secured};"
+         use autumn_web::{AutumnError, AutumnResult, Db, IntoResponse, Markup, get, html, post, secured};"
             .to_owned()
     } else {
         "use autumn_web::flash::Flash;\n\
          use autumn_web::{AutumnError, AutumnResult, Db, Markup, get, html, post, secured};"
             .to_owned()
+    };
+
+    // When `--live-validation`, emit one inline-validation handler per validated field.
+    let validate_handlers = if live_validation {
+        use std::fmt::Write as _;
+        let mut vh = String::new();
+        for (field_name, rules) in validations {
+            let rule_comment = rules.join(", ");
+            let _ = write!(
+                vh,
+                r#"
+
+/// `POST /{plural}/validate/{field_name}` — inline validation fragment.
+///
+/// Returns an `<span id="{field_name}-error">` OOB fragment with an error
+/// message when the value fails the `{rule_comment}` rule, or an empty span
+/// when it passes. Consumed by htmx `hx-swap="outerHTML"` on `hx-trigger="change"`.
+#[post("/{plural}/validate/{field_name}")]
+pub async fn validate_{field_name}(body: autumn_web::reexports::axum::body::Bytes) -> autumn_web::Markup {{
+    let value = url::form_urlencoded::parse(body.as_ref())
+        .find(|(k, _)| k == "{field_name}")
+        .map(|(_, v)| v.to_string())
+        .unwrap_or_default();
+    let error = if value.is_empty() {{ Some("required") }} else {{ None }};
+    autumn_web::html! {{
+        span id="{field_name}-error" {{
+            @if let Some(msg) = error {{
+                span style="color:red" {{ (msg) }}
+            }}
+        }}
+    }}
+}}"#
+            );
+        }
+        vh
+    } else {
+        String::new()
     };
 
     format!(
@@ -832,8 +914,16 @@ use crate::schema::{plural};",
         } else {
             ""
         },
-    ) + &format!(
-        r#"
+    ) + &{
+        let live_head_scripts = if live {
+            "\n                script src=(autumn_web::htmx::HTMX_JS_PATH) {};\n\
+             \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20script src=(autumn_web::htmx::HTMX_SSE_JS_PATH) {};"
+                .to_owned()
+        } else {
+            String::new()
+        };
+        format!(
+            r#"
 
 fn csrf_input(csrf: Option<&CsrfToken>, field: Option<&CsrfFormField>) -> Markup {{
     let csrf_field_name = field.map(|field| field.0.as_str()).unwrap_or("_csrf");
@@ -856,7 +946,7 @@ fn layout(title: &str, flash: Markup, content: Markup) -> Markup {{
             head {{
                 meta charset="utf-8";
                 title {{ (title) }}
-                link rel="stylesheet" href=(autumn_web::flash::FLASH_CSS_PATH);{layout_head_scripts}
+                link rel="stylesheet" href=(autumn_web::flash::FLASH_CSS_PATH);{live_head_scripts}
             }}
             body {{
                 (flash)
@@ -1032,7 +1122,7 @@ pub async fn events(
         )
     } else {
         String::new()
-    }
+    } + &validate_handlers
 }
 
 fn render_update_changeset_expr(pascal_name: &str, fields: &[Field]) -> String {
@@ -1055,7 +1145,12 @@ fn has_attachment_fields(fields: &[Field]) -> bool {
     fields.iter().any(|f| f.kind.is_attachment())
 }
 
-fn render_create_form_inputs(fields: &[Field]) -> String {
+fn render_create_form_inputs(
+    fields: &[Field],
+    live_validation: bool,
+    validated: &[&str],
+    plural: &str,
+) -> String {
     use std::fmt::Write as _;
     let mut out = String::new();
     for f in fields {
@@ -1072,18 +1167,39 @@ fn render_create_form_inputs(fields: &[Field]) -> String {
             );
         } else {
             let required = required_attr(f);
+            let hx_attrs = if live_validation && validated.contains(&f.name.as_str()) {
+                format!(
+                    " hx-post=\"/{plural}/validate/{name}\" hx-trigger=\"change\" hx-target=\"#{name}-error\" hx-swap=\"outerHTML\"",
+                    plural = plural,
+                    name = f.name
+                )
+            } else {
+                String::new()
+            };
+            let error_span = if live_validation && validated.contains(&f.name.as_str()) {
+                format!("\n            span id=\"{name}-error\" {{}}", name = f.name)
+            } else {
+                String::new()
+            };
             let _ = writeln!(
                 out,
-                "            label {{ \"{name}\" }} input type=\"text\" name=\"{name}\"{required};",
+                "            label {{ \"{name}\" }} input type=\"text\" name=\"{name}\"{required}{hx_attrs};{error_span}",
                 name = f.name,
-                required = required
+                required = required,
+                hx_attrs = hx_attrs,
+                error_span = error_span
             );
         }
     }
     out
 }
 
-fn render_edit_form_inputs(fields: &[Field]) -> String {
+fn render_edit_form_inputs(
+    fields: &[Field],
+    live_validation: bool,
+    validated: &[&str],
+    plural: &str,
+) -> String {
     use std::fmt::Write as _;
     let mut out = String::new();
     for f in fields {
@@ -1099,12 +1215,28 @@ fn render_edit_form_inputs(fields: &[Field]) -> String {
         } else {
             let value = edit_value_expr(f);
             let required = required_attr(f);
+            let hx_attrs = if live_validation && validated.contains(&f.name.as_str()) {
+                format!(
+                    " hx-post=\"/{plural}/validate/{name}\" hx-trigger=\"change\" hx-target=\"#{name}-error\" hx-swap=\"outerHTML\"",
+                    plural = plural,
+                    name = f.name
+                )
+            } else {
+                String::new()
+            };
+            let error_span = if live_validation && validated.contains(&f.name.as_str()) {
+                format!("\n            span id=\"{name}-error\" {{}}", name = f.name)
+            } else {
+                String::new()
+            };
             let _ = writeln!(
                 out,
-                "            label {{ \"{name}\" }} input type=\"text\" name=\"{name}\" value=({value}){required};",
+                "            label {{ \"{name}\" }} input type=\"text\" name=\"{name}\" value=({value}){required}{hx_attrs};{error_span}",
                 name = f.name,
                 value = value,
-                required = required
+                required = required,
+                hx_attrs = hx_attrs,
+                error_span = error_span
             );
         }
     }
@@ -1355,7 +1487,13 @@ fn render_smoke_test(
     }
 }
 
-fn main_route_entries(plural: &str, snake_name: &str, api: bool, live: bool) -> Vec<String> {
+fn main_route_entries(
+    plural: &str,
+    snake_name: &str,
+    api: bool,
+    live: bool,
+    validated_field_names: &[String],
+) -> Vec<String> {
     if api {
         vec![
             format!("repositories::{snake_name}::{snake_name}_api_list"),
@@ -1376,6 +1514,9 @@ fn main_route_entries(plural: &str, snake_name: &str, api: bool, live: bool) -> 
         ];
         if live {
             entries.push(format!("routes::{plural}::events"));
+        }
+        for field_name in validated_field_names {
+            entries.push(format!("routes::{plural}::validate_{field_name}"));
         }
         entries.push(format!("repositories::{snake_name}::{snake_name}_api_list"));
         entries.push(format!("repositories::{snake_name}::{snake_name}_api_get"));

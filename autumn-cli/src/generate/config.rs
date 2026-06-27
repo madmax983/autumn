@@ -66,6 +66,14 @@ pub struct ScaffoldConfigEntry {
     /// Inherits from `[generate] id` when absent.
     #[serde(default)]
     pub id: Option<String>,
+    /// Emit `broadcasts = "<plural>"` on the repository, a `LiveFragment` impl,
+    /// an SSE stream route, and an SSE-wired list container in the index view.
+    #[serde(default)]
+    pub live: bool,
+    /// Emit per-field inline validation endpoints and `hx-post` attributes on
+    /// form inputs.
+    #[serde(default)]
+    pub live_validation: bool,
 }
 
 /// Project-level generator defaults, read from `[generate]` in the config file.
@@ -282,6 +290,8 @@ pub fn merge_config_with_cli(
     cli_shard_key: Option<&str>,
     cli_live: bool,
     cli_id: Option<&str>,
+    cli_live: bool,
+    cli_live_validation: bool,
 ) -> Result<(Vec<String>, ScaffoldOptions), GenerateError> {
     let pick = |cli: &[String], toml: Vec<String>| -> Vec<String> {
         if cli.is_empty() { toml } else { cli.to_vec() }
@@ -297,6 +307,7 @@ pub fn merge_config_with_cli(
     let sharded = cli_sharded || config.sharded;
     let shard_key = cli_shard_key.map(str::to_owned).or(config.shard_key);
     let live = cli_live || config.live;
+    let live_validation = cli_live_validation || config.live_validation;
     // Precedence: CLI > per-resource TOML > project-default TOML > BigSerial.
     let id_type = if let Some(s) = cli_id {
         IdType::parse(s)?
@@ -320,6 +331,7 @@ pub fn merge_config_with_cli(
             queries,
             api,
             live,
+            live_validation,
         },
     ))
 }
@@ -612,6 +624,8 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
             shard_key: None,
             live: false,
             id: None,
+            live: false,
+            live_validation: false,
         }
     }
 
@@ -629,6 +643,8 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
             None,
             false,
             None,
+            false,
+            false,
         )
         .unwrap()
     }
@@ -658,6 +674,8 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
             None,
             false,
             None,
+            false,
+            false,
         )
         .unwrap();
         assert_eq!(fields, vec!["title:String", "body:Text"]);
@@ -678,6 +696,8 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
             None,
             false,
             None,
+            false,
+            false,
         )
         .unwrap();
         assert_eq!(opts.model.indexes, vec!["tag"]);
@@ -698,6 +718,8 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
             None,
             false,
             None,
+            false,
+            false,
         )
         .unwrap();
         assert_eq!(opts.model.validations, vec!["url=email"]);
@@ -720,6 +742,8 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
             None,
             false,
             None,
+            false,
+            false,
         )
         .unwrap();
         assert_eq!(opts.model.defaults, vec!["tag=general"]);
@@ -740,6 +764,8 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
             None,
             false,
             None,
+            false,
+            false,
         )
         .unwrap();
         assert_eq!(opts.queries, vec!["find_by_tag:tag"]);
@@ -761,6 +787,8 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
             None,
             false,
             None,
+            false,
+            false,
         )
         .unwrap();
         assert!(fields.is_empty());
@@ -785,6 +813,8 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
             None,
             false,
             None,
+            false,
+            false,
         )
         .unwrap();
         assert!(
@@ -844,6 +874,8 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
             None,
             false,
             None,
+            false,
+            false,
         )
         .unwrap();
         assert!(opts.api);
@@ -888,6 +920,8 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
             None,
             false,
             None,
+            false,
+            false,
         )
         .unwrap();
         assert!(
@@ -924,6 +958,8 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
             Some("user_id"),
             false,
             None,
+            false,
+            false,
         )
         .unwrap();
         assert_eq!(
@@ -983,6 +1019,8 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
             None,
             false,
             Some("uuid"),
+            false,
+            false,
         )
         .unwrap();
         assert_eq!(
@@ -1021,6 +1059,8 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
             None,
             false,
             Some("bigint"),
+            false,
+            false,
         )
         .unwrap();
         assert_eq!(
@@ -1055,6 +1095,8 @@ queries     = ["find_by_tag:tag", "find_by_alive:alive"]
             None,
             false,
             Some("guid"),
+            false,
+            false,
         )
         .unwrap_err();
         let msg = err.to_string();

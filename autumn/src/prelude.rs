@@ -78,18 +78,27 @@ pub use crate::flash::{Flash, FlashLevel, FlashMessage};
 /// Extension trait for adding htmx response headers.
 #[cfg(feature = "htmx")]
 pub use crate::htmx::HxResponseExt;
-/// htmx request extractor.
+/// htmx request extractor and asset paths.
 #[cfg(feature = "htmx")]
-pub use crate::htmx::{HTMX_CSRF_JS_PATH, HTMX_JS_PATH, HTMX_SSE_JS_PATH, HxRequest};
+pub use crate::htmx::{
+    HTMX_CSRF_JS_PATH, HTMX_JS_PATH, HTMX_SSE_JS_PATH, HxRequest, IDIOMORPH_JS_PATH,
+};
 /// Out-of-band multi-region swaps response builder.
 #[cfg(all(feature = "htmx", feature = "maud"))]
 pub use crate::htmx::{HtmxFragments, OobSwap};
+/// Trait for live-broadcasting model fragments via `#[repository(Model, broadcasts = "topic")]`.
+#[cfg(all(feature = "htmx", feature = "maud"))]
+pub use crate::live::LiveFragment;
 /// Transactional email types and extractor.
 #[cfg(feature = "mail")]
 pub use crate::mail::{
     Mail, MailConfig, MailDeliveryQueue, MailDeliveryQueueHandle, MailError, MailPreview,
     MailPreviewError, MailPreviewRegistry, MailTransport, Mailer, SmtpConfig, TlsMode, Transport,
 };
+#[cfg(all(feature = "presence", feature = "maud"))]
+pub use crate::presence_badge;
+#[cfg(all(feature = "presence", feature = "ws", feature = "maud"))]
+pub use crate::presence_stream;
 /// Shard routing extractors and types for `[[database.shards]]` apps.
 #[cfg(feature = "db")]
 pub use crate::sharding::{ShardKey, ShardKeyOverride, ShardedDb, ShardedReadDb, Shards};

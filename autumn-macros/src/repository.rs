@@ -269,12 +269,16 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
         } else if meta.path.is_ident("sharded") {
             sharded = true;
             Ok(())
+        } else if meta.path.is_ident("broadcasts") {
+            let value: LitStr = meta.value()?.parse()?;
+            broadcasts = Some(value.value());
+            Ok(())
         } else if meta.path.get_ident().is_some() && model_name.is_none() {
             model_name = Some(meta.path.get_ident().unwrap().clone());
             Ok(())
         } else {
             Err(meta.error(
-                "expected model name, table = \"...\", hooks = Type, commit_hooks = true, api = \"/path\", policy = Type, scope = Type, cursor_key = field, cursor_key_type = Type, soft_delete, tenant_scoped, no_upsert_trait, searchable, versioned = true, no_versioned_record_impl, primary_reads, or sharded",
+                "expected model name, table = \"...\", hooks = Type, commit_hooks = true, api = \"/path\", policy = Type, scope = Type, cursor_key = field, cursor_key_type = Type, soft_delete, tenant_scoped, no_upsert_trait, searchable, versioned = true, no_versioned_record_impl, primary_reads, sharded, or broadcasts = \"topic\"",
             ))
         }
     })
@@ -1205,6 +1209,8 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     __autumn_statement_timeout_ms: __seed.statement_timeout_ms,
                     __autumn_slow_threshold: __seed.slow_query_threshold,
                     __autumn_route: ::core::clone::Clone::clone(&__seed.route),
+                    #[cfg(all(feature = "ws", feature = "maud", feature = "htmx"))]
+                    __autumn_broadcast: ::core::option::Option::None,
                 }
             }
 
@@ -1238,6 +1244,36 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     __autumn_statement_timeout_ms: 0,
                     __autumn_slow_threshold: ::std::time::Duration::from_millis(500),
                     __autumn_route: ::core::option::Option::None,
+                    #[cfg(all(feature = "ws", feature = "maud", feature = "htmx"))]
+                    __autumn_broadcast: ::core::option::Option::None,
+                }
+            }
+
+            /// Construct this repository with an explicit broadcast handle.
+            ///
+            /// For use in tests only — simulates what `FromRequestParts<AppState>` does
+            /// when building a repository that can publish OOB live fragments.
+            #[cfg(all(feature = "ws", feature = "maud", feature = "htmx"))]
+            #[doc(hidden)]
+            #[must_use]
+            pub fn __autumn_test_with_broadcast(
+                pool: ::autumn_web::reexports::diesel_async::pooled_connection::deadpool::Pool<
+                    ::autumn_web::reexports::diesel_async::AsyncPgConnection,
+                >,
+                broadcast: ::autumn_web::channels::Broadcast,
+            ) -> Self {
+                #register_hooks
+                Self {
+                    pool,
+                    #hooks_field
+                    #idempotency_field
+                    #tenant_init_field
+                    #shards_none_field
+                    __autumn_read_route: ::autumn_web::repository::ReadRoute::Primary,
+                    __autumn_statement_timeout_ms: 0,
+                    __autumn_slow_threshold: ::std::time::Duration::from_millis(500),
+                    __autumn_route: ::core::option::Option::None,
+                    __autumn_broadcast: ::core::option::Option::Some(broadcast),
                 }
             }
         }
@@ -1306,6 +1342,10 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             __autumn_slow_threshold: ::std::time::Duration,
             /// Route path from `MatchedPath` for metrics labels.
             __autumn_route: ::std::option::Option<::std::string::String>,
+            /// Broadcast handle for live OOB fragment publishing (`broadcasts = "topic"`).
+            /// `None` when the repository was built without an `AppState` (e.g. `with_pool_untracked`).
+            #[cfg(all(feature = "ws", feature = "maud", feature = "htmx"))]
+            __autumn_broadcast: ::std::option::Option<::autumn_web::channels::Broadcast>,
         };
 
         let clone_impl = quote! {
@@ -1321,6 +1361,8 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         __autumn_statement_timeout_ms: self.__autumn_statement_timeout_ms,
                         __autumn_slow_threshold: self.__autumn_slow_threshold,
                         __autumn_route: self.__autumn_route.clone(),
+                        #[cfg(all(feature = "ws", feature = "maud", feature = "htmx"))]
+                        __autumn_broadcast: self.__autumn_broadcast.clone(),
                     }
                 }
             }
@@ -1362,6 +1404,8 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     __autumn_statement_timeout_ms: __autumn_timeout_ms,
                     __autumn_slow_threshold,
                     __autumn_route,
+                    #[cfg(all(feature = "ws", feature = "maud", feature = "htmx"))]
+                    __autumn_broadcast: ::std::option::Option::Some(state.broadcast()),
                 })
             }
         } else {
@@ -1376,6 +1420,8 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     __autumn_statement_timeout_ms: __autumn_timeout_ms,
                     __autumn_slow_threshold,
                     __autumn_route,
+                    #[cfg(all(feature = "ws", feature = "maud", feature = "htmx"))]
+                    __autumn_broadcast: ::std::option::Option::Some(state.broadcast()),
                 })
             }
         };
@@ -4886,6 +4932,10 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             __autumn_slow_threshold: ::std::time::Duration,
             /// Route path from `MatchedPath` for metrics labels.
             __autumn_route: ::std::option::Option<::std::string::String>,
+            /// Broadcast handle for live OOB fragment publishing (`broadcasts = "topic"`).
+            /// `None` when the repository was built without an `AppState` (e.g. `with_pool_untracked`).
+            #[cfg(all(feature = "ws", feature = "maud", feature = "htmx"))]
+            __autumn_broadcast: ::std::option::Option<::autumn_web::channels::Broadcast>,
         };
 
         let clone_impl = quote! {
@@ -4899,6 +4949,8 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         __autumn_statement_timeout_ms: self.__autumn_statement_timeout_ms,
                         __autumn_slow_threshold: self.__autumn_slow_threshold,
                         __autumn_route: self.__autumn_route.clone(),
+                        #[cfg(all(feature = "ws", feature = "maud", feature = "htmx"))]
+                        __autumn_broadcast: self.__autumn_broadcast.clone(),
                     }
                 }
             }
@@ -4933,6 +4985,8 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 __autumn_statement_timeout_ms: __autumn_timeout_ms,
                 __autumn_slow_threshold,
                 __autumn_route,
+                #[cfg(all(feature = "ws", feature = "maud", feature = "htmx"))]
+                __autumn_broadcast: ::std::option::Option::Some(state.broadcast()),
             })
         };
 
@@ -6757,6 +6811,84 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             update_many_body,
             delete_many_body,
         )
+    };
+
+    // §broadcasts: wrap save/update/delete bodies to publish hx-swap-oob fragments
+    // when `broadcasts = "topic"` is declared on the repository.
+    let (save_body, update_body, delete_body) = if let Some(ref topic) = config.broadcasts {
+        let topic_lit = proc_macro2::Literal::string(topic);
+        let wrapped_save = quote! {
+            #[cfg(all(feature = "ws", feature = "maud", feature = "htmx"))]
+            let __autumn_bcast_result: ::autumn_web::AutumnResult<#model_name> = {
+                #save_body
+            };
+            #[cfg(all(feature = "ws", feature = "maud", feature = "htmx"))]
+            {
+                if let (::core::result::Result::Ok(__rec), ::core::option::Option::Some(__bcast)) =
+                    (&__autumn_bcast_result, &self.__autumn_broadcast)
+                {
+                    let __fragment = <#model_name as ::autumn_web::live::LiveFragment>::render_fragment(__rec);
+                    let __dom_id = <#model_name as ::autumn_web::live::LiveFragment>::dom_id(__rec);
+                    let __swap = <#model_name as ::autumn_web::live::LiveFragment>::insert_swap();
+                    let _ = __bcast.publish_oob(#topic_lit, &__dom_id, __swap, &__fragment);
+                }
+                __autumn_bcast_result
+            }
+            #[cfg(not(all(feature = "ws", feature = "maud", feature = "htmx")))]
+            { #save_body }
+        };
+        let wrapped_update = quote! {
+            #[cfg(all(feature = "ws", feature = "maud", feature = "htmx"))]
+            let __autumn_bcast_result: ::autumn_web::AutumnResult<#model_name> = {
+                #update_body
+            };
+            #[cfg(all(feature = "ws", feature = "maud", feature = "htmx"))]
+            {
+                if let (::core::result::Result::Ok(__rec), ::core::option::Option::Some(__bcast)) =
+                    (&__autumn_bcast_result, &self.__autumn_broadcast)
+                {
+                    let __fragment = <#model_name as ::autumn_web::live::LiveFragment>::render_fragment(__rec);
+                    let __dom_id = <#model_name as ::autumn_web::live::LiveFragment>::dom_id(__rec);
+                    let _ = __bcast.publish_oob(
+                        #topic_lit,
+                        &__dom_id,
+                        ::autumn_web::htmx::OobSwap::True,
+                        &__fragment,
+                    );
+                }
+                __autumn_bcast_result
+            }
+            #[cfg(not(all(feature = "ws", feature = "maud", feature = "htmx")))]
+            { #update_body }
+        };
+        let wrapped_delete = quote! {
+            #[cfg(all(feature = "ws", feature = "maud", feature = "htmx"))]
+            let __autumn_bcast_id = id;
+            #[cfg(all(feature = "ws", feature = "maud", feature = "htmx"))]
+            let __autumn_bcast_result: ::autumn_web::AutumnResult<()> = {
+                #delete_body
+            };
+            #[cfg(all(feature = "ws", feature = "maud", feature = "htmx"))]
+            {
+                if let (::core::result::Result::Ok(()), ::core::option::Option::Some(__bcast)) =
+                    (&__autumn_bcast_result, &self.__autumn_broadcast)
+                {
+                    let __dom_id = <#model_name as ::autumn_web::live::LiveFragment>::dom_id_for(__autumn_bcast_id);
+                    let _ = __bcast.publish_oob(
+                        #topic_lit,
+                        &__dom_id,
+                        ::autumn_web::htmx::OobSwap::Delete,
+                        &maud::html! {},
+                    );
+                }
+                __autumn_bcast_result
+            }
+            #[cfg(not(all(feature = "ws", feature = "maud", feature = "htmx")))]
+            { #delete_body }
+        };
+        (wrapped_save, wrapped_update, wrapped_delete)
+    } else {
+        (save_body, update_body, delete_body)
     };
 
     let route_hook_registration = if commit_hooks_enabled {
@@ -9288,6 +9420,8 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         __autumn_statement_timeout_ms: __seed.statement_timeout_ms,
                         __autumn_slow_threshold: __seed.slow_query_threshold,
                         __autumn_route: ::core::clone::Clone::clone(&__seed.route),
+                        #[cfg(all(feature = "ws", feature = "maud", feature = "htmx"))]
+                        __autumn_broadcast: ::std::option::Option::Some(state.broadcast()),
                     })
                 }
             }
@@ -9355,6 +9489,8 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         __autumn_statement_timeout_ms: __seed.statement_timeout_ms,
                         __autumn_slow_threshold: __seed.slow_query_threshold,
                         __autumn_route: ::core::clone::Clone::clone(&__seed.route),
+                        #[cfg(all(feature = "ws", feature = "maud", feature = "htmx"))]
+                        __autumn_broadcast: ::core::option::Option::None,
                     }
                 }
             }
