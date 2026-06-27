@@ -10,7 +10,7 @@
 use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
 
-use autumn_web::http::Client;
+use autumn_web::http::{Client, ClientError};
 use autumn_web::prelude::*;
 
 use crate::schema::bookmarks;
@@ -42,12 +42,14 @@ pub async fn check_links(state: AppState) -> AutumnResult<()> {
 
     let mut dead_ids = Vec::new();
     for (id, url) in &alive {
-        let reachable = client
-            .head(url)
-            .no_retry()
-            .send()
-            .await
-            .is_ok_and(|r| r.status().is_success() || r.status().is_redirection());
+        let reachable = match client.head(url).no_retry().send().await {
+            Ok(r) => r.status().is_success() || r.status().is_redirection(),
+            Err(ClientError::CircuitBreakerOpen) => {
+                tracing::debug!("link-checker: circuit breaker open for {url}, skipping probe");
+                continue;
+            }
+            Err(_) => false,
+        };
 
         if !reachable {
             tracing::warn!("link-checker: dead link id={id} url={url}");

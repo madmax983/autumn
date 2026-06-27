@@ -7,7 +7,7 @@
 // Errors are logged at WARN level and the task retries on the
 // next scheduled interval.
 
-use autumn_web::http::Client;
+use autumn_web::http::{Client, ClientError};
 use autumn_web::prelude::*;
 use futures::FutureExt;
 use reqwest::StatusCode;
@@ -36,21 +36,19 @@ fn probe_outcome(head: Result<StatusCode, ()>, get: Option<Result<StatusCode, ()
 }
 
 async fn probe_reachable(client: &Client, url: &str) -> bool {
-    let head = client
-        .head(url)
-        .no_retry()
-        .send()
-        .await
-        .map(|response| response.status());
+    let head_result = client.head(url).no_retry().send().await;
+    let head = match head_result {
+        Err(ClientError::CircuitBreakerOpen) => return true, // inconclusive — don't mark dead
+        other => other.map(|r| r.status()),
+    };
     match head {
         Ok(status) if response_is_reachable(status) => true,
         Ok(status) if head_requires_get_fallback(status) => {
-            let get = client
-                .get(url)
-                .no_retry()
-                .send()
-                .await
-                .map(|response| response.status());
+            let get_result = client.get(url).no_retry().send().await;
+            let get = match get_result {
+                Err(ClientError::CircuitBreakerOpen) => return true, // inconclusive
+                other => other.map(|r| r.status()),
+            };
             probe_outcome(Ok(status), Some(get.map_err(|_| ())))
         }
         Ok(status) => probe_outcome(Ok(status), None),
