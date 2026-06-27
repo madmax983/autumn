@@ -79,7 +79,7 @@ pub trait SilentItemRepository {}
 
 // ── Test helpers ──────────────────────────────────────────────────────────────
 
-async fn setup_db() -> Pool<AsyncPgConnection> {
+async fn setup_db() -> (testcontainers::ContainerAsync<Postgres>, Pool<AsyncPgConnection>) {
     let container = Postgres::default().start().await.expect("postgres start");
     let url = format!(
         "postgres://postgres:postgres@{}:{}/postgres",
@@ -95,7 +95,7 @@ async fn setup_db() -> Pool<AsyncPgConnection> {
     .execute(&mut *conn)
     .await;
     drop(conn);
-    pool
+    (container, pool)
 }
 
 /// Build a repository backed by the given pool AND a channels handle so
@@ -110,7 +110,7 @@ fn repo_with_broadcast(pool: Pool<AsyncPgConnection>, channels: &Channels) -> Pg
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn save_broadcasts_oob_fragment() {
-    let pool = setup_db().await;
+    let (_container, pool) = setup_db().await;
     let channels = Channels::new(16);
     let mut rx = channels.subscribe("live_items");
     let repo = repo_with_broadcast(pool, &channels);
@@ -139,7 +139,7 @@ async fn save_broadcasts_oob_fragment() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn update_broadcasts_true_swap() {
-    let pool = setup_db().await;
+    let (_container, pool) = setup_db().await;
     let channels = Channels::new(16);
     let mut rx = channels.subscribe("live_items");
     let repo = repo_with_broadcast(pool, &channels);
@@ -181,7 +181,7 @@ async fn update_broadcasts_true_swap() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn delete_broadcasts_oob_delete() {
-    let pool = setup_db().await;
+    let (_container, pool) = setup_db().await;
     let channels = Channels::new(16);
     let mut rx = channels.subscribe("live_items");
     let repo = repo_with_broadcast(pool, &channels);
@@ -213,7 +213,7 @@ async fn delete_broadcasts_oob_delete() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn no_broadcasts_attr_emits_nothing() {
-    let pool = setup_db().await;
+    let (_container, pool) = setup_db().await;
     let channels = Channels::new(16);
     let mut rx = channels.subscribe("live_items");
 
@@ -231,7 +231,7 @@ async fn no_broadcasts_attr_emits_nothing() {
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn with_pool_untracked_skips_broadcast_silently() {
-    let pool = setup_db().await;
+    let (_container, pool) = setup_db().await;
     let channels = Channels::new(16);
     let mut rx = channels.subscribe("live_items");
 

@@ -60,4 +60,11 @@ impl autumn_web::live::LiveFragment for Post {
             }
         }
     }
+
+    fn insert_swap() -> autumn_web::htmx::OobSwap {
+        autumn_web::htmx::OobSwap::Target(
+            autumn_web::htmx::OobMethod::BeforeEnd,
+            "#posts-list".to_string(),
+        )
+    }
 }
