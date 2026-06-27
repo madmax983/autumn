@@ -417,11 +417,8 @@ pub fn inject_hx_swap_oob(html: &str, oob_value: &str) -> Option<String> {
         let abs_start = idx + start_pos;
         let remaining = &html[abs_start..];
         if remaining.starts_with("<!--") {
-            if let Some(comment_end) = remaining.find("-->") {
-                idx = abs_start + comment_end + 3;
-            } else {
-                return None;
-            }
+            let comment_end = remaining.find("-->")?;
+            idx = abs_start + comment_end + 3;
         } else {
             let mut tag_name_end = 0;
             for (char_idx, c) in remaining.char_indices().skip(1) {

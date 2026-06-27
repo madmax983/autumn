@@ -355,10 +355,9 @@ impl Broadcast {
             );
 
             if is_outer_html {
-                inject_hx_swap_oob(rendered, &value).map_or_else(
-                    || format!("<template hx-swap-oob=\"{escaped_value}\">{rendered}</template>"),
-                    |injected| injected,
-                )
+                inject_hx_swap_oob(rendered, &value).unwrap_or_else(|| {
+                    format!("<template hx-swap-oob=\"{escaped_value}\">{rendered}</template>")
+                })
             } else if matches!(strategy, OobSwap::Delete) {
                 format!("<div hx-swap-oob=\"{escaped_value}\"></div>")
             } else {
