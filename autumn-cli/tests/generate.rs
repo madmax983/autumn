@@ -2724,6 +2724,12 @@ fn live_scaffold_emits_live_fragment_and_broadcasts() {
         repo.contains("impl autumn_web::live::LiveFragment for Post"),
         "repository must contain LiveFragment impl under --live:\n{repo}"
     );
+    // insert_swap must target the list container so new rows are appended
+    // rather than replacing a non-existent element on remote clients.
+    assert!(
+        repo.contains("fn insert_swap()") && repo.contains("OobMethod::BeforeEnd"),
+        "LiveFragment impl must override insert_swap() with BeforeEnd targeting the list container:\n{repo}"
+    );
 }
 
 /// `--live` wires the index list container to an SSE stream so the list

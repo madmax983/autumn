@@ -466,6 +466,7 @@ fn render_repository_file(
              {sharded_note}"
         )
     };
+    let list_id = format!("{plural}-list");
     let live_fragment_impl = if live {
         format!(
             "\nimpl autumn_web::live::LiveFragment for {pascal_name} {{\n\
@@ -479,6 +480,12 @@ fn render_repository_file(
              \x20\x20\x20\x20\x20\x20\x20\x20maud::html! {{\n\
              \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20li id=(self.dom_id()) {{ (self.id) }}\n\
              \x20\x20\x20\x20\x20\x20\x20\x20}}\n\
+             \x20\x20\x20\x20}}\n\
+             \x20\x20\x20\x20fn insert_swap() -> autumn_web::htmx::OobSwap {{\n\
+             \x20\x20\x20\x20\x20\x20\x20\x20autumn_web::htmx::OobSwap::Target(\n\
+             \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20autumn_web::htmx::OobMethod::BeforeEnd,\n\
+             \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\"#{list_id}\".to_string(),\n\
+             \x20\x20\x20\x20\x20\x20\x20\x20)\n\
              \x20\x20\x20\x20}}\n\
              }}\n"
         )
