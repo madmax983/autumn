@@ -221,7 +221,7 @@ mod tests {
             .expect("timeout waiting for custom update broadcast")
             .expect("recv error");
         let html_content = msg.into_string();
-        assert!(html_content.contains("hx-swap-oob=\"outerHTML\""));
+        assert!(html_content.contains("hx-swap-oob=\"beforeend:#custom-posts-list\""));
         assert!(html_content.contains(&format!("id=\"custom-post-{}", custom_post.id)));
         assert!(html_content.contains("world"));
 
@@ -314,6 +314,7 @@ mod tests {
             .into_string();
 
         let combined = format!("{msg_go1} {msg_go2}");
+        assert!(combined.contains("hx-swap-oob=\"beforeend:#nullable_posts-list\""));
         assert!(combined.contains(&format!("nullable_post-{}", post_none.id)));
         assert!(combined.contains(&format!("nullable_post-{}", post_some.id)));
 

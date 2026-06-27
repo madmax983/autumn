@@ -1453,11 +1453,13 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                             .get("__autumn_previous_id")
                             .and_then(|__v| __v.as_str());
 
+                        let mut __topic_changed = false;
                         if let ::core::option::Option::Some(__prev_topic) = __ctx_val
                             .get("__autumn_previous_topic")
                             .and_then(|__v| __v.as_str())
                         {
                             if __prev_topic != __topic {
+                                __topic_changed = true;
                                 let __delete_id = __prev_id.unwrap_or(&__id);
                                 let __delete_fragment = ::autumn_web::html! {};
                                 if let ::core::result::Result::Err(__err) = __channels
@@ -1469,22 +1471,27 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                             }
                         }
 
-                        let __swap_strategy = if let ::core::option::Option::Some(__prev_id_val) = __prev_id {
-                            if __prev_id_val != &__id {
-                                ::autumn_web::htmx::OobSwap::Target(
-                                    ::autumn_web::htmx::OobMethod::OuterHTML,
-                                    ::std::format!("#{}", __prev_id_val),
-                                )
+                        let (__target_id, __swap_strategy) = if __topic_changed {
+                            (#container_expr, ::autumn_web::htmx::OobSwap::BeforeEnd)
+                        } else {
+                            let __strategy = if let ::core::option::Option::Some(__prev_id_val) = __prev_id {
+                                if __prev_id_val != &__id {
+                                    ::autumn_web::htmx::OobSwap::Target(
+                                        ::autumn_web::htmx::OobMethod::OuterHTML,
+                                        ::std::format!("#{}", __prev_id_val),
+                                    )
+                                } else {
+                                    ::autumn_web::htmx::OobSwap::OuterHTML
+                                }
                             } else {
                                 ::autumn_web::htmx::OobSwap::OuterHTML
-                            }
-                        } else {
-                            ::autumn_web::htmx::OobSwap::OuterHTML
+                            };
+                            (__id.as_str(), __strategy)
                         };
 
                         if let ::core::result::Result::Err(__err) = __channels
                             .broadcast()
-                            .publish_oob(&__topic, &__id, __swap_strategy, &__fragment)
+                            .publish_oob(&__topic, __target_id, __swap_strategy, &__fragment)
                         {
                             ::autumn_web::reexports::tracing::warn!(error = %__err, "auto-broadcast failed");
                         }
