@@ -537,6 +537,7 @@ impl JobAdminMemoryBackend {
     /// Record an enqueue that may carry a future due time. When `due_at` is in
     /// the future the record starts in the [`JobAdminStatus::Scheduled`] state
     /// so the dashboard surfaces it as a delayed job until it becomes runnable.
+    #[allow(clippy::too_many_arguments)]
     fn record_enqueue_due(
         &self,
         id: String,
@@ -1996,7 +1997,7 @@ impl JobClient {
                     tokio::spawn(async move {
                         tokio::select! {
                             biased;
-                            _ = cancel_token.cancelled() => {
+                            () = cancel_token.cancelled() => {
                                 // Admin-canceled before the due time: release the
                                 // unique lock immediately so re-enqueueing works
                                 // without waiting for the original timer to fire.
@@ -2006,7 +2007,7 @@ impl JobClient {
                                     coord.release_unique(&cancel_name, &unique_key, &cancel_id);
                                 }
                             }
-                            _ = tokio::time::sleep(delay) => {
+                            () = tokio::time::sleep(delay) => {
                                 let _ = sender.send(queued).await;
                             }
                         }
