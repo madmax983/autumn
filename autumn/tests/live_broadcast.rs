@@ -79,7 +79,10 @@ pub trait SilentItemRepository {}
 
 // ── Test helpers ──────────────────────────────────────────────────────────────
 
-async fn setup_db() -> (testcontainers::ContainerAsync<Postgres>, Pool<AsyncPgConnection>) {
+async fn setup_db() -> (
+    testcontainers::ContainerAsync<Postgres>,
+    Pool<AsyncPgConnection>,
+) {
     let container = Postgres::default().start().await.expect("postgres start");
     let url = format!(
         "postgres://postgres:postgres@{}:{}/postgres",
