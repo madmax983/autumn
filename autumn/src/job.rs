@@ -11861,6 +11861,265 @@ mod tests {
         shutdown.cancel();
         clear_global_job_client();
     }
+
+    // ── record_enqueue_due: None/past due → Enqueued status ─────────────────
+
+    #[test]
+    fn record_enqueue_due_with_none_due_at_produces_enqueued_status() {
+        let backend = JobAdminMemoryBackend::new_for_test(32);
+        let id = uuid::Uuid::new_v4().to_string();
+        backend.record_enqueue_due(
+            id,
+            "myjob",
+            serde_json::json!({}),
+            1,
+            3,
+            None,
+            chrono::Utc::now(),
+        );
+        let snap = backend.snapshot_sync(&JobAdminQuery::default());
+        assert_eq!(
+            snap.enqueued.total, 1,
+            "None due_at must produce Enqueued status"
+        );
+        assert_eq!(
+            snap.scheduled.total, 0,
+            "None due_at must not produce Scheduled status"
+        );
+    }
+
+    #[test]
+    fn record_enqueue_due_with_past_due_at_produces_enqueued_status() {
+        let backend = JobAdminMemoryBackend::new_for_test(32);
+        let id = uuid::Uuid::new_v4().to_string();
+        let past = chrono::Utc::now() - chrono::TimeDelta::hours(1);
+        backend.record_enqueue_due(
+            id,
+            "myjob",
+            serde_json::json!({}),
+            1,
+            3,
+            Some(past),
+            chrono::Utc::now(),
+        );
+        let snap = backend.snapshot_sync(&JobAdminQuery::default());
+        assert_eq!(
+            snap.enqueued.total, 1,
+            "past due_at must produce Enqueued status"
+        );
+        assert_eq!(
+            snap.scheduled.total, 0,
+            "past due_at must not produce Scheduled status"
+        );
+    }
+
+    // ── enqueue_after_commit_due: None / past / deferred / error ────────────
+
+    #[tokio::test]
+    async fn enqueue_after_commit_due_with_none_enqueues_immediately() {
+        use std::time::Duration;
+        let (client, mut rx) = make_test_client();
+
+        client
+            .enqueue_after_commit_due("test_job", serde_json::json!({"x": 10}), None)
+            .await
+            .expect("enqueue_after_commit_due(None) should succeed outside tx");
+
+        let received = tokio::time::timeout(Duration::from_millis(200), rx.recv()).await;
+        assert!(
+            received.is_ok(),
+            "job should be delivered immediately when due_at is None"
+        );
+        assert_eq!(received.unwrap().unwrap().name, "test_job");
+    }
+
+    #[tokio::test]
+    async fn enqueue_after_commit_due_with_past_enqueues_immediately() {
+        use std::time::Duration;
+        let (client, mut rx) = make_test_client();
+
+        let past = chrono::Utc::now() - chrono::TimeDelta::hours(1);
+        client
+            .enqueue_after_commit_due("test_job", serde_json::json!({"x": 20}), Some(past))
+            .await
+            .expect("enqueue_after_commit_due(Some(past)) should succeed outside tx");
+
+        let received = tokio::time::timeout(Duration::from_millis(200), rx.recv()).await;
+        assert!(
+            received.is_ok(),
+            "job should be delivered immediately when due_at is in the past"
+        );
+        assert_eq!(received.unwrap().unwrap().name, "test_job");
+    }
+
+    #[tokio::test]
+    async fn enqueue_after_commit_due_inside_scope_defers_and_fires() {
+        use crate::db::{AFTER_COMMIT_REGISTRY, CommitCallback};
+        use std::sync::{Arc, Mutex};
+        use std::time::Duration;
+
+        let (client, mut rx) = make_test_client();
+        let registry = Arc::new(Mutex::new(Vec::<CommitCallback>::new()));
+        let past = chrono::Utc::now() - chrono::TimeDelta::hours(1);
+
+        AFTER_COMMIT_REGISTRY
+            .scope(registry.clone(), async {
+                client
+                    .enqueue_after_commit_due("test_job", serde_json::json!({"x": 30}), Some(past))
+                    .await
+                    .expect("enqueue_after_commit_due should succeed inside scope");
+            })
+            .await;
+
+        let not_received = tokio::time::timeout(Duration::from_millis(50), rx.recv()).await;
+        assert!(
+            not_received.is_err(),
+            "job must not be delivered before commit callbacks run"
+        );
+
+        let callbacks: Vec<CommitCallback> = {
+            let mut reg = registry.lock().unwrap();
+            std::mem::take(&mut *reg)
+        };
+        for cb in callbacks {
+            cb().await.unwrap();
+        }
+
+        let received = tokio::time::timeout(Duration::from_millis(200), rx.recv()).await;
+        assert!(
+            received.is_ok(),
+            "job should be delivered after commit callbacks run"
+        );
+        assert_eq!(received.unwrap().unwrap().name, "test_job");
+    }
+
+    #[tokio::test]
+    async fn enqueue_after_commit_due_rejects_unregistered_job() {
+        let (client, _rx) = make_test_client();
+        let result = client
+            .enqueue_after_commit_due("unregistered_job", serde_json::json!({}), None)
+            .await;
+        assert!(result.is_err(), "unregistered job must fail eagerly");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("not registered"),
+            "error must mention 'not registered', got: {msg}"
+        );
+    }
+
+    // ── module-level enqueue_in_after_commit / enqueue_at_after_commit ───────
+
+    #[tokio::test]
+    async fn module_enqueue_in_after_commit_fails_without_global_client() {
+        let _guard = global_job_runtime_test_lock().lock().await;
+        clear_global_job_client();
+
+        let result =
+            enqueue_in_after_commit("some_job", serde_json::json!({}), std::time::Duration::ZERO)
+                .await;
+        assert!(
+            result.is_err(),
+            "enqueue_in_after_commit without global client must fail"
+        );
+
+        clear_global_job_client();
+    }
+
+    #[tokio::test]
+    async fn module_enqueue_at_after_commit_fails_without_global_client() {
+        let _guard = global_job_runtime_test_lock().lock().await;
+        clear_global_job_client();
+
+        let when = chrono::Utc::now();
+        let result = enqueue_at_after_commit("some_job", serde_json::json!({}), when).await;
+        assert!(
+            result.is_err(),
+            "enqueue_at_after_commit without global client must fail"
+        );
+
+        clear_global_job_client();
+    }
+
+    #[tokio::test]
+    async fn module_enqueue_in_after_commit_delivers_job_outside_tx() {
+        use std::time::Duration;
+        let _guard = global_job_runtime_test_lock().lock().await;
+        clear_global_job_client();
+
+        let (tx, mut rx) = mpsc::channel(16);
+        init_global_job_client(JobClient {
+            local_sender: Some(tx),
+            local_coordination: None,
+            #[cfg(feature = "redis")]
+            redis: None,
+            #[cfg(feature = "db")]
+            pg_pool: None,
+            registry: crate::actuator::JobRegistry::new(),
+            job_admin: JobAdminMemoryBackend::new_for_test(32),
+            default_max_attempts: 3,
+            default_initial_backoff_ms: 100,
+            per_job_settings: HashMap::from([(
+                "test_job".to_string(),
+                JobRuntimeSettings::basic(3, 100),
+            )]),
+            interceptor: None,
+            resilience_config: None,
+        });
+
+        enqueue_in_after_commit("test_job", serde_json::json!({"x": 1}), Duration::ZERO)
+            .await
+            .expect("enqueue_in_after_commit should succeed outside tx");
+
+        let received = tokio::time::timeout(Duration::from_millis(200), rx.recv()).await;
+        assert!(
+            received.is_ok(),
+            "job should be delivered immediately with zero delay outside tx"
+        );
+        assert_eq!(received.unwrap().unwrap().name, "test_job");
+
+        clear_global_job_client();
+    }
+
+    #[tokio::test]
+    async fn module_enqueue_at_after_commit_delivers_job_outside_tx() {
+        use std::time::Duration;
+        let _guard = global_job_runtime_test_lock().lock().await;
+        clear_global_job_client();
+
+        let (tx, mut rx) = mpsc::channel(16);
+        init_global_job_client(JobClient {
+            local_sender: Some(tx),
+            local_coordination: None,
+            #[cfg(feature = "redis")]
+            redis: None,
+            #[cfg(feature = "db")]
+            pg_pool: None,
+            registry: crate::actuator::JobRegistry::new(),
+            job_admin: JobAdminMemoryBackend::new_for_test(32),
+            default_max_attempts: 3,
+            default_initial_backoff_ms: 100,
+            per_job_settings: HashMap::from([(
+                "test_job".to_string(),
+                JobRuntimeSettings::basic(3, 100),
+            )]),
+            interceptor: None,
+            resilience_config: None,
+        });
+
+        let past = chrono::Utc::now() - chrono::TimeDelta::hours(1);
+        enqueue_at_after_commit("test_job", serde_json::json!({"x": 2}), past)
+            .await
+            .expect("enqueue_at_after_commit should succeed outside tx");
+
+        let received = tokio::time::timeout(Duration::from_millis(200), rx.recv()).await;
+        assert!(
+            received.is_ok(),
+            "job should be delivered immediately for past due time outside tx"
+        );
+        assert_eq!(received.unwrap().unwrap().name, "test_job");
+
+        clear_global_job_client();
+    }
 }
 
 #[cfg(test)]
