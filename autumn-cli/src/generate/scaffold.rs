@@ -489,6 +489,12 @@ fn render_repository_file(
         String::new()
     };
     let list_id = format!("{plural}-list");
+    // API scaffolds have no HTML show route — emit plain text; HTML scaffolds link to show page.
+    let fragment_item_content = if api {
+        format!("(self.id)")
+    } else {
+        format!("a href=(format!(\"/{plural}/{{}}\", self.id)) {{ (self.id) }}")
+    };
     let live_fragment_impl = if live {
         format!(
             "\nimpl autumn_web::live::LiveFragment for {pascal_name} {{\n\
@@ -501,7 +507,7 @@ fn render_repository_file(
              \x20\x20\x20\x20fn render_fragment(&self) -> maud::Markup {{\n\
              \x20\x20\x20\x20\x20\x20\x20\x20maud::html! {{\n\
              \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20li id=(self.dom_id()) {{\n\
-             \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20a href=(format!(\"/{plural}/{{}}\", self.id)) {{ (self.id) }}\n\
+             \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20{fragment_item_content}\n\
              \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20}}\n\
              \x20\x20\x20\x20\x20\x20\x20\x20}}\n\
              \x20\x20\x20\x20}}\n\
