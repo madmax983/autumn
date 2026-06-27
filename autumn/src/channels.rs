@@ -393,10 +393,10 @@ fn sse_oob_envelope(id: &str, strategy: &crate::htmx::OobSwap, fragment_html: &s
 /// Finds the first tag name boundary (space or `>`) and inserts the attribute
 /// before it, e.g. `<li id="x">` → `<li hx-swap-oob="true" id="x">`.
 #[cfg(feature = "maud")]
-fn inject_oob_attr(html: &str, value: &str) -> String {
+pub(crate) fn inject_oob_attr(html: &str, value: &str) -> String {
     if let Some(lt) = html.find('<') {
         let after_lt = &html[lt + 1..];
-        if let Some(pos) = after_lt.find(|c: char| c == ' ' || c == '>') {
+        if let Some(pos) = after_lt.find([' ', '>']) {
             let insert_at = lt + 1 + pos;
             return format!(
                 "{} hx-swap-oob=\"{value}\"{}",

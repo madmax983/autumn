@@ -6862,7 +6862,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     let __fragment = <#model_name as ::autumn_web::live::LiveFragment>::render_fragment(__rec);
                     let __dom_id = <#model_name as ::autumn_web::live::LiveFragment>::dom_id(__rec);
                     let __swap = <#model_name as ::autumn_web::live::LiveFragment>::insert_swap();
-                    let _ = __bcast.publish_oob(#topic_lit, &__dom_id, __swap, &__fragment);
+                    let _ = __bcast.publish_oob(#topic_lit, &__dom_id, &__swap, &__fragment);
                 }
                 __autumn_bcast_result
             }
@@ -6880,7 +6880,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     let _ = __bcast.publish_oob(
                         #topic_lit,
                         &__dom_id,
-                        ::autumn_web::htmx::OobSwap::True,
+                        &::autumn_web::htmx::OobSwap::True,
                         &__fragment,
                     );
                 }
@@ -6900,7 +6900,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     let _ = __bcast.publish_oob(
                         #topic_lit,
                         &__dom_id,
-                        ::autumn_web::htmx::OobSwap::Delete,
+                        &::autumn_web::htmx::OobSwap::Delete,
                         &maud::html! {},
                     );
                 }
