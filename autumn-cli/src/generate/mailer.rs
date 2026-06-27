@@ -67,23 +67,24 @@ pub fn plan_mailer(
 
     // ── templates/mailers/_layout.html (idempotent) ────────────────────────
     // Created on the first `generate mailer` call; subsequent calls skip it so
-    // user edits to the shared layout are not overwritten.
+    // user edits to the shared layout are not overwritten. Uses create_if_absent
+    // so concurrent generator runs are safe (exclusive-create, no TOCTOU race).
     if !no_layout {
-        let layout_html_path = project_root
-            .join("templates")
-            .join("mailers")
-            .join("_layout.html");
-        if !layout_html_path.exists() {
-            plan.create(layout_html_path, render_layout_html());
-        }
+        plan.create_if_absent(
+            project_root
+                .join("templates")
+                .join("mailers")
+                .join("_layout.html"),
+            render_layout_html(),
+        );
 
-        let layout_txt_path = project_root
-            .join("templates")
-            .join("mailers")
-            .join("_layout.txt");
-        if !layout_txt_path.exists() {
-            plan.create(layout_txt_path, render_layout_txt());
-        }
+        plan.create_if_absent(
+            project_root
+                .join("templates")
+                .join("mailers")
+                .join("_layout.txt"),
+            render_layout_txt(),
+        );
     }
 
     // ── src/mailers/<snake>.rs ─────────────────────────────────────────────
@@ -418,16 +419,15 @@ fn render_smoke_test(struct_name: &str, snake_name: &str, no_layout: bool) -> St
     let layout_assertions = if no_layout {
         String::new()
     } else {
-        format!(
-            "                assert!(\n\
-             html.contains(\"<table\"),\n\
-             \"html body must contain a table-based layout wrapper; got: {{html}}\"\n\
-             );\n\
-             assert!(\n\
-             html.contains(\"style=\"),\n\
-             \"html body must contain inline style= attributes; got: {{html}}\"\n\
-             );\n"
-        )
+        "                assert!(\n\
+                     html.contains(\"<table\"),\n\
+                     \"html body must contain a table-based layout wrapper; got: {html}\"\n\
+                 );\n\
+                 assert!(\n\
+                     html.contains(\"style=\"),\n\
+                     \"html body must contain inline style= attributes; got: {html}\"\n\
+                 );\n"
+            .to_owned()
     };
     format!(
         "\n\

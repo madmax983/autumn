@@ -661,13 +661,17 @@ impl MailBuilder {
                 "mail must include html or text body".to_owned(),
             ));
         }
+        // A layout is only applied when the corresponding body is present.
+        // If only one of html/text is set, the other layout half is intentionally
+        // skipped rather than erroring — a text-only mailer may legitimately pass
+        // an html_layout that has no effect, and vice-versa.
         let html = match (self.html, self.html_layout) {
             (Some(body), Some(layout)) => Some(compose_layout(&layout, &body)),
-            (html, _) => html,
+            (html, _) => html, // layout without a body: silently unused (by design)
         };
         let text = match (self.text, self.text_layout) {
             (Some(body), Some(layout)) => Some(compose_layout(&layout, &body)),
-            (text, _) => text,
+            (text, _) => text, // layout without a body: silently unused (by design)
         };
         Ok(Mail {
             from: self.from,

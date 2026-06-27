@@ -974,9 +974,9 @@ fn find_plan_content_for_path(plan: &Plan, path: &std::path::Path) -> Option<Str
         .rev()
         .find(|a| a.path() == path)
         .and_then(|a| match a {
-            Action::Create { contents, .. } | Action::Modify { contents, .. } => {
-                Some(contents.clone())
-            }
+            Action::Create { contents, .. }
+            | Action::Modify { contents, .. }
+            | Action::CreateIfAbsent { contents, .. } => Some(contents.clone()),
             // Binary/verbatim files have no textual content to inspect.
             Action::CreateBytes { .. } => None,
         })
