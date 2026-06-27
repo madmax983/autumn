@@ -7,6 +7,9 @@ level = "info"
 [health]
 path = "/health"
 
+[http.client]
+timeout_secs = 10
+
 [database]
 primary_url = "postgres://autumn:autumn@localhost:5432/bookmarks_distributed"
 replica_url = "postgres://autumn:autumn@localhost:5433/bookmarks_distributed"
