@@ -2,21 +2,24 @@
 //! preview registration, and a smoke test.
 //!
 //! For a name like `Welcome`, the generator produces:
+//! - `templates/mailers/_layout.html` / `_layout.txt` — shared email layout shell
+//!   (created once; subsequent `generate mailer` calls skip if already present).
 //! - `src/mailers/welcome.rs` — `WelcomeMailer` struct with a `#[mailer]` impl.
 //!   The macro generates `send_welcome` (async) and `deliver_later_welcome`
 //!   (fire-and-forget) from each method.
 //! - `src/mailers/previews/welcome.rs` — dev-only `#[mailer_preview]` impl,
 //!   kept separate from production code (mirrors Rails `test/mailers/previews/`).
 //! - `src/mailers/previews/mod.rs` — created or updated with `pub mod welcome;`.
-//! - `templates/mailers/welcome.html` — HTML template placeholder.
-//! - `templates/mailers/welcome.txt` — plain-text template placeholder.
+//! - `templates/mailers/welcome.html` — HTML body fragment (no `<head>`/`<body>`).
+//! - `templates/mailers/welcome.txt` — plain-text body fragment.
 //! - `src/mailers/mod.rs` — created or updated with `pub mod welcome;` and
 //!   `pub mod previews;`.
-//! - `tests/welcome_mailer.rs` — smoke test asserting both bodies render.
 //! - `src/main.rs` — `mod mailers;` declaration and
 //!   `.mail_previews(mail_previews![mailers::welcome::WelcomeMailer])` wired
 //!   into the app builder chain.
 //! - `Cargo.toml` — `"mail"` feature added to the `autumn-web` dependency.
+//!
+//! Use `--no-layout` to opt out of the shared layout for a specific mailer.
 
 use std::path::Path;
 
@@ -34,12 +37,20 @@ use super::{Flags, GenerateError, ensure_project_root, timestamp_now};
 /// one-click List-Unsubscribe and a `mail_unsubscribes` suppression migration
 /// is added (idempotently).
 ///
+/// When `no_layout` is `true`, the per-mailer template is emitted as a
+/// self-contained full HTML document and the generated mailer omits the
+/// `.layout(...)` builder call — useful for one-line plaintext or fully-custom
+/// HTML. When `false` (the default), a shared `_layout.html`/`_layout.txt` is
+/// created (idempotently) and the generated mailer composes the body fragment
+/// into the layout slot at build time.
+///
 /// # Errors
 /// Project layout and name validation errors surface here.
 pub fn plan_mailer(
     project_root: &Path,
     name: &str,
     list_unsubscribe: Option<&str>,
+    no_layout: bool,
 ) -> Result<Plan, GenerateError> {
     ensure_project_root(project_root)?;
     validate_resource_name(name)?;
@@ -54,13 +65,34 @@ pub fn plan_mailer(
 
     let mut plan = Plan::new(project_root);
 
+    // ── templates/mailers/_layout.html (idempotent) ────────────────────────
+    // Created on the first `generate mailer` call; subsequent calls skip it so
+    // user edits to the shared layout are not overwritten.
+    if !no_layout {
+        let layout_html_path = project_root
+            .join("templates")
+            .join("mailers")
+            .join("_layout.html");
+        if !layout_html_path.exists() {
+            plan.create(layout_html_path, render_layout_html());
+        }
+
+        let layout_txt_path = project_root
+            .join("templates")
+            .join("mailers")
+            .join("_layout.txt");
+        if !layout_txt_path.exists() {
+            plan.create(layout_txt_path, render_layout_txt());
+        }
+    }
+
     // ── src/mailers/<snake>.rs ─────────────────────────────────────────────
     plan.create(
         project_root
             .join("src")
             .join("mailers")
             .join(format!("{snake_name}.rs")),
-        render_mailer_file(&struct_name, &snake_name, list_unsubscribe),
+        render_mailer_file(&struct_name, &snake_name, list_unsubscribe, no_layout),
     );
 
     // ── templates/mailers/<snake>.html ─────────────────────────────────────
@@ -69,7 +101,7 @@ pub fn plan_mailer(
             .join("templates")
             .join("mailers")
             .join(format!("{snake_name}.html")),
-        render_html_template(&struct_name),
+        render_html_template(&struct_name, no_layout),
     );
 
     // ── templates/mailers/<snake>.txt ──────────────────────────────────────
@@ -78,7 +110,7 @@ pub fn plan_mailer(
             .join("templates")
             .join("mailers")
             .join(format!("{snake_name}.txt")),
-        render_txt_template(&struct_name),
+        render_txt_template(&struct_name, no_layout),
     );
 
     // ── src/mailers/previews/<snake>.rs ────────────────────────────────────
@@ -88,7 +120,7 @@ pub fn plan_mailer(
             .join("mailers")
             .join("previews")
             .join(format!("{snake_name}.rs")),
-        render_preview_file(&struct_name, &snake_name),
+        render_preview_file(&struct_name, &snake_name, no_layout),
     );
 
     // ── src/mailers/previews/mod.rs (create or update) ─────────────────────
@@ -206,11 +238,19 @@ fn render_mailer_file(
     struct_name: &str,
     snake_name: &str,
     list_unsubscribe: Option<&str>,
+    no_layout: bool,
 ) -> String {
     let mailer_attr = list_unsubscribe.map_or_else(
         || "#[mailer]".to_owned(),
         |scope| format!("#[mailer(list_unsubscribe = \"{scope}\")]"),
     );
+    let layout_call = if no_layout {
+        String::new()
+    } else {
+        format!(
+            "\n            .layout(\n                include_str!(\"../../templates/mailers/_layout.html\"),\n                include_str!(\"../../templates/mailers/_layout.txt\"),\n            )"
+        )
+    };
     let base = format!(
         r#"//! Generated by `autumn generate mailer`.
 //!
@@ -233,17 +273,28 @@ impl {struct_name} {{
             .to(to)
             .subject("{struct_name}")
             .html(include_str!("../../templates/mailers/{snake_name}.html"))
-            .text(include_str!("../../templates/mailers/{snake_name}.txt"))
+            .text(include_str!("../../templates/mailers/{snake_name}.txt")){layout_call}
             .build()
             .expect("valid mail")
     }}
 }}
 "#
     );
-    format!("{}{}", base, render_smoke_test(struct_name, snake_name))
+    format!(
+        "{}{}",
+        base,
+        render_smoke_test(struct_name, snake_name, no_layout)
+    )
 }
 
-fn render_preview_file(struct_name: &str, snake_name: &str) -> String {
+fn render_preview_file(struct_name: &str, snake_name: &str, no_layout: bool) -> String {
+    let layout_call = if no_layout {
+        String::new()
+    } else {
+        format!(
+            "\n            .layout(\n                include_str!(\"../../../templates/mailers/_layout.html\"),\n                include_str!(\"../../../templates/mailers/_layout.txt\"),\n            )"
+        )
+    };
     format!(
         r#"//! Dev-only mail preview for [`{struct_name}`].
 //!
@@ -262,7 +313,7 @@ impl {struct_name} {{
             .to("preview@example.com")
             .subject("{struct_name}")
             .html(include_str!("../../../templates/mailers/{snake_name}.html"))
-            .text(include_str!("../../../templates/mailers/{snake_name}.txt"))
+            .text(include_str!("../../../templates/mailers/{snake_name}.txt")){layout_call}
             .build()
             .expect("valid preview mail")
     }}
@@ -271,23 +322,113 @@ impl {struct_name} {{
     )
 }
 
-fn render_html_template(struct_name: &str) -> String {
-    format!(
-        "<!DOCTYPE html>\n\
-         <html>\n\
-         <head><meta charset=\"utf-8\"></head>\n\
-         <body>\n\
-           <p>Hello from {struct_name}!</p>\n\
-         </body>\n\
-         </html>\n"
-    )
+/// Shared HTML layout shell. Contains the document skeleton (charset, viewport,
+/// table-based responsive wrapper with inline CSS, header, body slot, footer).
+/// Per-mailer templates are body-only fragments composed into `{{ content }}`.
+fn render_layout_html() -> String {
+    r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="X-UA-Compatible" content="IE=edge">
+  <title></title>
+</head>
+<body style="margin:0;padding:0;background-color:#f4f4f4;font-family:Arial,Helvetica,sans-serif;">
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="background-color:#f4f4f4;">
+    <tr>
+      <td align="center" style="padding:24px 0;">
+        <!-- Header / branding -->
+        <table role="presentation" width="600" cellspacing="0" cellpadding="0" border="0" style="max-width:600px;width:100%;background-color:#ffffff;border-radius:6px;overflow:hidden;">
+          <tr>
+            <td style="background-color:#1a1a2e;padding:24px 32px;">
+              <p style="margin:0;color:#ffffff;font-size:20px;font-weight:bold;">Your App</p>
+            </td>
+          </tr>
+          <!-- Body content slot -->
+          <tr>
+            <td style="padding:32px;">
+              {{ content }}
+            </td>
+          </tr>
+          <!-- Footer -->
+          <tr>
+            <td style="background-color:#f4f4f4;padding:16px 32px;border-top:1px solid #e0e0e0;">
+              <p style="margin:0;font-size:12px;color:#888888;text-align:center;">
+                You are receiving this email because you signed up for our service.
+              </p>
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>
+"#
+    .to_owned()
 }
 
-fn render_txt_template(struct_name: &str) -> String {
-    format!("Hello from {struct_name}!\n")
+/// Shared plain-text layout shell.
+fn render_layout_txt() -> String {
+    "========================================\n\
+     Your App\n\
+     ========================================\n\
+     \n\
+     {{ content }}\n\
+     \n\
+     ----------------------------------------\n\
+     You are receiving this email because you signed up for our service.\n"
+        .to_owned()
 }
 
-fn render_smoke_test(struct_name: &str, snake_name: &str) -> String {
+/// Per-mailer HTML body fragment. No `<!DOCTYPE>`, `<head>`, or `<body>` —
+/// those belong in `_layout.html`. When `no_layout` is `true` a self-contained
+/// full document is emitted instead.
+fn render_html_template(struct_name: &str, no_layout: bool) -> String {
+    if no_layout {
+        format!(
+            "<!DOCTYPE html>\n\
+             <html>\n\
+             <head><meta charset=\"utf-8\"></head>\n\
+             <body>\n\
+               <p>Hello from {struct_name}!</p>\n\
+             </body>\n\
+             </html>\n"
+        )
+    } else {
+        format!(
+            "<h1 style=\"margin:0 0 16px;font-size:24px;color:#1a1a2e;\">Hello from {struct_name}!</h1>\n\
+             <p style=\"margin:0;font-size:16px;line-height:1.6;color:#333333;\">Your email body goes here.</p>\n"
+        )
+    }
+}
+
+/// Per-mailer plain-text body fragment. When `no_layout` is `true` a
+/// self-contained message is emitted instead.
+fn render_txt_template(struct_name: &str, no_layout: bool) -> String {
+    if no_layout {
+        format!("Hello from {struct_name}!\n")
+    } else {
+        format!("Hello from {struct_name}!\n\nYour email body goes here.\n")
+    }
+}
+
+fn render_smoke_test(struct_name: &str, snake_name: &str, no_layout: bool) -> String {
+    let layout_assertions = if no_layout {
+        String::new()
+    } else {
+        format!(
+            "                assert!(\n\
+             html.contains(\"<table\"),\n\
+             \"html body must contain a table-based layout wrapper; got: {{html}}\"\n\
+             );\n\
+             assert!(\n\
+             html.contains(\"style=\"),\n\
+             \"html body must contain inline style= attributes; got: {{html}}\"\n\
+             );\n"
+        )
+    };
     format!(
         "\n\
          #[cfg(test)]\n\
@@ -308,13 +449,14 @@ fn render_smoke_test(struct_name: &str, snake_name: &str) -> String {
                      text.contains(\"{struct_name}\"),\n\
                      \"text body must contain the mailer name; got: {{text}}\"\n\
                  );\n\
+                 {layout_assertions}\
              }}\n\
          }}\n"
     )
 }
 
 /// CLI entry point.
-pub fn run(name: &str, list_unsubscribe: Option<&str>, flags: Flags) {
+pub fn run(name: &str, list_unsubscribe: Option<&str>, no_layout: bool, flags: Flags) {
     let cwd = match std::env::current_dir() {
         Ok(d) => d,
         Err(e) => {
@@ -322,7 +464,7 @@ pub fn run(name: &str, list_unsubscribe: Option<&str>, flags: Flags) {
             std::process::exit(1);
         }
     };
-    match plan_mailer(&cwd, name, list_unsubscribe).and_then(|p| p.execute(flags)) {
+    match plan_mailer(&cwd, name, list_unsubscribe, no_layout).and_then(|p| p.execute(flags)) {
         Ok(()) => {}
         Err(e) => {
             eprintln!("Error: {e}");
@@ -370,7 +512,7 @@ async fn main() {
     #[test]
     fn plan_creates_mailer_file() {
         let tmp = project_with_main(default_main());
-        let plan = plan_mailer(tmp.path(), "Welcome", None).unwrap();
+        let plan = plan_mailer(tmp.path(), "Welcome", None, false).unwrap();
         assert!(
             plan.actions
                 .iter()
@@ -382,7 +524,7 @@ async fn main() {
     #[test]
     fn plan_creates_preview_file() {
         let tmp = project_with_main(default_main());
-        let plan = plan_mailer(tmp.path(), "Welcome", None).unwrap();
+        let plan = plan_mailer(tmp.path(), "Welcome", None, false).unwrap();
         assert!(
             plan.actions
                 .iter()
@@ -394,7 +536,7 @@ async fn main() {
     #[test]
     fn plan_includes_previews_mod_rs() {
         let tmp = project_with_main(default_main());
-        let plan = plan_mailer(tmp.path(), "Welcome", None).unwrap();
+        let plan = plan_mailer(tmp.path(), "Welcome", None, false).unwrap();
         assert!(
             plan.actions
                 .iter()
@@ -406,7 +548,7 @@ async fn main() {
     #[test]
     fn plan_creates_html_template() {
         let tmp = project_with_main(default_main());
-        let plan = plan_mailer(tmp.path(), "Welcome", None).unwrap();
+        let plan = plan_mailer(tmp.path(), "Welcome", None, false).unwrap();
         assert!(
             plan.actions
                 .iter()
@@ -418,7 +560,7 @@ async fn main() {
     #[test]
     fn plan_creates_txt_template() {
         let tmp = project_with_main(default_main());
-        let plan = plan_mailer(tmp.path(), "Welcome", None).unwrap();
+        let plan = plan_mailer(tmp.path(), "Welcome", None, false).unwrap();
         assert!(
             plan.actions
                 .iter()
@@ -430,7 +572,7 @@ async fn main() {
     #[test]
     fn plan_includes_mailer_mod_rs() {
         let tmp = project_with_main(default_main());
-        let plan = plan_mailer(tmp.path(), "Welcome", None).unwrap();
+        let plan = plan_mailer(tmp.path(), "Welcome", None, false).unwrap();
         assert!(
             plan.actions
                 .iter()
@@ -442,7 +584,7 @@ async fn main() {
     #[test]
     fn plan_does_not_create_external_smoke_test() {
         let tmp = project_with_main(default_main());
-        let plan = plan_mailer(tmp.path(), "Welcome", None).unwrap();
+        let plan = plan_mailer(tmp.path(), "Welcome", None, false).unwrap();
         assert!(
             !plan.actions.iter().any(|a| a
                 .path()
@@ -455,7 +597,7 @@ async fn main() {
     #[test]
     fn plan_updates_main_rs() {
         let tmp = project_with_main(default_main());
-        let plan = plan_mailer(tmp.path(), "Welcome", None).unwrap();
+        let plan = plan_mailer(tmp.path(), "Welcome", None, false).unwrap();
         assert!(
             plan.actions
                 .iter()
@@ -469,7 +611,7 @@ async fn main() {
     #[test]
     fn list_unsubscribe_sets_attribute_and_plans_migration() {
         let tmp = project_with_main(default_main());
-        plan_mailer(tmp.path(), "WeeklyDigest", Some("weekly_digest"))
+        plan_mailer(tmp.path(), "WeeklyDigest", Some("weekly_digest"), false)
             .unwrap()
             .execute(Flags::default())
             .unwrap();
@@ -501,29 +643,29 @@ async fn main() {
     fn rejects_unsafe_list_unsubscribe_scope() {
         let tmp = project_with_main(default_main());
         // A scope with a quote would inject invalid Rust into the attribute.
-        assert!(plan_mailer(tmp.path(), "Welcome", Some("a\" )]")).is_err());
-        assert!(plan_mailer(tmp.path(), "Welcome", Some("with space")).is_err());
-        assert!(plan_mailer(tmp.path(), "Welcome", Some("")).is_err());
+        assert!(plan_mailer(tmp.path(), "Welcome", Some("a\" )]"), false).is_err());
+        assert!(plan_mailer(tmp.path(), "Welcome", Some("with space"), false).is_err());
+        assert!(plan_mailer(tmp.path(), "Welcome", Some(""), false).is_err());
         // Identifier-like scopes are accepted.
-        assert!(plan_mailer(tmp.path(), "Welcome", Some("weekly_digest")).is_ok());
-        assert!(plan_mailer(tmp.path(), "Welcome", Some("product-updates")).is_ok());
+        assert!(plan_mailer(tmp.path(), "Welcome", Some("weekly_digest"), false).is_ok());
+        assert!(plan_mailer(tmp.path(), "Welcome", Some("product-updates"), false).is_ok());
     }
 
     #[test]
     fn rejects_unicode_and_special_chars_in_list_unsubscribe_scope() {
         let tmp = project_with_main(default_main());
         // Unicode characters are not allowed (alphanumeric ASCII + _ + - only).
-        assert!(plan_mailer(tmp.path(), "Welcome", Some("wöchentlich")).is_err());
-        assert!(plan_mailer(tmp.path(), "Welcome", Some("list.name")).is_err());
-        assert!(plan_mailer(tmp.path(), "Welcome", Some("list/name")).is_err());
+        assert!(plan_mailer(tmp.path(), "Welcome", Some("wöchentlich"), false).is_err());
+        assert!(plan_mailer(tmp.path(), "Welcome", Some("list.name"), false).is_err());
+        assert!(plan_mailer(tmp.path(), "Welcome", Some("list/name"), false).is_err());
         // Dash and underscore are fine.
-        assert!(plan_mailer(tmp.path(), "Welcome", Some("a-b_c")).is_ok());
+        assert!(plan_mailer(tmp.path(), "Welcome", Some("a-b_c"), false).is_ok());
     }
 
     #[test]
     fn without_list_unsubscribe_no_migration_and_plain_attribute() {
         let tmp = project_with_main(default_main());
-        let plan = plan_mailer(tmp.path(), "Welcome", None).unwrap();
+        let plan = plan_mailer(tmp.path(), "Welcome", None, false).unwrap();
         assert!(
             !plan
                 .actions
@@ -536,12 +678,13 @@ async fn main() {
     #[test]
     fn second_list_unsubscribe_mailer_does_not_duplicate_migration() {
         let tmp = project_with_main(default_main());
-        plan_mailer(tmp.path(), "WeeklyDigest", Some("weekly_digest"))
+        plan_mailer(tmp.path(), "WeeklyDigest", Some("weekly_digest"), false)
             .unwrap()
             .execute(Flags::default())
             .unwrap();
         // A second list mailer must reuse the existing suppression table.
-        let second = plan_mailer(tmp.path(), "ProductUpdates", Some("product_updates")).unwrap();
+        let second =
+            plan_mailer(tmp.path(), "ProductUpdates", Some("product_updates"), false).unwrap();
         assert!(
             !second
                 .actions
@@ -556,7 +699,7 @@ async fn main() {
     #[test]
     fn execute_writes_mailer_struct_and_macro_annotations() {
         let tmp = project_with_main(default_main());
-        plan_mailer(tmp.path(), "Welcome", None)
+        plan_mailer(tmp.path(), "Welcome", None, false)
             .unwrap()
             .execute(Flags::default())
             .unwrap();
@@ -586,7 +729,7 @@ async fn main() {
     #[test]
     fn execute_mailer_has_deliver_later_capable_method() {
         let tmp = project_with_main(default_main());
-        plan_mailer(tmp.path(), "Welcome", None)
+        plan_mailer(tmp.path(), "Welcome", None, false)
             .unwrap()
             .execute(Flags::default())
             .unwrap();
@@ -605,7 +748,7 @@ async fn main() {
     #[test]
     fn execute_writes_html_template_with_expected_content() {
         let tmp = project_with_main(default_main());
-        plan_mailer(tmp.path(), "Welcome", None)
+        plan_mailer(tmp.path(), "Welcome", None, false)
             .unwrap()
             .execute(Flags::default())
             .unwrap();
@@ -615,16 +758,14 @@ async fn main() {
             html.contains("WelcomeMailer"),
             "html template must reference the mailer name"
         );
-        assert!(
-            html.contains("<!DOCTYPE html>"),
-            "html template must be a valid HTML document"
-        );
+        // With layout, per-mailer template is body-only; full document is in _layout.html.
+        assert!(!html.is_empty(), "html template must not be empty");
     }
 
     #[test]
     fn execute_writes_txt_template_with_expected_content() {
         let tmp = project_with_main(default_main());
-        plan_mailer(tmp.path(), "Welcome", None)
+        plan_mailer(tmp.path(), "Welcome", None, false)
             .unwrap()
             .execute(Flags::default())
             .unwrap();
@@ -640,7 +781,7 @@ async fn main() {
     #[test]
     fn execute_writes_preview_file_with_mailer_preview() {
         let tmp = project_with_main(default_main());
-        plan_mailer(tmp.path(), "Welcome", None)
+        plan_mailer(tmp.path(), "Welcome", None, false)
             .unwrap()
             .execute(Flags::default())
             .unwrap();
@@ -664,7 +805,7 @@ async fn main() {
     #[test]
     fn execute_updates_mailer_mod_rs() {
         let tmp = project_with_main(default_main());
-        plan_mailer(tmp.path(), "Welcome", None)
+        plan_mailer(tmp.path(), "Welcome", None, false)
             .unwrap()
             .execute(Flags::default())
             .unwrap();
@@ -690,7 +831,7 @@ async fn main() {
     #[test]
     fn execute_updates_main_rs_with_mod_declaration() {
         let tmp = project_with_main(default_main());
-        plan_mailer(tmp.path(), "Welcome", None)
+        plan_mailer(tmp.path(), "Welcome", None, false)
             .unwrap()
             .execute(Flags::default())
             .unwrap();
@@ -705,7 +846,7 @@ async fn main() {
     #[test]
     fn execute_updates_main_rs_with_mail_previews_call() {
         let tmp = project_with_main(default_main());
-        plan_mailer(tmp.path(), "Welcome", None)
+        plan_mailer(tmp.path(), "Welcome", None, false)
             .unwrap()
             .execute(Flags::default())
             .unwrap();
@@ -724,7 +865,7 @@ async fn main() {
     #[test]
     fn execute_writes_smoke_test_with_body_assertions() {
         let tmp = project_with_main(default_main());
-        plan_mailer(tmp.path(), "Welcome", None)
+        plan_mailer(tmp.path(), "Welcome", None, false)
             .unwrap()
             .execute(Flags::default())
             .unwrap();
@@ -760,7 +901,7 @@ async fn main() {
     #[test]
     fn execute_adds_mail_feature_to_cargo_toml() {
         let tmp = project_with_main(default_main());
-        plan_mailer(tmp.path(), "Welcome", None)
+        plan_mailer(tmp.path(), "Welcome", None, false)
             .unwrap()
             .execute(Flags::default())
             .unwrap();
@@ -778,7 +919,7 @@ async fn main() {
     fn dry_run_writes_no_new_files() {
         let tmp = project_with_main(default_main());
         let original_main = fs::read_to_string(tmp.path().join("src/main.rs")).unwrap();
-        plan_mailer(tmp.path(), "Welcome", None)
+        plan_mailer(tmp.path(), "Welcome", None, false)
             .unwrap()
             .execute(Flags {
                 dry_run: true,
@@ -814,7 +955,7 @@ async fn main() {
         let tmp = project_with_main(default_main());
         fs::create_dir_all(tmp.path().join("src/mailers")).unwrap();
         fs::write(tmp.path().join("src/mailers/welcome.rs"), "// existing").unwrap();
-        let err = plan_mailer(tmp.path(), "Welcome", None)
+        let err = plan_mailer(tmp.path(), "Welcome", None, false)
             .unwrap()
             .execute(Flags::default())
             .unwrap_err();
@@ -829,7 +970,7 @@ async fn main() {
         let tmp = project_with_main(default_main());
         fs::create_dir_all(tmp.path().join("src/mailers")).unwrap();
         fs::write(tmp.path().join("src/mailers/welcome.rs"), "// old").unwrap();
-        plan_mailer(tmp.path(), "Welcome", None)
+        plan_mailer(tmp.path(), "Welcome", None, false)
             .unwrap()
             .execute(Flags {
                 force: true,
@@ -849,7 +990,7 @@ async fn main() {
     #[test]
     fn snake_case_input_is_normalised() {
         let tmp = project_with_main(default_main());
-        plan_mailer(tmp.path(), "welcome_email", None)
+        plan_mailer(tmp.path(), "welcome_email", None, false)
             .unwrap()
             .execute(Flags::default())
             .unwrap();
@@ -868,25 +1009,25 @@ async fn main() {
     fn plan_errors_when_main_rs_missing() {
         let tmp = TempDir::new().unwrap();
         fs::write(tmp.path().join("Cargo.toml"), "[package]\nname=\"x\"\n").unwrap();
-        let err = plan_mailer(tmp.path(), "Welcome", None).unwrap_err();
+        let err = plan_mailer(tmp.path(), "Welcome", None, false).unwrap_err();
         assert!(matches!(err, GenerateError::Io(_)));
     }
 
     #[test]
     fn plan_errors_when_not_in_project() {
         let tmp = TempDir::new().unwrap();
-        let err = plan_mailer(tmp.path(), "Welcome", None).unwrap_err();
+        let err = plan_mailer(tmp.path(), "Welcome", None, false).unwrap_err();
         assert!(matches!(err, GenerateError::NotInProject));
     }
 
     #[test]
     fn second_mailer_augments_mod_rs_and_previews() {
         let tmp = project_with_main(default_main());
-        plan_mailer(tmp.path(), "Welcome", None)
+        plan_mailer(tmp.path(), "Welcome", None, false)
             .unwrap()
             .execute(Flags::default())
             .unwrap();
-        plan_mailer(tmp.path(), "Notification", None)
+        plan_mailer(tmp.path(), "Notification", None, false)
             .unwrap()
             .execute(Flags {
                 force: true,
@@ -915,5 +1056,230 @@ async fn main() {
         let main = fs::read_to_string(tmp.path().join("src/main.rs")).unwrap();
         assert!(main.contains("mailers::welcome::WelcomeMailer"));
         assert!(main.contains("mailers::notification::NotificationMailer"));
+    }
+
+    // ── Shared layout: RED tests ──────────────────────────────────────────
+
+    #[test]
+    fn plan_creates_layout_html() {
+        let tmp = project_with_main(default_main());
+        let plan = plan_mailer(tmp.path(), "Welcome", None, false).unwrap();
+        assert!(
+            plan.actions
+                .iter()
+                .any(|a| a.path().ends_with("templates/mailers/_layout.html")),
+            "plan must include templates/mailers/_layout.html"
+        );
+    }
+
+    #[test]
+    fn plan_creates_layout_txt() {
+        let tmp = project_with_main(default_main());
+        let plan = plan_mailer(tmp.path(), "Welcome", None, false).unwrap();
+        assert!(
+            plan.actions
+                .iter()
+                .any(|a| a.path().ends_with("templates/mailers/_layout.txt")),
+            "plan must include templates/mailers/_layout.txt"
+        );
+    }
+
+    #[test]
+    fn layout_html_contains_table_and_style_and_content_marker() {
+        let tmp = project_with_main(default_main());
+        plan_mailer(tmp.path(), "Welcome", None, false)
+            .unwrap()
+            .execute(Flags::default())
+            .unwrap();
+
+        let layout = fs::read_to_string(tmp.path().join("templates/mailers/_layout.html")).unwrap();
+        assert!(
+            layout.contains("<table"),
+            "_layout.html must contain a table-based wrapper"
+        );
+        assert!(
+            layout.contains("style="),
+            "_layout.html must use inline style= attributes"
+        );
+        assert!(
+            layout.contains("{{ content }}"),
+            "_layout.html must contain the content slot marker"
+        );
+        assert!(
+            layout.contains("<!DOCTYPE html>"),
+            "_layout.html must be a complete document shell"
+        );
+    }
+
+    #[test]
+    fn layout_txt_contains_content_marker() {
+        let tmp = project_with_main(default_main());
+        plan_mailer(tmp.path(), "Welcome", None, false)
+            .unwrap()
+            .execute(Flags::default())
+            .unwrap();
+
+        let layout = fs::read_to_string(tmp.path().join("templates/mailers/_layout.txt")).unwrap();
+        assert!(
+            layout.contains("{{ content }}"),
+            "_layout.txt must contain the content slot marker"
+        );
+    }
+
+    #[test]
+    fn per_mailer_html_template_is_body_fragment_only() {
+        let tmp = project_with_main(default_main());
+        plan_mailer(tmp.path(), "Welcome", None, false)
+            .unwrap()
+            .execute(Flags::default())
+            .unwrap();
+
+        let html = fs::read_to_string(tmp.path().join("templates/mailers/welcome.html")).unwrap();
+        assert!(
+            !html.contains("<!DOCTYPE"),
+            "per-mailer template must NOT contain <!DOCTYPE — that belongs in _layout.html"
+        );
+        assert!(
+            !html.contains("<head"),
+            "per-mailer template must NOT contain <head>"
+        );
+        assert!(
+            !html.contains("<body"),
+            "per-mailer template must NOT contain <body>"
+        );
+        assert!(
+            html.contains("WelcomeMailer"),
+            "per-mailer template must still reference the mailer name"
+        );
+    }
+
+    #[test]
+    fn second_mailer_does_not_recreate_layout_files() {
+        let tmp = project_with_main(default_main());
+        plan_mailer(tmp.path(), "Welcome", None, false)
+            .unwrap()
+            .execute(Flags::default())
+            .unwrap();
+
+        // Overwrite _layout.html with a sentinel to detect re-creation.
+        let layout_path = tmp.path().join("templates/mailers/_layout.html");
+        fs::write(&layout_path, "<!-- sentinel -->").unwrap();
+
+        plan_mailer(tmp.path(), "Receipt", None, false)
+            .unwrap()
+            .execute(Flags::default())
+            .unwrap();
+
+        // The second generator run must NOT recreate the layout file.
+        let layout = fs::read_to_string(&layout_path).unwrap();
+        assert_eq!(
+            layout, "<!-- sentinel -->",
+            "second mailer generation must not overwrite _layout.html"
+        );
+    }
+
+    #[test]
+    fn second_mailer_template_has_no_doctype_or_head() {
+        let tmp = project_with_main(default_main());
+        plan_mailer(tmp.path(), "Welcome", None, false)
+            .unwrap()
+            .execute(Flags::default())
+            .unwrap();
+        plan_mailer(tmp.path(), "Receipt", None, false)
+            .unwrap()
+            .execute(Flags::default())
+            .unwrap();
+
+        let html = fs::read_to_string(tmp.path().join("templates/mailers/receipt.html")).unwrap();
+        assert!(
+            !html.contains("<!DOCTYPE"),
+            "2nd mailer template must add 0 lines of <!DOCTYPE boilerplate"
+        );
+        assert!(
+            !html.contains("<head"),
+            "2nd mailer template must add 0 lines of <head> boilerplate"
+        );
+    }
+
+    #[test]
+    fn generated_mailer_file_includes_layout_builder_call() {
+        let tmp = project_with_main(default_main());
+        plan_mailer(tmp.path(), "Welcome", None, false)
+            .unwrap()
+            .execute(Flags::default())
+            .unwrap();
+
+        let mailer = fs::read_to_string(tmp.path().join("src/mailers/welcome.rs")).unwrap();
+        assert!(
+            mailer.contains(".layout("),
+            "generated mailer must call .layout(...) to compose body into shared layout"
+        );
+    }
+
+    #[test]
+    fn generated_preview_file_includes_layout_builder_call() {
+        let tmp = project_with_main(default_main());
+        plan_mailer(tmp.path(), "Welcome", None, false)
+            .unwrap()
+            .execute(Flags::default())
+            .unwrap();
+
+        let preview =
+            fs::read_to_string(tmp.path().join("src/mailers/previews/welcome.rs")).unwrap();
+        assert!(
+            preview.contains(".layout("),
+            "generated preview must call .layout(...) to show layout-wrapped output"
+        );
+    }
+
+    #[test]
+    fn smoke_test_asserts_table_and_style() {
+        let tmp = project_with_main(default_main());
+        plan_mailer(tmp.path(), "Welcome", None, false)
+            .unwrap()
+            .execute(Flags::default())
+            .unwrap();
+
+        let mailer = fs::read_to_string(tmp.path().join("src/mailers/welcome.rs")).unwrap();
+        assert!(
+            mailer.contains("<table") || mailer.contains("\"<table\"") || mailer.contains("table"),
+            "smoke test must assert table-based wrapper is present"
+        );
+        assert!(
+            mailer.contains("style=") || mailer.contains("\"style=\""),
+            "smoke test must assert inline style= is present"
+        );
+    }
+
+    // ── --no-layout flag ──────────────────────────────────────────────────
+
+    #[test]
+    fn no_layout_flag_omits_layout_call_in_mailer() {
+        let tmp = project_with_main(default_main());
+        plan_mailer(tmp.path(), "Welcome", None, true)
+            .unwrap()
+            .execute(Flags::default())
+            .unwrap();
+
+        let mailer = fs::read_to_string(tmp.path().join("src/mailers/welcome.rs")).unwrap();
+        assert!(
+            !mailer.contains(".layout("),
+            "--no-layout must not emit .layout() call"
+        );
+    }
+
+    #[test]
+    fn no_layout_flag_emits_full_document_html_template() {
+        let tmp = project_with_main(default_main());
+        plan_mailer(tmp.path(), "Welcome", None, true)
+            .unwrap()
+            .execute(Flags::default())
+            .unwrap();
+
+        let html = fs::read_to_string(tmp.path().join("templates/mailers/welcome.html")).unwrap();
+        assert!(
+            html.contains("<!DOCTYPE html>"),
+            "--no-layout template must be a self-contained full-document HTML"
+        );
     }
 }
