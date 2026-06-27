@@ -1432,7 +1432,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         let __fragment = #render_expr;
                         if let ::core::result::Result::Err(__err) = __channels
                             .broadcast()
-                            .publish_oob(&__topic, #container_expr, ::autumn_web::htmx::OobSwap::BeforeEnd, &__fragment)
+                            .publish_oob(&__topic, #container_expr, &::autumn_web::htmx::OobSwap::BeforeEnd, &__fragment)
                         {
                             ::autumn_web::reexports::tracing::warn!(error = %__err, "auto-broadcast failed");
                         }
@@ -1464,7 +1464,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                 let __delete_fragment = ::autumn_web::html! {};
                                 if let ::core::result::Result::Err(__err) = __channels
                                     .broadcast()
-                                    .publish_oob(__prev_topic, __delete_id, ::autumn_web::htmx::OobSwap::Delete, &__delete_fragment)
+                                    .publish_oob(__prev_topic, __delete_id, &::autumn_web::htmx::OobSwap::Delete, &__delete_fragment)
                                 {
                                     ::autumn_web::reexports::tracing::warn!(error = %__err, "auto-broadcast delete of old topic failed");
                                 }
@@ -1491,7 +1491,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
                         if let ::core::result::Result::Err(__err) = __channels
                             .broadcast()
-                            .publish_oob(&__topic, __target_id, __swap_strategy, &__fragment)
+                            .publish_oob(&__topic, __target_id, &__swap_strategy, &__fragment)
                         {
                             ::autumn_web::reexports::tracing::warn!(error = %__err, "auto-broadcast failed");
                         }
@@ -1544,7 +1544,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         let __fragment = ::autumn_web::html! {};
                         if let ::core::result::Result::Err(__err) = __channels
                             .broadcast()
-                            .publish_oob(&__topic, &__id, ::autumn_web::htmx::OobSwap::Delete, &__fragment)
+                            .publish_oob(&__topic, &__id, &::autumn_web::htmx::OobSwap::Delete, &__fragment)
                         {
                             ::autumn_web::reexports::tracing::warn!(error = %__err, "auto-broadcast failed");
                         }
