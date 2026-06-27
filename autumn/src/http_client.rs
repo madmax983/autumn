@@ -537,21 +537,7 @@ impl Client {
     /// `reqwest::Client`.  Used when a shared inner client is available but
     /// no explicit `[http.client]` config is registered.
     fn with_inner(inner: reqwest::Client) -> Self {
-        let timeout = Duration::from_secs(30);
-        Self {
-            inner,
-            alias: None,
-            base_url: None,
-            base_urls: HashMap::new(),
-            retry_policy: RetryPolicy {
-                max_retries: 3,
-                retry_idempotent_only: true,
-                max_retry_after: Duration::from_secs(10),
-                request_timeout: Some(timeout),
-            },
-            mock: None,
-            resilience_config: None,
-        }
+        Self { inner, ..Self::new() }
     }
 
     /// Create a client from `[http.client]` framework configuration.
@@ -582,9 +568,10 @@ impl Client {
     /// Falls back to `Self::new()` for detached or test state that does not
     /// carry a shared client.
     pub fn from_state(state: &crate::AppState) -> Self {
+        let autumn_config = state.extension::<crate::config::AutumnConfig>();
         let config = state.extension::<crate::config::HttpConfig>().or_else(|| {
-            state
-                .extension::<crate::config::AutumnConfig>()
+            autumn_config
+                .as_ref()
                 .map(|c| Arc::new(c.http.clone()))
         });
         let shared = state.extension::<SharedReqwestClient>().map(|s| s.0.clone());
@@ -596,10 +583,7 @@ impl Client {
             (None, None) => Self::new(),
         };
 
-        let resilience = state
-            .extension::<crate::config::AutumnConfig>()
-            .map(|c| Arc::new(c.resilience.clone()));
-        client.resilience_config = resilience;
+        client.resilience_config = autumn_config.map(|c| Arc::new(c.resilience.clone()));
 
         if let Some(ext) = state.extension::<HttpMockRegistryExt>() {
             client = client.with_mock(ext.0.clone());

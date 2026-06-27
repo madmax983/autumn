@@ -38,6 +38,7 @@ fn probe_outcome(head: Result<StatusCode, ()>, get: Option<Result<StatusCode, ()
 async fn probe_reachable(client: &Client, url: &str) -> bool {
     let head = client
         .head(url)
+        .no_retry()
         .send()
         .await
         .map(|response| response.status());
@@ -46,6 +47,7 @@ async fn probe_reachable(client: &Client, url: &str) -> bool {
         Ok(status) if head_requires_get_fallback(status) => {
             let get = client
                 .get(url)
+                .no_retry()
                 .send()
                 .await
                 .map(|response| response.status());

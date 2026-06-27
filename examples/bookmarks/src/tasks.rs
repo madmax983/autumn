@@ -44,6 +44,7 @@ pub async fn check_links(state: AppState) -> AutumnResult<()> {
     for (id, url) in &alive {
         let reachable = client
             .head(url)
+            .no_retry()
             .send()
             .await
             .is_ok_and(|r| r.status().is_success() || r.status().is_redirection());
