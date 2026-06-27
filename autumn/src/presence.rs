@@ -403,7 +403,6 @@ pub fn presence_stream(
     impl tokio_stream::Stream<Item = Result<axum::response::sse::Event, std::convert::Infallible>>
     + use<>,
 > {
-    use maud::Render;
     use tokio_stream::StreamExt;
 
     let topic = topic.to_owned();
