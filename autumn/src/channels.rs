@@ -1239,7 +1239,7 @@ mod tests {
         let msg = rx.recv().await?;
         assert_eq!(
             msg.as_str(),
-            "<template hx-swap-oob=\"beforeend:#badge\"><span>3</span></template>"
+            "<div hx-swap-oob=\"beforeend:#badge\"><span>3</span></div>"
         );
         Ok(())
     }
