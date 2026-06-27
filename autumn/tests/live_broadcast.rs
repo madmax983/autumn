@@ -100,7 +100,7 @@ async fn setup_db() -> Pool<AsyncPgConnection> {
 
 /// Build a repository backed by the given pool AND a channels handle so
 /// broadcasts fire. Simulates what `FromRequestParts<AppState>` does.
-fn repo_with_broadcast(pool: Pool<AsyncPgConnection>, channels: Channels) -> PgLiveItemRepository {
+fn repo_with_broadcast(pool: Pool<AsyncPgConnection>, channels: &Channels) -> PgLiveItemRepository {
     let broadcast = channels.broadcast();
     PgLiveItemRepository::__autumn_test_with_broadcast(pool, broadcast)
 }
@@ -113,7 +113,7 @@ async fn save_broadcasts_oob_fragment() {
     let pool = setup_db().await;
     let channels = Channels::new(16);
     let mut rx = channels.subscribe("live_items");
-    let repo = repo_with_broadcast(pool, channels);
+    let repo = repo_with_broadcast(pool, &channels);
 
     let new_item = NewLiveItem {
         name: "hello".to_owned(),
@@ -142,7 +142,7 @@ async fn update_broadcasts_true_swap() {
     let pool = setup_db().await;
     let channels = Channels::new(16);
     let mut rx = channels.subscribe("live_items");
-    let repo = repo_with_broadcast(pool, channels);
+    let repo = repo_with_broadcast(pool, &channels);
 
     let saved = repo
         .save(&NewLiveItem {
@@ -184,7 +184,7 @@ async fn delete_broadcasts_oob_delete() {
     let pool = setup_db().await;
     let channels = Channels::new(16);
     let mut rx = channels.subscribe("live_items");
-    let repo = repo_with_broadcast(pool, channels);
+    let repo = repo_with_broadcast(pool, &channels);
 
     let saved = repo
         .save(&NewLiveItem {
