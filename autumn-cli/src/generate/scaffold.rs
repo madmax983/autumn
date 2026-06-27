@@ -481,7 +481,7 @@ fn render_repository_file(
              #[autumn_web::get(\"/{plural}/stream\")]\n\
              pub async fn stream(\n\
              \x20\x20\x20\x20state: autumn_web::extract::State<autumn_web::AppState>,\n\
-             ) -> impl autumn_web::IntoResponse {{\n\
+             ) -> impl autumn_web::reexports::axum::response::IntoResponse {{\n\
              \x20\x20\x20\x20autumn_web::sse::stream(&state, \"{plural}\")\n\
              }}\n"
         )
@@ -848,12 +848,13 @@ pub async fn index(
     };
 
     // Imports: when sharded, drop Db from brace-import and add ShardedDb separately.
-    // When `--live`, add IntoResponse for the SSE stream handler.
+    // The stream handler uses the fully-qualified axum path so no extra IntoResponse
+    // import is needed.
     let db_import = if sharded {
         if live {
             "use autumn_web::flash::Flash;\n\
              use autumn_web::sharding::ShardedDb;\n\
-             use autumn_web::{AutumnError, AutumnResult, IntoResponse, Markup, get, html, post, secured};"
+             use autumn_web::{AutumnError, AutumnResult, Markup, get, html, post, secured};"
                 .to_owned()
         } else {
             "use autumn_web::flash::Flash;\n\
@@ -863,7 +864,7 @@ pub async fn index(
         }
     } else if live {
         "use autumn_web::flash::Flash;\n\
-         use autumn_web::{AutumnError, AutumnResult, Db, IntoResponse, Markup, get, html, post, secured};"
+         use autumn_web::{AutumnError, AutumnResult, Db, Markup, get, html, post, secured};"
             .to_owned()
     } else {
         "use autumn_web::flash::Flash;\n\
