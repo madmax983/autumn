@@ -273,8 +273,17 @@ pub struct HttpMockRegistryExt(pub Arc<MockRegistry>);
 /// Shared, process-wide `reqwest::Client` registered in [`AppState`] at server
 /// boot. Cloning is O(1) because `reqwest::Client` is internally `Arc`-backed,
 /// and the connection pool is preserved across the clone.
+///
+/// `timeout_secs` records the per-request timeout the inner client was built
+/// with.  [`Client::from_state`] compares this against the currently installed
+/// config so that a `state_initializer` that replaces `AutumnConfig` with a
+/// different timeout causes the stale inner to be discarded and a fresh client
+/// to be built from the new config instead.
 #[derive(Clone)]
-pub(crate) struct SharedReqwestClient(pub(crate) reqwest::Client);
+pub(crate) struct SharedReqwestClient {
+    pub(crate) client: reqwest::Client,
+    pub(crate) timeout_secs: u64,
+}
 
 /// Handle returned by
 /// [`MockSetupBuilder::respond_with`] that lets tests assert call counts.
@@ -584,9 +593,23 @@ impl Client {
         let config = state
             .extension::<crate::config::HttpConfig>()
             .or_else(|| autumn_config.as_ref().map(|c| Arc::new(c.http.clone())));
-        let shared = state
-            .extension::<SharedReqwestClient>()
-            .map(|s| s.0.clone());
+
+        // Only reuse the shared inner client when its baked-in timeout still
+        // matches the effective config timeout.  A state_initializer that
+        // replaces AutumnConfig/HttpConfig with a different timeout_secs runs
+        // after build_state, so without this check the stale inner would
+        // silently override the new config's per-request timeout.
+        let effective_timeout_secs = config.as_ref().map_or(
+            crate::config::HttpClientConfig::default().timeout_secs,
+            |c| c.client.timeout_secs,
+        );
+        let shared = state.extension::<SharedReqwestClient>().and_then(|s| {
+            if s.timeout_secs == effective_timeout_secs {
+                Some(s.client.clone())
+            } else {
+                None
+            }
+        });
 
         let mut client = match (config, shared) {
             (Some(cfg), Some(inner)) => Self::from_config_with_inner(inner, &cfg.client),
@@ -1879,8 +1902,10 @@ mod tests {
     // RED-PHASE TEST 41: SharedReqwestClient round-trips through AppState extensions.
     #[test]
     fn shared_reqwest_client_ext_round_trips() {
-        let inner = reqwest::Client::new();
-        let ext = SharedReqwestClient(inner);
+        let ext = SharedReqwestClient {
+            client: reqwest::Client::new(),
+            timeout_secs: 30,
+        };
         let state = crate::AppState::for_test();
         state.insert_extension(ext);
         let retrieved = state.extension::<SharedReqwestClient>();
@@ -1928,7 +1953,10 @@ mod tests {
             .build()
             .expect("failed to build inner client");
         let state = crate::AppState::for_test();
-        state.insert_extension(SharedReqwestClient(distinctive_inner));
+        state.insert_extension(SharedReqwestClient {
+            client: distinctive_inner,
+            timeout_secs: 30,
+        });
 
         let client = Client::from_state(&state);
         let resp = client

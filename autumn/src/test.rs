@@ -1217,9 +1217,10 @@ impl TestApp {
         // Register the shared reqwest::Client so Client::from_state reuses the
         // connection pool in tests, mirroring the production build_state path.
         #[cfg(feature = "http-client")]
-        state.insert_extension(crate::http_client::SharedReqwestClient(
-            crate::http_client::Client::build_inner(&self.config.http.client),
-        ));
+        state.insert_extension(crate::http_client::SharedReqwestClient {
+            client: crate::http_client::Client::build_inner(&self.config.http.client),
+            timeout_secs: self.config.http.client.timeout_secs,
+        });
 
         // Install mock registry when http_mock() was called.
         #[cfg(feature = "http-client")]

@@ -7038,9 +7038,10 @@ fn build_state(
         default_max_age_secs: config.auth.step_up.default_max_age_secs,
     });
     #[cfg(feature = "http-client")]
-    state.insert_extension(crate::http_client::SharedReqwestClient(
-        crate::http_client::Client::build_inner(&config.http.client),
-    ));
+    state.insert_extension(crate::http_client::SharedReqwestClient {
+        client: crate::http_client::Client::build_inner(&config.http.client),
+        timeout_secs: config.http.client.timeout_secs,
+    });
     state
 }
 
