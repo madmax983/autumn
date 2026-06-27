@@ -2776,6 +2776,32 @@ fn live_scaffold_index_uses_sse_list_and_stream_route() {
     );
 }
 
+/// `--live` layout must include the idiomorph script, enable morph on the
+/// body, and wire the SSE container to use morph as its swap strategy.
+#[test]
+fn live_layout_references_idiomorph_and_morph() {
+    let (_tmp, project) = fresh_project("live-morph");
+    run_autumn(
+        &project,
+        &["generate", "scaffold", "Post", "title:String", "--live"],
+    );
+
+    let routes = fs::read_to_string(project.join("src/routes/posts.rs")).unwrap();
+
+    assert!(
+        routes.contains("IDIOMORPH_JS_PATH"),
+        "layout <head> must include the idiomorph script under --live:\n{routes}"
+    );
+    assert!(
+        routes.contains(r#"body hx-ext="morph""#),
+        "layout <body> must carry hx-ext=\"morph\" under --live:\n{routes}"
+    );
+    assert!(
+        routes.contains(r#"hx-swap="morph""#),
+        "SSE list container must use hx-swap=\"morph\" under --live:\n{routes}"
+    );
+}
+
 /// PR #1176 Codex round 2: login flows must delete the consumed session's
 /// tracked row before rotating (no phantom devices), the password-reset
 /// commit must be atomic with its session revocation (no consumed-token 500

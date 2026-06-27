@@ -1022,12 +1022,22 @@ use crate::schema::{plural};",
         // Load htmx + SSE extension whenever live features are active.
         // `--live-validation` alone (without `--live`) still requires htmx for
         // the `hx-post` / `hx-trigger` / `hx-swap` attributes to fire.
-        let live_head_scripts = if live || live_validation {
+        let live_head_scripts = if live {
+            "\n                script src=(autumn_web::htmx::HTMX_JS_PATH) {};\n\
+             \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20script src=(autumn_web::htmx::HTMX_SSE_JS_PATH) {};\n\
+             \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20script src=(autumn_web::htmx::IDIOMORPH_JS_PATH) {};"
+                .to_owned()
+        } else if live_validation {
             "\n                script src=(autumn_web::htmx::HTMX_JS_PATH) {};\n\
              \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20script src=(autumn_web::htmx::HTMX_SSE_JS_PATH) {};"
                 .to_owned()
         } else {
             String::new()
+        };
+        let live_body_open = if live {
+            r#"body hx-ext="morph""#
+        } else {
+            "body"
         };
         format!(
             r#"
@@ -1055,7 +1065,7 @@ fn layout(title: &str, flash: Markup, content: Markup) -> Markup {{
                 title {{ (title) }}
                 link rel="stylesheet" href=(autumn_web::flash::FLASH_CSS_PATH);{live_head_scripts}
             }}
-            body {{
+            {live_body_open} {{
                 (flash)
                 (content)
             }}
