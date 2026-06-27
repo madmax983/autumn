@@ -411,9 +411,8 @@ pub fn presence_stream(
     let subscriber = state.channels().subscribe(&format!("presence:{topic}"));
 
     let stream = subscriber.into_stream().map(move |_msg| {
-        use maud::Render;
         let count = presence.list(&topic).len();
-        let badge_html = presence_badge(count).render().into_string();
+        let badge_html = presence_badge(count).into_string();
         let data = crate::channels::inject_oob_attr(&badge_html, "outerHTML");
         Ok::<_, std::convert::Infallible>(axum::response::sse::Event::default().data(data))
     });
