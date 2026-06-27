@@ -323,7 +323,7 @@ impl Broadcast {
     /// let channels = Channels::new(16);
     /// channels
     ///     .broadcast()
-    ///     .publish_oob("feed", "notice", OobSwap::OuterHTML, &html! { div id="notice" { "Saved" } })
+    ///     .publish_oob("feed", "notice", &OobSwap::OuterHTML, &html! { div id="notice" { "Saved" } })
     ///     .expect("html publish should succeed");
     /// ```
     ///
