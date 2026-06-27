@@ -491,7 +491,7 @@ fn render_repository_file(
     let list_id = format!("{plural}-list");
     // API scaffolds have no HTML show route — emit plain text; HTML scaffolds link to show page.
     let fragment_item_content = if api {
-        format!("(self.id)")
+        "(self.id)".to_string()
     } else {
         format!("a href=(format!(\"/{plural}/{{}}\", self.id)) {{ (self.id) }}")
     };
