@@ -169,7 +169,12 @@ impl Plan {
                         .open(path)
                     {
                         Ok(mut f) => {
-                            f.write_all(contents.as_bytes())?;
+                            if let Err(e) = f.write_all(contents.as_bytes()) {
+                                // Remove the empty/partial file so the next run
+                                // does not skip creation due to AlreadyExists.
+                                let _ = fs::remove_file(path);
+                                return Err(GenerateError::Io(e));
+                            }
                             println!("  Created {}", relative_display(path, &self.project_root));
                         }
                         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {

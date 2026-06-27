@@ -367,9 +367,11 @@ impl IntoMailBody for maud::Markup {
     }
 }
 
-/// Placeholder token used in shared mailer layouts to mark where the per-mailer
-/// body fragment is inserted. Layouts that do not contain this marker are ignored
-/// and the raw body is delivered instead (prevents silent content loss).
+/// Placeholder token in shared mailer layouts marking where the per-mailer body
+/// fragment is inserted.
+///
+/// Layouts that do not contain this marker are ignored and the raw body is
+/// delivered instead (prevents silent content loss).
 pub const MAIL_LAYOUT_CONTENT_MARKER: &str = "{{ content }}";
 
 /// Compose a `layout` string and a `body` fragment by replacing
@@ -377,6 +379,7 @@ pub const MAIL_LAYOUT_CONTENT_MARKER: &str = "{{ content }}";
 ///
 /// If the layout does not contain the marker, `body` is returned unchanged so
 /// content is never silently dropped.
+#[must_use]
 pub fn compose_layout(layout: &str, body: &str) -> String {
     if layout.contains(MAIL_LAYOUT_CONTENT_MARKER) {
         layout.replace(MAIL_LAYOUT_CONTENT_MARKER, body)

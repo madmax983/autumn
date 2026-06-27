@@ -419,15 +419,16 @@ fn render_smoke_test(struct_name: &str, snake_name: &str, no_layout: bool) -> St
     let layout_assertions = if no_layout {
         String::new()
     } else {
-        "                assert!(\n\
-                     html.contains(\"<table\"),\n\
-                     \"html body must contain a table-based layout wrapper; got: {html}\"\n\
-                 );\n\
-                 assert!(\n\
-                     html.contains(\"style=\"),\n\
-                     \"html body must contain inline style= attributes; got: {html}\"\n\
-                 );\n"
-            .to_owned()
+        r#"                assert!(
+                    html.contains("<table"),
+                    "html body must contain a table-based layout wrapper; got: {html}"
+                );
+                assert!(
+                    html.contains("style="),
+                    "html body must contain inline style= attributes; got: {html}"
+                );
+"#
+        .to_owned()
     };
     format!(
         "\n\
