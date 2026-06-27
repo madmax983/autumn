@@ -6,6 +6,8 @@
 //   - FromRequestParts extractor (use as handler parameter)
 //   - Optional REST API handler generation with `api = "..."`
 //   - Optional mutation hooks with `hooks = ...`
+//   - `broadcasts = "posts"` on PostRepository publishes hx-swap-oob fragments
+//     over the "posts" SSE topic whenever a post is saved, updated, or deleted
 
 use crate::hooks::PostHooks;
 use crate::models::{
@@ -22,7 +24,10 @@ pub trait SubredditRepository {
     fn find_by_creator_id(creator_id: i64) -> Vec<Subreddit>;
 }
 
-#[autumn_web::repository(Post, hooks = PostHooks, api = "/api/posts")]
+// `broadcasts = "posts"` wires every repo mutation (save/update_by_id/delete_by_id)
+// to publish an `hx-swap-oob` fragment on the "posts" channel.  Clients that
+// subscribe to `/posts/stream` receive live DOM patches without polling.
+#[autumn_web::repository(Post, hooks = PostHooks, api = "/api/posts", broadcasts = "posts")]
 pub trait PostRepository {
     /// SELECT * FROM posts WHERE slug = $1
     fn find_by_slug(slug: String) -> Vec<Post>;
@@ -32,4 +37,27 @@ pub trait PostRepository {
 
     /// SELECT * FROM posts WHERE author_id = $1
     fn find_by_author_id(author_id: i64) -> Vec<Post>;
+}
+
+// LiveFragment renders a compact list-item fragment for each post.
+// The macro uses this to build the hx-swap-oob payload when save/update/delete fires.
+impl autumn_web::live::LiveFragment for Post {
+    fn dom_id_for(id: i64) -> String {
+        format!("post-{id}")
+    }
+
+    fn dom_id(&self) -> String {
+        Self::dom_id_for(self.id)
+    }
+
+    fn render_fragment(&self) -> maud::Markup {
+        maud::html! {
+            li id=(self.dom_id()) class="live-post" {
+                span class="post-score" { (self.score) " pts" }
+                " "
+                a href=(format!("/r/{}/comments/{}", self.subreddit_id, self.slug))
+                  class="post-title" { (self.title) }
+            }
+        }
+    }
 }

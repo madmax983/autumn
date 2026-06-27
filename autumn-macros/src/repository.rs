@@ -1137,12 +1137,13 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         quote! {}
     };
 
-    // When `broadcasts = "topic"` is configured the `__autumn_broadcast` field must be
-    // present unconditionally — the broadcast code references it directly and a user
-    // app that forgets to enable ws+maud+htmx features should get a clear compile
-    // error, not a silent no-op. For repositories that have no `broadcasts` attribute
-    // we keep the existing optional `#[cfg]` guard so the field only appears when the
-    // consumer enables those features.
+    // `__autumn_broadcast` is only emitted when `broadcasts = "topic"` is declared.
+    // Emitting it unconditionally (even behind `#[cfg]`) for repositories that never
+    // use broadcasts wastes memory and generates "unexpected cfg" warnings in consumer
+    // crates that don't define `ws`/`maud`/`htmx` as their own features.
+    // When `broadcasts` IS configured the field is always present (no `#[cfg]` guard)
+    // so a missing ws+maud+htmx feature produces a clear compile error instead of a
+    // silent no-op.
     let has_broadcasts = config.broadcasts.is_some();
     let bcast_struct_field = if has_broadcasts {
         quote! {
@@ -1151,36 +1152,22 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             __autumn_broadcast: ::std::option::Option<::autumn_web::channels::Broadcast>,
         }
     } else {
-        quote! {
-            /// Broadcast handle for live OOB fragment publishing (`broadcasts = "topic"`).
-            /// `None` when the repository was built without an `AppState` (e.g. `with_pool_untracked`).
-            #[cfg(all(feature = "ws", feature = "maud", feature = "htmx"))]
-            __autumn_broadcast: ::std::option::Option<::autumn_web::channels::Broadcast>,
-        }
+        quote! {}
     };
     let bcast_clone_field = if has_broadcasts {
         quote! { __autumn_broadcast: self.__autumn_broadcast.clone(), }
     } else {
-        quote! {
-            #[cfg(all(feature = "ws", feature = "maud", feature = "htmx"))]
-            __autumn_broadcast: self.__autumn_broadcast.clone(),
-        }
+        quote! {}
     };
     let bcast_field_none = if has_broadcasts {
         quote! { __autumn_broadcast: ::core::option::Option::None, }
     } else {
-        quote! {
-            #[cfg(all(feature = "ws", feature = "maud", feature = "htmx"))]
-            __autumn_broadcast: ::core::option::Option::None,
-        }
+        quote! {}
     };
     let bcast_field_some_state = if has_broadcasts {
         quote! { __autumn_broadcast: ::std::option::Option::Some(state.broadcast()), }
     } else {
-        quote! {
-            #[cfg(all(feature = "ws", feature = "maud", feature = "htmx"))]
-            __autumn_broadcast: ::std::option::Option::Some(state.broadcast()),
-        }
+        quote! {}
     };
 
     let with_pool_method = {
@@ -1221,13 +1208,37 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             }
         };
         // When `broadcasts` is configured the test-helper constructor must be
-        // unconditionally available so the broadcast integration tests can build
-        // the repository with an explicit handle. Without `broadcasts` the method
-        // stays behind a `#[cfg]` as before.
-        let bcast_test_ctor_attr = if has_broadcasts {
-            quote! {}
+        let test_ctor_method = if has_broadcasts {
+            quote! {
+                /// Construct this repository with an explicit broadcast handle.
+                ///
+                /// For use in tests only — simulates what `FromRequestParts<AppState>` does
+                /// when building a repository that can publish OOB live fragments.
+                #[doc(hidden)]
+                #[must_use]
+                pub fn __autumn_test_with_broadcast(
+                    pool: ::autumn_web::reexports::diesel_async::pooled_connection::deadpool::Pool<
+                        ::autumn_web::reexports::diesel_async::AsyncPgConnection,
+                    >,
+                    broadcast: ::autumn_web::channels::Broadcast,
+                ) -> Self {
+                    #register_hooks
+                    Self {
+                        pool,
+                        #hooks_field
+                        #idempotency_field
+                        #tenant_init_field
+                        #shards_none_field
+                        __autumn_read_route: ::autumn_web::repository::ReadRoute::Primary,
+                        __autumn_statement_timeout_ms: 0,
+                        __autumn_slow_threshold: ::std::time::Duration::from_millis(500),
+                        __autumn_route: ::core::option::Option::None,
+                        __autumn_broadcast: ::core::option::Option::Some(broadcast),
+                    }
+                }
+            }
         } else {
-            quote! { #[cfg(all(feature = "ws", feature = "maud", feature = "htmx"))] }
+            quote! {}
         };
         quote! {
             /// Construct this repository from a [`ShardedDb`](::autumn_web::sharding::ShardedDb)
@@ -1302,33 +1313,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 }
             }
 
-            /// Construct this repository with an explicit broadcast handle.
-            ///
-            /// For use in tests only — simulates what `FromRequestParts<AppState>` does
-            /// when building a repository that can publish OOB live fragments.
-            #bcast_test_ctor_attr
-            #[doc(hidden)]
-            #[must_use]
-            pub fn __autumn_test_with_broadcast(
-                pool: ::autumn_web::reexports::diesel_async::pooled_connection::deadpool::Pool<
-                    ::autumn_web::reexports::diesel_async::AsyncPgConnection,
-                >,
-                broadcast: ::autumn_web::channels::Broadcast,
-            ) -> Self {
-                #register_hooks
-                Self {
-                    pool,
-                    #hooks_field
-                    #idempotency_field
-                    #tenant_init_field
-                    #shards_none_field
-                    __autumn_read_route: ::autumn_web::repository::ReadRoute::Primary,
-                    __autumn_statement_timeout_ms: 0,
-                    __autumn_slow_threshold: ::std::time::Duration::from_millis(500),
-                    __autumn_route: ::core::option::Option::None,
-                    __autumn_broadcast: ::core::option::Option::Some(broadcast),
-                }
-            }
+            #test_ctor_method
         }
     };
 
