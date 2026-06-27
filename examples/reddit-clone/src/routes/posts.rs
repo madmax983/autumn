@@ -459,6 +459,27 @@ pub async fn submit(
     )))
 }
 
+// ── Short-form permalink for live-broadcast fragments ──────────
+
+/// Redirects `/posts/{post_id}` to the canonical `/r/{sub_slug}/posts/{post_slug}`.
+/// Used by live OOB fragments that only have a post id in scope.
+#[get("/posts/{post_id}")]
+pub async fn show_by_id(Path(post_id): Path<i64>, mut db: Db) -> AutumnResult<Redirect> {
+    let (post_slug, subreddit_id): (String, i64) = posts::table
+        .find(post_id)
+        .select((posts::slug, posts::subreddit_id))
+        .first(&mut *db)
+        .await
+        .map_err(|_| AutumnError::not_found_msg("Post not found"))?;
+    let sub_slug: String = subreddits::table
+        .find(subreddit_id)
+        .select(subreddits::slug)
+        .first(&mut *db)
+        .await
+        .map_err(|_| AutumnError::not_found_msg("Subreddit not found"))?;
+    Ok(Redirect::to(&format!("/r/{sub_slug}/posts/{post_slug}")))
+}
+
 // ── View single post with comments ─────────────────────────────
 
 #[allow(clippy::too_many_lines)] // Template-heavy function

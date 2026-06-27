@@ -482,7 +482,9 @@ fn render_repository_file(
              \x20\x20\x20\x20}}\n\
              \x20\x20\x20\x20fn render_fragment(&self) -> maud::Markup {{\n\
              \x20\x20\x20\x20\x20\x20\x20\x20maud::html! {{\n\
-             \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20li id=(self.dom_id()) {{ (self.id) }}\n\
+             \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20li id=(self.dom_id()) {{\n\
+             \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20a href=(format!(\"/{plural}/{{}}\", self.id)) {{ (self.id) }}\n\
+             \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20}}\n\
              \x20\x20\x20\x20\x20\x20\x20\x20}}\n\
              \x20\x20\x20\x20}}\n\
              \x20\x20\x20\x20fn insert_swap() -> autumn_web::htmx::OobSwap {{\n\
@@ -915,22 +917,40 @@ pub async fn index(
                         (None, Some(mx)) => format!("must be at most {mx} characters"),
                         (None, None) => unreachable!(),
                     };
-                    let _ = write!(error_chain, " else if {cond} {{\n        Some(\"{msg}\")\n    }}");
+                    let _ = write!(
+                        error_chain,
+                        " else if {cond} {{\n        Some(\"{msg}\")\n    }}"
+                    );
                 }
             }
             error_chain.push_str(" else {\n        None\n    }");
 
             // Build the handler string via push_str to avoid brace-escaping issues
             // between the format! template and the generated Rust { } delimiters.
-            let _ = write!(vh, "\n\n/// `POST /{plural}/validate/{field_name}` — inline validation fragment.\n");
-            let _ = write!(vh, "///\n/// Returns an `<span id=\"{field_name}-error\">` OOB fragment with an error\n");
-            let _ = writeln!(vh, "/// message when the value fails the `{rule_comment}` rule, or an empty span");
+            let _ = write!(
+                vh,
+                "\n\n/// `POST /{plural}/validate/{field_name}` — inline validation fragment.\n"
+            );
+            let _ = write!(
+                vh,
+                "///\n/// Returns an `<span id=\"{field_name}-error\">` OOB fragment with an error\n"
+            );
+            let _ = writeln!(
+                vh,
+                "/// message when the value fails the `{rule_comment}` rule, or an empty span"
+            );
             vh.push_str(
                 "/// when it passes. Consumed by htmx `hx-swap=\"outerHTML\"` on `hx-trigger=\"change\"`.\n",
             );
             let _ = writeln!(vh, "#[post(\"/{plural}/validate/{field_name}\")]");
-            let _ = writeln!(vh, "pub async fn validate_{field_name}(body: autumn_web::reexports::axum::body::Bytes) -> autumn_web::Markup {{");
-            let _ = write!(vh, "    let value = url::form_urlencoded::parse(body.as_ref())\n        .find(|(k, _)| k == \"{field_name}\")\n");
+            let _ = writeln!(
+                vh,
+                "pub async fn validate_{field_name}(body: autumn_web::reexports::axum::body::Bytes) -> autumn_web::Markup {{"
+            );
+            let _ = write!(
+                vh,
+                "    let value = url::form_urlencoded::parse(body.as_ref())\n        .find(|(k, _)| k == \"{field_name}\")\n"
+            );
             vh.push_str("        .map(|(_, v)| v.to_string())\n");
             vh.push_str("        .unwrap_or_default();\n");
             let _ = writeln!(vh, "    let error: Option<&str> = {error_chain};");

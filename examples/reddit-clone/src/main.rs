@@ -119,6 +119,7 @@ async fn main() {
             routes::posts::submit_form,
             routes::posts::submit_to_sub_form,
             routes::posts::submit,
+            routes::posts::show_by_id,
             routes::posts::show,
             routes::posts::edit_form,
             routes::posts::update,

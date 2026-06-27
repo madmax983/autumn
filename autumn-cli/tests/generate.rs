@@ -2743,6 +2743,11 @@ fn live_scaffold_emits_live_fragment_and_broadcasts() {
         repo.contains("fn insert_swap()") && repo.contains("OobMethod::BeforeEnd"),
         "LiveFragment impl must override insert_swap() with BeforeEnd targeting the list container:\n{repo}"
     );
+    // render_fragment must include a show-page link so live rows are navigable.
+    assert!(
+        repo.contains("a href=(format!(\"/posts/"),
+        "render_fragment must include a show link href:\n{repo}"
+    );
 }
 
 /// `--live` wires the index list container to an SSE stream so the list

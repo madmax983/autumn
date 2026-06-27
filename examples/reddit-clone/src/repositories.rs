@@ -55,7 +55,7 @@ impl autumn_web::live::LiveFragment for Post {
             li id=(self.dom_id()) class="live-post" {
                 span class="post-score" { (self.score) " pts" }
                 " "
-                a href=(format!("/r/{}/comments/{}", self.subreddit_id, self.slug))
+                a href=(format!("/posts/{}", self.id))
                   class="post-title" { (self.title) }
             }
         }
