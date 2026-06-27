@@ -2184,7 +2184,7 @@ async fn main() {
         assert!(routes.contains("sse-connect=\"/posts/events\""));
         assert!(routes.contains("hx-swap=\"none\""));
         assert!(routes.contains("script src=\"/static/js/htmx.min.js\""));
-        assert!(routes.contains("script src=\"/static/js/htmx-ext-sse.min.js\""));
+        assert!(routes.contains("script src=\"/static/js/sse.js\""));
         assert!(routes.contains("title: autumn_web::hooks::Patch::Set(form.title.clone())"));
 
         let main_rs = fs::read_to_string(tmp.path().join("src/main.rs")).unwrap();
