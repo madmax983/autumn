@@ -9,6 +9,7 @@
 //! - Updates to `src/main.rs` registering all new routes in `routes![ … ]`.
 
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::path::Path;
 
 use super::dsl::{Field, FieldKind, IdType, parse_fields};
@@ -572,7 +573,7 @@ fn render_decoded_form(_pascal_name: &str, fields: &[Field]) -> (String, String)
     reason = "This is a single template — splitting it produces less readable output, \
               not more. The whole point is one place that prints one file."
 )]
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::fn_params_excessive_bools)]
 fn render_routes_file(
     pascal_name: &str,
     snake_name: &str,
@@ -851,7 +852,7 @@ pub async fn index(
             let is_required = fields
                 .iter()
                 .find(|f| f.name == *field_name)
-                .map_or(true, |f| !f.nullable);
+                .is_none_or(|f| !f.nullable);
             let mut error_chain = if is_required {
                 String::from("if value.is_empty() {\n        Some(\"required\")\n    }")
             } else {
@@ -878,10 +879,10 @@ pub async fn index(
                             if let Ok(n) = n_str.trim().parse::<u64>() {
                                 min = Some(n);
                             }
-                        } else if let Some(n_str) = part.strip_prefix("max = ") {
-                            if let Ok(n) = n_str.trim().parse::<u64>() {
-                                max = Some(n);
-                            }
+                        } else if let Some(n_str) = part.strip_prefix("max = ")
+                            && let Ok(n) = n_str.trim().parse::<u64>()
+                        {
+                            max = Some(n);
                         }
                     }
                     if min.is_none() && max.is_none() {
@@ -903,39 +904,27 @@ pub async fn index(
                         (None, Some(mx)) => format!("must be at most {mx} characters"),
                         (None, None) => unreachable!(),
                     };
-                    error_chain.push_str(&format!(
-                        " else if {cond} {{\n        Some(\"{msg}\")\n    }}"
-                    ));
+                    let _ = write!(error_chain, " else if {cond} {{\n        Some(\"{msg}\")\n    }}");
                 }
             }
             error_chain.push_str(" else {\n        None\n    }");
 
             // Build the handler string via push_str to avoid brace-escaping issues
             // between the format! template and the generated Rust { } delimiters.
-            vh.push_str(&format!(
-                "\n\n/// `POST /{plural}/validate/{field_name}` — inline validation fragment.\n"
-            ));
-            vh.push_str(&format!(
-                "///\n/// Returns an `<span id=\"{field_name}-error\">` OOB fragment with an error\n"
-            ));
-            vh.push_str(&format!(
-                "/// message when the value fails the `{rule_comment}` rule, or an empty span\n"
-            ));
+            let _ = write!(vh, "\n\n/// `POST /{plural}/validate/{field_name}` — inline validation fragment.\n");
+            let _ = write!(vh, "///\n/// Returns an `<span id=\"{field_name}-error\">` OOB fragment with an error\n");
+            let _ = writeln!(vh, "/// message when the value fails the `{rule_comment}` rule, or an empty span");
             vh.push_str(
                 "/// when it passes. Consumed by htmx `hx-swap=\"outerHTML\"` on `hx-trigger=\"change\"`.\n",
             );
-            vh.push_str(&format!("#[post(\"/{plural}/validate/{field_name}\")]\n"));
-            vh.push_str(&format!(
-                "pub async fn validate_{field_name}(body: autumn_web::reexports::axum::body::Bytes) -> autumn_web::Markup {{\n"
-            ));
-            vh.push_str(&format!(
-                "    let value = url::form_urlencoded::parse(body.as_ref())\n        .find(|(k, _)| k == \"{field_name}\")\n"
-            ));
+            let _ = writeln!(vh, "#[post(\"/{plural}/validate/{field_name}\")]");
+            let _ = writeln!(vh, "pub async fn validate_{field_name}(body: autumn_web::reexports::axum::body::Bytes) -> autumn_web::Markup {{");
+            let _ = write!(vh, "    let value = url::form_urlencoded::parse(body.as_ref())\n        .find(|(k, _)| k == \"{field_name}\")\n");
             vh.push_str("        .map(|(_, v)| v.to_string())\n");
             vh.push_str("        .unwrap_or_default();\n");
-            vh.push_str(&format!("    let error: Option<&str> = {error_chain};\n"));
+            let _ = writeln!(vh, "    let error: Option<&str> = {error_chain};");
             vh.push_str("    autumn_web::html! {\n");
-            vh.push_str(&format!("        span id=\"{field_name}-error\" {{\n"));
+            let _ = writeln!(vh, "        span id=\"{field_name}-error\" {{");
             vh.push_str("            @if let Some(msg) = error {\n");
             vh.push_str("                span style=\"color:red\" { (msg) }\n");
             vh.push_str("            }\n");
