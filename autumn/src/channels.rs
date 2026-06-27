@@ -339,12 +339,23 @@ impl Broadcast {
         strategy: crate::htmx::OobSwap,
         fragment: &maud::Markup,
     ) -> Result<usize, BroadcastError> {
-        use crate::htmx::HtmxFragments;
-        use maud::Render;
-        let envelope = HtmxFragments::oob_only()
-            .oob_with_strategy(id, strategy, fragment.clone())
-            .render()
-            .into_string();
+        use crate::htmx::{OobSwap, inject_hx_swap_oob};
+        let rendered = &fragment.0;
+        let envelope = if strategy == OobSwap::Raw {
+            rendered.clone()
+        } else {
+            let value = strategy.format_value(id);
+            if let Some(injected) = inject_hx_swap_oob(rendered, &value) {
+                injected
+            } else {
+                use crate::htmx::HtmxFragments;
+                use maud::Render;
+                HtmxFragments::oob_only()
+                    .oob_with_strategy(id, strategy, fragment.clone())
+                    .render()
+                    .into_string()
+            }
+        };
         self.publish(topic, envelope)
     }
 }
@@ -1551,5 +1562,30 @@ mod tests {
 
         tx.send("sse message").unwrap();
         let _stream = sse;
+    }
+
+    #[cfg(feature = "maud")]
+    #[tokio::test]
+    async fn test_publish_oob_injects_without_template_wrapper()
+    -> Result<(), broadcast::error::RecvError> {
+        let channels = Channels::new(16);
+        let mut rx = channels.subscribe("test_publish_oob");
+
+        let oob = maud::html! { li id="item-2" { "Value" } };
+        channels
+            .broadcast()
+            .publish_oob(
+                "test_publish_oob",
+                "list-id",
+                crate::htmx::OobSwap::BeforeEnd,
+                &oob,
+            )
+            .unwrap();
+
+        assert_eq!(
+            rx.recv().await?.as_str(),
+            "<li hx-swap-oob=\"beforeend:#list-id\" id=\"item-2\">Value</li>"
+        );
+        Ok(())
     }
 }

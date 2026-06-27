@@ -389,6 +389,42 @@ impl HtmxFragments {
 }
 
 #[cfg(feature = "maud")]
+pub fn inject_hx_swap_oob(html: &str, oob_value: &str) -> Option<String> {
+    let mut idx = 0;
+    while let Some(start_pos) = html[idx..].find('<') {
+        let abs_start = idx + start_pos;
+        let remaining = &html[abs_start..];
+        if remaining.starts_with("<!--") {
+            if let Some(comment_end) = remaining.find("-->") {
+                idx = abs_start + comment_end + 3;
+            } else {
+                return None;
+            }
+        } else {
+            let mut tag_name_end = 0;
+            for (char_idx, c) in remaining.char_indices().skip(1) {
+                if c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '>' || c == '/' {
+                    tag_name_end = char_idx;
+                    break;
+                }
+            }
+            if tag_name_end == 0 {
+                return None;
+            }
+            let insert_pos = abs_start + tag_name_end;
+            let mut result = String::with_capacity(html.len() + oob_value.len() + 30);
+            result.push_str(&html[..insert_pos]);
+            result.push_str(" hx-swap-oob=\"");
+            result.push_str(oob_value);
+            result.push('"');
+            result.push_str(&html[insert_pos..]);
+            return Some(result);
+        }
+    }
+    None
+}
+
+#[cfg(feature = "maud")]
 fn escape_attribute(w: &mut String, s: &str) {
     for c in s.chars() {
         match c {
@@ -871,6 +907,34 @@ mod tests {
         assert_eq!(
             OobSwap::InnerHTML.format_value("#my-id"),
             "innerHTML:#my-id"
+        );
+    }
+
+    #[test]
+    fn test_inject_hx_swap_oob() {
+        assert_eq!(
+            inject_hx_swap_oob("<li id=\"1\"></li>", "beforeend:#container"),
+            Some("<li hx-swap-oob=\"beforeend:#container\" id=\"1\"></li>".to_string())
+        );
+        assert_eq!(
+            inject_hx_swap_oob("<!-- comment -->\n  <div class=\"foo\"></div>", "outerHTML"),
+            Some(
+                "<!-- comment -->\n  <div hx-swap-oob=\"outerHTML\" class=\"foo\"></div>"
+                    .to_string()
+            )
+        );
+        assert_eq!(inject_hx_swap_oob("Hello world", "true"), None);
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn test_inject_on_maud_markup() {
+        use maud::html;
+        let oob = html! { li id="item-1" { "Item" } };
+        let injected = inject_hx_swap_oob(&oob.0, "beforeend:#container");
+        assert_eq!(
+            injected,
+            Some("<li hx-swap-oob=\"beforeend:#container\" id=\"item-1\">Item</li>".to_string())
         );
     }
 }
