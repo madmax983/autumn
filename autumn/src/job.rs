@@ -187,6 +187,18 @@ pub(crate) enum EnqueueOutcome {
     Deduplicated,
 }
 
+/// Specifies the due instant for an after-commit enqueue.
+///
+/// `At` carries a pre-resolved absolute instant (or `None` for immediate).
+/// `After` carries a relative delay to be converted to an absolute instant
+/// **inside the after-commit callback** so the delay is measured from commit
+/// time rather than from the original API call time.
+#[derive(Debug, Clone, Copy)]
+enum AfterCommitDue {
+    At(Option<chrono::DateTime<chrono::Utc>>),
+    After(std::time::Duration),
+}
+
 #[derive(Debug)]
 struct QueuedJob {
     id: String,
@@ -228,6 +240,9 @@ pub type JobAdminFuture<'a, T> = Pin<Box<dyn Future<Output = AutumnResult<T>> + 
 pub enum JobAdminStatus {
     /// Waiting to be picked up by a worker.
     Enqueued,
+    /// Enqueued with a future due time (delayed/one-shot scheduled work).
+    /// Not visible to workers until the due time passes.
+    Scheduled,
     /// Currently executing in a worker.
     Running,
     /// Failed but already scheduled for an automatic retry.
@@ -252,6 +267,7 @@ impl JobAdminStatus {
     pub const fn label(self) -> &'static str {
         match self {
             Self::Enqueued => "enqueued",
+            Self::Scheduled => "scheduled",
             Self::Running => "running",
             Self::Retrying => "retrying",
             Self::Completed => "completed",
@@ -275,6 +291,8 @@ pub struct JobAdminRecord {
     pub status: JobAdminStatus,
     /// Time the job entered the queue.
     pub enqueued_at: Option<String>,
+    /// Due time for a delayed/scheduled job, if it is not yet runnable.
+    pub scheduled_for: Option<String>,
     /// Time the job started running.
     pub started_at: Option<String>,
     /// Time the job finished, failed, or was operated on.
@@ -344,6 +362,8 @@ pub struct JobScheduleSummary {
 pub struct JobAdminSnapshot {
     /// Enqueued jobs, newest-first.
     pub enqueued: JobAdminPage,
+    /// Scheduled (delayed) jobs awaiting their due time, soonest-due first.
+    pub scheduled: JobAdminPage,
     /// Running jobs, newest-first.
     pub running: JobAdminPage,
     /// Completed jobs from the last 24 hours, newest-first.
@@ -362,6 +382,7 @@ impl JobAdminSnapshot {
     pub const fn empty() -> Self {
         Self {
             enqueued: JobAdminPage::new(Vec::new(), 0, 1, DEFAULT_JOB_ADMIN_PER_PAGE),
+            scheduled: JobAdminPage::new(Vec::new(), 0, 1, DEFAULT_JOB_ADMIN_PER_PAGE),
             running: JobAdminPage::new(Vec::new(), 0, 1, DEFAULT_JOB_ADMIN_PER_PAGE),
             completed: JobAdminPage::new(Vec::new(), 0, 1, DEFAULT_JOB_ADMIN_PER_PAGE),
             failed: JobAdminPage::new(Vec::new(), 0, 1, DEFAULT_JOB_ADMIN_PER_PAGE),
@@ -376,6 +397,8 @@ impl JobAdminSnapshot {
 pub struct JobAdminQuery {
     /// Page number for enqueued jobs.
     pub enqueued_page: u64,
+    /// Page number for scheduled (delayed) jobs.
+    pub scheduled_page: u64,
     /// Page number for running jobs.
     pub running_page: u64,
     /// Page number for completed jobs.
@@ -390,6 +413,7 @@ impl Default for JobAdminQuery {
     fn default() -> Self {
         Self {
             enqueued_page: 1,
+            scheduled_page: 1,
             running_page: 1,
             completed_page: 1,
             failed_page: 1,
@@ -436,6 +460,7 @@ struct JobAdminStoredRecord {
     payload: Value,
     status: JobAdminStatus,
     enqueued_at: Option<chrono::DateTime<chrono::Utc>>,
+    scheduled_for: Option<chrono::DateTime<chrono::Utc>>,
     started_at: Option<chrono::DateTime<chrono::Utc>>,
     finished_at: Option<chrono::DateTime<chrono::Utc>>,
     attempt: u32,
@@ -459,6 +484,7 @@ impl JobAdminStoredRecord {
             name: self.name.clone(),
             status: self.status,
             enqueued_at: self.enqueued_at.map(format_job_admin_time),
+            scheduled_for: self.scheduled_for.map(format_job_admin_time),
             started_at: self.started_at.map(format_job_admin_time),
             finished_at: self.finished_at.map(format_job_admin_time),
             attempt: self.attempt,
@@ -475,6 +501,11 @@ struct JobAdminMemoryInner {
     records: HashMap<String, JobAdminStoredRecord>,
     order: VecDeque<String>,
     history_limit: usize,
+    /// Cancellation tokens for in-flight local delayed timers, keyed by job id.
+    /// When a Scheduled local job is canceled via the admin API, the token is
+    /// fired so the spawned timer task exits immediately and releases the unique
+    /// lock rather than holding it until the original due time fires.
+    delay_cancelers: HashMap<String, tokio_util::sync::CancellationToken>,
 }
 
 /// Bounded process-local job dashboard backend used by the built-in runtime.
@@ -498,20 +529,32 @@ impl JobAdminMemoryBackend {
                 records: HashMap::new(),
                 order: VecDeque::new(),
                 history_limit: history_limit.max(1),
+                delay_cancelers: HashMap::new(),
             })),
         }
     }
 
-    fn record_enqueue(
+    /// Record an enqueue that may carry a future due time. When `due_at` is in
+    /// the future the record starts in the [`JobAdminStatus::Scheduled`] state
+    /// so the dashboard surfaces it as a delayed job until it becomes runnable.
+    #[allow(clippy::too_many_arguments)]
+    fn record_enqueue_due(
         &self,
         id: String,
         name: &str,
         payload: Value,
         attempt: u32,
         max_attempts: u32,
+        due_at: Option<chrono::DateTime<chrono::Utc>>,
+        now: chrono::DateTime<chrono::Utc>,
     ) {
-        let now = chrono::Utc::now();
         let (principal_id, correlation_id) = job_payload_identity(&payload);
+        let scheduled_for = due_at.filter(|due| *due > now);
+        let status = if scheduled_for.is_some() {
+            JobAdminStatus::Scheduled
+        } else {
+            JobAdminStatus::Enqueued
+        };
         if let Ok(mut inner) = self.inner.write() {
             inner.order.push_back(id.clone());
             inner.records.insert(
@@ -520,8 +563,9 @@ impl JobAdminMemoryBackend {
                     id,
                     name: name.to_owned(),
                     payload,
-                    status: JobAdminStatus::Enqueued,
+                    status,
                     enqueued_at: Some(now),
+                    scheduled_for,
                     started_at: None,
                     finished_at: None,
                     attempt,
@@ -535,29 +579,44 @@ impl JobAdminMemoryBackend {
         }
     }
 
-    fn record_requeued(&self, id: &str, attempt: u32) {
+    /// Transition a job back to [`JobAdminStatus::Enqueued`] (retry or promotion
+    /// from the delayed ZSET) and return `true` when the prior status was
+    /// `Scheduled`.  Callers use this to avoid double-incrementing the `queued`
+    /// actuator counter for initially-delayed jobs that were already counted at
+    /// enqueue time.
+    fn record_requeued(&self, id: &str, attempt: u32) -> bool {
         if let Ok(mut inner) = self.inner.write()
             && let Some(record) = inner.records.get_mut(id)
         {
+            let was_scheduled = record.status == JobAdminStatus::Scheduled;
             record.status = JobAdminStatus::Enqueued;
             record.enqueued_at = Some(chrono::Utc::now());
+            record.scheduled_for = None;
             record.started_at = None;
             record.finished_at = None;
             record.attempt = attempt;
+            return was_scheduled;
         }
+        false
     }
 
     fn try_record_start(&self, id: &str, attempt: u32) -> JobAdminStartDecision {
         let Ok(mut inner) = self.inner.write() else {
             return JobAdminStartDecision::Missing;
         };
+        // Always clean up any delay canceler — the timer has fired so the
+        // token is no longer needed regardless of the transition outcome.
+        inner.delay_cancelers.remove(id);
         let Some(record) = inner.records.get_mut(id) else {
             return JobAdminStartDecision::Missing;
         };
         match record.status {
-            JobAdminStatus::Enqueued => {
+            // A `Scheduled` job becomes runnable once its delayed-send fires, at
+            // which point it starts like any other enqueued job.
+            JobAdminStatus::Enqueued | JobAdminStatus::Scheduled => {
                 record.status = JobAdminStatus::Running;
                 record.started_at = Some(chrono::Utc::now());
+                record.scheduled_for = None;
                 record.finished_at = None;
                 record.attempt = attempt;
                 JobAdminStartDecision::Started
@@ -697,15 +756,53 @@ impl JobAdminMemoryBackend {
             .records
             .get_mut(id)
             .ok_or_else(|| AutumnError::not_found_msg(format!("job '{id}' not found")))?;
-        if record.status != JobAdminStatus::Enqueued {
+        if !matches!(
+            record.status,
+            JobAdminStatus::Enqueued | JobAdminStatus::Scheduled
+        ) {
             return Err(AutumnError::bad_request_msg(
-                "only enqueued jobs can be canceled",
+                "only enqueued or scheduled jobs can be canceled",
             ));
         }
         record.status = JobAdminStatus::Canceled;
+        record.scheduled_for = None;
         record.finished_at = Some(chrono::Utc::now());
+        // Pull any pending timer canceler out while we still hold the lock.
+        let canceler = inner.delay_cancelers.remove(id);
         drop(inner);
+        // Fire outside the lock so the spawned timer task can release the
+        // unique lock without waiting for the write-lock to clear.
+        if let Some(token) = canceler {
+            token.cancel();
+        }
         Ok(())
+    }
+
+    /// Register a cancellation token for a local delayed timer.  When the
+    /// admin cancels a Scheduled job the token is fired so the timer exits and
+    /// releases the unique lock immediately rather than holding it until due.
+    ///
+    /// Returns `true` when the record is already `Canceled` (the admin canceled
+    /// the job in the window between `record_enqueue_due` and here); the caller
+    /// must then skip the timer entirely and clean up the unique lock and gauge.
+    fn register_delay_canceler(
+        &self,
+        id: String,
+        token: tokio_util::sync::CancellationToken,
+    ) -> bool {
+        if let Ok(mut inner) = self.inner.write() {
+            // If admin already canceled during an interceptor, do not register
+            // the token — the caller will do immediate cleanup instead.
+            if inner
+                .records
+                .get(&id)
+                .is_some_and(|r| r.status == JobAdminStatus::Canceled)
+            {
+                return true;
+            }
+            inner.delay_cancelers.insert(id, token);
+        }
+        false
     }
 
     fn snapshot_sync(&self, query: &JobAdminQuery) -> JobAdminSnapshot {
@@ -720,6 +817,13 @@ impl JobAdminMemoryBackend {
                 JobAdminStatus::Enqueued,
                 None,
                 query.enqueued_page,
+                per_page,
+            ),
+            scheduled: paginate_job_admin_records(
+                &inner,
+                JobAdminStatus::Scheduled,
+                None,
+                query.scheduled_page,
                 per_page,
             ),
             running: paginate_job_admin_records(
@@ -762,7 +866,15 @@ impl JobAdminMemoryBackend {
         max_attempts: u32,
     ) -> String {
         let id = uuid::Uuid::new_v4().to_string();
-        self.record_enqueue(id.clone(), name, payload, attempt, max_attempts);
+        self.record_enqueue_due(
+            id.clone(),
+            name,
+            payload,
+            attempt,
+            max_attempts,
+            None,
+            chrono::Utc::now(),
+        );
         id
     }
 
@@ -845,7 +957,10 @@ fn prune_job_admin_history(inner: &mut JobAdminMemoryInner) {
         let is_active = inner.records.get(&id).is_some_and(|record| {
             matches!(
                 record.status,
-                JobAdminStatus::Enqueued | JobAdminStatus::Running | JobAdminStatus::Retrying
+                JobAdminStatus::Enqueued
+                    | JobAdminStatus::Scheduled
+                    | JobAdminStatus::Running
+                    | JobAdminStatus::Retrying
             )
         });
         if is_active {
@@ -1192,6 +1307,17 @@ fn redis_requeue_unique_action(record: &RedisJobRecord) -> &'static str {
 #[cfg(feature = "redis")]
 const REDIS_WORKER_IDLE_SLEEP_MAX: std::time::Duration = std::time::Duration::from_millis(200);
 
+/// Maximum delay between delayed-ZSET promotion scans.
+///
+/// One-shot delayed jobs (`enqueue_in` / `enqueue_at`) share the same ZSET as
+/// retries.  Without a cap, a deployment whose jobs all have large retry
+/// backoffs (e.g. 60 s) would inherit that long promotion interval, causing
+/// short-delay jobs to run far later than requested.  Capping at 1 s keeps
+/// timing accurate while adding only negligible Redis load (ZRANGEBYSCORE is
+/// O(log N)).
+#[cfg(feature = "redis")]
+const REDIS_DELAYED_PROMOTION_MAX_INTERVAL_MS: u64 = 1_000;
+
 #[cfg(feature = "redis")]
 fn redis_retry_promotion_interval_ms(default_backoff_ms: u64, jobs: &[JobInfo]) -> u64 {
     let mut interval_ms = default_backoff_ms.max(1);
@@ -1200,7 +1326,7 @@ fn redis_retry_promotion_interval_ms(default_backoff_ms: u64, jobs: &[JobInfo]) 
             interval_ms = interval_ms.min(job.initial_backoff_ms);
         }
     }
-    interval_ms
+    interval_ms.min(REDIS_DELAYED_PROMOTION_MAX_INTERVAL_MS)
 }
 
 #[cfg(feature = "redis")]
@@ -1478,6 +1604,72 @@ pub async fn enqueue(name: &str, payload: Value) -> AutumnResult<()> {
     client.enqueue(name, payload).await
 }
 
+/// Convert a relative delay into an absolute due instant.
+///
+/// Saturates to `DateTime::MAX` on overflow (practically impossible).
+fn delay_to_when(delay: std::time::Duration) -> chrono::DateTime<chrono::Utc> {
+    // chrono::TimeDelta::from_std returns Err on overflow (>i64::MAX nanoseconds).
+    // Fall back to MAX_UTC rather than panicking.
+    let Ok(delta) = chrono::TimeDelta::from_std(delay) else {
+        return chrono::DateTime::<chrono::Utc>::MAX_UTC;
+    };
+    chrono::Utc::now()
+        .checked_add_signed(delta)
+        .unwrap_or(chrono::DateTime::<chrono::Utc>::MAX_UTC)
+}
+
+/// Enqueue a one-shot job to run once after `delay` elapses.
+///
+/// This is the deferred-execution companion to [`enqueue`]: the job is recorded
+/// immediately but is not delivered to a worker until `delay` has passed, then
+/// runs through the normal execution path (retries, backoff, dead-letter).
+///
+/// On the durable backends (`postgres`, `redis`) the due time is persisted, so a
+/// pending delay survives a worker/process restart. The in-process (`local`)
+/// backend is local-safe only: a pending delay is lost if the process restarts
+/// before the job becomes due.
+///
+/// For recurring work use `#[scheduled]`; for durable multi-step orchestration
+/// use Autumn Harvest. See `docs/guide/jobs.md`.
+///
+/// # Errors
+///
+/// Returns an internal error when the jobs runtime is not initialized, when
+/// `name` does not match a registered job, or when the active backend rejects
+/// the enqueue operation.
+pub async fn enqueue_in(
+    name: &str,
+    payload: Value,
+    delay: std::time::Duration,
+) -> AutumnResult<()> {
+    let when = delay_to_when(delay);
+    enqueue_at(name, payload, when).await
+}
+
+/// Enqueue a one-shot job to run once at the absolute instant `when`.
+///
+/// Behaves like [`enqueue_in`] but takes an absolute due time. A `when` in the
+/// past runs the job immediately. Calendar/timezone math is the caller's
+/// concern — `when` is an absolute UTC instant.
+///
+/// # Errors
+///
+/// Returns an internal error when the jobs runtime is not initialized, when
+/// `name` does not match a registered job, or when the active backend rejects
+/// the enqueue operation.
+pub async fn enqueue_at(
+    name: &str,
+    payload: Value,
+    when: chrono::DateTime<chrono::Utc>,
+) -> AutumnResult<()> {
+    let Some(client) = global_job_client() else {
+        return Err(AutumnError::internal_server_error(std::io::Error::other(
+            "job runtime is not initialized; register jobs with AppBuilder::jobs()",
+        )));
+    };
+    client.enqueue_due(name, payload, Some(when)).await
+}
+
 /// Enqueue a job using an **already-open connection** so the INSERT
 /// participates in the caller's transaction.
 ///
@@ -1519,6 +1711,57 @@ pub async fn enqueue_on_conn<A: serde::Serialize>(
     client.enqueue_on_conn(name, payload, conn).await
 }
 
+/// Transactional delayed enqueue.
+///
+/// Like [`enqueue_on_conn`] but the job becomes runnable only after `delay`
+/// elapses (and after the surrounding transaction commits). On the `postgres`
+/// backend this is crash-safe — the future `run_at` is persisted in the same
+/// transaction as the domain write.
+///
+/// # Errors
+///
+/// Returns an error if the job runtime is not initialized, if `args` cannot be
+/// serialized to JSON, or if the database INSERT fails.
+#[cfg(feature = "db")]
+pub async fn enqueue_in_on_conn<A: serde::Serialize>(
+    name: &str,
+    args: A,
+    delay: std::time::Duration,
+    conn: &mut diesel_async::AsyncPgConnection,
+) -> AutumnResult<()> {
+    let when = delay_to_when(delay);
+    enqueue_at_on_conn(name, args, when, conn).await
+}
+
+/// Transactional delayed enqueue at an absolute instant. See
+/// [`enqueue_in_on_conn`].
+///
+/// # Errors
+///
+/// Returns an error if the job runtime is not initialized, if `args` cannot be
+/// serialized to JSON, or if the database INSERT fails.
+#[cfg(feature = "db")]
+pub async fn enqueue_at_on_conn<A: serde::Serialize>(
+    name: &str,
+    args: A,
+    when: chrono::DateTime<chrono::Utc>,
+    conn: &mut diesel_async::AsyncPgConnection,
+) -> AutumnResult<()> {
+    let payload = serde_json::to_value(&args).map_err(|e| {
+        AutumnError::internal_server_error(std::io::Error::other(format!(
+            "job args serialization failed: {e}"
+        )))
+    })?;
+    let Some(client) = global_job_client() else {
+        return Err(AutumnError::internal_server_error(std::io::Error::other(
+            "job runtime is not initialized; register jobs with AppBuilder::jobs()",
+        )));
+    };
+    client
+        .enqueue_on_conn_due(name, payload, conn, Some(when))
+        .await
+}
+
 /// Enqueue a job that fires **only after the surrounding transaction commits**.
 ///
 /// This is the module-level companion to [`JobClient::enqueue_after_commit`].
@@ -1552,6 +1795,65 @@ pub async fn enqueue_after_commit<A: serde::Serialize>(name: &str, args: A) -> A
         )));
     };
     client.enqueue_after_commit(name, payload).await
+}
+
+/// Delayed variant of [`enqueue_after_commit`]: after the surrounding
+/// transaction commits, the job is enqueued to become runnable `delay` later.
+///
+/// Like [`enqueue_after_commit`], the after-commit deferral is process-local and
+/// not crash-safe. For a crash-safe transactional delay on the `postgres`
+/// backend, prefer [`enqueue_in_on_conn`].
+///
+/// # Errors
+///
+/// Returns an error if the job runtime is not initialized or if `args` cannot
+/// be serialized to JSON.
+pub async fn enqueue_in_after_commit<A: serde::Serialize>(
+    name: &str,
+    args: A,
+    delay: std::time::Duration,
+) -> AutumnResult<()> {
+    let payload = serde_json::to_value(&args).map_err(|e| {
+        AutumnError::internal_server_error(std::io::Error::other(format!(
+            "job args serialization failed: {e}"
+        )))
+    })?;
+    let Some(client) = global_job_client() else {
+        return Err(AutumnError::internal_server_error(std::io::Error::other(
+            "job runtime is not initialized; register jobs with AppBuilder::jobs()",
+        )));
+    };
+    // `enqueue_after_commit_delay` computes `when` inside the callback so
+    // the delay is measured from commit time, not from this call site.
+    client
+        .enqueue_after_commit_delay(name, payload, delay)
+        .await
+}
+
+/// Absolute-instant variant of [`enqueue_in_after_commit`].
+///
+/// # Errors
+///
+/// Returns an error if the job runtime is not initialized or if `args` cannot
+/// be serialized to JSON.
+pub async fn enqueue_at_after_commit<A: serde::Serialize>(
+    name: &str,
+    args: A,
+    when: chrono::DateTime<chrono::Utc>,
+) -> AutumnResult<()> {
+    let payload = serde_json::to_value(&args).map_err(|e| {
+        AutumnError::internal_server_error(std::io::Error::other(format!(
+            "job args serialization failed: {e}"
+        )))
+    })?;
+    let Some(client) = global_job_client() else {
+        return Err(AutumnError::internal_server_error(std::io::Error::other(
+            "job runtime is not initialized; register jobs with AppBuilder::jobs()",
+        )));
+    };
+    client
+        .enqueue_after_commit_due(name, payload, Some(when))
+        .await
 }
 
 /// Enqueue a job inside an **already-open connection**, writing the job row
@@ -1602,16 +1904,50 @@ impl JobClient {
         self.enqueue_with_outcome(name, payload).await.map(|_| ())
     }
 
+    /// Enqueue a job that becomes runnable at `due_at` (or immediately when
+    /// `due_at` is `None` or in the past). Backs [`enqueue_in`] / [`enqueue_at`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an internal error when `name` does not match a registered job or
+    /// enqueueing fails in the active backend.
+    pub async fn enqueue_due(
+        &self,
+        name: &str,
+        payload: Value,
+        due_at: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> AutumnResult<()> {
+        self.enqueue_with_outcome_due(name, payload, due_at)
+            .await
+            .map(|_| ())
+    }
+
     /// Enqueue like [`Self::enqueue`], reporting whether the job was stored
     /// or coalesced into an existing unique job. Used by operator paths that
     /// must distinguish "queued a retry" from "an equivalent job already
     /// exists".
-    #[allow(clippy::too_many_lines)]
     pub(crate) async fn enqueue_with_outcome(
         &self,
         name: &str,
         payload: Value,
     ) -> AutumnResult<EnqueueOutcome> {
+        self.enqueue_with_outcome_due(name, payload, None).await
+    }
+
+    #[allow(clippy::too_many_lines)]
+    pub(crate) async fn enqueue_with_outcome_due(
+        &self,
+        name: &str,
+        payload: Value,
+        due_at: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> AutumnResult<EnqueueOutcome> {
+        // Capture the reference instant once so every downstream decision
+        // (filter, admin record status, local-backend sleep) uses a consistent
+        // clock reading and near-due jobs cannot be misclassified.
+        let now = chrono::Utc::now();
+        // Only treat a due time strictly in the future as "delayed"; a past or
+        // absent due time enqueues for immediate execution exactly as before.
+        let due_at = due_at.filter(|due| *due > now);
         let Some(settings) = self.per_job_settings.get(name) else {
             return Err(AutumnError::internal_server_error(std::io::Error::other(
                 format!("job '{name}' is not registered; add it to AppBuilder::jobs()"),
@@ -1630,8 +1966,15 @@ impl JobClient {
         let constraints = ResolvedJobConstraints::for_payload(settings, &payload);
         let id = uuid::Uuid::new_v4().to_string();
         self.registry.record_enqueue(name);
-        self.job_admin
-            .record_enqueue(id.clone(), name, payload.clone(), 1, job_max_attempts);
+        self.job_admin.record_enqueue_due(
+            id.clone(),
+            name,
+            payload.clone(),
+            1,
+            job_max_attempts,
+            due_at,
+            now,
+        );
 
         let started = ::std::sync::Arc::new(::std::sync::atomic::AtomicBool::new(false));
         let started_clone = started.clone();
@@ -1655,25 +1998,86 @@ impl JobClient {
                 }
                 #[cfg(feature = "telemetry-otlp")]
                 let (traceparent, tracestate) = capture_job_trace_context();
-                let send_result = sender
-                    .send(QueuedJob {
-                        id: id_for_enqueue.clone(),
-                        name: name.to_string(),
-                        payload: payload_clone.clone(),
-                        attempt: 1,
-                        max_attempts: job_max_attempts,
-                        initial_backoff_ms: job_backoff_ms,
-                        #[cfg(feature = "telemetry-otlp")]
-                        traceparent,
-                        #[cfg(feature = "telemetry-otlp")]
-                        tracestate,
-                    })
-                    .await
-                    .map_err(|e| {
+                let queued = QueuedJob {
+                    id: id_for_enqueue.clone(),
+                    name: name.to_string(),
+                    payload: payload_clone.clone(),
+                    attempt: 1,
+                    max_attempts: job_max_attempts,
+                    initial_backoff_ms: job_backoff_ms,
+                    #[cfg(feature = "telemetry-otlp")]
+                    traceparent,
+                    #[cfg(feature = "telemetry-otlp")]
+                    tracestate,
+                };
+                let send_result = if let Some(due) = due_at {
+                    // Delayed enqueue on the in-process backend: hand the job to
+                    // a detached timer that sleeps until the due time and then
+                    // delivers it to a worker. This is local-safe only — a
+                    // pending delay is lost if the process restarts before the
+                    // job becomes due (durable backends persist the due time).
+                    // Recompute remaining delay at the moment actual_enqueue
+                    // runs (after any interceptor) so the sleep duration stays
+                    // accurate even if the interceptor took non-trivial time.
+                    let delay = (due - chrono::Utc::now())
+                        .to_std()
+                        .unwrap_or(std::time::Duration::ZERO);
+                    let sender = sender.clone();
+                    let cancel_token = tokio_util::sync::CancellationToken::new();
+                    let already_canceled = self
+                        .job_admin
+                        .register_delay_canceler(id_for_enqueue.clone(), cancel_token.clone());
+                    if already_canceled {
+                        // The admin canceled this job during an interceptor's
+                        // async work, before the token was registered.  The
+                        // admin record is already Canceled; just release the
+                        // unique lock and decrement the queued gauge.
+                        if let (Some(unique_key), Some(coord)) =
+                            (&constraints.unique_key, self.local_coordination.as_deref())
+                        {
+                            coord.release_unique(name, unique_key, &id_for_enqueue);
+                        }
+                        self.registry.record_cancel(name);
+                        return Ok(());
+                    }
+                    // Capture what we need on cancel: unique lock release,
+                    // admin status update, and queued-gauge decrement.
+                    let cancel_unique_key = constraints.unique_key.clone();
+                    let cancel_coordination = self.local_coordination.clone();
+                    let cancel_admin = self.job_admin.clone();
+                    let cancel_registry = self.registry.clone();
+                    let cancel_name = name.to_string();
+                    let cancel_id = id_for_enqueue.clone();
+                    tokio::spawn(async move {
+                        tokio::select! {
+                            biased;
+                            () = cancel_token.cancelled() => {
+                                // Admin-canceled before the due time: release the
+                                // unique lock immediately so re-enqueueing works
+                                // without waiting for the original timer to fire.
+                                // Also update the admin record and queued gauge so
+                                // /actuator does not report phantom queued work.
+                                if let (Some(unique_key), Some(coord)) =
+                                    (cancel_unique_key, cancel_coordination)
+                                {
+                                    coord.release_unique(&cancel_name, &unique_key, &cancel_id);
+                                }
+                                cancel_registry.record_cancel(&cancel_name);
+                                cancel_admin.record_cancelled(&cancel_id);
+                            }
+                            () = tokio::time::sleep(delay) => {
+                                let _ = sender.send(queued).await;
+                            }
+                        }
+                    });
+                    Ok(())
+                } else {
+                    sender.send(queued).await.map_err(|e| {
                         AutumnError::internal_server_error(std::io::Error::other(format!(
                             "failed to enqueue job: {e}"
                         )))
-                    });
+                    })
+                };
                 if send_result.is_err()
                     && let (Some(unique_key), Some(coordination)) = (
                         constraints.unique_key.as_deref(),
@@ -1690,6 +2094,7 @@ impl JobClient {
                     payload_clone.clone(),
                     job_max_attempts,
                     job_backoff_ms,
+                    due_at,
                     &constraints,
                 )
                 .await
@@ -1772,6 +2177,53 @@ impl JobClient {
         name: &str,
         payload: impl serde::Serialize,
     ) -> AutumnResult<()> {
+        self.enqueue_after_commit_due(name, payload, None).await
+    }
+
+    /// Delayed variant of [`Self::enqueue_after_commit`]: after the transaction
+    /// commits, the job is enqueued to become runnable at `due_at`. When
+    /// `due_at` is `None` or in the past this is exactly `enqueue_after_commit`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `payload` cannot be serialized to JSON, or if the
+    /// underlying enqueue fails (backend error, unregistered job name, etc.).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal after-commit registry mutex is poisoned.
+    pub async fn enqueue_after_commit_due(
+        &self,
+        name: &str,
+        payload: impl serde::Serialize,
+        due_at: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> AutumnResult<()> {
+        self.enqueue_after_commit_inner(name, payload, AfterCommitDue::At(due_at))
+            .await
+    }
+
+    /// Like [`Self::enqueue_after_commit_due`] but accepts a relative delay that
+    /// is resolved to an absolute instant **at commit time**, not at call time.
+    ///
+    /// This preserves "delay from commit" semantics: even if the surrounding
+    /// transaction takes longer than `delay`, the due time is always measured
+    /// from when the transaction actually commits.
+    pub(crate) async fn enqueue_after_commit_delay(
+        &self,
+        name: &str,
+        payload: impl serde::Serialize,
+        delay: std::time::Duration,
+    ) -> AutumnResult<()> {
+        self.enqueue_after_commit_inner(name, payload, AfterCommitDue::After(delay))
+            .await
+    }
+
+    async fn enqueue_after_commit_inner(
+        &self,
+        name: &str,
+        payload: impl serde::Serialize,
+        due: AfterCommitDue,
+    ) -> AutumnResult<()> {
         // Validate name eagerly so a typo/unregistered job fails the
         // transaction (before any DB commit) rather than being silently
         // dropped later when the deferred callback runs.
@@ -1800,7 +2252,13 @@ impl JobClient {
             let client = client.clone();
             let name = name.clone();
             let payload = payload.clone();
-            async move { client.enqueue(&name, payload).await }
+            // Resolve the due instant here, inside the callback, so that an
+            // AfterCommitDue::After delay is measured from commit time.
+            let due_at = match due {
+                AfterCommitDue::At(at) => at,
+                AfterCommitDue::After(d) => Some(delay_to_when(d)),
+            };
+            async move { client.enqueue_due(&name, payload, due_at).await }
         });
 
         #[cfg(feature = "db")]
@@ -1832,6 +2290,7 @@ impl JobClient {
         self.job_admin.record_deduplicated(id);
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn enqueue_durable(
         &self,
         id: String,
@@ -1839,6 +2298,7 @@ impl JobClient {
         payload: Value,
         max_attempts: u32,
         backoff_ms: u64,
+        due_at: Option<chrono::DateTime<chrono::Utc>>,
         constraints: &ResolvedJobConstraints,
     ) -> AutumnResult<EnqueueOutcome> {
         let breaker = self.resilience_config.as_ref().map_or_else(
@@ -1864,7 +2324,15 @@ impl JobClient {
         let guard = crate::circuit_breaker::CircuitBreakerGuard::new(breaker.clone());
 
         let res = self
-            .enqueue_durable_inner(id, name, payload, max_attempts, backoff_ms, constraints)
+            .enqueue_durable_inner(
+                id,
+                name,
+                payload,
+                max_attempts,
+                backoff_ms,
+                due_at,
+                constraints,
+            )
             .await;
         if res.is_ok() {
             guard.success();
@@ -1874,6 +2342,7 @@ impl JobClient {
         res
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn enqueue_durable_inner(
         &self,
         id: String,
@@ -1881,28 +2350,47 @@ impl JobClient {
         payload: Value,
         max_attempts: u32,
         backoff_ms: u64,
+        due_at: Option<chrono::DateTime<chrono::Utc>>,
         constraints: &ResolvedJobConstraints,
     ) -> AutumnResult<EnqueueOutcome> {
         #[cfg(feature = "redis")]
         if let Some(redis) = &self.redis {
+            let due_at_ms = due_at.map(|due| u64::try_from(due.timestamp_millis()).unwrap_or(0));
             return redis
-                .enqueue(id, name, payload, max_attempts, backoff_ms, constraints)
+                .enqueue(
+                    id,
+                    name,
+                    payload,
+                    max_attempts,
+                    backoff_ms,
+                    due_at_ms,
+                    constraints,
+                )
                 .await;
         }
         #[cfg(feature = "db")]
         if let Some(pool) = &self.pg_pool {
-            return pg_enqueue_job(
+            return pg_enqueue_job_at(
                 pool,
                 id,
                 name,
                 payload,
                 max_attempts,
                 backoff_ms,
+                due_at,
                 constraints,
             )
             .await;
         }
-        let _ = (id, name, payload, max_attempts, backoff_ms, constraints);
+        let _ = (
+            id,
+            name,
+            payload,
+            max_attempts,
+            backoff_ms,
+            due_at,
+            constraints,
+        );
         Err(AutumnError::internal_server_error(std::io::Error::other(
             "job runtime backend is unavailable",
         )))
@@ -1927,6 +2415,28 @@ impl JobClient {
         payload: Value,
         conn: &mut diesel_async::AsyncPgConnection,
     ) -> AutumnResult<()> {
+        self.enqueue_on_conn_due(name, payload, conn, None).await
+    }
+
+    /// Transactional enqueue (see [`Self::enqueue_on_conn`]) with an explicit
+    /// `due_at`. On the Postgres backend the job row is written inside the
+    /// caller's transaction with a future `run_at`, so it is delivered to a
+    /// worker only after **both** the transaction commits **and** the due time
+    /// passes — crash-safe delayed enqueue.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `name` is not a registered job, or if the database
+    /// INSERT fails.
+    #[cfg(feature = "db")]
+    pub async fn enqueue_on_conn_due(
+        &self,
+        name: &str,
+        payload: Value,
+        conn: &mut diesel_async::AsyncPgConnection,
+        due_at: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> AutumnResult<()> {
+        let due_at = due_at.filter(|due| *due > chrono::Utc::now());
         let Some(settings) = self.per_job_settings.get(name) else {
             return Err(AutumnError::internal_server_error(std::io::Error::other(
                 format!("job '{name}' is not registered; add it to AppBuilder::jobs()"),
@@ -1975,13 +2485,14 @@ impl JobClient {
             let payload_for_enqueue = payload.clone();
             let constraints_ref = &constraints;
             let actual_enqueue = async move {
-                let outcome = pg_enqueue_on_conn(
+                let outcome = pg_enqueue_on_conn_at(
                     conn,
                     id_for_enqueue.clone(),
                     name,
                     payload_for_enqueue,
                     job_max_attempts,
                     job_backoff_ms,
+                    due_at,
                     constraints_ref,
                 )
                 .await;
@@ -2017,7 +2528,7 @@ impl JobClient {
         // For the redis and local backends `conn` is irrelevant; the normal
         // enqueue path already applies interceptors, bookkeeping, uniqueness,
         // and concurrency metadata.
-        self.enqueue(name, payload).await
+        self.enqueue_due(name, payload, due_at).await
     }
 }
 
@@ -2550,6 +3061,10 @@ fn finish_local_slot(
 struct RedisClient {
     connection: redis::aio::ConnectionManager,
     queue_key: String,
+    /// ZSET keyed by due-time-ms used for delayed enqueues and retries. A
+    /// future-dated job is `ZADD`-ed here instead of pushed to `queue_key`, and
+    /// the worker's promotion loop moves it onto the queue once due.
+    delayed_key: String,
     record_prefix: String,
     unique_prefix: String,
 }
@@ -2677,12 +3192,17 @@ if ARGV[3] == '1' then
   end
 end
 redis.call('SET', KEYS[1], ARGV[1])
-redis.call('LPUSH', KEYS[2], ARGV[2])
+if ARGV[5] ~= '' and tonumber(ARGV[5]) ~= nil then
+  redis.call('ZADD', KEYS[4], tonumber(ARGV[5]), ARGV[2])
+else
+  redis.call('LPUSH', KEYS[2], ARGV[2])
+end
 return 1
 ";
 
 #[cfg(feature = "redis")]
 impl RedisClient {
+    #[allow(clippy::too_many_arguments)]
     async fn enqueue(
         &self,
         id: String,
@@ -2690,6 +3210,7 @@ impl RedisClient {
         payload: Value,
         default_max_attempts: u32,
         default_initial_backoff_ms: u64,
+        due_at_ms: Option<u64>,
         constraints: &ResolvedJobConstraints,
     ) -> AutumnResult<EnqueueOutcome> {
         #[cfg(feature = "telemetry-otlp")]
@@ -2732,18 +3253,43 @@ impl RedisClient {
         } else {
             "0"
         };
-        let lock_ttl_ms = redis_unique_lock_ttl_ms(constraints.unique_window);
+        let lock_ttl_ms = {
+            let base = redis_unique_lock_ttl_ms(constraints.unique_window);
+            // For non-TTL windows the backstop is sized for pending/running
+            // windows (~24 h). Extend it when a delayed job's due time would
+            // outlast that backstop so the unique lock stays valid until the
+            // job fires and is claimed.  TTL-window jobs keep their explicit
+            // user-specified TTL unchanged.
+            match due_at_ms {
+                Some(due_ms)
+                    if !matches!(
+                        constraints.unique_window,
+                        Some(JobUniquenessWindow::TtlMs(_))
+                    ) =>
+                {
+                    let delay_ms = due_ms.saturating_sub(now_unix_ms());
+                    delay_ms
+                        .saturating_add(REDIS_UNIQUE_LOCK_TTL_BACKSTOP_MS)
+                        .max(base)
+                }
+                _ => base,
+            }
+        };
+        // Empty string => immediate (LPUSH); a millisecond score => delayed (ZADD).
+        let due_at_arg = due_at_ms.map_or_else(String::new, |ms| ms.to_string());
 
         let stored: i64 = redis::cmd("EVAL")
             .arg(REDIS_ENQUEUE_SCRIPT)
-            .arg(3)
+            .arg(4)
             .arg(record_key)
             .arg(&self.queue_key)
             .arg(unique_lock_key)
+            .arg(&self.delayed_key)
             .arg(encoded)
             .arg(id)
             .arg(has_unique)
             .arg(lock_ttl_ms)
+            .arg(due_at_arg)
             .query_async(&mut connection)
             .await
             .map_err(|e| {
@@ -2764,6 +3310,7 @@ impl RedisClient {
 struct RedisJobAdminBackend {
     connection: redis::aio::ConnectionManager,
     queue_key: String,
+    delayed_key: String,
     processing_key: String,
     dead_key: String,
     completed_key: String,
@@ -2772,6 +3319,7 @@ struct RedisJobAdminBackend {
     dead_record_prefix: String,
     unique_prefix: String,
     history_limit: usize,
+    registry: crate::actuator::JobRegistry,
 }
 
 #[cfg(feature = "redis")]
@@ -2780,6 +3328,7 @@ impl RedisJobAdminBackend {
     fn new(
         connection: redis::aio::ConnectionManager,
         queue_key: String,
+        delayed_key: String,
         processing_key: String,
         dead_key: String,
         completed_key: String,
@@ -2788,10 +3337,12 @@ impl RedisJobAdminBackend {
         dead_record_prefix: String,
         unique_prefix: String,
         history_limit: usize,
+        registry: crate::actuator::JobRegistry,
     ) -> Self {
         Self {
             connection,
             queue_key,
+            delayed_key,
             processing_key,
             dead_key,
             completed_key,
@@ -2800,6 +3351,7 @@ impl RedisJobAdminBackend {
             dead_record_prefix,
             unique_prefix,
             history_limit: history_limit.max(1),
+            registry,
         }
     }
 
@@ -2816,6 +3368,14 @@ impl RedisJobAdminBackend {
             &self.record_prefix,
             JobAdminStatus::Enqueued,
             query.enqueued_page,
+            per_page,
+        )
+        .await?;
+        let scheduled = redis_admin_delayed_page(
+            &mut connection,
+            &self.delayed_key,
+            &self.record_prefix,
+            query.scheduled_page,
             per_page,
         )
         .await?;
@@ -2850,6 +3410,7 @@ impl RedisJobAdminBackend {
 
         Ok(JobAdminSnapshot {
             enqueued,
+            scheduled,
             running,
             completed,
             failed,
@@ -2950,6 +3511,17 @@ return 1
     async fn cancel_enqueued_redis(&self, id: &str) -> AutumnResult<()> {
         let mut connection = self.connection.clone();
         let active_record_key = redis_record_key(&self.record_prefix, id);
+        // Fetch the record first so we know the job name for gauge accounting.
+        let raw_record: Option<String> = redis::cmd("GET")
+            .arg(&active_record_key)
+            .query_async(&mut connection)
+            .await
+            .ok()
+            .flatten();
+        let job_name: Option<String> = raw_record
+            .as_deref()
+            .and_then(|s| serde_json::from_str::<RedisJobRecord>(s).ok())
+            .map(|r| r.name);
         // A concurrency-parked job lives in the blocked zset rather than the
         // queue list, and a canceled unique job must hand its lock back so
         // future enqueues are not coalesced against work that will never run.
@@ -2963,6 +3535,9 @@ end
 local removed = redis.call('LREM', KEYS[2], 0, ARGV[1])
 if removed == 0 then
   removed = redis.call('ZREM', KEYS[3], ARGV[1])
+end
+if removed == 0 then
+  removed = redis.call('ZREM', KEYS[5], ARGV[1])
 end
 if removed == 0 then
   return -1
@@ -2979,15 +3554,21 @@ redis.call('DEL', KEYS[1])
 return 1
 ",
             )
-            .arg(4)
-            .arg(active_record_key)
+            .arg(5)
+            .arg(&active_record_key)
             .arg(&self.queue_key)
             .arg(&self.blocked_key)
             .arg(&self.unique_prefix)
+            .arg(&self.delayed_key)
             .arg(id)
             .query_async(&mut connection)
             .await
             .map_err(|error| redis_admin_error("cancel enqueued job", &error))?;
+        if result == 1
+            && let Some(name) = job_name
+        {
+            self.registry.record_cancel(&name);
+        }
         redis_admin_operation_result(result, id, "cancel enqueued job")
     }
 }
@@ -3065,6 +3646,7 @@ fn redis_record_to_admin_record(record: &RedisJobRecord, status: JobAdminStatus)
         name: record.name.clone(),
         status,
         enqueued_at: redis_admin_time(record.enqueued_at_ms),
+        scheduled_for: None,
         started_at: redis_admin_time(record.started_at_ms),
         finished_at: redis_admin_time(record.finished_at_ms),
         attempt: record.attempt,
@@ -3123,6 +3705,52 @@ async fn redis_admin_active_list_page(
         .map_err(|error| redis_admin_error("read enqueued records", &error))?
         .into_iter()
         .map(|record| redis_record_to_admin_record(&record, status))
+        .collect();
+    Ok(JobAdminPage::new(records, total, page, per_page))
+}
+
+/// Page over the delayed ZSET, surfacing future-due jobs as
+/// [`JobAdminStatus::Scheduled`] with their due time (the ZSET score, in ms),
+/// soonest-due first.
+#[cfg(feature = "redis")]
+async fn redis_admin_delayed_page(
+    connection: &mut redis::aio::ConnectionManager,
+    delayed_key: &str,
+    record_prefix: &str,
+    page: u64,
+    per_page: u64,
+) -> AutumnResult<JobAdminPage> {
+    let page = page.max(1);
+    let start = page.saturating_sub(1).saturating_mul(per_page);
+    let stop = start.saturating_add(per_page).saturating_sub(1);
+    // Fetch (id, score) pairs soonest-due-first, plus the total ZSET size.
+    let (id_scores, total): (Vec<(String, f64)>, u64) = redis::pipe()
+        .cmd("ZRANGE")
+        .arg(delayed_key)
+        .arg(start)
+        .arg(stop)
+        .arg("WITHSCORES")
+        .cmd("ZCARD")
+        .arg(delayed_key)
+        .query_async(connection)
+        .await
+        .map_err(|error| redis_admin_error("read scheduled page", &error))?;
+    let ids: Vec<String> = id_scores.iter().map(|(id, _)| id.clone()).collect();
+    let due_by_id: std::collections::HashMap<String, f64> = id_scores.into_iter().collect();
+    let records = redis_records_for_ids(connection, record_prefix, &ids)
+        .await
+        .map_err(|error| redis_admin_error("read scheduled records", &error))?
+        .into_iter()
+        .map(|record| {
+            let mut admin = redis_record_to_admin_record(&record, JobAdminStatus::Scheduled);
+            if let Some(score) = due_by_id.get(&record.id) {
+                // ZSET scores are due-time-in-ms; clamp the f64 back to u64.
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                let due_ms = score.max(0.0) as u64;
+                admin.scheduled_for = redis_admin_time(Some(due_ms));
+            }
+            admin
+        })
         .collect();
     Ok(JobAdminPage::new(records, total, page, per_page))
 }
@@ -3440,8 +4068,13 @@ async fn record_enqueues_for_redis_ids(
                     .query_async::<()>(&mut *connection)
                     .await;
             }
-            state.job_registry.record_enqueue(&record.name);
-            job_admin.record_requeued(&record.id, record.attempt);
+            // Skip record_enqueue for initially-delayed jobs: they were already
+            // counted at enqueue time (queued += 1). Only retries and stale
+            // claim recoveries (prior status != Scheduled) need a fresh count.
+            let was_scheduled = job_admin.record_requeued(&record.id, record.attempt);
+            if !was_scheduled {
+                state.job_registry.record_enqueue(&record.name);
+            }
         }
     }
 
@@ -4322,6 +4955,7 @@ fn start_redis_runtime(
         state.insert_extension(JobAdminBackendEntry(Arc::new(RedisJobAdminBackend::new(
             admin_connection,
             queue_key.clone(),
+            delayed_key.clone(),
             processing_key.clone(),
             dead_key.clone(),
             completed_key.clone(),
@@ -4330,6 +4964,7 @@ fn start_redis_runtime(
             dead_record_prefix.clone(),
             unique_prefix.clone(),
             DEFAULT_JOB_ADMIN_HISTORY_LIMIT,
+            state.job_registry.clone(),
         ))));
     }
 
@@ -4356,6 +4991,7 @@ fn start_redis_runtime(
             redis: Some(RedisClient {
                 connection: producer_connection,
                 queue_key: queue_key.clone(),
+                delayed_key: delayed_key.clone(),
                 record_prefix: record_prefix.clone(),
                 unique_prefix: unique_prefix.clone(),
             }),
@@ -4593,7 +5229,7 @@ const PG_MAINTENANCE_INTERVAL: std::time::Duration = std::time::Duration::from_s
 /// Columns returned by every SELECT from `autumn_jobs` when OTLP is disabled.
 #[cfg(all(feature = "db", not(feature = "telemetry-otlp")))]
 const PG_JOB_SELECT_COLS: &str = "id, name, payload::TEXT AS payload, status, attempt, \
-    max_attempts, initial_backoff_ms, enqueued_at, started_at, finished_at, \
+    max_attempts, initial_backoff_ms, enqueued_at, run_at, started_at, finished_at, \
     claimed_by, claimed_at, last_error";
 
 /// Columns returned by every SELECT from `autumn_jobs` when OTLP is enabled.
@@ -4601,7 +5237,7 @@ const PG_JOB_SELECT_COLS: &str = "id, name, payload::TEXT AS payload, status, at
 /// `add_trace_context_to_jobs` migration.
 #[cfg(all(feature = "db", feature = "telemetry-otlp"))]
 const PG_JOB_SELECT_COLS: &str = "id, name, payload::TEXT AS payload, status, attempt, \
-    max_attempts, initial_backoff_ms, enqueued_at, started_at, finished_at, \
+    max_attempts, initial_backoff_ms, enqueued_at, run_at, started_at, finished_at, \
     claimed_by, claimed_at, last_error, traceparent, tracestate";
 
 /// A job row read from the `autumn_jobs` Postgres table.
@@ -4625,6 +5261,8 @@ struct PgJobRow {
     initial_backoff_ms: i64,
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>)]
     enqueued_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>)]
+    run_at: Option<chrono::DateTime<chrono::Utc>>,
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>)]
     started_at: Option<chrono::DateTime<chrono::Utc>>,
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>)]
@@ -4655,6 +5293,11 @@ impl PgJobRow {
             name: self.name.clone(),
             status,
             enqueued_at: self.enqueued_at.map(format_job_admin_time),
+            scheduled_for: if status == JobAdminStatus::Scheduled {
+                self.run_at.map(format_job_admin_time)
+            } else {
+                None
+            },
             started_at: self.started_at.map(format_job_admin_time),
             finished_at: self.finished_at.map(format_job_admin_time),
             attempt: u32::try_from(self.attempt).unwrap_or(0),
@@ -4674,6 +5317,15 @@ struct PgCount {
     count: i64,
 }
 
+#[cfg(feature = "db")]
+#[derive(diesel::QueryableByName)]
+struct PgEnqueuedCounts {
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    enqueued_count: i64,
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    scheduled_count: i64,
+}
+
 /// Exponential backoff delay in ms for attempt `attempt` (1-indexed).
 #[cfg(feature = "db")]
 fn pg_retry_delay_ms(initial_backoff_ms: i64, attempt: i32) -> i64 {
@@ -4690,6 +5342,7 @@ fn pg_retry_delay_ms(initial_backoff_ms: i64, attempt: i32) -> i64 {
 /// pass the guard simultaneously. Zero rows inserted for a unique job means
 /// the enqueue was coalesced.
 #[cfg(feature = "db")]
+#[allow(clippy::too_many_arguments)]
 async fn pg_insert_job(
     conn: &mut diesel_async::AsyncPgConnection,
     id: String,
@@ -4697,6 +5350,7 @@ async fn pg_insert_job(
     payload: Value,
     max_attempts: u32,
     initial_backoff_ms: u64,
+    run_at: Option<chrono::DateTime<chrono::Utc>>,
     constraints: &ResolvedJobConstraints,
 ) -> AutumnResult<EnqueueOutcome> {
     use diesel_async::RunQueryDsl as _;
@@ -4761,7 +5415,7 @@ async fn pg_insert_job(
         "INSERT INTO autumn_jobs \
          (id, name, payload, status, attempt, max_attempts, initial_backoff_ms, \
           enqueued_at, run_at, unique_key, unique_window, concurrency_key, concurrency_limit) \
-         SELECT $1, $2, $3::JSONB, 'enqueued', 1, $4, $5, NOW(), NOW(), $6, $7, $9, $10 \
+         SELECT $1, $2, $3::JSONB, 'enqueued', 1, $4, $5, NOW(), COALESCE($11, NOW()), $6, $7, $9, $10 \
          WHERE {DEDUP_GUARD} \
          {UNIQUE_CONFLICT}"
     ))
@@ -4776,14 +5430,15 @@ async fn pg_insert_job(
     )
     .bind::<diesel::sql_types::Nullable<diesel::sql_types::BigInt>, _>(unique_ttl_ms)
     .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(concurrency_key)
-    .bind::<diesel::sql_types::Nullable<diesel::sql_types::Integer>, _>(concurrency_limit);
+    .bind::<diesel::sql_types::Nullable<diesel::sql_types::Integer>, _>(concurrency_limit)
+    .bind::<diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>, _>(run_at);
     #[cfg(feature = "telemetry-otlp")]
     let query = diesel::sql_query(format!(
         "INSERT INTO autumn_jobs \
          (id, name, payload, status, attempt, max_attempts, initial_backoff_ms, \
           enqueued_at, run_at, unique_key, unique_window, concurrency_key, concurrency_limit, \
           traceparent, tracestate) \
-         SELECT $1, $2, $3::JSONB, 'enqueued', 1, $4, $5, NOW(), NOW(), $6, $7, $9, $10, $11, $12 \
+         SELECT $1, $2, $3::JSONB, 'enqueued', 1, $4, $5, NOW(), COALESCE($13, NOW()), $6, $7, $9, $10, $11, $12 \
          WHERE {DEDUP_GUARD} \
          {UNIQUE_CONFLICT}"
     ))
@@ -4800,7 +5455,8 @@ async fn pg_insert_job(
     .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(concurrency_key)
     .bind::<diesel::sql_types::Nullable<diesel::sql_types::Integer>, _>(concurrency_limit)
     .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(traceparent)
-    .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(tracestate);
+    .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(tracestate)
+    .bind::<diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>, _>(run_at);
 
     let inserted = query.execute(conn).await.map_err(|e| {
         AutumnError::internal_server_error_msg(format!("pg job enqueue failed: {e}"))
@@ -4811,8 +5467,11 @@ async fn pg_insert_job(
     Ok(EnqueueOutcome::Queued)
 }
 
-/// Insert a new job row into `autumn_jobs`.
-#[cfg(feature = "db")]
+/// Insert a new job row into `autumn_jobs` for immediate execution.
+///
+/// Thin wrapper over [`pg_enqueue_job_at`] with no delay; retained for the
+/// Postgres backend's test suite, which exercises the immediate path directly.
+#[cfg(all(feature = "db", test))]
 async fn pg_enqueue_job(
     pool: &PgPool,
     id: String,
@@ -4820,6 +5479,35 @@ async fn pg_enqueue_job(
     payload: Value,
     max_attempts: u32,
     initial_backoff_ms: u64,
+    constraints: &ResolvedJobConstraints,
+) -> AutumnResult<EnqueueOutcome> {
+    pg_enqueue_job_at(
+        pool,
+        id,
+        name,
+        payload,
+        max_attempts,
+        initial_backoff_ms,
+        None,
+        constraints,
+    )
+    .await
+}
+
+/// Insert a new job row into `autumn_jobs` with an explicit `run_at` due time.
+///
+/// When `run_at` is in the future the row is durable but invisible to the claim
+/// query (`WHERE run_at <= NOW()`) until then — a crash-safe delayed enqueue.
+#[cfg(feature = "db")]
+#[allow(clippy::too_many_arguments)]
+async fn pg_enqueue_job_at(
+    pool: &PgPool,
+    id: String,
+    name: &str,
+    payload: Value,
+    max_attempts: u32,
+    initial_backoff_ms: u64,
+    run_at: Option<chrono::DateTime<chrono::Utc>>,
     constraints: &ResolvedJobConstraints,
 ) -> AutumnResult<EnqueueOutcome> {
     let mut conn = pool
@@ -4833,6 +5521,7 @@ async fn pg_enqueue_job(
         payload,
         max_attempts,
         initial_backoff_ms,
+        run_at,
         constraints,
     )
     .await
@@ -4840,17 +5529,22 @@ async fn pg_enqueue_job(
 
 /// Insert a job into `autumn_jobs` using an **already-open connection**.
 ///
-/// Unlike [`pg_enqueue_job`], this function does not acquire a new connection
+/// Unlike [`pg_enqueue_job_at`], this function does not acquire a new connection
 /// from the pool. The INSERT participates in whatever transaction the caller
 /// has open, so if the caller rolls back, the job row disappears atomically.
+/// When `run_at` is in the future the row is also a crash-safe delayed enqueue:
+/// invisible to workers until **both** the transaction commits **and** the due
+/// time passes.
 #[cfg(feature = "db")]
-async fn pg_enqueue_on_conn(
+#[allow(clippy::too_many_arguments)]
+async fn pg_enqueue_on_conn_at(
     conn: &mut diesel_async::AsyncPgConnection,
     id: String,
     name: &str,
     payload: Value,
     max_attempts: u32,
     initial_backoff_ms: u64,
+    run_at: Option<chrono::DateTime<chrono::Utc>>,
     constraints: &ResolvedJobConstraints,
 ) -> AutumnResult<EnqueueOutcome> {
     pg_insert_job(
@@ -4860,6 +5554,7 @@ async fn pg_enqueue_on_conn(
         payload,
         max_attempts,
         initial_backoff_ms,
+        run_at,
         constraints,
     )
     .await
@@ -5374,12 +6069,10 @@ impl PgJobAdminBackend {
         let per_page = i64::try_from(query.per_page.clamp(1, 100)).unwrap_or(10);
         let now = chrono::Utc::now();
 
-        let enqueued = pg_admin_page(
+        let (enqueued, scheduled) = pg_enqueued_and_scheduled_pages(
             &mut conn,
-            PG_STATUS_ENQUEUED,
-            "enqueued_at",
-            None,
             query.enqueued_page,
+            query.scheduled_page,
             per_page,
         )
         .await?;
@@ -5413,6 +6106,7 @@ impl PgJobAdminBackend {
 
         Ok(JobAdminSnapshot {
             enqueued,
+            scheduled,
             running,
             completed,
             failed,
@@ -5623,6 +6317,86 @@ async fn pg_admin_page(
         page,
         u64::try_from(per_page).unwrap_or(10),
     ))
+}
+
+/// Fetch both the ready-enqueued page and the scheduled page for the Postgres
+/// admin dashboard in 3 queries (1 shared COUNT, 2 separate SELECTs) rather
+/// than 4.
+///
+/// Ready rows surface as [`JobAdminStatus::Enqueued`] (newest-first); scheduled
+/// rows surface as [`JobAdminStatus::Scheduled`] with their `run_at` due time,
+/// soonest-due first.
+#[cfg(feature = "db")]
+async fn pg_enqueued_and_scheduled_pages(
+    conn: &mut diesel_async::pooled_connection::deadpool::Object<diesel_async::AsyncPgConnection>,
+    enqueued_page: u64,
+    scheduled_page: u64,
+    per_page: i64,
+) -> AutumnResult<(JobAdminPage, JobAdminPage)> {
+    use diesel_async::RunQueryDsl as _;
+
+    // One query for both counts.
+    let counts = diesel::sql_query(
+        "SELECT \
+           COALESCE(SUM(CASE WHEN run_at IS NULL OR run_at <= NOW() THEN 1 ELSE 0 END), 0) AS enqueued_count, \
+           COALESCE(SUM(CASE WHEN run_at > NOW()  THEN 1 ELSE 0 END), 0) AS scheduled_count \
+         FROM autumn_jobs WHERE status = 'enqueued'",
+    )
+    .get_result::<PgEnqueuedCounts>(&mut **conn)
+    .await
+    .map_err(|e| AutumnError::internal_server_error_msg(format!("pg admin count: {e}")))?;
+
+    let enq_page = enqueued_page.max(1);
+    let enq_offset =
+        i64::try_from((enq_page - 1).saturating_mul(u64::try_from(per_page).unwrap_or(10)))
+            .unwrap_or(0);
+    let enqueued_rows = diesel::sql_query(format!(
+        "SELECT {PG_JOB_SELECT_COLS} FROM autumn_jobs \
+         WHERE status = 'enqueued' AND (run_at IS NULL OR run_at <= NOW()) \
+         ORDER BY enqueued_at DESC NULLS LAST \
+         LIMIT $1 OFFSET $2"
+    ))
+    .bind::<diesel::sql_types::BigInt, _>(per_page)
+    .bind::<diesel::sql_types::BigInt, _>(enq_offset)
+    .load::<PgJobRow>(&mut **conn)
+    .await
+    .map_err(|e| AutumnError::internal_server_error_msg(format!("pg admin page: {e}")))?;
+
+    let sch_page = scheduled_page.max(1);
+    let sch_offset =
+        i64::try_from((sch_page - 1).saturating_mul(u64::try_from(per_page).unwrap_or(10)))
+            .unwrap_or(0);
+    let scheduled_rows = diesel::sql_query(format!(
+        "SELECT {PG_JOB_SELECT_COLS} FROM autumn_jobs \
+         WHERE status = 'enqueued' AND run_at > NOW() \
+         ORDER BY run_at ASC \
+         LIMIT $1 OFFSET $2"
+    ))
+    .bind::<diesel::sql_types::BigInt, _>(per_page)
+    .bind::<diesel::sql_types::BigInt, _>(sch_offset)
+    .load::<PgJobRow>(&mut **conn)
+    .await
+    .map_err(|e| AutumnError::internal_server_error_msg(format!("pg admin page: {e}")))?;
+
+    let enqueued = JobAdminPage::new(
+        enqueued_rows
+            .iter()
+            .map(|r| r.to_admin_record(JobAdminStatus::Enqueued))
+            .collect(),
+        u64::try_from(counts.enqueued_count).unwrap_or(0),
+        enq_page,
+        u64::try_from(per_page).unwrap_or(10),
+    );
+    let scheduled = JobAdminPage::new(
+        scheduled_rows
+            .iter()
+            .map(|r| r.to_admin_record(JobAdminStatus::Scheduled))
+            .collect(),
+        u64::try_from(counts.scheduled_count).unwrap_or(0),
+        sch_page,
+        u64::try_from(per_page).unwrap_or(10),
+    );
+    Ok((enqueued, scheduled))
 }
 
 /// Start the Postgres job runtime.
@@ -5846,6 +6620,7 @@ mod tests {
         let snapshot = backend
             .snapshot(JobAdminQuery {
                 enqueued_page: 1,
+                scheduled_page: 1,
                 running_page: 1,
                 completed_page: 1,
                 failed_page: 1,
@@ -6384,6 +7159,154 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn local_enqueue_in_delays_then_runs_through_normal_path() {
+        let _guard = global_job_runtime_test_lock().lock().await;
+        clear_global_job_client();
+
+        let state = AppState::for_test().with_profile("dev");
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        start_local_runtime(
+            vec![JobInfo {
+                name: "delayed".to_string(),
+                max_attempts: 3,
+                initial_backoff_ms: 10,
+                uniqueness: None,
+                concurrency: None,
+                handler: |_state, _payload| Box::pin(async move { Ok(()) }),
+            }],
+            &state,
+            &shutdown,
+            1,
+            5,
+            250,
+        );
+
+        enqueue_in("delayed", serde_json::json!({}), Duration::from_millis(400))
+            .await
+            .unwrap();
+
+        // Before the due time elapses, the job sits in the "scheduled" list and
+        // must not have executed.
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        let admin = job_admin_backend(&state).unwrap();
+        let snap = admin.snapshot(JobAdminQuery::default()).await.unwrap();
+        assert_eq!(
+            snap.scheduled.total, 1,
+            "delayed job should be listed as scheduled before its due time"
+        );
+        assert_eq!(
+            snap.completed.total, 0,
+            "delayed job must not run before its due time"
+        );
+        assert_eq!(snap.enqueued.total, 0);
+
+        // After the due time it runs through the normal claim/execute path.
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        let snap = admin.snapshot(JobAdminQuery::default()).await.unwrap();
+        assert_eq!(
+            snap.completed.total, 1,
+            "delayed job should run once its due time passes"
+        );
+        assert_eq!(snap.scheduled.total, 0);
+
+        shutdown.cancel();
+        clear_global_job_client();
+    }
+
+    #[tokio::test]
+    async fn local_enqueue_at_in_the_past_runs_immediately() {
+        let _guard = global_job_runtime_test_lock().lock().await;
+        clear_global_job_client();
+
+        let state = AppState::for_test().with_profile("dev");
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        start_local_runtime(
+            vec![JobInfo {
+                name: "past".to_string(),
+                max_attempts: 3,
+                initial_backoff_ms: 10,
+                uniqueness: None,
+                concurrency: None,
+                handler: |_state, _payload| Box::pin(async move { Ok(()) }),
+            }],
+            &state,
+            &shutdown,
+            1,
+            5,
+            250,
+        );
+
+        let when = chrono::Utc::now() - chrono::TimeDelta::seconds(60);
+        enqueue_at("past", serde_json::json!({}), when)
+            .await
+            .unwrap();
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let admin = job_admin_backend(&state).unwrap();
+        let snap = admin.snapshot(JobAdminQuery::default()).await.unwrap();
+        assert_eq!(
+            snap.completed.total, 1,
+            "a job scheduled for the past should run immediately"
+        );
+        assert_eq!(snap.scheduled.total, 0);
+
+        shutdown.cancel();
+        clear_global_job_client();
+    }
+
+    #[tokio::test]
+    async fn local_scheduled_job_can_be_canceled_before_due() {
+        let _guard = global_job_runtime_test_lock().lock().await;
+        clear_global_job_client();
+
+        let state = AppState::for_test().with_profile("dev");
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        start_local_runtime(
+            vec![JobInfo {
+                name: "cancelable".to_string(),
+                max_attempts: 3,
+                initial_backoff_ms: 10,
+                uniqueness: None,
+                concurrency: None,
+                handler: |_state, _payload| Box::pin(async move { Ok(()) }),
+            }],
+            &state,
+            &shutdown,
+            1,
+            5,
+            250,
+        );
+
+        enqueue_in(
+            "cancelable",
+            serde_json::json!({}),
+            Duration::from_secs(3600),
+        )
+        .await
+        .unwrap();
+
+        let admin = job_admin_backend(&state).unwrap();
+        let snap = admin.snapshot(JobAdminQuery::default()).await.unwrap();
+        assert_eq!(snap.scheduled.total, 1);
+        let id = snap.scheduled.records[0].id.clone();
+        assert!(snap.scheduled.records[0].scheduled_for.is_some());
+
+        admin
+            .cancel(&id)
+            .await
+            .expect("scheduled job should cancel");
+
+        let snap = admin.snapshot(JobAdminQuery::default()).await.unwrap();
+        assert_eq!(
+            snap.scheduled.total, 0,
+            "canceled scheduled job should leave the scheduled list"
+        );
+
+        shutdown.cancel();
+        clear_global_job_client();
+    }
+
+    #[tokio::test]
     async fn test_interceptor_rejection_rolls_back_enqueue_bookkeeping() {
         struct RejectingInterceptor;
         impl crate::interceptor::JobInterceptor for RejectingInterceptor {
@@ -6769,6 +7692,21 @@ mod tests {
 
         assert_eq!(redis_retry_promotion_interval_ms(250, &jobs), 25);
         assert_eq!(redis_retry_promotion_interval_ms(0, &[]), 1);
+
+        // Large retry backoffs must not delay one-shot delayed-job promotion.
+        let slow_jobs = vec![JobInfo {
+            name: "very_slow".to_string(),
+            max_attempts: 3,
+            initial_backoff_ms: 60_000,
+            uniqueness: None,
+            concurrency: None,
+            handler: redis_counting_success_handler,
+        }];
+        assert_eq!(
+            redis_retry_promotion_interval_ms(60_000, &slow_jobs),
+            REDIS_DELAYED_PROMOTION_MAX_INTERVAL_MS,
+            "large backoff must be capped so delayed jobs are promoted within ~1s"
+        );
     }
 
     #[cfg(feature = "redis")]
@@ -6988,6 +7926,7 @@ mod tests {
         let producer = RedisClient {
             connection,
             queue_key: worker_config.queue_key.clone(),
+            delayed_key: worker_config.delayed_key.clone(),
             record_prefix: worker_config.record_prefix.clone(),
             unique_prefix: worker_config.unique_prefix.clone(),
         };
@@ -6998,6 +7937,7 @@ mod tests {
                 serde_json::json!({ "user_id": 42 }),
                 max_attempts,
                 1,
+                None,
                 &ResolvedJobConstraints::default(),
             )
             .await
@@ -7022,6 +7962,7 @@ mod tests {
         RedisJobAdminBackend::new(
             admin_connection,
             worker_config.queue_key.clone(),
+            worker_config.delayed_key.clone(),
             worker_config.processing_key.clone(),
             worker_config.dead_key.clone(),
             worker_config.completed_key.clone(),
@@ -7030,6 +7971,7 @@ mod tests {
             worker_config.dead_record_prefix.clone(),
             worker_config.unique_prefix.clone(),
             128,
+            crate::actuator::JobRegistry::new(),
         )
     }
 
@@ -7250,6 +8192,7 @@ mod tests {
         let snapshot = backend
             .snapshot(JobAdminQuery {
                 enqueued_page: 1,
+                scheduled_page: 1,
                 running_page: 1,
                 completed_page: 1,
                 failed_page: 1,
@@ -7592,6 +8535,48 @@ mod tests {
 
     #[cfg(feature = "redis")]
     #[test]
+    fn redis_delayed_unique_lock_ttl_extends_for_long_delays() {
+        // Helper mirroring the exact formula in RedisClient::enqueue so we
+        // can test it without a live Redis connection.
+        fn compute_lock_ttl(window: Option<JobUniquenessWindow>, due_at_ms: Option<u64>) -> u64 {
+            let base = redis_unique_lock_ttl_ms(window);
+            match due_at_ms {
+                Some(due_ms) if !matches!(window, Some(JobUniquenessWindow::TtlMs(_))) => {
+                    let delay_ms = due_ms.saturating_sub(now_unix_ms());
+                    delay_ms
+                        .saturating_add(REDIS_UNIQUE_LOCK_TTL_BACKSTOP_MS)
+                        .max(base)
+                }
+                _ => base,
+            }
+        }
+
+        let two_days_ms: u64 = 2 * 24 * 60 * 60 * 1_000;
+        let due_ms = now_unix_ms() + two_days_ms;
+
+        // Non-TTL window + long delay: lock must outlast the 24h backstop.
+        let ttl_running = compute_lock_ttl(Some(JobUniquenessWindow::Running), Some(due_ms));
+        assert!(
+            ttl_running >= two_days_ms,
+            "Running-window lock {ttl_running}ms must cover the 2-day delay"
+        );
+
+        // TTL-window: lock must stay at the user-specified value regardless.
+        let user_ttl_ms: u64 = 3_600_000; // 1h
+        let ttl_explicit =
+            compute_lock_ttl(Some(JobUniquenessWindow::TtlMs(user_ttl_ms)), Some(due_ms));
+        assert_eq!(
+            ttl_explicit, user_ttl_ms,
+            "TtlMs-window lock must not be extended for delayed jobs"
+        );
+
+        // No delay: lock stays at the 24h backstop.
+        let ttl_immediate = compute_lock_ttl(Some(JobUniquenessWindow::Running), None);
+        assert_eq!(ttl_immediate, REDIS_UNIQUE_LOCK_TTL_BACKSTOP_MS);
+    }
+
+    #[cfg(feature = "redis")]
+    #[test]
     fn redis_record_without_constraint_fields_deserializes_as_none() {
         // Records written by pre-#829 producers have none of the new fields.
         let legacy = r#"{"id":"a","name":"send_email","payload":{},"attempt":1,
@@ -7744,6 +8729,7 @@ mod tests {
         let producer = RedisClient {
             connection,
             queue_key: worker_config.queue_key.clone(),
+            delayed_key: worker_config.delayed_key.clone(),
             record_prefix: worker_config.record_prefix.clone(),
             unique_prefix: worker_config.unique_prefix.clone(),
         };
@@ -7754,6 +8740,7 @@ mod tests {
                 serde_json::json!({ "marker": id }),
                 3,
                 1,
+                None,
                 constraints,
             )
             .await
@@ -7924,6 +8911,7 @@ mod tests {
         let producer = RedisClient {
             connection: connection_producer,
             queue_key: worker_config.queue_key.clone(),
+            delayed_key: worker_config.delayed_key.clone(),
             record_prefix: worker_config.record_prefix.clone(),
             unique_prefix: worker_config.unique_prefix.clone(),
         };
@@ -7936,6 +8924,7 @@ mod tests {
                     serde_json::json!({}),
                     1,
                     1,
+                    None,
                     &constraints,
                 )
                 .await
@@ -7972,12 +8961,101 @@ mod tests {
                     serde_json::json!({}),
                     1,
                     1,
+                    None,
                     &constraints,
                 )
                 .await
                 .unwrap(),
             EnqueueOutcome::Queued,
             "a dead worker must not deadlock the unique key"
+        );
+    }
+
+    // Success metric (#1025) on Redis: a delayed enqueue lands on the `:delayed`
+    // ZSET (not the queue), is not claimable before its due time, survives a
+    // reconnect mid-delay, and is promoted to the queue and claimed exactly once
+    // after the due time passes.
+    #[cfg(feature = "redis")]
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires Docker (testcontainers)"]
+    async fn redis_delayed_enqueue_waits_for_due_time_and_survives_restart() {
+        use redis::AsyncCommands as _;
+
+        let (_container, client) = redis_test_client().await;
+        let worker_config = redis_test_worker_config("autumn:test:delayed", "worker-d", 30_000);
+        let state = AppState::for_test().with_profile("dev");
+        state.job_registry().register("send_email");
+        let job_admin = JobAdminMemoryBackend::new_for_test(32);
+        let mut connection = new_redis_connection_manager(&client, "test redis worker").unwrap();
+
+        let producer = RedisClient {
+            connection: new_redis_connection_manager(&client, "test redis producer").unwrap(),
+            queue_key: worker_config.queue_key.clone(),
+            delayed_key: worker_config.delayed_key.clone(),
+            record_prefix: worker_config.record_prefix.clone(),
+            unique_prefix: worker_config.unique_prefix.clone(),
+        };
+
+        // Enqueue due ~2s in the future.
+        let due_at_ms = now_unix_ms() + 2_000;
+        assert_eq!(
+            producer
+                .enqueue(
+                    "d1".to_string(),
+                    "send_email",
+                    serde_json::json!({ "user_id": 7 }),
+                    3,
+                    1,
+                    Some(due_at_ms),
+                    &ResolvedJobConstraints::default(),
+                )
+                .await
+                .unwrap(),
+            EnqueueOutcome::Queued
+        );
+
+        // It is parked on the delayed ZSET, not the work queue.
+        let queue_len: usize = connection.llen(&worker_config.queue_key).await.unwrap();
+        let delayed_len: usize = connection.zcard(&worker_config.delayed_key).await.unwrap();
+        assert_eq!(
+            queue_len, 0,
+            "delayed job must not be on the work queue yet"
+        );
+        assert_eq!(delayed_len, 1, "delayed job must be on the delayed ZSET");
+
+        // Promotion before the due time is a no-op; nothing becomes claimable.
+        promote_due_redis_retries(&mut connection, &worker_config, &state, &job_admin)
+            .await
+            .unwrap();
+        assert!(
+            claim_next_redis_job(&mut connection, &worker_config)
+                .await
+                .unwrap()
+                .is_none(),
+            "delayed job must not be claimable before its due time"
+        );
+
+        // Simulate a worker restart mid-delay: reconnect. The ZSET entry persists.
+        drop(connection);
+        let mut connection = new_redis_connection_manager(&client, "test redis worker 2").unwrap();
+
+        // After the due time: promotion moves it onto the queue and it claims once.
+        tokio::time::sleep(Duration::from_millis(2_500)).await;
+        promote_due_redis_retries(&mut connection, &worker_config, &state, &job_admin)
+            .await
+            .unwrap();
+        let claimed = claim_next_redis_job(&mut connection, &worker_config)
+            .await
+            .unwrap()
+            .expect("due job should be claimable after its due time");
+        assert_eq!(claimed.id, "d1");
+        assert_eq!(claimed.attempt, 1);
+        assert!(
+            claim_next_redis_job(&mut connection, &worker_config)
+                .await
+                .unwrap()
+                .is_none(),
+            "a due job must be delivered to exactly one worker"
         );
     }
 
@@ -8418,7 +9496,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("only enqueued jobs can be canceled"),
+                .contains("only enqueued or scheduled jobs can be canceled"),
             "unexpected error: {error}"
         );
     }
@@ -8457,6 +9535,7 @@ mod tests {
         let snapshot = backend
             .snapshot(JobAdminQuery {
                 enqueued_page: 2,
+                scheduled_page: 1,
                 running_page: 1,
                 completed_page: 1,
                 failed_page: 1,
@@ -8560,6 +9639,7 @@ mod tests {
                 max_attempts,
                 initial_backoff_ms: 1,
                 enqueued_at: None,
+                run_at: None,
                 started_at: None,
                 finished_at: None,
                 claimed_by: Some("worker".to_owned()),
@@ -9086,6 +10166,74 @@ mod tests {
             assert_eq!(finished.status, PG_STATUS_COMPLETED);
             assert!(finished.finished_at.is_some());
             assert!(finished.claimed_by.is_none());
+        }
+
+        // Success metric (#1025): a job enqueued with a future `run_at` is not
+        // delivered before its due time (±1s) and is delivered within one poll
+        // window after. Crash-restart is modeled by dropping the pool and
+        // reconnecting mid-delay — the durable row persists and the job still
+        // fires exactly once.
+        #[tokio::test]
+        #[ignore = "requires Docker (testcontainers)"]
+        async fn pg_delayed_enqueue_is_not_claimable_until_due_and_survives_restart() {
+            use testcontainers::runners::AsyncRunner as _;
+            use testcontainers_modules::postgres::Postgres;
+
+            let container = Postgres::default().start().await.unwrap();
+            let port = container.get_host_port_ipv4(5432).await.unwrap();
+            let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
+
+            let pool = pg_test_pool(&url);
+            pg_run_migration(&pool).await;
+
+            // Enqueue due ~2s in the future.
+            let job_id = uuid::Uuid::new_v4().to_string();
+            let due = chrono::Utc::now() + chrono::TimeDelta::seconds(2);
+            pg_enqueue_job_at(
+                &pool,
+                job_id.clone(),
+                "send_email",
+                serde_json::json!({ "user_id": 7 }),
+                5,
+                250,
+                Some(due),
+                &ResolvedJobConstraints::default(),
+            )
+            .await
+            .expect("delayed enqueue should succeed");
+
+            // Before the due time: not claimable.
+            assert!(
+                pg_claim_next_job(&pool, "worker-1", false).await.is_none(),
+                "delayed job must not be claimable before its due time"
+            );
+
+            // Simulate a worker/process restart mid-delay: drop the pool and
+            // reconnect. The durable row outlives the connection.
+            drop(pool);
+            let pool = pg_test_pool(&url);
+            assert!(
+                pg_claim_next_job(&pool, "worker-2", false).await.is_none(),
+                "delayed job must still be invisible right after a restart"
+            );
+
+            // After the due time: claimable exactly once, then runs the normal path.
+            tokio::time::sleep(Duration::from_millis(2_500)).await;
+            let claimed = pg_claim_next_job(&pool, "worker-2", false)
+                .await
+                .expect("delayed job should be claimable once due");
+            assert_eq!(claimed.id, job_id);
+            assert_eq!(claimed.attempt, 1);
+            assert!(
+                pg_claim_next_job(&pool, "worker-2", false).await.is_none(),
+                "a due job must be delivered to exactly one worker"
+            );
+
+            pg_ack_success(&pool, &job_id, "worker-2")
+                .await
+                .expect("ack should succeed");
+            let finished = pg_fetch_by_id(&pool, &job_id).await.expect("row exists");
+            assert_eq!(finished.status, PG_STATUS_COMPLETED);
         }
 
         #[tokio::test]
@@ -10411,6 +11559,7 @@ mod tests {
                     serde_json::Value::Null,
                     1,
                     1000,
+                    None,
                     &ResolvedJobConstraints::default(),
                 )
                 .await;
@@ -10427,6 +11576,7 @@ mod tests {
                 serde_json::Value::Null,
                 1,
                 1000,
+                None,
                 &ResolvedJobConstraints::default(),
             )
             .await;
@@ -10439,6 +11589,731 @@ mod tests {
                 || err_str.contains("Open")
         );
         crate::circuit_breaker::global_registry().clear();
+    }
+
+    // ── delay_to_when unit tests ──────────────────────────────────────────────
+
+    #[test]
+    fn delay_to_when_zero_returns_approximately_now() {
+        let before = chrono::Utc::now();
+        let result = delay_to_when(std::time::Duration::ZERO);
+        let after = chrono::Utc::now();
+        assert!(
+            result >= before && result <= after,
+            "zero delay should resolve to approximately now"
+        );
+    }
+
+    #[test]
+    fn delay_to_when_overflow_returns_max_utc() {
+        // u64::MAX seconds overflows i64 nanoseconds in TimeDelta::from_std.
+        let huge = std::time::Duration::from_secs(u64::MAX);
+        let result = delay_to_when(huge);
+        assert_eq!(
+            result,
+            chrono::DateTime::<chrono::Utc>::MAX_UTC,
+            "overflow duration must return MAX_UTC rather than panic"
+        );
+    }
+
+    #[test]
+    fn delay_to_when_small_delay_is_in_the_future() {
+        let before = chrono::Utc::now();
+        let result = delay_to_when(std::time::Duration::from_secs(60));
+        assert!(
+            result > before,
+            "a positive delay must resolve to the future"
+        );
+    }
+
+    // ── JobAdminMemoryBackend unit tests ──────────────────────────────────────
+
+    #[test]
+    fn record_requeued_returns_true_for_scheduled_job() {
+        let backend = JobAdminMemoryBackend::new_for_test(32);
+        let future_due = chrono::Utc::now() + chrono::TimeDelta::hours(1);
+        let id = uuid::Uuid::new_v4().to_string();
+        backend.record_enqueue_due(
+            id.clone(),
+            "myjob",
+            serde_json::json!({}),
+            1,
+            3,
+            Some(future_due),
+            chrono::Utc::now(),
+        );
+
+        // Job should be Scheduled.
+        let snap = backend.snapshot_sync(&JobAdminQuery::default());
+        assert_eq!(snap.scheduled.total, 1, "job should start as Scheduled");
+
+        // Transition back to Enqueued (e.g. promotion from delayed ZSET).
+        let was_scheduled = backend.record_requeued(&id, 1);
+        assert!(
+            was_scheduled,
+            "record_requeued must return true for a Scheduled job"
+        );
+
+        let snap2 = backend.snapshot_sync(&JobAdminQuery::default());
+        assert_eq!(
+            snap2.scheduled.total, 0,
+            "job should no longer be Scheduled"
+        );
+        assert_eq!(snap2.enqueued.total, 1, "job should now be Enqueued");
+    }
+
+    #[test]
+    fn record_requeued_returns_false_for_already_enqueued_job() {
+        let backend = JobAdminMemoryBackend::new_for_test(32);
+        let id = backend.record_enqueue_for_test("myjob", serde_json::json!({}), 1, 3);
+
+        let was_scheduled = backend.record_requeued(&id, 1);
+        assert!(
+            !was_scheduled,
+            "record_requeued must return false for an Enqueued (not Scheduled) job"
+        );
+    }
+
+    #[test]
+    fn record_requeued_returns_false_for_missing_id() {
+        let backend = JobAdminMemoryBackend::new_for_test(32);
+        let was_scheduled = backend.record_requeued("nonexistent-id", 1);
+        assert!(
+            !was_scheduled,
+            "record_requeued must return false for a missing id"
+        );
+    }
+
+    #[test]
+    fn cancel_enqueued_fires_cancellation_token() {
+        let backend = JobAdminMemoryBackend::new_for_test(32);
+        let id = backend.record_enqueue_for_test("myjob", serde_json::json!({}), 1, 3);
+
+        let token = tokio_util::sync::CancellationToken::new();
+        let child = token.child_token();
+        backend.register_delay_canceler(id.clone(), token);
+
+        assert!(
+            !child.is_cancelled(),
+            "token must not be cancelled before cancel_enqueued"
+        );
+        backend.cancel_enqueued(&id).expect("cancel should succeed");
+        assert!(
+            child.is_cancelled(),
+            "cancel_enqueued must fire the cancellation token"
+        );
+    }
+
+    #[test]
+    fn cancel_enqueued_removes_canceler_from_map() {
+        let backend = JobAdminMemoryBackend::new_for_test(32);
+        let id = backend.record_enqueue_for_test("myjob", serde_json::json!({}), 1, 3);
+
+        let token = tokio_util::sync::CancellationToken::new();
+        backend.register_delay_canceler(id.clone(), token);
+
+        assert!(
+            backend
+                .inner
+                .read()
+                .unwrap()
+                .delay_cancelers
+                .contains_key(&id),
+            "canceler must be registered before cancel"
+        );
+
+        backend.cancel_enqueued(&id).expect("cancel should succeed");
+
+        assert!(
+            !backend
+                .inner
+                .read()
+                .unwrap()
+                .delay_cancelers
+                .contains_key(&id),
+            "cancel_enqueued must remove the delay canceler from the map"
+        );
+    }
+
+    #[test]
+    fn try_record_start_removes_canceler() {
+        let backend = JobAdminMemoryBackend::new_for_test(32);
+        let id = backend.record_enqueue_for_test("myjob", serde_json::json!({}), 1, 3);
+
+        let token = tokio_util::sync::CancellationToken::new();
+        backend.register_delay_canceler(id.clone(), token);
+
+        assert!(
+            backend
+                .inner
+                .read()
+                .unwrap()
+                .delay_cancelers
+                .contains_key(&id),
+            "canceler should be registered"
+        );
+
+        let decision = backend.try_record_start(&id, 1);
+        assert!(
+            matches!(decision, JobAdminStartDecision::Started),
+            "try_record_start must succeed for an Enqueued job"
+        );
+
+        assert!(
+            !backend
+                .inner
+                .read()
+                .unwrap()
+                .delay_cancelers
+                .contains_key(&id),
+            "try_record_start must remove the delay canceler"
+        );
+    }
+
+    #[test]
+    fn try_record_start_accepts_scheduled_job() {
+        let backend = JobAdminMemoryBackend::new_for_test(32);
+        let future_due = chrono::Utc::now() + chrono::TimeDelta::hours(1);
+        let id = uuid::Uuid::new_v4().to_string();
+        backend.record_enqueue_due(
+            id.clone(),
+            "myjob",
+            serde_json::json!({}),
+            1,
+            3,
+            Some(future_due),
+            chrono::Utc::now(),
+        );
+
+        let snap = backend.snapshot_sync(&JobAdminQuery::default());
+        assert_eq!(
+            snap.scheduled.total, 1,
+            "job must be Scheduled before start"
+        );
+
+        let decision = backend.try_record_start(&id, 1);
+        assert!(
+            matches!(decision, JobAdminStartDecision::Started),
+            "try_record_start must accept a Scheduled job (timer fired)"
+        );
+    }
+
+    #[test]
+    fn prune_job_admin_history_preserves_scheduled_jobs() {
+        // Fill the history beyond its limit with completed jobs, then add a
+        // Scheduled job.  The Scheduled job must survive pruning.
+        let backend = JobAdminMemoryBackend::new_for_test(3);
+
+        // Fill with completed jobs to trigger pruning.
+        for _ in 0..5 {
+            let id = backend.record_enqueue_for_test("done", serde_json::json!({}), 1, 1);
+            backend.record_start_for_test(&id, 1);
+            backend.record_success_for_test(&id);
+        }
+
+        // Add a Scheduled (future-due) job.
+        let future_due = chrono::Utc::now() + chrono::TimeDelta::hours(1);
+        let sched_id = uuid::Uuid::new_v4().to_string();
+        backend.record_enqueue_due(
+            sched_id.clone(),
+            "delayed_job",
+            serde_json::json!({}),
+            1,
+            3,
+            Some(future_due),
+            chrono::Utc::now(),
+        );
+
+        // Force prune by completing another job.
+        let id2 = backend.record_enqueue_for_test("done2", serde_json::json!({}), 1, 1);
+        backend.record_start_for_test(&id2, 1);
+        backend.record_success_for_test(&id2);
+
+        let snap = backend.snapshot_sync(&JobAdminQuery::default());
+        assert_eq!(
+            snap.scheduled.total, 1,
+            "prune_job_admin_history must not evict Scheduled (active) jobs"
+        );
+        assert!(
+            snap.scheduled.records.iter().any(|r| r.id == sched_id),
+            "the specific Scheduled job must still be present after pruning"
+        );
+    }
+
+    #[test]
+    fn cancel_enqueued_rejects_running_job() {
+        let backend = JobAdminMemoryBackend::new_for_test(32);
+        let id = backend.record_enqueue_for_test("myjob", serde_json::json!({}), 1, 3);
+        backend.record_start_for_test(&id, 1);
+
+        let result = backend.cancel_enqueued(&id);
+        assert!(result.is_err(), "canceling a Running job must fail");
+    }
+
+    #[test]
+    fn register_delay_canceler_returns_true_when_already_canceled() {
+        // Simulate the race: admin cancels between record_enqueue_due and
+        // register_delay_canceler.
+        let backend = JobAdminMemoryBackend::new_for_test(32);
+        let future_due = chrono::Utc::now() + chrono::TimeDelta::hours(1);
+        let id = uuid::Uuid::new_v4().to_string();
+        backend.record_enqueue_due(
+            id.clone(),
+            "myjob",
+            serde_json::json!({}),
+            1,
+            3,
+            Some(future_due),
+            chrono::Utc::now(),
+        );
+
+        // Admin cancels before the timer is registered.
+        backend
+            .cancel_enqueued(&id)
+            .expect("cancel before token registration must succeed");
+
+        // register_delay_canceler must detect the Canceled status and return true.
+        let token = tokio_util::sync::CancellationToken::new();
+        let already_canceled = backend.register_delay_canceler(id.clone(), token);
+        assert!(
+            already_canceled,
+            "register_delay_canceler must return true when record is already Canceled"
+        );
+        // The token must NOT have been stored (cancel already happened).
+        assert!(
+            !backend
+                .inner
+                .read()
+                .unwrap()
+                .delay_cancelers
+                .contains_key(&id),
+            "token must not be stored for an already-canceled job"
+        );
+    }
+
+    #[test]
+    fn cancel_enqueued_scheduled_job_succeeds() {
+        let backend = JobAdminMemoryBackend::new_for_test(32);
+        let future_due = chrono::Utc::now() + chrono::TimeDelta::hours(1);
+        let id = uuid::Uuid::new_v4().to_string();
+        backend.record_enqueue_due(
+            id.clone(),
+            "myjob",
+            serde_json::json!({}),
+            1,
+            3,
+            Some(future_due),
+            chrono::Utc::now(),
+        );
+
+        backend
+            .cancel_enqueued(&id)
+            .expect("canceling a Scheduled job must succeed");
+
+        let snap = backend.snapshot_sync(&JobAdminQuery::default());
+        assert_eq!(
+            snap.scheduled.total, 0,
+            "job must leave Scheduled after cancel"
+        );
+    }
+
+    // ── enqueue_after_commit_delay tests ─────────────────────────────────────
+
+    #[tokio::test]
+    async fn enqueue_after_commit_delay_outside_tx_enqueues_with_delay() {
+        use std::time::Duration;
+        let (client, mut rx) = make_test_client();
+
+        // Outside any tx scope — should enqueue immediately (bypass after-commit).
+        client
+            .enqueue_after_commit_delay("test_job", serde_json::json!({"x": 42}), Duration::ZERO)
+            .await
+            .expect("enqueue_after_commit_delay should succeed outside tx");
+
+        let received = tokio::time::timeout(Duration::from_millis(200), rx.recv()).await;
+        assert!(
+            received.is_ok(),
+            "job should be delivered when delay is zero and outside tx"
+        );
+        let job = received.unwrap().expect("channel must not be closed");
+        assert_eq!(job.name, "test_job");
+    }
+
+    #[tokio::test]
+    async fn enqueue_after_commit_delay_inside_scope_defers_and_resolves_at_commit_time() {
+        use crate::db::{AFTER_COMMIT_REGISTRY, CommitCallback};
+        use std::sync::{Arc, Mutex};
+        use std::time::Duration;
+
+        let (client, mut rx) = make_test_client();
+        let registry = Arc::new(Mutex::new(Vec::<CommitCallback>::new()));
+
+        AFTER_COMMIT_REGISTRY
+            .scope(registry.clone(), async {
+                client
+                    .enqueue_after_commit_delay(
+                        "test_job",
+                        serde_json::json!({"x": 99}),
+                        Duration::ZERO,
+                    )
+                    .await
+                    .expect("enqueue_after_commit_delay should succeed inside scope");
+            })
+            .await;
+
+        // Job must NOT have been delivered before commit.
+        let not_received = tokio::time::timeout(Duration::from_millis(50), rx.recv()).await;
+        assert!(
+            not_received.is_err(),
+            "job must not be delivered before commit callbacks run"
+        );
+
+        // Fire commit callbacks (simulating a DB commit).
+        let callbacks: Vec<CommitCallback> = {
+            let mut reg = registry.lock().unwrap();
+            std::mem::take(&mut *reg)
+        };
+        for cb in callbacks {
+            cb().await.unwrap();
+        }
+
+        // Now the job should arrive.
+        let received = tokio::time::timeout(Duration::from_millis(200), rx.recv()).await;
+        assert!(
+            received.is_ok(),
+            "job should be delivered after commit callbacks run"
+        );
+        let job = received.unwrap().expect("channel must not be closed");
+        assert_eq!(job.name, "test_job");
+    }
+
+    // ── local cancel releases unique lock via CancellationToken ─────────────
+
+    #[tokio::test]
+    async fn local_scheduled_cancel_releases_unique_lock_immediately() {
+        let _guard = global_job_runtime_test_lock().lock().await;
+        clear_global_job_client();
+
+        let state = AppState::for_test().with_profile("dev");
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        start_local_runtime(
+            vec![JobInfo {
+                name: "unique_cancelable".to_string(),
+                max_attempts: 1,
+                initial_backoff_ms: 10,
+                uniqueness: Some(JobUniqueness {
+                    by: vec![],
+                    window: JobUniquenessWindow::Running,
+                }),
+                concurrency: None,
+                handler: |_state, _payload| Box::pin(async move { Ok(()) }),
+            }],
+            &state,
+            &shutdown,
+            1,
+            5,
+            250,
+        );
+
+        // Enqueue the first job with a long delay — it holds the unique lock.
+        enqueue_in(
+            "unique_cancelable",
+            serde_json::json!({}),
+            Duration::from_secs(3600),
+        )
+        .await
+        .unwrap();
+
+        let admin = job_admin_backend(&state).unwrap();
+        let snap = admin.snapshot(JobAdminQuery::default()).await.unwrap();
+        assert_eq!(snap.scheduled.total, 1, "first job should be Scheduled");
+        let id = snap.scheduled.records[0].id.clone();
+
+        // Cancel it — this must fire the CancellationToken and release the unique lock.
+        admin.cancel(&id).await.expect("cancel must succeed");
+
+        // Allow the spawned timer task a brief moment to process the cancellation.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Now a second enqueue with the same unique key must succeed (not deduplicate).
+        let result = enqueue_in(
+            "unique_cancelable",
+            serde_json::json!({}),
+            Duration::from_secs(3600),
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "second enqueue must succeed after unique lock is released by cancel"
+        );
+
+        let snap2 = admin.snapshot(JobAdminQuery::default()).await.unwrap();
+        assert_eq!(
+            snap2.scheduled.total, 1,
+            "second delayed job should be Scheduled"
+        );
+
+        shutdown.cancel();
+        clear_global_job_client();
+    }
+
+    // ── record_enqueue_due: None/past due → Enqueued status ─────────────────
+
+    #[test]
+    fn record_enqueue_due_with_none_due_at_produces_enqueued_status() {
+        let backend = JobAdminMemoryBackend::new_for_test(32);
+        let id = uuid::Uuid::new_v4().to_string();
+        backend.record_enqueue_due(
+            id,
+            "myjob",
+            serde_json::json!({}),
+            1,
+            3,
+            None,
+            chrono::Utc::now(),
+        );
+        let snap = backend.snapshot_sync(&JobAdminQuery::default());
+        assert_eq!(
+            snap.enqueued.total, 1,
+            "None due_at must produce Enqueued status"
+        );
+        assert_eq!(
+            snap.scheduled.total, 0,
+            "None due_at must not produce Scheduled status"
+        );
+    }
+
+    #[test]
+    fn record_enqueue_due_with_past_due_at_produces_enqueued_status() {
+        let backend = JobAdminMemoryBackend::new_for_test(32);
+        let id = uuid::Uuid::new_v4().to_string();
+        let past = chrono::Utc::now() - chrono::TimeDelta::hours(1);
+        backend.record_enqueue_due(
+            id,
+            "myjob",
+            serde_json::json!({}),
+            1,
+            3,
+            Some(past),
+            chrono::Utc::now(),
+        );
+        let snap = backend.snapshot_sync(&JobAdminQuery::default());
+        assert_eq!(
+            snap.enqueued.total, 1,
+            "past due_at must produce Enqueued status"
+        );
+        assert_eq!(
+            snap.scheduled.total, 0,
+            "past due_at must not produce Scheduled status"
+        );
+    }
+
+    // ── enqueue_after_commit_due: None / past / deferred / error ────────────
+
+    #[tokio::test]
+    async fn enqueue_after_commit_due_with_none_enqueues_immediately() {
+        use std::time::Duration;
+        let (client, mut rx) = make_test_client();
+
+        client
+            .enqueue_after_commit_due("test_job", serde_json::json!({"x": 10}), None)
+            .await
+            .expect("enqueue_after_commit_due(None) should succeed outside tx");
+
+        let received = tokio::time::timeout(Duration::from_millis(200), rx.recv()).await;
+        assert!(
+            received.is_ok(),
+            "job should be delivered immediately when due_at is None"
+        );
+        assert_eq!(received.unwrap().unwrap().name, "test_job");
+    }
+
+    #[tokio::test]
+    async fn enqueue_after_commit_due_with_past_enqueues_immediately() {
+        use std::time::Duration;
+        let (client, mut rx) = make_test_client();
+
+        let past = chrono::Utc::now() - chrono::TimeDelta::hours(1);
+        client
+            .enqueue_after_commit_due("test_job", serde_json::json!({"x": 20}), Some(past))
+            .await
+            .expect("enqueue_after_commit_due(Some(past)) should succeed outside tx");
+
+        let received = tokio::time::timeout(Duration::from_millis(200), rx.recv()).await;
+        assert!(
+            received.is_ok(),
+            "job should be delivered immediately when due_at is in the past"
+        );
+        assert_eq!(received.unwrap().unwrap().name, "test_job");
+    }
+
+    #[tokio::test]
+    async fn enqueue_after_commit_due_inside_scope_defers_and_fires() {
+        use crate::db::{AFTER_COMMIT_REGISTRY, CommitCallback};
+        use std::sync::{Arc, Mutex};
+        use std::time::Duration;
+
+        let (client, mut rx) = make_test_client();
+        let registry = Arc::new(Mutex::new(Vec::<CommitCallback>::new()));
+        let past = chrono::Utc::now() - chrono::TimeDelta::hours(1);
+
+        AFTER_COMMIT_REGISTRY
+            .scope(registry.clone(), async {
+                client
+                    .enqueue_after_commit_due("test_job", serde_json::json!({"x": 30}), Some(past))
+                    .await
+                    .expect("enqueue_after_commit_due should succeed inside scope");
+            })
+            .await;
+
+        let not_received = tokio::time::timeout(Duration::from_millis(50), rx.recv()).await;
+        assert!(
+            not_received.is_err(),
+            "job must not be delivered before commit callbacks run"
+        );
+
+        let callbacks: Vec<CommitCallback> = {
+            let mut reg = registry.lock().unwrap();
+            std::mem::take(&mut *reg)
+        };
+        for cb in callbacks {
+            cb().await.unwrap();
+        }
+
+        let received = tokio::time::timeout(Duration::from_millis(200), rx.recv()).await;
+        assert!(
+            received.is_ok(),
+            "job should be delivered after commit callbacks run"
+        );
+        assert_eq!(received.unwrap().unwrap().name, "test_job");
+    }
+
+    #[tokio::test]
+    async fn enqueue_after_commit_due_rejects_unregistered_job() {
+        let (client, _rx) = make_test_client();
+        let result = client
+            .enqueue_after_commit_due("unregistered_job", serde_json::json!({}), None)
+            .await;
+        assert!(result.is_err(), "unregistered job must fail eagerly");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("not registered"),
+            "error must mention 'not registered', got: {msg}"
+        );
+    }
+
+    // ── module-level enqueue_in_after_commit / enqueue_at_after_commit ───────
+
+    #[tokio::test]
+    async fn module_enqueue_in_after_commit_fails_without_global_client() {
+        let _guard = global_job_runtime_test_lock().lock().await;
+        clear_global_job_client();
+
+        let result =
+            enqueue_in_after_commit("some_job", serde_json::json!({}), std::time::Duration::ZERO)
+                .await;
+        assert!(
+            result.is_err(),
+            "enqueue_in_after_commit without global client must fail"
+        );
+
+        clear_global_job_client();
+    }
+
+    #[tokio::test]
+    async fn module_enqueue_at_after_commit_fails_without_global_client() {
+        let _guard = global_job_runtime_test_lock().lock().await;
+        clear_global_job_client();
+
+        let when = chrono::Utc::now();
+        let result = enqueue_at_after_commit("some_job", serde_json::json!({}), when).await;
+        assert!(
+            result.is_err(),
+            "enqueue_at_after_commit without global client must fail"
+        );
+
+        clear_global_job_client();
+    }
+
+    #[tokio::test]
+    async fn module_enqueue_in_after_commit_delivers_job_outside_tx() {
+        use std::time::Duration;
+        let _guard = global_job_runtime_test_lock().lock().await;
+        clear_global_job_client();
+
+        let (tx, mut rx) = mpsc::channel(16);
+        init_global_job_client(JobClient {
+            local_sender: Some(tx),
+            local_coordination: None,
+            #[cfg(feature = "redis")]
+            redis: None,
+            #[cfg(feature = "db")]
+            pg_pool: None,
+            registry: crate::actuator::JobRegistry::new(),
+            job_admin: JobAdminMemoryBackend::new_for_test(32),
+            default_max_attempts: 3,
+            default_initial_backoff_ms: 100,
+            per_job_settings: HashMap::from([(
+                "test_job".to_string(),
+                JobRuntimeSettings::basic(3, 100),
+            )]),
+            interceptor: None,
+            resilience_config: None,
+        });
+
+        enqueue_in_after_commit("test_job", serde_json::json!({"x": 1}), Duration::ZERO)
+            .await
+            .expect("enqueue_in_after_commit should succeed outside tx");
+
+        let received = tokio::time::timeout(Duration::from_millis(200), rx.recv()).await;
+        assert!(
+            received.is_ok(),
+            "job should be delivered immediately with zero delay outside tx"
+        );
+        assert_eq!(received.unwrap().unwrap().name, "test_job");
+
+        clear_global_job_client();
+    }
+
+    #[tokio::test]
+    async fn module_enqueue_at_after_commit_delivers_job_outside_tx() {
+        use std::time::Duration;
+        let _guard = global_job_runtime_test_lock().lock().await;
+        clear_global_job_client();
+
+        let (tx, mut rx) = mpsc::channel(16);
+        init_global_job_client(JobClient {
+            local_sender: Some(tx),
+            local_coordination: None,
+            #[cfg(feature = "redis")]
+            redis: None,
+            #[cfg(feature = "db")]
+            pg_pool: None,
+            registry: crate::actuator::JobRegistry::new(),
+            job_admin: JobAdminMemoryBackend::new_for_test(32),
+            default_max_attempts: 3,
+            default_initial_backoff_ms: 100,
+            per_job_settings: HashMap::from([(
+                "test_job".to_string(),
+                JobRuntimeSettings::basic(3, 100),
+            )]),
+            interceptor: None,
+            resilience_config: None,
+        });
+
+        let past = chrono::Utc::now() - chrono::TimeDelta::hours(1);
+        enqueue_at_after_commit("test_job", serde_json::json!({"x": 2}), past)
+            .await
+            .expect("enqueue_at_after_commit should succeed outside tx");
+
+        let received = tokio::time::timeout(Duration::from_millis(200), rx.recv()).await;
+        assert!(
+            received.is_ok(),
+            "job should be delivered immediately for past due time outside tx"
+        );
+        assert_eq!(received.unwrap().unwrap().name, "test_job");
+
+        clear_global_job_client();
     }
 }
 
