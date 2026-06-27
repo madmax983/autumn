@@ -1440,7 +1440,7 @@ fn mount_htmx_routes(mut router: axum::Router<AppState>) -> axum::Router<AppStat
 }
 
 #[cfg_attr(not(feature = "mail"), allow(unused_variables))]
-#[allow(clippy::cognitive_complexity)]
+#[allow(clippy::cognitive_complexity, clippy::too_many_lines)]
 fn mount_framework_routes(
     mut router: axum::Router<AppState>,
     config: &AutumnConfig,

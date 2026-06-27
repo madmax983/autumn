@@ -95,9 +95,10 @@ pub trait LiveFragment {
 
     /// Htmx swap strategy to use when a new record is inserted.
     ///
-    /// Defaults to [`OobSwap::True`] (replace an element with the matching id).
-    /// Override to use `OobSwap::BeforeEnd` (append to a list container) or
-    /// any other strategy.
+    /// Defaults to [`crate::htmx::OobSwap::True`] (replace an element with the
+    /// matching id). Override to use `OobSwap::BeforeEnd` (append to a list
+    /// container) or any other strategy.
+    #[must_use]
     fn insert_swap() -> crate::htmx::OobSwap {
         crate::htmx::OobSwap::True
     }

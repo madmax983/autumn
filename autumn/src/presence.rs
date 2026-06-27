@@ -427,6 +427,7 @@ pub fn presence_stream(
 ///
 /// The `<span>` carries `id="presence-badge"` so that [`presence_stream`]
 /// can swap it in-place via htmx OOB on every join/leave event.
+#[must_use]
 #[cfg(feature = "maud")]
 pub fn presence_badge(count: usize) -> maud::Markup {
     maud::html! {
