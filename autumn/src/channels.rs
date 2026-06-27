@@ -339,7 +339,7 @@ impl Broadcast {
         strategy: &crate::htmx::OobSwap,
         fragment: &maud::Markup,
     ) -> Result<usize, BroadcastError> {
-        use crate::htmx::{inject_hx_swap_oob, OobSwap};
+        use crate::htmx::{OobSwap, inject_hx_swap_oob};
         let rendered = &fragment.0;
         let envelope = if strategy == &OobSwap::Raw {
             rendered.clone()
@@ -347,7 +347,12 @@ impl Broadcast {
             let value = strategy.format_value(id);
             let escaped_value = crate::htmx::escape_attribute_string(&value);
 
-            let is_outer_html = matches!(strategy, OobSwap::True | OobSwap::OuterHTML | OobSwap::Target(crate::htmx::OobMethod::OuterHTML, _));
+            let is_outer_html = matches!(
+                strategy,
+                OobSwap::True
+                    | OobSwap::OuterHTML
+                    | OobSwap::Target(crate::htmx::OobMethod::OuterHTML, _)
+            );
 
             if is_outer_html {
                 inject_hx_swap_oob(rendered, &value).map_or_else(
