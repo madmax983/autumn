@@ -315,7 +315,7 @@ mod tests {
             .into_string();
 
         let combined = format!("{msg_go1} {msg_go2}");
-        assert!(combined.contains("hx-swap-oob=\"beforeend:#nullable_posts-list\""));
+        assert!(combined.contains("hx-swap-oob=\"beforeend:#category-posts-list\""));
         assert!(combined.contains(&format!("nullable_post-{}", post_none.id)));
         assert!(combined.contains(&format!("nullable_post-{}", post_some.id)));
 
