@@ -470,6 +470,24 @@ fn render_repository_file(
              {sharded_note}"
         )
     };
+    // For API scaffolds with --live, emit the stream route directly in the
+    // repository file since there is no separate routes file.
+    let api_stream_handler = if api && live {
+        format!(
+            "\n/// `GET /{plural}/stream` — SSE stream for live OOB fragments.\n\
+             ///\n\
+             /// Clients subscribe here to receive `hx-swap-oob` fragments whenever a\n\
+             /// `{snake_name}` is saved, updated, or deleted via the API.\n\
+             #[autumn_web::get(\"/{plural}/stream\")]\n\
+             pub async fn stream(\n\
+             \x20\x20\x20\x20state: autumn_web::extract::State<autumn_web::AppState>,\n\
+             ) -> impl autumn_web::IntoResponse {{\n\
+             \x20\x20\x20\x20autumn_web::sse::stream(&state, \"{plural}\")\n\
+             }}\n"
+        )
+    } else {
+        String::new()
+    };
     let list_id = format!("{plural}-list");
     let live_fragment_impl = if live {
         format!(
@@ -507,7 +525,8 @@ fn render_repository_file(
          pub trait {pascal_name}Repository {{\n\
 {query_body}\
          }}\n\
-{live_fragment_impl}"
+{live_fragment_impl}\
+{api_stream_handler}"
     )
 }
 
@@ -1587,13 +1606,17 @@ fn main_route_entries(
     validated_field_names: &[String],
 ) -> Vec<String> {
     if api {
-        vec![
+        let mut entries = vec![
             format!("repositories::{snake_name}::{snake_name}_api_list"),
             format!("repositories::{snake_name}::{snake_name}_api_get"),
             format!("repositories::{snake_name}::{snake_name}_api_create"),
             format!("repositories::{snake_name}::{snake_name}_api_update"),
             format!("repositories::{snake_name}::{snake_name}_api_delete"),
-        ]
+        ];
+        if live {
+            entries.push(format!("repositories::{snake_name}::stream"));
+        }
+        entries
     } else {
         let mut entries = vec![
             format!("routes::{plural}::index"),

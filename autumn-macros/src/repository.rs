@@ -972,6 +972,37 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         quote! {}
     };
 
+    // Broadcast field tokens — defined here so they are in scope for both
+    // `across_tenants_method` (below) and the main struct/constructor block
+    // (further down).  The full doc-comment version `bcast_struct_field` is
+    // used only in the struct definition; the clone/none/state variants are
+    // used in every constructor that builds a `Self { .. }` literal.
+    let has_broadcasts = config.broadcasts.is_some();
+    let bcast_struct_field = if has_broadcasts {
+        quote! {
+            /// Broadcast handle for live OOB fragment publishing (`broadcasts = "topic"`).
+            /// `None` when the repository was built without an `AppState` (e.g. `with_pool_untracked`).
+            __autumn_broadcast: ::std::option::Option<::autumn_web::channels::Broadcast>,
+        }
+    } else {
+        quote! {}
+    };
+    let bcast_clone_field = if has_broadcasts {
+        quote! { __autumn_broadcast: self.__autumn_broadcast.clone(), }
+    } else {
+        quote! {}
+    };
+    let bcast_field_none = if has_broadcasts {
+        quote! { __autumn_broadcast: ::core::option::Option::None, }
+    } else {
+        quote! {}
+    };
+    let bcast_field_some_state = if has_broadcasts {
+        quote! { __autumn_broadcast: ::std::option::Option::Some(state.broadcast()), }
+    } else {
+        quote! {}
+    };
+
     let across_tenants_method = if config.tenant_scoped {
         if let Some(hooks_ident) = &config.hooks_type {
             let idempotency_clone_field = if commit_hooks_enabled {
@@ -992,6 +1023,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         #idempotency_clone_field
                         across_tenants: true,
                         #shards_clone_field
+                        #bcast_clone_field
                         __autumn_read_route: self.__autumn_read_route.clone(),
                         __autumn_statement_timeout_ms: self.__autumn_statement_timeout_ms,
                         __autumn_slow_threshold: self.__autumn_slow_threshold,
@@ -1009,6 +1041,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         pool: self.pool.clone(),
                         across_tenants: true,
                         #shards_clone_field
+                        #bcast_clone_field
                         __autumn_read_route: self.__autumn_read_route.clone(),
                         __autumn_statement_timeout_ms: self.__autumn_statement_timeout_ms,
                         __autumn_slow_threshold: self.__autumn_slow_threshold,
@@ -1067,6 +1100,9 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         self.__autumn_route.as_deref(),
                         __shard.name(),
                     ),
+                    // Shard sub-repos are used for read fan-out only; mutations
+                    // broadcast from the parent, not the per-shard instance.
+                    #bcast_field_none
                 }
             }
         }
@@ -1133,39 +1169,6 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 );
             }
         }
-    } else {
-        quote! {}
-    };
-
-    // `__autumn_broadcast` is only emitted when `broadcasts = "topic"` is declared.
-    // Emitting it unconditionally (even behind `#[cfg]`) for repositories that never
-    // use broadcasts wastes memory and generates "unexpected cfg" warnings in consumer
-    // crates that don't define `ws`/`maud`/`htmx` as their own features.
-    // When `broadcasts` IS configured the field is always present (no `#[cfg]` guard)
-    // so a missing ws+maud+htmx feature produces a clear compile error instead of a
-    // silent no-op.
-    let has_broadcasts = config.broadcasts.is_some();
-    let bcast_struct_field = if has_broadcasts {
-        quote! {
-            /// Broadcast handle for live OOB fragment publishing (`broadcasts = "topic"`).
-            /// `None` when the repository was built without an `AppState` (e.g. `with_pool_untracked`).
-            __autumn_broadcast: ::std::option::Option<::autumn_web::channels::Broadcast>,
-        }
-    } else {
-        quote! {}
-    };
-    let bcast_clone_field = if has_broadcasts {
-        quote! { __autumn_broadcast: self.__autumn_broadcast.clone(), }
-    } else {
-        quote! {}
-    };
-    let bcast_field_none = if has_broadcasts {
-        quote! { __autumn_broadcast: ::core::option::Option::None, }
-    } else {
-        quote! {}
-    };
-    let bcast_field_some_state = if has_broadcasts {
-        quote! { __autumn_broadcast: ::std::option::Option::Some(state.broadcast()), }
     } else {
         quote! {}
     };
