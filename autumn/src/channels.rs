@@ -379,6 +379,7 @@ fn sse_oob_envelope(id: &str, strategy: &crate::htmx::OobSwap, fragment_html: &s
             format!("<div id=\"{id}\" hx-swap-oob=\"delete\"></div>")
         }
         OobSwap::True => inject_oob_attr(fragment_html, "true"),
+        OobSwap::OuterHTML => inject_oob_attr(fragment_html, "outerHTML"),
         OobSwap::Raw => fragment_html.to_string(),
         OobSwap::Custom(val) => inject_oob_attr(fragment_html, val),
         _ => {
