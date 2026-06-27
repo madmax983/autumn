@@ -1,3 +1,46 @@
+//! Circuit breaker pattern for resilience against cascading failures.
+//!
+//! A circuit breaker acts as a proxy for operations that might fail. It monitors
+//! the failure rate and, if it exceeds a threshold, "opens" the circuit to fail
+//! fast instead of overwhelming a struggling dependency. After a cooldown
+//! period, it enters a "half-open" state to test if the dependency has recovered.
+//!
+//! # Configuration
+//!
+//! Breakers are configured via `[resilience.circuit_breaker]` in `autumn.toml`.
+//! You can set global defaults and override them per-host.
+//!
+//! # Examples
+//!
+//! ```rust,ignore
+//! use autumn_web::circuit_breaker::{CircuitBreaker, CircuitBreakerPolicy};
+//! use std::time::Duration;
+//!
+//! let policy = CircuitBreakerPolicy {
+//!     failure_ratio_threshold: 0.5,
+//!     sample_window: Duration::from_secs(10),
+//!     minimum_sample_count: 5,
+//!     open_duration: Duration::from_secs(60),
+//!     half_open_trial_count: 2,
+//! };
+//!
+//! let breaker = CircuitBreaker::new("my_api", policy);
+//!
+//! // Run a future through the breaker
+//! let result = breaker.run(async {
+//!     // call external API
+//!     Ok::<_, &'static str>("success")
+//! }).await;
+//!
+//! // Use with Tower layers
+//! use autumn_web::circuit_breaker::CircuitBreakerLayer;
+//! use tower::{ServiceBuilder, ServiceExt};
+//!
+//! let svc = ServiceBuilder::new()
+//!     .layer(CircuitBreakerLayer::new(breaker))
+//!     .service(my_inner_service);
+//! ```
+
 #![allow(
     clippy::missing_panics_doc,
     clippy::missing_errors_doc,

@@ -151,7 +151,7 @@ mod sns_verify {
         Some((content_start, len))
     }
 
-    /// Extract the DER-encoded SubjectPublicKeyInfo from a DER X.509 certificate.
+    /// Extract the DER-encoded `SubjectPublicKeyInfo` from a DER X.509 certificate.
     pub(super) fn extract_spki_from_der(cert_der: &[u8]) -> Option<Vec<u8>> {
         let mut pos = 0;
         // Certificate SEQUENCE
@@ -209,36 +209,33 @@ mod sns_verify {
         use sha2::Digest as _;
 
         let public_key = rsa::RsaPublicKey::from_public_key_der(spki_der).map_err(|_| ())?;
-        match sig_version {
-            "2" => {
-                let hash = sha2::Sha256::digest(message);
-                public_key
-                    .verify(Pkcs1v15Sign::new::<sha2::Sha256>(), &hash, sig)
-                    .map_err(|_| ())
-            }
-            _ => {
-                // SignatureVersion 1 uses SHA-1.
-                // sha1 0.10 uses const-oid 0.10.x while rsa 0.9 uses const-oid 0.9.x,
-                // so Pkcs1v15Sign::new::<sha1::Sha1>() fails to compile.  Work around
-                // the version split by using new_unprefixed() and prepending the
-                // DigestInfo DER structure (RFC 3447 §9.2) manually.
-                use sha1::Digest as _;
-                let hash = sha1::Sha1::digest(message);
-                // SHA-1 DigestInfo prefix: SEQUENCE { SEQUENCE { OID sha1, NULL }, OCTET STRING }
-                const SHA1_DI_PREFIX: &[u8] = &[
-                    0x30, 0x21, 0x30, 0x09, 0x06, 0x05, 0x2b, 0x0e, 0x03, 0x02, 0x1a, 0x05, 0x00,
-                    0x04, 0x14,
-                ];
-                let mut digest_info = SHA1_DI_PREFIX.to_vec();
-                digest_info.extend_from_slice(&hash);
-                public_key
-                    .verify(Pkcs1v15Sign::new_unprefixed(), &digest_info, sig)
-                    .map_err(|_| ())
-            }
+        if sig_version == "2" {
+            let hash = sha2::Sha256::digest(message);
+            public_key
+                .verify(Pkcs1v15Sign::new::<sha2::Sha256>(), &hash, sig)
+                .map_err(|_| ())
+        } else {
+            // SignatureVersion 1 uses SHA-1.
+            // sha1 0.10 uses const-oid 0.10.x while rsa 0.9 uses const-oid 0.9.x,
+            // so Pkcs1v15Sign::new::<sha1::Sha1>() fails to compile.  Work around
+            // the version split by using new_unprefixed() and prepending the
+            // DigestInfo DER structure (RFC 3447 §9.2) manually.
+            use sha1::Digest as _;
+            let hash = sha1::Sha1::digest(message);
+            // SHA-1 DigestInfo prefix: SEQUENCE { SEQUENCE { OID sha1, NULL }, OCTET STRING }
+            const SHA1_DI_PREFIX: &[u8] = &[
+                0x30, 0x21, 0x30, 0x09, 0x06, 0x05, 0x2b, 0x0e, 0x03, 0x02, 0x1a, 0x05, 0x00,
+                0x04, 0x14,
+            ];
+            let mut digest_info = SHA1_DI_PREFIX.to_vec();
+            digest_info.extend_from_slice(&hash);
+            public_key
+                .verify(Pkcs1v15Sign::new_unprefixed(), &digest_info, sig)
+                .map_err(|_| ())
         }
     }
 
-    /// Verify the SNS notification signature and optional TopicArn binding.
+    /// Verify the SNS notification signature and optional `TopicArn` binding.
     ///
     /// `expected_topic_arn` — when `Some`, the notification's `TopicArn` must
     /// match exactly; this prevents any other AWS account's SNS topic from
@@ -308,7 +305,7 @@ mod sns_verify {
             StatusCode::UNAUTHORIZED
         })?;
         verify_rsa_signature(&spki, canonical.as_bytes(), &sig_bytes, sig_version).map_err(
-            |_| {
+            |()| {
                 tracing::warn!("inbound_mail.ses: SNS signature verification failed");
                 StatusCode::UNAUTHORIZED
             },
@@ -783,7 +780,7 @@ impl InboundMailRouter {
             .spam_report
             .as_ref()
             .and_then(|r| r.verdict.as_deref())
-            .map_or(false, |v| v.eq_ignore_ascii_case("yes"))
+            .is_some_and(|v| v.eq_ignore_ascii_case("yes"))
             && let Some(handler) = self.spam_handler
         {
             return handler(email).await;
@@ -948,9 +945,7 @@ pub(crate) fn parse_mailgun(
     // Use actual file parts when available (multipart/form-data delivery); fall back
     // to metadata-only attachment stubs for URL-encoded deliveries where Mailgun
     // includes only attachment-count / attachment-{n} fields.
-    let attachments = if !file_parts.is_empty() {
-        file_parts
-    } else {
+    let attachments = if file_parts.is_empty() {
         let attachment_count: usize = form
             .get("attachment-count")
             .and_then(|s| s.parse().ok())
@@ -967,6 +962,8 @@ pub(crate) fn parse_mailgun(
             }
         }
         metadata
+    } else {
+        file_parts
     };
 
     Ok(InboundEmail {
@@ -1186,7 +1183,7 @@ fn parse_rfc5322(raw: Bytes) -> InboundEmail {
     // but pass the original `content_type` value to boundary extraction so that
     // case-sensitive boundary parameter values are preserved.
     let ct_lower = content_type.to_ascii_lowercase();
-    let (text_body, html_body, attachments) = if body_bytes.iter().all(|b| b.is_ascii_whitespace())
+    let (text_body, html_body, attachments) = if body_bytes.iter().all(u8::is_ascii_whitespace)
     {
         (None, None, Vec::new())
     } else if ct_lower.starts_with("multipart/") {
@@ -1208,8 +1205,7 @@ fn parse_rfc5322(raw: Bytes) -> InboundEmail {
             let ct_only = ct_lower
                 .split(';')
                 .next()
-                .map(str::trim)
-                .unwrap_or("application/octet-stream")
+                .map_or("application/octet-stream", str::trim)
                 .to_string();
             let data = if cte == "base64" {
                 let stripped: String = String::from_utf8_lossy(body_bytes)
@@ -1217,9 +1213,7 @@ fn parse_rfc5322(raw: Bytes) -> InboundEmail {
                     .filter(|c| !c.is_ascii_whitespace())
                     .collect();
                 base64::engine::general_purpose::STANDARD
-                    .decode(stripped.as_bytes())
-                    .map(Bytes::from)
-                    .unwrap_or_else(|_| Bytes::copy_from_slice(body_bytes))
+                    .decode(stripped.as_bytes()).map_or_else(|_| Bytes::copy_from_slice(body_bytes), Bytes::from)
             } else if cte == "quoted-printable" {
                 Bytes::from(decode_quoted_printable_bytes(body_bytes))
             } else {
@@ -1455,7 +1449,7 @@ fn extract_multipart_bodies(
                 let after = abs + delim.len();
                 if !matches!(
                     body.get(after),
-                    None | Some(b'\r') | Some(b'\n') | Some(b'-') | Some(b' ') | Some(b'\t')
+                    None | Some(b'\r' | b'\n' | b'-' | b' ' | b'\t')
                 ) {
                     pos += rel + 1;
                     continue;
@@ -1495,14 +1489,10 @@ fn extract_multipart_bodies(
         // Per RFC 2045 §5.2, a missing Content-Type defaults to text/plain.
         let part_ct_lower = part_headers
             .lines()
-            .find(|l| l.to_ascii_lowercase().starts_with("content-type:"))
-            .map(|l| l[13..].trim().to_ascii_lowercase())
-            .unwrap_or_else(|| "text/plain".to_string());
+            .find(|l| l.to_ascii_lowercase().starts_with("content-type:")).map_or_else(|| "text/plain".to_string(), |l| l[13..].trim().to_ascii_lowercase());
         let part_ct_orig = part_headers
             .lines()
-            .find(|l| l.to_ascii_lowercase().starts_with("content-type:"))
-            .map(|l| l[13..].trim().to_string())
-            .unwrap_or_else(|| "text/plain".to_string());
+            .find(|l| l.to_ascii_lowercase().starts_with("content-type:")).map_or_else(|| "text/plain".to_string(), |l| l[13..].trim().to_string());
         let part_cte = part_headers
             .lines()
             .find(|l| {
@@ -1544,8 +1534,7 @@ fn extract_multipart_bodies(
             let ct_only = part_ct_lower
                 .split(';')
                 .next()
-                .map(str::trim)
-                .unwrap_or("application/octet-stream")
+                .map_or("application/octet-stream", str::trim)
                 .to_string();
             let data = if part_cte == "base64" {
                 let stripped: String = String::from_utf8_lossy(part_body_bytes)
@@ -1553,9 +1542,7 @@ fn extract_multipart_bodies(
                     .filter(|c| !c.is_ascii_whitespace())
                     .collect();
                 base64::engine::general_purpose::STANDARD
-                    .decode(stripped.as_bytes())
-                    .map(Bytes::from)
-                    .unwrap_or_else(|_| Bytes::copy_from_slice(part_body_bytes))
+                    .decode(stripped.as_bytes()).map_or_else(|_| Bytes::copy_from_slice(part_body_bytes), Bytes::from)
             } else if part_cte == "quoted-printable" {
                 // Use the byte-returning decoder to avoid UTF-8 replacement for
                 // non-text attachments whose decoded bytes may not be valid UTF-8.
@@ -1737,7 +1724,7 @@ fn find_part_end(body: &[u8], crlf_delim: &[u8], lf_delim: &[u8]) -> Option<usiz
         let after = abs + crlf_delim.len();
         if matches!(
             body.get(after),
-            None | Some(b'\r') | Some(b'\n') | Some(b'-') | Some(b' ') | Some(b'\t')
+            None | Some(b'\r' | b'\n' | b'-' | b' ' | b'\t')
         ) {
             return Some(abs);
         }
@@ -1749,7 +1736,7 @@ fn find_part_end(body: &[u8], crlf_delim: &[u8], lf_delim: &[u8]) -> Option<usiz
         let after = abs + lf_delim.len();
         if matches!(
             body.get(after),
-            None | Some(b'\r') | Some(b'\n') | Some(b'-') | Some(b' ') | Some(b'\t')
+            None | Some(b'\r' | b'\n' | b'-' | b' ' | b'\t')
         ) {
             return Some(abs);
         }
@@ -1796,7 +1783,7 @@ fn parse_mailgun_form_data(
         // RFC 2046: boundary must be followed by a valid terminator byte.
         if !matches!(
             body.get(after_delim),
-            None | Some(b'\r') | Some(b'\n') | Some(b'-') | Some(b' ') | Some(b'\t')
+            None | Some(b'\r' | b'\n' | b'-' | b' ' | b'\t')
         ) {
             search_from = abs + 1;
             continue;
@@ -1820,8 +1807,7 @@ fn parse_mailgun_form_data(
         // `find_part_end` validates the terminator byte to avoid false matches on
         // boundary-prefix strings (e.g. "\r\n--abc" inside "\r\n--abc123").
         let part_end = find_part_end(&body[part_start..], crlf_delim_bytes, lf_delim_bytes)
-            .map(|p| part_start + p)
-            .unwrap_or(body.len());
+            .map_or(body.len(), |p| part_start + p);
 
         search_from = part_end;
         let part = &body[part_start..part_end];
@@ -1859,17 +1845,14 @@ fn parse_mailgun_form_data(
             // File part: use raw bytes from the original buffer to avoid lossy UTF-8 corruption.
             let part_ct = headers_str
                 .lines()
-                .find(|l| l.to_ascii_lowercase().starts_with("content-type:"))
-                .map(|l| {
+                .find(|l| l.to_ascii_lowercase().starts_with("content-type:")).map_or_else(|| "application/octet-stream".to_string(), |l| {
                     l[13..]
                         .trim()
                         .split(';')
                         .next()
-                        .map(str::trim)
-                        .unwrap_or("application/octet-stream")
+                        .map_or("application/octet-stream", str::trim)
                         .to_ascii_lowercase()
-                })
-                .unwrap_or_else(|| "application/octet-stream".to_string());
+                });
             let part_cte = headers_str
                 .lines()
                 .find(|l| {
@@ -1885,9 +1868,7 @@ fn parse_mailgun_form_data(
                     .filter(|c| !c.is_ascii_whitespace())
                     .collect();
                 base64::engine::general_purpose::STANDARD
-                    .decode(stripped.as_bytes())
-                    .map(Bytes::from)
-                    .unwrap_or_else(|_| Bytes::copy_from_slice(body_bytes))
+                    .decode(stripped.as_bytes()).map_or_else(|_| Bytes::copy_from_slice(body_bytes), Bytes::from)
             } else {
                 // Binary (8-bit): copy raw bytes without any string conversion.
                 Bytes::copy_from_slice(body_bytes)
@@ -2041,13 +2022,12 @@ fn build_ses_route(
 
             // Verify SNS signature (and optional TopicArn binding) before parsing.
             #[cfg(feature = "inbound-ses")]
-            if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&body) {
-                if let Err(status) =
+            if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&body)
+                && let Err(status) =
                     sns_verify::verify(&json, &http_client, topic_arn.as_deref()).await
                 {
                     return status;
                 }
-            }
 
             match parse_ses(&body) {
                 #[cfg(feature = "inbound-ses")]
@@ -2056,7 +2036,7 @@ fn build_ses_route(
                         .get(&url)
                         .send()
                         .await
-                        .and_then(|r| r.error_for_status())
+                        .and_then(reqwest::Response::error_for_status)
                     {
                         Ok(_) => StatusCode::OK,
                         Err(e) => {
@@ -3186,7 +3166,7 @@ mod tests {
         // The QP-decoded body retains the trailing CRLF from the message line.
         let decoded = std::str::from_utf8(att.data.as_ref()).unwrap_or("<non-utf8>");
         assert_eq!(
-            decoded.trim_end_matches(|c| c == '\r' || c == '\n'),
+            decoded.trim_end_matches(['\r', '\n']),
             "Hello World",
             "QP-encoded attachment must be decoded: got {decoded:?}"
         );

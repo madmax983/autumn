@@ -1,3 +1,34 @@
+//! Safe retries for mutating HTTP requests.
+//!
+//! The idempotency layer ensures that a duplicate request (identified by an
+//! `Idempotency-Key` header) is not processed twice. If a client retries a
+//! request, the layer will intercept it and return the cached response from
+//! the original execution.
+//!
+//! # Configuration
+//!
+//! Idempotency is enabled by default via `[idempotency]` in `autumn.toml`.
+//! It can use an in-memory store (for single instances) or Redis.
+//!
+//! # Examples
+//!
+//! ```rust,ignore
+//! use autumn_web::prelude::*;
+//!
+//! // The handler will only execute once for a given idempotency key.
+//! // Subsequent requests with the same key will receive the cached response.
+//! #[post("/charge")]
+//! async fn charge_card(
+//!     idempotency_ctx: IdempotencyContext,
+//!     Json(req): Json<ChargeRequest>,
+//! ) -> AutumnResult<Json<ChargeResponse>> {
+//!     // Safely charge the card, knowing this won't run twice
+//!     // for the same `idempotency_ctx.key()`.
+//!     let res = stripe::charge(req).await?;
+//!     Ok(Json(res))
+//! }
+//! ```
+
 use bytes::Bytes;
 use futures::StreamExt as FuturesStreamExt;
 

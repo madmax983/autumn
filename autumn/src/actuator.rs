@@ -1385,7 +1385,7 @@ impl HealthCheckOutput {
 /// impl HealthIndicator for StripeIndicator {
 ///     fn check(&self) -> futures::future::BoxFuture<'_, HealthCheckOutput> {
 ///         Box::pin(async move {
-///             // TODO: ping Stripe API
+///             // Example: Check Stripe API reachability here
 ///             HealthCheckOutput::up()
 ///         })
 ///     }
