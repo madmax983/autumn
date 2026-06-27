@@ -11436,6 +11436,431 @@ mod tests {
         );
         crate::circuit_breaker::global_registry().clear();
     }
+
+    // ── delay_to_when unit tests ──────────────────────────────────────────────
+
+    #[test]
+    fn delay_to_when_zero_returns_approximately_now() {
+        let before = chrono::Utc::now();
+        let result = delay_to_when(std::time::Duration::ZERO);
+        let after = chrono::Utc::now();
+        assert!(
+            result >= before && result <= after,
+            "zero delay should resolve to approximately now"
+        );
+    }
+
+    #[test]
+    fn delay_to_when_overflow_returns_max_utc() {
+        // u64::MAX seconds overflows i64 nanoseconds in TimeDelta::from_std.
+        let huge = std::time::Duration::from_secs(u64::MAX);
+        let result = delay_to_when(huge);
+        assert_eq!(
+            result,
+            chrono::DateTime::<chrono::Utc>::MAX_UTC,
+            "overflow duration must return MAX_UTC rather than panic"
+        );
+    }
+
+    #[test]
+    fn delay_to_when_small_delay_is_in_the_future() {
+        let before = chrono::Utc::now();
+        let result = delay_to_when(std::time::Duration::from_secs(60));
+        assert!(
+            result > before,
+            "a positive delay must resolve to the future"
+        );
+    }
+
+    // ── JobAdminMemoryBackend unit tests ──────────────────────────────────────
+
+    #[test]
+    fn record_requeued_returns_true_for_scheduled_job() {
+        let backend = JobAdminMemoryBackend::new_for_test(32);
+        let future_due = chrono::Utc::now() + chrono::TimeDelta::hours(1);
+        let id = uuid::Uuid::new_v4().to_string();
+        backend.record_enqueue_due(
+            id.clone(),
+            "myjob",
+            serde_json::json!({}),
+            1,
+            3,
+            Some(future_due),
+            chrono::Utc::now(),
+        );
+
+        // Job should be Scheduled.
+        let snap = backend.snapshot_sync(&JobAdminQuery::default());
+        assert_eq!(snap.scheduled.total, 1, "job should start as Scheduled");
+
+        // Transition back to Enqueued (e.g. promotion from delayed ZSET).
+        let was_scheduled = backend.record_requeued(&id, 1);
+        assert!(
+            was_scheduled,
+            "record_requeued must return true for a Scheduled job"
+        );
+
+        let snap2 = backend.snapshot_sync(&JobAdminQuery::default());
+        assert_eq!(
+            snap2.scheduled.total, 0,
+            "job should no longer be Scheduled"
+        );
+        assert_eq!(snap2.enqueued.total, 1, "job should now be Enqueued");
+    }
+
+    #[test]
+    fn record_requeued_returns_false_for_already_enqueued_job() {
+        let backend = JobAdminMemoryBackend::new_for_test(32);
+        let id = backend.record_enqueue_for_test("myjob", serde_json::json!({}), 1, 3);
+
+        let was_scheduled = backend.record_requeued(&id, 1);
+        assert!(
+            !was_scheduled,
+            "record_requeued must return false for an Enqueued (not Scheduled) job"
+        );
+    }
+
+    #[test]
+    fn record_requeued_returns_false_for_missing_id() {
+        let backend = JobAdminMemoryBackend::new_for_test(32);
+        let was_scheduled = backend.record_requeued("nonexistent-id", 1);
+        assert!(
+            !was_scheduled,
+            "record_requeued must return false for a missing id"
+        );
+    }
+
+    #[test]
+    fn cancel_enqueued_fires_cancellation_token() {
+        let backend = JobAdminMemoryBackend::new_for_test(32);
+        let id = backend.record_enqueue_for_test("myjob", serde_json::json!({}), 1, 3);
+
+        let token = tokio_util::sync::CancellationToken::new();
+        let child = token.child_token();
+        backend.register_delay_canceler(id.clone(), token);
+
+        assert!(
+            !child.is_cancelled(),
+            "token must not be cancelled before cancel_enqueued"
+        );
+        backend.cancel_enqueued(&id).expect("cancel should succeed");
+        assert!(
+            child.is_cancelled(),
+            "cancel_enqueued must fire the cancellation token"
+        );
+    }
+
+    #[test]
+    fn cancel_enqueued_removes_canceler_from_map() {
+        let backend = JobAdminMemoryBackend::new_for_test(32);
+        let id = backend.record_enqueue_for_test("myjob", serde_json::json!({}), 1, 3);
+
+        let token = tokio_util::sync::CancellationToken::new();
+        backend.register_delay_canceler(id.clone(), token);
+
+        assert!(
+            backend
+                .inner
+                .read()
+                .unwrap()
+                .delay_cancelers
+                .contains_key(&id),
+            "canceler must be registered before cancel"
+        );
+
+        backend.cancel_enqueued(&id).expect("cancel should succeed");
+
+        assert!(
+            !backend
+                .inner
+                .read()
+                .unwrap()
+                .delay_cancelers
+                .contains_key(&id),
+            "cancel_enqueued must remove the delay canceler from the map"
+        );
+    }
+
+    #[test]
+    fn try_record_start_removes_canceler() {
+        let backend = JobAdminMemoryBackend::new_for_test(32);
+        let id = backend.record_enqueue_for_test("myjob", serde_json::json!({}), 1, 3);
+
+        let token = tokio_util::sync::CancellationToken::new();
+        backend.register_delay_canceler(id.clone(), token);
+
+        assert!(
+            backend
+                .inner
+                .read()
+                .unwrap()
+                .delay_cancelers
+                .contains_key(&id),
+            "canceler should be registered"
+        );
+
+        let decision = backend.try_record_start(&id, 1);
+        assert!(
+            matches!(decision, JobAdminStartDecision::Started),
+            "try_record_start must succeed for an Enqueued job"
+        );
+
+        assert!(
+            !backend
+                .inner
+                .read()
+                .unwrap()
+                .delay_cancelers
+                .contains_key(&id),
+            "try_record_start must remove the delay canceler"
+        );
+    }
+
+    #[test]
+    fn try_record_start_accepts_scheduled_job() {
+        let backend = JobAdminMemoryBackend::new_for_test(32);
+        let future_due = chrono::Utc::now() + chrono::TimeDelta::hours(1);
+        let id = uuid::Uuid::new_v4().to_string();
+        backend.record_enqueue_due(
+            id.clone(),
+            "myjob",
+            serde_json::json!({}),
+            1,
+            3,
+            Some(future_due),
+            chrono::Utc::now(),
+        );
+
+        let snap = backend.snapshot_sync(&JobAdminQuery::default());
+        assert_eq!(
+            snap.scheduled.total, 1,
+            "job must be Scheduled before start"
+        );
+
+        let decision = backend.try_record_start(&id, 1);
+        assert!(
+            matches!(decision, JobAdminStartDecision::Started),
+            "try_record_start must accept a Scheduled job (timer fired)"
+        );
+    }
+
+    #[test]
+    fn prune_job_admin_history_preserves_scheduled_jobs() {
+        // Fill the history beyond its limit with completed jobs, then add a
+        // Scheduled job.  The Scheduled job must survive pruning.
+        let backend = JobAdminMemoryBackend::new_for_test(3);
+
+        // Fill with completed jobs to trigger pruning.
+        for _ in 0..5 {
+            let id = backend.record_enqueue_for_test("done", serde_json::json!({}), 1, 1);
+            backend.record_start_for_test(&id, 1);
+            backend.record_success_for_test(&id);
+        }
+
+        // Add a Scheduled (future-due) job.
+        let future_due = chrono::Utc::now() + chrono::TimeDelta::hours(1);
+        let sched_id = uuid::Uuid::new_v4().to_string();
+        backend.record_enqueue_due(
+            sched_id.clone(),
+            "delayed_job",
+            serde_json::json!({}),
+            1,
+            3,
+            Some(future_due),
+            chrono::Utc::now(),
+        );
+
+        // Force prune by completing another job.
+        let id2 = backend.record_enqueue_for_test("done2", serde_json::json!({}), 1, 1);
+        backend.record_start_for_test(&id2, 1);
+        backend.record_success_for_test(&id2);
+
+        let snap = backend.snapshot_sync(&JobAdminQuery::default());
+        assert_eq!(
+            snap.scheduled.total, 1,
+            "prune_job_admin_history must not evict Scheduled (active) jobs"
+        );
+        assert!(
+            snap.scheduled.records.iter().any(|r| r.id == sched_id),
+            "the specific Scheduled job must still be present after pruning"
+        );
+    }
+
+    #[test]
+    fn cancel_enqueued_rejects_running_job() {
+        let backend = JobAdminMemoryBackend::new_for_test(32);
+        let id = backend.record_enqueue_for_test("myjob", serde_json::json!({}), 1, 3);
+        backend.record_start_for_test(&id, 1);
+
+        let result = backend.cancel_enqueued(&id);
+        assert!(result.is_err(), "canceling a Running job must fail");
+    }
+
+    #[test]
+    fn cancel_enqueued_scheduled_job_succeeds() {
+        let backend = JobAdminMemoryBackend::new_for_test(32);
+        let future_due = chrono::Utc::now() + chrono::TimeDelta::hours(1);
+        let id = uuid::Uuid::new_v4().to_string();
+        backend.record_enqueue_due(
+            id.clone(),
+            "myjob",
+            serde_json::json!({}),
+            1,
+            3,
+            Some(future_due),
+            chrono::Utc::now(),
+        );
+
+        backend
+            .cancel_enqueued(&id)
+            .expect("canceling a Scheduled job must succeed");
+
+        let snap = backend.snapshot_sync(&JobAdminQuery::default());
+        assert_eq!(
+            snap.scheduled.total, 0,
+            "job must leave Scheduled after cancel"
+        );
+    }
+
+    // ── enqueue_after_commit_delay tests ─────────────────────────────────────
+
+    #[tokio::test]
+    async fn enqueue_after_commit_delay_outside_tx_enqueues_with_delay() {
+        use std::time::Duration;
+        let (client, mut rx) = make_test_client();
+
+        // Outside any tx scope — should enqueue immediately (bypass after-commit).
+        client
+            .enqueue_after_commit_delay("test_job", serde_json::json!({"x": 42}), Duration::ZERO)
+            .await
+            .expect("enqueue_after_commit_delay should succeed outside tx");
+
+        let received = tokio::time::timeout(Duration::from_millis(200), rx.recv()).await;
+        assert!(
+            received.is_ok(),
+            "job should be delivered when delay is zero and outside tx"
+        );
+        let job = received.unwrap().expect("channel must not be closed");
+        assert_eq!(job.name, "test_job");
+    }
+
+    #[tokio::test]
+    async fn enqueue_after_commit_delay_inside_scope_defers_and_resolves_at_commit_time() {
+        use crate::db::{AFTER_COMMIT_REGISTRY, CommitCallback};
+        use std::sync::{Arc, Mutex};
+        use std::time::Duration;
+
+        let (client, mut rx) = make_test_client();
+        let registry = Arc::new(Mutex::new(Vec::<CommitCallback>::new()));
+
+        AFTER_COMMIT_REGISTRY
+            .scope(registry.clone(), async {
+                client
+                    .enqueue_after_commit_delay(
+                        "test_job",
+                        serde_json::json!({"x": 99}),
+                        Duration::ZERO,
+                    )
+                    .await
+                    .expect("enqueue_after_commit_delay should succeed inside scope");
+            })
+            .await;
+
+        // Job must NOT have been delivered before commit.
+        let not_received = tokio::time::timeout(Duration::from_millis(50), rx.recv()).await;
+        assert!(
+            not_received.is_err(),
+            "job must not be delivered before commit callbacks run"
+        );
+
+        // Fire commit callbacks (simulating a DB commit).
+        let callbacks: Vec<CommitCallback> = {
+            let mut reg = registry.lock().unwrap();
+            std::mem::take(&mut *reg)
+        };
+        for cb in callbacks {
+            cb().await.unwrap();
+        }
+
+        // Now the job should arrive.
+        let received = tokio::time::timeout(Duration::from_millis(200), rx.recv()).await;
+        assert!(
+            received.is_ok(),
+            "job should be delivered after commit callbacks run"
+        );
+        let job = received.unwrap().expect("channel must not be closed");
+        assert_eq!(job.name, "test_job");
+    }
+
+    // ── local cancel releases unique lock via CancellationToken ─────────────
+
+    #[tokio::test]
+    async fn local_scheduled_cancel_releases_unique_lock_immediately() {
+        let _guard = global_job_runtime_test_lock().lock().await;
+        clear_global_job_client();
+
+        let state = AppState::for_test().with_profile("dev");
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        start_local_runtime(
+            vec![JobInfo {
+                name: "unique_cancelable".to_string(),
+                max_attempts: 1,
+                initial_backoff_ms: 10,
+                uniqueness: Some(JobUniqueness {
+                    by: vec![],
+                    window: JobUniquenessWindow::Running,
+                }),
+                concurrency: None,
+                handler: |_state, _payload| Box::pin(async move { Ok(()) }),
+            }],
+            &state,
+            &shutdown,
+            1,
+            5,
+            250,
+        );
+
+        // Enqueue the first job with a long delay — it holds the unique lock.
+        enqueue_in(
+            "unique_cancelable",
+            serde_json::json!({}),
+            Duration::from_secs(3600),
+        )
+        .await
+        .unwrap();
+
+        let admin = job_admin_backend(&state).unwrap();
+        let snap = admin.snapshot(JobAdminQuery::default()).await.unwrap();
+        assert_eq!(snap.scheduled.total, 1, "first job should be Scheduled");
+        let id = snap.scheduled.records[0].id.clone();
+
+        // Cancel it — this must fire the CancellationToken and release the unique lock.
+        admin.cancel(&id).await.expect("cancel must succeed");
+
+        // Allow the spawned timer task a brief moment to process the cancellation.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Now a second enqueue with the same unique key must succeed (not deduplicate).
+        let result = enqueue_in(
+            "unique_cancelable",
+            serde_json::json!({}),
+            Duration::from_secs(3600),
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "second enqueue must succeed after unique lock is released by cancel"
+        );
+
+        let snap2 = admin.snapshot(JobAdminQuery::default()).await.unwrap();
+        assert_eq!(
+            snap2.scheduled.total, 1,
+            "second delayed job should be Scheduled"
+        );
+
+        shutdown.cancel();
+        clear_global_job_client();
+    }
 }
 
 #[cfg(test)]
