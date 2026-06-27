@@ -537,7 +537,15 @@ impl Client {
     /// `reqwest::Client`.  Used when a shared inner client is available but
     /// no explicit `[http.client]` config is registered.
     fn with_inner(inner: reqwest::Client) -> Self {
-        Self { inner, ..Self::new() }
+        Self {
+            inner,
+            alias: None,
+            base_url: None,
+            base_urls: HashMap::new(),
+            retry_policy: RetryPolicy::default(),
+            mock: None,
+            resilience_config: None,
+        }
     }
 
     /// Create a client from `[http.client]` framework configuration.
