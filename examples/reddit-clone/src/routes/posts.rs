@@ -105,12 +105,14 @@ pub async fn front_page(
             // the preloaded record's typed accessors (`?`-free in templates:
             // treat a missing preload as "absent").
             @if compact_layout {
-                div class="divide-y divide-gray-100" {
+                ul id="posts-list" class="divide-y divide-gray-100"
+                    hx-ext="sse" sse-connect="/posts/stream" sse-swap="message" hx-swap="none" {
                     @for post in &hot_posts {
                         @let author = post.author().ok().flatten();
                         @let sub = post.subreddit().ok().flatten();
                         @if let Some(sub) = sub {
-                            div class="flex items-center gap-3 py-2 px-2 hover:bg-gray-50 transition-colors" {
+                            li id=(format!("post-{}", post.id))
+                                class="flex items-center gap-3 py-2 px-2 hover:bg-gray-50 transition-colors" {
                                 span class="text-sm font-semibold text-gray-500 w-8 text-right shrink-0" {
                                     (post.score)
                                 }
@@ -146,12 +148,14 @@ pub async fn front_page(
                     }
                 }
             } @else {
-                div class="space-y-2" {
+                ul id="posts-list" class="space-y-2"
+                    hx-ext="sse" sse-connect="/posts/stream" sse-swap="message" hx-swap="none" {
                     @for post in &hot_posts {
                         @let author = post.author().ok().flatten();
                         @let sub = post.subreddit().ok().flatten();
                         @if let Some(sub) = sub {
-                            div class="bg-white rounded-lg shadow-sm border border-gray-200 \
+                            li id=(format!("post-{}", post.id))
+                                class="bg-white rounded-lg shadow-sm border border-gray-200 \
                                        hover:border-orange-300 transition-colors" {
                                 div class="flex items-start gap-3 p-4" {
                                     (vote_controls(post.id, post.score))
@@ -457,6 +461,27 @@ pub async fn submit(
     Ok(Redirect::to(&super::subreddits::__autumn_path_show(
         &sub.slug,
     )))
+}
+
+// ── Short-form permalink for live-broadcast fragments ──────────
+
+/// Redirects `/posts/{post_id}` to the canonical `/r/{sub_slug}/posts/{post_slug}`.
+/// Used by live OOB fragments that only have a post id in scope.
+#[get("/posts/{post_id}")]
+pub async fn show_by_id(Path(post_id): Path<i64>, mut db: Db) -> AutumnResult<Redirect> {
+    let (post_slug, subreddit_id): (String, i64) = posts::table
+        .find(post_id)
+        .select((posts::slug, posts::subreddit_id))
+        .first(&mut *db)
+        .await
+        .map_err(|_| AutumnError::not_found_msg("Post not found"))?;
+    let sub_slug: String = subreddits::table
+        .find(subreddit_id)
+        .select(subreddits::slug)
+        .first(&mut *db)
+        .await
+        .map_err(|_| AutumnError::not_found_msg("Subreddit not found"))?;
+    Ok(Redirect::to(&format!("/r/{sub_slug}/posts/{post_slug}")))
 }
 
 // ── View single post with comments ─────────────────────────────

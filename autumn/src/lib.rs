@@ -233,6 +233,13 @@ pub use http_client as http;
 pub mod flash;
 #[cfg(feature = "htmx")]
 pub mod htmx;
+/// Declarative live-broadcast trait for `#[repository(Model, broadcasts = "topic")]`.
+///
+/// Implement [`live::LiveFragment`] on a model to enable automatic `hx-swap-oob`
+/// broadcasts after each `save`/`update`/`delete_by_id` call. Requires the
+/// `ws`, `maud`, and `htmx` features.
+#[cfg(all(feature = "htmx", feature = "maud"))]
+pub mod live;
 pub mod log;
 pub(crate) mod logging;
 /// Project typed JSON endpoints as Model Context Protocol (MCP) tools so AI
@@ -254,6 +261,15 @@ pub mod prelude;
 pub use paths::PathExt;
 #[cfg(feature = "presence")]
 pub mod presence;
+#[cfg(all(feature = "presence", feature = "maud"))]
+pub use presence::presence_badge;
+#[cfg(all(
+    feature = "presence",
+    feature = "ws",
+    feature = "maud",
+    feature = "htmx"
+))]
+pub use presence::presence_stream;
 #[cfg(feature = "presence")]
 pub use presence::{Presence, PresenceEntry, PresenceEvent, PresenceHandle};
 pub(crate) mod route;
@@ -326,6 +342,8 @@ pub mod ws;
 /// This module is semver-exempt. Do not use it directly.
 #[doc(hidden)]
 pub mod __private {
+    #[cfg(all(feature = "db", feature = "ws"))]
+    pub use crate::repository_commit_hooks::CURRENT_CHANNELS;
     #[cfg(feature = "db")]
     pub use crate::repository_commit_hooks::{
         RepositoryCommitHookDescriptor, catch_repository_after_hook_unwind,
@@ -441,10 +459,16 @@ pub use validation::Validated;
 #[cfg(feature = "htmx")]
 pub use htmx::{
     AUTUMN_WIDGETS_JS_PATH, HTMX_CSRF_JS_PATH, HTMX_JS, HTMX_JS_PATH, HTMX_SSE_JS,
-    HTMX_SSE_JS_PATH, HTMX_VERSION,
+    HTMX_SSE_JS_PATH, HTMX_VERSION, IDIOMORPH_JS, IDIOMORPH_JS_PATH,
 };
 #[cfg(all(feature = "htmx", feature = "maud"))]
 pub use htmx::{HtmxFragments, OobSwap};
+/// Trait for rendering a model instance as an htmx `hx-swap-oob` fragment.
+///
+/// Implement this on your model and declare `broadcasts = "topic"` on the
+/// `#[repository]` attribute to enable automatic live broadcasts.
+#[cfg(all(feature = "htmx", feature = "maud"))]
+pub use live::LiveFragment;
 #[cfg(feature = "mail")]
 pub use mail::{
     Mail, MailConfig, MailDeliveryQueue, MailDeliveryQueueHandle, MailError, MailTransport, Mailer,

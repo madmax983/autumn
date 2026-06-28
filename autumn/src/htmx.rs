@@ -63,6 +63,22 @@ pub const AUTUMN_WIDGETS_JS_PATH: &str = "/static/js/autumn-widgets.js";
 /// `data-header="..."` on the meta tag when using a custom CSRF header name.
 pub const HTMX_CSRF_JS_PATH: &str = "/static/js/autumn-htmx-csrf.js";
 
+/// Idiomorph DOM-morphing library, embedded at compile time.
+///
+/// Serves at [`IDIOMORPH_JS_PATH`] with immutable caching headers.
+/// Enables `hx-swap="morph"` on htmx requests for smooth DOM updates.
+///
+/// Reference in your layout:
+/// ```html
+/// <script src="/static/js/idiomorph.min.js"></script>
+/// ```
+#[cfg(feature = "htmx")]
+pub const IDIOMORPH_JS: &[u8] = include_bytes!("../vendor/idiomorph.min.js");
+
+/// Same-origin path where Autumn serves the idiomorph library.
+#[cfg(feature = "htmx")]
+pub const IDIOMORPH_JS_PATH: &str = "/static/js/idiomorph.min.js";
+
 /// CSP-compatible htmx CSRF helper JavaScript.
 ///
 /// Served as an external same-origin script so applications do not need inline

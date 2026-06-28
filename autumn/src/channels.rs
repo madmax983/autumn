@@ -339,31 +339,9 @@ impl Broadcast {
         strategy: &crate::htmx::OobSwap,
         fragment: &maud::Markup,
     ) -> Result<usize, BroadcastError> {
-        use crate::htmx::{OobSwap, inject_hx_swap_oob};
-        let rendered = &fragment.0;
-        let envelope = if strategy == &OobSwap::Raw {
-            rendered.clone()
-        } else {
-            let value = strategy.format_value(id);
-            let escaped_value = crate::htmx::escape_attribute_string(&value);
-
-            let is_outer_html = matches!(
-                strategy,
-                OobSwap::True
-                    | OobSwap::OuterHTML
-                    | OobSwap::Target(crate::htmx::OobMethod::OuterHTML, _)
-            );
-
-            if is_outer_html {
-                inject_hx_swap_oob(rendered, &value).unwrap_or_else(|| {
-                    format!("<template hx-swap-oob=\"{escaped_value}\">{rendered}</template>")
-                })
-            } else if matches!(strategy, OobSwap::Delete) {
-                format!("<div hx-swap-oob=\"{escaped_value}\"></div>")
-            } else {
-                format!("<div hx-swap-oob=\"{escaped_value}\">{rendered}</div>")
-            }
-        };
+        use maud::Render;
+        let html = fragment.render().into_string();
+        let envelope = sse_oob_envelope(id, strategy, &html);
         self.publish(topic, envelope)
     }
 }
@@ -376,6 +354,78 @@ fn htmx_oob_envelope(fragment: &maud::Markup) -> String {
         .oob("", fragment.clone())
         .render()
         .into_string()
+}
+
+/// Format an OOB fragment for delivery over SSE.
+///
+/// Unlike HTTP responses (where htmx's full swap pipeline unwraps `<template>`
+/// elements), the SSE swap pipeline processes `hx-swap-oob` on the *element
+/// itself*. Wrapping in `<template hx-swap-oob="...">` causes the attribute to
+/// land on the template node, whose `childNodes` is always empty — so htmx
+/// performs the swap on nothing.
+///
+/// Correct SSE formats:
+/// - **`OobSwap::True`** (update) — inject `hx-swap-oob="true"` onto the root
+///   element; htmx replaces the matching DOM element via outerHTML.
+/// - **`OobSwap::Delete`** — emit a tombstone `<div id="{id}" hx-swap-oob="delete"></div>`;
+///   htmx deletes the matching element.
+/// - **All other strategies** — wrap the fragment in a `<div hx-swap-oob="…">`
+///   container so that htmx inserts the container's *children* at the target.
+#[cfg(feature = "maud")]
+fn sse_oob_envelope(id: &str, strategy: &crate::htmx::OobSwap, fragment_html: &str) -> String {
+    use crate::htmx::{OobMethod, OobSwap};
+    match strategy {
+        OobSwap::Delete => {
+            format!("<div id=\"{id}\" hx-swap-oob=\"delete\"></div>")
+        }
+        OobSwap::True => inject_oob_attr(fragment_html, "true"),
+        OobSwap::OuterHTML => inject_oob_attr(fragment_html, "outerHTML"),
+        // For targeted outerHTML, htmx replaces the CSS-selected element with
+        // whichever element carries hx-swap-oob. Inject the attribute onto the
+        // fragment root instead of wrapping it so the rendered row (not a synthetic
+        // div) becomes the replacement.
+        OobSwap::Target(OobMethod::OuterHTML, selector) => {
+            let value = format!("outerHTML:{selector}");
+            inject_oob_attr(fragment_html, &value)
+        }
+        OobSwap::Raw => fragment_html.to_string(),
+        // For outerHTML custom values inject the attribute on the fragment root
+        // so htmx replaces the selected element with this element directly.
+        // For all other strategies (beforeend, afterbegin, …) wrap in a <div>
+        // so htmx inserts the div's *children* at the target rather than the
+        // carrier element's children, which would strip the fragment's root tag.
+        OobSwap::Custom(val) if val == "outerHTML" || val.starts_with("outerHTML:") => {
+            inject_oob_attr(fragment_html, val)
+        }
+        OobSwap::Custom(val) => {
+            let escaped = val.replace('"', "&quot;");
+            format!("<div hx-swap-oob=\"{escaped}\">{fragment_html}</div>")
+        }
+        _ => {
+            let value = strategy.format_value(id).replace('"', "&quot;");
+            format!("<div hx-swap-oob=\"{value}\">{fragment_html}</div>")
+        }
+    }
+}
+
+/// Inject `hx-swap-oob="{value}"` into the opening tag of the root element.
+///
+/// Finds the first tag name boundary (space or `>`) and inserts the attribute
+/// before it, e.g. `<li id="x">` → `<li hx-swap-oob="true" id="x">`.
+#[cfg(feature = "maud")]
+pub(crate) fn inject_oob_attr(html: &str, value: &str) -> String {
+    if let Some(lt) = html.find('<') {
+        let after_lt = &html[lt + 1..];
+        if let Some(pos) = after_lt.find([' ', '>']) {
+            let insert_at = lt + 1 + pos;
+            return format!(
+                "{} hx-swap-oob=\"{value}\"{}",
+                &html[..insert_at],
+                &html[insert_at..]
+            );
+        }
+    }
+    html.to_string()
 }
 
 /// A sender handle for a broadcast channel.
@@ -1643,5 +1693,147 @@ mod tests {
             "<div hx-swap-oob=\"beforeend:#&quot;bad-id&quot;\"><li id=\"item-4\">Value</li></div>"
         );
         Ok(())
+    }
+
+    // ── sse_oob_envelope branch coverage ────────────────────────────────────────
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn oob_envelope_delete_emits_tombstone() {
+        let result = sse_oob_envelope("item-7", &crate::htmx::OobSwap::Delete, "");
+        assert_eq!(result, "<div id=\"item-7\" hx-swap-oob=\"delete\"></div>");
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn oob_envelope_true_injects_on_root() {
+        let frag = "<li id=\"item-8\">X</li>";
+        let result = sse_oob_envelope("item-8", &crate::htmx::OobSwap::True, frag);
+        assert!(
+            result.contains("hx-swap-oob=\"true\""),
+            "missing attr: {result}"
+        );
+        assert!(result.contains("<li"), "root tag stripped: {result}");
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn oob_envelope_raw_passes_through_unchanged() {
+        let frag = "<custom-element>data</custom-element>";
+        let result = sse_oob_envelope("x", &crate::htmx::OobSwap::Raw, frag);
+        assert_eq!(result, frag);
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn oob_envelope_target_outerhtml_injects_on_root() {
+        use crate::htmx::{OobMethod, OobSwap};
+        let frag = "<li id=\"item-9\">X</li>";
+        let result = sse_oob_envelope(
+            "item-9",
+            &OobSwap::Target(OobMethod::OuterHTML, "#item-9".to_string()),
+            frag,
+        );
+        assert!(
+            result.contains("hx-swap-oob=\"outerHTML:#item-9\""),
+            "got: {result}"
+        );
+        assert!(result.contains("<li"), "root tag stripped: {result}");
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn oob_envelope_custom_outerhtml_injects_on_root() {
+        use crate::htmx::OobSwap;
+        let frag = "<li id=\"item-10\">X</li>";
+        let result = sse_oob_envelope("item-10", &OobSwap::Custom("outerHTML".to_string()), frag);
+        assert!(
+            result.contains("hx-swap-oob=\"outerHTML\""),
+            "got: {result}"
+        );
+        assert!(result.contains("<li"), "root tag stripped: {result}");
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn oob_envelope_custom_outerhtml_selector_injects_on_root() {
+        use crate::htmx::OobSwap;
+        let frag = "<li id=\"item-11\">X</li>";
+        let result = sse_oob_envelope(
+            "item-11",
+            &OobSwap::Custom("outerHTML:#item-11".to_string()),
+            frag,
+        );
+        assert!(
+            result.contains("hx-swap-oob=\"outerHTML:#item-11\""),
+            "got: {result}"
+        );
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn oob_envelope_custom_non_outerhtml_wraps_in_div() {
+        use crate::htmx::OobSwap;
+        let frag = "<li id=\"item-12\">X</li>";
+        let result = sse_oob_envelope(
+            "item-12",
+            &OobSwap::Custom("beforeend:#items".to_string()),
+            frag,
+        );
+        assert!(
+            result.starts_with("<div hx-swap-oob=\"beforeend:#items\">"),
+            "got: {result}"
+        );
+        assert!(
+            result.contains("<li id=\"item-12\">"),
+            "fragment missing: {result}"
+        );
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn oob_envelope_outerhtml_injects_on_root() {
+        use crate::htmx::OobSwap;
+        let frag = "<li id=\"item-13\">X</li>";
+        let result = sse_oob_envelope("item-13", &OobSwap::OuterHTML, frag);
+        assert!(
+            result.contains("hx-swap-oob=\"outerHTML\""),
+            "missing outerHTML attr: {result}"
+        );
+        assert!(result.contains("<li"), "root tag stripped: {result}");
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn oob_envelope_target_beforeend_uses_catchall() {
+        use crate::htmx::{OobMethod, OobSwap};
+        let frag = "<li>item</li>";
+        let result = sse_oob_envelope(
+            "item-14",
+            &OobSwap::Target(OobMethod::BeforeEnd, "#list".to_string()),
+            frag,
+        );
+        assert!(
+            result.starts_with("<div hx-swap-oob="),
+            "catch-all must wrap in div: {result}"
+        );
+        assert!(result.contains("beforeend:#list"), "got: {result}");
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn inject_oob_attr_fallback_no_lt() {
+        let result = inject_oob_attr("no-tags-here", "true");
+        assert_eq!(
+            result, "no-tags-here",
+            "fallback must return html unchanged"
+        );
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn inject_oob_attr_fallback_no_boundary() {
+        let result = inject_oob_attr("<", "true");
+        assert_eq!(result, "<", "fallback must return html unchanged");
     }
 }

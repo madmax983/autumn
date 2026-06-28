@@ -274,7 +274,7 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
             Ok(())
         } else {
             Err(meta.error(
-                "expected model name, table = \"...\", hooks = Type, commit_hooks = true, api = \"/path\", policy = Type, scope = Type, cursor_key = field, cursor_key_type = Type, soft_delete, tenant_scoped, no_upsert_trait, searchable, versioned = true, no_versioned_record_impl, primary_reads, or sharded",
+                "expected model name, table = \"...\", hooks = Type, commit_hooks = true, api = \"/path\", policy = Type, scope = Type, cursor_key = field, cursor_key_type = Type, soft_delete, tenant_scoped, no_upsert_trait, searchable, versioned = true, no_versioned_record_impl, primary_reads, sharded, broadcasts = true, topic = \"...\", render = fn, or container = \"...\"",
             ))
         }
     })
@@ -286,9 +286,6 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
             "expected model name: #[repository(ModelName)]",
         )
     })?;
-    if broadcasts {
-        commit_hooks = true;
-    }
     if commit_hooks && hooks_type.is_none() && !broadcasts {
         return Err(syn::Error::new(
             proc_macro2::Span::call_site(),
@@ -968,6 +965,37 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         quote! {}
     };
 
+    // Broadcast field tokens — defined here so they are in scope for both
+    // `across_tenants_method` (below) and the main struct/constructor block
+    // (further down).  The full doc-comment version `bcast_struct_field` is
+    // used only in the struct definition; the clone/none/state variants are
+    // used in every constructor that builds a `Self { .. }` literal.
+    let has_broadcasts = config.broadcasts;
+    let bcast_struct_field = if has_broadcasts {
+        quote! {
+            /// Broadcast handle for live OOB fragment publishing (`broadcasts = "topic"`).
+            /// `None` when the repository was built without an `AppState` (e.g. `with_pool_untracked`).
+            __autumn_broadcast: ::std::option::Option<::autumn_web::channels::Broadcast>,
+        }
+    } else {
+        quote! {}
+    };
+    let bcast_clone_field = if has_broadcasts {
+        quote! { __autumn_broadcast: self.__autumn_broadcast.clone(), }
+    } else {
+        quote! {}
+    };
+    let bcast_field_none = if has_broadcasts {
+        quote! { __autumn_broadcast: ::core::option::Option::None, }
+    } else {
+        quote! {}
+    };
+    let bcast_field_some_state = if has_broadcasts {
+        quote! { __autumn_broadcast: ::std::option::Option::Some(state.broadcast()), }
+    } else {
+        quote! {}
+    };
+
     let across_tenants_method = if config.tenant_scoped {
         if let Some(hooks_ident) = &config.hooks_type {
             let idempotency_clone_field = if commit_hooks_enabled {
@@ -988,6 +1016,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         #idempotency_clone_field
                         across_tenants: true,
                         #shards_clone_field
+                        #bcast_clone_field
                         __autumn_read_route: self.__autumn_read_route.clone(),
                         __autumn_statement_timeout_ms: self.__autumn_statement_timeout_ms,
                         __autumn_slow_threshold: self.__autumn_slow_threshold,
@@ -1005,6 +1034,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         pool: self.pool.clone(),
                         across_tenants: true,
                         #shards_clone_field
+                        #bcast_clone_field
                         __autumn_read_route: self.__autumn_read_route.clone(),
                         __autumn_statement_timeout_ms: self.__autumn_statement_timeout_ms,
                         __autumn_slow_threshold: self.__autumn_slow_threshold,
@@ -1063,6 +1093,9 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         self.__autumn_route.as_deref(),
                         __shard.name(),
                     ),
+                    // Shard sub-repos are used for read fan-out only; mutations
+                    // broadcast from the parent, not the per-shard instance.
+                    #bcast_field_none
                 }
             }
         }
@@ -1170,6 +1203,39 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 #[doc = "Read-only methods route to the shard's read replica when one is configured and healthy (honoring the shard's `replica_fallback` policy); mutating methods always use the shard's primary. Pin a single call chain to the primary with [`on_primary`](Self::on_primary)."]
             }
         };
+        // When `broadcasts` is configured the test-helper constructor must be
+        let test_ctor_method = if has_broadcasts {
+            quote! {
+                /// Construct this repository with an explicit broadcast handle.
+                ///
+                /// For use in tests only — simulates what `FromRequestParts<AppState>` does
+                /// when building a repository that can publish OOB live fragments.
+                #[doc(hidden)]
+                #[must_use]
+                pub fn __autumn_test_with_broadcast(
+                    pool: ::autumn_web::reexports::diesel_async::pooled_connection::deadpool::Pool<
+                        ::autumn_web::reexports::diesel_async::AsyncPgConnection,
+                    >,
+                    broadcast: ::autumn_web::channels::Broadcast,
+                ) -> Self {
+                    #register_hooks
+                    Self {
+                        pool,
+                        #hooks_field
+                        #idempotency_field
+                        #tenant_init_field
+                        #shards_none_field
+                        __autumn_read_route: ::autumn_web::repository::ReadRoute::Primary,
+                        __autumn_statement_timeout_ms: 0,
+                        __autumn_slow_threshold: ::std::time::Duration::from_millis(500),
+                        __autumn_route: ::core::option::Option::None,
+                        __autumn_broadcast: ::core::option::Option::Some(broadcast),
+                    }
+                }
+            }
+        } else {
+            quote! {}
+        };
         quote! {
             /// Construct this repository from a [`ShardedDb`](::autumn_web::sharding::ShardedDb)
             /// extractor, preserving the full request instrumentation — statement
@@ -1205,6 +1271,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     __autumn_statement_timeout_ms: __seed.statement_timeout_ms,
                     __autumn_slow_threshold: __seed.slow_query_threshold,
                     __autumn_route: ::core::clone::Clone::clone(&__seed.route),
+                    #bcast_field_none
                 }
             }
 
@@ -1238,8 +1305,11 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     __autumn_statement_timeout_ms: 0,
                     __autumn_slow_threshold: ::std::time::Duration::from_millis(500),
                     __autumn_route: ::core::option::Option::None,
+                    #bcast_field_none
                 }
             }
+
+            #test_ctor_method
         }
     };
 
@@ -1306,6 +1376,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             __autumn_slow_threshold: ::std::time::Duration,
             /// Route path from `MatchedPath` for metrics labels.
             __autumn_route: ::std::option::Option<::std::string::String>,
+            #bcast_struct_field
         };
 
         let clone_impl = quote! {
@@ -1321,6 +1392,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         __autumn_statement_timeout_ms: self.__autumn_statement_timeout_ms,
                         __autumn_slow_threshold: self.__autumn_slow_threshold,
                         __autumn_route: self.__autumn_route.clone(),
+                        #bcast_clone_field
                     }
                 }
             }
@@ -1362,6 +1434,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     __autumn_statement_timeout_ms: __autumn_timeout_ms,
                     __autumn_slow_threshold,
                     __autumn_route,
+                    #bcast_field_some_state
                 })
             }
         } else {
@@ -1376,6 +1449,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     __autumn_statement_timeout_ms: __autumn_timeout_ms,
                     __autumn_slow_threshold,
                     __autumn_route,
+                    #bcast_field_some_state
                 })
             }
         };
@@ -1407,22 +1481,30 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 .as_deref()
                 .unwrap_or(&default_container);
             let model_prefix = to_snake_case(&config.model_name.to_string());
-            let model_name_str = config.model_name.to_string();
-            let table_name = &config.table_name;
 
-            let render_expr = if let Some(ref render_path) = config.broadcast_render {
-                quote! { #render_path(__record_ref) }
-            } else {
-                quote! {
-                    ::autumn_web::html! {
-                        li id=(::std::format!("{}-{}", #model_prefix, ::autumn_web::repository::ModelPrimaryKey::primary_key_value(__record_ref))) {
-                            a href=(::std::format!("/{}/{}", #table_name, ::autumn_web::repository::ModelPrimaryKey::primary_key_value(__record_ref))) {
-                                (::std::format!("{} #{}", #model_name_str, ::autumn_web::repository::ModelPrimaryKey::primary_key_value(__record_ref)))
-                            }
-                        }
-                    }
-                }
-            };
+            let (render_expr, create_swap_id, create_swap_strategy, update_id_expr, delete_id_expr) =
+                if let Some(ref render_path) = config.broadcast_render {
+                    let extract_id = quote! {
+                        ::autumn_web::htmx::extract_html_id(&{#render_path(__record_ref)}.into_string())
+                            .unwrap_or_else(|| ::std::format!("{}-{}", #model_prefix, ::autumn_web::repository::ModelPrimaryKey::primary_key_value(__record_ref)))
+                    };
+                    (
+                        quote! { #render_path(__record_ref) },
+                        quote! { #container_expr.to_string() },
+                        quote! { ::autumn_web::htmx::OobSwap::BeforeEnd },
+                        extract_id.clone(),
+                        extract_id,
+                    )
+                } else {
+                    let dom_id = quote! { <#model_name as ::autumn_web::live::LiveFragment>::dom_id(__record_ref) };
+                    (
+                        quote! { <#model_name as ::autumn_web::live::LiveFragment>::render_fragment(__record_ref) },
+                        quote! { <#model_name as ::autumn_web::live::LiveFragment>::dom_id(__record_ref) },
+                        quote! { <#model_name as ::autumn_web::live::LiveFragment>::insert_swap() },
+                        dom_id.clone(),
+                        dom_id,
+                    )
+                };
 
             let create = quote! {
                 {
@@ -1430,9 +1512,11 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     if let ::core::option::Option::Some(__channels) = ::autumn_web::__private::get_global_channels() {
                         let __topic = #topic_expr;
                         let __fragment = #render_expr;
+                        let __create_id = #create_swap_id;
+                        let __create_swap = #create_swap_strategy;
                         if let ::core::result::Result::Err(__err) = __channels
                             .broadcast()
-                            .publish_oob(&__topic, #container_expr, &::autumn_web::htmx::OobSwap::BeforeEnd, &__fragment)
+                            .publish_oob(&__topic, &__create_id, &__create_swap, &__fragment)
                         {
                             ::autumn_web::reexports::tracing::warn!(error = %__err, "auto-broadcast failed");
                         }
@@ -1446,8 +1530,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     if let ::core::option::Option::Some(__channels) = ::autumn_web::__private::get_global_channels() {
                         let __topic = #topic_expr;
                         let __fragment = #render_expr;
-                        let __id = ::autumn_web::htmx::extract_html_id(&__fragment.clone().into_string())
-                            .unwrap_or_else(|| ::std::format!("{}-{}", #model_prefix, ::autumn_web::repository::ModelPrimaryKey::primary_key_value(__record_ref)));
+                        let __id = #update_id_expr;
 
                         let __prev_id = __ctx_val
                             .get("__autumn_previous_id")
@@ -1507,43 +1590,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     let __record_ref = &__record;
                     if let ::core::option::Option::Some(__channels) = ::autumn_web::__private::get_global_channels() {
                         let __topic = #topic_expr;
-                        let __id = {
-                            let __fragment = #render_expr;
-                            let __html = __fragment.into_string();
-                            (|| -> ::core::option::Option<::std::string::String> {
-                                let __start_tag_end = __html.find('>')?;
-                                let __start_tag = &__html[..__start_tag_end];
-                                let mut __id_idx = ::core::option::Option::None;
-                                let mut __search_start = 0;
-                                while let ::core::option::Option::Some(__offset) = __start_tag[__search_start..].find("id=") {
-                                    let __absolute_idx = __search_start + __offset;
-                                    if __absolute_idx > 0 {
-                                        let __prev_char = __start_tag.as_bytes()[__absolute_idx - 1];
-                                        if __prev_char == b' ' || __prev_char == b'\t' || __prev_char == b'\n' || __prev_char == b'\r' {
-                                            __id_idx = ::core::option::Option::Some(__absolute_idx);
-                                            break;
-                                        }
-                                    }
-                                    __search_start = __absolute_idx + 3;
-                                }
-                                let __idx = __id_idx?;
-                                let __after_id = &__start_tag[__idx + 3..];
-                                let mut __chars = __after_id.chars();
-                                let __quote = __chars.next()?;
-                                if __quote == '"' || __quote == '\'' {
-                                    let mut __val = ::std::string::String::new();
-                                    for __c in __chars {
-                                        if __c == __quote {
-                                            break;
-                                        }
-                                        __val.push(__c);
-                                    }
-                                    ::core::option::Option::Some(__val)
-                                } else {
-                                    ::core::option::Option::None
-                                }
-                            })().unwrap_or_else(|| ::std::format!("{}-{}", #model_prefix, ::autumn_web::repository::ModelPrimaryKey::primary_key_value(__record_ref)))
-                        };
+                        let __id = #delete_id_expr;
                         let __fragment = ::autumn_web::html! {};
                         if let ::core::result::Result::Err(__err) = __channels
                             .broadcast()
@@ -1586,21 +1633,13 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 base_topic_expr
             };
 
-            let model_prefix = to_snake_case(&config.model_name.to_string());
-            let model_name_str = config.model_name.to_string();
-            let table_name = &config.table_name;
-            let render_expr = if let Some(ref render_path) = config.broadcast_render {
-                quote! { #render_path(__record_ref) }
+            let prev_id_expr = if let Some(ref render_path) = config.broadcast_render {
+                quote! { {
+                    let __prev_fragment = #render_path(__record_ref);
+                    ::autumn_web::htmx::extract_html_id(&__prev_fragment.into_string())
+                } }
             } else {
-                quote! {
-                    ::autumn_web::html! {
-                        li id=(::std::format!("{}-{}", #model_prefix, ::autumn_web::repository::ModelPrimaryKey::primary_key_value(__record_ref))) {
-                            a href=(::std::format!("/{}/{}", #table_name, ::autumn_web::repository::ModelPrimaryKey::primary_key_value(__record_ref))) {
-                                (::std::format!("{} #{}", #model_name_str, ::autumn_web::repository::ModelPrimaryKey::primary_key_value(__record_ref)))
-                            }
-                        }
-                    }
-                }
+                quote! { ::core::option::Option::Some(<#model_name as ::autumn_web::live::LiveFragment>::dom_id(__record_ref)) }
             };
 
             (
@@ -1608,8 +1647,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     let (__autumn_previous_topic, __autumn_previous_id) = if let ::core::option::Option::Some(__record_val) = &__vh_before {
                         let __record_ref = __record_val;
                         let __prev_topic = #topic_expr;
-                        let __prev_fragment = #render_expr;
-                        let __prev_id = ::autumn_web::htmx::extract_html_id(&__prev_fragment.into_string());
+                        let __prev_id = #prev_id_expr;
                         (::core::option::Option::Some(__prev_topic), __prev_id)
                     } else {
                         (::core::option::Option::None, ::core::option::Option::None)
@@ -4181,21 +4219,10 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         base_topic_expr
                     };
 
-                    let model_prefix = to_snake_case(&config.model_name.to_string());
-                    let model_name_str = config.model_name.to_string();
-                    let table_name = &config.table_name;
-                    let render_expr = if let Some(ref render_path) = config.broadcast_render {
-                        quote! { #render_path(__record_ref) }
+                    let prev_id_expr_bulk = if let Some(ref render_path) = config.broadcast_render {
+                        quote! { ::autumn_web::htmx::extract_html_id(&{#render_path(__record_ref)}.into_string()) }
                     } else {
-                        quote! {
-                            ::autumn_web::html! {
-                                li id=(::std::format!("{}-{}", #model_prefix, ::autumn_web::repository::ModelPrimaryKey::primary_key_value(__record_ref))) {
-                                    a href=(::std::format!("/{}/{}", #table_name, ::autumn_web::repository::ModelPrimaryKey::primary_key_value(__record_ref))) {
-                                        (::std::format!("{} #{}", #model_name_str, ::autumn_web::repository::ModelPrimaryKey::primary_key_value(__record_ref)))
-                                    }
-                                }
-                            }
-                        }
+                        quote! { ::core::option::Option::Some(<#model_name as ::autumn_web::live::LiveFragment>::dom_id(__record_ref)) }
                     };
 
                     quote! {
@@ -4225,8 +4252,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                             let __prev_topic = #topic_expr;
                             chunk_previous_topics.push(::core::option::Option::Some(__prev_topic.clone()));
 
-                            let __prev_fragment = #render_expr;
-                            let __prev_id = ::autumn_web::htmx::extract_html_id(&__prev_fragment.into_string());
+                            let __prev_id = #prev_id_expr_bulk;
                             chunk_previous_ids.push(__prev_id.clone());
 
                             if let ::core::option::Option::Some(__prev_id_val) = __prev_id {
@@ -4886,6 +4912,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             __autumn_slow_threshold: ::std::time::Duration,
             /// Route path from `MatchedPath` for metrics labels.
             __autumn_route: ::std::option::Option<::std::string::String>,
+            #bcast_struct_field
         };
 
         let clone_impl = quote! {
@@ -4899,6 +4926,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         __autumn_statement_timeout_ms: self.__autumn_statement_timeout_ms,
                         __autumn_slow_threshold: self.__autumn_slow_threshold,
                         __autumn_route: self.__autumn_route.clone(),
+                        #bcast_clone_field
                     }
                 }
             }
@@ -4933,6 +4961,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 __autumn_statement_timeout_ms: __autumn_timeout_ms,
                 __autumn_slow_threshold,
                 __autumn_route,
+                #bcast_field_some_state
             })
         };
 
@@ -6757,6 +6786,237 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             update_many_body,
             delete_many_body,
         )
+    };
+
+    // Compute inline broadcast tokens for broadcasts-only repos (no commit_hooks).
+    // These mirror the commit-hook broadcast tokens but use the result value from
+    // the wrapped async block (`__autumn_result` / `__autumn_record`) instead of
+    // the deserialized commit-hook payload.
+    let (inline_broadcast_create, inline_broadcast_update, inline_broadcast_delete) =
+        if config.broadcasts && !commit_hooks_enabled {
+            let base_topic_expr_outer = match generate_topic_format(
+                config
+                    .broadcast_topic
+                    .as_deref()
+                    .unwrap_or(&config.table_name),
+                &quote! { __record_ref },
+            ) {
+                Ok(expr) => expr,
+                Err(err) => {
+                    let compile_err = err.to_compile_error();
+                    return quote! { #compile_err };
+                }
+            };
+
+            let topic_expr_outer = if config.tenant_scoped {
+                quote! {
+                    ::std::format!(
+                        "tenant:{}:{}",
+                        ::autumn_web::tenancy::DisplayTenantId::tenant_id_str(
+                            &__record_ref.tenant_id
+                        ),
+                        #base_topic_expr_outer
+                    )
+                }
+            } else {
+                base_topic_expr_outer
+            };
+
+            let model_prefix_outer = to_snake_case(&config.model_name.to_string());
+            let default_container_outer = format!("{}-list", config.table_name);
+            let container_expr_outer = config
+                .broadcast_container
+                .as_deref()
+                .unwrap_or(&default_container_outer);
+
+            let (render_expr_outer, create_swap_id_outer, create_swap_outer, update_id_outer) =
+                if let Some(ref render_path) = config.broadcast_render {
+                    let extract_id = quote! {
+                        ::autumn_web::htmx::extract_html_id(
+                            &{#render_path(__record_ref)}.into_string()
+                        )
+                        .unwrap_or_else(|| ::std::format!(
+                            "{}-{}",
+                            #model_prefix_outer,
+                            ::autumn_web::repository::ModelPrimaryKey::primary_key_value(
+                                __record_ref
+                            )
+                        ))
+                    };
+                    (
+                        quote! { #render_path(__record_ref) },
+                        quote! { #container_expr_outer.to_string() },
+                        quote! { ::autumn_web::htmx::OobSwap::BeforeEnd },
+                        extract_id,
+                    )
+                } else {
+                    (
+                        quote! {
+                            <#model_name as ::autumn_web::live::LiveFragment>::render_fragment(
+                                __record_ref
+                            )
+                        },
+                        quote! {
+                            <#model_name as ::autumn_web::live::LiveFragment>::dom_id(__record_ref)
+                        },
+                        quote! {
+                            <#model_name as ::autumn_web::live::LiveFragment>::insert_swap()
+                        },
+                        quote! {
+                            <#model_name as ::autumn_web::live::LiveFragment>::dom_id(__record_ref)
+                        },
+                    )
+                };
+
+            // Inline delete can only use a static topic because the record has
+            // already been removed from the DB when the broadcast fires and we
+            // have no pre-fetched snapshot.  When the topic expression is dynamic
+            // (contains a field interpolation like "post:{category_id}"), we fall
+            // back to the raw table name so that *some* broadcast is emitted.
+            // Users who need correct delete broadcasts on dynamic topics should
+            // enable `commit_hooks = true`; the durable-worker path loads the
+            // record inside the same transaction before the delete and therefore
+            // always has the right topic.
+            //
+            // Similarly, `broadcast_render` users: the delete id is approximated
+            // as "{model_prefix}-{id}" because the custom render function cannot
+            // be called without the record.  The commit-hook path calls the render
+            // function on the pre-loaded record and extracts the real id from the
+            // produced HTML.
+            //
+            // Follow-up: https://github.com/madmax983/autumn/issues/1446 tracks
+            // adding pre-fetch support to the inline path for these cases.
+            let static_delete_topic_outer: String = {
+                let raw = config
+                    .broadcast_topic
+                    .as_deref()
+                    .unwrap_or(&config.table_name);
+                if raw.contains('{') {
+                    config.table_name.clone()
+                } else {
+                    raw.to_owned()
+                }
+            };
+            let inline_delete_id_outer = if config.broadcast_render.is_some() {
+                quote! { ::std::format!("{}-{}", #model_prefix_outer, id) }
+            } else {
+                quote! {
+                    <#model_name as ::autumn_web::live::LiveFragment>::dom_id_for(id)
+                }
+            };
+
+            let ic = quote! {
+                if let ::core::result::Result::Ok(ref __autumn_record) = __autumn_result {
+                    let __record_ref = __autumn_record;
+                    if let ::core::option::Option::Some(__channels) =
+                        ::autumn_web::__private::get_global_channels()
+                    {
+                        let __topic = #topic_expr_outer;
+                        let __fragment = #render_expr_outer;
+                        let __create_id = #create_swap_id_outer;
+                        let __create_swap = #create_swap_outer;
+                        if let ::core::result::Result::Err(__err) = __channels
+                            .broadcast()
+                            .publish_oob(&__topic, &__create_id, &__create_swap, &__fragment)
+                        {
+                            ::autumn_web::reexports::tracing::warn!(
+                                error = %__err,
+                                "auto-broadcast create failed"
+                            );
+                        }
+                    }
+                }
+            };
+            // NOTE: the inline update path does not detect topic changes (e.g. when
+            // a field that's part of a dynamic `topic = "post:{category_id}"` is
+            // mutated).  The commit-hook path captures the pre-update topic in
+            // `__autumn_previous_topic` and publishes a delete on the old topic
+            // before the insert on the new topic; the inline path would need a
+            // pre-fetch to do the same.  Use `commit_hooks = true` if you need
+            // correct broadcasts when topic-keyed fields are updated.
+            // Follow-up: https://github.com/madmax983/autumn/issues/1446
+            let iu = quote! {
+                if let ::core::result::Result::Ok(ref __autumn_record) = __autumn_result {
+                    let __record_ref = __autumn_record;
+                    if let ::core::option::Option::Some(__channels) =
+                        ::autumn_web::__private::get_global_channels()
+                    {
+                        let __topic = #topic_expr_outer;
+                        let __fragment = #render_expr_outer;
+                        let __id = #update_id_outer;
+                        if let ::core::result::Result::Err(__err) = __channels
+                            .broadcast()
+                            .publish_oob(
+                                &__topic,
+                                &__id,
+                                &::autumn_web::htmx::OobSwap::OuterHTML,
+                                &__fragment,
+                            )
+                        {
+                            ::autumn_web::reexports::tracing::warn!(
+                                error = %__err,
+                                "auto-broadcast update failed"
+                            );
+                        }
+                    }
+                }
+            };
+            let id_ = quote! {
+                if let ::core::result::Result::Ok(()) = __autumn_result {
+                    if let ::core::option::Option::Some(__channels) =
+                        ::autumn_web::__private::get_global_channels()
+                    {
+                        let __del_id = #inline_delete_id_outer;
+                        let __fragment = ::autumn_web::html! {};
+                        if let ::core::result::Result::Err(__err) = __channels
+                            .broadcast()
+                            .publish_oob(
+                                #static_delete_topic_outer,
+                                &__del_id,
+                                &::autumn_web::htmx::OobSwap::Delete,
+                                &__fragment,
+                            )
+                        {
+                            ::autumn_web::reexports::tracing::warn!(
+                                error = %__err,
+                                "auto-broadcast delete failed"
+                            );
+                        }
+                    }
+                }
+            };
+            (ic, iu, id_)
+        } else {
+            (quote! {}, quote! {}, quote! {})
+        };
+
+    // For repos that declare `broadcasts = true` but have no commit_hooks, wire
+    // inline broadcasts directly into the save / update / delete method bodies.
+    // The commit-hook path already includes the broadcasts in the durable worker;
+    // this path fires them synchronously after each mutation instead.
+    let (save_body, update_body, delete_body) = if config.broadcasts && !commit_hooks_enabled {
+        (
+            quote! {
+                let __autumn_result: ::autumn_web::AutumnResult<#model_name> =
+                    async { #save_body }.await;
+                #inline_broadcast_create
+                __autumn_result
+            },
+            quote! {
+                let __autumn_result: ::autumn_web::AutumnResult<#model_name> =
+                    async { #update_body }.await;
+                #inline_broadcast_update
+                __autumn_result
+            },
+            quote! {
+                let __autumn_result: ::autumn_web::AutumnResult<()> =
+                    async { #delete_body }.await;
+                #inline_broadcast_delete
+                __autumn_result
+            },
+        )
+    } else {
+        (save_body, update_body, delete_body)
     };
 
     let route_hook_registration = if commit_hooks_enabled {
@@ -9288,6 +9548,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         __autumn_statement_timeout_ms: __seed.statement_timeout_ms,
                         __autumn_slow_threshold: __seed.slow_query_threshold,
                         __autumn_route: ::core::clone::Clone::clone(&__seed.route),
+                        #bcast_field_some_state
                     })
                 }
             }
@@ -9355,6 +9616,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         __autumn_statement_timeout_ms: __seed.statement_timeout_ms,
                         __autumn_slow_threshold: __seed.slow_query_threshold,
                         __autumn_route: ::core::clone::Clone::clone(&__seed.route),
+                        #bcast_field_none
                     }
                 }
             }

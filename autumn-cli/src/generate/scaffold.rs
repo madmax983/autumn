@@ -8,6 +8,8 @@
 //! - A `tests/<snake>.rs` smoke test that asserts the index route returns 200.
 //! - Updates to `src/main.rs` registering all new routes in `routes![ … ]`.
 
+use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::path::Path;
 
 use super::dsl::{Field, FieldKind, IdType, parse_fields};
@@ -37,8 +39,12 @@ pub struct ScaffoldOptions {
     pub queries: Vec<String>,
     /// Scaffold a JSON-only API resource.
     pub api: bool,
-    /// Enable live auto-broadcasting using SSE and HTMX extensions.
+    /// Emit `broadcasts = true` on the repository, a `LiveFragment` impl,
+    /// an SSE events route, and an SSE-wired list container in the index view.
     pub live: bool,
+    /// Emit per-field inline validation endpoints and `hx-post` attributes on
+    /// form inputs (requires `--live`).
+    pub live_validation: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -110,6 +116,7 @@ pub fn plan_scaffold_with_options(
         queries: options.queries.clone(),
         api: options.api,
         live: options.live,
+        live_validation: options.live_validation,
     };
     let mut plan = plan_model_with_options(
         project_root,
@@ -161,8 +168,10 @@ pub fn plan_scaffold_with_options(
                 &form_fields,
                 options_with_key.model.sharded,
                 options_with_key.model.soft_delete,
-                options_with_key.live,
                 options_with_key.model.id_type,
+                options_with_key.live,
+                options_with_key.live_validation,
+                metadata.validations(),
             ),
         );
         let route_mod_path = routes_dir.join("mod.rs");
@@ -192,11 +201,17 @@ pub fn plan_scaffold_with_options(
             format!("missing {}", main_path.display()),
         ))
     })?;
+    let validated_field_names: Vec<String> = if options_with_key.live_validation {
+        metadata.validations().keys().cloned().collect()
+    } else {
+        Vec::new()
+    };
     let route_entries = main_route_entries(
         &plural,
         &snake_name,
         options_with_key.api,
         options_with_key.live,
+        &validated_field_names,
     );
     let mut mods = vec!["models", "schema", "repositories"];
     if !options_with_key.api {
@@ -224,32 +239,32 @@ pub fn plan_scaffold_with_options(
     }
     plan_cargo_deps(&mut plan, project_root, &combined);
 
-    if options_with_key.live {
-        let cargo_toml_path = project_root.join("Cargo.toml");
-        let mut cargo_content = None;
-        for action in &mut plan.actions {
-            match action {
-                Action::Modify { path, contents } if path == &cargo_toml_path => {
-                    cargo_content = Some(contents);
-                    break;
-                }
-                _ => {}
-            }
-        }
-
-        if let Some(contents) = cargo_content {
-            let with_ws = ensure_autumn_web_feature(contents, "ws");
-            let with_maud = ensure_autumn_web_feature(&with_ws, "maud");
-            let with_htmx = ensure_autumn_web_feature(&with_maud, "htmx");
-            *contents = with_htmx;
+    // --live requires `ws` (sse::stream), `maud` (LiveFragment/Markup), and `htmx`.
+    // --live-validation alone also emits Markup-returning validate handlers and
+    // references HTMX_JS_PATH, so it requires `htmx` + `maud` even without `ws`.
+    if options_with_key.live || options_with_key.live_validation {
+        let cargo_path = project_root.join("Cargo.toml");
+        let base = plan
+            .actions
+            .iter()
+            .rev()
+            .find_map(|a| match a {
+                Action::Modify { path, contents } if path == &cargo_path => Some(contents.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| read_or_empty(&cargo_path));
+        let mut updated = base.clone();
+        let feats: &[&str] = if options.live {
+            &["htmx", "maud", "ws"]
         } else {
-            let existing = read_or_empty(&cargo_toml_path);
-            let with_ws = ensure_autumn_web_feature(&existing, "ws");
-            let with_maud = ensure_autumn_web_feature(&with_ws, "maud");
-            let with_htmx = ensure_autumn_web_feature(&with_maud, "htmx");
-            if with_htmx != existing {
-                plan.modify(cargo_toml_path, with_htmx);
-            }
+            &["htmx", "maud"]
+        };
+        for feat in feats {
+            updated = ensure_autumn_web_feature(&updated, feat);
+        }
+        if updated != base {
+            plan.actions.retain(|a| a.path() != cargo_path);
+            plan.modify(cargo_path, updated);
         }
     }
 
@@ -455,6 +470,58 @@ fn render_repository_file(
              {sharded_note}"
         )
     };
+    // For API scaffolds with --live, emit the stream route directly in the
+    // repository file since there is no separate routes file.
+    let api_stream_handler = if api && live {
+        format!(
+            "\n/// `GET /{plural}/stream` — SSE stream for live OOB fragments.\n\
+             ///\n\
+             /// Clients subscribe here to receive `hx-swap-oob` fragments whenever a\n\
+             /// `{snake_name}` is saved, updated, or deleted via the API.\n\
+             #[autumn_web::get(\"/{plural}/stream\")]\n\
+             pub async fn stream(\n\
+             \x20\x20\x20\x20state: autumn_web::extract::State<autumn_web::AppState>,\n\
+             ) -> impl autumn_web::reexports::axum::response::IntoResponse {{\n\
+             \x20\x20\x20\x20autumn_web::sse::stream(&state, \"{plural}\")\n\
+             }}\n"
+        )
+    } else {
+        String::new()
+    };
+    let list_id = format!("{plural}-list");
+    // API scaffolds have no HTML show route — emit plain text; HTML scaffolds link to show page.
+    let fragment_item_content = if api {
+        "(self.id)".to_string()
+    } else {
+        format!("a href=(format!(\"/{plural}/{{}}\", self.id)) {{ (self.id) }}")
+    };
+    let live_fragment_impl = if live {
+        format!(
+            "\nimpl autumn_web::live::LiveFragment for {pascal_name} {{\n\
+             \x20\x20\x20\x20fn dom_id_for(id: i64) -> String {{\n\
+             \x20\x20\x20\x20\x20\x20\x20\x20format!(\"{snake_name}-{{id}}\")\n\
+             \x20\x20\x20\x20}}\n\
+             \x20\x20\x20\x20fn dom_id(&self) -> String {{\n\
+             \x20\x20\x20\x20\x20\x20\x20\x20Self::dom_id_for(self.id)\n\
+             \x20\x20\x20\x20}}\n\
+             \x20\x20\x20\x20fn render_fragment(&self) -> maud::Markup {{\n\
+             \x20\x20\x20\x20\x20\x20\x20\x20maud::html! {{\n\
+             \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20li id=(self.dom_id()) {{\n\
+             \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20{fragment_item_content}\n\
+             \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20}}\n\
+             \x20\x20\x20\x20\x20\x20\x20\x20}}\n\
+             \x20\x20\x20\x20}}\n\
+             \x20\x20\x20\x20fn insert_swap() -> autumn_web::htmx::OobSwap {{\n\
+             \x20\x20\x20\x20\x20\x20\x20\x20autumn_web::htmx::OobSwap::Target(\n\
+             \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20autumn_web::htmx::OobMethod::BeforeEnd,\n\
+             \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\"#{list_id}\".to_string(),\n\
+             \x20\x20\x20\x20\x20\x20\x20\x20)\n\
+             \x20\x20\x20\x20}}\n\
+             }}\n"
+        )
+    } else {
+        String::new()
+    };
     format!(
         "{doc_comment}\n\
          use crate::models::{snake_name}::{{{pascal_name}, New{pascal_name}, Update{pascal_name}}};\n\
@@ -463,7 +530,9 @@ fn render_repository_file(
          #[autumn_web::repository({pascal_name}, api = \"/api/{plural}\"{soft_delete_attr}{broadcasts_attr})]\n\
          pub trait {pascal_name}Repository {{\n\
 {query_body}\
-         }}\n"
+         }}\n\
+{live_fragment_impl}\
+{api_stream_handler}"
     )
 }
 
@@ -542,7 +611,7 @@ fn render_decoded_form(_pascal_name: &str, fields: &[Field]) -> (String, String)
     reason = "This is a single template — splitting it produces less readable output, \
               not more. The whole point is one place that prints one file."
 )]
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::fn_params_excessive_bools)]
 fn render_routes_file(
     pascal_name: &str,
     snake_name: &str,
@@ -550,17 +619,16 @@ fn render_routes_file(
     fields: &[Field],
     sharded: bool,
     soft_delete: bool,
-    live: bool,
     id_type: IdType,
+    live: bool,
+    live_validation: bool,
+    validations: &BTreeMap<String, Vec<String>>,
 ) -> String {
     let id_rust = id_type.rust_type();
-    let layout_head_scripts = if live {
-        "\n                script src=\"/static/js/htmx.min.js\" {}\n                script src=\"/static/js/sse.js\" {}"
-    } else {
-        ""
-    };
-    let create_inputs = render_create_form_inputs(fields);
-    let edit_inputs = render_edit_form_inputs(fields);
+    let validated_fields: Vec<&str> = validations.keys().map(String::as_str).collect();
+    let create_inputs =
+        render_create_form_inputs(fields, live_validation, &validated_fields, plural);
+    let edit_inputs = render_edit_form_inputs(fields, live_validation, &validated_fields, plural);
     let update_columns = render_update_columns(plural, fields);
     let nullable_field_match = render_nullable_field_match(fields);
     let has_attachments = has_attachment_fields(fields);
@@ -786,6 +854,8 @@ pub async fn index(
     };
 
     // Imports: when sharded, drop Db from brace-import and add ShardedDb separately.
+    // The stream handler uses the fully-qualified axum path so no extra IntoResponse
+    // import is needed.
     let db_import = if sharded {
         "use autumn_web::flash::Flash;\n\
          use autumn_web::sharding::ShardedDb;\n\
@@ -795,6 +865,122 @@ pub async fn index(
         "use autumn_web::flash::Flash;\n\
          use autumn_web::{AutumnError, AutumnResult, Db, Markup, get, html, post, secured};"
             .to_owned()
+    };
+
+    // When `--live-validation`, emit one inline-validation handler per validated field.
+    // Each handler runs the actual declared validation rule(s) at runtime, not just
+    // an empty-check stub.
+    let validate_handlers = if live_validation {
+        let mut vh = String::new();
+        for (field_name, rules) in validations {
+            let rule_comment = rules.join(", ");
+            // Build the error chain: start with an empty-value check, then
+            // append one branch per declared rule (url, email, length).
+            // Nullable fields are not required — leave them empty → None.
+            let is_required = fields
+                .iter()
+                .find(|f| f.name == *field_name)
+                .is_none_or(|f| !f.nullable);
+            let mut error_chain = if is_required {
+                String::from("if value.is_empty() {\n        Some(\"required\")\n    }")
+            } else {
+                String::from("if value.is_empty() {\n        None\n    }")
+            };
+            for rule in rules {
+                if rule == "url" {
+                    error_chain.push_str(
+                        " else if url::Url::parse(&value).is_err() {\n        Some(\"must be a valid URL\")\n    }",
+                    );
+                } else if rule == "email" {
+                    error_chain.push_str(
+                        " else if !value.contains('@')\n            || value.split_once('@').map_or(true, |(_, d)| !d.contains('.')) {\n        Some(\"must be a valid email address\")\n    }",
+                    );
+                } else if let Some(args_str) = rule
+                    .strip_prefix("length(")
+                    .and_then(|s| s.strip_suffix(")"))
+                {
+                    let mut min: Option<u64> = None;
+                    let mut max: Option<u64> = None;
+                    for part in args_str.split(',') {
+                        let part = part.trim();
+                        if let Some(n_str) = part.strip_prefix("min = ") {
+                            if let Ok(n) = n_str.trim().parse::<u64>() {
+                                min = Some(n);
+                            }
+                        } else if let Some(n_str) = part.strip_prefix("max = ")
+                            && let Ok(n) = n_str.trim().parse::<u64>()
+                        {
+                            max = Some(n);
+                        }
+                    }
+                    if min.is_none() && max.is_none() {
+                        continue;
+                    }
+                    let cond = match (min, max) {
+                        (Some(mn), Some(mx)) => {
+                            format!("value.chars().count() < {mn} || value.chars().count() > {mx}")
+                        }
+                        (Some(mn), None) => format!("value.chars().count() < {mn}"),
+                        (None, Some(mx)) => format!("value.chars().count() > {mx}"),
+                        (None, None) => unreachable!(),
+                    };
+                    let msg = match (min, max) {
+                        (Some(mn), Some(mx)) => {
+                            format!("must be between {mn} and {mx} characters")
+                        }
+                        (Some(mn), None) => format!("must be at least {mn} characters"),
+                        (None, Some(mx)) => format!("must be at most {mx} characters"),
+                        (None, None) => unreachable!(),
+                    };
+                    let _ = write!(
+                        error_chain,
+                        " else if {cond} {{\n        Some(\"{msg}\")\n    }}"
+                    );
+                }
+            }
+            error_chain.push_str(" else {\n        None\n    }");
+
+            // Build the handler string via push_str to avoid brace-escaping issues
+            // between the format! template and the generated Rust { } delimiters.
+            let _ = write!(
+                vh,
+                "\n\n/// `POST /{plural}/validate/{field_name}` — inline validation fragment.\n"
+            );
+            let _ = write!(
+                vh,
+                "///\n/// Returns an `<span id=\"{field_name}-error\">` OOB fragment with an error\n"
+            );
+            let _ = writeln!(
+                vh,
+                "/// message when the value fails the `{rule_comment}` rule, or an empty span"
+            );
+            vh.push_str(
+                "/// when it passes. Consumed by htmx `hx-swap=\"outerHTML\"` on `hx-trigger=\"change\"`.\n",
+            );
+            let _ = writeln!(vh, "#[post(\"/{plural}/validate/{field_name}\")]");
+            let _ = writeln!(
+                vh,
+                "pub async fn validate_{field_name}(body: autumn_web::reexports::axum::body::Bytes) -> autumn_web::Markup {{"
+            );
+            let _ = write!(
+                vh,
+                "    let value = url::form_urlencoded::parse(body.as_ref())\n        .find(|(k, _)| k == \"{field_name}\")\n"
+            );
+            vh.push_str("        .map(|(_, v)| v.to_string())\n");
+            vh.push_str("        .unwrap_or_default();\n");
+            let _ = writeln!(vh, "    let error: Option<&str> = {error_chain};");
+            vh.push_str("    autumn_web::html! {\n");
+            let _ = writeln!(vh, "        span id=\"{field_name}-error\" {{");
+            vh.push_str("            @if let Some(msg) = error {\n");
+            vh.push_str("                span style=\"color:red\" { (msg) }\n");
+            vh.push_str("            }\n");
+            vh.push_str("        }\n");
+            vh.push_str("    }\n");
+            vh.push_str("}\n");
+        }
+        vh
+    } else {
+        String::new()
     };
 
     format!(
@@ -832,8 +1018,29 @@ use crate::schema::{plural};",
         } else {
             ""
         },
-    ) + &format!(
-        r#"
+    ) + &{
+        // Load htmx + SSE extension whenever live features are active.
+        // `--live-validation` alone (without `--live`) still requires htmx for
+        // the `hx-post` / `hx-trigger` / `hx-swap` attributes to fire.
+        let live_head_scripts = if live {
+            "\n                script src=(autumn_web::htmx::HTMX_JS_PATH) {};\n\
+             \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20script src=(autumn_web::htmx::HTMX_SSE_JS_PATH) {};\n\
+             \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20script src=(autumn_web::htmx::IDIOMORPH_JS_PATH) {};"
+                .to_owned()
+        } else if live_validation {
+            "\n                script src=(autumn_web::htmx::HTMX_JS_PATH) {};\n\
+             \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20script src=(autumn_web::htmx::HTMX_SSE_JS_PATH) {};"
+                .to_owned()
+        } else {
+            String::new()
+        };
+        let live_body_open = if live {
+            r#"body hx-ext="morph""#
+        } else {
+            "body"
+        };
+        format!(
+            r#"
 
 fn csrf_input(csrf: Option<&CsrfToken>, field: Option<&CsrfFormField>) -> Markup {{
     let csrf_field_name = field.map(|field| field.0.as_str()).unwrap_or("_csrf");
@@ -856,9 +1063,9 @@ fn layout(title: &str, flash: Markup, content: Markup) -> Markup {{
             head {{
                 meta charset="utf-8";
                 title {{ (title) }}
-                link rel="stylesheet" href=(autumn_web::flash::FLASH_CSS_PATH);{layout_head_scripts}
+                link rel="stylesheet" href=(autumn_web::flash::FLASH_CSS_PATH);{live_head_scripts}
             }}
-            body {{
+            {live_body_open} {{
                 (flash)
                 (content)
             }}
@@ -1018,7 +1225,8 @@ fn redirect_to(url: &str) -> Markup {{
     }}
 }}
 "#
-    ) + &if live {
+        )
+    } + &if live {
         format!(
             r#"
 
@@ -1032,7 +1240,7 @@ pub async fn events(
         )
     } else {
         String::new()
-    }
+    } + &validate_handlers
 }
 
 fn render_update_changeset_expr(pascal_name: &str, fields: &[Field]) -> String {
@@ -1055,7 +1263,12 @@ fn has_attachment_fields(fields: &[Field]) -> bool {
     fields.iter().any(|f| f.kind.is_attachment())
 }
 
-fn render_create_form_inputs(fields: &[Field]) -> String {
+fn render_create_form_inputs(
+    fields: &[Field],
+    live_validation: bool,
+    validated: &[&str],
+    plural: &str,
+) -> String {
     use std::fmt::Write as _;
     let mut out = String::new();
     for f in fields {
@@ -1072,18 +1285,39 @@ fn render_create_form_inputs(fields: &[Field]) -> String {
             );
         } else {
             let required = required_attr(f);
+            let hx_attrs = if live_validation && validated.contains(&f.name.as_str()) {
+                format!(
+                    " hx-post=\"/{plural}/validate/{name}\" hx-trigger=\"change\" hx-target=\"#{name}-error\" hx-swap=\"outerHTML\"",
+                    plural = plural,
+                    name = f.name
+                )
+            } else {
+                String::new()
+            };
+            let error_span = if live_validation && validated.contains(&f.name.as_str()) {
+                format!("\n            span id=\"{name}-error\" {{}}", name = f.name)
+            } else {
+                String::new()
+            };
             let _ = writeln!(
                 out,
-                "            label {{ \"{name}\" }} input type=\"text\" name=\"{name}\"{required};",
+                "            label {{ \"{name}\" }} input type=\"text\" name=\"{name}\"{required}{hx_attrs};{error_span}",
                 name = f.name,
-                required = required
+                required = required,
+                hx_attrs = hx_attrs,
+                error_span = error_span
             );
         }
     }
     out
 }
 
-fn render_edit_form_inputs(fields: &[Field]) -> String {
+fn render_edit_form_inputs(
+    fields: &[Field],
+    live_validation: bool,
+    validated: &[&str],
+    plural: &str,
+) -> String {
     use std::fmt::Write as _;
     let mut out = String::new();
     for f in fields {
@@ -1099,12 +1333,28 @@ fn render_edit_form_inputs(fields: &[Field]) -> String {
         } else {
             let value = edit_value_expr(f);
             let required = required_attr(f);
+            let hx_attrs = if live_validation && validated.contains(&f.name.as_str()) {
+                format!(
+                    " hx-post=\"/{plural}/validate/{name}\" hx-trigger=\"change\" hx-target=\"#{name}-error\" hx-swap=\"outerHTML\"",
+                    plural = plural,
+                    name = f.name
+                )
+            } else {
+                String::new()
+            };
+            let error_span = if live_validation && validated.contains(&f.name.as_str()) {
+                format!("\n            span id=\"{name}-error\" {{}}", name = f.name)
+            } else {
+                String::new()
+            };
             let _ = writeln!(
                 out,
-                "            label {{ \"{name}\" }} input type=\"text\" name=\"{name}\" value=({value}){required};",
+                "            label {{ \"{name}\" }} input type=\"text\" name=\"{name}\" value=({value}){required}{hx_attrs};{error_span}",
                 name = f.name,
                 value = value,
-                required = required
+                required = required,
+                hx_attrs = hx_attrs,
+                error_span = error_span
             );
         }
     }
@@ -1355,15 +1605,25 @@ fn render_smoke_test(
     }
 }
 
-fn main_route_entries(plural: &str, snake_name: &str, api: bool, live: bool) -> Vec<String> {
+fn main_route_entries(
+    plural: &str,
+    snake_name: &str,
+    api: bool,
+    live: bool,
+    validated_field_names: &[String],
+) -> Vec<String> {
     if api {
-        vec![
+        let mut entries = vec![
             format!("repositories::{snake_name}::{snake_name}_api_list"),
             format!("repositories::{snake_name}::{snake_name}_api_get"),
             format!("repositories::{snake_name}::{snake_name}_api_create"),
             format!("repositories::{snake_name}::{snake_name}_api_update"),
             format!("repositories::{snake_name}::{snake_name}_api_delete"),
-        ]
+        ];
+        if live {
+            entries.push(format!("repositories::{snake_name}::stream"));
+        }
+        entries
     } else {
         let mut entries = vec![
             format!("routes::{plural}::index"),
@@ -1376,6 +1636,9 @@ fn main_route_entries(plural: &str, snake_name: &str, api: bool, live: bool) -> 
         ];
         if live {
             entries.push(format!("routes::{plural}::events"));
+        }
+        for field_name in validated_field_names {
+            entries.push(format!("routes::{plural}::validate_{field_name}"));
         }
         entries.push(format!("repositories::{snake_name}::{snake_name}_api_list"));
         entries.push(format!("repositories::{snake_name}::{snake_name}_api_get"));
@@ -2183,8 +2446,8 @@ async fn main() {
         assert!(routes.contains("hx-ext=\"sse\""));
         assert!(routes.contains("sse-connect=\"/posts/events\""));
         assert!(routes.contains("hx-swap=\"none\""));
-        assert!(routes.contains("script src=\"/static/js/htmx.min.js\""));
-        assert!(routes.contains("script src=\"/static/js/sse.js\""));
+        assert!(routes.contains("autumn_web::htmx::HTMX_JS_PATH"));
+        assert!(routes.contains("autumn_web::htmx::HTMX_SSE_JS_PATH"));
         assert!(routes.contains("title: autumn_web::hooks::Patch::Set(form.title.clone())"));
 
         let main_rs = fs::read_to_string(tmp.path().join("src/main.rs")).unwrap();

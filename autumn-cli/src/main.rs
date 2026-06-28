@@ -1639,9 +1639,14 @@ enum GenerateCommands {
         /// Defaults to `tenant_id` if that field is present, otherwise `id`.
         #[arg(long, value_name = "FIELD")]
         shard_key: Option<String>,
-        /// Auto-broadcast model mutations to live HTMX views.
+        /// Emit `broadcasts = true` on the repository, a `LiveFragment` impl,
+        /// an SSE stream route, and an SSE-wired list container in the index view.
         #[arg(long)]
         live: bool,
+        /// Emit per-field inline validation endpoints and `hx-post` attributes on
+        /// form inputs (implies `--live`).
+        #[arg(long)]
+        live_validation: bool,
         /// Print the file plan and exit without writing anything.
         #[arg(long)]
         dry_run: bool,
@@ -2486,6 +2491,7 @@ fn run_generate_command(cmd: GenerateCommands) {
             sharded,
             shard_key,
             live,
+            live_validation,
             dry_run,
             force,
         } => {
@@ -2540,6 +2546,7 @@ fn run_generate_command(cmd: GenerateCommands) {
                 shard_key.as_deref(),
                 live,
                 id.as_deref(),
+                live_validation,
             ) {
                 Ok(result) => result,
                 Err(e) => {

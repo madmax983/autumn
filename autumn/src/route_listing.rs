@@ -243,6 +243,16 @@ pub(crate) fn append_framework_routes(
         });
         infos.push(RouteInfo {
             method: "GET".to_owned(),
+            path: crate::htmx::IDIOMORPH_JS_PATH.to_owned(),
+            handler: "idiomorph".to_owned(),
+            source: RouteSource::Framework,
+            middleware: Vec::new(),
+            api_version: None,
+            status: None,
+            sunset_opt_out: None,
+        });
+        infos.push(RouteInfo {
+            method: "GET".to_owned(),
             path: crate::htmx::HTMX_SSE_JS_PATH.to_owned(),
             handler: "htmx_sse".to_owned(),
             source: RouteSource::Framework,

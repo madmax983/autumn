@@ -1045,6 +1045,7 @@ fn collect_claimed_get_paths(
         }
         claimed.insert(crate::htmx::HTMX_CSRF_JS_PATH.to_owned());
         claimed.insert(crate::htmx::AUTUMN_WIDGETS_JS_PATH.to_owned());
+        claimed.insert(crate::htmx::IDIOMORPH_JS_PATH.to_owned());
         claimed.insert(crate::htmx::HTMX_SSE_JS_PATH.to_owned());
     }
     // Dev live-reload endpoints are only mounted when the env vars
@@ -1382,64 +1383,8 @@ const fn is_i18n_bundle_extension_layer(_type_id: std::any::TypeId) -> bool {
     false
 }
 
-#[cfg(feature = "htmx")]
-fn mount_htmx_routes(mut router: axum::Router<AppState>) -> axum::Router<AppState> {
-    if crate::assets::htmx_is_vendored() {
-        tracing::debug!(
-            path = crate::htmx::HTMX_JS_PATH,
-            "htmx vendored via `autumn assets`; built-in handler skipped, ServeDir serves it"
-        );
-    } else {
-        router = router.route(crate::htmx::HTMX_JS_PATH, axum::routing::get(htmx_handler));
-        tracing::debug!(
-            method = "GET",
-            path = crate::htmx::HTMX_JS_PATH,
-            name = format!("htmx {}", crate::htmx::HTMX_VERSION),
-            "Mounted route"
-        );
-    }
-    router = router.route(
-        crate::htmx::HTMX_CSRF_JS_PATH,
-        axum::routing::get(htmx_csrf_handler),
-    );
-    router = router.route(
-        crate::htmx::AUTUMN_WIDGETS_JS_PATH,
-        axum::routing::get(autumn_widgets_handler),
-    );
-    if crate::assets::sse_is_vendored() {
-        tracing::debug!(
-            path = crate::htmx::HTMX_SSE_JS_PATH,
-            "sse extension vendored via `autumn assets`; built-in handler skipped, ServeDir serves it"
-        );
-    } else {
-        router = router.route(
-            crate::htmx::HTMX_SSE_JS_PATH,
-            axum::routing::get(htmx_sse_handler),
-        );
-        tracing::debug!(
-            method = "GET",
-            path = crate::htmx::HTMX_SSE_JS_PATH,
-            name = "htmx sse extension",
-            "Mounted route"
-        );
-    }
-    tracing::debug!(
-        method = "GET",
-        path = crate::htmx::HTMX_CSRF_JS_PATH,
-        name = "htmx csrf helper",
-        "Mounted route"
-    );
-    tracing::debug!(
-        method = "GET",
-        path = crate::htmx::AUTUMN_WIDGETS_JS_PATH,
-        name = "autumn widget runtime",
-        "Mounted route"
-    );
-    router
-}
-
 #[cfg_attr(not(feature = "mail"), allow(unused_variables))]
-#[allow(clippy::cognitive_complexity)]
+#[allow(clippy::cognitive_complexity, clippy::too_many_lines)]
 fn mount_framework_routes(
     mut router: axum::Router<AppState>,
     config: &AutumnConfig,
@@ -1451,7 +1396,64 @@ fn mount_framework_routes(
     // Framework-provided routes
     #[cfg(feature = "htmx")]
     {
-        router = mount_htmx_routes(router);
+        // When htmx is vendored via `autumn assets add htmx@…`, skip the
+        // built-in handler so ServeDir serves the correctly-pinned file.
+        // Axum explicit routes beat `nest_service`, so without this guard the
+        // embedded 2.0.4 bytes would shadow any updated vendored version.
+        if crate::assets::htmx_is_vendored() {
+            tracing::debug!(
+                path = crate::htmx::HTMX_JS_PATH,
+                "htmx vendored via `autumn assets`; built-in handler skipped, ServeDir serves it"
+            );
+        } else {
+            router = router.route(crate::htmx::HTMX_JS_PATH, axum::routing::get(htmx_handler));
+            tracing::debug!(
+                method = "GET",
+                path = crate::htmx::HTMX_JS_PATH,
+                name = format!("htmx {}", crate::htmx::HTMX_VERSION),
+                "Mounted route"
+            );
+        }
+        router = router.route(
+            crate::htmx::HTMX_CSRF_JS_PATH,
+            axum::routing::get(htmx_csrf_handler),
+        );
+        router = router.route(
+            crate::htmx::AUTUMN_WIDGETS_JS_PATH,
+            axum::routing::get(autumn_widgets_handler),
+        );
+        router = router.route(
+            crate::htmx::IDIOMORPH_JS_PATH,
+            axum::routing::get(idiomorph_handler),
+        );
+        router = router.route(
+            crate::htmx::HTMX_SSE_JS_PATH,
+            axum::routing::get(htmx_sse_handler),
+        );
+        tracing::debug!(
+            method = "GET",
+            path = crate::htmx::HTMX_CSRF_JS_PATH,
+            name = "htmx csrf helper",
+            "Mounted route"
+        );
+        tracing::debug!(
+            method = "GET",
+            path = crate::htmx::AUTUMN_WIDGETS_JS_PATH,
+            name = "autumn widget runtime",
+            "Mounted route"
+        );
+        tracing::debug!(
+            method = "GET",
+            path = crate::htmx::IDIOMORPH_JS_PATH,
+            name = "idiomorph DOM morphing",
+            "Mounted route"
+        );
+        tracing::debug!(
+            method = "GET",
+            path = crate::htmx::HTMX_SSE_JS_PATH,
+            name = "htmx SSE extension",
+            "Mounted route"
+        );
     }
 
     // Framework-provided flash-message stylesheet. Served as a same-origin
@@ -3232,6 +3234,28 @@ pub async fn autumn_widgets_handler() -> axum::response::Response {
         .into_response()
 }
 
+/// Serves the vendored idiomorph DOM-morphing library at [`crate::htmx::IDIOMORPH_JS_PATH`].
+///
+/// Idiomorph enables smooth DOM morphing via `hx-swap="morph"` in htmx.
+#[cfg(feature = "htmx")]
+pub async fn idiomorph_handler() -> axum::response::Response {
+    use axum::response::IntoResponse;
+    (
+        [
+            (http::header::CONTENT_TYPE, "application/javascript"),
+            (
+                http::header::CACHE_CONTROL,
+                "public, max-age=31536000, immutable",
+            ),
+        ],
+        crate::htmx::IDIOMORPH_JS,
+    )
+        .into_response()
+}
+
+/// Serves the vendored htmx SSE extension at [`crate::htmx::HTMX_SSE_JS_PATH`].
+///
+/// The SSE extension enables `hx-ext="sse"` for server-sent event streams.
 #[cfg(feature = "htmx")]
 pub async fn htmx_sse_handler() -> axum::response::Response {
     use axum::response::IntoResponse;
@@ -6394,4 +6418,38 @@ pub fn check_sunset(
     }
 
     None
+}
+
+#[cfg(all(test, feature = "htmx"))]
+mod idiomorph_tests {
+    use super::*;
+    use http::StatusCode;
+    use http_body_util::BodyExt;
+
+    #[tokio::test]
+    async fn idiomorph_handler_returns_js_with_correct_headers() {
+        let response = idiomorph_handler().await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let ct = response
+            .headers()
+            .get(http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert_eq!(ct, "application/javascript");
+
+        let cc = response
+            .headers()
+            .get(http::header::CACHE_CONTROL)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(
+            cc.contains("immutable"),
+            "expected immutable cache-control, got: {cc}"
+        );
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert!(!body.is_empty(), "idiomorph JS body must be non-empty");
+    }
 }

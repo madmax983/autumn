@@ -57,6 +57,11 @@ impl ModelMetadata {
     pub const fn defaults(&self) -> &BTreeMap<String, String> {
         &self.defaults
     }
+
+    #[must_use]
+    pub const fn validations(&self) -> &BTreeMap<String, Vec<String>> {
+        &self.validations
+    }
 }
 
 /// Compute every action a `generate model` invocation would perform.

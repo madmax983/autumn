@@ -6,7 +6,7 @@ publish = false
 default-run = "reddit-clone"
 
 [dependencies]
-autumn-web = { path = "../../autumn", features = ["mail", "ws", "presence", "storage", "multipart", "redis", "variants"] }
+autumn-web = { path = "../../autumn", features = ["mail", "ws", "presence", "storage", "multipart", "redis", "variants", "htmx", "maud"] }
 async-stream = "0.3"
 axum = { workspace = true }
 bytes = "1"
