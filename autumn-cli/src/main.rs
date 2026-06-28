@@ -1659,11 +1659,11 @@ enum GenerateCommands {
     ///
     /// Example:
     ///
-    ///   autumn generate plugin my-plugin
-    ///   autumn generate plugin my-plugin --path custom/path
+    ///   autumn generate plugin custom-auth
+    ///   autumn generate plugin custom-auth --path custom/path
     #[command(verbatim_doc_comment)]
     Plugin {
-        /// Plugin name (`snake_case` or `kebab-case`, e.g. `admin` or `my-plugin`).
+        /// Plugin name (`snake_case` or `kebab-case`, e.g. `admin` or `custom-auth`).
         name: String,
         /// Custom destination path for the generated plugin (defaults to `autumn-<name>-plugin` in the project root).
         #[arg(long)]
