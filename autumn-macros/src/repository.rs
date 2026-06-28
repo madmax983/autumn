@@ -286,9 +286,6 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
             "expected model name: #[repository(ModelName)]",
         )
     })?;
-    if broadcasts {
-        commit_hooks = true;
-    }
     if commit_hooks && hooks_type.is_none() && !broadcasts {
         return Err(syn::Error::new(
             proc_macro2::Span::call_site(),
