@@ -7175,13 +7175,15 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             }
         };
         // ── update_many broadcast ─────────────────────────────────────────
-        // Iterates the post-mutation result vec and broadcasts OuterHTML per record
-        // on its (potentially new) topic.  Skipped for dynamic topics: when a topic
-        // field can change, a bulk update would send OuterHTML to the post-update topic
-        // while old-topic subscribers never receive a delete — emitting nothing is safer
-        // than a misleading half-update.  Use commit_hooks = true for full correctness
-        // on bulk dynamic-topic updates.
-        let ium = if topic_is_dynamic_outer {
+        // Only broadcast OuterHTML for the simplest case: static topic + default render.
+        // Skipped when update_needs_prefetch (dynamic topic OR custom render) because:
+        // - dynamic topic: OuterHTML sent to the post-update topic leaves old-topic
+        //   subscribers with stale elements and new-topic clients with a failed swap.
+        // - custom render: the rendered element id may encode a mutable field; clients
+        //   hold the element under the pre-update id, so a swap keyed by the post-update
+        //   id misses its target.
+        // Both cases require N pre-fetches to handle correctly; use commit_hooks = true.
+        let ium = if update_needs_prefetch {
             quote! {}
         } else {
             quote! {
