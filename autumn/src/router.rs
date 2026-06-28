@@ -6419,3 +6419,37 @@ pub fn check_sunset(
 
     None
 }
+
+#[cfg(all(test, feature = "htmx"))]
+mod idiomorph_tests {
+    use super::*;
+    use http::StatusCode;
+    use http_body_util::BodyExt;
+
+    #[tokio::test]
+    async fn idiomorph_handler_returns_js_with_correct_headers() {
+        let response = idiomorph_handler().await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let ct = response
+            .headers()
+            .get(http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert_eq!(ct, "application/javascript");
+
+        let cc = response
+            .headers()
+            .get(http::header::CACHE_CONTROL)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(
+            cc.contains("immutable"),
+            "expected immutable cache-control, got: {cc}"
+        );
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert!(!body.is_empty(), "idiomorph JS body must be non-empty");
+    }
+}

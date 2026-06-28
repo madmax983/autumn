@@ -722,6 +722,51 @@ mod tests {
         let _sse = presence_stream(&state, "stream-test");
     }
 
+    /// Poll the `presence_stream` SSE body to exercise the closure that calls
+    /// `presence.list`, `presence_badge`, and `inject_oob_attr`.
+    #[cfg(all(feature = "ws", feature = "maud", feature = "htmx"))]
+    #[tokio::test]
+    async fn presence_stream_body_emits_oob_badge_on_join() {
+        use axum::response::IntoResponse;
+        use http_body_util::BodyExt;
+
+        let state = crate::AppState::for_test();
+        let presence_svc = state.presence().clone();
+
+        // Build the SSE response; subscription is set up inside presence_stream.
+        let sse = presence_stream(&state, "body-poll-test");
+        let response = sse.into_response();
+
+        // Trigger a join event after the subscription is established.
+        let _handle = presence_svc.track("body-poll-test", "frank", serde_json::json!({}));
+
+        let mut body = response.into_body();
+        // Poll for one frame — this drives the map closure that builds the OOB badge.
+        // `frame()` returns Option<Result<Frame<Bytes>, Error>>.
+        let frame_result = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            body.frame(),
+        )
+        .await
+        .expect("timed out waiting for SSE frame from presence_stream");
+
+        match frame_result {
+            Some(Ok(frame)) => {
+                if let Ok(data) = frame.into_data() {
+                    let text = String::from_utf8_lossy(&data);
+                    // The SSE data line carries the OOB badge HTML.
+                    assert!(
+                        text.contains("presence-badge") || text.contains("hx-swap-oob"),
+                        "expected OOB badge in SSE frame, got: {text}"
+                    );
+                }
+                // If it's a trailers frame that's fine — the closure fired.
+            }
+            Some(Err(e)) => panic!("SSE body error: {e}"),
+            None => panic!("SSE body ended without yielding a frame"),
+        }
+    }
+
     #[test]
     fn presence_event_round_trips() {
         let events = vec![
