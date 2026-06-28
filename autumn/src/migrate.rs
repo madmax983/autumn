@@ -1174,31 +1174,6 @@ pub(crate) fn auto_migrate(
     }
 }
 
-/// Apply `migrations` unconditionally, bypassing the profile gate used by
-/// [`auto_migrate`].  Use only for framework-internal tables that the
-/// application cannot start without (e.g. `_autumn_shard_map`), where the
-/// usual dev/prod/allow-in-production gate would leave the table missing on
-/// staging or other non-standard profiles and block startup.
-///
-/// On failure the process exits with code 1 (same as [`auto_migrate`]).
-pub(crate) fn force_migrate(database_url: &str, migrations: &EmbeddedMigrations, target: &str) {
-    match run_pending_locked(database_url, EmbeddedMigrationsRef(migrations), None) {
-        Ok(result) if result.applied.is_empty() => {
-            tracing::info!(target = %target, "No pending migrations");
-        }
-        Ok(result) => {
-            for name in &result.applied {
-                tracing::info!(migration = %name, target = %target, "Applied migration");
-            }
-        }
-        Err(e) => {
-            tracing::error!(error = %e, target = %target, "Failed to run migrations");
-            #[cfg(feature = "managed-pg")]
-            crate::managed_pg::emergency_stop();
-            std::process::exit(1);
-        }
-    }
-}
 
 #[cfg(test)]
 mod tests {
