@@ -1654,6 +1654,32 @@ enum GenerateCommands {
         #[arg(long)]
         force: bool,
     },
+    /// Scaffold an installable/conformant plugin crate.
+    ///
+    /// Creates:
+    ///   - `<target-dir>/Cargo.toml`       — plugin crate cargo file
+    ///   - `<target-dir>/src/lib.rs`       — main plugin implementation
+    ///   - `<target-dir>/README.md`        — installation & setup documentation
+    ///   - `<target-dir>/tests/conformance.rs` — conformance tests verification
+    ///
+    /// Example:
+    ///
+    ///   autumn generate plugin custom-auth
+    ///   autumn generate plugin custom-auth --path custom/path
+    #[command(verbatim_doc_comment)]
+    Plugin {
+        /// Plugin name (`snake_case` or `kebab-case`, e.g. `admin` or `custom-auth`).
+        name: String,
+        /// Custom destination path for the generated plugin (defaults to `autumn-<name>-plugin` in the project root).
+        #[arg(long)]
+        path: Option<String>,
+        /// Print the file plan and exit without writing anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Overwrite existing files instead of erroring on collision.
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 fn main() {
@@ -2555,6 +2581,72 @@ fn run_generate_command(cmd: GenerateCommands) {
                 }
             };
             generate::scaffold::run(&name, &fields, generate::Flags { dry_run, force }, &options);
+        }
+        GenerateCommands::Plugin {
+            name,
+            path,
+            dry_run,
+            force,
+        } => {
+            let cwd = match std::env::current_dir() {
+                Ok(d) => d,
+                Err(e) => {
+                    eprintln!("Error: cannot determine current directory: {e}");
+                    std::process::exit(1);
+                }
+            };
+            match generate::plugin::plan_plugin(
+                &cwd,
+                &name,
+                path.as_deref().map(std::path::Path::new),
+                generate::Flags { dry_run, force },
+            ) {
+                Ok(plugin_plan) => {
+                    match plugin_plan.plan.execute(generate::Flags { dry_run, force }) {
+                        Ok(()) => {
+                            if !dry_run {
+                                println!("\nNext steps:");
+                                println!(
+                                    "  1. Add the plugin to your workspace members in `Cargo.toml`:"
+                                );
+                                println!("       [workspace]");
+                                println!("       members = [");
+                                println!("           # ...,");
+                                println!("           \"{}\",", plugin_plan.target_dir_relative);
+                                println!("       ]");
+                                println!(
+                                    "  2. Add the dependency to your host app's `Cargo.toml`:"
+                                );
+                                println!("       [dependencies]");
+                                println!(
+                                    "       autumn-{}-plugin = {{ path = \"./{}\" }}",
+                                    plugin_plan.name_kebab, plugin_plan.target_dir_relative
+                                );
+                                println!(
+                                    "  3. Register the plugin with your host app in `src/main.rs`:"
+                                );
+                                println!(
+                                    "       app.plugin(autumn_{}_plugin::{}::new())",
+                                    plugin_plan.name_snake, plugin_plan.struct_name
+                                );
+                                println!("  4. Run the conformance test to verify:");
+                                println!(
+                                    "       cargo test -p autumn-{}-plugin\n",
+                                    plugin_plan.name_kebab
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("Error: {e}");
+                            std::process::exit(1);
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Error: {e}");
+                    std::process::exit(1);
+                }
+            }
         }
     }
 }
@@ -5139,6 +5231,52 @@ mod tests {
         };
         assert!(!dry_run);
         assert!(force);
+    }
+
+    #[test]
+    fn parse_generate_plugin() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "generate",
+            "plugin",
+            "foo",
+            "--path",
+            "custom-path",
+            "--dry-run",
+            "--force",
+        ])
+        .unwrap();
+        let Commands::Generate(GenerateCommands::Plugin {
+            name,
+            path,
+            dry_run,
+            force,
+        }) = cli.command
+        else {
+            panic!("expected Plugin variant");
+        };
+        assert_eq!(name, "foo");
+        assert_eq!(path.as_deref(), Some("custom-path"));
+        assert!(dry_run);
+        assert!(force);
+    }
+
+    #[test]
+    fn parse_generate_plugin_defaults() {
+        let cli = Cli::try_parse_from(["autumn", "generate", "plugin", "foo"]).unwrap();
+        let Commands::Generate(GenerateCommands::Plugin {
+            name,
+            path,
+            dry_run,
+            force,
+        }) = cli.command
+        else {
+            panic!("expected Plugin variant");
+        };
+        assert_eq!(name, "foo");
+        assert!(path.is_none());
+        assert!(!dry_run);
+        assert!(!force);
     }
 
     #[test]

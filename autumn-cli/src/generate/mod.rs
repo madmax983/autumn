@@ -21,6 +21,7 @@ pub mod mailer;
 pub mod migration;
 pub mod model;
 pub mod naming;
+pub mod plugin;
 pub mod pwa;
 pub mod scaffold;
 pub mod schema_edit;
