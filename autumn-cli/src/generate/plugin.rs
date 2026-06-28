@@ -6,22 +6,6 @@ use std::path::Path;
 use super::emit::Plan;
 use super::{Flags, GenerateError};
 
-fn to_pascal_case(s: &str) -> String {
-    let mut result = String::new();
-    let mut capitalize = true;
-    for c in s.chars() {
-        if c == '-' || c == '_' {
-            capitalize = true;
-        } else if capitalize {
-            result.push(c.to_ascii_uppercase());
-            capitalize = false;
-        } else {
-            result.push(c);
-        }
-    }
-    result
-}
-
 #[allow(clippy::too_many_lines)]
 pub fn plan_plugin(
     project_root: &Path,
@@ -35,15 +19,8 @@ pub fn plan_plugin(
     );
 
     if target_dir.exists() && !flags.force {
-        if target_dir.is_dir() {
-            let mut entries = fs::read_dir(&target_dir)?;
-            if entries.next().is_some() {
-                return Err(GenerateError::Config(format!(
-                    "target directory '{}' already exists and is not empty. Use --force to override.",
-                    target_dir.display().to_string().replace('\\', "/")
-                )));
-            }
-        } else {
+        let is_empty_dir = target_dir.is_dir() && fs::read_dir(&target_dir)?.next().is_none();
+        if !is_empty_dir {
             return Err(GenerateError::Config(format!(
                 "target directory '{}' already exists and is not empty. Use --force to override.",
                 target_dir.display().to_string().replace('\\', "/")
@@ -74,7 +51,7 @@ serde = {{ version = "1", features = ["derive"] }}
 "#
     );
 
-    let struct_name = format!("{}Plugin", to_pascal_case(name));
+    let struct_name = format!("{}Plugin", super::naming::pascal(&name.replace('-', "_")));
     let lib_rs_content = format!(
         r#"//! autumn-{name}-plugin
 
