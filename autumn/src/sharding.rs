@@ -286,6 +286,16 @@ pub const DEFAULT_DIRECTORY_CACHE_TTL: std::time::Duration = std::time::Duration
 pub const SHARD_DIRECTORY_MIGRATIONS: diesel_migrations::EmbeddedMigrations =
     diesel_migrations::embed_migrations!("shard_directory_migrations");
 
+/// The `_autumn_shard_map` table migration as a standalone embedded set.
+///
+/// Embedded separately so the boot-time shard-map guard can auto-create its
+/// control table at startup (the `migrations/` copy is applied by
+/// `autumn migrate`). The migration is `CREATE TABLE IF NOT EXISTS`, so
+/// applying it from either set is idempotent. Keep both copies in sync.
+#[cfg(feature = "db")]
+pub const SHARD_MAP_MIGRATIONS: diesel_migrations::EmbeddedMigrations =
+    diesel_migrations::embed_migrations!("shard_map_migrations");
+
 #[derive(Clone, Copy)]
 struct DirectoryCacheEntry {
     shard: ShardId,
