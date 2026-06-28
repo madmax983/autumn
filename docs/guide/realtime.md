@@ -147,6 +147,128 @@ app.with_channels_backend(LocalChannelsBackend::new(64))
 # }
 ```
 
+## Auto-broadcast with `LiveFragment`
+
+Autumn can broadcast OOB (out-of-band) htmx fragments automatically whenever
+a repository mutates a record. Opt in by implementing `LiveFragment` on your
+model and adding `broadcasts = true` to `#[repository]`.
+
+Requires the `ws`, `maud`, and `htmx` Cargo features.
+
+### 1. Implement `LiveFragment`
+
+```rust
+use autumn_web::prelude::*;
+use maud::{Markup, html};
+
+pub struct Post { pub id: i64, pub title: String }
+
+impl LiveFragment for Post {
+    fn dom_id_for(id: i64) -> String {
+        format!("post-{id}")
+    }
+
+    fn dom_id(&self) -> String {
+        Self::dom_id_for(self.id)
+    }
+
+    fn render_fragment(&self) -> Markup {
+        html! {
+            li id=(self.dom_id()) { (self.title) }
+        }
+    }
+
+    // Override for inserts: append to a list container instead of
+    // trying to replace an element that doesn't exist yet on the client.
+    fn insert_swap() -> OobSwap {
+        OobSwap::Target(OobMethod::BeforeEnd, "#posts-list".to_string())
+    }
+}
+```
+
+### 2. Declare `broadcasts = true` on the repository
+
+```rust
+#[repository(Post, broadcasts = true)]
+pub trait PostRepository {}
+```
+
+Use `topic = "custom-name"` to override the default topic (which is the
+table name, e.g. `"posts"`). Broadcasts fire synchronously after each
+`save`, `update`, or `delete_by_id` call.
+
+### 3. Wire the SSE list container in your template
+
+```html
+<ul id="posts-list"
+    hx-ext="sse"
+    sse-connect="/posts/stream"
+    sse-swap="message"
+    hx-swap="none">
+  <!-- rows rendered server-side on initial load -->
+</ul>
+```
+
+`hx-swap="none"` is required — it disables htmx's default in-band
+`innerHTML` swap so that incoming SSE messages are processed only as OOB
+swaps (instead of clearing the list first).
+
+### 4. Add the SSE stream route
+
+```rust
+#[get("/posts/stream")]
+async fn stream(State(state): State<AppState>) -> impl IntoResponse {
+    autumn_web::sse::stream(&state, "posts")
+}
+```
+
+### OOB swap strategies
+
+| Mutation | Default strategy |
+|----------|-----------------|
+| `save`   | `LiveFragment::insert_swap()` — defaults to `OobSwap::True` (replace by id); override with `OobSwap::Target` to append to a container |
+| `update` | `OobSwap::OuterHTML` (replace element by matching id) |
+| `delete` | `OobSwap::Delete` (remove element from DOM) |
+
+When both `broadcasts = true` and `commit_hooks = true` are declared,
+broadcasts fire in the durable commit-hook worker (after DB commit). Without
+commit hooks, they fire inline after the mutation in the same async task.
+
+---
+
+## `--live` Scaffold
+
+`autumn generate scaffold` accepts a `--live` flag that wires up a
+complete SSE broadcast pipeline for you:
+
+```sh
+autumn generate scaffold Post title:String body:String --live
+```
+
+This emits:
+- A `LiveFragment` impl on the model.
+- `#[repository(Post, broadcasts = true)]` on the generated repository.
+- A `/posts/stream` SSE route.
+- An index template whose list container uses `hx-ext="sse"` with
+  `hx-swap="none"` so OOB fragments patch rows without clearing the list.
+- The idiomorph `<script>` in the layout and `hx-ext="morph"` on `<body>`
+  for smooth DOM morphing on full-page navigations.
+
+Combine `--live` with `--live-validation` to also generate per-field
+`hx-post` validators that run server-side rules on `change` events and
+render inline error spans.
+
+---
+
+## Presence helpers
+
+See the [Presence guide](presence.md) for `presence_stream` (an SSE stream
+of join/leave events with OOB count badges) and `presence_badge` (a
+re-usable viewer-count fragment). Both integrate with the same channels
+infrastructure described here.
+
+---
+
 ## Actuator Metrics
 
 With the `ws` feature, `/actuator/channels` returns per-topic metrics:

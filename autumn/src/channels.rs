@@ -389,7 +389,18 @@ fn sse_oob_envelope(id: &str, strategy: &crate::htmx::OobSwap, fragment_html: &s
             inject_oob_attr(fragment_html, &value)
         }
         OobSwap::Raw => fragment_html.to_string(),
-        OobSwap::Custom(val) => inject_oob_attr(fragment_html, val),
+        // For outerHTML custom values inject the attribute on the fragment root
+        // so htmx replaces the selected element with this element directly.
+        // For all other strategies (beforeend, afterbegin, …) wrap in a <div>
+        // so htmx inserts the div's *children* at the target rather than the
+        // carrier element's children, which would strip the fragment's root tag.
+        OobSwap::Custom(val) if val == "outerHTML" || val.starts_with("outerHTML:") => {
+            inject_oob_attr(fragment_html, val)
+        }
+        OobSwap::Custom(val) => {
+            let escaped = val.replace('"', "&quot;");
+            format!("<div hx-swap-oob=\"{escaped}\">{fragment_html}</div>")
+        }
         _ => {
             let value = strategy.format_value(id).replace('"', "&quot;");
             format!("<div hx-swap-oob=\"{value}\">{fragment_html}</div>")

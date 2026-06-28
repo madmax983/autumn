@@ -6791,6 +6791,211 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         )
     };
 
+    // Compute inline broadcast tokens for broadcasts-only repos (no commit_hooks).
+    // These mirror the commit-hook broadcast tokens but use the result value from
+    // the wrapped async block (`__autumn_result` / `__autumn_record`) instead of
+    // the deserialized commit-hook payload.
+    let (inline_broadcast_create, inline_broadcast_update, inline_broadcast_delete) =
+        if config.broadcasts && !commit_hooks_enabled {
+            let base_topic_expr_outer = match generate_topic_format(
+                config
+                    .broadcast_topic
+                    .as_deref()
+                    .unwrap_or(&config.table_name),
+                &quote! { __record_ref },
+            ) {
+                Ok(expr) => expr,
+                Err(err) => {
+                    let compile_err = err.to_compile_error();
+                    return quote! { #compile_err };
+                }
+            };
+
+            let topic_expr_outer = if config.tenant_scoped {
+                quote! {
+                    ::std::format!(
+                        "tenant:{}:{}",
+                        ::autumn_web::tenancy::DisplayTenantId::tenant_id_str(
+                            &__record_ref.tenant_id
+                        ),
+                        #base_topic_expr_outer
+                    )
+                }
+            } else {
+                base_topic_expr_outer
+            };
+
+            let model_prefix_outer = to_snake_case(&config.model_name.to_string());
+            let default_container_outer = format!("{}-list", config.table_name);
+            let container_expr_outer = config
+                .broadcast_container
+                .as_deref()
+                .unwrap_or(&default_container_outer);
+
+            let (render_expr_outer, create_swap_id_outer, create_swap_outer, update_id_outer) =
+                if let Some(ref render_path) = config.broadcast_render {
+                    let extract_id = quote! {
+                        ::autumn_web::htmx::extract_html_id(
+                            &{#render_path(__record_ref)}.into_string()
+                        )
+                        .unwrap_or_else(|| ::std::format!(
+                            "{}-{}",
+                            #model_prefix_outer,
+                            ::autumn_web::repository::ModelPrimaryKey::primary_key_value(
+                                __record_ref
+                            )
+                        ))
+                    };
+                    (
+                        quote! { #render_path(__record_ref) },
+                        quote! { #container_expr_outer.to_string() },
+                        quote! { ::autumn_web::htmx::OobSwap::BeforeEnd },
+                        extract_id,
+                    )
+                } else {
+                    (
+                        quote! {
+                            <#model_name as ::autumn_web::live::LiveFragment>::render_fragment(
+                                __record_ref
+                            )
+                        },
+                        quote! {
+                            <#model_name as ::autumn_web::live::LiveFragment>::dom_id(__record_ref)
+                        },
+                        quote! {
+                            <#model_name as ::autumn_web::live::LiveFragment>::insert_swap()
+                        },
+                        quote! {
+                            <#model_name as ::autumn_web::live::LiveFragment>::dom_id(__record_ref)
+                        },
+                    )
+                };
+
+            let static_delete_topic_outer: String = {
+                let raw = config
+                    .broadcast_topic
+                    .as_deref()
+                    .unwrap_or(&config.table_name);
+                if raw.contains('{') {
+                    config.table_name.clone()
+                } else {
+                    raw.to_owned()
+                }
+            };
+            let inline_delete_id_outer = if config.broadcast_render.is_some() {
+                quote! { ::std::format!("{}-{}", #model_prefix_outer, id) }
+            } else {
+                quote! {
+                    <#model_name as ::autumn_web::live::LiveFragment>::dom_id_for(id)
+                }
+            };
+
+            let ic = quote! {
+                if let ::core::result::Result::Ok(ref __autumn_record) = __autumn_result {
+                    let __record_ref = __autumn_record;
+                    if let ::core::option::Option::Some(__channels) =
+                        ::autumn_web::__private::get_global_channels()
+                    {
+                        let __topic = #topic_expr_outer;
+                        let __fragment = #render_expr_outer;
+                        let __create_id = #create_swap_id_outer;
+                        let __create_swap = #create_swap_outer;
+                        if let ::core::result::Result::Err(__err) = __channels
+                            .broadcast()
+                            .publish_oob(&__topic, &__create_id, &__create_swap, &__fragment)
+                        {
+                            ::autumn_web::reexports::tracing::warn!(
+                                error = %__err,
+                                "auto-broadcast create failed"
+                            );
+                        }
+                    }
+                }
+            };
+            let iu = quote! {
+                if let ::core::result::Result::Ok(ref __autumn_record) = __autumn_result {
+                    let __record_ref = __autumn_record;
+                    if let ::core::option::Option::Some(__channels) =
+                        ::autumn_web::__private::get_global_channels()
+                    {
+                        let __topic = #topic_expr_outer;
+                        let __fragment = #render_expr_outer;
+                        let __id = #update_id_outer;
+                        if let ::core::result::Result::Err(__err) = __channels
+                            .broadcast()
+                            .publish_oob(
+                                &__topic,
+                                &__id,
+                                &::autumn_web::htmx::OobSwap::OuterHTML,
+                                &__fragment,
+                            )
+                        {
+                            ::autumn_web::reexports::tracing::warn!(
+                                error = %__err,
+                                "auto-broadcast update failed"
+                            );
+                        }
+                    }
+                }
+            };
+            let id_ = quote! {
+                if let ::core::result::Result::Ok(()) = __autumn_result {
+                    if let ::core::option::Option::Some(__channels) =
+                        ::autumn_web::__private::get_global_channels()
+                    {
+                        let __del_id = #inline_delete_id_outer;
+                        let __fragment = ::autumn_web::html! {};
+                        if let ::core::result::Result::Err(__err) = __channels
+                            .broadcast()
+                            .publish_oob(
+                                #static_delete_topic_outer,
+                                &__del_id,
+                                &::autumn_web::htmx::OobSwap::Delete,
+                                &__fragment,
+                            )
+                        {
+                            ::autumn_web::reexports::tracing::warn!(
+                                error = %__err,
+                                "auto-broadcast delete failed"
+                            );
+                        }
+                    }
+                }
+            };
+            (ic, iu, id_)
+        } else {
+            (quote! {}, quote! {}, quote! {})
+        };
+
+    // For repos that declare `broadcasts = true` but have no commit_hooks, wire
+    // inline broadcasts directly into the save / update / delete method bodies.
+    // The commit-hook path already includes the broadcasts in the durable worker;
+    // this path fires them synchronously after each mutation instead.
+    let (save_body, update_body, delete_body) = if config.broadcasts && !commit_hooks_enabled {
+        (
+            quote! {
+                let __autumn_result: ::autumn_web::AutumnResult<#model_name> =
+                    async { #save_body }.await;
+                #inline_broadcast_create
+                __autumn_result
+            },
+            quote! {
+                let __autumn_result: ::autumn_web::AutumnResult<#model_name> =
+                    async { #update_body }.await;
+                #inline_broadcast_update
+                __autumn_result
+            },
+            quote! {
+                let __autumn_result: ::autumn_web::AutumnResult<()> =
+                    async { #delete_body }.await;
+                #inline_broadcast_delete
+                __autumn_result
+            },
+        )
+    } else {
+        (save_body, update_body, delete_body)
+    };
+
     let route_hook_registration = if commit_hooks_enabled {
         quote! { #pg_name::__autumn_register_repository_commit_hooks(); }
     } else {
