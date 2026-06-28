@@ -116,3 +116,34 @@ To make the developer experience more robust ("idiot-proofing"):
 
 ## 4. 🧪 VERIFY - The "idiot proofing"
 - Confirmed that Axum's `IntoResponse` trait is not implemented for `i32`, `i64`, or other plain numbers out-of-the-box, meaning they cannot be returned directly from route handlers without manually converting them to strings or JSON first.
+
+# 🗣️ Echo: [DX Audit] Import Scan (Examples)
+
+## 1. 🔍 EXPERIENCE - The Walkthrough
+- Reviewed the `examples/saas/src/routes/` and other examples looking for heavy import requirements.
+
+## 2. 🚧 STUMBLE - The Friction Points
+- Discovered that pagination requires deep imports like `use autumn_web::ui::pagination::{PagerOptions, pagination_nav};` or `use autumn_web::pagination::{Page, PageRequest};`
+- The `routes![]` macro brings in handlers from various modules, but the framework's own types are not uniformly accessible without multiple `use` statements.
+
+## 3. 📢 REPORT - The Complaint
+- "Why do I have to import 12 traits and sub-modules to use simple features like pagination? Simple is better than powerful. If I have to memorize `autumn_web::ui::pagination::pagination_nav`, I'm leaving."
+
+## 4. 🧪 VERIFY - The "idiot proofing"
+- Confirmed that adding `pagination_nav` to the `prelude` module or re-exporting it properly would prevent users from having to guess where UI components live.
+
+# 🗣️ Echo: [DX Audit] Slang Check
+
+## 1. 🔍 EXPERIENCE - The Walkthrough
+- Looking at the output from `cargo run` and checking out the `actuator/health` endpoint on a fresh app.
+- Attempted to read the logs and figure out what the app is doing on startup.
+
+## 2. 🚧 STUMBLE - The Friction Points
+- The console logs mention "Centralized trusted-proxy resolution" and "idempotency layers".
+- The actuator endpoints mention "actuator" and "probes" which feels heavily Java/Spring Boot inspired.
+
+## 3. 📢 REPORT - The Complaint
+- "What on earth is an 'actuator' or 'idempotency layer'? If I'm building a simple web app, I don't want to learn enterprise architecture buzzwords."
+
+## 4. 🧪 VERIFY - The "idiot proofing"
+- Checked the `examples/hello` and realized the jargon makes it seem overly complex for beginners.
