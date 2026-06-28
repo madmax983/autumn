@@ -105,13 +105,13 @@ pub async fn front_page(
             // the preloaded record's typed accessors (`?`-free in templates:
             // treat a missing preload as "absent").
             @if compact_layout {
-                div id="posts-list" class="divide-y divide-gray-100"
+                ul id="posts-list" class="divide-y divide-gray-100"
                     hx-ext="sse" sse-connect="/posts/stream" sse-swap="message" {
                     @for post in &hot_posts {
                         @let author = post.author().ok().flatten();
                         @let sub = post.subreddit().ok().flatten();
                         @if let Some(sub) = sub {
-                            div id=(format!("post-{}", post.id))
+                            li id=(format!("post-{}", post.id))
                                 class="flex items-center gap-3 py-2 px-2 hover:bg-gray-50 transition-colors" {
                                 span class="text-sm font-semibold text-gray-500 w-8 text-right shrink-0" {
                                     (post.score)
@@ -148,13 +148,13 @@ pub async fn front_page(
                     }
                 }
             } @else {
-                div id="posts-list" class="space-y-2"
+                ul id="posts-list" class="space-y-2"
                     hx-ext="sse" sse-connect="/posts/stream" sse-swap="message" {
                     @for post in &hot_posts {
                         @let author = post.author().ok().flatten();
                         @let sub = post.subreddit().ok().flatten();
                         @if let Some(sub) = sub {
-                            div id=(format!("post-{}", post.id))
+                            li id=(format!("post-{}", post.id))
                                 class="bg-white rounded-lg shadow-sm border border-gray-200 \
                                        hover:border-orange-300 transition-colors" {
                                 div class="flex items-start gap-3 p-4" {

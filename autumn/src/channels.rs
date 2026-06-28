@@ -373,13 +373,21 @@ fn htmx_oob_envelope(fragment: &maud::Markup) -> String {
 ///   container so that htmx inserts the container's *children* at the target.
 #[cfg(feature = "maud")]
 fn sse_oob_envelope(id: &str, strategy: &crate::htmx::OobSwap, fragment_html: &str) -> String {
-    use crate::htmx::OobSwap;
+    use crate::htmx::{OobMethod, OobSwap};
     match strategy {
         OobSwap::Delete => {
             format!("<div id=\"{id}\" hx-swap-oob=\"delete\"></div>")
         }
         OobSwap::True => inject_oob_attr(fragment_html, "true"),
         OobSwap::OuterHTML => inject_oob_attr(fragment_html, "outerHTML"),
+        // For targeted outerHTML, htmx replaces the CSS-selected element with
+        // whichever element carries hx-swap-oob. Inject the attribute onto the
+        // fragment root instead of wrapping it so the rendered row (not a synthetic
+        // div) becomes the replacement.
+        OobSwap::Target(OobMethod::OuterHTML, selector) => {
+            let value = format!("outerHTML:{selector}");
+            inject_oob_attr(fragment_html, &value)
+        }
         OobSwap::Raw => fragment_html.to_string(),
         OobSwap::Custom(val) => inject_oob_attr(fragment_html, val),
         _ => {
