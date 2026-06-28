@@ -9,6 +9,8 @@ struct JobAttrs {
     name: Option<String>,
     max_attempts: Option<u32>,
     backoff_ms: Option<u64>,
+    /// Named queue this job is routed to; `None` defaults to `"default"`.
+    queue: Option<String>,
     /// `None` = unconfigured; `Some(false)` = explicit opt-out, which is an
     /// error when combined with other uniqueness attributes.
     unique: Option<bool>,
@@ -32,6 +34,13 @@ fn parse_basic_arg(
     } else if meta.path.is_ident("backoff_ms") {
         let value: LitInt = meta.value()?.parse()?;
         result.backoff_ms = Some(value.base10_parse::<u64>()?);
+    } else if meta.path.is_ident("queue") {
+        let value: LitStr = meta.value()?.parse()?;
+        let queue = value.value().trim().to_string();
+        if queue.is_empty() {
+            return Err(meta.error("queue must name a non-empty queue, e.g. \"critical\""));
+        }
+        result.queue = Some(queue);
     } else {
         return Ok(false);
     }
@@ -146,6 +155,7 @@ fn parse_job_args(attr: TokenStream) -> syn::Result<JobAttrs> {
         name: None,
         max_attempts: None,
         backoff_ms: None,
+        queue: None,
         unique: None,
         unique_by: None,
         unique_window: None,
@@ -162,7 +172,7 @@ fn parse_job_args(attr: TokenStream) -> syn::Result<JobAttrs> {
             Ok(())
         } else {
             Err(meta.error(
-                "unsupported attribute: expected name, max_attempts, backoff_ms, unique, \
+                "unsupported attribute: expected name, max_attempts, backoff_ms, queue, unique, \
                  unique_by, unique_window, unique_for_ms, concurrency, or concurrency_key",
             ))
         }
@@ -269,6 +279,7 @@ pub fn job_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let job_name = attrs.name.clone().unwrap_or_else(|| fn_name.to_string());
     let max_attempts = attrs.max_attempts.unwrap_or(0);
     let backoff_ms = attrs.backoff_ms.unwrap_or(0);
+    let queue = attrs.queue.clone().unwrap_or_else(|| "default".to_string());
     let uniqueness = uniqueness_tokens(&attrs);
     let concurrency = concurrency_tokens(&attrs);
 
@@ -311,6 +322,7 @@ pub fn job_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 name: #job_name.to_string(),
                 max_attempts: #max_attempts,
                 initial_backoff_ms: #backoff_ms,
+                queue: #queue.to_string(),
                 uniqueness: #uniqueness,
                 concurrency: #concurrency,
                 handler: |state: ::autumn_web::AppState, payload: ::autumn_web::reexports::serde_json::Value| {
@@ -428,6 +440,52 @@ mod tests {
     #[test]
     fn unknown_attribute_is_rejected() {
         assert!(parse(quote! { uniqueness = true }).is_err());
+    }
+
+    #[test]
+    fn parses_queue_arg() {
+        let attrs = parse(quote! { name = "send_email", queue = "critical" }).expect("parse");
+        assert_eq!(attrs.queue.as_deref(), Some("critical"));
+    }
+
+    #[test]
+    fn queue_defaults_to_none_when_unset() {
+        let attrs = parse(quote! { name = "send_email" }).expect("parse");
+        assert!(attrs.queue.is_none());
+    }
+
+    #[test]
+    fn rejects_empty_queue() {
+        assert!(parse(quote! { queue = "" }).is_err());
+        assert!(parse(quote! { queue = "   " }).is_err());
+    }
+
+    #[test]
+    fn expansion_carries_queue_into_job_info() {
+        let expanded = job_macro(
+            quote! { queue = "critical" },
+            quote! {
+                async fn reset_password(state: AppState, args: ResetArgs) -> AutumnResult<()> {
+                    Ok(())
+                }
+            },
+        )
+        .to_string();
+        assert!(expanded.contains("queue : \"critical\""), "{expanded}");
+    }
+
+    #[test]
+    fn expansion_defaults_queue_to_default() {
+        let expanded = job_macro(
+            quote! {},
+            quote! {
+                async fn plain(state: AppState, args: PlainArgs) -> AutumnResult<()> {
+                    Ok(())
+                }
+            },
+        )
+        .to_string();
+        assert!(expanded.contains("queue : \"default\""), "{expanded}");
     }
 
     #[test]

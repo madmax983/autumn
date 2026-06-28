@@ -195,6 +195,66 @@ domain aggregate id, or provider idempotency token.
 - Redis retries are scheduled in Redis before the worker moves on, so a crash
   during the backoff window does not drop the job.
 
+## Job priorities
+
+By default every job drains from a single FIFO queue, so a flood of low-value
+work (analytics rollups, thumbnails, bulk re-indexing) can sit *ahead of*
+latency-sensitive work like password-reset emails or payment-webhook fan-out.
+Named queues fix this head-of-line blocking: route each job to a queue, and let
+workers drain queues in priority order.
+
+Tag a job's queue with `queue = "..."`. Jobs with no `queue` land on the
+`"default"` queue, so apps that don't opt in behave exactly as before.
+
+```rust,ignore
+#[job(queue = "critical", max_attempts = 5)]
+async fn send_password_reset(state: AppState, args: ResetArgs) -> AutumnResult<()> { … }
+
+#[job(queue = "low")]
+async fn rebuild_search_index(state: AppState, args: IndexArgs) -> AutumnResult<()> { … }
+
+// No queue → the "default" queue.
+#[job]
+async fn send_receipt(state: AppState, args: ReceiptArgs) -> AutumnResult<()> { … }
+```
+
+Configure the worker drain order in `autumn.toml`. Two forms:
+
+```toml
+# Strict priority — workers always empty higher queues before lower ones.
+# A single `critical` job jumps ahead of a 1,000-job `low` backlog.
+[jobs]
+queues = ["critical", "default", "low"]
+```
+
+```toml
+# Weighted — fair draining that never starves a lower queue. Over a sustained
+# mixed load each queue is served in proportion to its weight (here roughly
+# 4 : 2 : 1), so `low` always makes forward progress even while `critical` has work.
+[jobs.queues]
+critical = 4
+default = 2
+low = 1
+```
+
+- **Strict** (`queues = [...]`) is the simple case: highest priority first, and a
+  worker only pulls a lower queue when every higher queue is empty.
+- **Weighted** (`[jobs.queues]` table) avoids starvation under sustained load:
+  it uses smooth weighted round-robin, so each queue is the first choice in
+  proportion to its weight over each cycle.
+
+Routing is honored end-to-end on every backend (local, Redis, Postgres): the
+queue is preserved through retries/backoff, dead-lettering, delayed enqueues, and
+`enqueue_after_commit`. The actuator/admin job view shows each job's queue.
+
+If a job declares a `queue` that is **not** in the configured drain list, that is
+a loud, documented condition — it is logged at startup (`WARN`) and the queue is
+appended at lowest priority so the job still drains instead of silently stalling.
+Add the queue to `[jobs] queues` to control its priority.
+
+> Out of scope (separate follow-ups): per-job-instance dynamic priority at
+> enqueue time, and per-queue concurrency caps / dedicated worker pools.
+
 ## Uniqueness and concurrency limits
 
 `#[job]` can declare dedup and in-flight caps directly, so double-submits and
