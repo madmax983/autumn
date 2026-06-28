@@ -6043,7 +6043,13 @@ async fn setup_database(
     // silent data misrouting from topology changes. Inert during static builds,
     // when no control DB is configured, and in explicit-slot mode.
     #[allow(clippy::question_mark)]
-    if let Err(e) = enforce_shard_map_guard(config, topology.as_ref(), runtime_boot).await {
+    if let Err(e) = Box::pin(enforce_shard_map_guard(
+        config,
+        topology.as_ref(),
+        runtime_boot,
+    ))
+    .await
+    {
         // Needs explicit `if let` (not `?`) so the managed-pg child can be stopped
         // before unwinding — `?` would skip the cfg-gated emergency stop call.
         #[cfg(feature = "managed-pg")]
