@@ -105,7 +105,8 @@ pub async fn front_page(
             // the preloaded record's typed accessors (`?`-free in templates:
             // treat a missing preload as "absent").
             @if compact_layout {
-                div id="posts-list" class="divide-y divide-gray-100" {
+                div id="posts-list" class="divide-y divide-gray-100"
+                    hx-ext="sse" sse-connect="/posts/stream" sse-swap="message" {
                     @for post in &hot_posts {
                         @let author = post.author().ok().flatten();
                         @let sub = post.subreddit().ok().flatten();
@@ -146,7 +147,8 @@ pub async fn front_page(
                     }
                 }
             } @else {
-                div id="posts-list" class="space-y-2" {
+                div id="posts-list" class="space-y-2"
+                    hx-ext="sse" sse-connect="/posts/stream" sse-swap="message" {
                     @for post in &hot_posts {
                         @let author = post.author().ok().flatten();
                         @let sub = post.subreddit().ok().flatten();

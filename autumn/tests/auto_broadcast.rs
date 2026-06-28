@@ -35,6 +35,28 @@ mod tests {
         }
     }
 
+    #[cfg(all(feature = "htmx", feature = "maud"))]
+    impl LiveFragment for BroadcastPost {
+        fn dom_id_for(id: i64) -> String {
+            format!("broadcast_post-{id}")
+        }
+
+        fn dom_id(&self) -> String {
+            Self::dom_id_for(self.id)
+        }
+
+        fn render_fragment(&self) -> Markup {
+            html! { li id=(self.dom_id()) { (self.title) } }
+        }
+
+        fn insert_swap() -> OobSwap {
+            OobSwap::Target(
+                autumn_web::htmx::OobMethod::BeforeEnd,
+                "#broadcast_posts-list".to_string(),
+            )
+        }
+    }
+
     // 1. Basic auto-broadcasting (defaults to topic = "broadcast_posts", container = "broadcast_posts-list")
     #[autumn_web::repository(BroadcastPost, table = "broadcast_posts", broadcasts = true)]
     pub trait BasicPostRepository {}
@@ -65,6 +87,28 @@ mod tests {
         pub id: i64,
         pub title: String,
         pub category: Option<String>,
+    }
+
+    #[cfg(all(feature = "htmx", feature = "maud"))]
+    impl LiveFragment for NullablePost {
+        fn dom_id_for(id: i64) -> String {
+            format!("nullable_post-{id}")
+        }
+
+        fn dom_id(&self) -> String {
+            Self::dom_id_for(self.id)
+        }
+
+        fn render_fragment(&self) -> Markup {
+            html! { li id=(self.dom_id()) { (self.title) } }
+        }
+
+        fn insert_swap() -> OobSwap {
+            OobSwap::Target(
+                autumn_web::htmx::OobMethod::BeforeEnd,
+                "#category-posts-list".to_string(),
+            )
+        }
     }
 
     #[autumn_web::repository(
