@@ -274,8 +274,10 @@ mod conformance_tests {{
 
     let target_dir_relative = target_dir
         .strip_prefix(project_root)
-        .map(|p| p.display().to_string().replace('\\', "/"))
-        .unwrap_or_else(|_| target_dir.display().to_string().replace('\\', "/"));
+        .map_or_else(
+            |_| target_dir.display().to_string().replace('\\', "/"),
+            |p| p.display().to_string().replace('\\', "/"),
+        );
 
     Ok(PluginPlan {
         plan,
