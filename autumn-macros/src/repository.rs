@@ -6892,7 +6892,11 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             .as_deref()
             .unwrap_or(&config.table_name);
         let topic_is_dynamic_outer = raw_topic_outer.contains('{');
-        let delete_needs_prefetch = topic_is_dynamic_outer || config.broadcast_render.is_some();
+        // Tenant-scoped repos also need a prefetch on delete: the topic includes the
+        // record's tenant_id (`"tenant:{id}:table"`), which is only available from the
+        // live row, so we must read it before the DELETE.
+        let delete_needs_prefetch =
+            topic_is_dynamic_outer || config.broadcast_render.is_some() || config.tenant_scoped;
         // broadcast_render is included: when a custom render fn encodes a mutable field
         // in the element id, the pre-mutation id may differ from the post-mutation id.
         // Capturing __autumn_prev_id lets the update broadcast target the old element
@@ -7172,37 +7176,43 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         };
         // ── update_many broadcast ─────────────────────────────────────────
         // Iterates the post-mutation result vec and broadcasts OuterHTML per record
-        // on its (potentially new) topic.  Topic-change detection for bulk updates
-        // would require N pre-fetches before the mutation; use commit_hooks = true
-        // for full correctness on bulk dynamic-topic updates.
-        let ium = quote! {
-            if let ::core::result::Result::Ok(ref __autumn_result_vec) = __autumn_result {
-                if let ::core::option::Option::Some(__channels) =
-                    ::autumn_web::__private::get_global_channels()
-                {
-                    for __autumn_record in __autumn_result_vec {
-                        let __record_ref = __autumn_record;
-                        let __topic = #topic_expr_outer;
-                        let __fragment = #render_expr_outer;
-                        let __id = #update_id_outer;
-                        if let ::core::result::Result::Err(__err) = __channels
-                            .broadcast()
-                            .publish_oob(
-                                &__topic,
-                                &__id,
-                                &::autumn_web::htmx::OobSwap::OuterHTML,
-                                &__fragment,
-                            )
-                        {
-                            ::autumn_web::reexports::tracing::warn!(
-                                error = %__err,
-                                "auto-broadcast update_many failed"
-                            );
+        // on its (potentially new) topic.  Skipped for dynamic topics: when a topic
+        // field can change, a bulk update would send OuterHTML to the post-update topic
+        // while old-topic subscribers never receive a delete — emitting nothing is safer
+        // than a misleading half-update.  Use commit_hooks = true for full correctness
+        // on bulk dynamic-topic updates.
+        let ium = if topic_is_dynamic_outer {
+            quote! {}
+        } else {
+            quote! {
+                if let ::core::result::Result::Ok(ref __autumn_result_vec) = __autumn_result {
+                    if let ::core::option::Option::Some(__channels) =
+                        ::autumn_web::__private::get_global_channels()
+                    {
+                        for __autumn_record in __autumn_result_vec {
+                            let __record_ref = __autumn_record;
+                            let __topic = #topic_expr_outer;
+                            let __fragment = #render_expr_outer;
+                            let __id = #update_id_outer;
+                            if let ::core::result::Result::Err(__err) = __channels
+                                .broadcast()
+                                .publish_oob(
+                                    &__topic,
+                                    &__id,
+                                    &::autumn_web::htmx::OobSwap::OuterHTML,
+                                    &__fragment,
+                                )
+                            {
+                                ::autumn_web::reexports::tracing::warn!(
+                                    error = %__err,
+                                    "auto-broadcast update_many failed"
+                                );
+                            }
                         }
                     }
                 }
             }
-        };
+        }; // end if topic_is_dynamic_outer else branch
 
         // ── delete_many broadcast ─────────────────────────────────────────
         // When the topic is dynamic or broadcast_render is set, each record is
