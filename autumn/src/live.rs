@@ -180,7 +180,10 @@ mod tests {
     }
 
     #[test]
-    fn insert_swap_defaults_to_true() {
-        assert!(matches!(Thing::insert_swap(), crate::htmx::OobSwap::True));
+    fn insert_swap_defaults_to_before_end() {
+        assert!(matches!(
+            Thing::insert_swap(),
+            crate::htmx::OobSwap::BeforeEnd
+        ));
     }
 }
