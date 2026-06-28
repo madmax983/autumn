@@ -413,7 +413,7 @@ impl Bundle {
     /// at compile time (via [`embed_locales!`](crate::embed_locales)).
     ///
     /// The embedded counterpart to [`load_from_dir`](Self::load_from_dir): same
-    /// `.ftl` discovery, same [`parse_ftl`] parsing, and the same fail-fast on a
+    /// `.ftl` discovery, same `parse_ftl` parsing, and the same fail-fast on a
     /// missing default locale — but every byte comes from the binary, so no
     /// `i18n/` sidecar directory is required at runtime.
     ///

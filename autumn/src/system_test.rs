@@ -254,7 +254,7 @@ pub struct SystemTest {
     artifact_dir_override: Option<PathBuf>,
     browser_timeout: Duration,
     hx_settle_timeout: Duration,
-    /// Optional pre-configured state; overrides the default `AppState::for_test()`.
+    /// Optional pre-configured state; overrides the default [`crate::state::AppState::for_test`].
     state_override: Option<crate::state::AppState>,
 }
 
@@ -293,7 +293,7 @@ impl SystemTest {
     }
 
     /// Supply a pre-configured [`AppState`] to use instead of
-    /// [`AppState::for_test()`].
+    /// [`crate::state::AppState::for_test`].
     ///
     /// Use this when the routes under test require a real database pool, API
     /// version registrations, authorization policies, or any other state that

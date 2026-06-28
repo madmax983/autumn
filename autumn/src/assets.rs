@@ -248,7 +248,7 @@ static EMBEDDED_MANIFEST: OnceLock<Option<AssetManifest>> = OnceLock::new();
 /// Register the embedded `static/` tree as the process-wide asset source.
 ///
 /// Parses the embedded `.autumn-manifest.json` so [`asset_url`] and
-/// [`is_manifest_asset`] resolve against it. Called by the framework during
+/// `is_manifest_asset` resolve against it. Called by the framework during
 /// `AppBuilder::run` before the router is built; calling it more than once is a
 /// no-op (the first registration wins).
 #[cfg(feature = "embed-assets")]
@@ -369,7 +369,7 @@ pub(crate) fn is_manifest_asset(rel_path: &str) -> bool {
 /// Returns `true` if the URI path segment looks like a fingerprinted asset
 /// by filename convention (`<stem>.<8-hex-chars>.<ext>`).
 ///
-/// Only used in tests; the cache middleware uses [`is_manifest_asset`] for
+/// Only used in tests; the cache middleware uses `is_manifest_asset` for
 /// production cache decisions.
 #[cfg(test)]
 pub(crate) fn is_fingerprinted_path(uri_path: &str) -> bool {

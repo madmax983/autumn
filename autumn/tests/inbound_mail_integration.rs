@@ -55,7 +55,7 @@ fn mailgun_form(key: &str, ts: &str, token: &str, extra: &[(&str, &str)]) -> Str
     }
 }
 
-/// Dummy route so TestApp is happy (it requires at least one route).
+/// Dummy route so `TestApp` is happy (it requires at least one route).
 #[get("/_ping")]
 async fn ping() -> &'static str {
     "pong"
@@ -706,7 +706,7 @@ fn generic_fn(
     Box<dyn std::future::Future<Output = autumn_web::AutumnResult<()>> + Send + 'static>,
 > {
     GENERIC_CALLS.fetch_add(1, Ordering::SeqCst);
-    *GENERIC_SUBJECT.lock().unwrap() = email.subject.clone();
+    *GENERIC_SUBJECT.lock().unwrap() = email.subject;
     Box::pin(async { Ok(()) })
 }
 
@@ -914,7 +914,7 @@ fn multipart_fn(
 ) -> std::pin::Pin<
     Box<dyn std::future::Future<Output = autumn_web::AutumnResult<()>> + Send + 'static>,
 > {
-    *MULTIPART_SUBJECT.lock().unwrap() = email.subject.clone();
+    *MULTIPART_SUBJECT.lock().unwrap() = email.subject;
     Box::pin(async { Ok(()) })
 }
 

@@ -1820,8 +1820,8 @@ impl AppBuilder {
     /// chain reporters; each receives every event. When none are registered,
     /// the built-in [`LogReporter`](crate::reporting::LogReporter) is used.
     ///
-    /// Mirrors [`with_blob_store`](Self::with_blob_store) /
-    /// [`with_cache_backend`](Self::with_cache_backend).
+    /// Mirrors [`with_blob_store`](AppBuilder::with_blob_store) /
+    /// [`with_cache_backend`](AppBuilder::with_cache_backend).
     ///
     /// # Examples
     ///
