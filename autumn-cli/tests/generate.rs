@@ -2648,6 +2648,70 @@ fn live_validation_emits_validate_handler_with_real_rules() {
     );
 }
 
+/// `--validate field=length:min=N` (no max) generates the min-only length check.
+#[test]
+fn live_validation_length_min_only() {
+    let (_tmp, project) = fresh_project("lv-min-only");
+    run_autumn(
+        &project,
+        &[
+            "generate",
+            "scaffold",
+            "Post",
+            "title:String",
+            "--validate",
+            "title=length:min=3",
+            "--live-validation",
+        ],
+    );
+
+    let routes = fs::read_to_string(project.join("src/routes/posts.rs")).unwrap();
+    assert!(
+        routes.contains("value.chars().count() < 3"),
+        "min-only length check must guard count < min:\n{routes}"
+    );
+    assert!(
+        routes.contains("must be at least 3 characters"),
+        "min-only error message must say 'at least':\n{routes}"
+    );
+    assert!(
+        !routes.contains("value.chars().count() >"),
+        "min-only rule must not emit an upper-bound check:\n{routes}"
+    );
+}
+
+/// `--validate field=length:max=N` (no min) generates the max-only length check.
+#[test]
+fn live_validation_length_max_only() {
+    let (_tmp, project) = fresh_project("lv-max-only");
+    run_autumn(
+        &project,
+        &[
+            "generate",
+            "scaffold",
+            "Post",
+            "title:String",
+            "--validate",
+            "title=length:max=50",
+            "--live-validation",
+        ],
+    );
+
+    let routes = fs::read_to_string(project.join("src/routes/posts.rs")).unwrap();
+    assert!(
+        routes.contains("value.chars().count() > 50"),
+        "max-only length check must guard count > max:\n{routes}"
+    );
+    assert!(
+        routes.contains("must be at most 50 characters"),
+        "max-only error message must say 'at most':\n{routes}"
+    );
+    assert!(
+        !routes.contains("value.chars().count() <"),
+        "max-only rule must not emit a lower-bound check:\n{routes}"
+    );
+}
+
 /// Without `--live-validation` the routes file contains no validate handlers
 /// and no hx-post attributes on form inputs.
 #[test]
@@ -2800,6 +2864,62 @@ fn live_layout_references_idiomorph_and_morph() {
     assert!(
         routes.contains(r#"hx-swap="none""#),
         "SSE list container must use hx-swap=\"none\" under --live:\n{routes}"
+    );
+}
+
+/// `--api --live` emits the SSE stream handler inside the repository file
+/// (there is no routes file for API scaffolds) and renders fragment items as
+/// plain ids rather than links (no HTML show page exists).
+#[test]
+fn live_api_scaffold_emits_stream_handler_in_repository() {
+    let (_tmp, project) = fresh_project("live-api");
+    run_autumn(
+        &project,
+        &[
+            "generate",
+            "scaffold",
+            "Post",
+            "title:String",
+            "--api",
+            "--live",
+        ],
+    );
+
+    // API scaffolds produce no routes file — the stream handler lives in the
+    // repository instead.
+    assert!(
+        !project.join("src/routes/posts.rs").is_file(),
+        "--api scaffold must not create a routes file"
+    );
+
+    let repo = fs::read_to_string(project.join("src/repositories/post.rs")).unwrap();
+
+    // The stream handler must be appended to the repository file.
+    assert!(
+        repo.contains("pub async fn stream("),
+        "repository must contain stream handler under --api --live:\n{repo}"
+    );
+    assert!(
+        repo.contains("GET /posts/stream"),
+        "repository must document the stream route path:\n{repo}"
+    );
+    assert!(
+        repo.contains("autumn_web::sse::stream(&state, \"posts\")"),
+        "stream handler must delegate to sse::stream:\n{repo}"
+    );
+
+    // LiveFragment impl is still present but renders plain ids (no show link).
+    assert!(
+        repo.contains("impl autumn_web::live::LiveFragment for Post"),
+        "repository must contain LiveFragment impl under --api --live:\n{repo}"
+    );
+    assert!(
+        !repo.contains("a href=(format!(\"/posts/"),
+        "API LiveFragment must NOT emit a show-page link (no HTML routes):\n{repo}"
+    );
+    assert!(
+        repo.contains("(self.id)"),
+        "API LiveFragment render_fragment must emit plain id:\n{repo}"
     );
 }
 

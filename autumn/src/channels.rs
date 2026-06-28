@@ -1789,4 +1789,51 @@ mod tests {
             "fragment missing: {result}"
         );
     }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn oob_envelope_outerhtml_injects_on_root() {
+        use crate::htmx::OobSwap;
+        let frag = "<li id=\"item-13\">X</li>";
+        let result = sse_oob_envelope("item-13", &OobSwap::OuterHTML, frag);
+        assert!(
+            result.contains("hx-swap-oob=\"outerHTML\""),
+            "missing outerHTML attr: {result}"
+        );
+        assert!(result.contains("<li"), "root tag stripped: {result}");
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn oob_envelope_target_beforeend_uses_catchall() {
+        use crate::htmx::{OobMethod, OobSwap};
+        let frag = "<li>item</li>";
+        let result = sse_oob_envelope(
+            "item-14",
+            &OobSwap::Target(OobMethod::BeforeEnd, "#list".to_string()),
+            frag,
+        );
+        assert!(
+            result.starts_with("<div hx-swap-oob="),
+            "catch-all must wrap in div: {result}"
+        );
+        assert!(result.contains("beforeend:#list"), "got: {result}");
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn inject_oob_attr_fallback_no_lt() {
+        let result = inject_oob_attr("no-tags-here", "true");
+        assert_eq!(
+            result, "no-tags-here",
+            "fallback must return html unchanged"
+        );
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn inject_oob_attr_fallback_no_boundary() {
+        let result = inject_oob_attr("<", "true");
+        assert_eq!(result, "<", "fallback must return html unchanged");
+    }
 }
