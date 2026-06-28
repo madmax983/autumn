@@ -12,6 +12,7 @@ pub struct PluginPlan {
     pub name_kebab: String,
     pub name_snake: String,
     pub struct_name: String,
+    pub target_dir_relative: String,
 }
 
 #[allow(clippy::too_many_lines)]
@@ -271,11 +272,17 @@ mod conformance_tests {{
         conformance_rs_content,
     );
 
+    let target_dir_relative = target_dir
+        .strip_prefix(project_root)
+        .map(|p| p.display().to_string().replace('\\', "/"))
+        .unwrap_or_else(|_| target_dir.display().to_string().replace('\\', "/"));
+
     Ok(PluginPlan {
         plan,
         name_kebab,
         name_snake,
         struct_name,
+        target_dir_relative,
     })
 }
 
@@ -380,7 +387,12 @@ mod tests {
         assert!(cargo_content.contains("[package]"));
         assert!(cargo_content.contains("name = \"autumn-foo-plugin\""));
         assert!(cargo_content.contains("edition = \"2024\""));
-        assert!(cargo_content.contains("autumn-web = { version = \"0.5\" }"));
+        let expected_version = env!("CARGO_PKG_VERSION")
+            .split('.')
+            .take(2)
+            .collect::<Vec<_>>()
+            .join(".");
+        assert!(cargo_content.contains(&format!("autumn-web = {{ version = \"{expected_version}\" }}")));
         assert!(cargo_content.contains("serde = { version = \"1\", features = [\"derive\"] }"));
 
         // Check src/lib.rs content

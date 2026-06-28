@@ -2606,8 +2606,8 @@ fn run_generate_command(cmd: GenerateCommands) {
                                 println!("       members = [");
                                 println!("           # ...,");
                                 println!(
-                                    "           \"autumn-{}-plugin\",",
-                                    plugin_plan.name_kebab
+                                    "           \"{}\",",
+                                    plugin_plan.target_dir_relative
                                 );
                                 println!("       ]");
                                 println!(

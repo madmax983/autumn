@@ -13,14 +13,14 @@
 ### Task 1: Refactor target directory collision check and Pascal case helper in generate::plugin
 
 **Files:**
-- Modify: `c:\Users\markm\autumn\autumn-cli\src\generate\plugin.rs`
+- Modify: `autumn-cli/src/generate/plugin.rs`
 
 **Step 1: Run existing tests**
 Run: `cargo test -p autumn-cli --bin autumn generate::plugin::tests`
 Expected: PASS
 
 **Step 2: Write minimal implementation**
-Apply changes to `c:\Users\markm\autumn\autumn-cli\src\generate\plugin.rs`:
+Apply changes to `autumn-cli/src/generate/plugin.rs`:
 - Replace directory checks at lines 37-52 with the simplified logic:
 ```rust
     if target_dir.exists() && !flags.force {
