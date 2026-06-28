@@ -2156,6 +2156,15 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         panic!("#[model]: could not detect primary-key field for factory generation")
     });
 
+    let model_primary_key_impl = quote! {
+        impl ::autumn_web::repository::ModelPrimaryKey for #name {
+            type IdType = #pk_ty;
+            fn primary_key_value(&self) -> Self::IdType {
+                ::core::clone::Clone::clone(&self.#pk_id)
+            }
+        }
+    };
+
     // Whether any factory field is an association (drives depth-check generation).
     let has_assoc_fields = fields_for_new
         .iter()
@@ -2823,6 +2832,7 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
         #can_set_tenant_id_impl
         #model_tenant_id_meta_impl
+        #model_primary_key_impl
 
         #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
         #vis enum #field_enum_name {

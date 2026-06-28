@@ -153,6 +153,8 @@ static REPOSITORY_COMMIT_HOOK_KICKERS: OnceLock<
 struct RepositoryCommitHookKickState {
     notify: Notify,
     pending: AtomicBool,
+    #[cfg(feature = "ws")]
+    channels: OnceLock<crate::channels::Channels>,
 }
 
 impl Default for RepositoryCommitHookKickState {
@@ -160,6 +162,8 @@ impl Default for RepositoryCommitHookKickState {
         Self {
             notify: Notify::new(),
             pending: AtomicBool::new(false),
+            #[cfg(feature = "ws")]
+            channels: OnceLock::new(),
         }
     }
 }
@@ -769,6 +773,53 @@ where
     Ok((context, record))
 }
 
+#[cfg(feature = "ws")]
+pub fn start_repository_commit_hook_worker(
+    pool: PgPool,
+    channels: Option<crate::channels::Channels>,
+    shutdown: CancellationToken,
+) {
+    register_inventory_repository_commit_hook_runners();
+    if !should_start_repository_commit_hook_worker(&registered_handler_keys()) {
+        return;
+    }
+
+    if let Some(ch) = channels.clone() {
+        let kick_state = repository_commit_hook_kick_state(&pool);
+        let _ = kick_state.channels.set(ch);
+    }
+
+    let worker_id = repository_commit_hook_worker_id();
+    tokio::spawn(async move {
+        if let Some(ch) = channels {
+            CURRENT_CHANNELS
+                .scope(ch, async move {
+                    loop {
+                        tokio::select! {
+                            () = shutdown.cancelled() => break,
+                            () = tokio::time::sleep(HOOK_WORKER_IDLE_SLEEP) => {
+                                recover_stale_repository_commit_hooks(&pool, &worker_id).await;
+                                drain_ready_repository_commit_hooks(&pool, &worker_id, 32).await;
+                            }
+                        }
+                    }
+                })
+                .await;
+        } else {
+            loop {
+                tokio::select! {
+                    () = shutdown.cancelled() => break,
+                    () = tokio::time::sleep(HOOK_WORKER_IDLE_SLEEP) => {
+                        recover_stale_repository_commit_hooks(&pool, &worker_id).await;
+                        drain_ready_repository_commit_hooks(&pool, &worker_id, 32).await;
+                    }
+                }
+            }
+        }
+    });
+}
+
+#[cfg(not(feature = "ws"))]
 pub fn start_repository_commit_hook_worker(pool: PgPool, shutdown: CancellationToken) {
     register_inventory_repository_commit_hook_runners();
     if !should_start_repository_commit_hook_worker(&registered_handler_keys()) {
@@ -842,6 +893,25 @@ fn spawn_repository_commit_hook_kick_worker(
         loop {
             state.notify.notified().await;
             while state.take_pending_kick() {
+                #[cfg(feature = "ws")]
+                {
+                    let ch_opt = state.channels.get().cloned().or_else(get_global_channels);
+                    if let Some(ch) = ch_opt {
+                        let pool_clone = pool.clone();
+                        let worker_id_clone = worker_id.clone();
+                        CURRENT_CHANNELS
+                            .scope(ch, async move {
+                                drain_ready_repository_commit_hooks(
+                                    &pool_clone,
+                                    &worker_id_clone,
+                                    32,
+                                )
+                                .await;
+                            })
+                            .await;
+                        continue;
+                    }
+                }
                 drain_ready_repository_commit_hooks(&pool, &worker_id, 32).await;
             }
         }
@@ -1307,6 +1377,71 @@ fn repository_commit_hook_worker_id() -> String {
 
 fn repository_commit_hook_pending_owner_id() -> String {
     format!("repository-hook-pending-{}", uuid::Uuid::new_v4())
+}
+
+#[cfg(feature = "ws")]
+tokio::task_local! {
+    pub static CURRENT_CHANNELS: crate::channels::Channels;
+}
+
+#[cfg(feature = "ws")]
+static GLOBAL_CHANNELS: std::sync::RwLock<Option<crate::channels::Channels>> =
+    std::sync::RwLock::new(None);
+
+#[cfg(feature = "ws")]
+pub fn set_global_channels(channels: crate::channels::Channels) {
+    if let Ok(mut lock) = GLOBAL_CHANNELS.write() {
+        *lock = Some(channels);
+    }
+}
+
+#[cfg(feature = "ws")]
+#[must_use]
+pub fn get_global_channels() -> Option<crate::channels::Channels> {
+    CURRENT_CHANNELS
+        .try_with(std::clone::Clone::clone)
+        .ok()
+        .or_else(|| GLOBAL_CHANNELS.read().ok().and_then(|lock| lock.clone()))
+}
+
+#[cfg(not(feature = "ws"))]
+#[derive(Clone)]
+pub struct Channels;
+
+#[cfg(not(feature = "ws"))]
+pub struct DummyBroadcast;
+
+#[cfg(not(feature = "ws"))]
+impl Channels {
+    #[allow(clippy::unused_self)]
+    pub const fn broadcast(&self) -> DummyBroadcast {
+        DummyBroadcast
+    }
+}
+
+#[cfg(not(feature = "ws"))]
+impl DummyBroadcast {
+    #[allow(clippy::unused_self, clippy::unnecessary_wraps)]
+    pub fn publish_oob<T, S>(
+        &self,
+        _topic: &str,
+        _id: &str,
+        _swap: S,
+        _fragment: &T,
+    ) -> Result<(), std::convert::Infallible> {
+        Ok(())
+    }
+}
+
+#[cfg(not(feature = "ws"))]
+#[allow(clippy::missing_const_for_fn)]
+pub fn set_global_channels(_channels: Channels) {}
+
+#[cfg(not(feature = "ws"))]
+#[must_use]
+#[allow(clippy::missing_const_for_fn)]
+pub fn get_global_channels() -> Option<Channels> {
+    None
 }
 
 #[cfg(test)]

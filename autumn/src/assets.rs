@@ -112,6 +112,14 @@ pub(crate) fn htmx_is_vendored() -> bool {
     load_vendor_manifest().is_some_and(|m| m.assets.contains_key("htmx"))
 }
 
+/// Returns `true` when the SSE extension has been pinned via `autumn assets add sse@…` or is present in the vendor manifest.
+///
+/// The router uses this to skip the built-in embedded sse handler so the
+/// vendored file is served by `ServeDir` instead.
+pub(crate) fn sse_is_vendored() -> bool {
+    load_vendor_manifest().is_some_and(|m| m.assets.contains_key("sse"))
+}
+
 #[cfg(feature = "embed-assets")]
 fn load_embedded_vendor_manifest() -> Option<VendorManifest> {
     EMBEDDED_STATIC

@@ -31,6 +31,12 @@ pub const HTMX_JS: &[u8] = include_bytes!("../vendor/htmx.min.js");
 /// Same-origin path where Autumn serves embedded htmx.
 pub const HTMX_JS_PATH: &str = "/static/js/htmx.min.js";
 
+/// htmx SSE extension JavaScript, embedded at compile time.
+pub const HTMX_SSE_JS: &[u8] = include_bytes!("../vendor/sse.js");
+
+/// Same-origin path where Autumn serves embedded htmx SSE extension.
+pub const HTMX_SSE_JS_PATH: &str = "/static/js/sse.js";
+
 /// Autumn widget runtime JavaScript, embedded at compile time.
 ///
 /// Provides CSP-compatible event-listener wiring for built-in widgets
@@ -396,6 +402,49 @@ fn escape_attribute(w: &mut String, s: &str) {
 }
 
 #[cfg(feature = "maud")]
+#[must_use]
+pub fn escape_attribute_string(s: &str) -> String {
+    let mut w = String::with_capacity(s.len() + 10);
+    escape_attribute(&mut w, s);
+    w
+}
+
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn inject_hx_swap_oob(html: &str, oob_value: &str) -> Option<String> {
+    let mut idx = 0;
+    while let Some(start_pos) = html[idx..].find('<') {
+        let abs_start = idx + start_pos;
+        let remaining = &html[abs_start..];
+        if remaining.starts_with("<!--") {
+            let comment_end = remaining.find("-->")?;
+            idx = abs_start + comment_end + 3;
+        } else {
+            let mut tag_name_end = 0;
+            for (char_idx, c) in remaining.char_indices().skip(1) {
+                if c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '>' || c == '/' {
+                    tag_name_end = char_idx;
+                    break;
+                }
+            }
+            if tag_name_end == 0 {
+                return None;
+            }
+            let insert_pos = abs_start + tag_name_end;
+            let escaped_val = escape_attribute_string(oob_value);
+            let mut result = String::with_capacity(html.len() + escaped_val.len() + 30);
+            result.push_str(&html[..insert_pos]);
+            result.push_str(" hx-swap-oob=\"");
+            result.push_str(&escaped_val);
+            result.push('"');
+            result.push_str(&html[insert_pos..]);
+            return Some(result);
+        }
+    }
+    None
+}
+
+#[cfg(feature = "maud")]
 impl maud::Render for HtmxFragments {
     fn render_to(&self, w: &mut String) {
         if let Some(primary) = &self.primary {
@@ -513,6 +562,45 @@ fn has_oob_attribute(html: &str) -> bool {
     false
 }
 
+/// Extracts the `id` attribute value from the root HTML element in the given HTML string.
+///
+/// Looks for an `id` attribute within the root start tag (before the first `>`).
+/// The attribute name must be preceded by a whitespace boundary.
+#[must_use]
+pub fn extract_html_id(html: &str) -> Option<String> {
+    let start_tag_end = html.find('>')?;
+    let start_tag = &html[..start_tag_end];
+    let mut id_idx = None;
+    let mut search_start = 0;
+    while let Some(offset) = start_tag[search_start..].find("id=") {
+        let absolute_idx = search_start + offset;
+        if absolute_idx > 0 {
+            let prev_char = start_tag.as_bytes()[absolute_idx - 1];
+            if prev_char == b' ' || prev_char == b'\t' || prev_char == b'\n' || prev_char == b'\r' {
+                id_idx = Some(absolute_idx);
+                break;
+            }
+        }
+        search_start = absolute_idx + 3;
+    }
+    let idx = id_idx?;
+    let after_id = &start_tag[idx + 3..];
+    let mut chars = after_id.chars();
+    let quote = chars.next()?;
+    if quote == '"' || quote == '\'' {
+        let mut val = String::new();
+        for c in chars {
+            if c == quote {
+                break;
+            }
+            val.push(c);
+        }
+        Some(val)
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -522,6 +610,7 @@ mod tests {
     #[allow(clippy::const_is_empty)]
     fn htmx_js_is_not_empty() {
         assert!(!HTMX_JS.is_empty(), "htmx.min.js should not be empty");
+        assert!(!HTMX_SSE_JS.is_empty(), "sse.js should not be empty");
     }
 
     #[test]
@@ -530,6 +619,14 @@ mod tests {
         assert!(
             start.contains("htmx") || start.contains("function") || start.contains('('),
             "htmx.min.js doesn't look like JavaScript: {start}"
+        );
+        let sse_start = std::str::from_utf8(&HTMX_SSE_JS[..50]).expect("sse should be valid UTF-8");
+        assert!(
+            sse_start.contains("Server")
+                || sse_start.contains("function")
+                || sse_start.contains('/')
+                || sse_start.contains('*'),
+            "sse.js doesn't look like JavaScript: {sse_start}"
         );
     }
 
@@ -542,6 +639,7 @@ mod tests {
     fn htmx_asset_paths_are_same_origin_static_paths() {
         assert_eq!(HTMX_JS_PATH, "/static/js/htmx.min.js");
         assert_eq!(HTMX_CSRF_JS_PATH, "/static/js/autumn-htmx-csrf.js");
+        assert_eq!(HTMX_SSE_JS_PATH, "/static/js/sse.js");
     }
 
     #[test]
@@ -816,6 +914,34 @@ mod tests {
         assert_eq!(
             OobSwap::InnerHTML.format_value("#my-id"),
             "innerHTML:#my-id"
+        );
+    }
+
+    #[test]
+    fn test_inject_hx_swap_oob() {
+        assert_eq!(
+            inject_hx_swap_oob("<li id=\"1\"></li>", "beforeend:#container"),
+            Some("<li hx-swap-oob=\"beforeend:#container\" id=\"1\"></li>".to_string())
+        );
+        assert_eq!(
+            inject_hx_swap_oob("<!-- comment -->\n  <div class=\"foo\"></div>", "outerHTML"),
+            Some(
+                "<!-- comment -->\n  <div hx-swap-oob=\"outerHTML\" class=\"foo\"></div>"
+                    .to_string()
+            )
+        );
+        assert_eq!(inject_hx_swap_oob("Hello world", "true"), None);
+    }
+
+    #[cfg(feature = "maud")]
+    #[test]
+    fn test_inject_on_maud_markup() {
+        use maud::html;
+        let oob = html! { li id="item-1" { "Item" } };
+        let injected = inject_hx_swap_oob(&oob.0, "beforeend:#container");
+        assert_eq!(
+            injected,
+            Some("<li hx-swap-oob=\"beforeend:#container\" id=\"item-1\">Item</li>".to_string())
         );
     }
 }

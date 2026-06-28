@@ -80,7 +80,7 @@ pub use crate::flash::{Flash, FlashLevel, FlashMessage};
 pub use crate::htmx::HxResponseExt;
 /// htmx request extractor.
 #[cfg(feature = "htmx")]
-pub use crate::htmx::{HTMX_CSRF_JS_PATH, HTMX_JS_PATH, HxRequest};
+pub use crate::htmx::{HTMX_CSRF_JS_PATH, HTMX_JS_PATH, HTMX_SSE_JS_PATH, HxRequest};
 /// Out-of-band multi-region swaps response builder.
 #[cfg(all(feature = "htmx", feature = "maud"))]
 pub use crate::htmx::{HtmxFragments, OobSwap};
