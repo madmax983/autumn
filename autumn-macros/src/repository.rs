@@ -6849,20 +6849,55 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     // a hard opt-in, so the user's crate must enable ws+maud+htmx features to get
     // the required types. A missing feature produces a clear compile error rather
     // than silently compiling out the broadcast logic.
+    //
+    // Tenant isolation: when `tenant_scoped` is also set, qualify the channel topic
+    // as "<base>:<tenant_id>" so broadcasts from tenant A are invisible to tenant B's
+    // SSE subscribers.  Broadcasts are skipped when no tenant context is established
+    // (e.g. background tasks) and in `across_tenants` mode.
     let (save_body, update_body, delete_body) = if let Some(ref topic) = config.broadcasts {
         let topic_lit = proc_macro2::Literal::string(topic);
+        // Emit code that resolves the runtime broadcast topic.
+        // For tenant_scoped repos the topic becomes "<base>:<tenant_id>".
+        let topic_resolve = if config.tenant_scoped {
+            quote! {
+                let __autumn_bcast_topic: ::core::option::Option<::std::string::String> =
+                    if self.across_tenants {
+                        ::core::option::Option::None
+                    } else {
+                        match ::autumn_web::tenancy::CURRENT_TENANT
+                            .try_with(|t| t.clone())
+                            .ok()
+                            .flatten()
+                        {
+                            ::core::option::Option::Some(__tid) => ::core::option::Option::Some(
+                                ::std::format!("{}:{}", #topic_lit, __tid),
+                            ),
+                            ::core::option::Option::None => ::core::option::Option::None,
+                        }
+                    };
+            }
+        } else {
+            quote! {
+                let __autumn_bcast_topic: ::core::option::Option<::std::string::String> =
+                    ::core::option::Option::Some(::std::string::String::from(#topic_lit));
+            }
+        };
         let wrapped_save = quote! {
             let __autumn_bcast_result: ::autumn_web::AutumnResult<#model_name> = {
                 #save_body
             };
             {
-                if let (::core::result::Result::Ok(__rec), ::core::option::Option::Some(__bcast)) =
-                    (&__autumn_bcast_result, &self.__autumn_broadcast)
+                #topic_resolve
+                if let (
+                    ::core::result::Result::Ok(__rec),
+                    ::core::option::Option::Some(__bcast),
+                    ::core::option::Option::Some(ref __topic),
+                ) = (&__autumn_bcast_result, &self.__autumn_broadcast, &__autumn_bcast_topic)
                 {
                     let __fragment = <#model_name as ::autumn_web::live::LiveFragment>::render_fragment(__rec);
                     let __dom_id = <#model_name as ::autumn_web::live::LiveFragment>::dom_id(__rec);
                     let __swap = <#model_name as ::autumn_web::live::LiveFragment>::insert_swap();
-                    let _ = __bcast.publish_oob(#topic_lit, &__dom_id, &__swap, &__fragment);
+                    let _ = __bcast.publish_oob(__topic, &__dom_id, &__swap, &__fragment);
                 }
                 __autumn_bcast_result
             }
@@ -6872,13 +6907,17 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 #update_body
             };
             {
-                if let (::core::result::Result::Ok(__rec), ::core::option::Option::Some(__bcast)) =
-                    (&__autumn_bcast_result, &self.__autumn_broadcast)
+                #topic_resolve
+                if let (
+                    ::core::result::Result::Ok(__rec),
+                    ::core::option::Option::Some(__bcast),
+                    ::core::option::Option::Some(ref __topic),
+                ) = (&__autumn_bcast_result, &self.__autumn_broadcast, &__autumn_bcast_topic)
                 {
                     let __fragment = <#model_name as ::autumn_web::live::LiveFragment>::render_fragment(__rec);
                     let __dom_id = <#model_name as ::autumn_web::live::LiveFragment>::dom_id(__rec);
                     let _ = __bcast.publish_oob(
-                        #topic_lit,
+                        __topic,
                         &__dom_id,
                         &::autumn_web::htmx::OobSwap::True,
                         &__fragment,
@@ -6893,12 +6932,16 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 #delete_body
             };
             {
-                if let (::core::result::Result::Ok(()), ::core::option::Option::Some(__bcast)) =
-                    (&__autumn_bcast_result, &self.__autumn_broadcast)
+                #topic_resolve
+                if let (
+                    ::core::result::Result::Ok(()),
+                    ::core::option::Option::Some(__bcast),
+                    ::core::option::Option::Some(ref __topic),
+                ) = (&__autumn_bcast_result, &self.__autumn_broadcast, &__autumn_bcast_topic)
                 {
                     let __dom_id = <#model_name as ::autumn_web::live::LiveFragment>::dom_id_for(__autumn_bcast_id);
                     let _ = __bcast.publish_oob(
-                        #topic_lit,
+                        __topic,
                         &__dom_id,
                         &::autumn_web::htmx::OobSwap::Delete,
                         &maud::html! {},
