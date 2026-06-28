@@ -6792,7 +6792,8 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     // These mirror the commit-hook broadcast tokens but use the result value from
     // the wrapped async block (`__autumn_result` / `__autumn_record`) instead of
     // the deserialized commit-hook payload.
-    let (inline_broadcast_create, inline_broadcast_update, inline_broadcast_delete) =
+    let (inline_broadcast_create, inline_broadcast_update, inline_broadcast_delete,
+         inline_update_prefetch, inline_delete_prefetch) =
         if config.broadcasts && !commit_hooks_enabled {
             let base_topic_expr_outer = match generate_topic_format(
                 config
@@ -6868,33 +6869,32 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     )
                 };
 
-            // Inline delete can only use a static topic because the record has
-            // already been removed from the DB when the broadcast fires and we
-            // have no pre-fetched snapshot.  When the topic expression is dynamic
-            // (contains a field interpolation like "post:{category_id}"), we fall
-            // back to the raw table name so that *some* broadcast is emitted.
-            // Users who need correct delete broadcasts on dynamic topics should
-            // enable `commit_hooks = true`; the durable-worker path loads the
-            // record inside the same transaction before the delete and therefore
-            // always has the right topic.
+            // Determine whether a pre-fetch is needed before the delete/update body.
+            // Pre-fetch is required when:
+            //  - the topic is dynamic (contains a field placeholder like "{category}"),
+            //    because after deletion the record is gone and the topic cannot be
+            //    interpolated; and for updates we need the pre-mutation topic to detect
+            //    topic changes and publish a delete on the old channel.
+            //  - broadcast_render is configured, because the custom render fn must run
+            //    on the live record to extract the real DOM id for delete broadcasts.
             //
-            // Similarly, `broadcast_render` users: the delete id is approximated
-            // as "{model_prefix}-{id}" because the custom render function cannot
-            // be called without the record.  The commit-hook path calls the render
-            // function on the pre-loaded record and extracts the real id from the
-            // produced HTML.
-            //
-            // Follow-up: https://github.com/madmax983/autumn/issues/1446 tracks
-            // adding pre-fetch support to the inline path for these cases.
+            // The simple case (static topic, no broadcast_render — what `--live`
+            // scaffolds) keeps the existing fast, zero-extra-query path.
+            let raw_topic_outer = config
+                .broadcast_topic
+                .as_deref()
+                .unwrap_or(&config.table_name);
+            let topic_is_dynamic_outer = raw_topic_outer.contains('{');
+            let delete_needs_prefetch = topic_is_dynamic_outer || config.broadcast_render.is_some();
+            let update_needs_prefetch = topic_is_dynamic_outer;
+
+            // Static fallbacks retained for the non-prefetch path and as the
+            // graceful-degradation fallback when the pre-fetch returns None.
             let static_delete_topic_outer: String = {
-                let raw = config
-                    .broadcast_topic
-                    .as_deref()
-                    .unwrap_or(&config.table_name);
-                if raw.contains('{') {
+                if topic_is_dynamic_outer {
                     config.table_name.clone()
                 } else {
-                    raw.to_owned()
+                    raw_topic_outer.to_owned()
                 }
             };
             let inline_delete_id_outer = if config.broadcast_render.is_some() {
@@ -6927,73 +6927,235 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     }
                 }
             };
-            // NOTE: the inline update path does not detect topic changes (e.g. when
-            // a field that's part of a dynamic `topic = "post:{category_id}"` is
-            // mutated).  The commit-hook path captures the pre-update topic in
-            // `__autumn_previous_topic` and publishes a delete on the old topic
-            // before the insert on the new topic; the inline path would need a
-            // pre-fetch to do the same.  Use `commit_hooks = true` if you need
-            // correct broadcasts when topic-keyed fields are updated.
-            // Follow-up: https://github.com/madmax983/autumn/issues/1446
-            let iu = quote! {
-                if let ::core::result::Result::Ok(ref __autumn_record) = __autumn_result {
-                    let __record_ref = __autumn_record;
-                    if let ::core::option::Option::Some(__channels) =
-                        ::autumn_web::__private::get_global_channels()
-                    {
-                        let __topic = #topic_expr_outer;
-                        let __fragment = #render_expr_outer;
-                        let __id = #update_id_outer;
-                        if let ::core::result::Result::Err(__err) = __channels
-                            .broadcast()
-                            .publish_oob(
-                                &__topic,
-                                &__id,
-                                &::autumn_web::htmx::OobSwap::OuterHTML,
-                                &__fragment,
+
+            // ── Update broadcast ─────────────────────────────────────────────
+            // When the topic is dynamic, a pre-fetch captures the pre-mutation topic
+            // (via `inline_update_prefetch` below) so we can detect topic changes and
+            // publish a delete on the old channel before inserting on the new one —
+            // mirroring the commit-hook `__autumn_previous_topic` logic.
+            let inline_update_prefetch = if update_needs_prefetch {
+                quote! {
+                    let (__autumn_prev_topic, __autumn_prev_id):
+                        (::core::option::Option<::std::string::String>,
+                         ::core::option::Option<::std::string::String>) = {
+                        let __pf: ::core::option::Option<#model_name> =
+                            self.find_by_id(id).await.ok().flatten();
+                        if let ::core::option::Option::Some(ref __record_ref) = __pf {
+                            (
+                                ::core::option::Option::Some(#topic_expr_outer),
+                                ::core::option::Option::Some(#update_id_outer),
                             )
+                        } else {
+                            (::core::option::Option::None, ::core::option::Option::None)
+                        }
+                    };
+                }
+            } else {
+                quote! {}
+            };
+
+            let iu = if update_needs_prefetch {
+                quote! {
+                    if let ::core::result::Result::Ok(ref __autumn_record) = __autumn_result {
+                        let __record_ref = __autumn_record;
+                        if let ::core::option::Option::Some(__channels) =
+                            ::autumn_web::__private::get_global_channels()
                         {
-                            ::autumn_web::reexports::tracing::warn!(
-                                error = %__err,
-                                "auto-broadcast update failed"
-                            );
+                            let __topic = #topic_expr_outer;
+                            let __fragment = #render_expr_outer;
+                            let __id = #update_id_outer;
+
+                            let __topic_changed = __autumn_prev_topic
+                                .as_deref()
+                                .map_or(false, |__prev| __prev != __topic.as_str());
+
+                            if __topic_changed {
+                                if let ::core::option::Option::Some(ref __prev_topic) =
+                                    __autumn_prev_topic
+                                {
+                                    let __delete_id =
+                                        __autumn_prev_id.as_deref().unwrap_or(__id.as_str());
+                                    let __delete_fragment = ::autumn_web::html! {};
+                                    if let ::core::result::Result::Err(__err) = __channels
+                                        .broadcast()
+                                        .publish_oob(
+                                            __prev_topic,
+                                            __delete_id,
+                                            &::autumn_web::htmx::OobSwap::Delete,
+                                            &__delete_fragment,
+                                        )
+                                    {
+                                        ::autumn_web::reexports::tracing::warn!(
+                                            error = %__err,
+                                            "auto-broadcast delete of old topic failed"
+                                        );
+                                    }
+                                }
+                            }
+
+                            let (__target_id, __swap_strategy): (
+                                ::std::string::String,
+                                ::autumn_web::htmx::OobSwap,
+                            ) = if __topic_changed {
+                                (
+                                    #container_expr_outer.to_string(),
+                                    ::autumn_web::htmx::OobSwap::BeforeEnd,
+                                )
+                            } else {
+                                let __strategy = if let ::core::option::Option::Some(
+                                    ref __prev_id_val,
+                                ) = __autumn_prev_id
+                                {
+                                    if __prev_id_val.as_str() != __id.as_str() {
+                                        ::autumn_web::htmx::OobSwap::Target(
+                                            ::autumn_web::htmx::OobMethod::OuterHTML,
+                                            ::std::format!("#{}", __prev_id_val),
+                                        )
+                                    } else {
+                                        ::autumn_web::htmx::OobSwap::OuterHTML
+                                    }
+                                } else {
+                                    ::autumn_web::htmx::OobSwap::OuterHTML
+                                };
+                                (__id.clone(), __strategy)
+                            };
+
+                            if let ::core::result::Result::Err(__err) = __channels
+                                .broadcast()
+                                .publish_oob(
+                                    &__topic,
+                                    &__target_id,
+                                    &__swap_strategy,
+                                    &__fragment,
+                                )
+                            {
+                                ::autumn_web::reexports::tracing::warn!(
+                                    error = %__err,
+                                    "auto-broadcast update failed"
+                                );
+                            }
+                        }
+                    }
+                }
+            } else {
+                quote! {
+                    if let ::core::result::Result::Ok(ref __autumn_record) = __autumn_result {
+                        let __record_ref = __autumn_record;
+                        if let ::core::option::Option::Some(__channels) =
+                            ::autumn_web::__private::get_global_channels()
+                        {
+                            let __topic = #topic_expr_outer;
+                            let __fragment = #render_expr_outer;
+                            let __id = #update_id_outer;
+                            if let ::core::result::Result::Err(__err) = __channels
+                                .broadcast()
+                                .publish_oob(
+                                    &__topic,
+                                    &__id,
+                                    &::autumn_web::htmx::OobSwap::OuterHTML,
+                                    &__fragment,
+                                )
+                            {
+                                ::autumn_web::reexports::tracing::warn!(
+                                    error = %__err,
+                                    "auto-broadcast update failed"
+                                );
+                            }
                         }
                     }
                 }
             };
-            let id_ = quote! {
-                if let ::core::result::Result::Ok(()) = __autumn_result {
-                    if let ::core::option::Option::Some(__channels) =
-                        ::autumn_web::__private::get_global_channels()
-                    {
-                        let __del_id = #inline_delete_id_outer;
-                        let __fragment = ::autumn_web::html! {};
-                        if let ::core::result::Result::Err(__err) = __channels
-                            .broadcast()
-                            .publish_oob(
-                                #static_delete_topic_outer,
-                                &__del_id,
-                                &::autumn_web::htmx::OobSwap::Delete,
-                                &__fragment,
-                            )
+
+            // ── Delete broadcast ─────────────────────────────────────────────
+            // When the topic is dynamic or broadcast_render is set, a pre-fetch loads
+            // the record before the DELETE so that the correct topic and DOM id are
+            // available even after the row is gone.  The `inline_delete_prefetch` token
+            // stream (below) populates `__autumn_prefetched` before the body runs.
+            let inline_delete_prefetch = if delete_needs_prefetch {
+                quote! {
+                    let __autumn_prefetched: ::core::option::Option<#model_name> =
+                        self.find_by_id(id).await.ok().flatten();
+                }
+            } else {
+                quote! {}
+            };
+
+            let id_ = if delete_needs_prefetch {
+                quote! {
+                    if let ::core::result::Result::Ok(()) = __autumn_result {
+                        if let ::core::option::Option::Some(__channels) =
+                            ::autumn_web::__private::get_global_channels()
                         {
-                            ::autumn_web::reexports::tracing::warn!(
-                                error = %__err,
-                                "auto-broadcast delete failed"
-                            );
+                            let (__del_topic, __del_id): (
+                                ::std::string::String,
+                                ::std::string::String,
+                            ) = if let ::core::option::Option::Some(ref __record_ref) =
+                                __autumn_prefetched
+                            {
+                                (#topic_expr_outer, #update_id_outer)
+                            } else {
+                                (
+                                    #static_delete_topic_outer.to_string(),
+                                    #inline_delete_id_outer,
+                                )
+                            };
+                            let __fragment = ::autumn_web::html! {};
+                            if let ::core::result::Result::Err(__err) = __channels
+                                .broadcast()
+                                .publish_oob(
+                                    &__del_topic,
+                                    &__del_id,
+                                    &::autumn_web::htmx::OobSwap::Delete,
+                                    &__fragment,
+                                )
+                            {
+                                ::autumn_web::reexports::tracing::warn!(
+                                    error = %__err,
+                                    "auto-broadcast delete failed"
+                                );
+                            }
+                        }
+                    }
+                }
+            } else {
+                quote! {
+                    if let ::core::result::Result::Ok(()) = __autumn_result {
+                        if let ::core::option::Option::Some(__channels) =
+                            ::autumn_web::__private::get_global_channels()
+                        {
+                            let __del_id = #inline_delete_id_outer;
+                            let __fragment = ::autumn_web::html! {};
+                            if let ::core::result::Result::Err(__err) = __channels
+                                .broadcast()
+                                .publish_oob(
+                                    #static_delete_topic_outer,
+                                    &__del_id,
+                                    &::autumn_web::htmx::OobSwap::Delete,
+                                    &__fragment,
+                                )
+                            {
+                                ::autumn_web::reexports::tracing::warn!(
+                                    error = %__err,
+                                    "auto-broadcast delete failed"
+                                );
+                            }
                         }
                     }
                 }
             };
-            (ic, iu, id_)
+            (ic, iu, id_, inline_update_prefetch, inline_delete_prefetch)
         } else {
-            (quote! {}, quote! {}, quote! {})
+            (quote! {}, quote! {}, quote! {}, quote! {}, quote! {})
         };
 
     // For repos that declare `broadcasts = true` but have no commit_hooks, wire
     // inline broadcasts directly into the save / update / delete method bodies.
     // The commit-hook path already includes the broadcasts in the durable worker;
     // this path fires them synchronously after each mutation instead.
+    //
+    // When the topic is dynamic or broadcast_render is set, a pre-fetch step runs
+    // before the mutation body so that topic interpolation and DOM-id extraction can
+    // operate on the live record (delete) or detect topic changes (update).
     let (save_body, update_body, delete_body) = if config.broadcasts && !commit_hooks_enabled {
         (
             quote! {
@@ -7003,12 +7165,14 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 __autumn_result
             },
             quote! {
+                #inline_update_prefetch
                 let __autumn_result: ::autumn_web::AutumnResult<#model_name> =
                     async { #update_body }.await;
                 #inline_broadcast_update
                 __autumn_result
             },
             quote! {
+                #inline_delete_prefetch
                 let __autumn_result: ::autumn_web::AutumnResult<()> =
                     async { #delete_body }.await;
                 #inline_broadcast_delete
