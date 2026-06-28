@@ -7,7 +7,11 @@
 //   - Optional REST API handler generation with `api = "..."`
 //   - Optional mutation hooks with `hooks = ...`
 //   - `broadcasts = "posts"` on PostRepository publishes hx-swap-oob fragments
-//     over the "posts" SSE topic whenever a post is saved, updated, or deleted
+//     over the "posts" SSE topic when mutations go through PgPostRepository.
+//     Note: the HTML form routes (submit/edit/delete) write directly with Diesel
+//     and therefore do not trigger broadcasts.  Broadcasts fire for REST API
+//     mutations at /api/posts.  To broadcast from HTML routes too, call
+//     state.broadcast().publish_oob(...) after each Diesel mutation.
 
 use crate::hooks::PostHooks;
 use crate::models::{
@@ -24,9 +28,9 @@ pub trait SubredditRepository {
     fn find_by_creator_id(creator_id: i64) -> Vec<Subreddit>;
 }
 
-// `broadcasts = "posts"` wires every repo mutation (save/update_by_id/delete_by_id)
-// to publish an `hx-swap-oob` fragment on the "posts" channel.  Clients that
-// subscribe to `/posts/stream` receive live DOM patches without polling.
+// `broadcasts = "posts"` wires every mutation that goes through PgPostRepository
+// (save/update_by_id/delete_by_id) to publish an `hx-swap-oob` fragment on the
+// "posts" channel.  Clients subscribing to `/posts/stream` receive live patches.
 #[autumn_web::repository(Post, hooks = PostHooks, api = "/api/posts", broadcasts = "posts")]
 pub trait PostRepository {
     /// SELECT * FROM posts WHERE slug = $1
