@@ -1484,22 +1484,30 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 .as_deref()
                 .unwrap_or(&default_container);
             let model_prefix = to_snake_case(&config.model_name.to_string());
-            let model_name_str = config.model_name.to_string();
-            let table_name = &config.table_name;
 
-            let render_expr = if let Some(ref render_path) = config.broadcast_render {
-                quote! { #render_path(__record_ref) }
-            } else {
-                quote! {
-                    ::autumn_web::html! {
-                        li id=(::std::format!("{}-{}", #model_prefix, ::autumn_web::repository::ModelPrimaryKey::primary_key_value(__record_ref))) {
-                            a href=(::std::format!("/{}/{}", #table_name, ::autumn_web::repository::ModelPrimaryKey::primary_key_value(__record_ref))) {
-                                (::std::format!("{} #{}", #model_name_str, ::autumn_web::repository::ModelPrimaryKey::primary_key_value(__record_ref)))
-                            }
-                        }
-                    }
-                }
-            };
+            let (render_expr, create_swap_id, create_swap_strategy, update_id_expr, delete_id_expr) =
+                if let Some(ref render_path) = config.broadcast_render {
+                    let extract_id = quote! {
+                        ::autumn_web::htmx::extract_html_id(&{#render_path(__record_ref)}.into_string())
+                            .unwrap_or_else(|| ::std::format!("{}-{}", #model_prefix, ::autumn_web::repository::ModelPrimaryKey::primary_key_value(__record_ref)))
+                    };
+                    (
+                        quote! { #render_path(__record_ref) },
+                        quote! { #container_expr.to_string() },
+                        quote! { ::autumn_web::htmx::OobSwap::BeforeEnd },
+                        extract_id.clone(),
+                        extract_id,
+                    )
+                } else {
+                    let dom_id = quote! { <#model_name as ::autumn_web::live::LiveFragment>::dom_id(__record_ref) };
+                    (
+                        quote! { <#model_name as ::autumn_web::live::LiveFragment>::render_fragment(__record_ref) },
+                        quote! { <#model_name as ::autumn_web::live::LiveFragment>::dom_id(__record_ref) },
+                        quote! { <#model_name as ::autumn_web::live::LiveFragment>::insert_swap() },
+                        dom_id.clone(),
+                        dom_id,
+                    )
+                };
 
             let create = quote! {
                 {
@@ -1507,9 +1515,11 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     if let ::core::option::Option::Some(__channels) = ::autumn_web::__private::get_global_channels() {
                         let __topic = #topic_expr;
                         let __fragment = #render_expr;
+                        let __create_id = #create_swap_id;
+                        let __create_swap = #create_swap_strategy;
                         if let ::core::result::Result::Err(__err) = __channels
                             .broadcast()
-                            .publish_oob(&__topic, #container_expr, &::autumn_web::htmx::OobSwap::BeforeEnd, &__fragment)
+                            .publish_oob(&__topic, &__create_id, &__create_swap, &__fragment)
                         {
                             ::autumn_web::reexports::tracing::warn!(error = %__err, "auto-broadcast failed");
                         }
@@ -1523,8 +1533,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     if let ::core::option::Option::Some(__channels) = ::autumn_web::__private::get_global_channels() {
                         let __topic = #topic_expr;
                         let __fragment = #render_expr;
-                        let __id = ::autumn_web::htmx::extract_html_id(&__fragment.clone().into_string())
-                            .unwrap_or_else(|| ::std::format!("{}-{}", #model_prefix, ::autumn_web::repository::ModelPrimaryKey::primary_key_value(__record_ref)));
+                        let __id = #update_id_expr;
 
                         let __prev_id = __ctx_val
                             .get("__autumn_previous_id")
@@ -1584,43 +1593,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     let __record_ref = &__record;
                     if let ::core::option::Option::Some(__channels) = ::autumn_web::__private::get_global_channels() {
                         let __topic = #topic_expr;
-                        let __id = {
-                            let __fragment = #render_expr;
-                            let __html = __fragment.into_string();
-                            (|| -> ::core::option::Option<::std::string::String> {
-                                let __start_tag_end = __html.find('>')?;
-                                let __start_tag = &__html[..__start_tag_end];
-                                let mut __id_idx = ::core::option::Option::None;
-                                let mut __search_start = 0;
-                                while let ::core::option::Option::Some(__offset) = __start_tag[__search_start..].find("id=") {
-                                    let __absolute_idx = __search_start + __offset;
-                                    if __absolute_idx > 0 {
-                                        let __prev_char = __start_tag.as_bytes()[__absolute_idx - 1];
-                                        if __prev_char == b' ' || __prev_char == b'\t' || __prev_char == b'\n' || __prev_char == b'\r' {
-                                            __id_idx = ::core::option::Option::Some(__absolute_idx);
-                                            break;
-                                        }
-                                    }
-                                    __search_start = __absolute_idx + 3;
-                                }
-                                let __idx = __id_idx?;
-                                let __after_id = &__start_tag[__idx + 3..];
-                                let mut __chars = __after_id.chars();
-                                let __quote = __chars.next()?;
-                                if __quote == '"' || __quote == '\'' {
-                                    let mut __val = ::std::string::String::new();
-                                    for __c in __chars {
-                                        if __c == __quote {
-                                            break;
-                                        }
-                                        __val.push(__c);
-                                    }
-                                    ::core::option::Option::Some(__val)
-                                } else {
-                                    ::core::option::Option::None
-                                }
-                            })().unwrap_or_else(|| ::std::format!("{}-{}", #model_prefix, ::autumn_web::repository::ModelPrimaryKey::primary_key_value(__record_ref)))
-                        };
+                        let __id = #delete_id_expr;
                         let __fragment = ::autumn_web::html! {};
                         if let ::core::result::Result::Err(__err) = __channels
                             .broadcast()
@@ -1663,21 +1636,13 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 base_topic_expr
             };
 
-            let model_prefix = to_snake_case(&config.model_name.to_string());
-            let model_name_str = config.model_name.to_string();
-            let table_name = &config.table_name;
-            let render_expr = if let Some(ref render_path) = config.broadcast_render {
-                quote! { #render_path(__record_ref) }
+            let prev_id_expr = if let Some(ref render_path) = config.broadcast_render {
+                quote! { {
+                    let __prev_fragment = #render_path(__record_ref);
+                    ::autumn_web::htmx::extract_html_id(&__prev_fragment.into_string())
+                } }
             } else {
-                quote! {
-                    ::autumn_web::html! {
-                        li id=(::std::format!("{}-{}", #model_prefix, ::autumn_web::repository::ModelPrimaryKey::primary_key_value(__record_ref))) {
-                            a href=(::std::format!("/{}/{}", #table_name, ::autumn_web::repository::ModelPrimaryKey::primary_key_value(__record_ref))) {
-                                (::std::format!("{} #{}", #model_name_str, ::autumn_web::repository::ModelPrimaryKey::primary_key_value(__record_ref)))
-                            }
-                        }
-                    }
-                }
+                quote! { ::core::option::Option::Some(<#model_name as ::autumn_web::live::LiveFragment>::dom_id(__record_ref)) }
             };
 
             (
@@ -1685,8 +1650,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     let (__autumn_previous_topic, __autumn_previous_id) = if let ::core::option::Option::Some(__record_val) = &__vh_before {
                         let __record_ref = __record_val;
                         let __prev_topic = #topic_expr;
-                        let __prev_fragment = #render_expr;
-                        let __prev_id = ::autumn_web::htmx::extract_html_id(&__prev_fragment.into_string());
+                        let __prev_id = #prev_id_expr;
                         (::core::option::Option::Some(__prev_topic), __prev_id)
                     } else {
                         (::core::option::Option::None, ::core::option::Option::None)
@@ -4258,21 +4222,10 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         base_topic_expr
                     };
 
-                    let model_prefix = to_snake_case(&config.model_name.to_string());
-                    let model_name_str = config.model_name.to_string();
-                    let table_name = &config.table_name;
-                    let render_expr = if let Some(ref render_path) = config.broadcast_render {
-                        quote! { #render_path(__record_ref) }
+                    let prev_id_expr_bulk = if let Some(ref render_path) = config.broadcast_render {
+                        quote! { ::autumn_web::htmx::extract_html_id(&{#render_path(__record_ref)}.into_string()) }
                     } else {
-                        quote! {
-                            ::autumn_web::html! {
-                                li id=(::std::format!("{}-{}", #model_prefix, ::autumn_web::repository::ModelPrimaryKey::primary_key_value(__record_ref))) {
-                                    a href=(::std::format!("/{}/{}", #table_name, ::autumn_web::repository::ModelPrimaryKey::primary_key_value(__record_ref))) {
-                                        (::std::format!("{} #{}", #model_name_str, ::autumn_web::repository::ModelPrimaryKey::primary_key_value(__record_ref)))
-                                    }
-                                }
-                            }
-                        }
+                        quote! { ::core::option::Option::Some(<#model_name as ::autumn_web::live::LiveFragment>::dom_id(__record_ref)) }
                     };
 
                     quote! {
@@ -4302,8 +4255,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                             let __prev_topic = #topic_expr;
                             chunk_previous_topics.push(::core::option::Option::Some(__prev_topic.clone()));
 
-                            let __prev_fragment = #render_expr;
-                            let __prev_id = ::autumn_web::htmx::extract_html_id(&__prev_fragment.into_string());
+                            let __prev_id = #prev_id_expr_bulk;
                             chunk_previous_ids.push(__prev_id.clone());
 
                             if let ::core::option::Option::Some(__prev_id_val) = __prev_id {

@@ -58,6 +58,13 @@ impl LiveFragment for LiveItem {
             li id=(self.dom_id()) { (self.name) }
         }
     }
+
+    fn insert_swap() -> autumn_web::htmx::OobSwap {
+        autumn_web::htmx::OobSwap::Target(
+            autumn_web::htmx::OobMethod::BeforeEnd,
+            "#live_items-list".to_string(),
+        )
+    }
 }
 
 // ── Repository with broadcasts ────────────────────────────────────────────────
