@@ -2605,10 +2605,7 @@ fn run_generate_command(cmd: GenerateCommands) {
                                 println!("       [workspace]");
                                 println!("       members = [");
                                 println!("           # ...,");
-                                println!(
-                                    "           \"{}\",",
-                                    plugin_plan.target_dir_relative
-                                );
+                                println!("           \"{}\",", plugin_plan.target_dir_relative);
                                 println!("       ]");
                                 println!(
                                     "  2. Add the dependency to your host app's `Cargo.toml`:"

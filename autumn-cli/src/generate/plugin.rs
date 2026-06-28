@@ -272,12 +272,10 @@ mod conformance_tests {{
         conformance_rs_content,
     );
 
-    let target_dir_relative = target_dir
-        .strip_prefix(project_root)
-        .map_or_else(
-            |_| target_dir.display().to_string().replace('\\', "/"),
-            |p| p.display().to_string().replace('\\', "/"),
-        );
+    let target_dir_relative = target_dir.strip_prefix(project_root).map_or_else(
+        |_| target_dir.display().to_string().replace('\\', "/"),
+        |p| p.display().to_string().replace('\\', "/"),
+    );
 
     Ok(PluginPlan {
         plan,
@@ -394,7 +392,9 @@ mod tests {
             .take(2)
             .collect::<Vec<_>>()
             .join(".");
-        assert!(cargo_content.contains(&format!("autumn-web = {{ version = \"{expected_version}\" }}")));
+        assert!(cargo_content.contains(&format!(
+            "autumn-web = {{ version = \"{expected_version}\" }}"
+        )));
         assert!(cargo_content.contains("serde = { version = \"1\", features = [\"derive\"] }"));
 
         // Check src/lib.rs content

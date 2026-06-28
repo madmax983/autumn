@@ -2711,6 +2711,7 @@ pub fn run(opts: DoctorOptions) {
     }));
 
     // ── Phase 3: spawn all tasks concurrently ────────────────────────────────
+    #[allow(clippy::needless_collect)]
     let handles: Vec<thread::JoinHandle<CheckResult>> =
         tasks.into_iter().map(thread::spawn).collect();
 
