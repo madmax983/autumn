@@ -1709,7 +1709,10 @@ mod tests {
     fn oob_envelope_true_injects_on_root() {
         let frag = "<li id=\"item-8\">X</li>";
         let result = sse_oob_envelope("item-8", &crate::htmx::OobSwap::True, frag);
-        assert!(result.contains("hx-swap-oob=\"true\""), "missing attr: {result}");
+        assert!(
+            result.contains("hx-swap-oob=\"true\""),
+            "missing attr: {result}"
+        );
         assert!(result.contains("<li"), "root tag stripped: {result}");
     }
 
@@ -1726,9 +1729,15 @@ mod tests {
     fn oob_envelope_target_outerhtml_injects_on_root() {
         use crate::htmx::{OobMethod, OobSwap};
         let frag = "<li id=\"item-9\">X</li>";
-        let result =
-            sse_oob_envelope("item-9", &OobSwap::Target(OobMethod::OuterHTML, "#item-9".to_string()), frag);
-        assert!(result.contains("hx-swap-oob=\"outerHTML:#item-9\""), "got: {result}");
+        let result = sse_oob_envelope(
+            "item-9",
+            &OobSwap::Target(OobMethod::OuterHTML, "#item-9".to_string()),
+            frag,
+        );
+        assert!(
+            result.contains("hx-swap-oob=\"outerHTML:#item-9\""),
+            "got: {result}"
+        );
         assert!(result.contains("<li"), "root tag stripped: {result}");
     }
 
@@ -1738,7 +1747,10 @@ mod tests {
         use crate::htmx::OobSwap;
         let frag = "<li id=\"item-10\">X</li>";
         let result = sse_oob_envelope("item-10", &OobSwap::Custom("outerHTML".to_string()), frag);
-        assert!(result.contains("hx-swap-oob=\"outerHTML\""), "got: {result}");
+        assert!(
+            result.contains("hx-swap-oob=\"outerHTML\""),
+            "got: {result}"
+        );
         assert!(result.contains("<li"), "root tag stripped: {result}");
     }
 
@@ -1747,8 +1759,15 @@ mod tests {
     fn oob_envelope_custom_outerhtml_selector_injects_on_root() {
         use crate::htmx::OobSwap;
         let frag = "<li id=\"item-11\">X</li>";
-        let result = sse_oob_envelope("item-11", &OobSwap::Custom("outerHTML:#item-11".to_string()), frag);
-        assert!(result.contains("hx-swap-oob=\"outerHTML:#item-11\""), "got: {result}");
+        let result = sse_oob_envelope(
+            "item-11",
+            &OobSwap::Custom("outerHTML:#item-11".to_string()),
+            frag,
+        );
+        assert!(
+            result.contains("hx-swap-oob=\"outerHTML:#item-11\""),
+            "got: {result}"
+        );
     }
 
     #[cfg(feature = "maud")]
@@ -1756,8 +1775,18 @@ mod tests {
     fn oob_envelope_custom_non_outerhtml_wraps_in_div() {
         use crate::htmx::OobSwap;
         let frag = "<li id=\"item-12\">X</li>";
-        let result = sse_oob_envelope("item-12", &OobSwap::Custom("beforeend:#items".to_string()), frag);
-        assert!(result.starts_with("<div hx-swap-oob=\"beforeend:#items\">"), "got: {result}");
-        assert!(result.contains("<li id=\"item-12\">"), "fragment missing: {result}");
+        let result = sse_oob_envelope(
+            "item-12",
+            &OobSwap::Custom("beforeend:#items".to_string()),
+            frag,
+        );
+        assert!(
+            result.starts_with("<div hx-swap-oob=\"beforeend:#items\">"),
+            "got: {result}"
+        );
+        assert!(
+            result.contains("<li id=\"item-12\">"),
+            "fragment missing: {result}"
+        );
     }
 }

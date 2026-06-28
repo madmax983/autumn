@@ -743,12 +743,10 @@ mod tests {
         let mut body = response.into_body();
         // Poll for one frame — this drives the map closure that builds the OOB badge.
         // `frame()` returns Option<Result<Frame<Bytes>, Error>>.
-        let frame_result = tokio::time::timeout(
-            std::time::Duration::from_millis(500),
-            body.frame(),
-        )
-        .await
-        .expect("timed out waiting for SSE frame from presence_stream");
+        let frame_result =
+            tokio::time::timeout(std::time::Duration::from_millis(500), body.frame())
+                .await
+                .expect("timed out waiting for SSE frame from presence_stream");
 
         match frame_result {
             Some(Ok(frame)) => {
