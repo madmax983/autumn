@@ -72,7 +72,7 @@ impl Blob {
     ///
     /// Most applications get one of these from
     /// [`BlobStore::put`](super::BlobStore::put) or
-    /// [`MultipartField::save_to_blob_store`](crate::extract::MultipartField::save_to_blob_store);
+    /// `MultipartField::save_to_blob_store`;
     /// constructing one by hand is intended for tests and migrations.
     #[must_use]
     pub fn new(

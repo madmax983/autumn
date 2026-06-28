@@ -512,7 +512,7 @@ pub use autumn_macros::api_doc;
 pub use autumn_macros::get;
 /// Annotate an async function as a first-class inbound mail handler.
 ///
-/// See [`inbound_mail`] for usage documentation.
+/// See [`mod@inbound_mail`] for usage documentation.
 #[cfg(feature = "inbound-mail")]
 pub use autumn_macros::inbound_mail;
 /// Collect mailer preview registrations into an `AppBuilder`.
