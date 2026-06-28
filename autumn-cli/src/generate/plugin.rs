@@ -177,13 +177,13 @@ impl Plugin for {struct_name} {{
 
     fn build(self, app: AppBuilder) -> AppBuilder {{
         // Wire a commented example route contribution:
-        // app.nest("/autumn-{name_kebab}-plugin", autumn_web::routes![index])
+        // app.routes(autumn_web::routes![index])
         app
     }}
 }}
 
 // Commented index route function:
-// #[autumn_web::get("/")]
+// #[autumn_web::get("/autumn-{name_kebab}-plugin")]
 // async fn index() -> &'static str {{
 //     "Hello from plugin!"
 // }}
@@ -411,7 +411,7 @@ mod tests {
         assert!(lib_content.contains("impl Plugin for FooPlugin"));
         assert!(lib_content.contains("fn name(&self) -> Cow<'static, str>"));
         assert!(lib_content.contains("Cow::Borrowed(\"autumn-foo-plugin\")"));
-        assert!(lib_content.contains("// app.nest("));
+        assert!(lib_content.contains("// app.routes("));
         assert!(lib_content.contains("index"));
 
         // Check README.md content

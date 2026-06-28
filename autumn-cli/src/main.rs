@@ -2611,13 +2611,21 @@ fn run_generate_command(cmd: GenerateCommands) {
                                 );
                                 println!("       ]");
                                 println!(
-                                    "  2. Register the plugin with your host app in `src/main.rs`:"
+                                    "  2. Add the dependency to your host app's `Cargo.toml`:"
+                                );
+                                println!("       [dependencies]");
+                                println!(
+                                    "       autumn-{}-plugin = {{ path = \"./{}\" }}",
+                                    plugin_plan.name_kebab, plugin_plan.target_dir_relative
+                                );
+                                println!(
+                                    "  3. Register the plugin with your host app in `src/main.rs`:"
                                 );
                                 println!(
                                     "       app.plugin(autumn_{}_plugin::{}::new())",
                                     plugin_plan.name_snake, plugin_plan.struct_name
                                 );
-                                println!("  3. Run the conformance test to verify:");
+                                println!("  4. Run the conformance test to verify:");
                                 println!(
                                     "       cargo test -p autumn-{}-plugin\n",
                                     plugin_plan.name_kebab
