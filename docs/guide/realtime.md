@@ -250,8 +250,8 @@ state machine.
 autumn generate scaffold Post title:String body:String \
     --live \
     --live-validation \
-    --validate title=length(min=1,max=200) \
-    --validate body=length(min=1)
+    --validate title=length:min=1,max=200 \
+    --validate body=length:min=1
 ```
 
 Open two browser tabs on the index. Create, edit, or delete a post in one
@@ -264,7 +264,7 @@ Type in the create/edit form — error messages appear inline, per field, on
 - A `LiveFragment` impl on the model (see above).
 - `#[repository(Post, broadcasts = true)]` on the repository — save, update,
   and delete automatically publish OOB htmx fragments to connected clients.
-- A `/posts/stream` SSE route.
+- A `/posts/events` SSE route.
 - The idiomorph `<script>` in the layout (`IDIOMORPH_JS_PATH`) and
   `hx-ext="morph"` on `<body>` for smooth morphing navigations.
 - An index list container wired to the SSE stream:
@@ -272,7 +272,7 @@ Type in the create/edit form — error messages appear inline, per field, on
 ```html
 <ul id="posts-list"
     hx-ext="sse"
-    sse-connect="/posts/stream"
+    sse-connect="/posts/events"
     sse-swap="message"
     hx-swap="none">
 ```
