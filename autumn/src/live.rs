@@ -102,22 +102,23 @@ pub trait LiveFragment {
     /// The root element must have `id = self.dom_id()`.
     fn render_fragment(&self) -> maud::Markup;
 
-    /// Htmx swap strategy to use when a new record is inserted.
+    /// Htmx swap strategy to use when a new record is inserted into the list.
     ///
-    /// Defaults to [`crate::htmx::OobSwap::True`], which replaces an element
-    /// with the matching DOM id. **For inserts this means the fragment is
-    /// silently dropped on clients that don't have the element yet.**
-    /// Override with [`crate::htmx::OobSwap::Target`] targeting a list
-    /// container so new rows are appended rather than dropped:
+    /// The target container is controlled by the `broadcast_container`
+    /// repository attribute (defaults to `{table}-list`). This method only
+    /// controls the *strategy* — how the fragment lands in that container.
+    ///
+    /// Defaults to [`crate::htmx::OobSwap::BeforeEnd`] (append). Override to
+    /// [`crate::htmx::OobSwap::AfterBegin`] to prepend instead:
     ///
     /// ```rust,ignore
     /// fn insert_swap() -> OobSwap {
-    ///     OobSwap::Target(OobMethod::BeforeEnd, "#tasks-list".to_string())
+    ///     OobSwap::AfterBegin
     /// }
     /// ```
     #[must_use]
     fn insert_swap() -> crate::htmx::OobSwap {
-        crate::htmx::OobSwap::True
+        crate::htmx::OobSwap::BeforeEnd
     }
 }
 
@@ -179,7 +180,10 @@ mod tests {
     }
 
     #[test]
-    fn insert_swap_defaults_to_true() {
-        assert!(matches!(Thing::insert_swap(), crate::htmx::OobSwap::True));
+    fn insert_swap_defaults_to_before_end() {
+        assert!(matches!(
+            Thing::insert_swap(),
+            crate::htmx::OobSwap::BeforeEnd
+        ));
     }
 }
