@@ -1649,6 +1649,31 @@ enum GenerateCommands {
         #[arg(long)]
         force: bool,
     },
+    /// Scaffold an installable/conformant plugin crate.
+    ///
+    /// Creates:
+    ///   - `<target-dir>/Cargo.toml`       — plugin crate cargo file
+    ///   - `<target-dir>/src/lib.rs`       — main plugin implementation
+    ///   - `<target-dir>/README.md`        — installation & setup documentation
+    ///   - `<target-dir>/tests/conformance.rs` — conformance tests verification
+    ///
+    /// Example:
+    ///
+    ///   autumn generate plugin my-plugin
+    ///   autumn generate plugin my-plugin --path custom/path
+    Plugin {
+        /// Plugin name (`snake_case` or `kebab-case`, e.g. `admin` or `my-plugin`).
+        name: String,
+        /// Custom destination path for the generated plugin (defaults to `autumn-<name>-plugin` in the project root).
+        #[arg(long)]
+        path: Option<String>,
+        /// Print the file plan and exit without writing anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Overwrite existing files instead of erroring on collision.
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 fn main() {
@@ -2548,6 +2573,34 @@ fn run_generate_command(cmd: GenerateCommands) {
                 }
             };
             generate::scaffold::run(&name, &fields, generate::Flags { dry_run, force }, &options);
+        }
+        GenerateCommands::Plugin {
+            name,
+            path,
+            dry_run,
+            force,
+        } => {
+            let cwd = match std::env::current_dir() {
+                Ok(d) => d,
+                Err(e) => {
+                    eprintln!("Error: cannot determine current directory: {e}");
+                    std::process::exit(1);
+                }
+            };
+            match generate::plugin::plan_plugin(
+                &cwd,
+                &name,
+                path.as_deref(),
+                generate::Flags { dry_run, force },
+            )
+            .and_then(|p| p.execute(generate::Flags { dry_run, force }))
+            {
+                Ok(()) => {}
+                Err(e) => {
+                    eprintln!("Error: {e}");
+                    std::process::exit(1);
+                }
+            }
         }
     }
 }
@@ -5131,6 +5184,34 @@ mod tests {
             panic!("expected Pwa variant");
         };
         assert!(!dry_run);
+        assert!(force);
+    }
+
+    #[test]
+    fn parse_generate_plugin() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "generate",
+            "plugin",
+            "foo",
+            "--path",
+            "custom-path",
+            "--dry-run",
+            "--force",
+        ])
+        .unwrap();
+        let Commands::Generate(GenerateCommands::Plugin {
+            name,
+            path,
+            dry_run,
+            force,
+        }) = cli.command
+        else {
+            panic!("expected Plugin variant");
+        };
+        assert_eq!(name, "foo");
+        assert_eq!(path.as_deref(), Some("custom-path"));
+        assert!(dry_run);
         assert!(force);
     }
 
