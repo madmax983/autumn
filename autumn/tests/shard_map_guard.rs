@@ -65,15 +65,13 @@ struct ShardMapRow {
 #[cfg(feature = "test-support")]
 async fn read_stored_map(db: &TestDb) -> Vec<(String, String)> {
     let mut conn = db.pool().get().await.expect("control connection");
-    diesel::sql_query(
-        "SELECT shard_name, slots FROM _autumn_shard_map ORDER BY shard_name",
-    )
-    .load::<ShardMapRow>(&mut conn)
-    .await
-    .expect("read _autumn_shard_map")
-    .into_iter()
-    .map(|r| (r.shard_name, r.slots))
-    .collect()
+    diesel::sql_query("SELECT shard_name, slots FROM _autumn_shard_map ORDER BY shard_name")
+        .load::<ShardMapRow>(&mut conn)
+        .await
+        .expect("read _autumn_shard_map")
+        .into_iter()
+        .map(|r| (r.shard_name, r.slots))
+        .collect()
 }
 
 #[cfg(feature = "test-support")]
@@ -151,12 +149,22 @@ async fn shard_map_guard_refuses_when_topology_changes() {
         err.contains("shard slot map mismatch"),
         "error must describe the mismatch; got: {err}"
     );
-    assert!(err.contains("3 shards"), "must mention computed count; got: {err}");
-    assert!(err.contains("2 shards"), "must mention stored count; got: {err}");
+    assert!(
+        err.contains("3 shards"),
+        "must mention computed count; got: {err}"
+    );
+    assert!(
+        err.contains("2 shards"),
+        "must mention stored count; got: {err}"
+    );
 
     // Stored map must be untouched — no rows added or modified.
     let stored = read_stored_map(db).await;
-    assert_eq!(stored.len(), 2, "stored map must be unchanged after mismatch");
+    assert_eq!(
+        stored.len(),
+        2,
+        "stored map must be unchanged after mismatch"
+    );
     assert_eq!(stored[0].1, "0-8191");
     assert_eq!(stored[1].1, "8192-16383");
 }

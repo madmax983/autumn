@@ -3859,9 +3859,7 @@ pub fn check_stored_slot_map(
     computed: &[ShardSlotAssignment],
     stored: Option<&[ShardSlotAssignment]>,
 ) -> Result<(), String> {
-    fn to_map(
-        assignments: &[ShardSlotAssignment],
-    ) -> std::collections::BTreeMap<&str, &str> {
+    fn to_map(assignments: &[ShardSlotAssignment]) -> std::collections::BTreeMap<&str, &str> {
         assignments
             .iter()
             .map(|a| (a.name.as_str(), a.ranges.as_str()))
@@ -4024,9 +4022,7 @@ impl DatabaseConfig {
     /// # Errors
     ///
     /// Propagates any [`ConfigError`] from `resolved_slot_map`.
-    pub fn resolved_shard_assignments(
-        &self,
-    ) -> Result<Vec<ShardSlotAssignment>, ConfigError> {
+    pub fn resolved_shard_assignments(&self) -> Result<Vec<ShardSlotAssignment>, ConfigError> {
         let slot_map = self.resolved_slot_map()?;
         let n = self.shards.len();
         let mut per_shard: Vec<Vec<usize>> = vec![Vec::new(); n];
@@ -8738,7 +8734,10 @@ redirect_uri = "http://localhost:3000/auth/github/callback"
     #[test]
     fn shards_auto_split_true_when_all_slots_none() {
         let config = DatabaseConfig {
-            shards: vec![shard("a", "postgres://a/app"), shard("b", "postgres://b/app")],
+            shards: vec![
+                shard("a", "postgres://a/app"),
+                shard("b", "postgres://b/app"),
+            ],
             ..Default::default()
         };
         assert!(config.shards_auto_split());
@@ -8764,7 +8763,10 @@ redirect_uri = "http://localhost:3000/auth/github/callback"
     #[test]
     fn resolved_shard_assignments_two_shards() {
         let config = DatabaseConfig {
-            shards: vec![shard("s0", "postgres://s0/app"), shard("s1", "postgres://s1/app")],
+            shards: vec![
+                shard("s0", "postgres://s0/app"),
+                shard("s1", "postgres://s1/app"),
+            ],
             ..Default::default()
         };
         let assignments = config
@@ -8808,10 +8810,7 @@ redirect_uri = "http://localhost:3000/auth/github/callback"
     #[test]
     fn check_stored_slot_map_explicit_mode_always_ok() {
         // Even with a wildly different stored map, explicit mode is never blocked.
-        let computed = vec![
-            assignment("s0", "0-8191"),
-            assignment("s1", "8192-16383"),
-        ];
+        let computed = vec![assignment("s0", "0-8191"), assignment("s1", "8192-16383")];
         let stored = vec![
             assignment("s0", "0-5460"),
             assignment("s1", "5461-10922"),
@@ -8822,24 +8821,15 @@ redirect_uri = "http://localhost:3000/auth/github/callback"
 
     #[test]
     fn check_stored_slot_map_first_boot_no_stored_ok() {
-        let computed = vec![
-            assignment("s0", "0-8191"),
-            assignment("s1", "8192-16383"),
-        ];
+        let computed = vec![assignment("s0", "0-8191"), assignment("s1", "8192-16383")];
         assert!(check_stored_slot_map(true, &computed, None).is_ok());
     }
 
     #[test]
     fn check_stored_slot_map_matching_map_ok() {
-        let computed = vec![
-            assignment("s0", "0-8191"),
-            assignment("s1", "8192-16383"),
-        ];
+        let computed = vec![assignment("s0", "0-8191"), assignment("s1", "8192-16383")];
         // Order-insensitive: stored in reverse order still matches.
-        let stored = vec![
-            assignment("s1", "8192-16383"),
-            assignment("s0", "0-8191"),
-        ];
+        let stored = vec![assignment("s1", "8192-16383"), assignment("s0", "0-8191")];
         assert!(check_stored_slot_map(true, &computed, Some(&stored)).is_ok());
     }
 
@@ -8850,10 +8840,7 @@ redirect_uri = "http://localhost:3000/auth/github/callback"
             assignment("s1", "5461-10922"),
             assignment("s2", "10923-16383"),
         ];
-        let stored = vec![
-            assignment("s0", "0-8191"),
-            assignment("s1", "8192-16383"),
-        ];
+        let stored = vec![assignment("s0", "0-8191"), assignment("s1", "8192-16383")];
         let err = check_stored_slot_map(true, &computed, Some(&stored))
             .expect_err("3-shard auto-split vs 2-shard stored map must fail");
         assert!(err.contains("shard slot map mismatch"), "message: {err}");
@@ -8867,14 +8854,14 @@ redirect_uri = "http://localhost:3000/auth/github/callback"
             assignment("alpha", "0-8191"),
             assignment("beta", "8192-16383"),
         ];
-        let stored = vec![
-            assignment("s0", "0-8191"),
-            assignment("s1", "8192-16383"),
-        ];
+        let stored = vec![assignment("s0", "0-8191"), assignment("s1", "8192-16383")];
         let err = check_stored_slot_map(true, &computed, Some(&stored))
             .expect_err("renamed shards must be detected as mismatch");
         assert!(err.contains("shard slot map mismatch"), "message: {err}");
-        assert!(err.contains("alpha"), "message must name computed shards: {err}");
+        assert!(
+            err.contains("alpha"),
+            "message must name computed shards: {err}"
+        );
         assert!(err.contains("s0"), "message must name stored shards: {err}");
     }
 }

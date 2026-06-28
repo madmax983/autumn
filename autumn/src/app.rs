@@ -5952,10 +5952,8 @@ async fn setup_database(
         config.database.has_shards(),
         hook_queue_migration_mode,
     );
-    let shard_map_migration_required = shard_map_migration_is_required(
-        config.database.has_shards(),
-        hook_queue_migration_mode,
-    );
+    let shard_map_migration_required =
+        shard_map_migration_is_required(config.database.has_shards(), hook_queue_migration_mode);
     let check_replica_migrations = !migrations.is_empty();
     let topology = match pool_provider {
         Some(factory) => factory(config.database.clone()).await,
@@ -6267,7 +6265,11 @@ struct ShardMapRow {
 /// stored map, indicating a topology change that would silently misroute data.
 #[cfg(feature = "db")]
 pub async fn run_shard_map_guard(
-    control_pool: &deadpool::managed::Pool<diesel_async::pooled_connection::AsyncDieselConnectionManager<diesel_async::AsyncPgConnection>>,
+    control_pool: &deadpool::managed::Pool<
+        diesel_async::pooled_connection::AsyncDieselConnectionManager<
+            diesel_async::AsyncPgConnection,
+        >,
+    >,
     computed: &[crate::config::ShardSlotAssignment],
     auto_split: bool,
 ) -> Result<(), String> {
@@ -7696,7 +7698,9 @@ mod tests {
             crate::config::ShardConfig {
                 name: "shard1".to_owned(),
                 primary_url: "postgres://localhost/shard1".to_owned(),
-                slots: Some(vec![crate::config::SlotSpec::Range("8192-16383".to_owned())]),
+                slots: Some(vec![crate::config::SlotSpec::Range(
+                    "8192-16383".to_owned(),
+                )]),
                 replica_url: Some("postgres://localhost/shard1_ro".to_owned()),
                 primary_pool_size: None,
                 replica_pool_size: Some(2),
