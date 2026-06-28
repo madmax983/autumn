@@ -6871,6 +6871,24 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     )
                 };
 
+            // Inline delete can only use a static topic because the record has
+            // already been removed from the DB when the broadcast fires and we
+            // have no pre-fetched snapshot.  When the topic expression is dynamic
+            // (contains a field interpolation like "post:{category_id}"), we fall
+            // back to the raw table name so that *some* broadcast is emitted.
+            // Users who need correct delete broadcasts on dynamic topics should
+            // enable `commit_hooks = true`; the durable-worker path loads the
+            // record inside the same transaction before the delete and therefore
+            // always has the right topic.
+            //
+            // Similarly, `broadcast_render` users: the delete id is approximated
+            // as "{model_prefix}-{id}" because the custom render function cannot
+            // be called without the record.  The commit-hook path calls the render
+            // function on the pre-loaded record and extracts the real id from the
+            // produced HTML.
+            //
+            // Follow-up: https://github.com/madmax983/autumn/issues/1446 tracks
+            // adding pre-fetch support to the inline path for these cases.
             let static_delete_topic_outer: String = {
                 let raw = config
                     .broadcast_topic
@@ -6912,6 +6930,14 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     }
                 }
             };
+            // NOTE: the inline update path does not detect topic changes (e.g. when
+            // a field that's part of a dynamic `topic = "post:{category_id}"` is
+            // mutated).  The commit-hook path captures the pre-update topic in
+            // `__autumn_previous_topic` and publishes a delete on the old topic
+            // before the insert on the new topic; the inline path would need a
+            // pre-fetch to do the same.  Use `commit_hooks = true` if you need
+            // correct broadcasts when topic-keyed fields are updated.
+            // Follow-up: https://github.com/madmax983/autumn/issues/1446
             let iu = quote! {
                 if let ::core::result::Result::Ok(ref __autumn_record) = __autumn_result {
                     let __record_ref = __autumn_record;
