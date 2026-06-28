@@ -2777,7 +2777,8 @@ fn live_scaffold_index_uses_sse_list_and_stream_route() {
 }
 
 /// `--live` layout must include the idiomorph script, enable morph on the
-/// body, and wire the SSE container to use morph as its swap strategy.
+/// body, and wire the SSE container with hx-swap="none" so that OOB fragments
+/// are processed without the in-band innerHTML swap clearing the list.
 #[test]
 fn live_layout_references_idiomorph_and_morph() {
     let (_tmp, project) = fresh_project("live-morph");
@@ -2797,8 +2798,8 @@ fn live_layout_references_idiomorph_and_morph() {
         "layout <body> must carry hx-ext=\"morph\" under --live:\n{routes}"
     );
     assert!(
-        routes.contains(r#"hx-swap="morph""#),
-        "SSE list container must use hx-swap=\"morph\" under --live:\n{routes}"
+        routes.contains(r#"hx-swap="none""#),
+        "SSE list container must use hx-swap=\"none\" under --live:\n{routes}"
     );
 }
 

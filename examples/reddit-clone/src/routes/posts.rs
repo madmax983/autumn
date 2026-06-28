@@ -106,7 +106,7 @@ pub async fn front_page(
             // treat a missing preload as "absent").
             @if compact_layout {
                 ul id="posts-list" class="divide-y divide-gray-100"
-                    hx-ext="sse" sse-connect="/posts/stream" sse-swap="message" {
+                    hx-ext="sse" sse-connect="/posts/stream" sse-swap="message" hx-swap="none" {
                     @for post in &hot_posts {
                         @let author = post.author().ok().flatten();
                         @let sub = post.subreddit().ok().flatten();
@@ -149,7 +149,7 @@ pub async fn front_page(
                 }
             } @else {
                 ul id="posts-list" class="space-y-2"
-                    hx-ext="sse" sse-connect="/posts/stream" sse-swap="message" {
+                    hx-ext="sse" sse-connect="/posts/stream" sse-swap="message" hx-swap="none" {
                     @for post in &hot_posts {
                         @let author = post.author().ok().flatten();
                         @let sub = post.subreddit().ok().flatten();

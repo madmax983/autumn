@@ -783,7 +783,7 @@ fn render_routes_file(
     let ul_list_render = if live {
         format!(
             r#"@if page_req.page() == 1 {{
-            ul id="{plural}-list" hx-ext="sse" sse-connect="/{plural}/events" sse-swap="message" hx-swap="morph" {{
+            ul id="{plural}-list" hx-ext="sse" sse-connect="/{plural}/events" sse-swap="message" hx-swap="none" {{
                 @for row in &page_data.content {{
                     {li_render}
                 }}
@@ -2445,7 +2445,7 @@ async fn main() {
         assert!(routes.contains("autumn_web::sse::stream"));
         assert!(routes.contains("hx-ext=\"sse\""));
         assert!(routes.contains("sse-connect=\"/posts/events\""));
-        assert!(routes.contains("hx-swap=\"morph\""));
+        assert!(routes.contains("hx-swap=\"none\""));
         assert!(routes.contains("autumn_web::htmx::HTMX_JS_PATH"));
         assert!(routes.contains("autumn_web::htmx::HTMX_SSE_JS_PATH"));
         assert!(routes.contains("title: autumn_web::hooks::Patch::Set(form.title.clone())"));

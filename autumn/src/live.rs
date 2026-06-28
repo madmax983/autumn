@@ -2,9 +2,10 @@
 //!
 //! Implement [`LiveFragment`] on any `#[model]` type to opt in to
 //! `hx-swap-oob` broadcasts whenever the repository mutates that model.
-//! Then add `broadcasts = "topic"` to your `#[repository]` attribute and
-//! the generated `save`/`update`/`delete_by_id` methods will automatically
-//! publish the rendered HTML fragment to the named channel.
+//! Then add `broadcasts = true` (and optionally `topic = "tasks"`) to your
+//! `#[repository]` attribute and the generated `save`/`update`/`delete_by_id`
+//! methods will automatically publish the rendered HTML fragment to the
+//! named channel.
 //!
 //! # Example
 //!
@@ -32,7 +33,7 @@
 //!     }
 //! }
 //! // Then declare:
-//! // #[autumn_web::repository(Task, broadcasts = "tasks")]
+//! // #[autumn_web::repository(Task, broadcasts = true, topic = "tasks")]
 //! // pub trait TaskRepository {}
 //! ```
 //!
@@ -64,7 +65,8 @@
 //!
 //! Wire the matching container in your index template:
 //! ```html
-//! <ul id="tasks-list" hx-ext="sse" sse-connect="/tasks/stream" sse-swap="message"></ul>
+//! <ul id="tasks-list" hx-ext="sse" sse-connect="/tasks/stream"
+//!     sse-swap="message" hx-swap="none"></ul>
 //! ```
 //!
 //! # Note on `commit_hooks`
@@ -76,9 +78,9 @@
 
 /// Trait that connects a model to its live-broadcast HTML fragment.
 ///
-/// Implement this on your model type and declare `broadcasts = "topic"` on the
-/// `#[repository]` attribute to enable automatic OOB broadcasts after each
-/// mutation.
+/// Implement this on your model type and declare `broadcasts = true` (plus an
+/// optional `topic = "..."`) on the `#[repository]` attribute to enable
+/// automatic OOB broadcasts after each mutation.
 ///
 /// Requires the `ws`, `maud`, and `htmx` features of `autumn-web`.
 #[cfg(all(feature = "htmx", feature = "maud"))]
