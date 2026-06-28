@@ -6978,14 +6978,14 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
                             let __topic_changed = __autumn_prev_topic
                                 .as_deref()
-                                .map_or(false, |__prev| __prev != __topic.as_str());
+                                .map_or(false, |__prev| __prev != __topic);
 
                             if __topic_changed {
                                 if let ::core::option::Option::Some(ref __prev_topic) =
                                     __autumn_prev_topic
                                 {
                                     let __delete_id =
-                                        __autumn_prev_id.as_deref().unwrap_or(__id.as_str());
+                                        __autumn_prev_id.as_deref().unwrap_or(&__id);
                                     let __delete_fragment = ::autumn_web::html! {};
                                     if let ::core::result::Result::Err(__err) = __channels
                                         .broadcast()
@@ -7017,7 +7017,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                     ref __prev_id_val,
                                 ) = __autumn_prev_id
                                 {
-                                    if __prev_id_val.as_str() != __id.as_str() {
+                                    if __prev_id_val != &__id {
                                         ::autumn_web::htmx::OobSwap::Target(
                                             ::autumn_web::htmx::OobMethod::OuterHTML,
                                             ::std::format!("#{}", __prev_id_val),
@@ -7301,11 +7301,27 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 }
             };
 
-            (ic, iu, id_, inline_update_prefetch, inline_delete_prefetch,
-             ium, inline_delete_many_prefetch, idm)
+            (
+                ic,
+                iu,
+                id_,
+                inline_update_prefetch,
+                inline_delete_prefetch,
+                ium,
+                inline_delete_many_prefetch,
+                idm,
+            )
         } else {
-            (quote! {}, quote! {}, quote! {}, quote! {}, quote! {},
-             quote! {}, quote! {}, quote! {})
+            (
+                quote! {},
+                quote! {},
+                quote! {},
+                quote! {},
+                quote! {},
+                quote! {},
+                quote! {},
+                quote! {},
+            )
         };
 
     // For repos that declare `broadcasts = true` but have no commit_hooks, wire
@@ -7355,7 +7371,13 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 },
             )
         } else {
-            (save_body, update_body, delete_body, update_many_body, delete_many_body)
+            (
+                save_body,
+                update_body,
+                delete_body,
+                update_many_body,
+                delete_many_body,
+            )
         };
 
     let route_hook_registration = if commit_hooks_enabled {
