@@ -2746,6 +2746,7 @@ pub fn start_runtime(
                 config.workers,
                 config.max_attempts,
                 config.initial_backoff_ms,
+                &config.queues,
             );
             Ok(())
         }
@@ -2787,6 +2788,7 @@ pub fn start_runtime(
                 config.workers,
                 config.max_attempts,
                 config.initial_backoff_ms,
+                &config.queues,
             );
             Ok(())
         }
@@ -2930,6 +2932,7 @@ pub(crate) fn start_local_runtime(
     workers: usize,
     default_max_attempts: u32,
     default_initial_backoff_ms: u64,
+    queues_config: &crate::config::JobQueuesConfig,
 ) {
     let job_admin = default_job_admin_backend_for_state(state);
     let per_job_settings = build_per_job_settings(&jobs);
@@ -2952,12 +2955,7 @@ pub(crate) fn start_local_runtime(
     // queue declared on a job but missing from config at lowest priority so it
     // still drains. Warn loudly about those so the operator can fix the config.
     let declared_queues = collect_declared_queues(&jobs_by_name);
-    let queues_config = state
-        .extension::<crate::config::AutumnConfig>()
-        .map_or_else(crate::config::JobQueuesConfig::default, |c| {
-            c.jobs.queues.clone()
-        });
-    let (schedule, unconfigured) = QueueSchedule::effective(&queues_config, &declared_queues);
+    let (schedule, unconfigured) = QueueSchedule::effective(queues_config, &declared_queues);
     for queue in &unconfigured {
         tracing::warn!(
             queue = %queue,
@@ -7640,6 +7638,7 @@ mod tests {
             1,
             5,
             250,
+            &crate::config::JobQueuesConfig::default(),
         );
 
         let mut samples = Vec::new();
@@ -7681,6 +7680,7 @@ mod tests {
             1,
             5,
             250,
+            &crate::config::JobQueuesConfig::default(),
         );
 
         enqueue_in("delayed", serde_json::json!({}), Duration::from_millis(400))
@@ -7737,6 +7737,7 @@ mod tests {
             1,
             5,
             250,
+            &crate::config::JobQueuesConfig::default(),
         );
 
         let when = chrono::Utc::now() - chrono::TimeDelta::seconds(60);
@@ -7779,6 +7780,7 @@ mod tests {
             1,
             5,
             250,
+            &crate::config::JobQueuesConfig::default(),
         );
 
         enqueue_in(
@@ -7869,6 +7871,7 @@ mod tests {
             1,
             5,
             250,
+            &crate::config::JobQueuesConfig::default(),
         );
 
         let res = enqueue("noop", serde_json::json!({})).await;
@@ -9740,6 +9743,7 @@ mod tests {
             1,
             5,
             250,
+            &crate::config::JobQueuesConfig::default(),
         );
 
         let error = enqueue("typoed-job", serde_json::json!({}))
@@ -12816,6 +12820,7 @@ mod tests {
             1,
             5,
             250,
+            &crate::config::JobQueuesConfig::default(),
         );
 
         // Enqueue the first job with a long delay — it holds the unique lock.
@@ -13295,6 +13300,7 @@ mod uniqueness_concurrency_tests {
             2,
             5,
             250,
+            &crate::config::JobQueuesConfig::default(),
         );
 
         let payload = serde_json::json!({"invoice_id": 42});
@@ -13350,6 +13356,7 @@ mod uniqueness_concurrency_tests {
             1,
             5,
             250,
+            &crate::config::JobQueuesConfig::default(),
         );
 
         let payload = serde_json::json!({"invoice_id": 1});
@@ -13400,6 +13407,7 @@ mod uniqueness_concurrency_tests {
             1,
             5,
             250,
+            &crate::config::JobQueuesConfig::default(),
         );
 
         let failures = |state: &AppState| {
@@ -13456,6 +13464,7 @@ mod uniqueness_concurrency_tests {
             2,
             5,
             250,
+            &crate::config::JobQueuesConfig::default(),
         );
 
         let payload = serde_json::json!({"invoice_id": 3});
@@ -13509,6 +13518,7 @@ mod uniqueness_concurrency_tests {
             1,
             5,
             250,
+            &crate::config::JobQueuesConfig::default(),
         );
 
         let payload = serde_json::json!({"invoice_id": 4});
@@ -13567,6 +13577,7 @@ mod uniqueness_concurrency_tests {
             2,
             5,
             250,
+            &crate::config::JobQueuesConfig::default(),
         );
 
         enqueue(
@@ -13646,6 +13657,7 @@ mod uniqueness_concurrency_tests {
             4,
             5,
             250,
+            &crate::config::JobQueuesConfig::default(),
         );
 
         for marker in 0..6 {
@@ -13729,6 +13741,7 @@ mod uniqueness_concurrency_tests {
             4,
             5,
             250,
+            &crate::config::JobQueuesConfig::default(),
         );
 
         for marker in 0..2 {
@@ -13798,6 +13811,7 @@ mod uniqueness_concurrency_tests {
             2,
             5,
             250,
+            &crate::config::JobQueuesConfig::default(),
         );
 
         // First instance fails terminally, releasing the key.
@@ -13894,6 +13908,7 @@ mod uniqueness_concurrency_tests {
             2,
             5,
             250,
+            &crate::config::JobQueuesConfig::default(),
         );
 
         let payload = serde_json::json!({"invoice_id": 11});
@@ -13968,6 +13983,7 @@ mod uniqueness_concurrency_tests {
             2,
             5,
             250,
+            &crate::config::JobQueuesConfig::default(),
         );
 
         enqueue("limited_failing", serde_json::json!({"marker": 1}))
@@ -14024,11 +14040,6 @@ mod uniqueness_concurrency_tests {
         PRIO_URGENT_DONE.store(0, Ordering::SeqCst);
 
         let state = AppState::for_test().with_profile("dev");
-        // Strict priority: critical drains ahead of default ahead of low.
-        let mut autumn_config = crate::config::AutumnConfig::default();
-        autumn_config.jobs.queues =
-            crate::config::JobQueuesConfig::strict_list(["critical", "default", "low"]);
-        state.insert_extension(autumn_config);
         let shutdown = tokio_util::sync::CancellationToken::new();
         start_local_runtime(
             vec![
@@ -14056,6 +14067,7 @@ mod uniqueness_concurrency_tests {
             1,
             5,
             250,
+            &crate::config::JobQueuesConfig::strict_list(["critical", "default", "low"]),
         );
 
         // A flood of low-priority work, then a single critical job behind it.

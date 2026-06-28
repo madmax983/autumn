@@ -7050,11 +7050,11 @@ path = "/healthz"
     #[test]
     fn job_queues_weighted_rejects_zero_weight() {
         let err = toml::from_str::<AutumnConfig>(
-            r#"
+            r"
             [jobs.queues]
             critical = 4
             default = 0
-            "#,
+            ",
         )
         .unwrap_err()
         .to_string();
