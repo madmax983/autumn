@@ -13,8 +13,11 @@ pub fn plan_plugin(
     path: Option<&str>,
     flags: Flags,
 ) -> Result<Plan, GenerateError> {
+    let name_kebab = super::naming::snake(name).replace('_', "-");
+    let name_snake = name_kebab.replace('-', "_");
+
     let target_dir = path.map_or_else(
-        || project_root.join(format!("autumn-{name}-plugin")),
+        || project_root.join(format!("autumn-{name_kebab}-plugin")),
         |p| project_root.join(p),
     );
 
@@ -41,7 +44,7 @@ pub fn plan_plugin(
 
     let cargo_toml_content = format!(
         r#"[package]
-name = "autumn-{name}-plugin"
+name = "autumn-{name_kebab}-plugin"
 version = "0.1.0"
 edition = "2024"
 
@@ -53,7 +56,7 @@ serde = {{ version = "1", features = ["derive"] }}
 
     let struct_name = format!("{}Plugin", super::naming::pascal(&name.replace('-', "_")));
     let lib_rs_content = format!(
-        r#"//! autumn-{name}-plugin
+        r#"//! autumn-{name_kebab}-plugin
 
 use std::borrow::Cow;
 
@@ -77,7 +80,7 @@ impl Default for {struct_name} {{
 
 impl Plugin for {struct_name} {{
     fn name(&self) -> Cow<'static, str> {{
-        Cow::Borrowed("autumn-{name}-plugin")
+        Cow::Borrowed("autumn-{name_kebab}-plugin")
     }}
 
     fn build(self, app: AppBuilder) -> AppBuilder {{
@@ -95,9 +98,8 @@ impl Plugin for {struct_name} {{
 "#
     );
 
-    let name_snake = name.replace('-', "_");
     let readme_content = format!(
-        r#"# autumn-{name}-plugin
+        r#"# autumn-{name_kebab}-plugin
 
 An Autumn plugin for {name}.
 
@@ -107,7 +109,7 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-autumn-{name}-plugin = {{ version = "0.1.0" }}
+autumn-{name_kebab}-plugin = {{ version = "0.1.0" }}
 ```
 
 ## Setup
@@ -140,9 +142,9 @@ mod conformance_tests {{
         let routes = vec![
             RouteInfo {{
                 method: "GET".to_owned(),
-                path: "/autumn-{name}-plugin".to_owned(),
+                path: "/autumn-{name_kebab}-plugin".to_owned(),
                 handler: "autumn_{name_snake}_plugin::index".to_owned(),
-                source: RouteSource::Plugin("autumn-{name}-plugin".to_owned()),
+                source: RouteSource::Plugin("autumn-{name_kebab}-plugin".to_owned()),
                 middleware: vec![],
                 api_version: None,
                 status: None,
@@ -150,9 +152,9 @@ mod conformance_tests {{
             }},
         ];
 
-        let config = ConformanceConfig::new("autumn-{name}-plugin")
-            .prefix("/autumn-{name}-plugin")
-            .sensitive_route("/autumn-{name}-plugin", "Role: admin required");
+        let config = ConformanceConfig::new("autumn-{name_kebab}-plugin")
+            .prefix("/autumn-{name_kebab}-plugin")
+            .sensitive_route("/autumn-{name_kebab}-plugin", "Role: admin required");
 
         let report = run_conformance(&config, &routes);
         assert!(
@@ -187,7 +189,7 @@ mod tests {
         let project_root = temp_dir.path();
         let target_dir = project_root.join("autumn-foo-plugin");
 
-        let plan = plan_plugin(project_root, "foo", None, Flags::default()).unwrap();
+        let plan = plan_plugin(project_root, "Foo", None, Flags::default()).unwrap();
 
         // Verify Cargo.toml, src/lib.rs, README.md, and tests/conformance.rs are planned for creation
         let paths: std::collections::HashSet<PathBuf> = plan
@@ -211,6 +213,41 @@ mod tests {
         assert!(
             paths.contains(&target_dir.join("tests/conformance.rs")),
             "Should plan tests/conformance.rs"
+        );
+
+        // Verify crate name and struct name
+        let cargo_action = plan
+            .actions
+            .iter()
+            .find(|a| a.path() == target_dir.join("Cargo.toml"))
+            .unwrap();
+        let super::super::emit::Action::Create {
+            contents: cargo_content,
+            ..
+        } = cargo_action
+        else {
+            panic!("Expected Create action");
+        };
+        assert!(
+            cargo_content.contains("name = \"autumn-foo-plugin\""),
+            "Expected Cargo.toml to contain the lowercase kebab-case crate name"
+        );
+
+        let lib_action = plan
+            .actions
+            .iter()
+            .find(|a| a.path() == target_dir.join("src/lib.rs"))
+            .unwrap();
+        let super::super::emit::Action::Create {
+            contents: lib_content,
+            ..
+        } = lib_action
+        else {
+            panic!("Expected Create action");
+        };
+        assert!(
+            lib_content.contains("pub struct FooPlugin;"),
+            "Expected src/lib.rs to define FooPlugin"
         );
     }
 
