@@ -112,6 +112,10 @@ pub(crate) fn htmx_is_vendored() -> bool {
     load_vendor_manifest().is_some_and(|m| m.assets.contains_key("htmx"))
 }
 
+pub(crate) fn htmx_sse_is_vendored() -> bool {
+    load_vendor_manifest().is_some_and(|m| m.assets.contains_key("htmx-ext-sse"))
+}
+
 #[cfg(feature = "embed-assets")]
 fn load_embedded_vendor_manifest() -> Option<VendorManifest> {
     EMBEDDED_STATIC

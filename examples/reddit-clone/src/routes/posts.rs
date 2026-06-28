@@ -111,7 +111,8 @@ pub async fn front_page(
                         @let author = post.author().ok().flatten();
                         @let sub = post.subreddit().ok().flatten();
                         @if let Some(sub) = sub {
-                            div class="flex items-center gap-3 py-2 px-2 hover:bg-gray-50 transition-colors" {
+                            div id=(format!("post-{}", post.id))
+                                class="flex items-center gap-3 py-2 px-2 hover:bg-gray-50 transition-colors" {
                                 span class="text-sm font-semibold text-gray-500 w-8 text-right shrink-0" {
                                     (post.score)
                                 }
@@ -153,7 +154,8 @@ pub async fn front_page(
                         @let author = post.author().ok().flatten();
                         @let sub = post.subreddit().ok().flatten();
                         @if let Some(sub) = sub {
-                            div class="bg-white rounded-lg shadow-sm border border-gray-200 \
+                            div id=(format!("post-{}", post.id))
+                                class="bg-white rounded-lg shadow-sm border border-gray-200 \
                                        hover:border-orange-300 transition-colors" {
                                 div class="flex items-start gap-3 p-4" {
                                     (vote_controls(post.id, post.score))

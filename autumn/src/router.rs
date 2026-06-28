@@ -1046,7 +1046,9 @@ fn collect_claimed_get_paths(
         claimed.insert(crate::htmx::HTMX_CSRF_JS_PATH.to_owned());
         claimed.insert(crate::htmx::AUTUMN_WIDGETS_JS_PATH.to_owned());
         claimed.insert(crate::htmx::IDIOMORPH_JS_PATH.to_owned());
-        claimed.insert(crate::htmx::HTMX_SSE_JS_PATH.to_owned());
+        if !crate::assets::htmx_sse_is_vendored() {
+            claimed.insert(crate::htmx::HTMX_SSE_JS_PATH.to_owned());
+        }
     }
     // Dev live-reload endpoints are only mounted when the env vars
     // that enable them are set, but reserving the paths regardless
@@ -1426,10 +1428,23 @@ fn mount_framework_routes(
             crate::htmx::IDIOMORPH_JS_PATH,
             axum::routing::get(idiomorph_handler),
         );
-        router = router.route(
-            crate::htmx::HTMX_SSE_JS_PATH,
-            axum::routing::get(htmx_sse_handler),
-        );
+        if crate::assets::htmx_sse_is_vendored() {
+            tracing::debug!(
+                path = crate::htmx::HTMX_SSE_JS_PATH,
+                "htmx-ext-sse vendored via `autumn assets`; built-in handler skipped, ServeDir serves it"
+            );
+        } else {
+            router = router.route(
+                crate::htmx::HTMX_SSE_JS_PATH,
+                axum::routing::get(htmx_sse_handler),
+            );
+            tracing::debug!(
+                method = "GET",
+                path = crate::htmx::HTMX_SSE_JS_PATH,
+                name = "htmx SSE extension",
+                "Mounted route"
+            );
+        }
         tracing::debug!(
             method = "GET",
             path = crate::htmx::HTMX_CSRF_JS_PATH,
@@ -1446,12 +1461,6 @@ fn mount_framework_routes(
             method = "GET",
             path = crate::htmx::IDIOMORPH_JS_PATH,
             name = "idiomorph DOM morphing",
-            "Mounted route"
-        );
-        tracing::debug!(
-            method = "GET",
-            path = crate::htmx::HTMX_SSE_JS_PATH,
-            name = "htmx SSE extension",
             "Mounted route"
         );
     }
