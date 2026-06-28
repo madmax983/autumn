@@ -6126,11 +6126,14 @@ async fn run_startup_migrations(
                 );
             }
             // The shard-map guard table also lives on the control plane only.
+            // Always allow auto-applying this framework-internal table: the guard
+            // depends on it existing and returns a hard error when it's missing,
+            // so skipping the migration in production would block startup.
             if shard_map_migration_required {
                 crate::migrate::auto_migrate(
                     &url,
                     profile.as_deref(),
-                    auto_in_prod,
+                    true,
                     &crate::sharding::SHARD_MAP_MIGRATIONS,
                     "control",
                 );
@@ -6263,7 +6266,6 @@ struct ShardMapRow {
 /// Returns a `String` error when the computed auto-split map differs from the
 /// stored map, indicating a topology change that would silently misroute data.
 #[cfg(feature = "db")]
-#[cfg_attr(not(feature = "test-support"), allow(dead_code))]
 pub async fn run_shard_map_guard(
     control_pool: &deadpool::managed::Pool<diesel_async::pooled_connection::AsyncDieselConnectionManager<diesel_async::AsyncPgConnection>>,
     computed: &[crate::config::ShardSlotAssignment],
@@ -6299,12 +6301,11 @@ pub async fn run_shard_map_guard(
     {
         Ok(rows) => rows,
         Err(e) => {
-            tracing::warn!(
-                "shard-map guard could not read _autumn_shard_map ({e}); \
-                 skipping slot-map validation — run `autumn migrate` to create \
-                 the control schema"
-            );
-            return Ok(());
+            return Err(format!(
+                "shard-map guard could not read _autumn_shard_map: {e} — \
+                 run `autumn migrate` to create the control schema before \
+                 starting with auto-split shards"
+            ));
         }
     };
 
@@ -6324,19 +6325,31 @@ pub async fn run_shard_map_guard(
     crate::config::check_stored_slot_map(auto_split, computed, stored_opt)?;
 
     // First boot: persist the current map so future boots can compare against it.
-    if stored_opt.is_none() {
-        for assignment in computed {
-            diesel::sql_query(
-                "INSERT INTO _autumn_shard_map (shard_name, slots) VALUES ($1, $2) \
-                 ON CONFLICT (shard_name) DO UPDATE \
-                 SET slots = EXCLUDED.slots, updated_at = NOW()",
-            )
-            .bind::<diesel::sql_types::Text, _>(&assignment.name)
-            .bind::<diesel::sql_types::Text, _>(&assignment.ranges)
-            .execute(&mut conn)
-            .await
-            .map_err(|e| format!("shard-map guard could not persist map: {e}"))?;
-        }
+    // Wrapped in a transaction so a mid-loop failure leaves no partial rows —
+    // partial rows would cause a spurious mismatch error on the next boot attempt.
+    if stored.is_empty() {
+        use diesel_async::AsyncConnection as _;
+        use scoped_futures::ScopedFutureExt as _;
+        let assignments: Vec<_> = computed.to_vec();
+        conn.transaction::<(), diesel::result::Error, _>(move |conn| {
+            async move {
+                for assignment in &assignments {
+                    diesel::sql_query(
+                        "INSERT INTO _autumn_shard_map (shard_name, slots) VALUES ($1, $2) \
+                         ON CONFLICT (shard_name) DO UPDATE \
+                         SET slots = EXCLUDED.slots, updated_at = NOW()",
+                    )
+                    .bind::<diesel::sql_types::Text, _>(&assignment.name)
+                    .bind::<diesel::sql_types::Text, _>(&assignment.ranges)
+                    .execute(conn)
+                    .await?;
+                }
+                Ok(())
+            }
+            .scope_boxed()
+        })
+        .await
+        .map_err(|e| format!("shard-map guard could not persist map: {e}"))?;
     }
 
     Ok(())

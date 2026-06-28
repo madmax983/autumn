@@ -13,12 +13,14 @@
 
 #![cfg(feature = "db")]
 
+#[cfg(feature = "test-support")]
 use autumn_web::config::{DatabaseConfig, ShardConfig};
 #[cfg(feature = "test-support")]
 use autumn_web::test::TestDb;
 #[cfg(feature = "test-support")]
 use diesel_async::RunQueryDsl;
 
+#[cfg(feature = "test-support")]
 fn two_shard_config() -> DatabaseConfig {
     DatabaseConfig {
         connect_timeout_secs: 1,
@@ -34,6 +36,7 @@ fn two_shard_config() -> DatabaseConfig {
     }
 }
 
+#[cfg(feature = "test-support")]
 fn three_shard_config() -> DatabaseConfig {
     DatabaseConfig {
         connect_timeout_secs: 1,

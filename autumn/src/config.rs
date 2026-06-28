@@ -3876,13 +3876,17 @@ pub fn check_stored_slot_map(
     if to_map(computed) == to_map(stored) {
         return Ok(());
     }
+    let computed_names: Vec<&str> = computed.iter().map(|a| a.name.as_str()).collect();
+    let stored_names: Vec<&str> = stored.iter().map(|a| a.name.as_str()).collect();
     Err(format!(
-        "shard slot map mismatch — auto-split with {} shards produces a different map \
-         than the stored map ({} shards). Set explicit [[database.shards]] slot ranges \
-         matching the stored map, then move data between shards deliberately before \
-         changing the topology.",
+        "shard slot map mismatch — auto-split with {} shards ({}) produces a different \
+         map than the stored map ({} shards: {}). Set explicit [[database.shards]] slot \
+         ranges matching the stored map, then move data between shards deliberately \
+         before changing the topology.",
         computed.len(),
+        computed_names.join(", "),
         stored.len(),
+        stored_names.join(", "),
     ))
 }
 
@@ -8870,5 +8874,7 @@ redirect_uri = "http://localhost:3000/auth/github/callback"
         let err = check_stored_slot_map(true, &computed, Some(&stored))
             .expect_err("renamed shards must be detected as mismatch");
         assert!(err.contains("shard slot map mismatch"), "message: {err}");
+        assert!(err.contains("alpha"), "message must name computed shards: {err}");
+        assert!(err.contains("s0"), "message must name stored shards: {err}");
     }
 }
