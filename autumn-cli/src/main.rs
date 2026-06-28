@@ -2591,12 +2591,45 @@ fn run_generate_command(cmd: GenerateCommands) {
             match generate::plugin::plan_plugin(
                 &cwd,
                 &name,
-                path.as_deref(),
+                path.as_deref().map(std::path::Path::new),
                 generate::Flags { dry_run, force },
-            )
-            .and_then(|p| p.execute(generate::Flags { dry_run, force }))
-            {
-                Ok(()) => {}
+            ) {
+                Ok(plugin_plan) => {
+                    match plugin_plan.plan.execute(generate::Flags { dry_run, force }) {
+                        Ok(()) => {
+                            if !dry_run {
+                                println!("\nNext steps:");
+                                println!(
+                                    "  1. Add the plugin to your workspace members in `Cargo.toml`:"
+                                );
+                                println!("       [workspace]");
+                                println!("       members = [");
+                                println!("           # ...,");
+                                println!(
+                                    "           \"autumn-{}-plugin\",",
+                                    plugin_plan.name_kebab
+                                );
+                                println!("       ]");
+                                println!(
+                                    "  2. Register the plugin with your host app in `src/main.rs`:"
+                                );
+                                println!(
+                                    "       app.plugin(autumn_{}_plugin::{}::new())",
+                                    plugin_plan.name_snake, plugin_plan.struct_name
+                                );
+                                println!("  3. Run the conformance test to verify:");
+                                println!(
+                                    "       cargo test -p autumn-{}-plugin\n",
+                                    plugin_plan.name_kebab
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("Error: {e}");
+                            std::process::exit(1);
+                        }
+                    }
+                }
                 Err(e) => {
                     eprintln!("Error: {e}");
                     std::process::exit(1);
