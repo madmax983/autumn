@@ -6891,7 +6891,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 if let (
                     ::core::result::Result::Ok(__rec),
                     ::core::option::Option::Some(__bcast),
-                    ::core::option::Option::Some(ref __topic),
+                    ::core::option::Option::Some(__topic),
                 ) = (&__autumn_bcast_result, &self.__autumn_broadcast, &__autumn_bcast_topic)
                 {
                     let __fragment = <#model_name as ::autumn_web::live::LiveFragment>::render_fragment(__rec);
@@ -6911,7 +6911,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 if let (
                     ::core::result::Result::Ok(__rec),
                     ::core::option::Option::Some(__bcast),
-                    ::core::option::Option::Some(ref __topic),
+                    ::core::option::Option::Some(__topic),
                 ) = (&__autumn_bcast_result, &self.__autumn_broadcast, &__autumn_bcast_topic)
                 {
                     let __fragment = <#model_name as ::autumn_web::live::LiveFragment>::render_fragment(__rec);
@@ -6936,7 +6936,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 if let (
                     ::core::result::Result::Ok(()),
                     ::core::option::Option::Some(__bcast),
-                    ::core::option::Option::Some(ref __topic),
+                    ::core::option::Option::Some(__topic),
                 ) = (&__autumn_bcast_result, &self.__autumn_broadcast, &__autumn_bcast_topic)
                 {
                     let __dom_id = <#model_name as ::autumn_web::live::LiveFragment>::dom_id_for(__autumn_bcast_id);
