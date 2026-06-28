@@ -193,7 +193,7 @@ impl QueueSchedule {
     /// A per-worker cursor producing each claim iteration's attempt order.
     pub(crate) fn cursor(&self) -> QueueCursor {
         QueueCursor {
-            names: self.queues.iter().map(|(n, _)| n.clone()).collect(),
+            names: Arc::new(self.queues.iter().map(|(n, _)| n.clone()).collect()),
             weights: self.queues.iter().map(|(_, w)| *w).collect(),
             current: vec![0_i64; self.queues.len()],
             strict: self.strict,
@@ -206,7 +206,7 @@ impl QueueSchedule {
 /// so each queue is served in proportion to its weight and none is ever starved.
 #[derive(Debug, Clone)]
 pub(crate) struct QueueCursor {
-    names: Vec<String>,
+    names: Arc<Vec<String>>,
     weights: Vec<u32>,
     current: Vec<i64>,
     strict: bool,
@@ -216,9 +216,9 @@ impl QueueCursor {
     /// Ordered queue names to attempt for this claim iteration. The first entry
     /// is the queue to serve now; the rest follow (so a worker never idles while
     /// any queue has work).
-    pub(crate) fn next_order(&mut self) -> Vec<String> {
+    pub(crate) fn next_order(&mut self) -> Arc<Vec<String>> {
         if self.strict || self.names.len() <= 1 {
-            return self.names.clone();
+            return Arc::clone(&self.names);
         }
         // Smooth weighted round-robin (nginx-style): every queue is the first
         // choice exactly `weight` times per cycle of length `sum(weights)`.
@@ -237,7 +237,7 @@ impl QueueCursor {
         let mut order = Vec::with_capacity(self.names.len());
         order.push(self.names[best].clone());
         order.extend(rest.into_iter().map(|i| self.names[i].clone()));
-        order
+        Arc::new(order)
     }
 }
 
@@ -2466,7 +2466,6 @@ impl JobClient {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::too_many_arguments)]
     async fn enqueue_durable(
         &self,
         id: String,
@@ -3055,6 +3054,8 @@ fn collect_declared_queues(jobs_by_name: &Arc<RwLock<HashMap<String, JobInfo>>>)
     queues
 }
 
+const LOCAL_QUEUE_WARN_THRESHOLD: usize = 10_000;
+
 /// Shared, priority-ordered job buffer for the in-process backend.
 ///
 /// Jobs are bucketed per named queue; workers pop the highest-priority
@@ -3073,12 +3074,21 @@ impl LocalQueueBuffer {
         }
     }
 
+    #[allow(clippy::significant_drop_tightening)]
     fn push(&self, job: QueuedJob) {
         {
             let mut map = self.inner.lock().expect("local job buffer lock poisoned");
-            map.entry(normalize_queue_name(&job.queue))
-                .or_default()
-                .push_back(job);
+            let bucket = map.entry(normalize_queue_name(&job.queue)).or_default();
+            if bucket.len() == LOCAL_QUEUE_WARN_THRESHOLD {
+                tracing::warn!(
+                    queue = %job.queue,
+                    threshold = LOCAL_QUEUE_WARN_THRESHOLD,
+                    "local job queue has grown past the warning threshold; \
+                     memory use is unbounded — consider reducing enqueue rate or \
+                     switching to the Redis or Postgres backend"
+                );
+            }
+            bucket.push_back(job);
         }
         self.notify.notify_one();
     }
@@ -3636,7 +3646,6 @@ struct RedisJobAdminBackend {
 
 #[cfg(feature = "redis")]
 impl RedisJobAdminBackend {
-    #[allow(clippy::too_many_arguments)]
     #[allow(clippy::too_many_arguments)]
     fn new(
         connection: redis::aio::ConnectionManager,
@@ -5776,6 +5785,29 @@ fn pg_retry_delay_ms(initial_backoff_ms: i64, attempt: i32) -> i64 {
     initial_backoff_ms.saturating_mul(2_i64.saturating_pow(exp))
 }
 
+#[cfg(feature = "db")]
+async fn pg_evict_expired_unique_key(
+    conn: &mut diesel_async::AsyncPgConnection,
+    name: &str,
+    key: &str,
+    ttl_ms: i64,
+) {
+    use diesel_async::RunQueryDsl as _;
+    let _ = diesel::sql_query(
+        "UPDATE autumn_jobs \
+         SET unique_key = NULL \
+         WHERE name = $1 AND unique_key = $2 \
+           AND unique_window = 'ttl' \
+           AND enqueued_at <= NOW() - ($3::BIGINT * INTERVAL '1 millisecond') \
+           AND status IN ('enqueued', 'running')",
+    )
+    .bind::<diesel::sql_types::Text, _>(name)
+    .bind::<diesel::sql_types::Text, _>(key)
+    .bind::<diesel::sql_types::BigInt, _>(ttl_ms)
+    .execute(conn)
+    .await;
+}
+
 /// Shared INSERT for new job rows, with uniqueness dedup applied in SQL.
 ///
 /// The `WHERE ... NOT EXISTS` guard handles the common dedup paths (an
@@ -5840,19 +5872,7 @@ async fn pg_insert_job(
     // the partial unique index (idx_autumn_jobs_unique_inflight) and cause the
     // ON CONFLICT DO NOTHING to silently drop a legitimate replacement enqueue.
     if let (Some(ttl), Some(key)) = (unique_ttl_ms, &constraints.unique_key) {
-        let _ = diesel::sql_query(
-            "UPDATE autumn_jobs \
-             SET unique_key = NULL \
-             WHERE name = $1 AND unique_key = $2 \
-               AND unique_window = 'ttl' \
-               AND enqueued_at <= NOW() - ($3::BIGINT * INTERVAL '1 millisecond') \
-               AND status IN ('enqueued', 'running')",
-        )
-        .bind::<diesel::sql_types::Text, _>(name)
-        .bind::<diesel::sql_types::Text, _>(key.as_str())
-        .bind::<diesel::sql_types::BigInt, _>(ttl)
-        .execute(conn)
-        .await;
+        pg_evict_expired_unique_key(conn, name, key.as_str(), ttl).await;
     }
 
     #[cfg(not(feature = "telemetry-otlp"))]
@@ -14086,7 +14106,14 @@ mod queue_schedule_tests {
         assert!(schedule.is_strict());
         let mut cursor = schedule.cursor();
         for _ in 0..10 {
-            assert_eq!(cursor.next_order(), vec!["critical", "default", "low"]);
+            assert_eq!(
+                cursor.next_order().as_slice(),
+                [
+                    "critical".to_string(),
+                    "default".to_string(),
+                    "low".to_string()
+                ]
+            );
         }
     }
 

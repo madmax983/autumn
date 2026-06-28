@@ -1735,8 +1735,7 @@ pub struct JobQueue {
 /// Accepts **either** a TOML array (strict priority, in order) **or** a TOML
 /// table of `name = weight` (weighted, fair). Empty or unset falls back to a
 /// single `default` queue so an app that doesn't opt in behaves exactly as today.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(from = "JobQueuesRepr")]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JobQueuesConfig {
     /// Configured queues, highest priority first.
     pub queues: Vec<JobQueue>,
@@ -1814,20 +1813,41 @@ impl JobQueuesConfig {
     }
 }
 
-/// Serde shape for `[jobs] queues`: array (strict) or `name = weight` table.
-#[derive(Deserialize)]
-#[serde(untagged)]
-enum JobQueuesRepr {
-    List(Vec<String>),
-    Weighted(std::collections::BTreeMap<String, u32>),
-}
+impl<'de> serde::Deserialize<'de> for JobQueuesConfig {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        use serde::de::{MapAccess, SeqAccess, Visitor};
+        use std::fmt;
 
-impl From<JobQueuesRepr> for JobQueuesConfig {
-    fn from(repr: JobQueuesRepr) -> Self {
-        match repr {
-            JobQueuesRepr::List(names) => Self::strict_list(names),
-            JobQueuesRepr::Weighted(map) => Self::weighted(map),
+        struct JobQueuesVisitor;
+
+        impl<'de> Visitor<'de> for JobQueuesVisitor {
+            type Value = JobQueuesConfig;
+
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str(
+                    "an ordered list of queue names (e.g. queues = [\"critical\", \"default\"]) \
+                     or a weight table (e.g. [jobs.queues] critical = 4, default = 1)",
+                )
+            }
+
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+                let mut names = Vec::new();
+                while let Some(name) = seq.next_element::<String>()? {
+                    names.push(name);
+                }
+                Ok(JobQueuesConfig::strict_list(names))
+            }
+
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+                let mut entries: Vec<(String, u32)> = Vec::new();
+                while let Some((k, v)) = map.next_entry::<String, u32>()? {
+                    entries.push((k, v));
+                }
+                Ok(JobQueuesConfig::weighted(entries))
+            }
         }
+
+        d.deserialize_any(JobQueuesVisitor)
     }
 }
 
