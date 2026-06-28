@@ -1661,6 +1661,7 @@ enum GenerateCommands {
     ///
     ///   autumn generate plugin my-plugin
     ///   autumn generate plugin my-plugin --path custom/path
+    #[command(verbatim_doc_comment)]
     Plugin {
         /// Plugin name (`snake_case` or `kebab-case`, e.g. `admin` or `my-plugin`).
         name: String,
@@ -5213,6 +5214,24 @@ mod tests {
         assert_eq!(path.as_deref(), Some("custom-path"));
         assert!(dry_run);
         assert!(force);
+    }
+
+    #[test]
+    fn parse_generate_plugin_defaults() {
+        let cli = Cli::try_parse_from(["autumn", "generate", "plugin", "foo"]).unwrap();
+        let Commands::Generate(GenerateCommands::Plugin {
+            name,
+            path,
+            dry_run,
+            force,
+        }) = cli.command
+        else {
+            panic!("expected Plugin variant");
+        };
+        assert_eq!(name, "foo");
+        assert!(path.is_none());
+        assert!(!dry_run);
+        assert!(!force);
     }
 
     #[test]
