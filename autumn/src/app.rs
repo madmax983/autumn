@@ -6277,19 +6277,14 @@ pub async fn run_shard_map_guard(
         return Ok(());
     }
 
-    // If the control pool cannot be acquired (e.g. no real DB in unit tests or
-    // a cold-start where the DB is not yet reachable), we cannot read the stored
-    // map. This is equivalent to "no stored map" — there is nothing to compare
-    // against, so the guard is inert and startup proceeds normally.
     let mut conn = match control_pool.get().await {
         Ok(conn) => conn,
         Err(e) => {
-            tracing::warn!(
-                "shard-map guard could not acquire a control connection ({e}); \
-                 skipping slot-map validation — ensure the control database is \
-                 reachable to enforce topology change detection"
-            );
-            return Ok(());
+            return Err(format!(
+                "shard-map guard could not acquire a control connection: {e} — \
+                 ensure the control database is reachable to enforce topology \
+                 change detection"
+            ));
         }
     };
 
@@ -7692,7 +7687,7 @@ mod tests {
             crate::config::ShardConfig {
                 name: "shard0".to_owned(),
                 primary_url: "postgres://localhost/shard0".to_owned(),
-                slots: None,
+                slots: Some(vec![crate::config::SlotSpec::Range("0-8191".to_owned())]),
                 replica_url: None,
                 primary_pool_size: Some(3),
                 replica_pool_size: None,
@@ -7701,7 +7696,7 @@ mod tests {
             crate::config::ShardConfig {
                 name: "shard1".to_owned(),
                 primary_url: "postgres://localhost/shard1".to_owned(),
-                slots: None,
+                slots: Some(vec![crate::config::SlotSpec::Range("8192-16383".to_owned())]),
                 replica_url: Some("postgres://localhost/shard1_ro".to_owned()),
                 primary_pool_size: None,
                 replica_pool_size: Some(2),
