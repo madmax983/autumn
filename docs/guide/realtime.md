@@ -236,27 +236,126 @@ commit hooks, they fire inline after the mutation in the same async task.
 
 ---
 
-## `--live` Scaffold
+## Live scaffold — the closest thing to Phoenix LiveView
 
-`autumn generate scaffold` accepts a `--live` flag that wires up a
-complete SSE broadcast pipeline for you:
+`autumn generate scaffold` with `--live` and `--live-validation` gives you
+the same two headline features that make Phoenix LiveView compelling:
+real-time DOM updates pushed from the server, and inline field validation
+without a page reload — all without a persistent socket or a client-side
+state machine.
+
+### The one-liner
 
 ```sh
-autumn generate scaffold Post title:String body:String --live
+autumn generate scaffold Post title:String body:String \
+    --live \
+    --live-validation \
+    --validate title=length(min=1,max=200) \
+    --validate body=length(min=1)
 ```
 
-This emits:
-- A `LiveFragment` impl on the model.
-- `#[repository(Post, broadcasts = true)]` on the generated repository.
-- A `/posts/stream` SSE route.
-- An index template whose list container uses `hx-ext="sse"` with
-  `hx-swap="none"` so OOB fragments patch rows without clearing the list.
-- The idiomorph `<script>` in the layout and `hx-ext="morph"` on `<body>`
-  for smooth DOM morphing on full-page navigations.
+Open two browser tabs on the index. Create, edit, or delete a post in one
+tab — the other tab updates itself via SSE without polling or a full reload.
+Type in the create/edit form — error messages appear inline, per field, on
+`change`, driven by the same server-side rules that guard the actual save.
 
-Combine `--live` with `--live-validation` to also generate per-field
-`hx-post` validators that run server-side rules on `change` events and
-render inline error spans.
+### What `--live` generates
+
+- A `LiveFragment` impl on the model (see above).
+- `#[repository(Post, broadcasts = true)]` on the repository — save, update,
+  and delete automatically publish OOB htmx fragments to connected clients.
+- A `/posts/stream` SSE route.
+- The idiomorph `<script>` in the layout (`IDIOMORPH_JS_PATH`) and
+  `hx-ext="morph"` on `<body>` for smooth morphing navigations.
+- An index list container wired to the SSE stream:
+
+```html
+<ul id="posts-list"
+    hx-ext="sse"
+    sse-connect="/posts/stream"
+    sse-swap="message"
+    hx-swap="none">
+```
+
+`hx-swap="none"` is intentional — it prevents htmx from running an
+in-band innerHTML swap (which would clear the list) when an SSE message
+arrives. The OOB attributes on each fragment handle their own targeted
+patch.
+
+### What `--live-validation` adds
+
+This is the key feature. For every field named in `--validate`, the
+scaffold generates three things working together:
+
+**1. `hx-*` attributes on each form input** (both create and edit forms):
+
+```html
+<input name="title" type="text" value=""
+       hx-post="/posts/validate/title"
+       hx-trigger="change"
+       hx-target="#title-error"
+       hx-swap="outerHTML">
+```
+
+On every `change` event the browser POSTs the current field value to a
+dedicated validation endpoint. No JavaScript required.
+
+**2. An error span slot** adjacent to each input:
+
+```html
+<span id="title-error"></span>
+```
+
+htmx's `hx-swap="outerHTML"` replaces this span with whatever the server
+returns — either a populated error span or an empty one on success.
+
+**3. A validation handler** per field that runs the actual declared rules:
+
+```rust
+#[post("/posts/validate/title")]
+pub async fn validate_title(body: Bytes) -> Markup {
+    let value = /* parse form body */;
+    let error: Option<&str> = if value.is_empty() {
+        Some("required")
+    } else if value.chars().count() > 200 {
+        Some("must be at most 200 characters")
+    } else {
+        None
+    };
+    html! {
+        span id="title-error" {
+            @if let Some(msg) = error {
+                span style="color:red" { (msg) }
+            }
+        }
+    }
+}
+```
+
+The rules are the same ones the model's `#[validate]` attributes enforce on
+save — they live in one place (the `--validate` flags) and the scaffold
+emits them consistently in both the model and the runtime handler. Users see
+feedback at `change` time; the server rejects invalid saves anyway; no
+duplication of logic.
+
+### Supported validation rules
+
+| Rule | Flag syntax | Behaviour |
+|------|-------------|-----------|
+| Required (non-nullable) | automatic | Empty string → `"required"` |
+| Min/max length | `length(min=1,max=200)` | Character count check |
+| Valid URL | `url` | `url::Url::parse` |
+| Valid email | `email` | `@` + domain dot check |
+
+### Comparison with Phoenix LiveView
+
+Phoenix LiveView achieves inline validation through a persistent WebSocket
+and a stateful server-side process that re-renders the form on each event.
+Autumn's approach is intentionally stateless — each validation POST is a
+standalone HTTP request that returns a single fragment. There is no
+per-connection server process to crash, hibernate, or scale; the tradeoff
+is that multi-field cross-validation (e.g. "password matches confirm")
+requires a small custom handler rather than a single `handle_event`.
 
 ---
 
