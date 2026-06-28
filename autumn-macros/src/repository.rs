@@ -1499,7 +1499,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     let dom_id = quote! { <#model_name as ::autumn_web::live::LiveFragment>::dom_id(__record_ref) };
                     (
                         quote! { <#model_name as ::autumn_web::live::LiveFragment>::render_fragment(__record_ref) },
-                        quote! { <#model_name as ::autumn_web::live::LiveFragment>::dom_id(__record_ref) },
+                        quote! { #container_expr.to_string() },
                         quote! { <#model_name as ::autumn_web::live::LiveFragment>::insert_swap() },
                         dom_id.clone(),
                         dom_id,
@@ -1558,7 +1558,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         }
 
                         let (__target_id, __swap_strategy) = if __topic_changed {
-                            (#container_expr, ::autumn_web::htmx::OobSwap::BeforeEnd)
+                            (#container_expr, <#model_name as ::autumn_web::live::LiveFragment>::insert_swap())
                         } else {
                             let __strategy = if let ::core::option::Option::Some(__prev_id_val) = __prev_id {
                                 if __prev_id_val != &__id {
@@ -6864,9 +6864,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                             __record_ref
                         )
                     },
-                    quote! {
-                        <#model_name as ::autumn_web::live::LiveFragment>::dom_id(__record_ref)
-                    },
+                    quote! { #container_expr_outer.to_string() },
                     quote! {
                         <#model_name as ::autumn_web::live::LiveFragment>::insert_swap()
                     },
@@ -7020,7 +7018,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         ) = if __topic_changed {
                             (
                                 #container_expr_outer.to_string(),
-                                ::autumn_web::htmx::OobSwap::BeforeEnd,
+                                <#model_name as ::autumn_web::live::LiveFragment>::insert_swap(),
                             )
                         } else {
                             let __strategy = if let ::core::option::Option::Some(
