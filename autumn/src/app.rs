@@ -6256,7 +6256,7 @@ struct ShardMapRow {
 /// This is the DB-backed core of the boot-time guard: it reads existing rows,
 /// delegates to the pure [`crate::config::check_stored_slot_map`] for the
 /// comparison, and persists the map on first boot (no rows yet). Factored out
-/// of [`enforce_shard_map_guard`] so integration tests can drive it directly
+/// of `enforce_shard_map_guard` so integration tests can drive it directly
 /// without a full `AutumnConfig`.
 ///
 /// # Errors
