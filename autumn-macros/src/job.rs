@@ -37,8 +37,15 @@ fn parse_basic_arg(
     } else if meta.path.is_ident("queue") {
         let value: LitStr = meta.value()?.parse()?;
         let queue = value.value().trim().to_string();
-        if queue.is_empty() {
-            return Err(meta.error("queue must name a non-empty queue, e.g. \"critical\""));
+        if queue.is_empty()
+            || !queue
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
+        {
+            return Err(meta.error(
+                "queue name must be non-empty and contain only lowercase letters, digits, \
+                 underscores, or hyphens (e.g. \"critical\", \"email-low\")",
+            ));
         }
         result.queue = Some(queue);
     } else {

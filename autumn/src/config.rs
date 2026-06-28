@@ -1832,7 +1832,13 @@ impl<'de> serde::Deserialize<'de> for JobQueuesConfig {
 
             fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
                 let mut names = Vec::new();
+                let mut seen = std::collections::HashSet::new();
                 while let Some(name) = seq.next_element::<String>()? {
+                    if !seen.insert(name.clone()) {
+                        return Err(serde::de::Error::custom(format!(
+                            "duplicate queue name '{name}' in queues list"
+                        )));
+                    }
                     names.push(name);
                 }
                 Ok(JobQueuesConfig::strict_list(names))
@@ -1841,6 +1847,12 @@ impl<'de> serde::Deserialize<'de> for JobQueuesConfig {
             fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
                 let mut entries: Vec<(String, u32)> = Vec::new();
                 while let Some((k, v)) = map.next_entry::<String, u32>()? {
+                    if v == 0 {
+                        return Err(serde::de::Error::custom(format!(
+                            "queue '{k}' weight must be at least 1 (got 0); \
+                             to disable a queue remove it from the list"
+                        )));
+                    }
                     entries.push((k, v));
                 }
                 Ok(JobQueuesConfig::weighted(entries))
@@ -7017,6 +7029,39 @@ path = "/healthz"
         assert_eq!(weight("critical"), Some(4));
         assert_eq!(weight("default"), Some(2));
         assert_eq!(weight("low"), Some(1));
+    }
+
+    #[test]
+    fn job_queues_strict_list_rejects_duplicate_names() {
+        let err = toml::from_str::<AutumnConfig>(
+            r#"
+            [jobs]
+            queues = ["critical", "default", "critical"]
+            "#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("duplicate queue name") && err.contains("critical"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn job_queues_weighted_rejects_zero_weight() {
+        let err = toml::from_str::<AutumnConfig>(
+            r#"
+            [jobs.queues]
+            critical = 4
+            default = 0
+            "#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("weight must be at least 1") && err.contains("default"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
