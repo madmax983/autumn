@@ -1174,7 +1174,6 @@ pub(crate) fn auto_migrate(
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
