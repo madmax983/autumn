@@ -269,16 +269,12 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
         } else if meta.path.is_ident("sharded") {
             sharded = true;
             Ok(())
-        } else if meta.path.is_ident("broadcasts") {
-            let value: LitStr = meta.value()?.parse()?;
-            broadcasts = Some(value.value());
-            Ok(())
         } else if meta.path.get_ident().is_some() && model_name.is_none() {
             model_name = Some(meta.path.get_ident().unwrap().clone());
             Ok(())
         } else {
             Err(meta.error(
-                "expected model name, table = \"...\", hooks = Type, commit_hooks = true, api = \"/path\", policy = Type, scope = Type, cursor_key = field, cursor_key_type = Type, soft_delete, tenant_scoped, no_upsert_trait, searchable, versioned = true, no_versioned_record_impl, primary_reads, sharded, or broadcasts = \"topic\"",
+                "expected model name, table = \"...\", hooks = Type, commit_hooks = true, api = \"/path\", policy = Type, scope = Type, cursor_key = field, cursor_key_type = Type, soft_delete, tenant_scoped, no_upsert_trait, searchable, versioned = true, no_versioned_record_impl, primary_reads, sharded, broadcasts = true, topic = \"...\", render = fn, or container = \"...\"",
             ))
         }
     })
@@ -977,7 +973,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     // (further down).  The full doc-comment version `bcast_struct_field` is
     // used only in the struct definition; the clone/none/state variants are
     // used in every constructor that builds a `Self { .. }` literal.
-    let has_broadcasts = config.broadcasts.is_some();
+    let has_broadcasts = config.broadcasts;
     let bcast_struct_field = if has_broadcasts {
         quote! {
             /// Broadcast handle for live OOB fragment publishing (`broadcasts = "topic"`).
@@ -6841,118 +6837,6 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             update_many_body,
             delete_many_body,
         )
-    };
-
-    // §broadcasts: wrap save/update/delete bodies to publish hx-swap-oob fragments
-    // when `broadcasts = "topic"` is declared on the repository.
-    // The `#[cfg]` guards are intentionally absent here: `broadcasts = "topic"` is
-    // a hard opt-in, so the user's crate must enable ws+maud+htmx features to get
-    // the required types. A missing feature produces a clear compile error rather
-    // than silently compiling out the broadcast logic.
-    //
-    // Tenant isolation: when `tenant_scoped` is also set, qualify the channel topic
-    // as "<base>:<tenant_id>" so broadcasts from tenant A are invisible to tenant B's
-    // SSE subscribers.  Broadcasts are skipped when no tenant context is established
-    // (e.g. background tasks) and in `across_tenants` mode.
-    let (save_body, update_body, delete_body) = if let Some(ref topic) = config.broadcasts {
-        let topic_lit = proc_macro2::Literal::string(topic);
-        // Emit code that resolves the runtime broadcast topic.
-        // For tenant_scoped repos the topic becomes "<base>:<tenant_id>".
-        let topic_resolve = if config.tenant_scoped {
-            quote! {
-                let __autumn_bcast_topic: ::core::option::Option<::std::string::String> =
-                    if self.across_tenants {
-                        ::core::option::Option::None
-                    } else {
-                        match ::autumn_web::tenancy::CURRENT_TENANT
-                            .try_with(|t| t.clone())
-                            .ok()
-                            .flatten()
-                        {
-                            ::core::option::Option::Some(__tid) => ::core::option::Option::Some(
-                                ::std::format!("{}:{}", #topic_lit, __tid),
-                            ),
-                            ::core::option::Option::None => ::core::option::Option::None,
-                        }
-                    };
-            }
-        } else {
-            quote! {
-                let __autumn_bcast_topic: ::core::option::Option<::std::string::String> =
-                    ::core::option::Option::Some(::std::string::String::from(#topic_lit));
-            }
-        };
-        let wrapped_save = quote! {
-            let __autumn_bcast_result: ::autumn_web::AutumnResult<#model_name> = {
-                #save_body
-            };
-            {
-                #topic_resolve
-                if let (
-                    ::core::result::Result::Ok(__rec),
-                    ::core::option::Option::Some(__bcast),
-                    ::core::option::Option::Some(__topic),
-                ) = (&__autumn_bcast_result, &self.__autumn_broadcast, &__autumn_bcast_topic)
-                {
-                    let __fragment = <#model_name as ::autumn_web::live::LiveFragment>::render_fragment(__rec);
-                    let __dom_id = <#model_name as ::autumn_web::live::LiveFragment>::dom_id(__rec);
-                    let __swap = <#model_name as ::autumn_web::live::LiveFragment>::insert_swap();
-                    let _ = __bcast.publish_oob(__topic, &__dom_id, &__swap, &__fragment);
-                }
-                __autumn_bcast_result
-            }
-        };
-        let wrapped_update = quote! {
-            let __autumn_bcast_result: ::autumn_web::AutumnResult<#model_name> = {
-                #update_body
-            };
-            {
-                #topic_resolve
-                if let (
-                    ::core::result::Result::Ok(__rec),
-                    ::core::option::Option::Some(__bcast),
-                    ::core::option::Option::Some(__topic),
-                ) = (&__autumn_bcast_result, &self.__autumn_broadcast, &__autumn_bcast_topic)
-                {
-                    let __fragment = <#model_name as ::autumn_web::live::LiveFragment>::render_fragment(__rec);
-                    let __dom_id = <#model_name as ::autumn_web::live::LiveFragment>::dom_id(__rec);
-                    let _ = __bcast.publish_oob(
-                        __topic,
-                        &__dom_id,
-                        &::autumn_web::htmx::OobSwap::True,
-                        &__fragment,
-                    );
-                }
-                __autumn_bcast_result
-            }
-        };
-        let wrapped_delete = quote! {
-            let __autumn_bcast_id = id;
-            let __autumn_bcast_result: ::autumn_web::AutumnResult<()> = {
-                #delete_body
-            };
-            {
-                #topic_resolve
-                if let (
-                    ::core::result::Result::Ok(()),
-                    ::core::option::Option::Some(__bcast),
-                    ::core::option::Option::Some(__topic),
-                ) = (&__autumn_bcast_result, &self.__autumn_broadcast, &__autumn_bcast_topic)
-                {
-                    let __dom_id = <#model_name as ::autumn_web::live::LiveFragment>::dom_id_for(__autumn_bcast_id);
-                    let _ = __bcast.publish_oob(
-                        __topic,
-                        &__dom_id,
-                        &::autumn_web::htmx::OobSwap::Delete,
-                        &maud::html! {},
-                    );
-                }
-                __autumn_bcast_result
-            }
-        };
-        (wrapped_save, wrapped_update, wrapped_delete)
-    } else {
-        (save_body, update_body, delete_body)
     };
 
     let route_hook_registration = if commit_hooks_enabled {

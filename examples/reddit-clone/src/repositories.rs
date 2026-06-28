@@ -28,10 +28,10 @@ pub trait SubredditRepository {
     fn find_by_creator_id(creator_id: i64) -> Vec<Subreddit>;
 }
 
-// `broadcasts = "posts"` wires every mutation that goes through PgPostRepository
+// `broadcasts = true` wires every mutation that goes through PgPostRepository
 // (save/update_by_id/delete_by_id) to publish an `hx-swap-oob` fragment on the
-// "posts" channel.  Clients subscribing to `/posts/stream` receive live patches.
-#[autumn_web::repository(Post, hooks = PostHooks, api = "/api/posts", broadcasts = "posts")]
+// "posts" channel.  Clients subscribing to `/posts/events` receive live patches.
+#[autumn_web::repository(Post, hooks = PostHooks, api = "/api/posts", broadcasts = true)]
 pub trait PostRepository {
     /// SELECT * FROM posts WHERE slug = $1
     fn find_by_slug(slug: String) -> Vec<Post>;

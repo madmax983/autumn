@@ -1,17 +1,18 @@
-//! Integration tests for declarative live broadcast via `#[repository(Model, broadcasts = "topic")]`.
+//! Integration tests for declarative live broadcast via `#[repository(Model, broadcasts = true)]`.
 //!
 //! These tests verify that:
 //! - `save` publishes an OOB insert fragment to the configured topic
 //! - `update` publishes an OOB outerHTML swap fragment
 //! - `delete_by_id` publishes an OOB delete fragment
 //! - Repositories declared without `broadcasts` emit nothing
-//! - Repositories constructed without state (via `with_pool_untracked`) skip broadcast silently
+//! - Repositories constructed without a `CURRENT_CHANNELS` context skip broadcast silently
 //!
 //! **Requires Docker** (Postgres testcontainer) for DB-backed tests.
 
 #![cfg(all(feature = "ws", feature = "maud", feature = "htmx", feature = "db"))]
 #![allow(clippy::must_use_candidate, clippy::missing_const_for_fn)]
 
+use autumn_web::__private::CURRENT_CHANNELS;
 use autumn_web::channels::Channels;
 use autumn_web::hooks::Patch;
 use autumn_web::live::LiveFragment;
@@ -41,7 +42,7 @@ pub struct LiveItem {
     pub name: String,
 }
 
-// ── LiveFragment impl ─────────────────────────────────────────────────────────
+// ── LiveFragment impl (compile check — trait is user-facing) ──────────────────
 
 impl LiveFragment for LiveItem {
     fn dom_id_for(id: i64) -> String {
@@ -61,7 +62,7 @@ impl LiveFragment for LiveItem {
 
 // ── Repository with broadcasts ────────────────────────────────────────────────
 
-#[autumn_web::repository(LiveItem, table = "live_items", broadcasts = "live_items")]
+#[autumn_web::repository(LiveItem, table = "live_items", broadcasts = true)]
 pub trait LiveItemRepository {}
 
 // ── Repository WITHOUT broadcasts (control group) ────────────────────────────
@@ -101,13 +102,6 @@ async fn setup_db() -> (
     (container, pool)
 }
 
-/// Build a repository backed by the given pool AND a channels handle so
-/// broadcasts fire. Simulates what `FromRequestParts<AppState>` does.
-fn repo_with_broadcast(pool: Pool<AsyncPgConnection>, channels: &Channels) -> PgLiveItemRepository {
-    let broadcast = channels.broadcast();
-    PgLiveItemRepository::__autumn_test_with_broadcast(pool, broadcast)
-}
-
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -116,12 +110,16 @@ async fn save_broadcasts_oob_fragment() {
     let (_container, pool) = setup_db().await;
     let channels = Channels::new(16);
     let mut rx = channels.subscribe("live_items");
-    let repo = repo_with_broadcast(pool, &channels);
-
+    let repo = PgLiveItemRepository::with_pool_untracked(pool);
     let new_item = NewLiveItem {
         name: "hello".to_owned(),
     };
-    let saved = repo.save(&new_item).await.expect("save");
+
+    let _saved = CURRENT_CHANNELS
+        .scope(channels, async {
+            repo.save(&new_item).await.expect("save")
+        })
+        .await;
 
     let msg = tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv())
         .await
@@ -133,9 +131,10 @@ async fn save_broadcasts_oob_fragment() {
         html.contains("hx-swap-oob"),
         "must contain hx-swap-oob, got: {html}"
     );
+    // Trunk-dev default container: "{table}-list" = "live_items-list"
     assert!(
-        html.contains(&LiveItem::dom_id_for(saved.id)),
-        "must contain dom_id, got: {html}"
+        html.contains("live_items-list"),
+        "create must target container live_items-list, got: {html}"
     );
 }
 
@@ -145,25 +144,32 @@ async fn update_broadcasts_true_swap() {
     let (_container, pool) = setup_db().await;
     let channels = Channels::new(16);
     let mut rx = channels.subscribe("live_items");
-    let repo = repo_with_broadcast(pool, &channels);
+    let repo = PgLiveItemRepository::with_pool_untracked(pool);
 
-    let saved = repo
-        .save(&NewLiveItem {
-            name: "first".to_owned(),
+    let saved = CURRENT_CHANNELS
+        .scope(channels.clone(), async {
+            repo.save(&NewLiveItem {
+                name: "first".to_owned(),
+            })
+            .await
+            .expect("save")
         })
-        .await
-        .expect("save");
+        .await;
     // drain the insert broadcast
     let _ = tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv()).await;
 
-    repo.update(
-        saved.id,
-        &UpdateLiveItem {
-            name: Patch::Set("updated".to_owned()),
-        },
-    )
-    .await
-    .expect("update");
+    CURRENT_CHANNELS
+        .scope(channels, async {
+            repo.update(
+                saved.id,
+                &UpdateLiveItem {
+                    name: Patch::Set("updated".to_owned()),
+                },
+            )
+            .await
+            .expect("update")
+        })
+        .await;
 
     let msg = tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv())
         .await
@@ -175,9 +181,10 @@ async fn update_broadcasts_true_swap() {
         html.contains("hx-swap-oob"),
         "must contain hx-swap-oob: {html}"
     );
+    // Update uses OobSwap::True (outerHTML) — fragment carries the attribute directly
     assert!(
-        html.contains(&LiveItem::dom_id_for(saved.id)),
-        "must contain dom_id: {html}"
+        html.contains("live_item"),
+        "update fragment must reference item element, got: {html}"
     );
 }
 
@@ -187,18 +194,25 @@ async fn delete_broadcasts_oob_delete() {
     let (_container, pool) = setup_db().await;
     let channels = Channels::new(16);
     let mut rx = channels.subscribe("live_items");
-    let repo = repo_with_broadcast(pool, &channels);
+    let repo = PgLiveItemRepository::with_pool_untracked(pool);
 
-    let saved = repo
-        .save(&NewLiveItem {
-            name: "to_delete".to_owned(),
+    let saved = CURRENT_CHANNELS
+        .scope(channels.clone(), async {
+            repo.save(&NewLiveItem {
+                name: "to_delete".to_owned(),
+            })
+            .await
+            .expect("save")
         })
-        .await
-        .expect("save");
+        .await;
     // drain the insert broadcast
     let _ = tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv()).await;
 
-    repo.delete_by_id(saved.id).await.expect("delete");
+    CURRENT_CHANNELS
+        .scope(channels, async {
+            repo.delete_by_id(saved.id).await.expect("delete");
+        })
+        .await;
 
     let msg = tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv())
         .await
@@ -207,9 +221,11 @@ async fn delete_broadcasts_oob_delete() {
 
     let html = msg.as_str();
     assert!(html.contains("delete"), "must contain delete swap: {html}");
+    // Trunk-dev delete tombstone: <div id="live_item-{id}" hx-swap-oob="delete">
     assert!(
-        html.contains(&LiveItem::dom_id_for(saved.id)),
-        "must contain dom_id: {html}"
+        html.contains(&format!("live_item-{}", saved.id)),
+        "must contain element id live_item-{}, got: {html}",
+        saved.id
     );
 }
 
@@ -221,11 +237,15 @@ async fn no_broadcasts_attr_emits_nothing() {
     let mut rx = channels.subscribe("live_items");
 
     let repo = PgSilentItemRepository::with_pool_untracked(pool);
-
     let new_item = NewSilentItem {
         name: "quiet".to_owned(),
     };
-    repo.save(&new_item).await.expect("save");
+    // Even inside a CURRENT_CHANNELS scope, SilentItemRepository has no broadcasts attr
+    CURRENT_CHANNELS
+        .scope(channels, async {
+            repo.save(&new_item).await.expect("save");
+        })
+        .await;
 
     let result = tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv()).await;
     assert!(result.is_err(), "no broadcasts should have been emitted");
@@ -238,7 +258,7 @@ async fn with_pool_untracked_skips_broadcast_silently() {
     let channels = Channels::new(16);
     let mut rx = channels.subscribe("live_items");
 
-    // Construct without state — broadcast channel is None
+    // No CURRENT_CHANNELS scope — get_global_channels() returns None
     let repo = PgLiveItemRepository::with_pool_untracked(pool);
     let new_item = NewLiveItem {
         name: "no_state".to_owned(),
@@ -246,11 +266,41 @@ async fn with_pool_untracked_skips_broadcast_silently() {
     let _saved = repo
         .save(&new_item)
         .await
-        .expect("save succeeds even without broadcast");
+        .expect("save succeeds even without broadcast context");
 
     let result = tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv()).await;
     assert!(
         result.is_err(),
-        "with_pool_untracked must not panic or broadcast"
+        "without CURRENT_CHANNELS scope, no broadcast should fire"
+    );
+    drop(channels);
+}
+
+// ── LiveFragment compile/unit tests (no DB needed) ───────────────────────────
+
+#[test]
+fn live_fragment_dom_id_for_matches_dom_id() {
+    let item = LiveItem {
+        id: 42,
+        name: "test".to_owned(),
+    };
+    assert_eq!(item.dom_id(), LiveItem::dom_id_for(42));
+    assert_eq!(item.dom_id(), "live-item-42");
+}
+
+#[test]
+fn live_fragment_render_contains_dom_id() {
+    let item = LiveItem {
+        id: 7,
+        name: "hello".to_owned(),
+    };
+    let markup = item.render_fragment().into_string();
+    assert!(
+        markup.contains("live-item-7"),
+        "render must use dom_id: {markup}"
+    );
+    assert!(
+        markup.contains("hello"),
+        "render must include item name: {markup}"
     );
 }

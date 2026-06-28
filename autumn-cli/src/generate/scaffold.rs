@@ -783,7 +783,7 @@ fn render_routes_file(
     let ul_list_render = if live {
         format!(
             r#"@if page_req.page() == 1 {{
-            ul id="{plural}-list" hx-ext="sse" sse-connect="/{plural}/events" sse-swap="message" hx-swap="none" {{
+            ul id="{plural}-list" hx-ext="sse" sse-connect="/{plural}/events" sse-swap="message" hx-swap="morph" {{
                 @for row in &page_data.content {{
                     {li_render}
                 }}
@@ -1225,7 +1225,8 @@ fn redirect_to(url: &str) -> Markup {{
     }}
 }}
 "#
-    ) + &if live {
+        )
+    } + &if live {
         format!(
             r#"
 
@@ -2444,9 +2445,9 @@ async fn main() {
         assert!(routes.contains("autumn_web::sse::stream"));
         assert!(routes.contains("hx-ext=\"sse\""));
         assert!(routes.contains("sse-connect=\"/posts/events\""));
-        assert!(routes.contains("hx-swap=\"none\""));
-        assert!(routes.contains("script src=\"/static/js/htmx.min.js\""));
-        assert!(routes.contains("script src=\"/static/js/sse.js\""));
+        assert!(routes.contains("hx-swap=\"morph\""));
+        assert!(routes.contains("autumn_web::htmx::HTMX_JS_PATH"));
+        assert!(routes.contains("autumn_web::htmx::HTMX_SSE_JS_PATH"));
         assert!(routes.contains("title: autumn_web::hooks::Patch::Set(form.title.clone())"));
 
         let main_rs = fs::read_to_string(tmp.path().join("src/main.rs")).unwrap();

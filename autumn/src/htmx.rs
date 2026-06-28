@@ -79,22 +79,6 @@ pub const IDIOMORPH_JS: &[u8] = include_bytes!("../vendor/idiomorph.min.js");
 #[cfg(feature = "htmx")]
 pub const IDIOMORPH_JS_PATH: &str = "/static/js/idiomorph.min.js";
 
-/// htmx SSE extension, embedded at compile time.
-///
-/// Enables `hx-ext="sse"`, `sse-connect`, and `sse-swap` attributes for
-/// server-sent event streams. Serves at [`HTMX_SSE_JS_PATH`].
-///
-/// Reference in your layout:
-/// ```html
-/// <script src="/static/js/htmx-ext-sse.js"></script>
-/// ```
-#[cfg(feature = "htmx")]
-pub const HTMX_SSE_JS: &[u8] = include_bytes!("../vendor/htmx-ext-sse.js");
-
-/// Same-origin path where Autumn serves the htmx SSE extension.
-#[cfg(feature = "htmx")]
-pub const HTMX_SSE_JS_PATH: &str = "/static/js/htmx-ext-sse.js";
-
 /// CSP-compatible htmx CSRF helper JavaScript.
 ///
 /// Served as an external same-origin script so applications do not need inline

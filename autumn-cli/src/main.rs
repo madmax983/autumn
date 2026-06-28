@@ -2546,7 +2546,6 @@ fn run_generate_command(cmd: GenerateCommands) {
                 shard_key.as_deref(),
                 live,
                 id.as_deref(),
-                live,
                 live_validation,
             ) {
                 Ok(result) => result,

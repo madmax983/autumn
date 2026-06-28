@@ -2728,7 +2728,7 @@ fn live_scaffold_emits_live_fragment_and_broadcasts() {
 
     let repo = fs::read_to_string(project.join("src/repositories/post.rs")).unwrap();
     assert!(
-        repo.contains("broadcasts = \"posts\""),
+        repo.contains("broadcasts = true"),
         "repository must have broadcasts attribute under --live:\n{repo}"
     );
     // LiveFragment impl is co-located in the repository file next to the
@@ -2767,11 +2767,11 @@ fn live_scaffold_index_uses_sse_list_and_stream_route() {
         "index list must have hx-ext=\"sse\" under --live:\n{routes}"
     );
     assert!(
-        routes.contains("sse-connect=\"/posts/stream\""),
+        routes.contains("sse-connect=\"/posts/events\""),
         "index list must connect to the SSE stream endpoint:\n{routes}"
     );
     assert!(
-        routes.contains("pub async fn stream"),
+        routes.contains("pub async fn events"),
         "routes must contain the stream handler:\n{routes}"
     );
 }
