@@ -54,7 +54,8 @@ use super::{Flags, GenerateError, ensure_project_root};
 pub fn plan_tauri(project_root: &Path) -> Result<Plan, GenerateError> {
     ensure_project_root(project_root)?;
 
-    let (package_name, package_version, bin_name) = read_package_meta(project_root)?;
+    let (package_name, package_version, bin_name, has_embed_assets) =
+        read_package_meta(project_root)?;
     let mut plan = Plan::new(project_root);
     let tauri = project_root.join("src-tauri");
 
@@ -98,11 +99,11 @@ pub fn plan_tauri(project_root: &Path) -> Result<Plan, GenerateError> {
     // Staging scripts
     plan.create(
         tauri.join("stage-sidecar.sh"),
-        render_stage_sidecar_sh(&package_name, &bin_name),
+        render_stage_sidecar_sh(&package_name, &bin_name, has_embed_assets),
     );
     plan.create(
         tauri.join("stage-sidecar.ps1"),
-        render_stage_sidecar_ps1(&package_name, &bin_name),
+        render_stage_sidecar_ps1(&package_name, &bin_name, has_embed_assets),
     );
     plan.create(tauri.join(".gitignore"), render_gitignore());
 
@@ -145,7 +146,14 @@ pub fn run(flags: Flags) {
 /// `version` resolves workspace inheritance: if `[package] version.workspace
 /// = true` the function walks up the directory tree to find
 /// `[workspace.package] version` in an ancestor `Cargo.toml`.
-fn read_package_meta(project_root: &Path) -> Result<(String, String, String), GenerateError> {
+///
+/// `has_embed_assets_feature` is `true` when the app's `Cargo.toml` declares
+/// an `embed-assets` entry under `[features]`.  When true, staging scripts
+/// pass `--features embed-assets` (the app-crate feature) rather than
+/// `--features autumn-web/embed-assets` (dep path only), so that the app's
+/// `#[cfg(feature = "embed-assets")]` guard on `.embedded_static()` is
+/// satisfied — mirroring what `autumn build --embed` does.
+fn read_package_meta(project_root: &Path) -> Result<(String, String, String, bool), GenerateError> {
     let cargo_path = project_root.join("Cargo.toml");
     let content = std::fs::read_to_string(&cargo_path).map_err(GenerateError::Io)?;
     let doc: toml::Value = toml::from_str(&content)
@@ -163,7 +171,7 @@ fn read_package_meta(project_root: &Path) -> Result<(String, String, String), Ge
     let version = match pkg.get("version") {
         Some(toml::Value::String(s)) => s.clone(),
         Some(toml::Value::Table(t))
-            if t.get("workspace").and_then(|v| v.as_bool()) == Some(true) =>
+            if t.get("workspace").and_then(toml::Value::as_bool) == Some(true) =>
         {
             resolve_workspace_version(project_root).unwrap_or_else(|| "0.1.0".to_owned())
         }
@@ -187,44 +195,55 @@ fn read_package_meta(project_root: &Path) -> Result<(String, String, String), Ge
         .get("default-run")
         .and_then(|v| v.as_str())
         .map(str::to_owned);
-    let bin_name = {
-        let explicit_bins = doc.get("bin").and_then(|b| b.as_array());
-        if let Some(bins) = explicit_bins {
-            // Step 1: explicit [[bin]] entry whose path is src/main.rs.
-            bins.iter()
-                .find(|b| {
-                    b.get("path")
-                        .and_then(|p| p.as_str())
-                        .is_some_and(|p| p == "src/main.rs" || p == "src\\main.rs")
-                })
-                .and_then(|b| b.get("name"))
-                .and_then(|n| n.as_str())
-                .map(str::to_owned)
-                .or_else(|| {
-                    if project_root.join("src/main.rs").is_file() {
-                        // Step 2: src/main.rs exists but is not declared in [[bin]];
-                        // Cargo auto-discovers it as the package-named binary.
-                        // The [[bin]] entries are for other auxiliary programs.
-                        Some(name.clone())
-                    } else {
-                        // Step 3: honour [package] default-run when set.
-                        default_run.clone().or_else(|| {
-                            // Step 4: single or first explicit [[bin]] as last resort.
-                            bins.first()
-                                .and_then(|b| b.get("name"))
-                                .and_then(|n| n.as_str())
-                                .map(str::to_owned)
-                        })
-                    }
-                })
-                .unwrap_or_else(|| name.clone())
-        } else {
+    let bin_name = doc
+        .get("bin")
+        .and_then(|b| b.as_array())
+        .map_or_else(
             // Step 5: no [[bin]] at all — package name is the binary name.
-            name.clone()
-        }
-    };
+            || name.clone(),
+            |bins| {
+                // Step 1: explicit [[bin]] entry whose path is src/main.rs.
+                bins.iter()
+                    .find(|b| {
+                        b.get("path")
+                            .and_then(|p| p.as_str())
+                            .is_some_and(|p| p == "src/main.rs" || p == "src\\main.rs")
+                    })
+                    .and_then(|b| b.get("name"))
+                    .and_then(|n| n.as_str())
+                    .map(str::to_owned)
+                    .or_else(|| {
+                        if project_root.join("src/main.rs").is_file() {
+                            // Step 2: src/main.rs exists but is not declared in [[bin]];
+                            // Cargo auto-discovers it as the package-named binary.
+                            // The [[bin]] entries are for other auxiliary programs.
+                            Some(name.clone())
+                        } else {
+                            // Step 3: honour [package] default-run when set.
+                            default_run.clone().or_else(|| {
+                                // Step 4: single or first explicit [[bin]] as last resort.
+                                bins.first()
+                                    .and_then(|b| b.get("name"))
+                                    .and_then(|n| n.as_str())
+                                    .map(str::to_owned)
+                            })
+                        }
+                    })
+                    .unwrap_or_else(|| name.clone())
+            },
+        );
 
-    Ok((name, version, bin_name))
+    // Check whether the app defines an `embed-assets` Cargo feature.
+    // `autumn new` generates this; it typically expands to
+    // `["autumn-web/embed-assets"]`.  App code gates `.embedded_static()` on
+    // `#[cfg(feature = "embed-assets")]`, so the staging script must enable the
+    // *app-crate* feature — not just the dep path — to satisfy that guard.
+    let has_embed_assets_feature = doc
+        .get("features")
+        .and_then(toml::Value::as_table)
+        .is_some_and(|features| features.contains_key("embed-assets"));
+
+    Ok((name, version, bin_name, has_embed_assets_feature))
 }
 
 /// Walk from `project_root` upward looking for a `Cargo.toml` that declares
@@ -233,19 +252,16 @@ fn resolve_workspace_version(project_root: &Path) -> Option<String> {
     let mut dir: Option<&Path> = Some(project_root);
     while let Some(d) = dir {
         let cargo = d.join("Cargo.toml");
-        if cargo.is_file() {
-            if let Ok(content) = std::fs::read_to_string(&cargo) {
-                if let Ok(doc) = toml::from_str::<toml::Value>(&content) {
-                    if let Some(v) = doc
-                        .get("workspace")
-                        .and_then(|w| w.get("package"))
-                        .and_then(|p| p.get("version"))
-                        .and_then(|v| v.as_str())
-                    {
-                        return Some(v.to_owned());
-                    }
-                }
-            }
+        if cargo.is_file()
+            && let Ok(content) = std::fs::read_to_string(&cargo)
+            && let Ok(doc) = toml::from_str::<toml::Value>(&content)
+            && let Some(v) = doc
+                .get("workspace")
+                .and_then(|w| w.get("package"))
+                .and_then(|p| p.get("version"))
+                .and_then(|v| v.as_str())
+        {
+            return Some(v.to_owned());
         }
         dir = d.parent();
     }
@@ -624,7 +640,16 @@ fn render_placeholder_icon_svg() -> String {
     .to_owned()
 }
 
-fn render_stage_sidecar_sh(_package_name: &str, bin_name: &str) -> String {
+fn render_stage_sidecar_sh(_package_name: &str, bin_name: &str, has_embed_assets: bool) -> String {
+    // When the app defines an `embed-assets` Cargo feature (as `autumn new` generates),
+    // enable it so that `#[cfg(feature = "embed-assets")]` guards in app code are
+    // satisfied and `.embedded_static()` is actually wired in.  Fall back to the
+    // dependency path when the app doesn't define its own feature alias.
+    let embed_feature = if has_embed_assets {
+        "embed-assets,autumn-web/managed-pg-bundled"
+    } else {
+        "autumn-web/embed-assets,autumn-web/managed-pg-bundled"
+    };
     format!(
         r#"#!/usr/bin/env bash
 # Build the autumn server sidecar with embedded assets and managed Postgres,
@@ -634,8 +659,8 @@ fn render_stage_sidecar_sh(_package_name: &str, bin_name: &str) -> String {
 # Run manually: bash src-tauri/stage-sidecar.sh
 #
 # Requires autumn features:
-#   autumn-web/embed-assets        (#1004 — single-binary asset embed)
-#   autumn-web/managed-pg-bundled  (#1119 — bundled Postgres, no external install)
+#   embed-assets / autumn-web/embed-assets  (#1004 — single-binary asset embed)
+#   autumn-web/managed-pg-bundled           (#1119 — bundled Postgres, no external install)
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${{BASH_SOURCE[0]}}")" && pwd)"
 APP_DIR="$(dirname "$SCRIPT_DIR")"
@@ -653,19 +678,15 @@ mkdir -p src-tauri/binaries
 if [ "${{TARGET_TRIPLE}}" = "universal-apple-darwin" ]; then
     for ARCH in x86_64-apple-darwin aarch64-apple-darwin; do
         cargo build --release --target "$ARCH" --bin {bin_name} \
-          --features autumn-web/embed-assets,autumn-web/managed-pg-bundled
+          --features {embed_feature}
     done
     lipo -create -output "src-tauri/binaries/{bin_name}-universal-apple-darwin" \
       "${{TARGET_DIR}}/x86_64-apple-darwin/release/{bin_name}" \
       "${{TARGET_DIR}}/aarch64-apple-darwin/release/{bin_name}"
     echo "Staged (universal): src-tauri/binaries/{bin_name}-universal-apple-darwin"
 else
-    # Build with both autumn-web features so the sidecar binary embeds static assets
-    # and bundles Postgres.  Both are specified via the dependency path so this script
-    # works with any autumn project regardless of whether the app's Cargo.toml defines
-    # a top-level `embed-assets` feature alias.
     cargo build --release --target "${{TARGET_TRIPLE}}" --bin {bin_name} \
-      --features autumn-web/embed-assets,autumn-web/managed-pg-bundled
+      --features {embed_feature}
     cp "${{TARGET_DIR}}/${{TARGET_TRIPLE}}/release/{bin_name}" \
        "src-tauri/binaries/{bin_name}-${{TARGET_TRIPLE}}"
     echo "Staged: src-tauri/binaries/{bin_name}-${{TARGET_TRIPLE}}"
@@ -723,7 +744,12 @@ done
     )
 }
 
-fn render_stage_sidecar_ps1(_package_name: &str, bin_name: &str) -> String {
+fn render_stage_sidecar_ps1(_package_name: &str, bin_name: &str, has_embed_assets: bool) -> String {
+    let embed_feature = if has_embed_assets {
+        "embed-assets,autumn-web/managed-pg-bundled"
+    } else {
+        "autumn-web/embed-assets,autumn-web/managed-pg-bundled"
+    };
     format!(
         r#"# Build the autumn server sidecar with embedded assets and managed Postgres,
 # then place it in src-tauri\binaries\ for Tauri to bundle.
@@ -747,12 +773,8 @@ $TargetDir = $Env:CARGO_TARGET_DIR
 if (-not $TargetDir) {{
     $TargetDir = (cargo metadata --no-deps --format-version 1 --quiet | ConvertFrom-Json).target_directory
 }}
-# Build with both autumn-web features so the sidecar binary embeds static assets
-# and bundles Postgres.  Both are specified via the dependency path so this script
-# works with any autumn project regardless of whether the app's Cargo.toml defines
-# a top-level `embed-assets` feature alias.
 cargo build --release --target "$TargetTriple" --bin {bin_name} `
-  --features autumn-web/embed-assets,autumn-web/managed-pg-bundled
+  --features {embed_feature}
 New-Item -ItemType Directory -Force -Path src-tauri\binaries | Out-Null
 Copy-Item "$TargetDir\$TargetTriple\release\{bin_name}.exe" `
           "src-tauri\binaries\{bin_name}-$TargetTriple.exe"
@@ -898,6 +920,7 @@ const PLACEHOLDER_ICNS: &[u8] = &[
 
 #[cfg(test)]
 mod tests {
+    use std::fmt::Write as FmtWrite;
     use std::fs;
 
     use tempfile::TempDir;
@@ -965,10 +988,10 @@ mod tests {
     /// binary, not the first manifest entry.
     fn project_with_default_run(pkg_name: &str, default_run: &str, bins: &[&str]) -> TempDir {
         let tmp = TempDir::new().unwrap();
-        let bin_sections: String = bins
-            .iter()
-            .map(|b| format!("\n[[bin]]\nname=\"{b}\"\npath=\"src/{b}.rs\"\n"))
-            .collect();
+        let bin_sections = bins.iter().fold(String::new(), |mut acc, b| {
+            write!(acc, "\n[[bin]]\nname=\"{b}\"\npath=\"src/{b}.rs\"\n").unwrap();
+            acc
+        });
         fs::write(
             tmp.path().join("Cargo.toml"),
             format!(
@@ -992,6 +1015,24 @@ mod tests {
             format!(
                 "[package]\nname=\"{pkg_name}\"\nversion.workspace = true\nedition=\"2024\"\n\
                  \n[workspace]\n\n[workspace.package]\nversion=\"{ws_version}\"\n\
+                 \n[dependencies]\nautumn-web = \"0.5.0\"\n"
+            ),
+        )
+        .unwrap();
+        fs::create_dir_all(tmp.path().join("src")).unwrap();
+        fs::write(tmp.path().join("src/main.rs"), "fn main() {}\n").unwrap();
+        tmp
+    }
+
+    /// Project that defines an `embed-assets` Cargo feature (as `autumn new`
+    /// generates it), mapping to `["autumn-web/embed-assets"]`.
+    fn project_with_embed_assets(pkg_name: &str) -> TempDir {
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join("Cargo.toml"),
+            format!(
+                "[package]\nname=\"{pkg_name}\"\nversion=\"0.1.0\"\nedition=\"2024\"\n\
+                 \n[features]\nembed-assets = [\"autumn-web/embed-assets\"]\n\
                  \n[dependencies]\nautumn-web = \"0.5.0\"\n"
             ),
         )
@@ -1077,7 +1118,7 @@ mod tests {
 
     #[test]
     fn stage_sidecar_sh_uses_cargo_metadata_for_target_dir() {
-        let sh = render_stage_sidecar_sh("my-app", "my-app");
+        let sh = render_stage_sidecar_sh("my-app", "my-app", true);
         // cargo metadata resolves the real output dir for workspace members and
         // respects CARGO_TARGET_DIR overrides.
         assert!(
@@ -1098,7 +1139,7 @@ mod tests {
 
     #[test]
     fn stage_sidecar_sh_handles_universal_apple_darwin() {
-        let sh = render_stage_sidecar_sh("my-app", "my-app");
+        let sh = render_stage_sidecar_sh("my-app", "my-app", true);
         // universal-apple-darwin is a Tauri meta-target; cargo build --target
         // universal-apple-darwin fails because rustc doesn't know it.
         assert!(
@@ -1117,7 +1158,7 @@ mod tests {
 
     #[test]
     fn stage_sidecar_ps1_uses_cargo_metadata_for_target_dir() {
-        let ps1 = render_stage_sidecar_ps1("my-app", "my-app");
+        let ps1 = render_stage_sidecar_ps1("my-app", "my-app", true);
         assert!(
             ps1.contains("cargo metadata"),
             "stage-sidecar.ps1 must use `cargo metadata` to locate the Cargo target directory"
@@ -1134,7 +1175,7 @@ mod tests {
 
     #[test]
     fn stage_sidecar_sh_stages_profile_configs() {
-        let sh = render_stage_sidecar_sh("my-app", "my-app");
+        let sh = render_stage_sidecar_sh("my-app", "my-app", true);
         // Profile configs are staged at build time (beforeBuildCommand) so that the
         // static resource entries in tauri.conf.json are always satisfiable — even when
         // autumn-prod.toml is created after `autumn generate tauri` was run.
@@ -1151,7 +1192,7 @@ mod tests {
 
     #[test]
     fn stage_sidecar_ps1_stages_profile_configs() {
-        let ps1 = render_stage_sidecar_ps1("my-app", "my-app");
+        let ps1 = render_stage_sidecar_ps1("my-app", "my-app", true);
         assert!(
             ps1.contains("src-tauri\\configs") || ps1.contains("src-tauri/configs"),
             "stage-sidecar.ps1 must create src-tauri\\configs\\ and populate it with \
@@ -1168,7 +1209,7 @@ mod tests {
     // real config because AutumnConfig stops at the first existing file in the lookup list.
     #[test]
     fn stage_sidecar_sh_copies_alias_to_both_names() {
-        let sh = render_stage_sidecar_sh("my-app", "my-app");
+        let sh = render_stage_sidecar_sh("my-app", "my-app", true);
         // Must handle the case where only autumn-production.toml exists by copying it
         // to autumn-prod.toml as well — look for the elif + both cp lines.
         assert!(
@@ -1190,7 +1231,7 @@ mod tests {
 
     #[test]
     fn stage_sidecar_ps1_copies_alias_to_both_names() {
-        let ps1 = render_stage_sidecar_ps1("my-app", "my-app");
+        let ps1 = render_stage_sidecar_ps1("my-app", "my-app", true);
         assert!(
             ps1.contains("autumn-production.toml") && ps1.contains("autumn-prod.toml"),
             "stage-sidecar.ps1 must handle prod/production alias pair explicitly"
@@ -1272,7 +1313,7 @@ mod tests {
 
     #[test]
     fn stage_sidecar_sh_uses_bin_name_for_binary() {
-        let sh = render_stage_sidecar_sh("my-app", "my-server");
+        let sh = render_stage_sidecar_sh("my-app", "my-server", true);
         assert!(
             sh.contains("my-server"),
             "stage-sidecar.sh must reference the binary target name in copy commands"
@@ -1286,7 +1327,7 @@ mod tests {
 
     #[test]
     fn stage_sidecar_ps1_uses_bin_name_for_binary() {
-        let ps1 = render_stage_sidecar_ps1("my-app", "my-server");
+        let ps1 = render_stage_sidecar_ps1("my-app", "my-server", true);
         assert!(
             ps1.contains("my-server"),
             "stage-sidecar.ps1 must reference the binary target name in copy commands"
@@ -1407,8 +1448,53 @@ mod tests {
     }
 
     #[test]
+    fn stage_sidecar_sh_uses_app_embed_feature_when_defined() {
+        // When the app defines an `embed-assets` Cargo feature, the staging
+        // script must pass it (not just the dep path) so that
+        // `#[cfg(feature = "embed-assets")]` guards in app code are active.
+        let sh = render_stage_sidecar_sh("my-app", "my-app", true);
+        assert!(
+            sh.contains("--features embed-assets,autumn-web/managed-pg-bundled"),
+            "when app has embed-assets feature the script must use the app-crate feature flag"
+        );
+    }
+
+    #[test]
+    fn stage_sidecar_sh_falls_back_to_dep_path_when_no_app_feature() {
+        let sh = render_stage_sidecar_sh("my-app", "my-app", false);
+        assert!(
+            sh.contains("--features autumn-web/embed-assets,autumn-web/managed-pg-bundled"),
+            "without app-level embed-assets, script must use the dep feature path"
+        );
+    }
+
+    #[test]
+    fn plan_uses_app_embed_feature_for_generated_scaffold() {
+        // The `project()` fixture matches a scaffold generated by `autumn new`,
+        // which always defines an `embed-assets` feature.
+        let tmp = project_with_embed_assets("my-app");
+        let plan = plan_tauri(tmp.path()).unwrap();
+        let sh: &str = plan
+            .actions
+            .iter()
+            .find(|a| a.path().to_string_lossy().ends_with("stage-sidecar.sh"))
+            .and_then(|a| {
+                if let crate::generate::emit::Action::Create { contents, .. } = a {
+                    Some(contents.as_str())
+                } else {
+                    None
+                }
+            })
+            .expect("stage-sidecar.sh action not found");
+        assert!(
+            sh.contains("--features embed-assets,"),
+            "generated scaffold with embed-assets feature must use app-crate feature in staging script"
+        );
+    }
+
+    #[test]
     fn stage_sidecar_sh_creates_autumn_toml_when_absent() {
-        let sh = render_stage_sidecar_sh("my-app", "my-app");
+        let sh = render_stage_sidecar_sh("my-app", "my-app", true);
         assert!(
             sh.contains(": > autumn.toml") || sh.contains("> autumn.toml"),
             "staging script must create an empty autumn.toml when none exists \
@@ -1418,7 +1504,7 @@ mod tests {
 
     #[test]
     fn stage_sidecar_ps1_creates_autumn_toml_when_absent() {
-        let ps1 = render_stage_sidecar_ps1("my-app", "my-app");
+        let ps1 = render_stage_sidecar_ps1("my-app", "my-app", true);
         assert!(
             ps1.contains("autumn.toml"),
             "PowerShell staging script must handle a missing autumn.toml"
