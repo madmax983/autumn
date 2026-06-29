@@ -17,6 +17,7 @@ pub mod dsl;
 pub mod emit;
 pub mod inbound_mail;
 pub mod introspect;
+pub mod job;
 pub mod mailer;
 pub mod migration;
 pub mod model;

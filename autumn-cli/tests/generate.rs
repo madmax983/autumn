@@ -816,6 +816,67 @@ fn generated_scaffold_cargo_checks() {
     );
 }
 
+/// Slow end-to-end check: scaffold a fresh project, run `autumn generate job`,
+/// and `cargo check` the result against the local `autumn-web` crate. Verifies
+/// the generator produces code that compiles without hand-editing.
+///
+/// Ignored by default; run with `cargo test -p autumn-cli -- --ignored`.
+#[test]
+#[ignore = "slow: cargo-checks a fresh project — run with `cargo test -p autumn-cli -- --ignored`"]
+fn generated_job_cargo_checks() {
+    let (_tmp, project) = fresh_project("job-build");
+    patch_generated_cargo_toml(&project);
+
+    run_autumn(
+        &project,
+        &[
+            "generate",
+            "job",
+            "SendWelcomeEmail",
+            "user_id:i64",
+            "email:String",
+        ],
+    );
+
+    // The generated Cargo.toml must include serde.
+    let cargo_toml = fs::read_to_string(project.join("Cargo.toml")).unwrap();
+    assert!(
+        cargo_toml.contains("serde"),
+        "Cargo.toml must include serde after generate job"
+    );
+
+    // The generator must have created the expected files.
+    assert!(
+        project.join("src/jobs/send_welcome_email.rs").exists(),
+        "src/jobs/send_welcome_email.rs must exist"
+    );
+    assert!(
+        project.join("src/jobs/mod.rs").exists(),
+        "src/jobs/mod.rs must exist"
+    );
+
+    // main.rs must be wired up.
+    let main = fs::read_to_string(project.join("src/main.rs")).unwrap();
+    assert!(main.contains("mod jobs;"), "main.rs must declare mod jobs");
+    assert!(
+        main.contains(".jobs(jobs::registered_jobs())"),
+        "main.rs must include .jobs() call"
+    );
+
+    // The whole project must cargo-check cleanly (inline tests included).
+    let check = Command::new("cargo")
+        .args(["check", "--tests"])
+        .current_dir(&project)
+        .output()
+        .unwrap();
+    assert!(
+        check.status.success(),
+        "cargo check on generated job failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&check.stdout),
+        String::from_utf8_lossy(&check.stderr),
+    );
+}
+
 // ── autumn generate auth integration tests ────────────────────────────────────
 
 #[allow(clippy::too_many_lines)]
