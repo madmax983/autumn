@@ -1532,7 +1532,9 @@ fn title_case(s: &str) -> String {
     s.split('_')
         .map(|word| {
             let mut chars = word.chars();
-            chars.next().map_or_else(String::new, |c| c.to_uppercase().to_string() + chars.as_str())
+            chars.next().map_or_else(String::new, |c| {
+                c.to_uppercase().to_string() + chars.as_str()
+            })
         })
         .collect::<Vec<_>>()
         .join(" ")
