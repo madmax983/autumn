@@ -56,42 +56,6 @@ fn layout(title: &str, content: Markup) -> Markup {
     }
 }
 
-fn bookmark_card(bookmark: &Bookmark) -> Markup {
-    html! {
-        li id=(format!("bookmark-{}", bookmark.id))
-           class="p-4 bg-white rounded shadow flex justify-between items-center gap-4" {
-            div {
-                a href=(bookmark.url) target="_blank"
-                   class="text-indigo-600 font-medium hover:underline" {
-                    (bookmark.title)
-                }
-                a href=(format!("/bookmarks/tag/{}", bookmark.tag))
-                   class="ml-2 text-xs bg-gray-200 rounded px-2 py-0.5" {
-                    (bookmark.tag)
-                }
-                @if !bookmark.alive {
-                    span class="ml-2 text-xs bg-red-100 text-red-600 rounded px-2 py-0.5" {
-                        "dead link"
-                    }
-                }
-            }
-            div class="flex items-center gap-3 text-sm" {
-                a href=(format!("/bookmarks/{}/edit", bookmark.id))
-                   class="text-gray-500 hover:text-gray-700" {
-                    "Edit"
-                }
-                button
-                    hx-delete=(format!("/api/bookmarks/{}", bookmark.id))
-                    hx-target=(format!("#bookmark-{}", bookmark.id))
-                    hx-swap="outerHTML"
-                    hx-confirm="Delete this bookmark?"
-                    class="text-red-500 hover:text-red-700" {
-                    "Delete"
-                }
-            }
-        }
-    }
-}
 
 /// Column definitions shared by the index, by-tag, and search-result views.
 ///
