@@ -54,7 +54,22 @@ pub fn plan_job(project_root: &Path, name: &str, fields: &[String]) -> Result<Pl
 
     let parsed_fields = parse_fields(fields)?;
     let snake_name = snake(name);
-    let pascal_name = pascal(name);
+    // Derive pascal_name from the normalized snake_name so lower-camelCase input
+    // (e.g. `sendWelcomeEmail`) produces `SendWelcomeEmail`, not `sendWelcomeEmail`.
+    let pascal_name = pascal(&snake_name);
+
+    // Attachment fields require the `storage` autumn-web feature and are not
+    // meaningful as job arguments (pass a storage key or file ID instead).
+    for field in &parsed_fields {
+        if matches!(field.kind, FieldKind::Attachment) {
+            return Err(GenerateError::InvalidField {
+                token: format!("{}:Attachment", field.name),
+                reason: "Attachment fields are not supported in job args structs; \
+                         pass a storage key (String) or file ID (i64) instead"
+                    .into(),
+            });
+        }
+    }
     let args_struct = format!("{pascal_name}Args");
     let companion_struct = format!("{pascal_name}Job");
     let job_entry = format!("{snake_name}::{snake_name}");
@@ -450,6 +465,45 @@ async fn main() {
             .unwrap();
 
         assert!(tmp.path().join("src/jobs/send_welcome_email.rs").exists());
+    }
+
+    #[test]
+    fn lower_camel_input_produces_correct_pascal_name() {
+        let tmp = project_with_main(default_main());
+        plan_job(tmp.path(), "sendWelcomeEmail", &[])
+            .unwrap()
+            .execute(Flags::default())
+            .unwrap();
+
+        // File must exist and struct names must be PascalCase, not lower-camelCase.
+        let src = fs::read_to_string(tmp.path().join("src/jobs/send_welcome_email.rs")).unwrap();
+        assert!(
+            src.contains("pub struct SendWelcomeEmailArgs"),
+            "args struct must be PascalCase: {src}"
+        );
+        assert!(
+            src.contains("SendWelcomeEmailJob::NAME"),
+            "companion struct must be PascalCase: {src}"
+        );
+        assert!(
+            !src.contains("sendWelcomeEmailJob"),
+            "must not contain lower-camelCase companion: {src}"
+        );
+    }
+
+    #[test]
+    fn attachment_field_is_rejected() {
+        let tmp = project_with_main(default_main());
+        let err = plan_job(
+            tmp.path(),
+            "ProcessUpload",
+            &["avatar:Attachment".to_string()],
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, GenerateError::InvalidField { .. }),
+            "Attachment field must be rejected: {err:?}"
+        );
     }
 
     // ── Field rendering ───────────────────────────────────────────────────
