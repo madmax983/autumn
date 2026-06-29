@@ -2327,6 +2327,7 @@ mod tests {
                 name: "cleanup_probe".to_string(),
                 max_attempts: 1,
                 initial_backoff_ms: 1,
+                queue: "default".to_string(),
                 uniqueness: None,
                 concurrency: None,
                 handler: cleanup_probe_job,

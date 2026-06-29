@@ -377,6 +377,23 @@ pub fn scheduled(attr: TokenStream, item: TokenStream) -> TokenStream {
 }
 
 /// Declare an on-demand background job.
+///
+/// Route latency-sensitive work to a named queue with `queue = "..."`. Workers
+/// drain queues in the priority order configured under `[jobs] queues` in
+/// `autumn.toml`, so a flood of low-priority jobs can't delay a critical one.
+/// Jobs with no `queue` land on the `"default"` queue.
+///
+/// ```ignore
+/// #[job(queue = "critical", max_attempts = 5)]
+/// async fn send_password_reset(state: AppState, args: ResetArgs) -> AutumnResult<()> {
+///     Ok(())
+/// }
+///
+/// // autumn.toml — strict priority (or weighted: { critical = 4, default = 1 }):
+/// // [jobs]
+/// // queues = ["critical", "default", "low"]
+/// SendPasswordResetJob::enqueue(ResetArgs { user_id: 1 }).await?;
+/// ```
 #[proc_macro_attribute]
 pub fn job(attr: TokenStream, item: TokenStream) -> TokenStream {
     job::job_macro(attr.into(), item.into()).into()

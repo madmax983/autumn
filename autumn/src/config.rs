@@ -1690,6 +1690,14 @@ pub struct JobConfig {
     /// Default initial retry backoff in milliseconds.
     #[serde(default = "default_job_backoff_ms")]
     pub initial_backoff_ms: u64,
+    /// Ordered/weighted list of queues workers drain, highest priority first.
+    ///
+    /// Unset = a single `default` queue (today's behavior). A TOML array such as
+    /// `queues = ["critical", "default", "low"]` is **strict priority**; a table
+    /// such as `[jobs.queues] critical = 4` / `default = 1` is **weighted**
+    /// (probabilistic fair draining that never starves lower queues).
+    #[serde(default)]
+    pub queues: JobQueuesConfig,
     /// Redis backend options.
     #[serde(default)]
     pub redis: JobRedisConfig,
@@ -1705,9 +1713,153 @@ impl Default for JobConfig {
             workers: default_job_workers(),
             max_attempts: default_job_max_attempts(),
             initial_backoff_ms: default_job_backoff_ms(),
+            queues: JobQueuesConfig::default(),
             redis: JobRedisConfig::default(),
             postgres: JobPostgresConfig::default(),
         }
+    }
+}
+
+/// A single named queue and its draining weight.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JobQueue {
+    /// Queue name, as declared by `#[job(queue = "...")]`.
+    pub name: String,
+    /// Relative draining weight (used only for weighted draining; `1` for the
+    /// strict-priority list form).
+    pub weight: u32,
+}
+
+/// Worker queue drain configuration parsed from `[jobs] queues`.
+///
+/// Accepts **either** a TOML array (strict priority, in order) **or** a TOML
+/// table of `name = weight` (weighted, fair). Empty or unset falls back to a
+/// single `default` queue so an app that doesn't opt in behaves exactly as today.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JobQueuesConfig {
+    /// Configured queues, highest priority first.
+    pub queues: Vec<JobQueue>,
+    /// `true` for the ordered-list form (strict priority); `false` for the
+    /// weighted-table form (deficit weighted round-robin).
+    pub strict: bool,
+}
+
+impl Default for JobQueuesConfig {
+    fn default() -> Self {
+        Self::single_default()
+    }
+}
+
+impl JobQueuesConfig {
+    /// The zero-config default: one strict `default` queue.
+    #[must_use]
+    pub fn single_default() -> Self {
+        Self {
+            queues: vec![JobQueue {
+                name: "default".to_string(),
+                weight: 1,
+            }],
+            strict: true,
+        }
+    }
+
+    /// Build a strict-priority schedule from an ordered list of queue names.
+    #[must_use]
+    pub fn strict_list<I, S>(names: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let queues: Vec<JobQueue> = names
+            .into_iter()
+            .map(|name| JobQueue {
+                name: name.into(),
+                weight: 1,
+            })
+            .collect();
+        if queues.is_empty() {
+            Self::single_default()
+        } else {
+            Self {
+                queues,
+                strict: true,
+            }
+        }
+    }
+
+    /// Build a weighted schedule from `(name, weight)` pairs. Weights are
+    /// clamped to a minimum of `1` so every configured queue makes progress.
+    #[must_use]
+    pub fn weighted<I, S>(entries: I) -> Self
+    where
+        I: IntoIterator<Item = (S, u32)>,
+        S: Into<String>,
+    {
+        let queues: Vec<JobQueue> = entries
+            .into_iter()
+            .map(|(name, weight)| JobQueue {
+                name: name.into(),
+                weight: weight.max(1),
+            })
+            .collect();
+        if queues.is_empty() {
+            Self::single_default()
+        } else {
+            Self {
+                queues,
+                strict: false,
+            }
+        }
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for JobQueuesConfig {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        use serde::de::{MapAccess, SeqAccess, Visitor};
+        use std::fmt;
+
+        struct JobQueuesVisitor;
+
+        impl<'de> Visitor<'de> for JobQueuesVisitor {
+            type Value = JobQueuesConfig;
+
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str(
+                    "an ordered list of queue names (e.g. queues = [\"critical\", \"default\"]) \
+                     or a weight table (e.g. [jobs.queues] critical = 4, default = 1)",
+                )
+            }
+
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+                let mut names = Vec::new();
+                let mut seen = std::collections::HashSet::new();
+                while let Some(name) = seq.next_element::<String>()? {
+                    if !seen.insert(name.clone()) {
+                        return Err(serde::de::Error::custom(format!(
+                            "duplicate queue name '{name}' in queues list"
+                        )));
+                    }
+                    names.push(name);
+                }
+                Ok(JobQueuesConfig::strict_list(names))
+            }
+
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+                let mut entries: Vec<(String, u32)> = Vec::new();
+                while let Some((k, v)) = map.next_entry::<String, u32>()? {
+                    if v == 0 {
+                        return Err(serde::de::Error::custom(format!(
+                            "queue '{k}' weight must be at least 1 (got 0); \
+                             to disable a queue remove it from the list"
+                        )));
+                    }
+                    entries.push((k, v));
+                }
+                Ok(JobQueuesConfig::weighted(entries))
+            }
+        }
+
+        d.deserialize_any(JobQueuesVisitor)
     }
 }
 
@@ -6802,6 +6954,114 @@ path = "/healthz"
         );
         assert_eq!(config.jobs.redis.key_prefix, "demo:jobs");
         assert_eq!(config.jobs.redis.visibility_timeout_ms, 15_000);
+    }
+
+    #[test]
+    fn job_queues_defaults_to_single_default_queue() {
+        let config = AutumnConfig::default();
+        assert!(config.jobs.queues.strict);
+        assert_eq!(config.jobs.queues.queues.len(), 1);
+        assert_eq!(config.jobs.queues.queues[0].name, "default");
+        assert_eq!(config.jobs.queues.queues[0].weight, 1);
+    }
+
+    #[test]
+    fn jobs_without_queues_key_keeps_single_default_queue() {
+        let config: AutumnConfig = toml::from_str(
+            r#"
+            [jobs]
+            backend = "local"
+            workers = 4
+            "#,
+        )
+        .unwrap();
+        assert!(config.jobs.queues.strict);
+        assert_eq!(config.jobs.queues.queues.len(), 1);
+        assert_eq!(config.jobs.queues.queues[0].name, "default");
+    }
+
+    #[test]
+    fn job_queues_parse_ordered_list_as_strict_priority() {
+        let config: AutumnConfig = toml::from_str(
+            r#"
+            [jobs]
+            backend = "local"
+            queues = ["critical", "default", "low"]
+            "#,
+        )
+        .unwrap();
+        assert!(config.jobs.queues.strict, "list form is strict priority");
+        let names: Vec<&str> = config
+            .jobs
+            .queues
+            .queues
+            .iter()
+            .map(|q| q.name.as_str())
+            .collect();
+        assert_eq!(names, ["critical", "default", "low"]);
+        assert!(config.jobs.queues.queues.iter().all(|q| q.weight == 1));
+    }
+
+    #[test]
+    fn job_queues_parse_weight_map_as_weighted() {
+        let config: AutumnConfig = toml::from_str(
+            r#"
+            [jobs]
+            backend = "local"
+
+            [jobs.queues]
+            critical = 4
+            default = 2
+            low = 1
+            "#,
+        )
+        .unwrap();
+        assert!(!config.jobs.queues.strict, "map form is weighted");
+        let weight = |name: &str| {
+            config
+                .jobs
+                .queues
+                .queues
+                .iter()
+                .find(|q| q.name == name)
+                .map(|q| q.weight)
+        };
+        assert_eq!(weight("critical"), Some(4));
+        assert_eq!(weight("default"), Some(2));
+        assert_eq!(weight("low"), Some(1));
+    }
+
+    #[test]
+    fn job_queues_strict_list_rejects_duplicate_names() {
+        let err = toml::from_str::<AutumnConfig>(
+            r#"
+            [jobs]
+            queues = ["critical", "default", "critical"]
+            "#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("duplicate queue name") && err.contains("critical"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn job_queues_weighted_rejects_zero_weight() {
+        let err = toml::from_str::<AutumnConfig>(
+            r"
+            [jobs.queues]
+            critical = 4
+            default = 0
+            ",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("weight must be at least 1") && err.contains("default"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

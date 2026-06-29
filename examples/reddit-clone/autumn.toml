@@ -7,6 +7,10 @@ backend = "postgres"
 workers = 2
 max_attempts = 5
 initial_backoff_ms = 500
+# Named queues drained in strict priority order (highest first). Jobs tagged
+# with `#[job(queue = "...")]` route here; untagged jobs use "default".
+# For weighted/fair draining instead, use a table: [jobs.queues] critical = 4 ...
+queues = ["critical", "default", "low"]
 
 [log]
 level = "info"

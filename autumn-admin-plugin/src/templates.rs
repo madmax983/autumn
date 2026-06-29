@@ -683,7 +683,7 @@ fn job_row(
             td {
                 strong { (record.name) }
                 div style="font-size: 0.75rem; color: var(--text-muted);" {
-                    (record.status.label()) " · " (record.id)
+                    (record.status.label()) " · queue " (record.queue) " · " (record.id)
                     @if let Some(due) = record.scheduled_for.as_deref() {
                         " · due " (due)
                     }
@@ -2598,6 +2598,7 @@ mod tests {
                 vec![JobAdminRecord {
                     id: "job-enqueued".to_owned(),
                     name: "send_email".to_owned(),
+                    queue: "default".to_owned(),
                     status: JobAdminStatus::Enqueued,
                     enqueued_at: Some("2026-05-07T10:00:00Z".to_owned()),
                     scheduled_for: None,
@@ -2617,6 +2618,7 @@ mod tests {
                 vec![JobAdminRecord {
                     id: "job-scheduled".to_owned(),
                     name: "reminder".to_owned(),
+                    queue: "default".to_owned(),
                     status: JobAdminStatus::Scheduled,
                     enqueued_at: Some("2026-05-07T10:00:00Z".to_owned()),
                     scheduled_for: Some("2026-05-08T10:00:00Z".to_owned()),
@@ -2636,6 +2638,7 @@ mod tests {
                 vec![JobAdminRecord {
                     id: "job-running".to_owned(),
                     name: "reindex".to_owned(),
+                    queue: "default".to_owned(),
                     status: JobAdminStatus::Running,
                     enqueued_at: Some("2026-05-07T10:01:00Z".to_owned()),
                     scheduled_for: None,
@@ -2655,6 +2658,7 @@ mod tests {
                 vec![JobAdminRecord {
                     id: "job-complete".to_owned(),
                     name: "digest".to_owned(),
+                    queue: "default".to_owned(),
                     status: JobAdminStatus::Completed,
                     enqueued_at: Some("2026-05-07T09:00:00Z".to_owned()),
                     scheduled_for: None,
@@ -2674,6 +2678,7 @@ mod tests {
                 vec![JobAdminRecord {
                     id: "job-failed".to_owned(),
                     name: "send_email".to_owned(),
+                    queue: "default".to_owned(),
                     status: JobAdminStatus::Failed,
                     enqueued_at: Some("2026-05-07T08:00:00Z".to_owned()),
                     scheduled_for: None,
