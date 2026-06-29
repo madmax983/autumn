@@ -426,6 +426,22 @@ fn resolve_binary_from_metadata(
             // Otherwise prefer `default-run` so packages with multiple binaries
             // always start the right one. Mirror the same logic as `dev.rs`.
             let name = if let Some(explicit) = bin {
+                // Only accept this package when it actually owns the requested
+                // binary target — without this guard, a workspace with multiple
+                // members matching the CWD filter would always pick the first
+                // member regardless of which one owns the bin, giving the wrong
+                // manifest_dir for fingerprinting and static rendering.
+                let has_target = pkg["targets"].as_array().is_some_and(|ts| {
+                    ts.iter().any(|t| {
+                        t["name"].as_str() == Some(explicit)
+                            && t["kind"]
+                                .as_array()
+                                .is_some_and(|ks| ks.iter().any(|k| k == "bin"))
+                    })
+                });
+                if !has_target {
+                    return None;
+                }
                 explicit.to_owned()
             } else if let Some(name) = pkg["default_run"].as_str() {
                 name.to_owned()
@@ -445,9 +461,21 @@ fn resolve_binary_from_metadata(
             Some((name, dir))
         })
         .ok_or_else(|| {
-            package.map_or_else(
-                || "no binary target found in current package".to_owned(),
-                |pkg_name| format!("no binary target found in package '{pkg_name}'"),
+            bin.map_or_else(
+                || {
+                    package.map_or_else(
+                        || "no binary target found in current package".to_owned(),
+                        |pkg_name| format!("no binary target found in package '{pkg_name}'"),
+                    )
+                },
+                |explicit| {
+                    package.map_or_else(
+                        || format!("no binary target '{explicit}' found in current package"),
+                        |pkg_name| {
+                            format!("no binary target '{explicit}' found in package '{pkg_name}'")
+                        },
+                    )
+                },
             )
         })?;
 
@@ -654,6 +682,65 @@ mod tests {
         )
         .unwrap();
         assert_eq!(bin, expected_binary("/tmp/target/debug/seed"));
+    }
+
+    #[test]
+    fn resolve_binary_bin_picks_correct_workspace_member() {
+        // Without -p, autumn build --bin web from a workspace root must pick the
+        // member that actually owns bin "web", not just the first CWD-matching member.
+        let metadata = serde_json::json!({
+            "target_directory": "/workspace/target",
+            "packages": [
+                {
+                    "name": "app-a",
+                    "manifest_path": "/workspace/app-a/Cargo.toml",
+                    "targets": [{ "name": "server", "kind": ["bin"], "src_path": "/workspace/app-a/src/main.rs" }]
+                },
+                {
+                    "name": "app-b",
+                    "manifest_path": "/workspace/app-b/Cargo.toml",
+                    "targets": [{ "name": "web", "kind": ["bin"], "src_path": "/workspace/app-b/src/main.rs" }]
+                }
+            ]
+        });
+        // Both members are under the CWD (/workspace); --bin web belongs to app-b.
+        let (bin, manifest_dir) = resolve_binary_from_metadata(
+            &metadata,
+            true,
+            None,
+            Some("web"),
+            Path::new("/workspace"),
+        )
+        .unwrap();
+        assert_eq!(bin, expected_binary("/workspace/target/debug/web"));
+        assert_eq!(
+            manifest_dir,
+            Some(PathBuf::from("/workspace/app-b")),
+            "--bin web must resolve to app-b's manifest_dir, not app-a's"
+        );
+    }
+
+    #[test]
+    fn resolve_binary_bin_not_in_any_member_errors() {
+        let metadata = serde_json::json!({
+            "target_directory": "/tmp/target",
+            "packages": [{
+                "name": "app-a",
+                "manifest_path": "/workspace/app-a/Cargo.toml",
+                "targets": [{ "name": "server", "kind": ["bin"], "src_path": "/workspace/app-a/src/main.rs" }]
+            }]
+        });
+        let result = resolve_binary_from_metadata(
+            &metadata,
+            true,
+            None,
+            Some("missing-bin"),
+            Path::new("/workspace"),
+        );
+        assert!(
+            result.unwrap_err().contains("missing-bin"),
+            "error must name the missing binary target"
+        );
     }
 
     #[test]
