@@ -2470,7 +2470,8 @@ mod db_store {
         fn rotate<'a>(
             &'a self,
             raw_token: &'a str,
-        ) -> Pin<Box<dyn Future<Output = crate::AutumnResult<Option<String>>> + Send + 'a>> {
+        ) -> Pin<Box<dyn Future<Output = crate::AutumnResult<Option<String>>> + Send + 'a>>
+        {
             Box::pin(async move {
                 let old_hash = hash_api_token(raw_token);
                 let new_raw = generate_raw_token();
