@@ -545,7 +545,7 @@ enum Commands {
         /// Binary target to inspect (for packages with multiple bin targets).
         #[arg(long, value_name = "BIN")]
         bin: Option<String>,
-        /// Output format.
+        /// Output format (`table`, `json`, or `tui`).
         #[arg(long, default_value = "table", value_name = "FORMAT")]
         format: String,
         /// Show only routes whose path starts with PREFIX (positional shorthand for --filter).
@@ -3653,6 +3653,17 @@ mod tests {
         match cli.command {
             Commands::Routes { format, .. } => {
                 assert_eq!(format, "json");
+            }
+            _ => panic!("expected Routes command"),
+        }
+    }
+
+    #[test]
+    fn parse_routes_format_tui() {
+        let cli = Cli::try_parse_from(["autumn", "routes", "--format", "tui"]).unwrap();
+        match cli.command {
+            Commands::Routes { format, .. } => {
+                assert_eq!(format, "tui");
             }
             _ => panic!("expected Routes command"),
         }
