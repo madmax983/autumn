@@ -208,6 +208,20 @@ pub async fn show(id: Path<i64>, mut db: Db) -> AutumnResult<Markup> {
                 a href="/bookmarks" class="text-sm text-indigo-600 hover:underline" { "Back to list" }
             }
             (property_list(&props))
+            div class="flex gap-3 mt-6" {
+                a href=(format!("/bookmarks/{}/edit", row.id))
+                   class="bg-indigo-600 text-white px-4 py-2 rounded hover:bg-indigo-700 text-sm" {
+                    "Edit"
+                }
+                button
+                    hx-delete=(format!("/api/bookmarks/{}", row.id))
+                    hx-target="body"
+                    hx-push-url="/bookmarks"
+                    hx-confirm="Delete this bookmark?"
+                    class="bg-red-600 text-white px-4 py-2 rounded hover:bg-red-700 text-sm" {
+                    "Delete"
+                }
+            }
         },
     ))
 }

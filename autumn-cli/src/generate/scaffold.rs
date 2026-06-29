@@ -166,6 +166,7 @@ pub fn plan_scaffold_with_options(
                 &snake_name,
                 &plural,
                 &form_fields,
+                &fields,
                 options_with_key.model.sharded,
                 options_with_key.model.soft_delete,
                 options_with_key.model.id_type,
@@ -613,6 +614,7 @@ fn render_routes_file(
     snake_name: &str,
     plural: &str,
     fields: &[Field],
+    all_fields: &[Field],
     sharded: bool,
     soft_delete: bool,
     id_type: IdType,
@@ -823,7 +825,7 @@ fn render_routes_file(
     };
 
     let list_render = if live { &live_ul_render } else { &table_render };
-    let show_rows = render_show_property_rows(fields);
+    let show_rows = render_show_property_rows(all_fields);
 
     let index_handler = if sharded {
         if live {
@@ -2825,6 +2827,34 @@ async fn main() {
         assert!(
             routes.contains("\"User name\""),
             "humanize must produce 'User name': {routes}"
+        );
+    }
+
+    #[test]
+    fn show_includes_defaulted_fields_in_property_list() {
+        // Regression test: fields with `#[default]` are excluded from the
+        // form (form_fields), but must still appear in the show property list.
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "views:i64".into()],
+            "20260427000000",
+            &ScaffoldOptions {
+                model: ModelOptions {
+                    defaults: vec!["views=0".to_string()],
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+        assert!(
+            routes.contains("\"Views\""),
+            "show must include defaulted field 'views': {routes}"
         );
     }
 }
