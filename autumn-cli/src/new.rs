@@ -289,10 +289,8 @@ fn generate_inner(
     // uncovered line (as it does for the multi-line writes above).
     let ci_workflow = project_dir.join(".github/workflows/ci.yml");
     fs::write(ci_workflow, render(templates::CI_WORKFLOW))?;
-    fs::write(
-        project_dir.join("rust-toolchain.toml"),
-        render(templates::RUST_TOOLCHAIN),
-    )?;
+    let rust_toolchain = project_dir.join("rust-toolchain.toml");
+    fs::write(rust_toolchain, render(templates::RUST_TOOLCHAIN))?;
     fs::write(project_dir.join("rustfmt.toml"), render(templates::RUSTFMT))?;
     fs::write(project_dir.join("clippy.toml"), render(templates::CLIPPY))?;
 
@@ -1383,10 +1381,8 @@ mod tests {
     fn rust_toolchain_lists_rustfmt_and_clippy_components() {
         let tmp = TempDir::new().unwrap();
         generate("toolchain-comp-app", tmp.path()).unwrap();
-        let content = fs::read_to_string(
-            tmp.path().join("toolchain-comp-app/rust-toolchain.toml"),
-        )
-        .unwrap();
+        let content =
+            fs::read_to_string(tmp.path().join("toolchain-comp-app/rust-toolchain.toml")).unwrap();
         assert!(
             content.contains("rustfmt"),
             "rust-toolchain.toml must list rustfmt in components: {content}"
@@ -1412,8 +1408,7 @@ mod tests {
     fn rustfmt_toml_has_correct_edition_and_max_width() {
         let tmp = TempDir::new().unwrap();
         generate("fmt-cfg-app", tmp.path()).unwrap();
-        let content =
-            fs::read_to_string(tmp.path().join("fmt-cfg-app/rustfmt.toml")).unwrap();
+        let content = fs::read_to_string(tmp.path().join("fmt-cfg-app/rustfmt.toml")).unwrap();
         assert!(
             content.contains(r#"edition = "2024""#),
             "rustfmt.toml must set edition = \"2024\": {content}"
@@ -1439,8 +1434,7 @@ mod tests {
     fn clippy_toml_msrv_matches_rust_version() {
         let tmp = TempDir::new().unwrap();
         generate("clippy-msrv-app", tmp.path()).unwrap();
-        let content =
-            fs::read_to_string(tmp.path().join("clippy-msrv-app/clippy.toml")).unwrap();
+        let content = fs::read_to_string(tmp.path().join("clippy-msrv-app/clippy.toml")).unwrap();
         assert!(
             content.contains("msrv"),
             "clippy.toml must set msrv: {content}"
@@ -1455,8 +1449,7 @@ mod tests {
     fn gitignore_does_not_exclude_toolchain_files() {
         let tmp = TempDir::new().unwrap();
         generate("gi-toolchain-app", tmp.path()).unwrap();
-        let content =
-            fs::read_to_string(tmp.path().join("gi-toolchain-app/.gitignore")).unwrap();
+        let content = fs::read_to_string(tmp.path().join("gi-toolchain-app/.gitignore")).unwrap();
         assert!(
             !content.contains("rust-toolchain"),
             ".gitignore must NOT exclude rust-toolchain.toml: {content}"
