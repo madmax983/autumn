@@ -54,14 +54,14 @@ use super::{Flags, GenerateError, ensure_project_root};
 pub fn plan_tauri(project_root: &Path) -> Result<Plan, GenerateError> {
     ensure_project_root(project_root)?;
 
-    let package_name = read_package_name(project_root)?;
+    let (package_name, package_version) = read_package_meta(project_root)?;
     let mut plan = Plan::new(project_root);
     let tauri = project_root.join("src-tauri");
 
     // Core Tauri project files
     plan.create(
         tauri.join("tauri.conf.json"),
-        render_tauri_conf(&package_name),
+        render_tauri_conf(&package_name, &package_version),
     );
     plan.create(
         tauri.join("Cargo.toml"),
@@ -131,23 +131,32 @@ pub fn run(flags: Flags) {
     }
 }
 
-// ── Package name helper ───────────────────────────────────────────────────────
+// ── Package metadata helper ───────────────────────────────────────────────────
 
-fn read_package_name(project_root: &Path) -> Result<String, GenerateError> {
+fn read_package_meta(project_root: &Path) -> Result<(String, String), GenerateError> {
     let cargo_path = project_root.join("Cargo.toml");
     let content = std::fs::read_to_string(&cargo_path).map_err(GenerateError::Io)?;
     let doc: toml::Value = toml::from_str(&content)
         .map_err(|e| GenerateError::Config(format!("failed to parse Cargo.toml: {e}")))?;
-    doc.get("package")
-        .and_then(|p| p.get("name"))
+    let pkg = doc
+        .get("package")
+        .ok_or_else(|| GenerateError::Config("Cargo.toml missing [package].name".to_owned()))?;
+    let name = pkg
+        .get("name")
         .and_then(|n| n.as_str())
         .map(str::to_owned)
-        .ok_or_else(|| GenerateError::Config("Cargo.toml missing [package].name".to_owned()))
+        .ok_or_else(|| GenerateError::Config("Cargo.toml missing [package].name".to_owned()))?;
+    let version = pkg
+        .get("version")
+        .and_then(|v| v.as_str())
+        .unwrap_or("0.1.0")
+        .to_owned();
+    Ok((name, version))
 }
 
 // ── Content renderers ─────────────────────────────────────────────────────────
 
-fn render_tauri_conf(package_name: &str) -> String {
+fn render_tauri_conf(package_name: &str, version: &str) -> String {
     // Bundle identifier: reverse-DNS with underscores replaced by hyphens.
     // Apple's spec allows only alphanumerics, hyphens, and periods — underscores are invalid.
     let identifier = format!("com.example.{}", package_name.replace('_', "-"));
@@ -184,7 +193,7 @@ fn render_tauri_conf(package_name: &str) -> String {
         r#"{{
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "{title}",
-  "version": "0.1.0",
+  "version": "{version}",
   "identifier": "{identifier}",
   "build": {{
     "beforeBuildCommand": "{before_build_cmd}"
@@ -1039,15 +1048,27 @@ mod tests {
 
     #[test]
     fn tauri_conf_is_valid_json() {
-        let conf = render_tauri_conf("my-app");
+        let conf = render_tauri_conf("my-app", "0.1.0");
         let parsed: serde_json::Value =
             serde_json::from_str(&conf).expect("tauri.conf.json must be valid JSON");
         assert!(parsed.is_object());
     }
 
     #[test]
+    fn tauri_conf_uses_package_version() {
+        let conf = render_tauri_conf("my-app", "1.4.2");
+        let parsed: serde_json::Value = serde_json::from_str(&conf).unwrap();
+        assert_eq!(
+            parsed["version"].as_str(),
+            Some("1.4.2"),
+            "tauri.conf.json version must match [package].version from Cargo.toml, \
+             not a hardcoded 0.1.0"
+        );
+    }
+
+    #[test]
     fn tauri_conf_has_identifier() {
-        let conf = render_tauri_conf("my-app");
+        let conf = render_tauri_conf("my-app", "0.1.0");
         let parsed: serde_json::Value = serde_json::from_str(&conf).unwrap();
         assert!(
             parsed["identifier"].is_string(),
@@ -1061,7 +1082,7 @@ mod tests {
 
     #[test]
     fn tauri_conf_has_product_name() {
-        let conf = render_tauri_conf("my-app");
+        let conf = render_tauri_conf("my-app", "0.1.0");
         let parsed: serde_json::Value = serde_json::from_str(&conf).unwrap();
         assert!(
             parsed["productName"].is_string(),
@@ -1071,7 +1092,7 @@ mod tests {
 
     #[test]
     fn tauri_conf_has_external_bin() {
-        let conf = render_tauri_conf("my-app");
+        let conf = render_tauri_conf("my-app", "0.1.0");
         let parsed: serde_json::Value = serde_json::from_str(&conf).unwrap();
         let bins = parsed["bundle"]["externalBin"]
             .as_array()
@@ -1086,7 +1107,7 @@ mod tests {
 
     #[test]
     fn tauri_conf_has_icon_array() {
-        let conf = render_tauri_conf("my-app");
+        let conf = render_tauri_conf("my-app", "0.1.0");
         let parsed: serde_json::Value = serde_json::from_str(&conf).unwrap();
         let icons = parsed["bundle"]["icon"]
             .as_array()
@@ -1100,7 +1121,7 @@ mod tests {
 
     #[test]
     fn tauri_conf_has_before_build_command() {
-        let conf = render_tauri_conf("my-app");
+        let conf = render_tauri_conf("my-app", "0.1.0");
         let parsed: serde_json::Value = serde_json::from_str(&conf).unwrap();
         let cmd = parsed["build"]["beforeBuildCommand"]
             .as_str()
@@ -1361,7 +1382,7 @@ mod tests {
 
     #[test]
     fn tauri_conf_bundles_autumn_toml_as_resource() {
-        let conf = render_tauri_conf("my-app");
+        let conf = render_tauri_conf("my-app", "0.1.0");
         let parsed: serde_json::Value = serde_json::from_str(&conf).unwrap();
         // Tauri v2 resources must be a map { source_path: dest_path }, not an array.
         let resources = parsed["bundle"]["resources"]
@@ -1432,7 +1453,7 @@ mod tests {
 
     #[test]
     fn tauri_conf_identifier_replaces_underscores() {
-        let conf = render_tauri_conf("my_app");
+        let conf = render_tauri_conf("my_app", "0.1.0");
         let parsed: serde_json::Value = serde_json::from_str(&conf).unwrap();
         let id = parsed["identifier"].as_str().unwrap();
         assert!(
@@ -1447,7 +1468,7 @@ mod tests {
 
     #[test]
     fn tauri_conf_security_is_under_app() {
-        let conf = render_tauri_conf("my-app");
+        let conf = render_tauri_conf("my-app", "0.1.0");
         let parsed: serde_json::Value = serde_json::from_str(&conf).unwrap();
         assert!(
             parsed["app"]["security"].is_object(),
@@ -1814,7 +1835,7 @@ mod tests {
 
     #[test]
     fn tauri_conf_product_name_handles_underscore_separator() {
-        let conf = render_tauri_conf("my_app");
+        let conf = render_tauri_conf("my_app", "0.1.0");
         let parsed: serde_json::Value = serde_json::from_str(&conf).unwrap();
         let name = parsed["productName"].as_str().unwrap();
         assert!(
