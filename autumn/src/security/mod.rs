@@ -139,6 +139,7 @@
 
 pub mod captcha;
 pub(crate) mod config;
+pub(crate) mod constant_time;
 pub(crate) mod csrf;
 pub(crate) mod headers;
 pub mod proxy;
@@ -146,6 +147,7 @@ pub mod rate_limit;
 pub(crate) mod trusted_proxies;
 
 // Re-export commonly used types at the module level.
+pub(crate) use constant_time::{constant_time_eq, constant_time_eq_str};
 #[cfg(feature = "maud")]
 pub use captcha::bot_protection_widget;
 pub use captcha::{
