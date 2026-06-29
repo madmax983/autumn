@@ -610,13 +610,22 @@ fn setup(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {{
         // times out and exits.
         .env("AUTUMN_SERVER__UNIX_SOCKET", "")
         .env("AUTUMN_SERVE_FORCE_UNIX_SOCKET", "")
-        // Clear inherited profile-selection vars so the sidecar's compile-time
-        // AUTUMN_IS_DEBUG (baked in by #[autumn_web::main]: "0" for release
-        // builds, "1" for debug) determines the active profile.  Without this,
-        // a shell that exports AUTUMN_ENV=dev causes the installed desktop app
-        // to load dev config regardless of build mode, potentially connecting to
-        // the wrong database or skipping production security settings.
-        .env("AUTUMN_ENV", "")
+        // The sidecar binds only on loopback (AUTUMN_SERVER__HOST=127.0.0.1), but
+        // if the app's production autumn.toml sets trusted_hosts.hosts to the
+        // public domain, Autumn's trusted-host middleware would reject the webview's
+        // Host: 127.0.0.1 requests with a 400.  Override to allow loopback hosts
+        // unconditionally — the server is loopback-only so no external traffic
+        // can reach it regardless of this setting.
+        .env("AUTUMN_SECURITY__TRUSTED_HOSTS__HOSTS", "127.0.0.1,localhost")
+        // Profile selection: in a debug Tauri build (`cargo tauri dev`) the
+        // stage-sidecar script always produces a --release sidecar (AUTUMN_IS_DEBUG=0
+        // baked in → prod profile), but the developer expects dev config (dev DB,
+        // relaxed security, etc.).  Set AUTUMN_ENV=dev so the release sidecar still
+        // loads dev settings.  In a release Tauri build (`cargo tauri build`) clear
+        // it instead so the sidecar's baked-in AUTUMN_IS_DEBUG=0 selects prod.
+        .env("AUTUMN_ENV", if cfg!(debug_assertions) {{ "dev" }} else {{ "" }})
+        // Clear AUTUMN_PROFILE regardless — it is the legacy spelling of AUTUMN_ENV
+        // and should never be inherited from the calling shell environment.
         .env("AUTUMN_PROFILE", "")
         // Clear one-off mode flags inherited from the calling environment.
         // If any of these are set, AppBuilder::run() enters a non-serving mode
@@ -2132,18 +2141,50 @@ mod tests {
     #[test]
     fn lib_rs_clears_inherited_profile_env_vars() {
         let lib = render_shell_lib_rs("my-app", "my-app");
-        // If AUTUMN_ENV or AUTUMN_PROFILE is set in the shell that launches the desktop
-        // app, the sidecar would inherit it and load the wrong profile (e.g. dev config
-        // on an installed release app).  Clearing them lets the sidecar's compile-time
-        // AUTUMN_IS_DEBUG auto-detection determine the active profile.
+        // AUTUMN_ENV is set conditionally: "dev" in debug Tauri builds (cargo tauri dev)
+        // and "" in release Tauri builds (cargo tauri build), using cfg!(debug_assertions).
         assert!(
-            lib.contains("\"AUTUMN_ENV\", \"\""),
-            "lib.rs must clear AUTUMN_ENV so inherited shell profile vars don't \
-             override the sidecar's compile-time profile auto-detection"
+            lib.contains("AUTUMN_ENV") && lib.contains("cfg!(debug_assertions)"),
+            "lib.rs must set AUTUMN_ENV conditionally on cfg!(debug_assertions) \
+             so cargo tauri dev uses dev config and cargo tauri build uses prod config"
         );
         assert!(
             lib.contains("\"AUTUMN_PROFILE\", \"\""),
-            "lib.rs must clear AUTUMN_PROFILE (legacy alias) for the same reason"
+            "lib.rs must clear AUTUMN_PROFILE (legacy alias) so it is never inherited"
+        );
+    }
+
+    #[test]
+    fn lib_rs_sets_dev_profile_in_debug_tauri_builds() {
+        let lib = render_shell_lib_rs("my-app", "my-app");
+        // cargo tauri dev compiles the shell in debug mode; the sidecar is always a
+        // --release binary (AUTUMN_IS_DEBUG=0 baked in → prod profile). Setting
+        // AUTUMN_ENV=dev in cfg!(debug_assertions) makes the sidecar load dev config.
+        assert!(
+            lib.contains("\"dev\"") && lib.contains("cfg!(debug_assertions)"),
+            "lib.rs must set AUTUMN_ENV=\"dev\" when cfg!(debug_assertions) so \
+             cargo tauri dev loads dev config even though the sidecar is --release"
+        );
+    }
+
+    #[test]
+    fn lib_rs_overrides_trusted_hosts_to_loopback() {
+        let lib = render_shell_lib_rs("my-app", "my-app");
+        // Production autumn.toml may set trusted_hosts.hosts = ["example.com"].
+        // The webview connects to http://127.0.0.1:{port} (Host: 127.0.0.1) which
+        // would be rejected by the trusted-host middleware with a 400.  The shell
+        // always overrides the setting to allow loopback — the server only binds
+        // loopback so no external traffic reaches it regardless.
+        assert!(
+            lib.contains("AUTUMN_SECURITY__TRUSTED_HOSTS__HOSTS"),
+            "lib.rs must set AUTUMN_SECURITY__TRUSTED_HOSTS__HOSTS to override \
+             any production trusted-host config that would reject the webview's \
+             loopback Host header"
+        );
+        assert!(
+            lib.contains("127.0.0.1") && lib.contains("localhost"),
+            "AUTUMN_SECURITY__TRUSTED_HOSTS__HOSTS must include both 127.0.0.1 \
+             and localhost so either form of the loopback address is accepted"
         );
     }
 
