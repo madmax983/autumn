@@ -217,12 +217,16 @@ fn read_package_meta(project_root: &Path) -> Result<(String, String, String, boo
     let bin_name: String = (|| -> Result<String, GenerateError> {
         if let Some(bins) = doc.get("bin").and_then(|b| b.as_array()) {
             // Step 1: explicit [[bin]] entry whose path resolves to src/main.rs.
-            // Normalize the manifest path (strip leading "./" or ".\") before
-            // comparing so "path = './src/main.rs'" matches as well.
+            // Canonicalize by splitting on both separators and filtering empty and
+            // CurDir (".") segments so "src/./main.rs", "./src/main.rs", and
+            // "src/main.rs" all match identically.
             let main_bin = bins.iter().find(|b| {
                 b.get("path").and_then(|p| p.as_str()).is_some_and(|p| {
-                    let norm = p.trim_start_matches("./").trim_start_matches(".\\");
-                    norm == "src/main.rs" || norm == "src\\main.rs"
+                    let segs: Vec<&str> = p
+                        .split(['/', '\\'])
+                        .filter(|&s| !s.is_empty() && s != ".")
+                        .collect();
+                    segs == ["src", "main.rs"]
                 })
             });
             if let Some(n) = main_bin
@@ -464,6 +468,7 @@ tauri-build = {{ version = "2", features = [] }}
 [dependencies]
 tauri = {{ version = "2", features = [] }}
 tauri-plugin-shell = "2"
+getrandom = "0.2"
 
 [profile.release]
 panic = "abort"
@@ -583,6 +588,9 @@ fn setup(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {{
     // Postgres cluster (#1119) in db/.  Create proactively; the sidecar won't if absent.
     let app_data_dir = data_root.join("db");
     std::fs::create_dir_all(&app_data_dir)?;
+    // Per-install signing secret: autumn requires one in prod mode.  Generate 32
+    // random bytes on first launch and persist them so tokens survive restarts.
+    let signing_secret = load_or_generate_signing_secret(&data_root);
 
     // autumn.toml is bundled as a Tauri resource (see tauri.conf.json bundle.resources).
     // The sidecar's working directory is set to resource_dir so AutumnConfig finds it.
@@ -642,6 +650,9 @@ fn setup(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {{
         // unconditionally — the server is loopback-only so no external traffic
         // can reach it regardless of this setting.
         .env("AUTUMN_SECURITY__TRUSTED_HOSTS__HOSTS", "127.0.0.1,localhost")
+        // Per-install signing secret so autumn's prod-mode JWT signing always
+        // has a valid secret and doesn't abort before binding the HTTP port.
+        .env("AUTUMN_SECURITY__SIGNING_SECRET", &signing_secret)
         // Profile selection: in a debug Tauri build (`cargo tauri dev`) the
         // stage-sidecar script always produces a --release sidecar (AUTUMN_IS_DEBUG=0
         // baked in → prod profile), but the developer expects dev config (dev DB,
@@ -749,6 +760,26 @@ fn setup(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {{
 
     Ok(())
 }}
+
+/// Generate a 32-byte random signing secret on first launch, persist it to
+/// `{{data_root}}/signing_secret.txt`, and return it as a hex string.
+/// Autumn requires a signing secret in prod mode to sign JWTs / session tokens.
+/// Without this, the release sidecar calls `fail_fast_on_invalid_signing_secret`
+/// and exits before binding the HTTP port, leaving the TCP probe to time out.
+fn load_or_generate_signing_secret(data_root: &std::path::Path) -> String {{
+    let path = data_root.join("signing_secret.txt");
+    if let Ok(s) = std::fs::read_to_string(&path) {{
+        let s = s.trim().to_owned();
+        if s.len() >= 32 {{
+            return s;
+        }}
+    }}
+    let mut bytes = [0u8; 32];
+    getrandom::getrandom(&mut bytes).unwrap_or(());
+    let hex: String = bytes.iter().map(|b| format!("{{b:02x}}")).collect();
+    let _ = std::fs::write(&path, &hex);
+    hex
+}}
 "#
     )
 }
@@ -767,43 +798,36 @@ fn render_placeholder_icon_svg() -> String {
 }
 
 fn render_stage_sidecar_sh(package_name: &str, bin_name: &str, has_embed_assets: bool) -> String {
-    // When the app defines an `embed-assets` Cargo feature (as `autumn new` generates),
-    // enable it so that `#[cfg(feature = "embed-assets")]` guards in app code are
-    // satisfied and `.embedded_static()` is actually wired in.  Fall back to the
-    // dependency path when the app doesn't define its own feature alias.
+    // Use the app-level alias when present; fall back to the crate feature path.
     let embed_feature = if has_embed_assets {
         "embed-assets,autumn-web/managed-pg-bundled"
     } else {
         "autumn-web/embed-assets,autumn-web/managed-pg-bundled"
     };
+    // Only fingerprint when the app-level alias exists; `autumn build --embed` passes
+    // --features embed-assets (app-level), which fails for apps without that alias.
+    let fingerprint = if has_embed_assets {
+        format!("autumn build --embed -p {package_name}\n")
+    } else {
+        String::new()
+    };
     format!(
         r#"#!/usr/bin/env bash
-# Build the autumn server sidecar with embedded assets and managed Postgres,
-# then place it in src-tauri/binaries/ for Tauri to bundle.
-#
+# Build the autumn server sidecar (embedded assets + managed Postgres) and
+# place it in src-tauri/binaries/ for Tauri to bundle.
 # Wired into tauri.conf.json > build.beforeBuildCommand.
 # Run manually: bash src-tauri/stage-sidecar.sh
-#
-# Requires autumn features:
-#   embed-assets / autumn-web/embed-assets  (#1004 — single-binary asset embed)
-#   autumn-web/managed-pg-bundled           (#1119 — bundled Postgres, no external install)
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${{BASH_SOURCE[0]}}")" && pwd)"
 APP_DIR="$(dirname "$SCRIPT_DIR")"
 cd "$APP_DIR"
-# TAURI_ENV_TARGET_TRIPLE is set by `cargo tauri build` for cross-compilation;
-# fall back to the host triple when running the script manually.
+# TAURI_ENV_TARGET_TRIPLE is set by Tauri for cross-compilation; fall back to host.
 TARGET_TRIPLE="${{TAURI_ENV_TARGET_TRIPLE:-$(rustc -Vv | awk '/^host/{{print $2}}')}}";
-# Resolve the real Cargo output directory.  Workspace members share the workspace
-# root's target/ and CARGO_TARGET_DIR / .cargo/config.toml can redirect it.
+# Resolve Cargo output dir (CARGO_TARGET_DIR or workspace target/).
 TARGET_DIR="${{CARGO_TARGET_DIR:-$(cargo metadata --no-deps --format-version 1 --quiet \
     | sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')}}"
 mkdir -p src-tauri/binaries
-# Fingerprint static/ before the embed compile (mirrors autumn build --embed phases 1-2):
-# compile → write .autumn-manifest.json → the target-specific cargo build below embeds it.
-autumn build --embed -p {package_name}
-# universal-apple-darwin is a Tauri meta-target, not a rustc triple.  Build both
-# Darwin slices separately and combine with lipo(1) into a fat binary.
+{fingerprint}# universal-apple-darwin: build both Darwin slices and lipo them together.
 if [ "${{TARGET_TRIPLE}}" = "universal-apple-darwin" ]; then
     for ARCH in x86_64-apple-darwin aarch64-apple-darwin; do
         cargo build --release --target "$ARCH" --bin {bin_name} \
@@ -879,6 +903,15 @@ fn render_stage_sidecar_ps1(package_name: &str, bin_name: &str, has_embed_assets
     } else {
         "autumn-web/embed-assets,autumn-web/managed-pg-bundled"
     };
+    let fingerprint = if has_embed_assets {
+        format!(
+            "# Fingerprint static/ before the embed compile (mirrors autumn build --embed phases 1-2):\n\
+             # compile → write .autumn-manifest.json → the cargo build below embeds it.\n\
+             autumn build --embed -p {package_name}\n"
+        )
+    } else {
+        String::new()
+    };
     format!(
         r#"# Build the autumn server sidecar with embedded assets and managed Postgres,
 # then place it in src-tauri\binaries\ for Tauri to bundle.
@@ -902,12 +935,7 @@ $TargetDir = $Env:CARGO_TARGET_DIR
 if (-not $TargetDir) {{
     $TargetDir = (cargo metadata --no-deps --format-version 1 --quiet | ConvertFrom-Json).target_directory
 }}
-# Fingerprint static/ so include_dir! bakes current hashed asset URLs into the sidecar.
-# autumn build --embed runs: compile → fingerprint static/ → embed compile (host arch).
-# The target-specific cargo build below then bakes the fingerprinted tree.
-# autumn must be installed: cargo install autumn-cli (already needed for `autumn generate`).
-autumn build --embed -p {package_name}
-New-Item -ItemType Directory -Force -Path src-tauri\binaries | Out-Null
+{fingerprint}New-Item -ItemType Directory -Force -Path src-tauri\binaries | Out-Null
 cargo build --release --target "$TargetTriple" --bin {bin_name} `
   --features {embed_feature}
 Copy-Item "$TargetDir\$TargetTriple\release\{bin_name}.exe" `
@@ -1107,6 +1135,23 @@ mod tests {
             format!(
                 "[package]\nname=\"{pkg_name}\"\nversion=\"0.1.0\"\nedition=\"2024\"\n\
                  \n[[bin]]\nname=\"{bin_name}\"\npath=\"./src/main.rs\"\n\
+                 \n[dependencies]\nautumn-web = \"0.5.0\"\n"
+            ),
+        )
+        .unwrap();
+        fs::create_dir_all(tmp.path().join("src")).unwrap();
+        fs::write(tmp.path().join("src/main.rs"), "fn main() {}\n").unwrap();
+        tmp
+    }
+
+    /// Project whose `[[bin]] path` contains a middle `.` component (`src/./main.rs`).
+    fn project_with_middle_dot_bin(pkg_name: &str, bin_name: &str) -> TempDir {
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join("Cargo.toml"),
+            format!(
+                "[package]\nname=\"{pkg_name}\"\nversion=\"0.1.0\"\nedition=\"2024\"\n\
+                 \n[[bin]]\nname=\"{bin_name}\"\npath=\"src/./main.rs\"\n\
                  \n[dependencies]\nautumn-web = \"0.5.0\"\n"
             ),
         )
@@ -1637,6 +1682,34 @@ mod tests {
         assert!(
             !sh.contains("--bin my-app"),
             "generator must not fall back to package name for a ./src/main.rs [[bin]] path"
+        );
+    }
+
+    #[test]
+    fn plan_normalizes_middle_dot_bin_path() {
+        // [[bin]] path = "src/./main.rs" (CurDir component in the middle) must
+        // canonicalize to src/main.rs, identifying it as the main binary entry point.
+        let tmp = project_with_middle_dot_bin("my-app", "my-server");
+        let plan = plan_tauri(tmp.path()).unwrap();
+        let sh: &str = plan
+            .actions
+            .iter()
+            .find(|a| a.path().to_string_lossy().ends_with("stage-sidecar.sh"))
+            .and_then(|a| {
+                if let crate::generate::emit::Action::Create { contents, .. } = a {
+                    Some(contents.as_str())
+                } else {
+                    None
+                }
+            })
+            .expect("stage-sidecar.sh action not found");
+        assert!(
+            sh.contains("my-server"),
+            "[[bin]] with path='src/./main.rs' must resolve to the custom bin name (not package name)"
+        );
+        assert!(
+            !sh.contains("--bin my-app"),
+            "generator must canonicalize 'src/./main.rs' and not fall back to the package name"
         );
     }
 
@@ -2366,6 +2439,45 @@ mod tests {
             lib.contains("data_root") && lib.contains("join(\"blobs\")"),
             "AUTUMN_STORAGE__LOCAL__ROOT must point to a writable subdirectory of \
              app_data_dir (e.g. data_root.join(\"blobs\")), not the read-only resource_dir"
+        );
+    }
+
+    #[test]
+    fn lib_rs_generates_per_install_signing_secret() {
+        let lib = render_shell_lib_rs("my-app", "my-app");
+        assert!(
+            lib.contains("load_or_generate_signing_secret"),
+            "lib.rs must define load_or_generate_signing_secret() so a per-install signing \
+             secret is generated on first launch; without it, autumn's prod mode calls \
+             fail_fast_on_invalid_signing_secret and aborts before binding the HTTP port"
+        );
+        assert!(
+            lib.contains("getrandom::getrandom"),
+            "load_or_generate_signing_secret must use getrandom to produce cryptographic \
+             randomness; a weak source would allow signing secret prediction"
+        );
+        assert!(
+            lib.contains("signing_secret.txt"),
+            "load_or_generate_signing_secret must persist the secret to a file so it \
+             survives app restarts; re-generating on every launch would invalidate all \
+             existing sessions"
+        );
+    }
+
+    #[test]
+    fn lib_rs_sets_signing_secret_env_var() {
+        let lib = render_shell_lib_rs("my-app", "my-app");
+        assert!(
+            lib.contains("AUTUMN_SECURITY__SIGNING_SECRET"),
+            "lib.rs must pass AUTUMN_SECURITY__SIGNING_SECRET to the sidecar; without it \
+             autumn's prod mode calls fail_fast_on_invalid_signing_secret and exits before \
+             binding the HTTP port, causing the TCP health probe to time out"
+        );
+        // The env var must be set using the local signing_secret variable.
+        assert!(
+            lib.contains("signing_secret"),
+            "AUTUMN_SECURITY__SIGNING_SECRET must be sourced from the signing_secret local \
+             variable returned by load_or_generate_signing_secret"
         );
     }
 
