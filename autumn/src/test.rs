@@ -225,7 +225,7 @@ pub struct SentMail {
 #[cfg(feature = "mail")]
 impl From<&crate::mail::Mail> for SentMail {
     fn from(m: &crate::mail::Mail) -> Self {
-        SentMail {
+        Self {
             from: m.from.clone(),
             reply_to: m.reply_to.clone(),
             to: m.to.clone(),
@@ -1309,11 +1309,11 @@ impl TestApp {
             let effective: std::sync::Arc<dyn crate::interceptor::MailInterceptor> =
                 if let Some(user) = self.mail_interceptor {
                     std::sync::Arc::new(ChainedMailInterceptor {
-                        first: recorder.clone(),
+                        first: recorder,
                         second: user,
                     })
                 } else {
-                    recorder.clone()
+                    recorder
                 };
             state.insert_extension(effective);
         }
@@ -1734,7 +1734,7 @@ impl TestClient {
     pub fn assert_email_sent(&self, predicate: impl Fn(&SentMail) -> bool) -> &Self {
         let sent = self.sent_mail();
         assert!(
-            sent.iter().any(|m| predicate(m)),
+            sent.iter().any(predicate),
             "no sent email matched the predicate;\nactually sent: {sent:#?}",
         );
         self
