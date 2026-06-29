@@ -215,11 +215,14 @@ where
         parts: &mut Parts,
         _state: &S,
     ) -> impl Future<Output = Result<Self, Self::Rejection>> + Send {
+        // When SessionLayer is absent (e.g. service-token-only routes that use
+        // RequireApiToken but not a session cookie), fall back to an empty guest
+        // session so scoped policy checks can still run on token scopes alone.
         let session = parts
             .extensions
             .get::<Self>()
             .cloned()
-            .expect("SessionLayer must be installed to use the Session extractor");
+            .unwrap_or_else(|| Session::new(String::new(), HashMap::new()));
         async move { Ok(session) }
     }
 }
