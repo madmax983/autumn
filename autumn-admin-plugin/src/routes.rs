@@ -653,7 +653,7 @@ async fn model_create(
     let (pool, model) = resolve(&state, &registry, &slug)?;
 
     let fields = model.fields();
-    let form_data = coerce_form_fields(strip_meta_fields(form_data, &fields), &fields);
+    let form_data = coerce_form_fields(strip_meta_fields(form_data, &fields, false), &fields);
     let record = model
         .create(&pool, form_data)
         .await
@@ -830,7 +830,7 @@ async fn model_update(
     let (pool, model) = resolve(&state, &registry, &slug)?;
 
     let fields = model.fields();
-    let form_data = coerce_form_fields(strip_meta_fields(form_data, &fields), &fields);
+    let form_data = coerce_form_fields(strip_meta_fields(form_data, &fields, true), &fields);
     model
         .update(&pool, id, form_data)
         .await
@@ -1279,7 +1279,7 @@ async fn config_key_history(
 
 /// Filter incoming form data down to fields the model declared as editable.
 ///
-/// Enforcement (all three are necessary):
+/// Enforcement (all four are necessary):
 ///
 /// 1. **Drop underscore-prefixed keys** (`_csrf` and similar form internals).
 /// 2. **Drop keys not declared in `fields`** so a crafted POST can't inject
@@ -1287,12 +1287,15 @@ async fn config_key_history(
 /// 3. **Drop keys whose `AdminField::editable = false`** so read-only columns
 ///    (`id`, `created_at`, computed fields, privilege flags) can't be
 ///    overwritten by admins submitting tampered forms.
-/// 4. **Drop blank string values on declared `Password` fields** so "leave
+/// 4. **Drop `create_only` keys on update** so immutable-after-create fields
+///    (e.g. `principal_id`, `expires_at`) can't be silently ignored while
+///    an admin thinks they've changed them.
+/// 5. **Drop blank string values on declared `Password` fields** so "leave
 ///    blank to keep current" doesn't wipe stored hashes.
 ///
 /// The UI's readonly contract is the source of truth: if the admin didn't
 /// declare a field as editable, model code never sees it.
-fn strip_meta_fields(mut data: Value, fields: &[AdminField]) -> Value {
+fn strip_meta_fields(mut data: Value, fields: &[AdminField], for_update: bool) -> Value {
     if let Some(obj) = data.as_object_mut() {
         obj.retain(|k, v| {
             if k.starts_with('_') {
@@ -1312,6 +1315,12 @@ fn strip_meta_fields(mut data: Value, fields: &[AdminField]) -> Value {
             }
             if !field.editable {
                 // Readonly field — drop it regardless of submitted value.
+                return false;
+            }
+            if for_update && field.create_only {
+                // Immutable-after-create field — drop on update so the model
+                // never sees it and the admin can't be misled into thinking
+                // the change was persisted.
                 return false;
             }
             // Drop blank string values on Password fields so admins editing
@@ -1478,7 +1487,7 @@ mod tests {
     #[test]
     fn strip_meta_removes_csrf_and_underscore_fields() {
         let input = json!({"name": "x", "_csrf": "t", "_foo": 1});
-        let out = strip_meta_fields(input, &fields(&[("name", AdminFieldKind::Text)]));
+        let out = strip_meta_fields(input, &fields(&[("name", AdminFieldKind::Text)]), false);
         assert_eq!(out, json!({"name": "x"}));
     }
 
@@ -1488,10 +1497,10 @@ mod tests {
             ("password", AdminFieldKind::Password),
             ("other", AdminFieldKind::Text),
         ]);
-        let out = strip_meta_fields(json!({"password": "", "other": "y"}), &fields);
+        let out = strip_meta_fields(json!({"password": "", "other": "y"}), &fields, false);
         assert_eq!(out, json!({"other": "y"}));
 
-        let out = strip_meta_fields(json!({"password": "hunter2", "other": "y"}), &fields);
+        let out = strip_meta_fields(json!({"password": "hunter2", "other": "y"}), &fields, false);
         assert_eq!(out, json!({"password": "hunter2", "other": "y"}));
     }
 
@@ -1500,7 +1509,7 @@ mod tests {
         // Regression: the old name-heuristic version missed this.
         // A field called "secret" declared as Password must still be stripped.
         let fields = fields(&[("secret", AdminFieldKind::Password)]);
-        let out = strip_meta_fields(json!({"secret": ""}), &fields);
+        let out = strip_meta_fields(json!({"secret": ""}), &fields, false);
         assert_eq!(out, json!({}));
     }
 
@@ -1510,7 +1519,7 @@ mod tests {
             ("name", AdminFieldKind::Text),
             ("bio", AdminFieldKind::TextArea),
         ]);
-        let out = strip_meta_fields(json!({"name": "", "bio": ""}), &fields);
+        let out = strip_meta_fields(json!({"name": "", "bio": ""}), &fields, false);
         assert_eq!(out, json!({"name": "", "bio": ""}));
     }
 
@@ -1772,7 +1781,7 @@ mod tests {
         // but legal), we should NOT drop the empty string — the model gets to
         // decide. Only `AdminFieldKind::Password` triggers the strip.
         let fields = fields(&[("password", AdminFieldKind::Text)]);
-        let out = strip_meta_fields(json!({"password": ""}), &fields);
+        let out = strip_meta_fields(json!({"password": ""}), &fields, false);
         assert_eq!(out, json!({"password": ""}));
     }
 
@@ -1783,7 +1792,7 @@ mod tests {
         // that doesn't expose it).
         let fields = fields(&[("name", AdminFieldKind::Text)]);
         let input = json!({"name": "x", "is_admin": true, "raw_column": "y"});
-        let out = strip_meta_fields(input, &fields);
+        let out = strip_meta_fields(input, &fields, false);
         assert_eq!(out, json!({"name": "x"}));
     }
 
@@ -1796,8 +1805,25 @@ mod tests {
         let mut hidden = AdminField::new("owner_id", AdminFieldKind::Hidden);
         hidden.editable = true; // deliberately wrong
         let schema = vec![hidden];
-        let out = strip_meta_fields(json!({"owner_id": 999}), &schema);
+        let out = strip_meta_fields(json!({"owner_id": 999}), &schema, false);
         assert_eq!(out, json!({}));
+    }
+
+    #[test]
+    fn strip_meta_drops_create_only_fields_on_update_but_keeps_on_create() {
+        let mut principal = AdminField::new("principal_id", AdminFieldKind::Text);
+        principal.create_only = true;
+        let name = AdminField::new("name", AdminFieldKind::Text);
+        let schema = vec![principal, name];
+        let input = json!({"principal_id": "svc:x", "name": "my-token"});
+
+        // create context — create_only field is kept
+        let out = strip_meta_fields(input.clone(), &schema, false);
+        assert_eq!(out, json!({"principal_id": "svc:x", "name": "my-token"}));
+
+        // update context — create_only field is dropped
+        let out = strip_meta_fields(input, &schema, true);
+        assert_eq!(out, json!({"name": "my-token"}));
     }
 
     #[test]
@@ -1816,7 +1842,7 @@ mod tests {
             "created_at": "2026-01-01T00:00:00Z",
             "name": "legit",
         });
-        let out = strip_meta_fields(input, &schema);
+        let out = strip_meta_fields(input, &schema, false);
         assert_eq!(out, json!({"name": "legit"}));
     }
 

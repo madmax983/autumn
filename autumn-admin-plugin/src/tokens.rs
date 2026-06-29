@@ -53,13 +53,15 @@ impl AdminModel for TokenAdminModel {
                 .searchable(),
             AdminField::new("principal_id", AdminFieldKind::Text)
                 .label("Principal")
-                .searchable(),
+                .searchable()
+                .create_only(),
             AdminField::new("scopes", AdminFieldKind::TextArea)
                 .label("Scopes (JSON array)")
                 .optional(),
             AdminField::new("expires_at", AdminFieldKind::DateTime)
                 .label("Expires At")
-                .optional(),
+                .optional()
+                .create_only(),
             AdminField::new("last_used_at", AdminFieldKind::DateTime)
                 .label("Last Used")
                 .readonly()

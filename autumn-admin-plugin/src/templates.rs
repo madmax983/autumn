@@ -1471,11 +1471,17 @@ pub fn model_form_page(
                     div class="form-group" {
                         label class="form-label" for=(field.name) {
                             (field.label)
-                            @if field.required {
+                            @if field.required && !(is_edit && field.create_only) {
                                 span class="required" { "*" }
                             }
                         }
-                        (render_form_widget(field, record))
+                        @if is_edit && field.create_only {
+                            // Immutable-after-create: show current value as read-only text
+                            // so the admin can see it but cannot change it.
+                            (render_readonly_display(field, record))
+                        } @else {
+                            (render_form_widget(field, record))
+                        }
                     }
                 }
 
@@ -1909,6 +1915,28 @@ fn render_detail_value(record: &Value, field: &AdminField) -> Markup {
                 (serde_json::to_string_pretty(v).unwrap_or_default())
             }
         },
+    }
+}
+
+/// Render a read-only display for a create-only field on the edit form.
+///
+/// Shows the current value as static text with no form control so the admin
+/// can see it but cannot alter it (and it is never submitted to the server).
+fn render_readonly_display(field: &AdminField, record: Option<&Value>) -> Markup {
+    let value = record
+        .and_then(|r| r.get(field.name))
+        .map(|v| match v {
+            Value::String(s) => s.clone(),
+            other => other.to_string(),
+        })
+        .unwrap_or_default();
+    html! {
+        p class="form-static-value" style="margin: 0; padding: 0.375rem 0; color: #555;" {
+            (value)
+        }
+        small class="form-help" style="color: #888;" {
+            "This field cannot be changed after creation."
+        }
     }
 }
 
