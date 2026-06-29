@@ -1394,7 +1394,6 @@ enum GenerateCommands {
         name: String,
         /// Fields for the args struct in `name:Type` format
         /// (e.g. `user_id:i64 email:String`).
-        #[arg(trailing_var_arg = true)]
         fields: Vec<String>,
         /// Print the file plan and exit without writing anything.
         #[arg(long)]

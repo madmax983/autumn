@@ -11,7 +11,7 @@
 
 use std::path::Path;
 
-use super::dsl::{Field, parse_fields};
+use super::dsl::{Field, FieldKind, parse_fields};
 use super::emit::Plan;
 use super::model::validate_resource_name;
 use super::naming::{pascal, snake};
@@ -20,8 +20,29 @@ use super::schema_edit::{
 };
 use super::{Flags, GenerateError, ensure_project_root, read_or_empty};
 
-/// Extra Cargo dependencies the job generator's output requires.
-const JOB_DEPS: &[(&str, &str)] = &[("serde", "{ version = \"1\", features = [\"derive\"] }")];
+/// Cargo dependencies always required by generated job files.
+const JOB_DEPS_BASE: &[(&str, &str)] = &[("serde", "{ version = \"1\", features = [\"derive\"] }")];
+
+/// Extra deps needed when the args struct uses `uuid::Uuid` fields.
+const JOB_DEPS_UUID: (&str, &str) = ("uuid", "{ version = \"1\", features = [\"serde\"] }");
+
+/// Extra deps needed when the args struct uses `chrono` date/time fields.
+const JOB_DEPS_CHRONO: (&str, &str) = ("chrono", "{ version = \"0.4\", features = [\"serde\"] }");
+
+/// Build the complete dep list for a job based on which field types are used.
+fn job_deps(fields: &[Field]) -> Vec<(&'static str, &'static str)> {
+    let mut deps: Vec<(&str, &str)> = JOB_DEPS_BASE.to_vec();
+    if fields.iter().any(|f| matches!(f.kind, FieldKind::Uuid)) {
+        deps.push(JOB_DEPS_UUID);
+    }
+    if fields
+        .iter()
+        .any(|f| matches!(f.kind, FieldKind::NaiveDateTime | FieldKind::DateTime))
+    {
+        deps.push(JOB_DEPS_CHRONO);
+    }
+    deps
+}
 
 /// Compute the file actions for `autumn generate job`.
 ///
@@ -68,8 +89,8 @@ pub fn plan_job(project_root: &Path, name: &str, fields: &[String]) -> Result<Pl
     let updated_main = add_jobs_registration_to_app(&with_mod);
     plan.modify(main_path, updated_main);
 
-    // ── Cargo.toml: ensure serde dep ──────────────────────────────────────
-    super::model::plan_cargo_deps(&mut plan, project_root, JOB_DEPS);
+    // ── Cargo.toml: ensure serde (always) plus uuid/chrono if used ───────
+    super::model::plan_cargo_deps(&mut plan, project_root, &job_deps(&parsed_fields));
 
     Ok(plan)
 }
@@ -632,6 +653,63 @@ async fn main() {
         assert!(
             cargo.contains("serde"),
             "Cargo.toml must include serde: {cargo}"
+        );
+    }
+
+    #[test]
+    fn uuid_field_adds_uuid_dep_to_cargo_toml() {
+        let tmp = project_with_main(default_main());
+        plan_job(tmp.path(), "ProcessUser", &["user_id:Uuid".to_string()])
+            .unwrap()
+            .execute(Flags::default())
+            .unwrap();
+
+        let cargo = fs::read_to_string(tmp.path().join("Cargo.toml")).unwrap();
+        assert!(
+            cargo.contains("uuid"),
+            "Cargo.toml must include uuid: {cargo}"
+        );
+    }
+
+    #[test]
+    fn datetime_field_adds_chrono_dep_to_cargo_toml() {
+        let tmp = project_with_main(default_main());
+        plan_job(
+            tmp.path(),
+            "ScheduleReport",
+            &["run_at:NaiveDateTime".to_string()],
+        )
+        .unwrap()
+        .execute(Flags::default())
+        .unwrap();
+
+        let cargo = fs::read_to_string(tmp.path().join("Cargo.toml")).unwrap();
+        assert!(
+            cargo.contains("chrono"),
+            "Cargo.toml must include chrono: {cargo}"
+        );
+    }
+
+    #[test]
+    fn primitive_fields_do_not_add_uuid_or_chrono() {
+        let tmp = project_with_main(default_main());
+        plan_job(
+            tmp.path(),
+            "SendWelcomeEmail",
+            &["user_id:i64".to_string(), "email:String".to_string()],
+        )
+        .unwrap()
+        .execute(Flags::default())
+        .unwrap();
+
+        let cargo = fs::read_to_string(tmp.path().join("Cargo.toml")).unwrap();
+        assert!(
+            !cargo.contains("uuid"),
+            "Cargo.toml must not include uuid for primitive fields"
+        );
+        assert!(
+            !cargo.contains("chrono"),
+            "Cargo.toml must not include chrono for primitive fields"
         );
     }
 }
