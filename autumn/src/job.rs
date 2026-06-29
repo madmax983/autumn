@@ -6,7 +6,13 @@
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, OnceLock, RwLock};
+#[cfg(not(loom))]
+pub(crate) use std::sync::{Arc, OnceLock, RwLock};
+
+#[cfg(loom)]
+pub(crate) use loom::sync::{Arc, RwLock};
+#[cfg(loom)]
+pub(crate) use std::sync::OnceLock;
 
 use futures::FutureExt as _;
 #[cfg(feature = "redis")]
@@ -1740,22 +1746,16 @@ pub(crate) fn install_job_client(state: &AppState, client: JobClient) {
 }
 
 pub(crate) fn init_global_job_client(client: JobClient) {
-    if let Some(lock) = GLOBAL_JOB_CLIENT.get() {
-        if let Ok(mut guard) = lock.write() {
-            *guard = Some(Arc::new(client));
-        }
-        return;
+    let lock = GLOBAL_JOB_CLIENT.get_or_init(|| RwLock::new(None));
+    if let Ok(mut guard) = lock.write() {
+        *guard = Some(Arc::new(client));
     }
-    let _ = GLOBAL_JOB_CLIENT.set(RwLock::new(Some(Arc::new(client))));
 }
 
 pub fn clear_global_job_client() {
-    if let Some(lock) = GLOBAL_JOB_CLIENT.get() {
-        if let Ok(mut guard) = lock.write() {
-            *guard = None;
-        }
-    } else {
-        let _ = GLOBAL_JOB_CLIENT.set(RwLock::new(None));
+    let lock = GLOBAL_JOB_CLIENT.get_or_init(|| RwLock::new(None));
+    if let Ok(mut guard) = lock.write() {
+        *guard = None;
     }
 }
 
@@ -7164,6 +7164,49 @@ mod tests {
             .expect("snapshot after operations");
         assert!(snapshot.failed.records.is_empty());
         assert!(snapshot.enqueued.records.is_empty());
+    }
+
+    #[test]
+    fn chaos_job_client_loom() {
+        #[cfg(loom)]
+        loom::model(|| {
+            let registry = crate::actuator::JobRegistry::new();
+            let admin = JobAdminMemoryBackend::new_for_test(32);
+            let client = JobClient {
+                local_sender: None,
+                local_coordination: None,
+                #[cfg(feature = "redis")]
+                redis: None,
+                #[cfg(feature = "db")]
+                pg_pool: None,
+                registry,
+                job_admin: admin,
+                default_max_attempts: 3,
+                default_initial_backoff_ms: 250,
+                per_job_settings: std::collections::HashMap::new(),
+                interceptor: None,
+                resilience_config: None,
+            };
+
+            let t1 = loom::thread::spawn({
+                let c = client.clone();
+                move || {
+                    init_global_job_client(c);
+                }
+            });
+
+            let t2 = loom::thread::spawn(|| {
+                clear_global_job_client();
+            });
+
+            let t3 = loom::thread::spawn(|| {
+                let _ = global_job_client();
+            });
+
+            t1.join().unwrap();
+            t2.join().unwrap();
+            t3.join().unwrap();
+        });
     }
 
     #[tokio::test]
