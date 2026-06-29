@@ -172,25 +172,48 @@ fn read_package_meta(project_root: &Path) -> Result<(String, String, String), Ge
 
     // Derive the binary target name from [[bin]] sections.  When a custom name
     // is set, `cargo build` writes that name (not the package name) under
-    // `target/.../release/`.  Prefer the bin whose path is `src/main.rs`
-    // (the primary entry point), then fall back to the first declared bin, then
-    // the package name (the Cargo default when no [[bin]] is declared).
-    let bin_name = doc
-        .get("bin")
-        .and_then(|b| b.as_array())
-        .and_then(|bins| {
+    // `target/.../release/`.
+    //
+    // Priority:
+    //   1. A [[bin]] entry whose path is explicitly `src/main.rs` (renamed main).
+    //   2. If `src/main.rs` exists on disk but isn't in [[bin]], Cargo auto-discovers
+    //      it under the package name; any explicit [[bin]] entries are auxiliary bins
+    //      and must NOT override the primary target.
+    //   3. The first (and only) [[bin]] when there is no `src/main.rs` at all.
+    //   4. The package name (Cargo default when no [[bin]] is declared).
+    let bin_name = {
+        let explicit_bins = doc.get("bin").and_then(|b| b.as_array());
+        if let Some(bins) = explicit_bins {
+            // Step 1: explicit [[bin]] entry whose path is src/main.rs.
             bins.iter()
                 .find(|b| {
                     b.get("path")
                         .and_then(|p| p.as_str())
                         .is_some_and(|p| p == "src/main.rs" || p == "src\\main.rs")
                 })
-                .or_else(|| bins.first())
                 .and_then(|b| b.get("name"))
                 .and_then(|n| n.as_str())
-        })
-        .unwrap_or(&name)
-        .to_owned();
+                .map(str::to_owned)
+                .or_else(|| {
+                    if project_root.join("src/main.rs").is_file() {
+                        // Step 2: src/main.rs exists but is not declared in [[bin]];
+                        // Cargo auto-discovers it as the package-named binary.
+                        // The [[bin]] entries are for other auxiliary programs.
+                        Some(name.clone())
+                    } else {
+                        // Step 3: no src/main.rs — the first declared bin IS the app.
+                        bins.first()
+                            .and_then(|b| b.get("name"))
+                            .and_then(|n| n.as_str())
+                            .map(str::to_owned)
+                    }
+                })
+                .unwrap_or_else(|| name.clone())
+        } else {
+            // Step 4: no [[bin]] at all — package name is the binary name.
+            name.clone()
+        }
+    };
 
     Ok((name, version, bin_name))
 }
@@ -645,6 +668,12 @@ fi
 # BOTH names so the profile resolves correctly regardless of AUTUMN_ENV spelling,
 # avoiding an empty stub from shadowing real config in the other alias.
 mkdir -p src-tauri/configs
+# Ensure autumn.toml exists at the project root — tauri.conf.json always
+# lists it as a bundle resource.  Projects without a config file use
+# AutumnConfig defaults; an empty TOML is a valid no-op.
+if [ ! -f "autumn.toml" ]; then
+    : > autumn.toml
+fi
 # prod/production alias pair
 if [ -f "autumn-prod.toml" ] && [ -f "autumn-production.toml" ]; then
     cp autumn-prod.toml src-tauri/configs/autumn-prod.toml
@@ -726,6 +755,12 @@ Write-Host "Staged: src-tauri/binaries/{bin_name}-$TargetTriple.exe"
 # BOTH names so the profile resolves correctly regardless of AUTUMN_ENV spelling,
 # avoiding an empty stub from shadowing real config in the other alias.
 New-Item -ItemType Directory -Force -Path src-tauri\configs | Out-Null
+# Ensure autumn.toml exists at the project root — tauri.conf.json always
+# lists it as a bundle resource.  Projects without a config file use
+# AutumnConfig defaults; an empty TOML is a valid no-op.
+if (-not (Test-Path autumn.toml)) {{
+    New-Item -ItemType File -Force -Path autumn.toml | Out-Null
+}}
 # prod/production alias pair
 if ((Test-Path autumn-prod.toml) -and (Test-Path autumn-production.toml)) {{
     Copy-Item autumn-prod.toml src-tauri\configs\autumn-prod.toml
@@ -891,6 +926,28 @@ mod tests {
         .unwrap();
         fs::create_dir_all(tmp.path().join("src")).unwrap();
         fs::write(tmp.path().join("src/main.rs"), "fn main() {}\n").unwrap();
+        tmp
+    }
+
+    /// Project with src/main.rs (the primary autumn binary, auto-discovered by
+    /// Cargo under the package name) plus an auxiliary [[bin]] for a background
+    /// worker.  The generator must pick the package-named binary, not the worker.
+    fn project_with_aux_bin(pkg_name: &str, worker_name: &str) -> TempDir {
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join("Cargo.toml"),
+            format!(
+                "[package]\nname=\"{pkg_name}\"\nversion=\"0.1.0\"\nedition=\"2024\"\n\
+                 \n[[bin]]\nname=\"{worker_name}\"\npath=\"src/worker.rs\"\n\
+                 \n[dependencies]\nautumn-web = \"0.5.0\"\n"
+            ),
+        )
+        .unwrap();
+        fs::create_dir_all(tmp.path().join("src")).unwrap();
+        // Auto-discovered primary binary (NOT listed in [[bin]]).
+        fs::write(tmp.path().join("src/main.rs"), "fn main() {}\n").unwrap();
+        // The explicit auxiliary bin.
+        fs::write(tmp.path().join("src/worker.rs"), "fn main() {}\n").unwrap();
         tmp
     }
 
@@ -1255,6 +1312,58 @@ mod tests {
             parsed["version"].as_str(),
             Some("3.1.4"),
             "tauri.conf.json must use the resolved workspace version, not fall back to 0.1.0"
+        );
+    }
+
+    #[test]
+    fn plan_aux_bin_does_not_override_main_binary() {
+        // A project with src/main.rs (auto-discovered as the primary binary, package
+        // name) plus an auxiliary [[bin]] for a worker should stage the package-named
+        // binary, NOT the worker.
+        let tmp = project_with_aux_bin("my-app", "worker");
+        let plan = plan_tauri(tmp.path()).unwrap();
+        let sh: &str = plan
+            .actions
+            .iter()
+            .find(|a| a.path().to_string_lossy().ends_with("stage-sidecar.sh"))
+            .and_then(|a| {
+                if let crate::generate::emit::Action::Create { contents, .. } = a {
+                    Some(contents.as_str())
+                } else {
+                    None
+                }
+            })
+            .expect("stage-sidecar.sh action not found");
+        assert!(
+            sh.contains("my-app"),
+            "stage-sidecar.sh must use the package (primary) binary name when src/main.rs is auto-discovered"
+        );
+        assert!(
+            !sh.contains("/release/worker") && !sh.contains("--bin worker"),
+            "stage-sidecar.sh must not use the auxiliary [[bin]] name 'worker' as the primary target"
+        );
+    }
+
+    #[test]
+    fn stage_sidecar_sh_creates_autumn_toml_when_absent() {
+        let sh = render_stage_sidecar_sh("my-app", "my-app");
+        assert!(
+            sh.contains(": > autumn.toml") || sh.contains("> autumn.toml"),
+            "staging script must create an empty autumn.toml when none exists \
+             (tauri.conf.json always lists it as a bundle resource)"
+        );
+    }
+
+    #[test]
+    fn stage_sidecar_ps1_creates_autumn_toml_when_absent() {
+        let ps1 = render_stage_sidecar_ps1("my-app", "my-app");
+        assert!(
+            ps1.contains("autumn.toml"),
+            "PowerShell staging script must handle a missing autumn.toml"
+        );
+        assert!(
+            ps1.contains("New-Item") || ps1.contains("Set-Content"),
+            "PowerShell staging script must create autumn.toml when absent"
         );
     }
 
