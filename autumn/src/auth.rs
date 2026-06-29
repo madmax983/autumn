@@ -1495,6 +1495,12 @@ pub struct VerifiedToken {
     pub principal_id: String,
     /// Flat permission strings granted to this token.
     pub scopes: Vec<String>,
+    /// Human-readable name supplied at mint time; used by [`ApiTokenStore::rotate`]
+    /// to re-issue the replacement with the same name.
+    pub name: String,
+    /// Expiry carried through so [`ApiTokenStore::rotate`] can preserve it on
+    /// the replacement token instead of issuing a non-expiring one.
+    pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// Non-secret metadata for an issued token, returned by
@@ -1604,6 +1610,8 @@ pub trait ApiTokenStore: Send + Sync + 'static {
                 .map(|principal_id| VerifiedToken {
                     principal_id,
                     scopes: Vec::new(),
+                    name: String::new(),
+                    expires_at: None,
                 }))
         })
     }
@@ -1639,9 +1647,9 @@ pub trait ApiTokenStore: Send + Sync + 'static {
                     let raw = self
                         .issue_scoped(IssueTokenSpec {
                             principal_id: &vt.principal_id,
-                            name: "rotated",
+                            name: &vt.name,
                             scopes: &scopes,
-                            expires_at: None,
+                            expires_at: vt.expires_at,
                         })
                         .await?;
                     Ok(Some(raw))
@@ -1789,6 +1797,8 @@ impl InMemoryApiTokenStore {
         let verified = VerifiedToken {
             principal_id: stored.principal_id.clone(),
             scopes: stored.scopes.clone(),
+            name: stored.name.clone(),
+            expires_at: stored.expires_at,
         };
         drop(guard);
         Some(verified)
@@ -2120,6 +2130,7 @@ where
                     let VerifiedToken {
                         principal_id,
                         scopes,
+                        ..
                     } = verified;
                     // Fulfil the RateLimitPrincipal contract so key_strategy =
                     // "authenticated_principal" works without an extra middleware shim.
@@ -2314,7 +2325,8 @@ mod db_store {
         )
     }
 
-    fn scopes_from_json(value: &serde_json::Value) -> Vec<String> {
+    #[must_use]
+    pub fn scopes_from_json(value: &serde_json::Value) -> Vec<String> {
         value
             .as_array()
             .map(|arr| {
@@ -2465,7 +2477,13 @@ mod db_store {
                 let now = self.clock.now().naive_utc();
                 let mut conn = self.conn().await?;
                 // Live tokens only: not revoked, and either no expiry or not yet expired.
-                let row: Option<(i64, String, serde_json::Value)> = api_tokens::table
+                let row: Option<(
+                    i64,
+                    String,
+                    String,
+                    Option<NaiveDateTime>,
+                    serde_json::Value,
+                )> = api_tokens::table
                     .filter(api_tokens::token_hash.eq(&hash))
                     .filter(api_tokens::revoked_at.is_null())
                     .filter(
@@ -2473,24 +2491,39 @@ mod db_store {
                             .is_null()
                             .or(api_tokens::expires_at.gt(now)),
                     )
-                    .select((api_tokens::id, api_tokens::principal_id, api_tokens::scopes))
+                    .select((
+                        api_tokens::id,
+                        api_tokens::principal_id,
+                        api_tokens::name,
+                        api_tokens::expires_at,
+                        api_tokens::scopes,
+                    ))
                     .first(&mut conn)
                     .await
                     .optional()
                     .map_err(|e| AutumnError::internal_server_error_msg(e.to_string()))?;
 
-                let Some((id, principal_id, scopes_json)) = row else {
+                let Some((id, principal_id, name, expires_at_naive, scopes_json)) = row else {
                     return Ok(None);
                 };
-                // Record usage. A best-effort stamp; failure to update must not
-                // reject an otherwise-valid token.
-                let _ = diesel::update(api_tokens::table.filter(api_tokens::id.eq(id)))
-                    .set(api_tokens::last_used_at.eq(Some(now)))
-                    .execute(&mut conn)
-                    .await;
+                // Throttled usage stamp: only write last_used_at when it is NULL or
+                // older than 5 minutes, avoiding a write on every single request.
+                let threshold = now - chrono::Duration::minutes(5);
+                let _ = diesel::update(
+                    api_tokens::table.filter(api_tokens::id.eq(id)).filter(
+                        api_tokens::last_used_at
+                            .is_null()
+                            .or(api_tokens::last_used_at.lt(threshold)),
+                    ),
+                )
+                .set(api_tokens::last_used_at.eq(Some(now)))
+                .execute(&mut conn)
+                .await;
                 Ok(Some(VerifiedToken {
                     principal_id,
                     scopes: scopes_from_json(&scopes_json),
+                    name,
+                    expires_at: expires_at_naive.map(to_utc),
                 }))
             })
         }
@@ -2538,6 +2571,14 @@ mod db_store {
 
 #[cfg(feature = "db")]
 pub use db_store::DbApiTokenStore;
+/// Convert a JSONB `serde_json::Value` (array of strings) to a flat scope list.
+///
+/// Returns an empty `Vec` for non-array values; non-string array elements are
+/// silently skipped. This is the canonical deserializer for the `scopes` JSONB
+/// column shared by [`DbApiTokenStore`] and the admin panel.
+#[cfg(feature = "db")]
+#[doc(hidden)]
+pub use db_store::scopes_from_json;
 
 #[cfg(test)]
 mod tests {

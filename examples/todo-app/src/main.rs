@@ -63,6 +63,16 @@ impl ApiTokenStore for DeferredStore {
         let store = self.inner();
         Box::pin(async move { store.revoke(raw_token).await })
     }
+
+    fn verify_scoped<'a>(
+        &'a self,
+        raw_token: &'a str,
+    ) -> Pin<
+        Box<dyn Future<Output = AutumnResult<Option<autumn_web::auth::VerifiedToken>>> + Send + 'a>,
+    > {
+        let store = self.inner();
+        Box::pin(async move { store.verify_scoped(raw_token).await })
+    }
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────────

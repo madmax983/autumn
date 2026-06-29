@@ -768,6 +768,26 @@ where
     authorize(state, session, action, resource).await
 }
 
+/// Scope-aware variant of [`__check_policy`] emitted by the `#[authorize]`
+/// proc-macro. Threads the authenticating token's granted scopes into the
+/// [`PolicyContext`] so policies can decide on `ctx.has_scope(...)`.
+///
+/// **Not part of the public API** — call [`authorize_with_scopes`] from user
+/// code.
+#[doc(hidden)]
+pub async fn __check_policy_scoped<R>(
+    state: &crate::AppState,
+    session: &Session,
+    scopes: Option<&crate::auth::ApiTokenScopes>,
+    action: &str,
+    resource: &R,
+) -> crate::AutumnResult<()>
+where
+    R: Send + Sync + 'static,
+{
+    authorize_with_scopes(state, session, scopes, action, resource).await
+}
+
 /// Pre-insert authorization helper for the
 /// `#[repository(policy = ...)]`-generated `POST` endpoint.
 ///

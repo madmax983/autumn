@@ -5,7 +5,9 @@
 //! at creation and is never stored or re-displayed; listing exposes only
 //! non-secret metadata (name, principal, scopes, expiry, last-used, revoked).
 
-use autumn_web::auth::{ApiTokenStore, DbApiTokenStore, IssueTokenSpec, hash_api_token};
+use autumn_web::auth::{
+    ApiTokenStore, DbApiTokenStore, IssueTokenSpec, hash_api_token, scopes_from_json,
+};
 use chrono::{DateTime, NaiveDateTime, Utc};
 use serde_json::Value;
 
@@ -300,10 +302,7 @@ impl AdminModel for TokenAdminModel {
 fn parse_scopes(value: Option<&Value>) -> Result<Vec<String>, AdminError> {
     match value {
         None | Some(Value::Null) => Ok(Vec::new()),
-        Some(Value::Array(arr)) => Ok(arr
-            .iter()
-            .filter_map(|v| v.as_str().map(str::to_owned))
-            .collect()),
+        Some(v @ Value::Array(_)) => Ok(scopes_from_json(v)),
         Some(Value::String(s)) => {
             let trimmed = s.trim();
             if trimmed.is_empty() {
