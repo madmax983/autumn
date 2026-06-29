@@ -109,7 +109,7 @@ pub fn run_revoke(raw_token: &str) {
     eprintln!("\u{2713} Token revoked.");
 }
 
-// ── internals ─────────────────────────────────────────────────────────────────
+// ── internals ─────────────────────────────────────────────────────────────────────────────
 
 fn sha256_hex(input: &str) -> String {
     hex_encode(Sha256::digest(input.as_bytes()))
