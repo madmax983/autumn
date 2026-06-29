@@ -166,10 +166,12 @@ fn render_tauri_conf(package_name: &str) -> String {
     // beforeBuildCommand must use the native shell for the host OS.
     // cfg!(windows) is evaluated when the generator binary compiles, which runs on
     // the same host where `cargo tauri build` will later be invoked.
+    // Use `bash` explicitly — the staging script uses BASH_SOURCE and `pipefail`,
+    // which are not supported by POSIX `sh` (e.g. dash on Debian/Ubuntu).
     let before_build_cmd = if cfg!(windows) {
         "powershell -ExecutionPolicy Bypass -File stage-sidecar.ps1"
     } else {
-        "sh stage-sidecar.sh"
+        "bash stage-sidecar.sh"
     };
     format!(
         r#"{{
@@ -424,8 +426,12 @@ cd "$APP_DIR"
 # TAURI_ENV_TARGET_TRIPLE is set by `cargo tauri build` for cross-compilation;
 # fall back to the host triple when running the script manually.
 TARGET_TRIPLE="${{TAURI_ENV_TARGET_TRIPLE:-$(rustc -Vv | awk '/^host/{{print $2}}')}}";
+# Use the app-level `embed-assets` feature (not `autumn-web/embed-assets` directly)
+# so that #[cfg(feature = "embed-assets")] in the scaffolded main.rs activates
+# the .embedded_static() wiring.  autumn-web/managed-pg-bundled has no app-level
+# analog so it must be addressed via the dependency path.
 cargo build --release --target "${{TARGET_TRIPLE}}" \
-  --features autumn-web/embed-assets,autumn-web/managed-pg-bundled
+  --features embed-assets,autumn-web/managed-pg-bundled
 mkdir -p src-tauri/binaries
 cp "target/${{TARGET_TRIPLE}}/release/{package_name}" \
    "src-tauri/binaries/{package_name}-${{TARGET_TRIPLE}}"
@@ -452,8 +458,11 @@ $TargetTriple = $Env:TAURI_ENV_TARGET_TRIPLE
 if (-not $TargetTriple) {{
     $TargetTriple = (rustc -Vv | Select-String "^host").Line.Split()[1]
 }}
+# Use the app-level embed-assets feature (not autumn-web/embed-assets directly)
+# so that #[cfg(feature = "embed-assets")] in the scaffolded main.rs activates
+# the .embedded_static() wiring.
 cargo build --release --target "$TargetTriple" `
-  --features autumn-web/embed-assets,autumn-web/managed-pg-bundled
+  --features embed-assets,autumn-web/managed-pg-bundled
 New-Item -ItemType Directory -Force -Path src-tauri\binaries | Out-Null
 Copy-Item "target\$TargetTriple\release\{package_name}.exe" `
           "src-tauri\binaries\{package_name}-$TargetTriple.exe"
@@ -486,7 +495,7 @@ Required prerequisites for `cargo tauri build`:\n\
   4. Build the desktop app:\n\
        cd src-tauri && cargo tauri build\n\
 \n\
-  The sidecar is built with autumn-web/embed-assets (#1004) and\n\
+  The sidecar is built with the app-level embed-assets feature (#1004) and\n\
   autumn-web/managed-pg-bundled (#1119) so the packaged desktop app needs\n\
   no separately-installed database or loose asset files.\n\
 \n\
