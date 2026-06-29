@@ -11,13 +11,15 @@
 //! - **`active_search`** — wires the search input to `/bookmarks/search` via
 //!   htmx; search results swap in a fresh `data_table`.
 //! - **`autocomplete_input`** — tag picker on the new/edit forms.
+//! - **`property_list`** — renders the detail view (`/bookmarks/{id}`) as a
+//!   semantic `<dl>` of labelled field values, replacing hand-rolled markup.
 //!
-//! All three compose in the index view without special wiring, demonstrating
-//! the composition AC from issue #1116.
+//! All four compose without special wiring, demonstrating the widget lane
+//! (data_table, active_search, autocomplete_input, property_list).
 
 use autumn_web::extract::{Form, Path};
 use autumn_web::prelude::*;
-use autumn_web::widgets::{Column, DataTableConfig, data_table};
+use autumn_web::widgets::{Column, DataTableConfig, data_table, property_list};
 use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
 
@@ -188,13 +190,21 @@ pub async fn show(id: Path<i64>, mut db: Db) -> AutumnResult<Markup> {
         .await
         .map_err(AutumnError::not_found)?;
 
+    let props: Vec<(&str, maud::Markup)> = vec![
+        ("Id", html! { (row.id) }),
+        ("Url", html! { a href=(&row.url) { (&row.url) } }),
+        ("Title", html! { (&row.title) }),
+        ("Tag", html! { a href=(format!("/bookmarks/tag/{}", row.tag)) { (&row.tag) } }),
+        ("Alive", html! { (row.alive.to_string()) }),
+        ("Created at", html! { (row.created_at.to_string()) }),
+    ];
     Ok(layout(
         &format!("Bookmark #{}", row.id),
         html! {
             div class="mb-6" {
                 a href="/bookmarks" class="text-sm text-indigo-600 hover:underline" { "Back to list" }
             }
-            (bookmark_card(&row))
+            (property_list(&props))
         },
     ))
 }

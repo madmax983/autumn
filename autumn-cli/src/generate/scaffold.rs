@@ -823,6 +823,7 @@ fn render_routes_file(
     };
 
     let list_render = if live { &live_ul_render } else { &table_render };
+    let show_rows = render_show_property_rows(fields);
 
     let index_handler = if sharded {
         if live {
@@ -1149,8 +1150,11 @@ pub async fn show(id: Path<{id_rust}>, mut db: {db_ty}, flash: Flash) -> AutumnR
         .first(&mut *db)
         .await
         .map_err(AutumnError::not_found)?;
+    let props: Vec<(&str, maud::Markup)> = vec![
+{show_rows}    ];
     Ok(layout(&format!("{pascal_name} #{{}}", row.id), flash.render().await, html! {{
         h1 {{ "{pascal_name} #" (row.id) }}
+        (autumn_web::widgets::property_list(&props))
         a href="/{plural}" {{ "Back to list" }}
         " "
         a href=(format!("/{plural}/{{}}/edit", row.id)) {{ "Edit" }}
@@ -1521,6 +1525,39 @@ fn render_columns_vec(pascal_name: &str, plural: &str, fields: &[Field]) -> Stri
     );
     let _ = writeln!(out, "    ];");
     out
+}
+
+/// Emit the `vec![…]` body for the `props` binding in the `show` handler.
+///
+/// Produces one `("Label", maud::html! { value_expr })` tuple per row:
+/// `id`, every DSL-declared field (humanized label), then `created_at`.
+fn render_show_property_rows(fields: &[Field]) -> String {
+    let mut out = String::new();
+    out.push_str(r#"        ("Id", maud::html! { (row.id) }),"#);
+    out.push('\n');
+    for f in fields {
+        let label = humanize(&f.name);
+        let cell_expr = cell_value_expr(f);
+        out.push_str(&format!(
+            r#"        ("{label}", maud::html! {{ ({cell_expr}) }}),"#
+        ));
+        out.push('\n');
+    }
+    out.push_str(r#"        ("Created at", maud::html! { (row.created_at.to_string()) }),"#);
+    out.push('\n');
+    out
+}
+
+/// Humanize a `snake_case` field name: capitalize only the first word.
+///
+/// `created_at` → `"Created at"`, `user_name` → `"User name"`.
+/// Matches the humanization convention used in Phoenix / Rails form labels.
+fn humanize(s: &str) -> String {
+    let replaced = s.replace('_', " ");
+    let mut chars = replaced.chars();
+    chars
+        .next()
+        .map_or_else(String::new, |c| c.to_uppercase().to_string() + chars.as_str())
 }
 
 /// Convert `snake_case` field name to `Title Case` header label.
@@ -2718,5 +2755,56 @@ async fn main() {
         assert!(cargo.contains("\"ws\""));
         assert!(cargo.contains("\"maud\""));
         assert!(cargo.contains("\"htmx\""));
+    }
+
+    // ── property_list scaffold conformance (issue #1120) ──────────────────
+
+    #[test]
+    fn show_uses_property_list_widget_with_declared_fields() {
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &[
+                "title:String".into(),
+                "body:Text".into(),
+                "published:bool".into(),
+            ],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+        // show handler references property_list widget
+        assert!(
+            routes.contains("autumn_web::widgets::property_list"),
+            "show must use property_list widget: {routes}"
+        );
+        // Each declared field appears with humanized label
+        assert!(routes.contains("\"Title\""), "show must list 'title' field: {routes}");
+        assert!(routes.contains("\"Body\""), "show must list 'body' field: {routes}");
+        assert!(routes.contains("\"Published\""), "show must list 'published' field: {routes}");
+        // id and created_at always present
+        assert!(routes.contains("\"Id\""), "show must include id: {routes}");
+        assert!(routes.contains("\"Created at\""), "show must include created_at: {routes}");
+    }
+
+    #[test]
+    fn show_property_list_label_humanization() {
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &["published_at:NaiveDateTime".into(), "user_name:String".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+        // humanized: first word capitalized, rest lowercase (snake_case → "Word rest")
+        assert!(routes.contains("\"Published at\""), "humanize must produce 'Published at': {routes}");
+        assert!(routes.contains("\"User name\""), "humanize must produce 'User name': {routes}");
     }
 }
