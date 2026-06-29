@@ -725,7 +725,7 @@ impl TestApp {
             _job_runtime: None,
             clock_as_any: None,
             #[cfg(feature = "mail")]
-            mail_recorder: MailRecorder::new(),
+            mail_recorder: None,
         }
     }
 
@@ -1304,8 +1304,9 @@ impl TestApp {
         state.insert_extension(self.config.clone());
 
         #[cfg(feature = "mail")]
-        {
-            let recorder = std::sync::Arc::new(self.mail_recorder.clone());
+        let mail_recorder_for_client = {
+            let recorder_for_client = self.mail_recorder.clone();
+            let recorder = std::sync::Arc::new(self.mail_recorder);
             let effective: std::sync::Arc<dyn crate::interceptor::MailInterceptor> =
                 if let Some(user) = self.mail_interceptor {
                     std::sync::Arc::new(ChainedMailInterceptor {
@@ -1316,7 +1317,8 @@ impl TestApp {
                     recorder
                 };
             state.insert_extension(effective);
-        }
+            recorder_for_client
+        };
         if let Some(interceptor) = self.job_interceptor {
             state.insert_extension(interceptor);
         }
@@ -1515,7 +1517,7 @@ impl TestApp {
             _job_runtime: job_runtime,
             clock_as_any: self.clock_as_any,
             #[cfg(feature = "mail")]
-            mail_recorder: self.mail_recorder,
+            mail_recorder: Some(mail_recorder_for_client),
         }
     }
 }
@@ -1564,8 +1566,10 @@ pub struct TestClient {
     _job_runtime: Option<TestJobRuntime>,
     /// Retained so `advance_clock` can downcast to [`crate::time::TickingClock`].
     clock_as_any: Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>,
+    /// `None` when built via [`TestApp::from_router`], which bypasses recorder
+    /// wiring. `Some` for all clients produced by [`TestApp::build`].
     #[cfg(feature = "mail")]
-    mail_recorder: MailRecorder,
+    mail_recorder: Option<MailRecorder>,
 }
 
 struct TestJobRuntime {
@@ -1679,7 +1683,10 @@ impl TestClient {
     #[cfg(feature = "mail")]
     #[must_use]
     pub fn sent_mail(&self) -> Vec<SentMail> {
-        self.mail_recorder.get_sent()
+        self.mail_recorder
+            .as_ref()
+            .expect("sent_mail() is not available on a TestClient built via from_router(); use TestApp::new().merge(router).build() instead")
+            .get_sent()
     }
 
     /// Asserts that exactly `n` emails were sent, panicking with a list of
