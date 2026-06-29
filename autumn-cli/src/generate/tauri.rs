@@ -292,7 +292,8 @@ fn render_shell_lib_rs(package_name: &str) -> String {
 //!   3. Poll GET /health in a background thread until the server is ready (up to 30 s),
 //!      then open the webview window pointing at http://127.0.0.1:<port>.
 //!      On timeout, the app exits with a non-zero code rather than showing a blank window.
-//!   4. On main window close, kill the sidecar — no orphaned server process.
+//!   4. On main window close, send SIGTERM for graceful shutdown (so on_shutdown hooks
+//!      run, including ManagedPostgresPoolProvider::stop()), then force-kill after 3 s.
 
 use std::net::TcpListener;
 use tauri::{{Manager, App}};
@@ -308,18 +309,32 @@ pub fn run() {{
         .setup(|app| setup(app))
         .on_window_event(|window, event| {{
             if let tauri::WindowEvent::Destroyed = event {{
-                // Only kill the sidecar when the main window closes, not on any
-                // secondary window (dialogs, settings panels, etc.).
+                // Only shut down the sidecar when the main window closes, not on
+                // secondary windows (dialogs, settings panels, etc.).
                 if window.label() == "main" {{
                     let handle = window.app_handle();
-                    if let Some(mut child) = handle
+                    if let Some(child) = handle
                         .state::<SidecarHandle>()
                         .0
                         .lock()
                         .unwrap()
                         .take()
                     {{
-                        let _ = child.kill();
+                        // Send SIGTERM first so autumn's on_shutdown hooks run
+                        // (including ManagedPostgresPoolProvider::stop() if wired).
+                        // Fall back to SIGKILL / TerminateProcess after 3 s.
+                        #[cfg(unix)]
+                        let graceful_pid = child.pid() as i32;
+                        std::thread::spawn(move || {{
+                            #[cfg(unix)]
+                            {{
+                                let _ = std::process::Command::new("kill")
+                                    .args(["-TERM", &graceful_pid.to_string()])
+                                    .status();
+                                std::thread::sleep(std::time::Duration::from_secs(3));
+                            }}
+                            let _ = child.kill();
+                        }});
                     }}
                 }}
             }}
@@ -368,6 +383,12 @@ fn setup(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {{
             "AUTUMN_MANAGED_PG_DATA_DIR",
             app_data_dir.to_string_lossy().as_ref(),
         )
+        // Clear any inherited attach URL so the sidecar owns its bundled Postgres
+        // cluster rather than connecting to a stale or foreign database.
+        // ManagedPostgresPoolProvider checks AUTUMN_MANAGED_PG_ATTACH_URL before
+        // AUTUMN_MANAGED_PG_DATA_DIR and returns it without starting a local cluster;
+        // an empty value is ignored by the provider.
+        .env("AUTUMN_MANAGED_PG_ATTACH_URL", "")
         // Belt-and-suspenders for apps not using #[autumn_web::main] where
         // AUTUMN_MANIFEST_DIR env var IS consulted before the CWD fallback.
         .env(
@@ -376,9 +397,11 @@ fn setup(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {{
         )
         // Clear any inherited Unix-socket config so the sidecar always binds
         // TCP on the loopback address the probe polls.  Without this, an
-        // inherited AUTUMN_SERVER__UNIX_SOCKET would make the sidecar healthy
-        // on a socket path while the TCP health probe times out and exits.
+        // inherited AUTUMN_SERVER__UNIX_SOCKET or AUTUMN_SERVE_FORCE_UNIX_SOCKET
+        // would make the sidecar bind a socket path while the TCP health probe
+        // times out and exits.
         .env("AUTUMN_SERVER__UNIX_SOCKET", "")
+        .env("AUTUMN_SERVE_FORCE_UNIX_SOCKET", "")
         .spawn()?;
     *app.state::<SidecarHandle>().0.lock().unwrap() = Some(child);
 
@@ -1080,6 +1103,43 @@ mod tests {
             lib.contains("AUTUMN_SERVER__UNIX_SOCKET"),
             "lib.rs must clear AUTUMN_SERVER__UNIX_SOCKET so an inherited env var \
              cannot redirect the sidecar to a Unix socket the TCP probe cannot reach"
+        );
+        // AUTUMN_SERVE_FORCE_UNIX_SOCKET is a separate out-of-band override in
+        // app.rs that bypasses the config-system socket setting; must also be cleared.
+        assert!(
+            lib.contains("AUTUMN_SERVE_FORCE_UNIX_SOCKET"),
+            "lib.rs must also clear AUTUMN_SERVE_FORCE_UNIX_SOCKET — it overrides \
+             AUTUMN_SERVER__UNIX_SOCKET and would still redirect to a Unix socket"
+        );
+    }
+
+    #[test]
+    fn lib_rs_clears_managed_pg_attach_url() {
+        let lib = render_shell_lib_rs("my-app");
+        // If AUTUMN_MANAGED_PG_ATTACH_URL is inherited (e.g. from a terminal where
+        // `autumn serve` is running), ManagedPostgresPoolProvider connects to that
+        // existing cluster instead of starting the bundled one.  Clearing it ensures
+        // the desktop app always owns its local database.
+        assert!(
+            lib.contains("AUTUMN_MANAGED_PG_ATTACH_URL"),
+            "lib.rs must clear AUTUMN_MANAGED_PG_ATTACH_URL so an inherited attach \
+             URL cannot redirect the sidecar to a foreign or stale database cluster"
+        );
+    }
+
+    #[test]
+    fn lib_rs_sends_sigterm_before_kill() {
+        let lib = render_shell_lib_rs("my-app");
+        // Graceful SIGTERM lets autumn's on_shutdown hooks run (including pg.stop()).
+        // Force-kill is the fallback after a timeout.
+        assert!(
+            lib.contains("SIGTERM") || lib.contains("-TERM"),
+            "lib.rs on_window_event must send SIGTERM before force-killing the sidecar \
+             so ManagedPostgresPoolProvider::stop() runs during graceful shutdown"
+        );
+        assert!(
+            lib.contains("pid()"),
+            "lib.rs must call child.pid() to get the sidecar PID for SIGTERM"
         );
     }
 
