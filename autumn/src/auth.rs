@@ -2467,6 +2467,51 @@ mod db_store {
             })
         }
 
+        fn rotate<'a>(
+            &'a self,
+            raw_token: &'a str,
+        ) -> Pin<Box<dyn Future<Output = crate::AutumnResult<Option<String>>> + Send + 'a>> {
+            Box::pin(async move {
+                let old_hash = hash_api_token(raw_token);
+                let new_raw = generate_raw_token();
+                let new_hash = hash_api_token(&new_raw);
+                let mut conn = self.conn().await?;
+                // Atomic CTE: revoke the old token and insert a replacement carrying
+                // the same name/scopes/expiry in a single statement. If the old hash
+                // is unknown or already revoked the UPDATE returns 0 rows, the INSERT
+                // is a no-op, and COUNT(*) returns 0 — the caller sees None.
+                #[derive(diesel::QueryableByName)]
+                struct CountRow {
+                    #[diesel(sql_type = diesel::sql_types::BigInt)]
+                    count: i64,
+                }
+                let row: CountRow = diesel::sql_query(
+                    "WITH rotated AS ( \
+                        UPDATE api_tokens \
+                        SET revoked_at = NOW() AT TIME ZONE 'utc' \
+                        WHERE token_hash = $1 AND revoked_at IS NULL \
+                        RETURNING principal_id, name, scopes, expires_at \
+                     ), \
+                     inserted AS ( \
+                        INSERT INTO api_tokens (token_hash, principal_id, name, scopes, expires_at) \
+                        SELECT $2, principal_id, name, scopes, expires_at FROM rotated \
+                        RETURNING 1 \
+                     ) \
+                     SELECT COUNT(*)::bigint AS count FROM inserted",
+                )
+                .bind::<diesel::sql_types::Text, _>(&old_hash)
+                .bind::<diesel::sql_types::Text, _>(&new_hash)
+                .get_result(&mut conn)
+                .await
+                .map_err(|e| AutumnError::internal_server_error_msg(e.to_string()))?;
+                if row.count == 0 {
+                    Ok(None)
+                } else {
+                    Ok(Some(new_raw))
+                }
+            })
+        }
+
         fn verify_scoped<'a>(
             &'a self,
             raw_token: &'a str,
