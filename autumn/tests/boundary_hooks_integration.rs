@@ -167,38 +167,10 @@ fn app_builder_registers_interceptors() {
 #[cfg(feature = "mail")]
 #[tokio::test]
 async fn mail_interceptor_intercepts_sends() {
+    // Converted from hand-rolled RecordingMailInterceptor to the built-in helpers.
     use autumn_web::get;
     use autumn_web::mail::{Mail, Mailer, Transport};
     use autumn_web::test::TestApp;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    static CALLS: AtomicUsize = AtomicUsize::new(0);
-
-    struct RecordingMailInterceptor;
-    impl MailInterceptor for RecordingMailInterceptor {
-        fn intercept<'a>(
-            &'a self,
-            _mail: &'a Mail,
-            next: std::pin::Pin<
-                Box<
-                    dyn std::future::Future<Output = Result<(), autumn_web::mail::MailError>>
-                        + Send
-                        + 'a,
-                >,
-            >,
-        ) -> std::pin::Pin<
-            Box<
-                dyn std::future::Future<Output = Result<(), autumn_web::mail::MailError>>
-                    + Send
-                    + 'a,
-            >,
-        > {
-            Box::pin(async move {
-                CALLS.fetch_add(1, Ordering::SeqCst);
-                next.await
-            })
-        }
-    }
 
     #[get("/send-test-mail")]
     async fn send_test_mail(mailer: Mailer) -> &'static str {
@@ -218,14 +190,13 @@ async fn mail_interceptor_intercepts_sends() {
 
     let client = TestApp::new()
         .config(config)
-        .with_mail_interceptor(RecordingMailInterceptor)
         .routes(autumn_web::routes![send_test_mail])
         .build();
 
-    let response = client.get("/send-test-mail").send().await;
-    response.assert_ok();
+    client.get("/send-test-mail").send().await.assert_ok();
 
-    assert_eq!(CALLS.load(Ordering::SeqCst), 1);
+    // ~40-line hand-rolled interceptor replaced by one assertion:
+    client.assert_email_count(1);
 }
 
 #[tokio::test]
