@@ -55,12 +55,106 @@ impl autumn_web::live::LiveFragment for Post {
     }
 
     fn render_fragment(&self) -> maud::Markup {
+        use crate::models::{Subreddit, User};
+        use diesel::prelude::*;
+        use diesel_async::RunQueryDsl;
+
+        let (author_name, sub_name, sub_slug) = if let Some(pool) = crate::GLOBAL_DB_POOL.get() {
+            tokio::task::block_in_place(|| {
+                let rt = tokio::runtime::Handle::current();
+                rt.block_on(async {
+                    let mut conn = pool.get().await.ok()?;
+                    let author: User = crate::schema::users::table
+                        .find(self.author_id)
+                        .first(&mut conn)
+                        .await
+                        .ok()?;
+                    let sub: Subreddit = crate::schema::subreddits::table
+                        .find(self.subreddit_id)
+                        .first(&mut conn)
+                        .await
+                        .ok()?;
+                    Some((author.username, sub.name, sub.slug))
+                })
+            })
+            .unwrap_or_else(|| {
+                (
+                    "deleted_user".to_string(),
+                    "unknown".to_string(),
+                    "unknown".to_string(),
+                )
+            })
+        } else {
+            (
+                "deleted_user".to_string(),
+                "unknown".to_string(),
+                "unknown".to_string(),
+            )
+        };
+
+        let card_url = format!("/r/{}/posts/{}", sub_slug, self.slug);
+
         maud::html! {
-            li id=(self.dom_id()) class="live-post" {
-                span class="post-score" { (self.score) " pts" }
-                " "
-                a href=(format!("/posts/{}", self.id))
-                  class="post-title" { (self.title) }
+            li id=(self.dom_id()) class="posts-feed-item transition-all" {
+                // 1. Card Layout Version
+                div class="posts-feed-card-version bg-white rounded-lg shadow-sm border border-gray-200 hover:border-orange-300 transition-colors" {
+                    div class="flex items-start gap-3 p-4" {
+                        (crate::routes::layout::vote_controls(self.id, self.score))
+                        div class="flex-1 min-w-0" {
+                            a href=(card_url)
+                               class="text-lg font-medium text-gray-900 hover:text-orange-600 line-clamp-2" {
+                                (self.title)
+                            }
+                            div class="text-xs text-gray-400 mt-1" {
+                                a href=(format!("/r/{}", sub_slug))
+                                   class="font-medium text-gray-600 hover:underline" {
+                                    "r/" (sub_name)
+                                }
+                                " \u{2022} posted by "
+                                a href=(format!("/u/{}", author_name))
+                                   class="text-gray-500 hover:underline" {
+                                    "u/" (author_name)
+                                }
+                                " " (crate::routes::layout::time_ago(&self.created_at))
+                                " \u{2022} "
+                                a href=(card_url)
+                                   class="text-gray-500 hover:text-orange-600" {
+                                    (self.comment_count) " comments"
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // 2. Compact Layout Version
+                div class="posts-feed-compact-version flex items-center gap-3 py-2 px-2 hover:bg-gray-50 transition-colors" {
+                    span class="text-sm font-semibold text-gray-500 w-8 text-right shrink-0" {
+                        (self.score)
+                    }
+                    div class="flex-1 min-w-0" {
+                        a href=(card_url)
+                           class="text-sm font-medium text-gray-900 hover:text-orange-600 line-clamp-1" {
+                            (self.title)
+                        }
+                        div class="text-xs text-gray-400" {
+                            a href=(format!("/r/{}", sub_slug))
+                               class="text-gray-500 hover:underline" {
+                                "r/" (sub_name)
+                            }
+                            " \u{2022} "
+                            a href=(format!("/u/{}", author_name))
+                               class="text-gray-500 hover:underline" {
+                                "u/" (author_name)
+                            }
+                            " \u{2022} " (crate::routes::layout::time_ago(&self.created_at))
+                            " \u{2022} "
+                            a href=(card_url)
+                               class="text-gray-500 hover:text-orange-600" {
+                                (self.comment_count) " comments"
+                            }
+                        }
+                    }
+                }
             }
         }
     }

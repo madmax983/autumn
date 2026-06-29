@@ -16,7 +16,7 @@ use scoped_futures::ScopedFutureExt;
 
 use crate::jobs::{PostPublicationArgs, PostPublicationJob};
 use crate::models::{Comment, CommentAssociations, Post, PostAssociations, Subreddit};
-use crate::repositories::PgPostRepository;
+use crate::repositories::{PgPostRepository, PostRepository};
 use crate::schema::{posts, subreddits};
 use crate::slugify::slugify;
 
@@ -105,38 +105,39 @@ pub async fn front_page(
             // the preloaded record's typed accessors (`?`-free in templates:
             // treat a missing preload as "absent").
             @if compact_layout {
-                ul id="posts-list" class="divide-y divide-gray-100"
+                ul id="posts-list" class="divide-y divide-gray-100 posts-feed-compact"
                     hx-ext="sse" sse-connect="/posts/stream" sse-swap="message" hx-swap="none" {
                     @for post in &hot_posts {
                         @let author = post.author().ok().flatten();
                         @let sub = post.subreddit().ok().flatten();
                         @if let Some(sub) = sub {
-                            li id=(format!("post-{}", post.id))
-                                class="flex items-center gap-3 py-2 px-2 hover:bg-gray-50 transition-colors" {
-                                span class="text-sm font-semibold text-gray-500 w-8 text-right shrink-0" {
-                                    (post.score)
-                                }
-                                div class="flex-1 min-w-0" {
-                                    a href=(paths::show(&sub.slug, &post.slug))
-                                       class="text-sm font-medium text-gray-900 hover:text-orange-600 \
-                                              line-clamp-1" {
-                                        (post.title)
+                            li id=(format!("post-{}", post.id)) class="posts-feed-item transition-all" {
+                                div class="posts-feed-compact-version flex items-center gap-3 py-2 px-2 hover:bg-gray-50 transition-colors" {
+                                    span class="text-sm font-semibold text-gray-500 w-8 text-right shrink-0" {
+                                        (post.score)
                                     }
-                                    div class="text-xs text-gray-400" {
-                                        a href=(super::subreddits::__autumn_path_show(&sub.slug))
-                                           class="text-gray-500 hover:underline" {
-                                            "r/" (sub.name)
-                                        }
-                                        @if let Some(author) = author {
-                                            " \u{2022} "
-                                            a href=(super::auth::__autumn_path_profile(&author.username))
-                                               class="text-gray-500 hover:underline" { "u/" (author.username) }
-                                        }
-                                        " \u{2022} " (time_ago(&post.created_at))
-                                        " \u{2022} "
+                                    div class="flex-1 min-w-0" {
                                         a href=(paths::show(&sub.slug, &post.slug))
-                                           class="text-gray-500 hover:text-orange-600" {
-                                            (post.comment_count) " comments"
+                                           class="text-sm font-medium text-gray-900 hover:text-orange-600 \
+                                                  line-clamp-1" {
+                                            (post.title)
+                                        }
+                                        div class="text-xs text-gray-400" {
+                                            a href=(super::subreddits::__autumn_path_show(&sub.slug))
+                                               class="text-gray-500 hover:underline" {
+                                                "r/" (sub.name)
+                                            }
+                                            @if let Some(author) = author {
+                                                " \u{2022} "
+                                                a href=(super::auth::__autumn_path_profile(&author.username))
+                                                   class="text-gray-500 hover:underline" { "u/" (author.username) }
+                                            }
+                                            " \u{2022} " (time_ago(&post.created_at))
+                                            " \u{2022} "
+                                            a href=(paths::show(&sub.slug, &post.slug))
+                                               class="text-gray-500 hover:text-orange-600" {
+                                                (post.comment_count) " comments"
+                                            }
                                         }
                                     }
                                 }
@@ -154,34 +155,33 @@ pub async fn front_page(
                         @let author = post.author().ok().flatten();
                         @let sub = post.subreddit().ok().flatten();
                         @if let Some(sub) = sub {
-                            li id=(format!("post-{}", post.id))
-                                class="bg-white rounded-lg shadow-sm border border-gray-200 \
-                                       hover:border-orange-300 transition-colors" {
-                                div class="flex items-start gap-3 p-4" {
-                                    (vote_controls(post.id, post.score))
-                                    div class="flex-1 min-w-0" {
-                                        a href=(paths::show(&sub.slug, &post.slug))
-                                           class="text-lg font-medium text-gray-900 hover:text-orange-600 \
-                                                  line-clamp-2" {
-                                            (post.title)
-                                        }
-                                        div class="text-xs text-gray-400 mt-1" {
-                                            a href=(super::subreddits::__autumn_path_show(&sub.slug))
-                                               class="font-medium text-gray-600 hover:underline" {
-                                                "r/" (sub.name)
-                                            }
-                                            @if let Some(author) = author {
-                                                " \u{2022} posted by "
-                                                a href=(super::auth::__autumn_path_profile(&author.username))
-                                                   class="text-gray-500 hover:underline" {
-                                                    "u/" (author.username)
-                                                }
-                                            }
-                                            " " (time_ago(&post.created_at))
-                                            " \u{2022} "
+                            li id=(format!("post-{}", post.id)) class="posts-feed-item transition-all" {
+                                div class="posts-feed-card-version bg-white rounded-lg shadow-sm border border-gray-200 hover:border-orange-300 transition-colors" {
+                                    div class="flex items-start gap-3 p-4" {
+                                        (vote_controls(post.id, post.score))
+                                        div class="flex-1 min-w-0" {
                                             a href=(paths::show(&sub.slug, &post.slug))
-                                               class="text-gray-500 hover:text-orange-600" {
-                                                (post.comment_count) " comments"
+                                               class="text-lg font-medium text-gray-900 hover:text-orange-600 line-clamp-2" {
+                                                (post.title)
+                                            }
+                                            div class="text-xs text-gray-400 mt-1" {
+                                                a href=(super::subreddits::__autumn_path_show(&sub.slug))
+                                                   class="font-medium text-gray-600 hover:underline" {
+                                                    "r/" (sub.name)
+                                                }
+                                                @if let Some(author) = author {
+                                                    " \u{2022} posted by "
+                                                    a href=(super::auth::__autumn_path_profile(&author.username))
+                                                       class="text-gray-500 hover:underline" {
+                                                        "u/" (author.username)
+                                                    }
+                                                }
+                                                " " (time_ago(&post.created_at))
+                                                " \u{2022} "
+                                                a href=(paths::show(&sub.slug, &post.slug))
+                                                   class="text-gray-500 hover:text-orange-600" {
+                                                    (post.comment_count) " comments"
+                                                }
                                             }
                                         }
                                     }
@@ -366,8 +366,10 @@ pub struct SubmitPostForm {
 #[secured]
 #[post("/submit")]
 pub async fn submit(
+    State(state): State<AppState>,
     session: Session,
     mut db: Db,
+    repo: PgPostRepository,
     flash: Flash,
     form: Form<SubmitPostForm>,
 ) -> AutumnResult<Redirect> {
@@ -412,50 +414,66 @@ pub async fn submit(
     // Ensure unique slug within this subreddit by appending a suffix
     let slug = unique_slug(&base_slug, form.0.subreddit_id, &mut db).await?;
 
-    // Insert the post, then create an explicit author upvote so
-    // score always matches the sum of actual vote rows.
     let body = form.0.body.trim().to_string();
     let subreddit_id = form.0.subreddit_id;
     let subreddit_slug = sub.slug.clone();
-    db.tx(move |conn| {
-        async move {
-            let post_id: i64 = diesel::insert_into(posts::table)
-                .values((
-                    posts::title.eq(&title),
-                    posts::slug.eq(&slug),
-                    posts::body.eq(&body),
-                    posts::url.eq(&url),
-                    posts::author_id.eq(user_id),
-                    posts::subreddit_id.eq(subreddit_id),
-                    posts::score.eq(1_i64),
-                ))
-                .returning(posts::id)
-                .get_result(conn)
-                .await?;
 
-            diesel::insert_into(crate::schema::votes::table)
-                .values((
-                    crate::schema::votes::user_id.eq(user_id),
-                    crate::schema::votes::post_id.eq(post_id),
-                    crate::schema::votes::value.eq(1_i16),
-                ))
-                .execute(conn)
-                .await?;
+    let new_post = crate::models::NewPost {
+        title: title.clone(),
+        slug: slug.clone(),
+        body: body.clone(),
+        url,
+        author_id: user_id,
+        subreddit_id,
+    };
 
-            // Default jobs.backend is Postgres, so keep the job row in this
-            // transaction: a failed enqueue rolls back the post and vote too.
-            autumn_web::job::enqueue_on_conn(
-                PostPublicationJob::NAME,
-                PostPublicationArgs::new(post_id, &title, &slug, &subreddit_slug, &author_username),
-                conn,
-            )
-            .await?;
+    let post = repo.save(&new_post).await?;
 
-            Ok::<_, AutumnError>(())
-        }
-        .scope_boxed()
-    })
-    .await?;
+    diesel::insert_into(crate::schema::votes::table)
+        .values((
+            crate::schema::votes::user_id.eq(user_id),
+            crate::schema::votes::post_id.eq(post.id),
+            crate::schema::votes::value.eq(1_i16),
+        ))
+        .execute(&mut *db)
+        .await?;
+
+    diesel::update(posts::table.find(post.id))
+        .set(posts::score.eq(1_i64))
+        .execute(&mut *db)
+        .await?;
+
+    // Reload the post to get the updated fields
+    let post: Post = posts::table.find(post.id).first(&mut *db).await?;
+
+    let _ = state.broadcast().publish_oob(
+        "posts",
+        &post.dom_id(),
+        &autumn_web::htmx::OobSwap::OuterHTML,
+        &post.render_fragment(),
+    );
+
+    let _ = state.broadcast().publish_oob(
+        &format!("posts:r/{}", subreddit_slug),
+        &post.dom_id(),
+        &autumn_web::htmx::OobSwap::Target(
+            autumn_web::htmx::OobMethod::BeforeEnd,
+            "#posts-list".to_string(),
+        ),
+        &post.render_fragment(),
+    );
+
+    // Enqueue the publication job. Note that since PgPostRepository::save manages its
+    // own transaction internally, we do not need to call autumn_web::job::enqueue_on_conn here.
+    let payload = serde_json::to_value(PostPublicationArgs::new(
+        post.id,
+        &title,
+        &slug,
+        &subreddit_slug,
+        &author_username,
+    ))
+    .unwrap();
+    autumn_web::job::enqueue(PostPublicationJob::NAME, payload).await?;
 
     flash.success("Post created.").await;
     Ok(Redirect::to(&super::subreddits::__autumn_path_show(
@@ -769,6 +787,7 @@ pub async fn update(
     State(state): State<AppState>,
     session: Session,
     mut db: Db,
+    repo: PgPostRepository,
     flash: Flash,
     form: Form<EditPostForm>,
 ) -> AutumnResult<Redirect> {
@@ -799,15 +818,13 @@ pub async fn update(
     // Ensure unique slug within subreddit, excluding the current post
     let new_slug = unique_slug_excluding(&base_slug, post.subreddit_id, post.id, &mut db).await?;
 
-    diesel::update(posts::table.find(post.id))
-        .set((
-            posts::title.eq(&title),
-            posts::slug.eq(&new_slug),
-            posts::body.eq(form.0.body.trim()),
-            posts::updated_at.eq(chrono::Utc::now().naive_utc()),
-        ))
-        .execute(&mut *db)
-        .await?;
+    let changes = crate::models::UpdatePost {
+        title: Patch::Set(title),
+        slug: Patch::Set(new_slug.clone()),
+        body: Patch::Set(form.0.body.trim().to_string()),
+        ..Default::default()
+    };
+    repo.update(post.id, &changes).await?;
 
     flash.success("Post updated.").await;
     Ok(Redirect::to(&paths::show(&sub_slug, &new_slug)))
@@ -822,6 +839,7 @@ pub async fn delete_post(
     State(state): State<AppState>,
     session: Session,
     mut db: Db,
+    repo: PgPostRepository,
     flash: Flash,
 ) -> AutumnResult<autumn_web::reexports::axum::response::Response> {
     let post: Post = posts::table
@@ -835,9 +853,14 @@ pub async fn delete_post(
 
     autumn_web::authorization::authorize::<Post>(&state, &session, "delete", &post).await?;
 
-    diesel::delete(posts::table.find(post.id))
-        .execute(&mut *db)
-        .await?;
+    repo.delete_by_id(post.id).await?;
+
+    let _ = state.broadcast().publish_oob(
+        &format!("posts:r/{}", sub_slug),
+        &post.dom_id(),
+        &autumn_web::htmx::OobSwap::Delete,
+        &autumn_web::html! {},
+    );
 
     flash.success("Post deleted.").await;
     Ok(super::layout::hx_redirect_to(
