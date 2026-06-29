@@ -194,7 +194,10 @@ pub async fn show(id: Path<i64>, mut db: Db) -> AutumnResult<Markup> {
         ("Id", html! { (row.id) }),
         ("Url", html! { a href=(&row.url) { (&row.url) } }),
         ("Title", html! { (&row.title) }),
-        ("Tag", html! { a href=(format!("/bookmarks/tag/{}", row.tag)) { (&row.tag) } }),
+        (
+            "Tag",
+            html! { a href=(format!("/bookmarks/tag/{}", row.tag)) { (&row.tag) } },
+        ),
         ("Alive", html! { (row.alive.to_string()) }),
         ("Created at", html! { (row.created_at.to_string()) }),
     ];

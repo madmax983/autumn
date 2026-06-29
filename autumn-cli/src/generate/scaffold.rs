@@ -1554,9 +1554,9 @@ fn render_show_property_rows(fields: &[Field]) -> String {
 fn humanize(s: &str) -> String {
     let replaced = s.replace('_', " ");
     let mut chars = replaced.chars();
-    chars
-        .next()
-        .map_or_else(String::new, |c| c.to_uppercase().to_string() + chars.as_str())
+    chars.next().map_or_else(String::new, |c| {
+        c.to_uppercase().to_string() + chars.as_str()
+    })
 }
 
 /// Convert `snake_case` field name to `Title Case` header label.
@@ -2781,12 +2781,24 @@ async fn main() {
             "show must use property_list widget: {routes}"
         );
         // Each declared field appears with humanized label
-        assert!(routes.contains("\"Title\""), "show must list 'title' field: {routes}");
-        assert!(routes.contains("\"Body\""), "show must list 'body' field: {routes}");
-        assert!(routes.contains("\"Published\""), "show must list 'published' field: {routes}");
+        assert!(
+            routes.contains("\"Title\""),
+            "show must list 'title' field: {routes}"
+        );
+        assert!(
+            routes.contains("\"Body\""),
+            "show must list 'body' field: {routes}"
+        );
+        assert!(
+            routes.contains("\"Published\""),
+            "show must list 'published' field: {routes}"
+        );
         // id and created_at always present
         assert!(routes.contains("\"Id\""), "show must include id: {routes}");
-        assert!(routes.contains("\"Created at\""), "show must include created_at: {routes}");
+        assert!(
+            routes.contains("\"Created at\""),
+            "show must include created_at: {routes}"
+        );
     }
 
     #[test]
@@ -2795,7 +2807,10 @@ async fn main() {
         let plan = plan_scaffold(
             tmp.path(),
             "Post",
-            &["published_at:NaiveDateTime".into(), "user_name:String".into()],
+            &[
+                "published_at:NaiveDateTime".into(),
+                "user_name:String".into(),
+            ],
             "20260427000000",
         )
         .unwrap();
@@ -2803,7 +2818,13 @@ async fn main() {
 
         let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
         // humanized: first word capitalized, rest lowercase (snake_case → "Word rest")
-        assert!(routes.contains("\"Published at\""), "humanize must produce 'Published at': {routes}");
-        assert!(routes.contains("\"User name\""), "humanize must produce 'User name': {routes}");
+        assert!(
+            routes.contains("\"Published at\""),
+            "humanize must produce 'Published at': {routes}"
+        );
+        assert!(
+            routes.contains("\"User name\""),
+            "humanize must produce 'User name': {routes}"
+        );
     }
 }
