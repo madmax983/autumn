@@ -185,7 +185,7 @@ pub(crate) struct McpWiring {
     /// CORS layer, so it must serve preflight for allowlisted browser clients).
     pub cors: crate::config::CorsConfig,
     /// The app's trusted-Host policy, gating the same-origin shortcut.
-    pub trusted_hosts: crate::router::TrustedHostPolicy,
+    pub trusted_hosts: crate::security::TrustedHostPolicy,
     /// Configured tenant header to forward (header-based tenancy), else `None`.
     pub tenant_header: Option<String>,
     /// Configured CSRF token header name (default `x-csrf-token`). Forwarded on
@@ -220,7 +220,7 @@ pub struct McpServer {
     /// (whose `Origin` and `Host` are both the attacker's domain) cannot bypass
     /// `Origin` validation by Host-match alone — it must still be an explicitly
     /// trusted host, exactly as normal routes require.
-    trusted_hosts: crate::router::TrustedHostPolicy,
+    trusted_hosts: crate::security::TrustedHostPolicy,
     /// The configured tenant header name (e.g. `x-tenant-id`) when the app uses
     /// header-based tenancy (`[tenancy] enabled = true, source = "header"`).
     /// `tools/call` forwards this header onto the dispatched request so the
@@ -254,7 +254,7 @@ impl McpServer {
     fn origin_allowed(&self, origin: &str, host: Option<&str>, scheme: Option<&str>) -> bool {
         if let Some(host) = host
             && is_same_origin(origin, host, scheme)
-            && crate::router::extract_host_without_port(host)
+            && crate::security::extract_host_without_port(host)
                 .is_some_and(|h| self.trusted_hosts.allows_host(&h.to_ascii_lowercase()))
         {
             return true;
@@ -882,7 +882,7 @@ async fn mcp_host_origin_guard(
     // `initialize`/`tools/list` with an arbitrary `Host` and enumerate the tool
     // catalog — even though the same request to a direct route would be rejected.
     let host_trusted = host
-        .and_then(crate::router::extract_host_without_port)
+        .and_then(crate::security::extract_host_without_port)
         .map(|h| h.trim_end_matches('.').to_ascii_lowercase())
         .filter(|h| !h.is_empty())
         .map_or_else(
@@ -2246,10 +2246,10 @@ mod tests {
 
     /// A trusted-Host policy that trusts the given hosts (plus dev loopback,
     /// which `from_config` adds for non-production profiles).
-    fn trusted(hosts: &[&str]) -> crate::router::TrustedHostPolicy {
+    fn trusted(hosts: &[&str]) -> crate::security::TrustedHostPolicy {
         let mut config = crate::config::AutumnConfig::default();
         config.security.trusted_hosts.hosts = hosts.iter().map(|h| (*h).to_owned()).collect();
-        crate::router::TrustedHostPolicy::from_config(&config)
+        crate::security::TrustedHostPolicy::from_config(&config)
     }
 
     fn server(allowed_origins: Vec<String>) -> McpServer {
