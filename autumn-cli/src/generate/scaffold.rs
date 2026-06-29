@@ -1481,8 +1481,8 @@ fn cell_value_expr(field: &Field) -> String {
         (true, _) => format!("row.{name}.as_ref().map(ToString::to_string).unwrap_or_default()"),
         // Non-nullable Bytea: Cow<str> does implement Render.
         (false, FieldKind::Bytea) => format!("String::from_utf8_lossy(&row.{name})"),
-        // String/Text: implement Render directly.
-        (false, FieldKind::String | FieldKind::Text) => format!("row.{name}.as_str()"),
+        // String/Text: &String implements Render via deref coercion.
+        (false, FieldKind::String | FieldKind::Text) => format!("&row.{name}"),
         // Numerics (i32, i64, f32, f64): implement Render directly.
         (false, FieldKind::I32 | FieldKind::I64 | FieldKind::F32 | FieldKind::F64) => {
             format!("row.{name}")
