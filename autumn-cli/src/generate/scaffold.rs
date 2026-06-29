@@ -1532,19 +1532,18 @@ fn render_columns_vec(pascal_name: &str, plural: &str, fields: &[Field]) -> Stri
 /// Produces one `("Label", maud::html! { value_expr })` tuple per row:
 /// `id`, every DSL-declared field (humanized label), then `created_at`.
 fn render_show_property_rows(fields: &[Field]) -> String {
-    let mut out = String::new();
-    out.push_str(r#"        ("Id", maud::html! { (row.id) }),"#);
-    out.push('\n');
+    let mut out = String::with_capacity(fields.len() * 100 + 150);
+    out.push_str("        (\"Id\", maud::html! { (row.id) }),\n");
     for f in fields {
         let label = humanize(&f.name);
         let cell_expr = cell_value_expr(f);
-        out.push_str(&format!(
-            r#"        ("{label}", maud::html! {{ ({cell_expr}) }}),"#
-        ));
-        out.push('\n');
+        out.push_str("        (\"");
+        out.push_str(&label);
+        out.push_str("\", maud::html! { (");
+        out.push_str(&cell_expr);
+        out.push_str(") }),\n");
     }
-    out.push_str(r#"        ("Created at", maud::html! { (row.created_at.to_string()) }),"#);
-    out.push('\n');
+    out.push_str("        (\"Created at\", maud::html! { (row.created_at.to_string()) }),\n");
     out
 }
 
