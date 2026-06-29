@@ -592,6 +592,371 @@ pub fn autocomplete_empty_state(message: &str) -> maud::Markup {
     }
 }
 
+// ── data_table ────────────────────────────────────────────────────────────
+
+/// Sort direction for a [`data_table`] sortable column header.
+///
+/// `Asc` is the default. Use [`SortDir::toggled`] to flip the direction
+/// when building sort links for the active column.
+#[cfg(feature = "maud")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SortDir {
+    /// Ascending order (default).
+    #[default]
+    Asc,
+    /// Descending order.
+    Desc,
+}
+
+#[cfg(feature = "maud")]
+impl SortDir {
+    /// Query-parameter value: `"asc"` or `"desc"`.
+    #[must_use]
+    pub const fn param_value(self) -> &'static str {
+        match self {
+            Self::Asc => "asc",
+            Self::Desc => "desc",
+        }
+    }
+
+    /// `aria-sort` attribute value: `"ascending"` or `"descending"`.
+    #[must_use]
+    pub const fn aria_value(self) -> &'static str {
+        match self {
+            Self::Asc => "ascending",
+            Self::Desc => "descending",
+        }
+    }
+
+    /// Returns the opposite direction.
+    #[must_use]
+    pub const fn toggled(self) -> Self {
+        match self {
+            Self::Asc => Self::Desc,
+            Self::Desc => Self::Asc,
+        }
+    }
+}
+
+/// A single column definition for [`data_table`].
+///
+/// Each column carries a header label, an optional sort key (opt-in via
+/// [`Column::sortable`]), and a cell closure that maps a row reference to
+/// `Markup`.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use autumn_web::widgets::{Column, data_table, DataTableConfig};
+///
+/// struct Post { id: i64, title: String }
+///
+/// let cols: Vec<Column<Post>> = vec![
+///     Column::new("ID", |row| html! { (row.id) }),
+///     Column::new("Title", |row| html! { (row.title.as_str()) })
+///         .sortable("title"),
+/// ];
+/// ```
+#[cfg(feature = "maud")]
+pub struct Column<'a, T> {
+    /// Column header label shown in `<th>`.
+    pub header: &'a str,
+    /// If `Some`, this column is sortable and the value is the `sort=` query param.
+    pub sort_key: Option<&'a str>,
+    /// Cell renderer: maps a row reference to rendered `Markup`.
+    pub cell: Box<dyn Fn(&T) -> maud::Markup + Send + 'a>,
+}
+
+#[cfg(feature = "maud")]
+impl<'a, T> Column<'a, T> {
+    /// Create a new non-sortable column with a header label and cell closure.
+    #[must_use]
+    pub fn new(header: &'a str, cell: impl Fn(&T) -> maud::Markup + Send + 'a) -> Self {
+        Self {
+            header,
+            sort_key: None,
+            cell: Box::new(cell),
+        }
+    }
+
+    /// Make this column sortable, linking the header with `sort={sort_key}` query params.
+    ///
+    /// The server owns the actual ordering; the widget only renders the link.
+    #[must_use]
+    pub const fn sortable(mut self, sort_key: &'a str) -> Self {
+        self.sort_key = Some(sort_key);
+        self
+    }
+}
+
+/// Configuration for a [`data_table`] widget.
+///
+/// Build with [`DataTableConfig::new`] and chain builder methods for optional overrides.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use autumn_web::widgets::DataTableConfig;
+///
+/// let config = DataTableConfig::new("No posts found.")
+///     .base_path("/posts")
+///     .query("q=foo")
+///     .active_sort("title")
+///     .caption("Posts");
+/// ```
+#[cfg(feature = "maud")]
+#[derive(Debug, Clone)]
+pub struct DataTableConfig<'a> {
+    /// Optional `<caption>` for the table (table name/description, not the empty state).
+    pub caption: Option<&'a str>,
+    /// Message shown when `rows` is empty (required).
+    pub empty_message: &'a str,
+    /// Base path for sort links, e.g. `"/posts"`.
+    pub base_path: &'a str,
+    /// Raw query string of the current request (preserved on sort links).
+    pub query: &'a str,
+    /// Query parameter name for the sort column (default `"sort"`).
+    pub sort_param: &'a str,
+    /// Query parameter name for the sort direction (default `"dir"`).
+    pub dir_param: &'a str,
+    /// Query parameter name for the page (stripped on sort, default `"page"`).
+    pub page_param: &'a str,
+    /// The currently active sort column key, if any.
+    pub active_sort: Option<&'a str>,
+    /// Direction of the active sort (default [`SortDir::Asc`]).
+    pub active_dir: SortDir,
+    /// Optional CSS class to add to the `<table>` element.
+    pub class: Option<&'a str>,
+}
+
+#[cfg(feature = "maud")]
+impl<'a> DataTableConfig<'a> {
+    /// Create a new config with the given empty-state message and sensible defaults.
+    #[must_use]
+    pub const fn new(empty_message: &'a str) -> Self {
+        Self {
+            caption: None,
+            empty_message,
+            base_path: "",
+            query: "",
+            sort_param: "sort",
+            dir_param: "dir",
+            page_param: "page",
+            active_sort: None,
+            active_dir: SortDir::Asc,
+            class: None,
+        }
+    }
+
+    /// Set the table `<caption>` (table name; use for accessibility, not for empty state).
+    #[must_use]
+    pub const fn caption(mut self, caption: &'a str) -> Self {
+        self.caption = Some(caption);
+        self
+    }
+
+    /// Set the base path for sort links (default `""`).
+    #[must_use]
+    pub const fn base_path(mut self, base_path: &'a str) -> Self {
+        self.base_path = base_path;
+        self
+    }
+
+    /// Preserve the current request query string on sort links.
+    #[must_use]
+    pub const fn query(mut self, query: &'a str) -> Self {
+        self.query = query;
+        self
+    }
+
+    /// Set the active sort column key.
+    #[must_use]
+    pub const fn active_sort(mut self, key: &'a str) -> Self {
+        self.active_sort = Some(key);
+        self
+    }
+
+    /// Set the active sort direction.
+    #[must_use]
+    pub const fn active_dir(mut self, dir: SortDir) -> Self {
+        self.active_dir = dir;
+        self
+    }
+
+    /// Add a CSS class to the `<table>` element.
+    #[must_use]
+    pub const fn class(mut self, class: &'a str) -> Self {
+        self.class = Some(class);
+        self
+    }
+}
+
+/// Strip named params from a raw query string, returning the preserved remainder.
+///
+/// Intentional duplication of the same helper in `ui::pagination` — that one is
+/// private to its module. Both are small enough that sharing outweighs coupling.
+#[cfg(feature = "maud")]
+fn dt_filter_query(query: &str, drop_keys: &[&str]) -> String {
+    let query = query.strip_prefix('?').unwrap_or(query);
+    query
+        .split('&')
+        .filter(|pair| {
+            if pair.is_empty() {
+                return false;
+            }
+            let key = pair.split('=').next().unwrap_or(pair);
+            !drop_keys.contains(&key)
+        })
+        .collect::<Vec<&str>>()
+        .join("&")
+}
+
+/// Render a column-driven data table from a slice of records.
+///
+/// Emits a semantic, accessible `<table>` with a `<thead>` row of `<th scope="col">`
+/// headers and a `<tbody>` of `<tr>`/`<td>` cells. Empty rows render a single
+/// placeholder row spanning all columns. Sortable columns (opt-in via
+/// [`Column::sortable`]) carry `aria-sort` on the `<th>` and a link that toggles
+/// direction while preserving the current query string (sort resets pagination).
+///
+/// # Composes with `active_search` and `pagination_nav`
+///
+/// ```rust
+/// # use autumn_web::pagination::{Page, PageRequest};
+/// # use autumn_web::ui::pagination::{pagination_nav, PagerOptions};
+/// # use autumn_web::widgets::{Column, DataTableConfig, data_table};
+/// # struct Post { id: i64, title: String }
+/// # let req = PageRequest::new(1, 10);
+/// # let rows: Vec<Post> = vec![];
+/// # let page: Page<Post> = Page::new(rows, 0, &req);
+/// let cols: Vec<Column<Post>> = vec![
+///     Column::new("ID", |row: &Post| maud::html! { (row.id) }),
+///     Column::new("Title", |row: &Post| maud::html! { (row.title.as_str()) }),
+/// ];
+/// let html = maud::html! {
+///     (data_table(&page.content, &cols, &DataTableConfig::new("No posts yet.").base_path("/posts")))
+///     (pagination_nav(&page, &PagerOptions::new("/posts")))
+/// };
+/// assert!(html.into_string().contains("<table"));
+/// ```
+///
+/// # Example with sortable columns
+///
+/// ```rust,ignore
+/// use autumn_web::prelude::*;
+/// use autumn_web::widgets::{Column, DataTableConfig, SortDir, data_table};
+/// use serde::Deserialize;
+///
+/// #[derive(Deserialize)]
+/// struct SortQuery { sort: Option<String>, dir: Option<String> }
+///
+/// #[get("/posts")]
+/// async fn index(
+///     Query(q): Query<SortQuery>,
+///     page_req: PageRequest,
+///     repo: PgPostRepository,
+/// ) -> AutumnResult<Markup> {
+///     let active_dir = if q.dir.as_deref() == Some("desc") { SortDir::Desc } else { SortDir::Asc };
+///     let page_data = repo.page(&page_req).await?;
+///     let cols: Vec<Column<Post>> = vec![
+///         Column::new("Title", |row| html! { (row.title.as_str()) }).sortable("title"),
+///         Column::new("", |row| html! { a href=(format!("/posts/{}", row.id)) { "Show" } }),
+///     ];
+///     let config = DataTableConfig::new("No posts yet.")
+///         .base_path("/posts")
+///         .active_sort(q.sort.as_deref().unwrap_or(""))
+///         .active_dir(active_dir);
+///     Ok(layout("Posts", html! {
+///         (data_table(&page_data.content, &cols, &config))
+///         (pagination_nav(&page_data, &PagerOptions::new("/posts")))
+///     }))
+/// }
+/// ```
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn data_table<T>(
+    rows: &[T],
+    columns: &[Column<'_, T>],
+    config: &DataTableConfig<'_>,
+) -> maud::Markup {
+    let col_count = columns.len();
+    // Hoist loop-invariant: query/drop-keys are the same for every sortable column.
+    let filtered = dt_filter_query(
+        config.query,
+        &[config.sort_param, config.dir_param, config.page_param],
+    );
+
+    maud::html! {
+        table class=[config.class] {
+            @if let Some(caption) = config.caption {
+                caption { (caption) }
+            }
+            thead {
+                tr {
+                    @for col in columns {
+                        @if let Some(sort_key) = col.sort_key {
+                            // Determine sort direction for this column's link.
+                            @let is_active = config.active_sort == Some(sort_key);
+                            @let link_dir = if is_active {
+                                config.active_dir.toggled()
+                            } else {
+                                SortDir::Asc
+                            };
+                            @let aria_sort = if is_active {
+                                config.active_dir.aria_value()
+                            } else {
+                                "none"
+                            };
+                            @let href = if filtered.is_empty() {
+                                format!(
+                                    "{}?{}={}&{}={}",
+                                    config.base_path,
+                                    config.sort_param,
+                                    sort_key,
+                                    config.dir_param,
+                                    link_dir.param_value(),
+                                )
+                            } else {
+                                format!(
+                                    "{}?{}&{}={}&{}={}",
+                                    config.base_path,
+                                    filtered,
+                                    config.sort_param,
+                                    sort_key,
+                                    config.dir_param,
+                                    link_dir.param_value(),
+                                )
+                            };
+                            th scope="col" aria-sort=(aria_sort) {
+                                a href=(href) { (col.header) }
+                            }
+                        } @else {
+                            th scope="col" { (col.header) }
+                        }
+                    }
+                }
+            }
+            tbody {
+                @if rows.is_empty() {
+                    tr {
+                        td colspan=(col_count) {
+                            span role="status" { (config.empty_message) }
+                        }
+                    }
+                } @else {
+                    @for row in rows {
+                        tr {
+                            @for col in columns {
+                                td { ((col.cell)(row)) }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 // ── Tests ──────────────────────────────────────────────────────────────────
 
 #[cfg(all(test, feature = "maud"))]
@@ -1190,5 +1555,200 @@ mod tests {
             html.contains(r#"role="status""#) || html.contains("aria-live"),
             "{html}"
         );
+    }
+
+    // ── data_table ─────────────────────────────────────────────────────
+
+    #[test]
+    fn sortdir_param_value() {
+        assert_eq!(SortDir::Asc.param_value(), "asc");
+        assert_eq!(SortDir::Desc.param_value(), "desc");
+    }
+
+    #[test]
+    fn sortdir_aria_value() {
+        assert_eq!(SortDir::Asc.aria_value(), "ascending");
+        assert_eq!(SortDir::Desc.aria_value(), "descending");
+    }
+
+    #[test]
+    fn sortdir_toggled() {
+        assert_eq!(SortDir::Asc.toggled(), SortDir::Desc);
+        assert_eq!(SortDir::Desc.toggled(), SortDir::Asc);
+    }
+
+    #[test]
+    fn data_table_config_defaults() {
+        let cfg = DataTableConfig::new("No items");
+        assert_eq!(cfg.empty_message, "No items");
+        assert_eq!(cfg.sort_param, "sort");
+        assert_eq!(cfg.dir_param, "dir");
+        assert_eq!(cfg.page_param, "page");
+        assert!(cfg.active_sort.is_none());
+        assert_eq!(cfg.active_dir, SortDir::Asc);
+        assert!(cfg.caption.is_none());
+        assert!(cfg.class.is_none());
+        assert_eq!(cfg.base_path, "");
+        assert_eq!(cfg.query, "");
+    }
+
+    #[test]
+    fn data_table_config_builders() {
+        let cfg = DataTableConfig::new("No items")
+            .base_path("/posts")
+            .query("q=foo")
+            .caption("Posts table")
+            .active_sort("title")
+            .active_dir(SortDir::Desc)
+            .class("my-table");
+        assert_eq!(cfg.base_path, "/posts");
+        assert_eq!(cfg.query, "q=foo");
+        assert_eq!(cfg.caption, Some("Posts table"));
+        assert_eq!(cfg.active_sort, Some("title"));
+        assert_eq!(cfg.active_dir, SortDir::Desc);
+        assert_eq!(cfg.class, Some("my-table"));
+    }
+
+    #[test]
+    fn data_table_has_thead_th_scope_col() {
+        let cols: Vec<Column<i32>> = vec![
+            Column::new("Name", |_| maud::html! { "n" }),
+            Column::new("Age", |_| maud::html! { "a" }),
+        ];
+        let html = data_table(&[1i32], &cols, &DataTableConfig::new("empty")).into_string();
+        assert!(html.contains("<thead"), "{html}");
+        assert!(html.contains(r#"scope="col""#), "{html}");
+        assert!(html.contains("Name"), "{html}");
+        assert!(html.contains("Age"), "{html}");
+    }
+
+    #[test]
+    fn data_table_renders_tbody_rows_and_cells() {
+        let cols: Vec<Column<&str>> = vec![Column::new("Word", |row| maud::html! { (*row) })];
+        let html =
+            data_table(&["hello", "world"], &cols, &DataTableConfig::new("empty")).into_string();
+        assert!(html.contains("<tbody"), "{html}");
+        assert!(html.contains("hello"), "{html}");
+        assert!(html.contains("world"), "{html}");
+        // Two data rows
+        assert_eq!(
+            html.matches("<tr").count(),
+            3,
+            "1 header row + 2 data rows: {html}"
+        );
+    }
+
+    #[test]
+    fn data_table_caption_when_set() {
+        let cols: Vec<Column<i32>> = vec![Column::new("X", |_| maud::html! { "x" })];
+        let html = data_table(
+            &[1i32],
+            &cols,
+            &DataTableConfig::new("e").caption("My Table"),
+        )
+        .into_string();
+        assert!(html.contains("<caption"), "{html}");
+        assert!(html.contains("My Table"), "{html}");
+    }
+
+    #[test]
+    fn data_table_no_caption_by_default() {
+        let cols: Vec<Column<i32>> = vec![Column::new("X", |_| maud::html! { "x" })];
+        let html = data_table(&[1i32], &cols, &DataTableConfig::new("e")).into_string();
+        assert!(!html.contains("<caption"), "{html}");
+    }
+
+    #[test]
+    fn data_table_applies_class_when_set() {
+        let cols: Vec<Column<i32>> = vec![Column::new("X", |_| maud::html! { "x" })];
+        let html =
+            data_table(&[1i32], &cols, &DataTableConfig::new("e").class("styled")).into_string();
+        assert!(html.contains(r#"class="styled""#), "{html}");
+    }
+
+    #[test]
+    fn data_table_empty_renders_single_colspan_row() {
+        let cols: Vec<Column<i32>> = vec![
+            Column::new("A", |_| maud::html! { "a" }),
+            Column::new("B", |_| maud::html! { "b" }),
+            Column::new("C", |_| maud::html! { "c" }),
+        ];
+        let html = data_table(&[], &cols, &DataTableConfig::new("Nothing here")).into_string();
+        assert!(html.contains("Nothing here"), "{html}");
+        assert!(html.contains(r#"colspan="3""#), "{html}");
+        // Only the header tr, no data rows
+        assert_eq!(html.matches("<tr").count(), 2, "header + empty row: {html}");
+    }
+
+    #[test]
+    fn data_table_empty_message_announced() {
+        let cols: Vec<Column<i32>> = vec![Column::new("X", |_| maud::html! { "x" })];
+        let html = data_table(&[], &cols, &DataTableConfig::new("No results")).into_string();
+        assert!(html.contains(r#"role="status""#), "{html}");
+    }
+
+    #[test]
+    fn data_table_nonsortable_header_is_plain() {
+        let cols: Vec<Column<i32>> = vec![Column::new("Title", |_| maud::html! { "t" })];
+        let html = data_table(&[1i32], &cols, &DataTableConfig::new("e")).into_string();
+        // No sort link in header
+        let thead_end = html.find("</thead>").unwrap_or(html.len());
+        let thead = &html[..thead_end];
+        assert!(!thead.contains("<a "), "{html}");
+        assert!(!thead.contains("aria-sort"), "{html}");
+    }
+
+    #[test]
+    fn data_table_sortable_inactive_has_link_and_aria_sort_none() {
+        let cols: Vec<Column<i32>> =
+            vec![Column::new("Title", |_| maud::html! { "t" }).sortable("title")];
+        let cfg = DataTableConfig::new("e").base_path("/posts");
+        let html = data_table(&[1i32], &cols, &cfg).into_string();
+        assert!(html.contains(r#"aria-sort="none""#), "{html}");
+        assert!(html.contains("sort=title"), "{html}");
+        assert!(html.contains("dir=asc"), "{html}");
+    }
+
+    #[test]
+    fn data_table_sortable_active_reflects_dir_and_toggles() {
+        let cols: Vec<Column<i32>> =
+            vec![Column::new("Title", |_| maud::html! { "t" }).sortable("title")];
+        let cfg = DataTableConfig::new("e")
+            .base_path("/posts")
+            .active_sort("title")
+            .active_dir(SortDir::Asc);
+        let html = data_table(&[1i32], &cols, &cfg).into_string();
+        assert!(html.contains(r#"aria-sort="ascending""#), "{html}");
+        // toggled dir link
+        assert!(html.contains("dir=desc"), "{html}");
+    }
+
+    #[test]
+    fn data_table_sortable_link_preserves_other_query_params() {
+        let cols: Vec<Column<i32>> =
+            vec![Column::new("Name", |_| maud::html! { "n" }).sortable("name")];
+        let cfg = DataTableConfig::new("e")
+            .base_path("/posts")
+            .query("q=hello");
+        let html = data_table(&[1i32], &cols, &cfg).into_string();
+        assert!(html.contains("q=hello"), "{html}");
+    }
+
+    #[test]
+    fn data_table_sortable_link_drops_existing_sort_dir_page() {
+        let cols: Vec<Column<i32>> =
+            vec![Column::new("Name", |_| maud::html! { "n" }).sortable("name")];
+        let cfg = DataTableConfig::new("e")
+            .base_path("/posts")
+            .query("q=foo&sort=old&dir=asc&page=3");
+        let html = data_table(&[1i32], &cols, &cfg).into_string();
+        // old sort params stripped, new sort=name present
+        assert!(html.contains("sort=name"), "{html}");
+        // page stripped (reset to page 1)
+        assert!(!html.contains("page=3"), "{html}");
+        // q preserved
+        assert!(html.contains("q=foo"), "{html}");
+        // no duplicate old sort
+        assert!(!html.contains("sort=old"), "{html}");
     }
 }
