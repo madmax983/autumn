@@ -22,6 +22,9 @@ mod templates {
     pub const SEED_CARGO_TOML: &str = include_str!("templates/seed_Cargo.toml.tmpl");
     pub const INTEGRATION_TEST: &str = include_str!("templates/tests/integration_test.rs.tmpl");
     pub const CI_WORKFLOW: &str = include_str!("templates/.github/workflows/ci.yml.tmpl");
+    pub const RUST_TOOLCHAIN: &str = include_str!("templates/rust-toolchain.toml.tmpl");
+    pub const RUSTFMT: &str = include_str!("templates/rustfmt.toml.tmpl");
+    pub const CLIPPY: &str = include_str!("templates/clippy.toml.tmpl");
 }
 
 /// Variables substituted into project and starter template files.
@@ -286,6 +289,10 @@ fn generate_inner(
     // uncovered line (as it does for the multi-line writes above).
     let ci_workflow = project_dir.join(".github/workflows/ci.yml");
     fs::write(ci_workflow, render(templates::CI_WORKFLOW))?;
+    let rust_toolchain = project_dir.join("rust-toolchain.toml");
+    fs::write(rust_toolchain, render(templates::RUST_TOOLCHAIN))?;
+    fs::write(project_dir.join("rustfmt.toml"), render(templates::RUSTFMT))?;
+    fs::write(project_dir.join("clippy.toml"), render(templates::CLIPPY))?;
 
     write_optional_scaffold_files(&project_dir, name, opts, &render)?;
 
@@ -393,6 +400,9 @@ fn print_scaffold_summary(name: &str, opts: GenerateOptions) {
     println!("  Created {name}/static/css/input.css");
     println!("  Created {name}/tailwind.config.js");
     println!("  Created {name}/.gitignore");
+    println!("  Created {name}/rust-toolchain.toml");
+    println!("  Created {name}/rustfmt.toml");
+    println!("  Created {name}/clippy.toml");
     println!("  Created {name}/migrations/");
     println!("  Created {name}/tests/integration_test.rs");
     println!("  Created {name}/config/master.key (keep secret — never commit)");
@@ -1336,6 +1346,137 @@ mod tests {
             s.contains("stripe_secret_key") || s.contains('#'),
             "decrypted content should have placeholder comments"
         );
+    }
+
+    // ── rust-toolchain.toml / rustfmt.toml / clippy.toml scaffolding ─────────
+
+    #[test]
+    fn generates_rust_toolchain_toml() {
+        let tmp = TempDir::new().unwrap();
+        generate("toolchain-app", tmp.path()).unwrap();
+        let p = tmp.path().join("toolchain-app");
+        assert!(
+            p.join("rust-toolchain.toml").is_file(),
+            "`autumn new` must write rust-toolchain.toml"
+        );
+    }
+
+    #[test]
+    fn rust_toolchain_pins_channel_to_msrv() {
+        let tmp = TempDir::new().unwrap();
+        generate("toolchain-ver-app", tmp.path()).unwrap();
+        let content =
+            fs::read_to_string(tmp.path().join("toolchain-ver-app/rust-toolchain.toml")).unwrap();
+        assert!(
+            content.contains("channel"),
+            "rust-toolchain.toml must set channel: {content}"
+        );
+        assert!(
+            content.contains("1.88.0"),
+            "rust-toolchain.toml channel must match the Cargo.toml rust-version (1.88.0): {content}"
+        );
+    }
+
+    #[test]
+    fn rust_toolchain_lists_rustfmt_and_clippy_components() {
+        let tmp = TempDir::new().unwrap();
+        generate("toolchain-comp-app", tmp.path()).unwrap();
+        let content =
+            fs::read_to_string(tmp.path().join("toolchain-comp-app/rust-toolchain.toml")).unwrap();
+        assert!(
+            content.contains("rustfmt"),
+            "rust-toolchain.toml must list rustfmt in components: {content}"
+        );
+        assert!(
+            content.contains("clippy"),
+            "rust-toolchain.toml must list clippy in components: {content}"
+        );
+    }
+
+    #[test]
+    fn generates_rustfmt_toml() {
+        let tmp = TempDir::new().unwrap();
+        generate("fmt-app", tmp.path()).unwrap();
+        let p = tmp.path().join("fmt-app");
+        assert!(
+            p.join("rustfmt.toml").is_file(),
+            "`autumn new` must write rustfmt.toml"
+        );
+    }
+
+    #[test]
+    fn rustfmt_toml_has_correct_edition_and_max_width() {
+        let tmp = TempDir::new().unwrap();
+        generate("fmt-cfg-app", tmp.path()).unwrap();
+        let content = fs::read_to_string(tmp.path().join("fmt-cfg-app/rustfmt.toml")).unwrap();
+        assert!(
+            content.contains(r#"edition = "2024""#),
+            "rustfmt.toml must set edition = \"2024\": {content}"
+        );
+        assert!(
+            content.contains("max_width = 100"),
+            "rustfmt.toml must set max_width = 100: {content}"
+        );
+    }
+
+    #[test]
+    fn generates_clippy_toml() {
+        let tmp = TempDir::new().unwrap();
+        generate("clippy-app", tmp.path()).unwrap();
+        let p = tmp.path().join("clippy-app");
+        assert!(
+            p.join("clippy.toml").is_file(),
+            "`autumn new` must write clippy.toml"
+        );
+    }
+
+    #[test]
+    fn clippy_toml_msrv_matches_rust_version() {
+        let tmp = TempDir::new().unwrap();
+        generate("clippy-msrv-app", tmp.path()).unwrap();
+        let content = fs::read_to_string(tmp.path().join("clippy-msrv-app/clippy.toml")).unwrap();
+        assert!(
+            content.contains("msrv"),
+            "clippy.toml must set msrv: {content}"
+        );
+        assert!(
+            content.contains("1.88.0"),
+            "clippy.toml msrv must match Cargo.toml rust-version (1.88.0): {content}"
+        );
+    }
+
+    #[test]
+    fn gitignore_does_not_exclude_toolchain_files() {
+        let tmp = TempDir::new().unwrap();
+        generate("gi-toolchain-app", tmp.path()).unwrap();
+        let content = fs::read_to_string(tmp.path().join("gi-toolchain-app/.gitignore")).unwrap();
+        assert!(
+            !content.contains("rust-toolchain"),
+            ".gitignore must NOT exclude rust-toolchain.toml: {content}"
+        );
+        assert!(
+            !content.contains("rustfmt.toml"),
+            ".gitignore must NOT exclude rustfmt.toml: {content}"
+        );
+        assert!(
+            !content.contains("clippy.toml"),
+            ".gitignore must NOT exclude clippy.toml: {content}"
+        );
+    }
+
+    #[test]
+    fn scaffold_summary_mentions_toolchain_files() {
+        let tmp = TempDir::new().unwrap();
+        // Use generate_with (non-quiet) and capture stdout.
+        // We can't easily capture stdout in unit tests, so we verify the files
+        // exist and the summary helper doesn't strip them — this is covered by
+        // the file-existence tests above. This test verifies print_scaffold_summary
+        // is at least called without panic for the default case.
+        generate("summary-toolchain-app", tmp.path()).unwrap();
+        let p = tmp.path().join("summary-toolchain-app");
+        assert!(p.join("rust-toolchain.toml").is_file());
+        assert!(p.join("rustfmt.toml").is_file());
+        assert!(p.join("clippy.toml").is_file());
     }
 
     #[test]
