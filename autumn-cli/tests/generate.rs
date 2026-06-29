@@ -4112,6 +4112,20 @@ fn generate_tauri_scaffolds_expected_files() {
         "src-tauri/src/lib.rs must be created"
     );
 
+    // Platform-specific Tauri config overlays (beforeBuildCommand/beforeDevCommand)
+    assert!(
+        project.join("src-tauri/tauri.linux.conf.json").is_file(),
+        "tauri.linux.conf.json must be created"
+    );
+    assert!(
+        project.join("src-tauri/tauri.macos.conf.json").is_file(),
+        "tauri.macos.conf.json must be created"
+    );
+    assert!(
+        project.join("src-tauri/tauri.windows.conf.json").is_file(),
+        "tauri.windows.conf.json must be created"
+    );
+
     // Staging scripts
     assert!(
         project.join("src-tauri/stage-sidecar.sh").is_file(),
@@ -4172,9 +4186,10 @@ fn generate_tauri_conf_is_valid_json_with_required_fields() {
         "externalBin must not be empty"
     );
     assert!(parsed["bundle"]["icon"].is_array(), "must have bundle.icon");
+    // beforeBuildCommand lives in platform-specific overlay files, not the main conf.
     assert!(
-        parsed["build"]["beforeBuildCommand"].is_string(),
-        "must have build.beforeBuildCommand"
+        parsed["build"]["beforeBuildCommand"].is_null(),
+        "beforeBuildCommand must be absent from tauri.conf.json (lives in platform overlays)"
     );
     // The externalBin must reference the app name
     let bins = parsed["bundle"]["externalBin"].as_array().unwrap();

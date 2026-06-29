@@ -96,6 +96,22 @@ pub fn plan_tauri(project_root: &Path) -> Result<Plan, GenerateError> {
     plan.create_bytes(icons_dir.join("icon.ico"), PLACEHOLDER_ICO);
     plan.create_bytes(icons_dir.join("icon.icns"), PLACEHOLDER_ICNS);
 
+    // Platform-specific Tauri config overlays — Tauri CLI merges them at build/dev time.
+    // beforeBuildCommand and beforeDevCommand live here so tauri.conf.json is
+    // host-OS-agnostic and cargo tauri dev also stages the sidecar.
+    plan.create(
+        tauri.join("tauri.linux.conf.json"),
+        render_tauri_linux_conf(),
+    );
+    plan.create(
+        tauri.join("tauri.macos.conf.json"),
+        render_tauri_macos_conf(),
+    );
+    plan.create(
+        tauri.join("tauri.windows.conf.json"),
+        render_tauri_windows_conf(),
+    );
+
     // Staging scripts
     plan.create(
         tauri.join("stage-sidecar.sh"),
@@ -197,70 +213,71 @@ fn read_package_meta(project_root: &Path) -> Result<(String, String, String, boo
         .get("default-run")
         .and_then(|v| v.as_str())
         .map(str::to_owned);
-    let bin_name = doc
-        .get("bin")
-        .and_then(|b| b.as_array())
-        .map_or_else(
-            // Step 5: no [[bin]] table — honour default-run, then src/bin/ discovery,
-            // then fall back to the package name (which Cargo uses for src/main.rs).
-            || {
-                if let Some(dr) = &default_run {
-                    return dr.clone();
-                }
-                // Inspect src/bin/ for auto-discovered binaries.  Cargo names each
-                // binary after the file stem (not the package), so `src/bin/web.rs`
-                // produces a `web` binary, not `<package>`.
-                if let Ok(entries) = std::fs::read_dir(project_root.join("src/bin")) {
-                    let stems: Vec<String> = entries
-                        .filter_map(std::result::Result::ok)
-                        .filter_map(|e| {
-                            let p = e.path();
-                            if p.extension().is_some_and(|x| x == "rs") {
-                                p.file_stem()
-                                    .and_then(|s| s.to_str())
-                                    .map(str::to_owned)
-                            } else {
-                                None
-                            }
-                        })
-                        .collect();
-                    if stems.len() == 1 {
-                        return stems.into_iter().next().unwrap();
-                    }
-                }
-                name.clone()
-            },
-            |bins| {
-                // Step 1: explicit [[bin]] entry whose path is src/main.rs.
-                bins.iter()
-                    .find(|b| {
-                        b.get("path")
-                            .and_then(|p| p.as_str())
-                            .is_some_and(|p| p == "src/main.rs" || p == "src\\main.rs")
-                    })
-                    .and_then(|b| b.get("name"))
-                    .and_then(|n| n.as_str())
-                    .map(str::to_owned)
-                    .or_else(|| {
-                        if project_root.join("src/main.rs").is_file() {
-                            // Step 2: src/main.rs exists but is not declared in [[bin]];
-                            // Cargo auto-discovers it as the package-named binary.
-                            // The [[bin]] entries are for other auxiliary programs.
-                            Some(name.clone())
+    let bin_name = doc.get("bin").and_then(|b| b.as_array()).map_or_else(
+        // Step 5: no [[bin]] table — honour default-run, then check src/main.rs,
+        // then src/bin/ discovery, then fall back to the package name.
+        || {
+            if let Some(dr) = &default_run {
+                return dr.clone();
+            }
+            // Step 5a: src/main.rs exists → Cargo auto-discovers it as the
+            // package-named binary, even when src/bin/ also has files.
+            // Prefer the package name over any src/bin/ stem.
+            if project_root.join("src/main.rs").is_file() {
+                return name.clone();
+            }
+            // Inspect src/bin/ for auto-discovered binaries.  Cargo names each
+            // binary after the file stem (not the package), so `src/bin/web.rs`
+            // produces a `web` binary, not `<package>`.
+            if let Ok(entries) = std::fs::read_dir(project_root.join("src/bin")) {
+                let stems: Vec<String> = entries
+                    .filter_map(std::result::Result::ok)
+                    .filter_map(|e| {
+                        let p = e.path();
+                        if p.extension().is_some_and(|x| x == "rs") {
+                            p.file_stem().and_then(|s| s.to_str()).map(str::to_owned)
                         } else {
-                            // Step 3: honour [package] default-run when set.
-                            default_run.clone().or_else(|| {
-                                // Step 4: single or first explicit [[bin]] as last resort.
-                                bins.first()
-                                    .and_then(|b| b.get("name"))
-                                    .and_then(|n| n.as_str())
-                                    .map(str::to_owned)
-                            })
+                            None
                         }
                     })
-                    .unwrap_or_else(|| name.clone())
-            },
-        );
+                    .collect();
+                if stems.len() == 1 {
+                    return stems.into_iter().next().unwrap();
+                }
+            }
+            name.clone()
+        },
+        |bins| {
+            // Step 1: explicit [[bin]] entry whose path is src/main.rs.
+            bins.iter()
+                .find(|b| {
+                    b.get("path")
+                        .and_then(|p| p.as_str())
+                        .is_some_and(|p| p == "src/main.rs" || p == "src\\main.rs")
+                })
+                .and_then(|b| b.get("name"))
+                .and_then(|n| n.as_str())
+                .map(str::to_owned)
+                .or_else(|| {
+                    if project_root.join("src/main.rs").is_file() {
+                        // Step 2: src/main.rs exists but is not declared in [[bin]];
+                        // Cargo auto-discovers it as the package-named binary.
+                        // The [[bin]] entries are for other auxiliary programs.
+                        Some(name.clone())
+                    } else {
+                        // Step 3: honour [package] default-run when set.
+                        default_run.clone().or_else(|| {
+                            // Step 4: single or first explicit [[bin]] as last resort.
+                            bins.first()
+                                .and_then(|b| b.get("name"))
+                                .and_then(|n| n.as_str())
+                                .map(str::to_owned)
+                        })
+                    }
+                })
+                .unwrap_or_else(|| name.clone())
+        },
+    );
 
     // Check whether the app defines an `embed-assets` Cargo feature.
     // `autumn new` generates this; it typically expands to
@@ -315,16 +332,12 @@ fn render_tauri_conf(package_name: &str, version: &str, bin_name: &str) -> Strin
         })
         .collect::<Vec<_>>()
         .join(" ");
-    // beforeBuildCommand must use the native shell for the host OS.
-    // cfg!(windows) is evaluated when the generator binary compiles, which runs on
-    // the same host where `cargo tauri build` will later be invoked.
-    // Use `bash` explicitly — the staging script uses BASH_SOURCE and `pipefail`,
-    // which are not supported by POSIX `sh` (e.g. dash on Debian/Ubuntu).
-    let before_build_cmd = if cfg!(windows) {
-        "powershell -ExecutionPolicy Bypass -File stage-sidecar.ps1"
-    } else {
-        "bash stage-sidecar.sh"
-    };
+    // beforeBuildCommand and beforeDevCommand are declared in the platform-specific
+    // overlay files (tauri.linux.conf.json, tauri.macos.conf.json,
+    // tauri.windows.conf.json) that Tauri CLI merges at build/dev time.
+    // Keeping them out of tauri.conf.json makes the generated scaffold
+    // host-OS-agnostic: it stays correct regardless of which OS generated it.
+    //
     // Profile config entries always point to src-tauri/configs/, which the staging
     // script (beforeBuildCommand) populates at build time — copying real files or
     // creating empty stubs for profiles that don't yet exist.  An empty TOML file
@@ -338,9 +351,6 @@ fn render_tauri_conf(package_name: &str, version: &str, bin_name: &str) -> Strin
   "productName": "{title}",
   "version": "{version}",
   "identifier": "{identifier}",
-  "build": {{
-    "beforeBuildCommand": "{before_build_cmd}"
-  }},
   "bundle": {{
     "active": true,
     "targets": "all",
@@ -373,6 +383,42 @@ fn render_tauri_conf(package_name: &str, version: &str, bin_name: &str) -> Strin
 }}
 "#
     )
+}
+
+/// Platform-specific Tauri config overlays — Tauri CLI merges these at build/dev time.
+/// Keeping `beforeBuildCommand` / `beforeDevCommand` here (not in `tauri.conf.json`)
+/// means the generated scaffold is host-OS-agnostic.
+fn render_tauri_linux_conf() -> String {
+    r#"{
+  "build": {
+    "beforeBuildCommand": "bash stage-sidecar.sh",
+    "beforeDevCommand": "bash stage-sidecar.sh"
+  }
+}
+"#
+    .to_owned()
+}
+
+fn render_tauri_macos_conf() -> String {
+    r#"{
+  "build": {
+    "beforeBuildCommand": "bash stage-sidecar.sh",
+    "beforeDevCommand": "bash stage-sidecar.sh"
+  }
+}
+"#
+    .to_owned()
+}
+
+fn render_tauri_windows_conf() -> String {
+    r#"{
+  "build": {
+    "beforeBuildCommand": "powershell -ExecutionPolicy Bypass -File stage-sidecar.ps1",
+    "beforeDevCommand": "powershell -ExecutionPolicy Bypass -File stage-sidecar.ps1"
+  }
+}
+"#
+    .to_owned()
 }
 
 fn render_shell_cargo_toml(package_name: &str) -> String {
@@ -887,11 +933,13 @@ Required prerequisites for `cargo tauri build`:\n\
        macOS:   xcode-select --install\n\
        Windows: Install WebView2 + Visual Studio C++ build tools\n\
 \n\
-  3. Stage the autumn server sidecar (also wired into beforeBuildCommand):\n\
+  3. Stage the autumn server sidecar (also wired into beforeBuildCommand /\n\
+     beforeDevCommand in the platform-specific overlay files):\n\
        bash src-tauri/stage-sidecar.sh\n\
 \n\
-  4. Build the desktop app:\n\
+  4. Build or develop the desktop app:\n\
        cd src-tauri && cargo tauri build\n\
+       cd src-tauri && cargo tauri dev\n\
 \n\
   The sidecar is built with autumn-web/embed-assets (#1004) and\n\
   autumn-web/managed-pg-bundled (#1119).  For a DB-backed app the bundled\n\
@@ -1076,6 +1124,29 @@ mod tests {
         .unwrap();
         fs::create_dir_all(tmp.path().join("src")).unwrap();
         fs::write(tmp.path().join("src/main.rs"), "fn main() {}\n").unwrap();
+        tmp
+    }
+
+    /// Project with BOTH `src/main.rs` AND `src/bin/<bin_name>.rs` but NO `[[bin]]`
+    /// table — Cargo auto-discovers src/main.rs as the package-named binary; the
+    /// generator must prefer that over the src/bin/ stem.
+    fn project_with_main_and_src_bin(pkg_name: &str, bin_stem: &str) -> TempDir {
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join("Cargo.toml"),
+            format!(
+                "[package]\nname=\"{pkg_name}\"\nversion=\"0.1.0\"\nedition=\"2024\"\n\
+                 \n[dependencies]\nautumn-web = \"0.5.0\"\n"
+            ),
+        )
+        .unwrap();
+        fs::create_dir_all(tmp.path().join("src/bin")).unwrap();
+        fs::write(tmp.path().join("src/main.rs"), "fn main() {}\n").unwrap();
+        fs::write(
+            tmp.path().join(format!("src/bin/{bin_stem}.rs")),
+            "fn main() {}\n",
+        )
+        .unwrap();
         tmp
     }
 
@@ -1506,6 +1577,36 @@ mod tests {
     }
 
     #[test]
+    fn plan_prefers_main_rs_over_src_bin_when_both_exist() {
+        // A package with BOTH src/main.rs AND src/bin/worker.rs and NO [[bin]] table —
+        // Cargo treats src/main.rs as the primary binary (package-named), and src/bin/
+        // as an additional binary.  The generator must pick the package name, not "worker".
+        let tmp = project_with_main_and_src_bin("my-app", "worker");
+        let plan = plan_tauri(tmp.path()).unwrap();
+        let sh: &str = plan
+            .actions
+            .iter()
+            .find(|a| a.path().to_string_lossy().ends_with("stage-sidecar.sh"))
+            .and_then(|a| {
+                if let crate::generate::emit::Action::Create { contents, .. } = a {
+                    Some(contents.as_str())
+                } else {
+                    None
+                }
+            })
+            .expect("stage-sidecar.sh action not found");
+        assert!(
+            sh.contains("my-app"),
+            "when src/main.rs and src/bin/worker.rs both exist without [[bin]], \
+             the package name 'my-app' must be used (not the src/bin/ stem 'worker')"
+        );
+        assert!(
+            !sh.contains("--bin worker"),
+            "staging script must not use the src/bin/ stem 'worker' when src/main.rs is present"
+        );
+    }
+
+    #[test]
     fn plan_detects_src_bin_auto_discovered_binary() {
         // A package with src/bin/web.rs and no src/main.rs or [[bin]] table —
         // Cargo auto-discovers it as binary "web" (file stem, not package name).
@@ -1655,15 +1756,83 @@ mod tests {
     }
 
     #[test]
-    fn tauri_conf_has_before_build_command() {
+    fn tauri_conf_has_no_before_build_command() {
+        // beforeBuildCommand lives in the platform-specific overlay files, not the
+        // main tauri.conf.json, so the generated scaffold is host-OS-agnostic.
         let conf = render_tauri_conf("my-app", "0.1.0", "my-app");
         let parsed: serde_json::Value = serde_json::from_str(&conf).unwrap();
-        let cmd = parsed["build"]["beforeBuildCommand"]
-            .as_str()
-            .expect("build.beforeBuildCommand must be a string");
         assert!(
-            cmd.contains("stage-sidecar"),
-            "beforeBuildCommand must reference the staging script"
+            parsed["build"]["beforeBuildCommand"].is_null(),
+            "beforeBuildCommand must be absent from tauri.conf.json; \
+             it belongs in the platform-specific overlay files"
+        );
+    }
+
+    #[test]
+    fn platform_conf_files_are_in_plan() {
+        let tmp = project("my-app");
+        assert!(has_action(&tmp, "src-tauri/tauri.linux.conf.json"));
+        assert!(has_action(&tmp, "src-tauri/tauri.macos.conf.json"));
+        assert!(has_action(&tmp, "src-tauri/tauri.windows.conf.json"));
+    }
+
+    #[test]
+    fn platform_conf_linux_has_before_build_and_dev_commands() {
+        let conf = render_tauri_linux_conf();
+        let parsed: serde_json::Value = serde_json::from_str(&conf).expect("valid JSON");
+        let build_cmd = parsed["build"]["beforeBuildCommand"].as_str().unwrap_or("");
+        let dev_cmd = parsed["build"]["beforeDevCommand"].as_str().unwrap_or("");
+        assert!(
+            build_cmd.contains("stage-sidecar"),
+            "linux conf must have beforeBuildCommand referencing the staging script"
+        );
+        assert!(
+            dev_cmd.contains("stage-sidecar"),
+            "linux conf must have beforeDevCommand so `cargo tauri dev` stages the sidecar"
+        );
+        assert!(
+            build_cmd.contains("bash"),
+            "linux beforeBuildCommand must use bash"
+        );
+    }
+
+    #[test]
+    fn platform_conf_macos_has_before_build_and_dev_commands() {
+        let conf = render_tauri_macos_conf();
+        let parsed: serde_json::Value = serde_json::from_str(&conf).expect("valid JSON");
+        let build_cmd = parsed["build"]["beforeBuildCommand"].as_str().unwrap_or("");
+        let dev_cmd = parsed["build"]["beforeDevCommand"].as_str().unwrap_or("");
+        assert!(
+            build_cmd.contains("stage-sidecar"),
+            "macos conf must have beforeBuildCommand referencing the staging script"
+        );
+        assert!(
+            dev_cmd.contains("stage-sidecar"),
+            "macos conf must have beforeDevCommand so `cargo tauri dev` stages the sidecar"
+        );
+        assert!(
+            build_cmd.contains("bash"),
+            "macos beforeBuildCommand must use bash"
+        );
+    }
+
+    #[test]
+    fn platform_conf_windows_has_before_build_and_dev_commands() {
+        let conf = render_tauri_windows_conf();
+        let parsed: serde_json::Value = serde_json::from_str(&conf).expect("valid JSON");
+        let build_cmd = parsed["build"]["beforeBuildCommand"].as_str().unwrap_or("");
+        let dev_cmd = parsed["build"]["beforeDevCommand"].as_str().unwrap_or("");
+        assert!(
+            build_cmd.contains("stage-sidecar"),
+            "windows conf must have beforeBuildCommand referencing the staging script"
+        );
+        assert!(
+            dev_cmd.contains("stage-sidecar"),
+            "windows conf must have beforeDevCommand so `cargo tauri dev` stages the sidecar"
+        );
+        assert!(
+            build_cmd.contains("powershell") || build_cmd.contains("ps1"),
+            "windows beforeBuildCommand must use PowerShell"
         );
     }
 
