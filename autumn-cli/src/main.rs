@@ -1623,8 +1623,8 @@ enum GenerateCommands {
     /// Creates:
     ///   - `src-tauri/`                 — standalone Tauri shell crate
     ///   - `src-tauri/tauri.conf.json`  — Tauri v2 config (productName, bundle, sidecar)
-    ///   - `src-tauri/src/lib.rs`       — sidecar lifecycle glue (ephemeral port, /health
-    ///                                     polling, kill-on-close)
+    ///   - `src-tauri/src/lib.rs`       — sidecar lifecycle glue (ephemeral port,
+    ///     /health polling, kill-on-close)
     ///   - `src-tauri/icons/`           — placeholder icons for immediate buildability
     ///   - `src-tauri/stage-sidecar.sh` — build + stage the sidecar (Unix)
     ///   - `src-tauri/stage-sidecar.ps1`— build + stage the sidecar (Windows)

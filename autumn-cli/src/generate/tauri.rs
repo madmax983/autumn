@@ -150,18 +150,26 @@ fn read_package_name(project_root: &Path) -> Result<String, GenerateError> {
 fn render_tauri_conf(package_name: &str) -> String {
     // Bundle identifier: reverse-DNS style, hyphens kept (valid per Apple/Android specs)
     let identifier = format!("com.example.{package_name}");
-    // Display title: capitalise first letter of each word
+    // Display title: capitalise first letter of each word; split on both '-' and '_'
+    // so kebab-case (`my-app` → `My App`) and snake_case (`my_app` → `My App`) both work.
     let title: String = package_name
-        .split('-')
+        .split(['-', '_'])
         .map(|word| {
             let mut chars = word.chars();
-            match chars.next() {
-                None => String::new(),
-                Some(c) => c.to_uppercase().to_string() + chars.as_str(),
-            }
+            chars.next().map_or_else(String::new, |c| {
+                c.to_uppercase().to_string() + chars.as_str()
+            })
         })
         .collect::<Vec<_>>()
         .join(" ");
+    // beforeBuildCommand must use the native shell for the host OS.
+    // cfg!(windows) is evaluated when the generator binary compiles, which runs on
+    // the same host where `cargo tauri build` will later be invoked.
+    let before_build_cmd = if cfg!(windows) {
+        "powershell -ExecutionPolicy Bypass -File stage-sidecar.ps1"
+    } else {
+        "sh stage-sidecar.sh"
+    };
     format!(
         r#"{{
   "$schema": "https://schema.tauri.app/config/2",
@@ -169,7 +177,7 @@ fn render_tauri_conf(package_name: &str) -> String {
   "version": "0.1.0",
   "identifier": "{identifier}",
   "build": {{
-    "beforeBuildCommand": "sh stage-sidecar.sh"
+    "beforeBuildCommand": "{before_build_cmd}"
   }},
   "bundle": {{
     "active": true,
@@ -246,12 +254,15 @@ fn render_shell_lib_rs(package_name: &str) -> String {
 //!
 //! Lifecycle:
 //!   1. Bind loopback:0 to find a free ephemeral port (no hardcoded port collision).
+//!      Note: there is a brief window between dropping the listener and the sidecar
+//!      binding the port; in practice this race is extremely rare on loopback.
 //!   2. Spawn the autumn server sidecar with `AUTUMN_SERVER__PORT` set to that port.
 //!      `AUTUMN_MANAGED_PG_DATA_DIR` is set to the OS app-data dir so the managed
 //!      Postgres cluster (autumn feature #1119) persists across restarts.
-//!   3. Poll GET /health until the server is ready (up to 15 s), then open the
-//!      webview window pointing at http://127.0.0.1:<port>.
-//!   4. Kill the sidecar when the last window closes — no orphaned server process.
+//!   3. Poll GET /health in a background thread until the server is ready (up to 15 s),
+//!      then open the webview window pointing at http://127.0.0.1:<port>.
+//!      On timeout, the app exits with a non-zero code rather than showing a blank window.
+//!   4. On window close, kill the sidecar — no orphaned server process.
 
 use std::net::TcpListener;
 use tauri::{{Manager, App}};
@@ -286,6 +297,8 @@ pub fn run() {{
 fn setup(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {{
     // 1. Find a free loopback port: bind :0, read the assigned port, then drop
     //    the listener so the autumn server can bind that same address.
+    //    Note: there is a brief window between dropping the listener and the sidecar
+    //    binding; in practice this race is extremely rare on loopback.
     let port = {{
         let l = TcpListener::bind("127.0.0.1:0")?;
         l.local_addr()?.port()
@@ -300,37 +313,61 @@ fn setup(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {{
         .sidecar("{sidecar_bin}")?
         .env("AUTUMN_SERVER__HOST", "127.0.0.1")
         .env("AUTUMN_SERVER__PORT", port.to_string())
-        .env("AUTUMN_MANAGED_PG_DATA_DIR", app_data_dir.to_string_lossy().as_ref())
+        .env(
+            "AUTUMN_MANAGED_PG_DATA_DIR",
+            app_data_dir.to_string_lossy().as_ref(),
+        )
         .spawn()?;
     *app.state::<SidecarHandle>().0.lock().unwrap() = Some(child);
 
-    // 4. Poll GET /health until the server responds 200 (≤ 15 s).
-    let addr = format!("127.0.0.1:{{port}}");
-    'wait: for _ in 0..75 {{
-        if let Ok(mut stream) = std::net::TcpStream::connect(&addr) {{
-            use std::io::{{Read, Write}};
-            let req = format!(
-                "GET /health HTTP/1.1\r\nHost: {{addr}}\r\nConnection: close\r\n\r\n"
-            );
-            if stream.write_all(req.as_bytes()).is_ok() {{
-                let mut buf = [0u8; 16];
-                if stream.read(&mut buf).is_ok() && buf.starts_with(b"HTTP/1.1 200") {{
-                    break 'wait;
+    // 4. Poll /health in a background thread so setup() returns immediately and the
+    //    Tauri event loop starts.  Blocking here freezes the UI and can trigger OS
+    //    ANR watchdogs on macOS and Windows.
+    let handle = app.handle().clone();
+    std::thread::spawn(move || {{
+        let addr = format!("127.0.0.1:{{port}}");
+        let poll_timeout = std::time::Duration::from_millis(200);
+        let mut ready = false;
+        for _ in 0..75 {{
+            if let Ok(mut stream) = std::net::TcpStream::connect_timeout(
+                &addr.parse().unwrap(),
+                poll_timeout,
+            ) {{
+                use std::io::{{Read, Write}};
+                let req =
+                    format!("GET /health HTTP/1.1\r\nHost: {{addr}}\r\nConnection: close\r\n\r\n");
+                if stream.write_all(req.as_bytes()).is_ok() {{
+                    let mut buf = [0u8; 16];
+                    if stream.read(&mut buf).is_ok() && buf.starts_with(b"HTTP/1.1 200") {{
+                        ready = true;
+                        break;
+                    }}
                 }}
             }}
+            std::thread::sleep(poll_timeout);
         }}
-        std::thread::sleep(std::time::Duration::from_millis(200));
-    }}
-
-    // 5. Open the webview window pointing at the local server.
-    tauri::WebviewWindowBuilder::new(
-        app,
-        "main",
-        tauri::WebviewUrl::External(format!("http://127.0.0.1:{{port}}").parse()?),
-    )
-    .title("{package_name}")
-    .inner_size(1200.0, 800.0)
-    .build()?;
+        if !ready {{
+            eprintln!(
+                "[{package_name}] Server did not become ready within 15 s — exiting."
+            );
+            handle.exit(1);
+            return;
+        }}
+        if let Err(e) = tauri::WebviewWindowBuilder::new(
+            &handle,
+            "main",
+            tauri::WebviewUrl::External(
+                format!("http://127.0.0.1:{{port}}").parse().unwrap(),
+            ),
+        )
+        .title("{package_name}")
+        .inner_size(1200.0, 800.0)
+        .build()
+        {{
+            eprintln!("[{package_name}] Failed to open window: {{e}}");
+            handle.exit(1);
+        }}
+    }});
 
     Ok(())
 }}
@@ -1118,6 +1155,54 @@ mod tests {
         assert!(
             matches!(err, GenerateError::Collisions(_)),
             "re-running without --force must return a Collisions error"
+        );
+    }
+
+    // ── lib.rs background thread + timeout behaviour ──────────────────────────
+
+    #[test]
+    fn lib_rs_uses_background_thread_for_health_poll() {
+        let lib = render_shell_lib_rs("my-app");
+        assert!(
+            lib.contains("thread::spawn"),
+            "lib.rs must move the health poll into a background thread so setup() \
+             returns immediately and the Tauri event loop starts"
+        );
+    }
+
+    #[test]
+    fn lib_rs_exits_app_on_sidecar_timeout() {
+        let lib = render_shell_lib_rs("my-app");
+        assert!(
+            lib.contains(".exit("),
+            "lib.rs must call handle.exit() when the sidecar fails to become ready, \
+             not silently open a blank window"
+        );
+    }
+
+    #[test]
+    fn lib_rs_uses_connect_timeout_for_health_poll() {
+        let lib = render_shell_lib_rs("my-app");
+        assert!(
+            lib.contains("connect_timeout"),
+            "lib.rs must use TcpStream::connect_timeout so each poll attempt is bounded"
+        );
+    }
+
+    // ── productName title-case handles snake_case package names ──────────────
+
+    #[test]
+    fn tauri_conf_product_name_handles_underscore_separator() {
+        let conf = render_tauri_conf("my_app");
+        let parsed: serde_json::Value = serde_json::from_str(&conf).unwrap();
+        let name = parsed["productName"].as_str().unwrap();
+        assert!(
+            name.contains(' '),
+            "productName for 'my_app' must contain spaces (title-case), got: {name}"
+        );
+        assert!(
+            !name.contains('_'),
+            "productName for 'my_app' must not contain underscores, got: {name}"
         );
     }
 }

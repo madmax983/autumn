@@ -4312,14 +4312,20 @@ fn generate_tauri_reuses_pwa_icon() {
     // Simulate PWA generator having run
     run_autumn(&project, &["generate", "pwa"]);
 
+    // Read the PWA icon before running the Tauri generator
+    let pwa_icon =
+        fs::read_to_string(project.join("static/icons/icon.svg")).expect("PWA icon must exist");
+
     run_autumn(&project, &["generate", "tauri"]);
 
-    // The tauri icon.svg must exist and must contain PWA icon content
-    assert!(
-        project.join("src-tauri/icons/icon.svg").is_file(),
-        "icons/icon.svg must be created"
+    // The Tauri icon.svg must contain the same content as the PWA icon
+    let tauri_icon = fs::read_to_string(project.join("src-tauri/icons/icon.svg"))
+        .expect("src-tauri/icons/icon.svg must be created");
+    assert_eq!(
+        pwa_icon, tauri_icon,
+        "src-tauri/icons/icon.svg must contain the same content as the PWA icon"
     );
-    // Both the PWA and tauri icon.svg exist
+    // Original PWA icon must be untouched
     assert!(
         project.join("static/icons/icon.svg").is_file(),
         "PWA icon must still exist"
