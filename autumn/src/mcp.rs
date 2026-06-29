@@ -1638,11 +1638,14 @@ fn build_request(
         // Use the same full segment encoder the typed path helpers use, so an
         // MCP call accepts the same values a direct HTTP caller could pass.
         let encoded = if is_catch_all {
-            value
-                .split('/')
-                .map(crate::paths::encode_path_segment)
-                .collect::<Vec<_>>()
-                .join("/")
+            let mut result = String::with_capacity(value.len() + 10);
+            for (i, segment) in value.split('/').enumerate() {
+                if i > 0 {
+                    result.push('/');
+                }
+                result.push_str(&crate::paths::encode_path_segment(segment));
+            }
+            result
         } else {
             crate::paths::encode_path_segment(&value)
         };

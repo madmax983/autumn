@@ -58,18 +58,20 @@ pub fn encode_path_segment(value: impl std::fmt::Display) -> String {
 #[must_use]
 pub fn encode_catch_all_param(value: impl std::fmt::Display) -> String {
     let s = value.to_string();
-    s.split('/')
-        .map(|segment| {
-            if segment == "." {
-                "%2E".to_string()
-            } else if segment == ".." {
-                "%2E%2E".to_string()
-            } else {
-                percent_encode(segment)
-            }
-        })
-        .collect::<Vec<String>>()
-        .join("/")
+    let mut result = String::with_capacity(s.len() + 10);
+    for (i, segment) in s.split('/').enumerate() {
+        if i > 0 {
+            result.push('/');
+        }
+        if segment == "." {
+            result.push_str("%2E");
+        } else if segment == ".." {
+            result.push_str("%2E%2E");
+        } else {
+            result.push_str(&percent_encode(segment));
+        }
+    }
+    result
 }
 
 /// Percent-encode a query component per RFC 3986.
