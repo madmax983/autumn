@@ -148,8 +148,9 @@ fn read_package_name(project_root: &Path) -> Result<String, GenerateError> {
 // ── Content renderers ─────────────────────────────────────────────────────────
 
 fn render_tauri_conf(package_name: &str) -> String {
-    // Bundle identifier: reverse-DNS style, hyphens kept (valid per Apple/Android specs)
-    let identifier = format!("com.example.{package_name}");
+    // Bundle identifier: reverse-DNS with underscores replaced by hyphens.
+    // Apple's spec allows only alphanumerics, hyphens, and periods — underscores are invalid.
+    let identifier = format!("com.example.{}", package_name.replace('_', "-"));
     // Display title: capitalise first letter of each word; split on both '-' and '_'
     // so kebab-case (`my-app` → `My App`) and snake_case (`my_app` → `My App`) both work.
     let title: String = package_name
@@ -194,8 +195,10 @@ fn render_tauri_conf(package_name: &str) -> String {
       "binaries/{package_name}"
     ]
   }},
-  "security": {{
-    "csp": null
+  "app": {{
+    "security": {{
+      "csp": null
+    }}
   }}
 }}
 "#
@@ -246,9 +249,8 @@ fn render_shell_main_rs(package_name: &str) -> String {
     )
 }
 
+#[allow(clippy::too_many_lines)]
 fn render_shell_lib_rs(package_name: &str) -> String {
-    // The sidecar binary name (must match the Cargo package `name` in the app workspace).
-    let sidecar_bin = format!("binaries/{package_name}");
     format!(
         r#"//! Tauri desktop shell for {package_name}.
 //!
@@ -257,12 +259,12 @@ fn render_shell_lib_rs(package_name: &str) -> String {
 //!      Note: there is a brief window between dropping the listener and the sidecar
 //!      binding the port; in practice this race is extremely rare on loopback.
 //!   2. Spawn the autumn server sidecar with `AUTUMN_SERVER__PORT` set to that port.
-//!      `AUTUMN_MANAGED_PG_DATA_DIR` is set to the OS app-data dir so the managed
+//!      `AUTUMN_MANAGED_PG_DATA_DIR` is set to `<app-data-dir>/db` so the managed
 //!      Postgres cluster (autumn feature #1119) persists across restarts.
-//!   3. Poll GET /health in a background thread until the server is ready (up to 15 s),
+//!   3. Poll GET /health in a background thread until the server is ready (up to 30 s),
 //!      then open the webview window pointing at http://127.0.0.1:<port>.
 //!      On timeout, the app exits with a non-zero code rather than showing a blank window.
-//!   4. On window close, kill the sidecar — no orphaned server process.
+//!   4. On main window close, kill the sidecar — no orphaned server process.
 
 use std::net::TcpListener;
 use tauri::{{Manager, App}};
@@ -278,15 +280,19 @@ pub fn run() {{
         .setup(|app| setup(app))
         .on_window_event(|window, event| {{
             if let tauri::WindowEvent::Destroyed = event {{
-                let handle = window.app_handle();
-                if let Some(mut child) = handle
-                    .state::<SidecarHandle>()
-                    .0
-                    .lock()
-                    .unwrap()
-                    .take()
-                {{
-                    let _ = child.kill();
+                // Only kill the sidecar when the main window closes, not on any
+                // secondary window (dialogs, settings panels, etc.).
+                if window.label() == "main" {{
+                    let handle = window.app_handle();
+                    if let Some(mut child) = handle
+                        .state::<SidecarHandle>()
+                        .0
+                        .lock()
+                        .unwrap()
+                        .take()
+                    {{
+                        let _ = child.kill();
+                    }}
                 }}
             }}
         }})
@@ -305,12 +311,16 @@ fn setup(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {{
     }};
 
     // 2. Persistent data dir for the managed Postgres cluster (#1119).
-    let app_data_dir = app.path().app_data_dir()?;
+    //    Use a `db/` subdirectory so Postgres cluster files don't clutter
+    //    the app-data root.  Create it proactively; the sidecar won't if absent.
+    let app_data_dir = app.path().app_data_dir()?.join("db");
+    std::fs::create_dir_all(&app_data_dir)?;
 
     // 3. Spawn the autumn server sidecar (built with embed-assets + managed-pg-bundled).
+    //    The sidecar() argument is the binary basename matching externalBin in tauri.conf.json.
     let (_rx, child) = app
         .shell()
-        .sidecar("{sidecar_bin}")?
+        .sidecar("{package_name}")?
         .env("AUTUMN_SERVER__HOST", "127.0.0.1")
         .env("AUTUMN_SERVER__PORT", port.to_string())
         .env(
@@ -325,17 +335,24 @@ fn setup(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {{
     //    ANR watchdogs on macOS and Windows.
     let handle = app.handle().clone();
     std::thread::spawn(move || {{
-        let addr = format!("127.0.0.1:{{port}}");
+        // Build SocketAddr directly to avoid repeated string formatting and parse() panics.
+        let addr = std::net::SocketAddr::new(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)),
+            port,
+        );
         let poll_timeout = std::time::Duration::from_millis(200);
         let mut ready = false;
-        for _ in 0..75 {{
-            if let Ok(mut stream) = std::net::TcpStream::connect_timeout(
-                &addr.parse().unwrap(),
-                poll_timeout,
-            ) {{
+        // 150 × 200 ms = 30 s total — enough headroom for cold Postgres initialisation.
+        for _ in 0..150 {{
+            if let Ok(mut stream) =
+                std::net::TcpStream::connect_timeout(&addr, poll_timeout)
+            {{
+                // Bound the read so a silent connection doesn't stall the loop.
+                let _ = stream.set_read_timeout(Some(poll_timeout));
                 use std::io::{{Read, Write}};
-                let req =
-                    format!("GET /health HTTP/1.1\r\nHost: {{addr}}\r\nConnection: close\r\n\r\n");
+                let req = format!(
+                    "GET /health HTTP/1.1\r\nHost: 127.0.0.1:{{port}}\r\nConnection: close\r\n\r\n"
+                );
                 if stream.write_all(req.as_bytes()).is_ok() {{
                     let mut buf = [0u8; 16];
                     if stream.read(&mut buf).is_ok() && buf.starts_with(b"HTTP/1.1 200") {{
@@ -348,7 +365,7 @@ fn setup(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {{
         }}
         if !ready {{
             eprintln!(
-                "[{package_name}] Server did not become ready within 15 s — exiting."
+                "[{package_name}] Server did not become ready within 30 s — exiting."
             );
             handle.exit(1);
             return;
@@ -404,11 +421,13 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${{BASH_SOURCE[0]}}")" && pwd)"
 APP_DIR="$(dirname "$SCRIPT_DIR")"
 cd "$APP_DIR"
-TARGET_TRIPLE="$(rustc -Vv | awk '/^host/{{print $2}}')"
-cargo build --release \
+# TAURI_ENV_TARGET_TRIPLE is set by `cargo tauri build` for cross-compilation;
+# fall back to the host triple when running the script manually.
+TARGET_TRIPLE="${{TAURI_ENV_TARGET_TRIPLE:-$(rustc -Vv | awk '/^host/{{print $2}}')}}";
+cargo build --release --target "${{TARGET_TRIPLE}}" \
   --features autumn-web/embed-assets,autumn-web/managed-pg-bundled
 mkdir -p src-tauri/binaries
-cp "target/release/{package_name}" \
+cp "target/${{TARGET_TRIPLE}}/release/{package_name}" \
    "src-tauri/binaries/{package_name}-${{TARGET_TRIPLE}}"
 echo "Staged: src-tauri/binaries/{package_name}-${{TARGET_TRIPLE}}"
 "#
@@ -427,11 +446,16 @@ $ErrorActionPreference = "Stop"
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $AppDir = Split-Path -Parent $ScriptDir
 Set-Location $AppDir
-$TargetTriple = (rustc -Vv | Select-String "^host").Line.Split()[1]
-cargo build --release `
+# TAURI_ENV_TARGET_TRIPLE is set by `cargo tauri build` for cross-compilation;
+# fall back to the host triple when running the script manually.
+$TargetTriple = $Env:TAURI_ENV_TARGET_TRIPLE
+if (-not $TargetTriple) {{
+    $TargetTriple = (rustc -Vv | Select-String "^host").Line.Split()[1]
+}}
+cargo build --release --target "$TargetTriple" `
   --features autumn-web/embed-assets,autumn-web/managed-pg-bundled
 New-Item -ItemType Directory -Force -Path src-tauri\binaries | Out-Null
-Copy-Item "target\release\{package_name}.exe" `
+Copy-Item "target\$TargetTriple\release\{package_name}.exe" `
           "src-tauri\binaries\{package_name}-$TargetTriple.exe"
 Write-Host "Staged: src-tauri/binaries/{package_name}-$TargetTriple.exe"
 "#
@@ -844,6 +868,49 @@ mod tests {
         assert!(
             lib.contains(".kill()"),
             "lib.rs must kill the sidecar child on window close"
+        );
+        assert!(
+            lib.contains("window.label()") && lib.contains("\"main\""),
+            "lib.rs must guard kill behind window.label() == \"main\" so secondary windows \
+             don't prematurely terminate the sidecar"
+        );
+    }
+
+    #[test]
+    fn lib_rs_pg_data_dir_uses_db_subdirectory() {
+        let lib = render_shell_lib_rs("my-app");
+        assert!(
+            lib.contains(".join(\"db\")"),
+            "lib.rs must isolate Postgres files in <app-data-dir>/db, not the root"
+        );
+    }
+
+    #[test]
+    fn tauri_conf_identifier_replaces_underscores() {
+        let conf = render_tauri_conf("my_app");
+        let parsed: serde_json::Value = serde_json::from_str(&conf).unwrap();
+        let id = parsed["identifier"].as_str().unwrap();
+        assert!(
+            !id.contains('_'),
+            "bundle identifier must not contain underscores (invalid per Apple spec), got: {id}"
+        );
+        assert!(
+            id.contains("my-app"),
+            "bundle identifier must use hyphens instead of underscores, got: {id}"
+        );
+    }
+
+    #[test]
+    fn tauri_conf_security_is_under_app() {
+        let conf = render_tauri_conf("my-app");
+        let parsed: serde_json::Value = serde_json::from_str(&conf).unwrap();
+        assert!(
+            parsed["app"]["security"].is_object(),
+            "security config must be nested under 'app' (Tauri v2 schema requirement)"
+        );
+        assert!(
+            parsed["security"].is_null(),
+            "security must NOT appear at the top level (invalid in Tauri v2 schema)"
         );
     }
 
