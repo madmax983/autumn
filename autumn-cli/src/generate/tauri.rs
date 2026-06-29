@@ -213,75 +213,91 @@ fn read_package_meta(project_root: &Path) -> Result<(String, String, String, boo
         .get("default-run")
         .and_then(|v| v.as_str())
         .map(str::to_owned);
-    let bin_name = doc.get("bin").and_then(|b| b.as_array()).map_or_else(
-        // Step 5: no [[bin]] table — honour default-run, then check src/main.rs,
-        // then src/bin/ discovery, then fall back to the package name.
-        || {
-            if let Some(dr) = &default_run {
-                return dr.clone();
-            }
-            // Step 5a: src/main.rs exists → Cargo auto-discovers it as the
-            // package-named binary, even when src/bin/ also has files.
-            // Prefer the package name over any src/bin/ stem.
-            if project_root.join("src/main.rs").is_file() {
-                return name.clone();
-            }
-            // Inspect src/bin/ for auto-discovered binaries.  Cargo names each
-            // binary after the file stem (for `src/bin/web.rs`) or the directory
-            // name (for `src/bin/web/main.rs`), not the package name.
-            if let Ok(entries) = std::fs::read_dir(project_root.join("src/bin")) {
-                let stems: Vec<String> = entries
-                    .filter_map(std::result::Result::ok)
-                    .filter_map(|e| {
-                        let p = e.path();
-                        if p.extension().is_some_and(|x| x == "rs") {
-                            // Flat file: src/bin/web.rs → "web"
-                            p.file_stem().and_then(|s| s.to_str()).map(str::to_owned)
-                        } else if p.is_dir() && p.join("main.rs").is_file() {
-                            // Directory-style: src/bin/web/main.rs → "web"
-                            p.file_name().and_then(|s| s.to_str()).map(str::to_owned)
-                        } else {
-                            None
-                        }
-                    })
-                    .collect();
-                if stems.len() == 1 {
-                    return stems.into_iter().next().unwrap();
-                }
-            }
-            name.clone()
-        },
-        |bins| {
-            // Step 1: explicit [[bin]] entry whose path is src/main.rs.
-            bins.iter()
-                .find(|b| {
-                    b.get("path")
-                        .and_then(|p| p.as_str())
-                        .is_some_and(|p| p == "src/main.rs" || p == "src\\main.rs")
+    // Resolve bin name in a Result-returning block so ambiguous cases can error.
+    let bin_name: String = (|| -> Result<String, GenerateError> {
+        if let Some(bins) = doc.get("bin").and_then(|b| b.as_array()) {
+            // Step 1: explicit [[bin]] entry whose path resolves to src/main.rs.
+            // Normalize the manifest path (strip leading "./" or ".\") before
+            // comparing so "path = './src/main.rs'" matches as well.
+            let main_bin = bins.iter().find(|b| {
+                b.get("path").and_then(|p| p.as_str()).is_some_and(|p| {
+                    let norm = p.trim_start_matches("./").trim_start_matches(".\\");
+                    norm == "src/main.rs" || norm == "src\\main.rs"
                 })
+            });
+            if let Some(n) = main_bin
                 .and_then(|b| b.get("name"))
                 .and_then(|n| n.as_str())
-                .map(str::to_owned)
-                .or_else(|| {
-                    if project_root.join("src/main.rs").is_file() {
-                        // Step 2: src/main.rs exists but is not declared in [[bin]];
-                        // Cargo auto-discovers it as the package-named binary.
-                        // The [[bin]] entries are for other auxiliary programs.
-                        Some(name.clone())
+            {
+                return Ok(n.to_owned());
+            }
+            if project_root.join("src/main.rs").is_file() {
+                // Step 2: src/main.rs exists but is not declared in [[bin]];
+                // Cargo auto-discovers it as the package-named binary.
+                // The [[bin]] entries are for other auxiliary programs.
+                return Ok(name.clone());
+            }
+            // Step 3: honour [package] default-run when set.
+            if let Some(dr) = &default_run {
+                return Ok(dr.clone());
+            }
+            // Step 4: single or first explicit [[bin]] as last resort.
+            return Ok(bins
+                .first()
+                .and_then(|b| b.get("name"))
+                .and_then(|n| n.as_str())
+                .map_or_else(|| name.clone(), str::to_owned));
+        }
+        // Step 5: no [[bin]] table — honour default-run, then check src/main.rs,
+        // then src/bin/ discovery; error on ambiguous multi-bin packages.
+        if let Some(dr) = &default_run {
+            return Ok(dr.clone());
+        }
+        // Step 5a: src/main.rs exists → Cargo auto-discovers it as the
+        // package-named binary, even when src/bin/ also has files.
+        if project_root.join("src/main.rs").is_file() {
+            return Ok(name.clone());
+        }
+        // Inspect src/bin/ for auto-discovered binaries.  Cargo names each
+        // binary after the file stem (for `src/bin/web.rs`) or the directory
+        // name (for `src/bin/web/main.rs`), not the package name.
+        if let Ok(entries) = std::fs::read_dir(project_root.join("src/bin")) {
+            let stems: Vec<String> = entries
+                .filter_map(std::result::Result::ok)
+                .filter_map(|e| {
+                    let p = e.path();
+                    if p.extension().is_some_and(|x| x == "rs") {
+                        // Flat file: src/bin/web.rs → "web"
+                        p.file_stem().and_then(|s| s.to_str()).map(str::to_owned)
+                    } else if p.is_dir() && p.join("main.rs").is_file() {
+                        // Directory-style: src/bin/web/main.rs → "web"
+                        p.file_name().and_then(|s| s.to_str()).map(str::to_owned)
                     } else {
-                        // Step 3: honour [package] default-run when set.
-                        default_run.clone().or_else(|| {
-                            // Step 4: single or first explicit [[bin]] as last resort.
-                            bins.first()
-                                .and_then(|b| b.get("name"))
-                                .and_then(|n| n.as_str())
-                                .map(str::to_owned)
-                        })
+                        None
                     }
                 })
-                .unwrap_or_else(|| name.clone())
-        },
-    );
+                .collect();
+            match stems.len() {
+                1 => return Ok(stems.into_iter().next().unwrap()),
+                0 => {}
+                _ => {
+                    // Multiple src/bin/ targets with no default-run: Cargo cannot
+                    // build `--bin <package>` because that name doesn't exist.
+                    // Fail fast so the developer sees a clear error rather than
+                    // staging scripts that reference a nonexistent binary.
+                    let mut sorted = stems;
+                    sorted.sort();
+                    return Err(GenerateError::Config(format!(
+                        "ambiguous sidecar target: found multiple auto-discovered \
+                         src/bin/ binaries ({}) and no [package] default-run is set; \
+                         add `default-run = \"<bin>\"` to Cargo.toml to select one",
+                        sorted.join(", ")
+                    )));
+                }
+            }
+        }
+        Ok(name.clone())
+    })()?;
 
     // Check whether the app defines an `embed-assets` Cargo feature.
     // `autumn new` generates this; it typically expands to
@@ -1064,6 +1080,50 @@ mod tests {
         tmp
     }
 
+    /// Like `project_with_custom_bin` but the [[bin]] path uses a `./` prefix
+    /// (e.g. `path = "./src/main.rs"`), which is valid Cargo TOML but must be
+    /// normalized before comparing to detect the src/main.rs target.
+    fn project_with_dotslash_bin(pkg_name: &str, bin_name: &str) -> TempDir {
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join("Cargo.toml"),
+            format!(
+                "[package]\nname=\"{pkg_name}\"\nversion=\"0.1.0\"\nedition=\"2024\"\n\
+                 \n[[bin]]\nname=\"{bin_name}\"\npath=\"./src/main.rs\"\n\
+                 \n[dependencies]\nautumn-web = \"0.5.0\"\n"
+            ),
+        )
+        .unwrap();
+        fs::create_dir_all(tmp.path().join("src")).unwrap();
+        fs::write(tmp.path().join("src/main.rs"), "fn main() {}\n").unwrap();
+        tmp
+    }
+
+    /// Project with multiple `src/bin/` files and no `src/main.rs` or [[bin]] table
+    /// and no `default-run`.  Cargo cannot build `--bin <package>` because that name
+    /// doesn't exist; the generator must return an error rather than silently using
+    /// the package name.
+    fn project_with_multi_src_bin(pkg_name: &str, bin_stems: &[&str]) -> TempDir {
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join("Cargo.toml"),
+            format!(
+                "[package]\nname=\"{pkg_name}\"\nversion=\"0.1.0\"\nedition=\"2024\"\n\
+                 \n[dependencies]\nautumn-web = \"0.5.0\"\n"
+            ),
+        )
+        .unwrap();
+        fs::create_dir_all(tmp.path().join("src/bin")).unwrap();
+        for stem in bin_stems {
+            fs::write(
+                tmp.path().join(format!("src/bin/{stem}.rs")),
+                "fn main() {}\n",
+            )
+            .unwrap();
+        }
+        tmp
+    }
+
     /// Project with src/main.rs (the primary autumn binary, auto-discovered by
     /// Cargo under the package name) plus an auxiliary [[bin]] for a background
     /// worker.  The generator must pick the package-named binary, not the worker.
@@ -1532,6 +1592,54 @@ mod tests {
             !sh.contains("/release/my-app"),
             "stage-sidecar.sh must not hardcode the package name 'my-app' as the binary path"
         );
+    }
+
+    #[test]
+    fn plan_normalizes_dotslash_bin_path() {
+        // [[bin]] path = "./src/main.rs" (with ./ prefix) must be treated the same
+        // as "src/main.rs" — both point to the same file, and the [[bin]] name must
+        // override the package name just like the non-prefixed form.
+        let tmp = project_with_dotslash_bin("my-app", "my-server");
+        let plan = plan_tauri(tmp.path()).unwrap();
+        let sh: &str = plan
+            .actions
+            .iter()
+            .find(|a| a.path().to_string_lossy().ends_with("stage-sidecar.sh"))
+            .and_then(|a| {
+                if let crate::generate::emit::Action::Create { contents, .. } = a {
+                    Some(contents.as_str())
+                } else {
+                    None
+                }
+            })
+            .expect("stage-sidecar.sh action not found");
+        assert!(
+            sh.contains("my-server"),
+            "[[bin]] with path='./src/main.rs' must still resolve to the custom bin name"
+        );
+        assert!(
+            !sh.contains("--bin my-app"),
+            "generator must not fall back to package name for a ./src/main.rs [[bin]] path"
+        );
+    }
+
+    #[test]
+    fn plan_errors_on_ambiguous_multi_src_bin() {
+        // A package with multiple src/bin/ files and no default-run has no single
+        // sidecar target; the generator must return an error rather than silently
+        // using the package name (which cargo build --bin <package> would reject).
+        let tmp = project_with_multi_src_bin("my-app", &["web", "worker"]);
+        let err = plan_tauri(tmp.path()).unwrap_err();
+        assert!(
+            matches!(err, GenerateError::Config(_)),
+            "expected Config error for ambiguous multi-bin package, got: {err:?}"
+        );
+        if let GenerateError::Config(msg) = err {
+            assert!(
+                msg.contains("ambiguous") || msg.contains("default-run"),
+                "error message must mention ambiguity and how to resolve it, got: {msg}"
+            );
+        }
     }
 
     #[test]
