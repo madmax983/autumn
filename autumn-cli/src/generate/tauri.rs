@@ -54,14 +54,14 @@ use super::{Flags, GenerateError, ensure_project_root};
 pub fn plan_tauri(project_root: &Path) -> Result<Plan, GenerateError> {
     ensure_project_root(project_root)?;
 
-    let (package_name, package_version) = read_package_meta(project_root)?;
+    let (package_name, package_version, bin_name) = read_package_meta(project_root)?;
     let mut plan = Plan::new(project_root);
     let tauri = project_root.join("src-tauri");
 
     // Core Tauri project files
     plan.create(
         tauri.join("tauri.conf.json"),
-        render_tauri_conf(&package_name, &package_version),
+        render_tauri_conf(&package_name, &package_version, &bin_name),
     );
     plan.create(
         tauri.join("Cargo.toml"),
@@ -74,7 +74,7 @@ pub fn plan_tauri(project_root: &Path) -> Result<Plan, GenerateError> {
     );
     plan.create(
         tauri.join("src").join("lib.rs"),
-        render_shell_lib_rs(&package_name),
+        render_shell_lib_rs(&package_name, &bin_name),
     );
 
     // Icons — reuse the PWA icon when the user already ran `autumn generate pwa`
@@ -98,11 +98,11 @@ pub fn plan_tauri(project_root: &Path) -> Result<Plan, GenerateError> {
     // Staging scripts
     plan.create(
         tauri.join("stage-sidecar.sh"),
-        render_stage_sidecar_sh(&package_name),
+        render_stage_sidecar_sh(&package_name, &bin_name),
     );
     plan.create(
         tauri.join("stage-sidecar.ps1"),
-        render_stage_sidecar_ps1(&package_name),
+        render_stage_sidecar_ps1(&package_name, &bin_name),
     );
     plan.create(tauri.join(".gitignore"), render_gitignore());
 
@@ -133,7 +133,19 @@ pub fn run(flags: Flags) {
 
 // ── Package metadata helper ───────────────────────────────────────────────────
 
-fn read_package_meta(project_root: &Path) -> Result<(String, String), GenerateError> {
+/// Returns `(package_name, version, bin_name)`.
+///
+/// `bin_name` is the Cargo binary target name used for the sidecar — it
+/// matches the filename `cargo build` writes under `target/.../release/`.
+/// When no `[[bin]]` section is declared, Cargo defaults to `src/main.rs`
+/// with the same name as the package, so `bin_name == package_name` in that
+/// common case.  When `[[bin]] name = "…"` is set, Cargo writes that name
+/// instead, so staging scripts and Tauri's `.sidecar()` call must use it.
+///
+/// `version` resolves workspace inheritance: if `[package] version.workspace
+/// = true` the function walks up the directory tree to find
+/// `[workspace.package] version` in an ancestor `Cargo.toml`.
+fn read_package_meta(project_root: &Path) -> Result<(String, String, String), GenerateError> {
     let cargo_path = project_root.join("Cargo.toml");
     let content = std::fs::read_to_string(&cargo_path).map_err(GenerateError::Io)?;
     let doc: toml::Value = toml::from_str(&content)
@@ -146,17 +158,71 @@ fn read_package_meta(project_root: &Path) -> Result<(String, String), GenerateEr
         .and_then(|n| n.as_str())
         .map(str::to_owned)
         .ok_or_else(|| GenerateError::Config("Cargo.toml missing [package].name".to_owned()))?;
-    let version = pkg
-        .get("version")
-        .and_then(|v| v.as_str())
-        .unwrap_or("0.1.0")
+
+    // Resolve version, handling workspace inheritance (`version.workspace = true`).
+    let version = match pkg.get("version") {
+        Some(toml::Value::String(s)) => s.clone(),
+        Some(toml::Value::Table(t))
+            if t.get("workspace").and_then(|v| v.as_bool()) == Some(true) =>
+        {
+            resolve_workspace_version(project_root).unwrap_or_else(|| "0.1.0".to_owned())
+        }
+        _ => "0.1.0".to_owned(),
+    };
+
+    // Derive the binary target name from [[bin]] sections.  When a custom name
+    // is set, `cargo build` writes that name (not the package name) under
+    // `target/.../release/`.  Prefer the bin whose path is `src/main.rs`
+    // (the primary entry point), then fall back to the first declared bin, then
+    // the package name (the Cargo default when no [[bin]] is declared).
+    let bin_name = doc
+        .get("bin")
+        .and_then(|b| b.as_array())
+        .and_then(|bins| {
+            bins.iter()
+                .find(|b| {
+                    b.get("path")
+                        .and_then(|p| p.as_str())
+                        .is_some_and(|p| p == "src/main.rs" || p == "src\\main.rs")
+                })
+                .or_else(|| bins.first())
+                .and_then(|b| b.get("name"))
+                .and_then(|n| n.as_str())
+        })
+        .unwrap_or(&name)
         .to_owned();
-    Ok((name, version))
+
+    Ok((name, version, bin_name))
+}
+
+/// Walk from `project_root` upward looking for a `Cargo.toml` that declares
+/// `[workspace.package] version = "…"`.  Returns `None` if not found.
+fn resolve_workspace_version(project_root: &Path) -> Option<String> {
+    let mut dir: Option<&Path> = Some(project_root);
+    while let Some(d) = dir {
+        let cargo = d.join("Cargo.toml");
+        if cargo.is_file() {
+            if let Ok(content) = std::fs::read_to_string(&cargo) {
+                if let Ok(doc) = toml::from_str::<toml::Value>(&content) {
+                    if let Some(v) = doc
+                        .get("workspace")
+                        .and_then(|w| w.get("package"))
+                        .and_then(|p| p.get("version"))
+                        .and_then(|v| v.as_str())
+                    {
+                        return Some(v.to_owned());
+                    }
+                }
+            }
+        }
+        dir = d.parent();
+    }
+    None
 }
 
 // ── Content renderers ─────────────────────────────────────────────────────────
 
-fn render_tauri_conf(package_name: &str, version: &str) -> String {
+fn render_tauri_conf(package_name: &str, version: &str, bin_name: &str) -> String {
     // Bundle identifier: reverse-DNS with underscores replaced by hyphens.
     // Apple's spec allows only alphanumerics, hyphens, and periods — underscores are invalid.
     let identifier = format!("com.example.{}", package_name.replace('_', "-"));
@@ -210,7 +276,7 @@ fn render_tauri_conf(package_name: &str, version: &str) -> String {
       "icons/icon.icns"
     ],
     "externalBin": [
-      "binaries/{package_name}"
+      "binaries/{bin_name}"
     ],
     "resources": {{
       "../autumn.toml": "autumn.toml",
@@ -277,7 +343,7 @@ fn render_shell_main_rs(package_name: &str) -> String {
 }
 
 #[allow(clippy::too_many_lines)]
-fn render_shell_lib_rs(package_name: &str) -> String {
+fn render_shell_lib_rs(package_name: &str, bin_name: &str) -> String {
     format!(
         r#"//! Tauri desktop shell for {package_name}.
 //!
@@ -384,7 +450,7 @@ fn setup(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {{
     //    The sidecar() argument is the binary basename matching externalBin in tauri.conf.json.
     let (_rx, child) = app
         .shell()
-        .sidecar("{package_name}")?
+        .sidecar("{bin_name}")?
         // Working directory = resource dir so autumn.toml is found via CWD fallback.
         .current_dir(&resource_dir)
         .env("AUTUMN_SERVER__HOST", "127.0.0.1")
@@ -526,7 +592,7 @@ fn render_placeholder_icon_svg() -> String {
     .to_owned()
 }
 
-fn render_stage_sidecar_sh(package_name: &str) -> String {
+fn render_stage_sidecar_sh(_package_name: &str, bin_name: &str) -> String {
     format!(
         r#"#!/usr/bin/env bash
 # Build the autumn server sidecar with embedded assets and managed Postgres,
@@ -554,23 +620,23 @@ mkdir -p src-tauri/binaries
 # Darwin slices separately and combine with lipo(1) into a fat binary.
 if [ "${{TARGET_TRIPLE}}" = "universal-apple-darwin" ]; then
     for ARCH in x86_64-apple-darwin aarch64-apple-darwin; do
-        cargo build --release --target "$ARCH" \
+        cargo build --release --target "$ARCH" --bin {bin_name} \
           --features autumn-web/embed-assets,autumn-web/managed-pg-bundled
     done
-    lipo -create -output "src-tauri/binaries/{package_name}-universal-apple-darwin" \
-      "${{TARGET_DIR}}/x86_64-apple-darwin/release/{package_name}" \
-      "${{TARGET_DIR}}/aarch64-apple-darwin/release/{package_name}"
-    echo "Staged (universal): src-tauri/binaries/{package_name}-universal-apple-darwin"
+    lipo -create -output "src-tauri/binaries/{bin_name}-universal-apple-darwin" \
+      "${{TARGET_DIR}}/x86_64-apple-darwin/release/{bin_name}" \
+      "${{TARGET_DIR}}/aarch64-apple-darwin/release/{bin_name}"
+    echo "Staged (universal): src-tauri/binaries/{bin_name}-universal-apple-darwin"
 else
     # Build with both autumn-web features so the sidecar binary embeds static assets
     # and bundles Postgres.  Both are specified via the dependency path so this script
     # works with any autumn project regardless of whether the app's Cargo.toml defines
     # a top-level `embed-assets` feature alias.
-    cargo build --release --target "${{TARGET_TRIPLE}}" \
+    cargo build --release --target "${{TARGET_TRIPLE}}" --bin {bin_name} \
       --features autumn-web/embed-assets,autumn-web/managed-pg-bundled
-    cp "${{TARGET_DIR}}/${{TARGET_TRIPLE}}/release/{package_name}" \
-       "src-tauri/binaries/{package_name}-${{TARGET_TRIPLE}}"
-    echo "Staged: src-tauri/binaries/{package_name}-${{TARGET_TRIPLE}}"
+    cp "${{TARGET_DIR}}/${{TARGET_TRIPLE}}/release/{bin_name}" \
+       "src-tauri/binaries/{bin_name}-${{TARGET_TRIPLE}}"
+    echo "Staged: src-tauri/binaries/{bin_name}-${{TARGET_TRIPLE}}"
 fi
 # Stage profile config files into src-tauri/configs/ so tauri.conf.json resource
 # entries are always satisfiable at bundle time.
@@ -619,7 +685,7 @@ done
     )
 }
 
-fn render_stage_sidecar_ps1(package_name: &str) -> String {
+fn render_stage_sidecar_ps1(_package_name: &str, bin_name: &str) -> String {
     format!(
         r#"# Build the autumn server sidecar with embedded assets and managed Postgres,
 # then place it in src-tauri\binaries\ for Tauri to bundle.
@@ -647,12 +713,12 @@ if (-not $TargetDir) {{
 # and bundles Postgres.  Both are specified via the dependency path so this script
 # works with any autumn project regardless of whether the app's Cargo.toml defines
 # a top-level `embed-assets` feature alias.
-cargo build --release --target "$TargetTriple" `
+cargo build --release --target "$TargetTriple" --bin {bin_name} `
   --features autumn-web/embed-assets,autumn-web/managed-pg-bundled
 New-Item -ItemType Directory -Force -Path src-tauri\binaries | Out-Null
-Copy-Item "$TargetDir\$TargetTriple\release\{package_name}.exe" `
-          "src-tauri\binaries\{package_name}-$TargetTriple.exe"
-Write-Host "Staged: src-tauri/binaries/{package_name}-$TargetTriple.exe"
+Copy-Item "$TargetDir\$TargetTriple\release\{bin_name}.exe" `
+          "src-tauri\binaries\{bin_name}-$TargetTriple.exe"
+Write-Host "Staged: src-tauri/binaries/{bin_name}-$TargetTriple.exe"
 # Stage profile config files into src-tauri\configs\ so tauri.conf.json resource
 # entries are always satisfiable at bundle time.
 # For alias pairs (prod/production, dev/development): AutumnConfig stops at the
@@ -812,6 +878,38 @@ mod tests {
         tmp
     }
 
+    fn project_with_custom_bin(pkg_name: &str, bin_name: &str) -> TempDir {
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join("Cargo.toml"),
+            format!(
+                "[package]\nname=\"{pkg_name}\"\nversion=\"0.1.0\"\nedition=\"2024\"\n\
+                 \n[[bin]]\nname=\"{bin_name}\"\npath=\"src/main.rs\"\n\
+                 \n[dependencies]\nautumn-web = \"0.5.0\"\n"
+            ),
+        )
+        .unwrap();
+        fs::create_dir_all(tmp.path().join("src")).unwrap();
+        fs::write(tmp.path().join("src/main.rs"), "fn main() {}\n").unwrap();
+        tmp
+    }
+
+    fn project_with_workspace_version(pkg_name: &str, ws_version: &str) -> TempDir {
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join("Cargo.toml"),
+            format!(
+                "[package]\nname=\"{pkg_name}\"\nversion.workspace = true\nedition=\"2024\"\n\
+                 \n[workspace]\n\n[workspace.package]\nversion=\"{ws_version}\"\n\
+                 \n[dependencies]\nautumn-web = \"0.5.0\"\n"
+            ),
+        )
+        .unwrap();
+        fs::create_dir_all(tmp.path().join("src")).unwrap();
+        fs::write(tmp.path().join("src/main.rs"), "fn main() {}\n").unwrap();
+        tmp
+    }
+
     // ── plan_tauri: error cases ───────────────────────────────────────────────
 
     #[test]
@@ -888,7 +986,7 @@ mod tests {
 
     #[test]
     fn stage_sidecar_sh_uses_cargo_metadata_for_target_dir() {
-        let sh = render_stage_sidecar_sh("my-app");
+        let sh = render_stage_sidecar_sh("my-app", "my-app");
         // cargo metadata resolves the real output dir for workspace members and
         // respects CARGO_TARGET_DIR overrides.
         assert!(
@@ -909,7 +1007,7 @@ mod tests {
 
     #[test]
     fn stage_sidecar_sh_handles_universal_apple_darwin() {
-        let sh = render_stage_sidecar_sh("my-app");
+        let sh = render_stage_sidecar_sh("my-app", "my-app");
         // universal-apple-darwin is a Tauri meta-target; cargo build --target
         // universal-apple-darwin fails because rustc doesn't know it.
         assert!(
@@ -928,7 +1026,7 @@ mod tests {
 
     #[test]
     fn stage_sidecar_ps1_uses_cargo_metadata_for_target_dir() {
-        let ps1 = render_stage_sidecar_ps1("my-app");
+        let ps1 = render_stage_sidecar_ps1("my-app", "my-app");
         assert!(
             ps1.contains("cargo metadata"),
             "stage-sidecar.ps1 must use `cargo metadata` to locate the Cargo target directory"
@@ -945,7 +1043,7 @@ mod tests {
 
     #[test]
     fn stage_sidecar_sh_stages_profile_configs() {
-        let sh = render_stage_sidecar_sh("my-app");
+        let sh = render_stage_sidecar_sh("my-app", "my-app");
         // Profile configs are staged at build time (beforeBuildCommand) so that the
         // static resource entries in tauri.conf.json are always satisfiable — even when
         // autumn-prod.toml is created after `autumn generate tauri` was run.
@@ -962,7 +1060,7 @@ mod tests {
 
     #[test]
     fn stage_sidecar_ps1_stages_profile_configs() {
-        let ps1 = render_stage_sidecar_ps1("my-app");
+        let ps1 = render_stage_sidecar_ps1("my-app", "my-app");
         assert!(
             ps1.contains("src-tauri\\configs") || ps1.contains("src-tauri/configs"),
             "stage-sidecar.ps1 must create src-tauri\\configs\\ and populate it with \
@@ -979,7 +1077,7 @@ mod tests {
     // real config because AutumnConfig stops at the first existing file in the lookup list.
     #[test]
     fn stage_sidecar_sh_copies_alias_to_both_names() {
-        let sh = render_stage_sidecar_sh("my-app");
+        let sh = render_stage_sidecar_sh("my-app", "my-app");
         // Must handle the case where only autumn-production.toml exists by copying it
         // to autumn-prod.toml as well — look for the elif + both cp lines.
         assert!(
@@ -1001,7 +1099,7 @@ mod tests {
 
     #[test]
     fn stage_sidecar_ps1_copies_alias_to_both_names() {
-        let ps1 = render_stage_sidecar_ps1("my-app");
+        let ps1 = render_stage_sidecar_ps1("my-app", "my-app");
         assert!(
             ps1.contains("autumn-production.toml") && ps1.contains("autumn-prod.toml"),
             "stage-sidecar.ps1 must handle prod/production alias pair explicitly"
@@ -1048,7 +1146,7 @@ mod tests {
 
     #[test]
     fn tauri_conf_is_valid_json() {
-        let conf = render_tauri_conf("my-app", "0.1.0");
+        let conf = render_tauri_conf("my-app", "0.1.0", "my-app");
         let parsed: serde_json::Value =
             serde_json::from_str(&conf).expect("tauri.conf.json must be valid JSON");
         assert!(parsed.is_object());
@@ -1056,7 +1154,7 @@ mod tests {
 
     #[test]
     fn tauri_conf_uses_package_version() {
-        let conf = render_tauri_conf("my-app", "1.4.2");
+        let conf = render_tauri_conf("my-app", "1.4.2", "my-app");
         let parsed: serde_json::Value = serde_json::from_str(&conf).unwrap();
         assert_eq!(
             parsed["version"].as_str(),
@@ -1067,8 +1165,102 @@ mod tests {
     }
 
     #[test]
+    fn tauri_conf_externalbin_uses_bin_name() {
+        let conf = render_tauri_conf("my-app", "0.1.0", "my-server");
+        let parsed: serde_json::Value = serde_json::from_str(&conf).unwrap();
+        let ext_bin = parsed["bundle"]["externalBin"][0].as_str().unwrap_or("");
+        assert!(
+            ext_bin.contains("my-server"),
+            "externalBin must use the [[bin]] target name, not the package name; got: {ext_bin}"
+        );
+        assert!(
+            !ext_bin.contains("my-app"),
+            "externalBin must not use the package name when [[bin]] name differs; got: {ext_bin}"
+        );
+    }
+
+    #[test]
+    fn stage_sidecar_sh_uses_bin_name_for_binary() {
+        let sh = render_stage_sidecar_sh("my-app", "my-server");
+        assert!(
+            sh.contains("my-server"),
+            "stage-sidecar.sh must reference the binary target name in copy commands"
+        );
+        assert!(
+            !sh.contains("/release/my-app") && !sh.contains("my-app-$"),
+            "stage-sidecar.sh must not use the package name for the compiled binary path \
+             when the [[bin]] name differs"
+        );
+    }
+
+    #[test]
+    fn stage_sidecar_ps1_uses_bin_name_for_binary() {
+        let ps1 = render_stage_sidecar_ps1("my-app", "my-server");
+        assert!(
+            ps1.contains("my-server"),
+            "stage-sidecar.ps1 must reference the binary target name in copy commands"
+        );
+        assert!(
+            !ps1.contains("release\\my-app") && !ps1.contains("my-app-$"),
+            "stage-sidecar.ps1 must not use the package name for the compiled binary path \
+             when the [[bin]] name differs"
+        );
+    }
+
+    #[test]
+    fn plan_reads_custom_bin_name_from_cargo_toml() {
+        let tmp = project_with_custom_bin("my-app", "my-server");
+        let plan = plan_tauri(tmp.path()).unwrap();
+        // The staging script must use the [[bin]] name, not the package name.
+        let sh: &str = plan
+            .actions
+            .iter()
+            .find(|a| a.path().to_string_lossy().ends_with("stage-sidecar.sh"))
+            .and_then(|a| {
+                if let crate::generate::emit::Action::Create { contents, .. } = a {
+                    Some(contents.as_str())
+                } else {
+                    None
+                }
+            })
+            .expect("stage-sidecar.sh action not found");
+        assert!(
+            sh.contains("my-server"),
+            "stage-sidecar.sh must use [[bin]] name 'my-server' for the compiled binary"
+        );
+        assert!(
+            !sh.contains("/release/my-app"),
+            "stage-sidecar.sh must not hardcode the package name 'my-app' as the binary path"
+        );
+    }
+
+    #[test]
+    fn plan_resolves_workspace_inherited_version() {
+        let tmp = project_with_workspace_version("my-app", "3.1.4");
+        let plan = plan_tauri(tmp.path()).unwrap();
+        let conf: &str = plan
+            .actions
+            .iter()
+            .find(|a| a.path().to_string_lossy().ends_with("tauri.conf.json"))
+            .and_then(|a| {
+                if let crate::generate::emit::Action::Create { contents, .. } = a {
+                    Some(contents.as_str())
+                } else {
+                    None
+                }
+            })
+            .expect("tauri.conf.json action not found");
+        let parsed: serde_json::Value = serde_json::from_str(conf).unwrap();
+        assert_eq!(
+            parsed["version"].as_str(),
+            Some("3.1.4"),
+            "tauri.conf.json must use the resolved workspace version, not fall back to 0.1.0"
+        );
+    }
+
+    #[test]
     fn tauri_conf_has_identifier() {
-        let conf = render_tauri_conf("my-app", "0.1.0");
+        let conf = render_tauri_conf("my-app", "0.1.0", "my-app");
         let parsed: serde_json::Value = serde_json::from_str(&conf).unwrap();
         assert!(
             parsed["identifier"].is_string(),
@@ -1082,7 +1274,7 @@ mod tests {
 
     #[test]
     fn tauri_conf_has_product_name() {
-        let conf = render_tauri_conf("my-app", "0.1.0");
+        let conf = render_tauri_conf("my-app", "0.1.0", "my-app");
         let parsed: serde_json::Value = serde_json::from_str(&conf).unwrap();
         assert!(
             parsed["productName"].is_string(),
@@ -1092,7 +1284,7 @@ mod tests {
 
     #[test]
     fn tauri_conf_has_external_bin() {
-        let conf = render_tauri_conf("my-app", "0.1.0");
+        let conf = render_tauri_conf("my-app", "0.1.0", "my-app");
         let parsed: serde_json::Value = serde_json::from_str(&conf).unwrap();
         let bins = parsed["bundle"]["externalBin"]
             .as_array()
@@ -1107,7 +1299,7 @@ mod tests {
 
     #[test]
     fn tauri_conf_has_icon_array() {
-        let conf = render_tauri_conf("my-app", "0.1.0");
+        let conf = render_tauri_conf("my-app", "0.1.0", "my-app");
         let parsed: serde_json::Value = serde_json::from_str(&conf).unwrap();
         let icons = parsed["bundle"]["icon"]
             .as_array()
@@ -1121,7 +1313,7 @@ mod tests {
 
     #[test]
     fn tauri_conf_has_before_build_command() {
-        let conf = render_tauri_conf("my-app", "0.1.0");
+        let conf = render_tauri_conf("my-app", "0.1.0", "my-app");
         let parsed: serde_json::Value = serde_json::from_str(&conf).unwrap();
         let cmd = parsed["build"]["beforeBuildCommand"]
             .as_str()
@@ -1183,7 +1375,7 @@ mod tests {
 
     #[test]
     fn lib_rs_binds_loopback_ephemeral_port() {
-        let lib = render_shell_lib_rs("my-app");
+        let lib = render_shell_lib_rs("my-app", "my-app");
         assert!(
             lib.contains("127.0.0.1:0"),
             "lib.rs must bind loopback:0 to find a free ephemeral port"
@@ -1192,7 +1384,7 @@ mod tests {
 
     #[test]
     fn lib_rs_sets_autumn_server_port_env() {
-        let lib = render_shell_lib_rs("my-app");
+        let lib = render_shell_lib_rs("my-app", "my-app");
         assert!(
             lib.contains("AUTUMN_SERVER__PORT"),
             "lib.rs must pass AUTUMN_SERVER__PORT to the sidecar"
@@ -1201,7 +1393,7 @@ mod tests {
 
     #[test]
     fn lib_rs_sets_autumn_server_host_env() {
-        let lib = render_shell_lib_rs("my-app");
+        let lib = render_shell_lib_rs("my-app", "my-app");
         assert!(
             lib.contains("AUTUMN_SERVER__HOST"),
             "lib.rs must pass AUTUMN_SERVER__HOST to the sidecar"
@@ -1210,7 +1402,7 @@ mod tests {
 
     #[test]
     fn lib_rs_sets_managed_pg_data_dir() {
-        let lib = render_shell_lib_rs("my-app");
+        let lib = render_shell_lib_rs("my-app", "my-app");
         assert!(
             lib.contains("AUTUMN_MANAGED_PG_DATA_DIR"),
             "lib.rs must pass AUTUMN_MANAGED_PG_DATA_DIR for managed Postgres (#1119)"
@@ -1219,7 +1411,7 @@ mod tests {
 
     #[test]
     fn lib_rs_spawns_sidecar() {
-        let lib = render_shell_lib_rs("my-app");
+        let lib = render_shell_lib_rs("my-app", "my-app");
         assert!(
             lib.contains(".sidecar("),
             "lib.rs must spawn the sidecar via tauri-plugin-shell"
@@ -1232,7 +1424,7 @@ mod tests {
 
     #[test]
     fn lib_rs_polls_for_http_response() {
-        let lib = render_shell_lib_rs("my-app");
+        let lib = render_shell_lib_rs("my-app", "my-app");
         // Probe accepts any valid HTTP response rather than a specific path/status,
         // so it works regardless of the app's health route configuration.
         assert!(
@@ -1247,7 +1439,7 @@ mod tests {
 
     #[test]
     fn lib_rs_kills_sidecar_on_window_destroyed() {
-        let lib = render_shell_lib_rs("my-app");
+        let lib = render_shell_lib_rs("my-app", "my-app");
         assert!(
             lib.contains("Destroyed"),
             "lib.rs must handle WindowEvent::Destroyed"
@@ -1265,7 +1457,7 @@ mod tests {
 
     #[test]
     fn lib_rs_pg_data_dir_uses_db_subdirectory() {
-        let lib = render_shell_lib_rs("my-app");
+        let lib = render_shell_lib_rs("my-app", "my-app");
         assert!(
             lib.contains(".join(\"db\")"),
             "lib.rs must isolate Postgres files in <app-data-dir>/db, not the root"
@@ -1274,7 +1466,7 @@ mod tests {
 
     #[test]
     fn lib_rs_does_not_override_health_path() {
-        let lib = render_shell_lib_rs("my-app");
+        let lib = render_shell_lib_rs("my-app", "my-app");
         // Setting AUTUMN_HEALTH__PATH=/health can cause Axum to panic when the app
         // already has a custom GET /health route (duplicate route registration).
         // The probe instead accepts any HTTP response so no specific path is needed.
@@ -1287,7 +1479,7 @@ mod tests {
 
     #[test]
     fn lib_rs_clears_unix_socket_env() {
-        let lib = render_shell_lib_rs("my-app");
+        let lib = render_shell_lib_rs("my-app", "my-app");
         assert!(
             lib.contains("AUTUMN_SERVER__UNIX_SOCKET"),
             "lib.rs must clear AUTUMN_SERVER__UNIX_SOCKET so an inherited env var \
@@ -1304,7 +1496,7 @@ mod tests {
 
     #[test]
     fn lib_rs_clears_managed_pg_attach_url() {
-        let lib = render_shell_lib_rs("my-app");
+        let lib = render_shell_lib_rs("my-app", "my-app");
         // If AUTUMN_MANAGED_PG_ATTACH_URL is inherited (e.g. from a terminal where
         // `autumn serve` is running), ManagedPostgresPoolProvider connects to that
         // existing cluster instead of starting the bundled one.  Clearing it ensures
@@ -1318,7 +1510,7 @@ mod tests {
 
     #[test]
     fn lib_rs_sends_graceful_shutdown_signal_before_kill() {
-        let lib = render_shell_lib_rs("my-app");
+        let lib = render_shell_lib_rs("my-app", "my-app");
         // Unix: SIGTERM triggers autumn's tokio signal handler so on_shutdown hooks run.
         // Windows: autumn only handles ctrl_c() (CTRL_C_EVENT); taskkill sends
         // WM_CLOSE/CTRL_CLOSE_EVENT which autumn does not handle, so we force-kill
@@ -1341,7 +1533,7 @@ mod tests {
 
     #[test]
     fn lib_rs_clears_inherited_profile_env_vars() {
-        let lib = render_shell_lib_rs("my-app");
+        let lib = render_shell_lib_rs("my-app", "my-app");
         // If AUTUMN_ENV or AUTUMN_PROFILE is set in the shell that launches the desktop
         // app, the sidecar would inherit it and load the wrong profile (e.g. dev config
         // on an installed release app).  Clearing them lets the sidecar's compile-time
@@ -1359,7 +1551,7 @@ mod tests {
 
     #[test]
     fn lib_rs_sets_autumn_manifest_dir() {
-        let lib = render_shell_lib_rs("my-app");
+        let lib = render_shell_lib_rs("my-app", "my-app");
         assert!(
             lib.contains("AUTUMN_MANIFEST_DIR"),
             "lib.rs must set AUTUMN_MANIFEST_DIR to the Tauri resource dir so the \
@@ -1369,7 +1561,7 @@ mod tests {
 
     #[test]
     fn lib_rs_sets_sidecar_cwd_to_resource_dir() {
-        let lib = render_shell_lib_rs("my-app");
+        let lib = render_shell_lib_rs("my-app", "my-app");
         assert!(
             lib.contains(".current_dir("),
             "lib.rs must set the sidecar's working directory to resource_dir; \
@@ -1382,7 +1574,7 @@ mod tests {
 
     #[test]
     fn tauri_conf_bundles_autumn_toml_as_resource() {
-        let conf = render_tauri_conf("my-app", "0.1.0");
+        let conf = render_tauri_conf("my-app", "0.1.0", "my-app");
         let parsed: serde_json::Value = serde_json::from_str(&conf).unwrap();
         // Tauri v2 resources must be a map { source_path: dest_path }, not an array.
         let resources = parsed["bundle"]["resources"]
@@ -1440,7 +1632,7 @@ mod tests {
 
     #[test]
     fn lib_rs_kills_sidecar_on_timeout() {
-        let lib = render_shell_lib_rs("my-app");
+        let lib = render_shell_lib_rs("my-app", "my-app");
         // The timeout branch must kill the sidecar before handle.exit(1);
         // check that .kill() appears more than once (once for Destroyed, once for timeout).
         let kill_count = lib.matches(".kill()").count();
@@ -1453,7 +1645,7 @@ mod tests {
 
     #[test]
     fn tauri_conf_identifier_replaces_underscores() {
-        let conf = render_tauri_conf("my_app", "0.1.0");
+        let conf = render_tauri_conf("my_app", "0.1.0", "my_app");
         let parsed: serde_json::Value = serde_json::from_str(&conf).unwrap();
         let id = parsed["identifier"].as_str().unwrap();
         assert!(
@@ -1468,7 +1660,7 @@ mod tests {
 
     #[test]
     fn tauri_conf_security_is_under_app() {
-        let conf = render_tauri_conf("my-app", "0.1.0");
+        let conf = render_tauri_conf("my-app", "0.1.0", "my-app");
         let parsed: serde_json::Value = serde_json::from_str(&conf).unwrap();
         assert!(
             parsed["app"]["security"].is_object(),
@@ -1804,7 +1996,7 @@ mod tests {
 
     #[test]
     fn lib_rs_uses_background_thread_for_health_poll() {
-        let lib = render_shell_lib_rs("my-app");
+        let lib = render_shell_lib_rs("my-app", "my-app");
         assert!(
             lib.contains("thread::spawn"),
             "lib.rs must move the health poll into a background thread so setup() \
@@ -1814,7 +2006,7 @@ mod tests {
 
     #[test]
     fn lib_rs_exits_app_on_sidecar_timeout() {
-        let lib = render_shell_lib_rs("my-app");
+        let lib = render_shell_lib_rs("my-app", "my-app");
         assert!(
             lib.contains(".exit("),
             "lib.rs must call handle.exit() when the sidecar fails to become ready, \
@@ -1824,7 +2016,7 @@ mod tests {
 
     #[test]
     fn lib_rs_uses_connect_timeout_for_health_poll() {
-        let lib = render_shell_lib_rs("my-app");
+        let lib = render_shell_lib_rs("my-app", "my-app");
         assert!(
             lib.contains("connect_timeout"),
             "lib.rs must use TcpStream::connect_timeout so each poll attempt is bounded"
@@ -1835,7 +2027,7 @@ mod tests {
 
     #[test]
     fn tauri_conf_product_name_handles_underscore_separator() {
-        let conf = render_tauri_conf("my_app", "0.1.0");
+        let conf = render_tauri_conf("my_app", "0.1.0", "my_app");
         let parsed: serde_json::Value = serde_json::from_str(&conf).unwrap();
         let name = parsed["productName"].as_str().unwrap();
         assert!(
