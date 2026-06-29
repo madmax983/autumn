@@ -1076,19 +1076,19 @@ pub fn breadcrumb(crumbs: &[Crumb<'_>]) -> maud::Markup {
     }
     let last = crumbs.len() - 1;
     maud::html! {
-        nav aria-label="Breadcrumb" {
-            ol {
+        nav aria-label="Breadcrumb" class="autumn-breadcrumb" {
+            ol class="autumn-breadcrumb__list" {
                 @for (i, crumb) in crumbs.iter().enumerate() {
-                    li {
+                    li class="autumn-breadcrumb__item" {
                         @if i > 0 {
-                            span aria-hidden="true" { "›" }
+                            span aria-hidden="true" class="autumn-breadcrumb__separator" { "›" }
                         }
                         @if i == last {
-                            span aria-current="page" { (crumb.label) }
+                            span aria-current="page" class="autumn-breadcrumb__current" { (crumb.label) }
                         } @else if let Some(href) = crumb.href {
-                            a href=(href) { (crumb.label) }
+                            a href=(href) class="autumn-breadcrumb__link" { (crumb.label) }
                         } @else {
-                            span { (crumb.label) }
+                            span class="autumn-breadcrumb__text" { (crumb.label) }
                         }
                     }
                 }
@@ -1752,7 +1752,8 @@ mod tests {
         assert!(html.contains("Current Page"), "{html}");
         // The current page span must not itself be a link.
         assert!(!html.contains("<a href=\"\">Current Page"), "{html}");
-        assert!(html.contains("aria-current=\"page\">Current Page"), "{html}");
+        assert!(html.contains("aria-current=\"page\""), "{html}");
+        assert!(html.contains("autumn-breadcrumb__current"), "{html}");
     }
 
     #[test]
@@ -1827,7 +1828,7 @@ mod tests {
             Crumb::current("Current"),
         ];
         let html = breadcrumb(&crumbs).into_string();
-        assert!(html.contains("<span>Unlinked Middle</span>"), "{html}");
+        assert!(html.contains("<span class=\"autumn-breadcrumb__text\">Unlinked Middle</span>"), "{html}");
         // Only the last item carries aria-current
         assert_eq!(html.matches(r#"aria-current="page""#).count(), 1, "{html}");
     }
