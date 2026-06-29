@@ -1610,6 +1610,38 @@ enum GenerateCommands {
         #[arg(long)]
         force: bool,
     },
+    /// Scaffold a Tauri desktop wrapper that ships the autumn app as a native installer.
+    ///
+    /// Uses the **sidecar model**: the autumn server binary runs as a supervised child
+    /// of the Tauri shell, and the webview loads the app from a free loopback port.
+    /// The existing autumn app (routes, Maud/htmx, sessions) runs unmodified.
+    ///
+    /// The sidecar is built with `autumn-web/embed-assets` (#1004) and
+    /// `autumn-web/managed-pg-bundled` (#1119) so the packaged desktop app needs
+    /// no separately-installed database or loose asset files.
+    ///
+    /// Creates:
+    ///   - `src-tauri/`                 — standalone Tauri shell crate
+    ///   - `src-tauri/tauri.conf.json`  — Tauri v2 config (productName, bundle, sidecar)
+    ///   - `src-tauri/src/lib.rs`       — sidecar lifecycle glue (ephemeral port, /health
+    ///                                     polling, kill-on-close)
+    ///   - `src-tauri/icons/`           — placeholder icons for immediate buildability
+    ///   - `src-tauri/stage-sidecar.sh` — build + stage the sidecar (Unix)
+    ///   - `src-tauri/stage-sidecar.ps1`— build + stage the sidecar (Windows)
+    ///
+    /// Example:
+    ///
+    ///   autumn generate tauri
+    ///   autumn generate tauri --dry-run
+    #[command(verbatim_doc_comment)]
+    Tauri {
+        /// Print the file plan and exit without writing anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Overwrite existing files instead of erroring on collision.
+        #[arg(long)]
+        force: bool,
+    },
     /// Scaffold a multi-step form wizard with session-backed state and per-step validation.
     ///
     /// Emits step structs, GET + POST handlers, progress rendering, commit and
@@ -2490,6 +2522,9 @@ fn run_generate_command(cmd: GenerateCommands) {
         } => generate::system_test::run(&name, generate::Flags { dry_run, force }),
         GenerateCommands::Pwa { dry_run, force } => {
             generate::pwa::run(generate::Flags { dry_run, force });
+        }
+        GenerateCommands::Tauri { dry_run, force } => {
+            generate::tauri::run(generate::Flags { dry_run, force });
         }
         GenerateCommands::Auth {
             name,
@@ -5321,6 +5356,40 @@ mod tests {
         let cli = Cli::try_parse_from(["autumn", "generate", "pwa", "--force"]).unwrap();
         let Commands::Generate(GenerateCommands::Pwa { dry_run, force }) = cli.command else {
             panic!("expected Pwa variant");
+        };
+        assert!(!dry_run);
+        assert!(force);
+    }
+
+    // ── autumn generate tauri ──────────────────────────────────────────────
+
+    #[test]
+    fn parse_generate_tauri() {
+        let cli = Cli::try_parse_from(["autumn", "generate", "tauri"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Generate(GenerateCommands::Tauri {
+                dry_run: false,
+                force: false
+            })
+        ));
+    }
+
+    #[test]
+    fn parse_generate_tauri_dry_run() {
+        let cli = Cli::try_parse_from(["autumn", "generate", "tauri", "--dry-run"]).unwrap();
+        let Commands::Generate(GenerateCommands::Tauri { dry_run, force }) = cli.command else {
+            panic!("expected Tauri variant");
+        };
+        assert!(dry_run);
+        assert!(!force);
+    }
+
+    #[test]
+    fn parse_generate_tauri_force() {
+        let cli = Cli::try_parse_from(["autumn", "generate", "tauri", "--force"]).unwrap();
+        let Commands::Generate(GenerateCommands::Tauri { dry_run, force }) = cli.command else {
+            panic!("expected Tauri variant");
         };
         assert!(!dry_run);
         assert!(force);
