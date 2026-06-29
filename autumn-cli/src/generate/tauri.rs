@@ -577,10 +577,11 @@ fn setup(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {{
         l.local_addr()?.port()
     }};
 
-    // 2. Persistent data dir for the managed Postgres cluster (#1119).
-    //    Use a `db/` subdirectory so Postgres cluster files don't clutter
-    //    the app-data root.  Create it proactively; the sidecar won't if absent.
-    let app_data_dir = app.path().app_data_dir()?.join("db");
+    // 2. Persistent per-app data directories.
+    //    Use subdirectories so distinct concerns don't share the same root.
+    let data_root = app.path().app_data_dir()?;
+    // Postgres cluster (#1119) in db/.  Create proactively; the sidecar won't if absent.
+    let app_data_dir = data_root.join("db");
     std::fs::create_dir_all(&app_data_dir)?;
 
     // autumn.toml is bundled as a Tauri resource (see tauri.conf.json bundle.resources).
@@ -606,6 +607,14 @@ fn setup(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {{
         .env(
             "AUTUMN_MANAGED_PG_DATA_DIR",
             app_data_dir.to_string_lossy().as_ref(),
+        )
+        // Redirect local blob storage to a writable per-app location.
+        // Default storage.local.root is "target/blobs" — relative to CWD (resource_dir),
+        // which is read-only in installed bundles; the app would abort before opening the window.
+        // Route blobs to {{app-data-dir}}/blobs where the process always has write access.
+        .env(
+            "AUTUMN_STORAGE__LOCAL__ROOT",
+            data_root.join("blobs").to_string_lossy().as_ref(),
         )
         // Clear any inherited attach URL so the sidecar owns its bundled Postgres
         // cluster rather than connecting to a stale or foreign database.
@@ -757,7 +766,7 @@ fn render_placeholder_icon_svg() -> String {
     .to_owned()
 }
 
-fn render_stage_sidecar_sh(_package_name: &str, bin_name: &str, has_embed_assets: bool) -> String {
+fn render_stage_sidecar_sh(package_name: &str, bin_name: &str, has_embed_assets: bool) -> String {
     // When the app defines an `embed-assets` Cargo feature (as `autumn new` generates),
     // enable it so that `#[cfg(feature = "embed-assets")]` guards in app code are
     // satisfied and `.embedded_static()` is actually wired in.  Fall back to the
@@ -790,6 +799,9 @@ TARGET_TRIPLE="${{TAURI_ENV_TARGET_TRIPLE:-$(rustc -Vv | awk '/^host/{{print $2}
 TARGET_DIR="${{CARGO_TARGET_DIR:-$(cargo metadata --no-deps --format-version 1 --quiet \
     | sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')}}"
 mkdir -p src-tauri/binaries
+# Fingerprint static/ before the embed compile (mirrors autumn build --embed phases 1-2):
+# compile → write .autumn-manifest.json → the target-specific cargo build below embeds it.
+autumn build --embed -p {package_name}
 # universal-apple-darwin is a Tauri meta-target, not a rustc triple.  Build both
 # Darwin slices separately and combine with lipo(1) into a fat binary.
 if [ "${{TARGET_TRIPLE}}" = "universal-apple-darwin" ]; then
@@ -861,7 +873,7 @@ done
     )
 }
 
-fn render_stage_sidecar_ps1(_package_name: &str, bin_name: &str, has_embed_assets: bool) -> String {
+fn render_stage_sidecar_ps1(package_name: &str, bin_name: &str, has_embed_assets: bool) -> String {
     let embed_feature = if has_embed_assets {
         "embed-assets,autumn-web/managed-pg-bundled"
     } else {
@@ -890,9 +902,14 @@ $TargetDir = $Env:CARGO_TARGET_DIR
 if (-not $TargetDir) {{
     $TargetDir = (cargo metadata --no-deps --format-version 1 --quiet | ConvertFrom-Json).target_directory
 }}
+# Fingerprint static/ so include_dir! bakes current hashed asset URLs into the sidecar.
+# autumn build --embed runs: compile → fingerprint static/ → embed compile (host arch).
+# The target-specific cargo build below then bakes the fingerprinted tree.
+# autumn must be installed: cargo install autumn-cli (already needed for `autumn generate`).
+autumn build --embed -p {package_name}
+New-Item -ItemType Directory -Force -Path src-tauri\binaries | Out-Null
 cargo build --release --target "$TargetTriple" --bin {bin_name} `
   --features {embed_feature}
-New-Item -ItemType Directory -Force -Path src-tauri\binaries | Out-Null
 Copy-Item "$TargetDir\$TargetTriple\release\{bin_name}.exe" `
           "src-tauri\binaries\{bin_name}-$TargetTriple.exe"
 Write-Host "Staged: src-tauri/binaries/{bin_name}-$TargetTriple.exe"
@@ -2333,6 +2350,57 @@ mod tests {
              (which is absent on installed machines), so AutumnConfig falls back to \
              PathBuf::from(\"autumn.toml\") — setting CWD to resource_dir makes that \
              fallback find the bundled autumn.toml"
+        );
+    }
+
+    #[test]
+    fn lib_rs_redirects_blob_storage_to_app_data_dir() {
+        let lib = render_shell_lib_rs("my-app", "my-app");
+        assert!(
+            lib.contains("AUTUMN_STORAGE__LOCAL__ROOT"),
+            "lib.rs must set AUTUMN_STORAGE__LOCAL__ROOT; default storage.local.root is \
+             'target/blobs' (relative to CWD = resource_dir, which is read-only in \
+             installed bundles), so apps using local blob storage would abort at startup"
+        );
+        assert!(
+            lib.contains("data_root") && lib.contains("join(\"blobs\")"),
+            "AUTUMN_STORAGE__LOCAL__ROOT must point to a writable subdirectory of \
+             app_data_dir (e.g. data_root.join(\"blobs\")), not the read-only resource_dir"
+        );
+    }
+
+    #[test]
+    fn staging_sh_fingerprints_before_embed() {
+        let sh = render_stage_sidecar_sh("my-app", "my-app", true);
+        let fingerprint_pos = sh.find("autumn build --embed").unwrap_or(usize::MAX);
+        let cargo_pos = sh.find("cargo build --release").unwrap_or(usize::MAX);
+        assert!(
+            fingerprint_pos < cargo_pos,
+            "stage-sidecar.sh must run `autumn build --embed` before the embed cargo build \
+             to fingerprint static/ (mirror the 3-phase autumn build --embed process); \
+             stale .autumn-manifest.json would bake wrong asset hashes into the sidecar"
+        );
+    }
+
+    #[test]
+    fn staging_sh_fingerprints_includes_package_name() {
+        let sh = render_stage_sidecar_sh("my-app", "my-app", true);
+        assert!(
+            sh.contains("autumn build --embed -p my-app"),
+            "stage-sidecar.sh must pass -p <package> to autumn build --embed so workspace \
+             members fingerprint the correct package's static/ directory"
+        );
+    }
+
+    #[test]
+    fn staging_ps1_fingerprints_before_embed() {
+        let ps1 = render_stage_sidecar_ps1("my-app", "my-app", true);
+        let fingerprint_pos = ps1.find("autumn build --embed").unwrap_or(usize::MAX);
+        let cargo_pos = ps1.find("cargo build --release").unwrap_or(usize::MAX);
+        assert!(
+            fingerprint_pos < cargo_pos,
+            "stage-sidecar.ps1 must run `autumn build --embed` before the embed cargo build \
+             to fingerprint static/ (mirror the 3-phase autumn build --embed process)"
         );
     }
 
