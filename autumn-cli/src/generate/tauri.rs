@@ -710,8 +710,12 @@ fn setup(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {{
         // AUTUMN_MANAGED_PG_DATA_DIR and returns it without starting a local cluster;
         // an empty value is ignored by the provider.
         .env("AUTUMN_MANAGED_PG_ATTACH_URL", "")
-        // Belt-and-suspenders for apps not using #[autumn_web::main] where
-        // AUTUMN_MANIFEST_DIR env var IS consulted before the CWD fallback.
+        // Override the compile-time manifest dir so config loading reads from
+        // the bundled resource dir on all machines, including the developer's
+        // machine where the source tree still exists.  autumn's OsEnv::var
+        // checks the process env before the #[autumn_web::main] baked-in path
+        // when AUTUMN_MANIFEST_DIR is set, so this overrides both the CWD
+        // fallback and the macro-injected compile-time value.
         .env(
             "AUTUMN_MANIFEST_DIR",
             resource_dir.to_string_lossy().as_ref(),

@@ -106,15 +106,22 @@ pub fn run(debug: bool, embed: bool, package: Option<&str>, bin: Option<&str>) {
     eprintln!("Compiling ({profile} profile)...");
     run_cargo_or_exit(build_cargo_command(debug, embed, package, bin));
 
+    // Resolve the selected package's directory before fingerprinting so that
+    // when --bin selects a member of a workspace without -p, we fingerprint
+    // that member's static/ tree rather than the workspace root's.
+    let (binary, manifest_dir) = find_binary(debug, package, bin);
+
     // Release builds fingerprint *after* the compile (the runtime reads the
     // manifest from disk, so order doesn't matter, and the static renderer below
     // then resolves the new hashed URLs).
     if !debug {
         eprintln!("\nFingerprinting static assets...");
-        fingerprint_static_assets();
+        let static_dir = manifest_dir.as_deref().map_or_else(
+            || std::path::Path::new("static").to_owned(),
+            |d| d.join("static"),
+        );
+        fingerprint_assets_in(&static_dir);
     }
-
-    let (binary, manifest_dir) = find_binary(debug, package, bin);
     eprintln!("\nRunning static renderer...\n");
 
     let mut cmd = Command::new(&binary);
@@ -163,12 +170,6 @@ pub fn run(debug: bool, embed: bool, package: Option<&str>, bin: Option<&str>) {
     }
 
     eprintln!("\n\u{1F342} Build complete!");
-}
-
-/// Fingerprint every file under `static/`, write content-hashed copies, and
-/// emit `static/.autumn-manifest.json`.
-fn fingerprint_static_assets() {
-    fingerprint_assets_in(Path::new("static"));
 }
 
 /// Core fingerprinting implementation.
