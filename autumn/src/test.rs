@@ -263,18 +263,10 @@ impl crate::interceptor::MailInterceptor for MailRecorder {
         &'a self,
         mail: &'a crate::mail::Mail,
         next: std::pin::Pin<
-            Box<
-                dyn std::future::Future<Output = Result<(), crate::mail::MailError>>
-                    + Send
-                    + 'a,
-            >,
+            Box<dyn std::future::Future<Output = Result<(), crate::mail::MailError>> + Send + 'a>,
         >,
     ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<Output = Result<(), crate::mail::MailError>>
-                + Send
-                + 'a,
-        >,
+        Box<dyn std::future::Future<Output = Result<(), crate::mail::MailError>> + Send + 'a>,
     > {
         let snapshot = SentMail::from(mail);
         let mails = std::sync::Arc::clone(&self.mails);
@@ -302,18 +294,10 @@ impl crate::interceptor::MailInterceptor for ChainedMailInterceptor {
         &'a self,
         mail: &'a crate::mail::Mail,
         next: std::pin::Pin<
-            Box<
-                dyn std::future::Future<Output = Result<(), crate::mail::MailError>>
-                    + Send
-                    + 'a,
-            >,
+            Box<dyn std::future::Future<Output = Result<(), crate::mail::MailError>> + Send + 'a>,
         >,
     ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<Output = Result<(), crate::mail::MailError>>
-                + Send
-                + 'a,
-        >,
+        Box<dyn std::future::Future<Output = Result<(), crate::mail::MailError>> + Send + 'a>,
     > {
         let second_next = self.second.intercept(mail, next);
         self.first.intercept(mail, second_next)

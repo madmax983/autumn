@@ -133,17 +133,15 @@ async fn user_interceptor_composes_with_recorder() {
             _mail: &'a Mail,
             next: std::pin::Pin<
                 Box<
-                    dyn std::future::Future<
-                            Output = Result<(), autumn_web::mail::MailError>,
-                        > + Send
+                    dyn std::future::Future<Output = Result<(), autumn_web::mail::MailError>>
+                        + Send
                         + 'a,
                 >,
             >,
         ) -> std::pin::Pin<
             Box<
-                dyn std::future::Future<
-                        Output = Result<(), autumn_web::mail::MailError>,
-                    > + Send
+                dyn std::future::Future<Output = Result<(), autumn_web::mail::MailError>>
+                    + Send
                     + 'a,
             >,
         > {
