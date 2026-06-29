@@ -981,7 +981,10 @@ mod tests {
             .expect("bundle.resources must be a map (Tauri v2 schema requirement)");
         let has_autumn_toml = resources
             .iter()
-            .any(|(k, v)| k.contains("autumn.toml") || v.as_str().map(|s| s.contains("autumn.toml")).unwrap_or(false));
+            .any(|(k, v)| {
+                k.contains("autumn.toml")
+                    || v.as_str().is_some_and(|s| s.contains("autumn.toml"))
+            });
         assert!(
             has_autumn_toml,
             "tauri.conf.json must bundle autumn.toml as a resource so the installed \
@@ -998,8 +1001,7 @@ mod tests {
         assert!(
             kill_count >= 2,
             "lib.rs must kill the sidecar in both the timeout path and the window-build \
-             failure path, not only in WindowEvent::Destroyed; found {} .kill() call(s)",
-            kill_count
+             failure path, not only in WindowEvent::Destroyed; found {kill_count} .kill() call(s)"
         );
     }
 
