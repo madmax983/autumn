@@ -11,13 +11,15 @@
 //! - **`active_search`** — wires the search input to `/bookmarks/search` via
 //!   htmx; search results swap in a fresh `data_table`.
 //! - **`autocomplete_input`** — tag picker on the new/edit forms.
+//! - **`property_list`** — renders the detail view (`/bookmarks/{id}`) as a
+//!   semantic `<dl>` of labelled field values, replacing hand-rolled markup.
 //!
-//! All three compose in the index view without special wiring, demonstrating
-//! the composition AC from issue #1116.
+//! All four compose without special wiring, demonstrating the widget lane
+//! (data_table, active_search, autocomplete_input, property_list).
 
 use autumn_web::extract::{Form, Path};
 use autumn_web::prelude::*;
-use autumn_web::widgets::{Column, DataTableConfig, data_table};
+use autumn_web::widgets::{Column, DataTableConfig, data_table, property_list};
 use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
 
@@ -49,43 +51,6 @@ fn layout(title: &str, content: Markup) -> Markup {
                     }
                 }
                 main class="max-w-3xl mx-auto p-6" { (content) }
-            }
-        }
-    }
-}
-
-fn bookmark_card(bookmark: &Bookmark) -> Markup {
-    html! {
-        li id=(format!("bookmark-{}", bookmark.id))
-           class="p-4 bg-white rounded shadow flex justify-between items-center gap-4" {
-            div {
-                a href=(bookmark.url) target="_blank"
-                   class="text-indigo-600 font-medium hover:underline" {
-                    (bookmark.title)
-                }
-                a href=(format!("/bookmarks/tag/{}", bookmark.tag))
-                   class="ml-2 text-xs bg-gray-200 rounded px-2 py-0.5" {
-                    (bookmark.tag)
-                }
-                @if !bookmark.alive {
-                    span class="ml-2 text-xs bg-red-100 text-red-600 rounded px-2 py-0.5" {
-                        "dead link"
-                    }
-                }
-            }
-            div class="flex items-center gap-3 text-sm" {
-                a href=(format!("/bookmarks/{}/edit", bookmark.id))
-                   class="text-gray-500 hover:text-gray-700" {
-                    "Edit"
-                }
-                button
-                    hx-delete=(format!("/api/bookmarks/{}", bookmark.id))
-                    hx-target=(format!("#bookmark-{}", bookmark.id))
-                    hx-swap="outerHTML"
-                    hx-confirm="Delete this bookmark?"
-                    class="text-red-500 hover:text-red-700" {
-                    "Delete"
-                }
             }
         }
     }
@@ -188,13 +153,37 @@ pub async fn show(id: Path<i64>, mut db: Db) -> AutumnResult<Markup> {
         .await
         .map_err(AutumnError::not_found)?;
 
+    let props: Vec<(&str, maud::Markup)> = vec![
+        ("Id", html! { (row.id) }),
+        ("Url", html! { a href=(&row.url) { (&row.url) } }),
+        ("Title", html! { (&row.title) }),
+        (
+            "Tag",
+            html! { a href=(format!("/bookmarks/tag/{}", row.tag)) { (&row.tag) } },
+        ),
+        ("Alive", html! { (row.alive.to_string()) }),
+        ("Created at", html! { (row.created_at.to_string()) }),
+    ];
     Ok(layout(
         &format!("Bookmark #{}", row.id),
         html! {
             div class="mb-6" {
                 a href="/bookmarks" class="text-sm text-indigo-600 hover:underline" { "Back to list" }
             }
-            (bookmark_card(&row))
+            (property_list(&props))
+            div class="flex gap-3 mt-6" {
+                a href=(format!("/bookmarks/{}/edit", row.id))
+                   class="bg-indigo-600 text-white px-4 py-2 rounded hover:bg-indigo-700 text-sm" {
+                    "Edit"
+                }
+                button
+                    hx-delete=(format!("/api/bookmarks/{}", row.id))
+                    hx-confirm="Delete this bookmark?"
+                    hx-on--after-request="if(event.detail.successful) window.location='/bookmarks'"
+                    class="bg-red-600 text-white px-4 py-2 rounded hover:bg-red-700 text-sm" {
+                    "Delete"
+                }
+            }
         },
     ))
 }

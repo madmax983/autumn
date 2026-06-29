@@ -592,6 +592,58 @@ pub fn autocomplete_empty_state(message: &str) -> maud::Markup {
     }
 }
 
+// ── property_list ─────────────────────────────────────────────────────────
+
+/// Render a property list (definition list) for a record's fields.
+///
+/// Emits a `<dl class="autumn-property-list">` with one `<dt>`/`<dd>` pair per
+/// entry. Labels (`&str`) are HTML-escaped; values are pre-escaped [`Markup`](maud::Markup)
+/// so callers can pass plain text, a formatted date, or a nested link/badge
+/// without escaping foot-guns.
+///
+/// An empty `rows` slice renders an empty `<dl>`, never panics.
+///
+/// # CSS hooks
+///
+/// | Selector | Element |
+/// |---|---|
+/// | `.autumn-property-list` | The `<dl>` wrapper |
+/// | `.autumn-property-list dt` | Label term |
+/// | `.autumn-property-list dd` | Value description |
+///
+/// # Example
+///
+/// ```rust
+/// use autumn_web::widgets::property_list;
+/// use maud::html;
+///
+/// struct Post { id: i64, title: String, published: bool }
+/// let post = Post { id: 1, title: "Hello".into(), published: true };
+///
+/// let rows = vec![
+///     ("Id", html! { (post.id) }),
+///     ("Title", html! { (&post.title) }),
+///     ("Published", html! { (post.published.to_string()) }),
+/// ];
+/// let markup = property_list(&rows);
+/// let html = markup.into_string();
+/// assert!(html.contains(r#"class="autumn-property-list""#));
+/// assert!(html.contains("<dt>Id</dt>"));
+/// assert!(html.contains("<dd>1</dd>"));
+/// ```
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn property_list(rows: &[(&str, maud::Markup)]) -> maud::Markup {
+    maud::html! {
+        dl class="autumn-property-list" {
+            @for (label, value) in rows {
+                dt { (label) }
+                dd { (value) }
+            }
+        }
+    }
+}
+
 // ── data_table ────────────────────────────────────────────────────────────
 
 /// Sort direction for a [`data_table`] sortable column header.
@@ -1555,6 +1607,61 @@ mod tests {
             html.contains(r#"role="status""#) || html.contains("aria-live"),
             "{html}"
         );
+    }
+
+    // ── property_list ──────────────────────────────────────────────────
+
+    #[test]
+    fn property_list_empty_slice_renders_empty_dl_never_panics() {
+        let html = property_list(&[]).into_string();
+        assert!(html.contains("<dl"), "{html}");
+        assert!(!html.contains("<dt"), "{html}");
+    }
+
+    #[test]
+    fn property_list_has_autumn_property_list_class() {
+        let html = property_list(&[]).into_string();
+        assert!(html.contains(r#"class="autumn-property-list""#), "{html}");
+    }
+
+    #[test]
+    fn property_list_renders_dt_and_dd_per_row() {
+        let rows = vec![
+            ("Title", maud::html! { "My Post" }),
+            ("Published", maud::html! { "true" }),
+        ];
+        let html = property_list(&rows).into_string();
+        assert!(html.contains("<dt>Title</dt>"), "{html}");
+        assert!(html.contains("<dt>Published</dt>"), "{html}");
+        assert!(html.contains("<dd>My Post</dd>"), "{html}");
+        assert!(html.contains("<dd>true</dd>"), "{html}");
+    }
+
+    #[test]
+    fn property_list_escapes_label() {
+        let rows = vec![("<script>alert(1)</script>", maud::html! { "safe" })];
+        let html = property_list(&rows).into_string();
+        assert!(!html.contains("<script>"), "{html}");
+        assert!(html.contains("&lt;script&gt;"), "{html}");
+    }
+
+    #[test]
+    fn property_list_renders_markup_value_unescaped() {
+        let rows = vec![("Link", maud::html! { a href="/foo" { "click" } })];
+        let html = property_list(&rows).into_string();
+        assert!(html.contains(r#"<a href="/foo">click</a>"#), "{html}");
+    }
+
+    #[test]
+    fn property_list_multiple_rows_all_rendered() {
+        let rows = vec![
+            ("A", maud::html! { "1" }),
+            ("B", maud::html! { "2" }),
+            ("C", maud::html! { "3" }),
+        ];
+        let html = property_list(&rows).into_string();
+        assert_eq!(html.matches("<dt>").count(), 3, "{html}");
+        assert_eq!(html.matches("<dd>").count(), 3, "{html}");
     }
 
     // ── data_table ─────────────────────────────────────────────────────

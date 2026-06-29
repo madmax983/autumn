@@ -316,7 +316,8 @@ pub mod ui;
 /// Active search and autocomplete form primitives with htmx integration.
 ///
 /// See [`widgets`] for the full API including [`widgets::active_search`],
-/// [`widgets::autocomplete_input`], and their configuration types.
+/// [`widgets::autocomplete_input`], [`widgets::data_table`],
+/// [`widgets::property_list`], and their configuration types.
 pub mod widgets;
 /// First-class multi-step form wizards with session-backed state and per-step validation.
 ///
