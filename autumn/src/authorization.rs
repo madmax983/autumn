@@ -1177,6 +1177,20 @@ mod tests {
     }
 
     #[test]
+    fn forbidden_response_deserializes_from_toml() {
+        #[derive(Debug, serde::Deserialize)]
+        struct Holder {
+            value: ForbiddenResponse,
+        }
+        let h: Holder = toml::from_str(r#"value = "403""#).unwrap();
+        assert_eq!(h.value, ForbiddenResponse::Forbidden403);
+        let h: Holder = toml::from_str(r#"value = "404""#).unwrap();
+        assert_eq!(h.value, ForbiddenResponse::NotFound404);
+        let err = toml::from_str::<Holder>(r#"value = "418""#).unwrap_err();
+        assert!(err.to_string().contains("418"));
+    }
+
+    #[test]
     fn registry_scope_double_registration_panics_with_clear_message() {
         let registry = PolicyRegistry::default();
         registry.register_scope::<Note, _>(EmptyScope);
