@@ -1009,6 +1009,94 @@ pub fn data_table<T>(
     }
 }
 
+// ── breadcrumb ────────────────────────────────────────────────────────────
+
+/// A single crumb in a [`breadcrumb`] navigation trail.
+///
+/// Build with [`Crumb::link`] for a linked crumb or [`Crumb::current`] for the
+/// current (non-linked) page. The last item in the slice passed to [`breadcrumb`]
+/// is always treated as the current page regardless of whether `href` is set.
+#[cfg(feature = "maud")]
+#[derive(Debug, Clone)]
+pub struct Crumb<'a> {
+    /// Visible label for this crumb. HTML-escaped by Maud.
+    pub label: &'a str,
+    /// Optional URL for this crumb. `None` on the last crumb (current page).
+    pub href: Option<&'a str>,
+}
+
+#[cfg(feature = "maud")]
+impl<'a> Crumb<'a> {
+    /// Create a linked crumb.
+    #[must_use]
+    pub const fn link(label: &'a str, href: &'a str) -> Self {
+        Self {
+            label,
+            href: Some(href),
+        }
+    }
+
+    /// Create the current-page crumb (no link).
+    #[must_use]
+    pub const fn current(label: &'a str) -> Self {
+        Self { label, href: None }
+    }
+}
+
+/// Render an accessible breadcrumb navigation trail.
+///
+/// Emits a `<nav aria-label="Breadcrumb">` containing an `<ol>`. Every crumb
+/// except the last renders as an `<a>` link (using `href` when provided); the
+/// last crumb renders as the current page marked with `aria-current="page"`.
+/// Separators are wrapped in `<span aria-hidden="true">` so screen readers
+/// announce only the crumb labels.
+///
+/// An empty slice renders empty [`maud::Markup`] (no output, no panic).
+/// A single crumb renders without a leading separator.
+///
+/// # Example
+///
+/// ```rust
+/// use autumn_web::widgets::{Crumb, breadcrumb};
+///
+/// let crumbs = [
+///     Crumb::link("Home", "/"),
+///     Crumb::link("Posts", "/posts"),
+///     Crumb::current("My Post"),
+/// ];
+/// let html = breadcrumb(&crumbs).into_string();
+/// assert!(html.contains(r#"aria-current="page""#));
+/// assert!(html.contains(r#"href="/posts""#));
+/// ```
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn breadcrumb(crumbs: &[Crumb<'_>]) -> maud::Markup {
+    if crumbs.is_empty() {
+        return maud::html! {};
+    }
+    let last = crumbs.len() - 1;
+    maud::html! {
+        nav aria-label="Breadcrumb" {
+            ol {
+                @for (i, crumb) in crumbs.iter().enumerate() {
+                    li {
+                        @if i > 0 {
+                            span aria-hidden="true" { "›" }
+                        }
+                        @if i == last {
+                            span aria-current="page" { (crumb.label) }
+                        } @else if let Some(href) = crumb.href {
+                            a href=(href) { (crumb.label) }
+                        } @else {
+                            (crumb.label)
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 // ── Tests ──────────────────────────────────────────────────────────────────
 
 #[cfg(all(test, feature = "maud"))]
@@ -1607,6 +1695,127 @@ mod tests {
             html.contains(r#"role="status""#) || html.contains("aria-live"),
             "{html}"
         );
+    }
+
+    // ── breadcrumb ─────────────────────────────────────────────────────
+
+    #[test]
+    fn breadcrumb_empty_slice_renders_nothing_no_panic() {
+        let html = breadcrumb(&[]).into_string();
+        assert!(html.is_empty(), "expected empty output, got: {html}");
+    }
+
+    #[test]
+    fn breadcrumb_wrapped_in_nav_with_aria_label() {
+        let crumbs = [Crumb::link("Home", "/"), Crumb::current("Posts")];
+        let html = breadcrumb(&crumbs).into_string();
+        assert!(html.contains("<nav"), "{html}");
+        assert!(html.contains("aria-label"), "{html}");
+    }
+
+    #[test]
+    fn breadcrumb_contains_ordered_list() {
+        let crumbs = [Crumb::link("Home", "/"), Crumb::current("Posts")];
+        let html = breadcrumb(&crumbs).into_string();
+        assert!(html.contains("<ol"), "{html}");
+        assert!(html.contains("</ol>"), "{html}");
+    }
+
+    #[test]
+    fn breadcrumb_last_crumb_has_aria_current_page() {
+        let crumbs = [
+            Crumb::link("Home", "/"),
+            Crumb::link("Posts", "/posts"),
+            Crumb::current("My Post"),
+        ];
+        let html = breadcrumb(&crumbs).into_string();
+        assert!(html.contains(r#"aria-current="page""#), "{html}");
+    }
+
+    #[test]
+    fn breadcrumb_preceding_crumbs_render_as_links() {
+        let crumbs = [
+            Crumb::link("Home", "/"),
+            Crumb::link("Posts", "/posts"),
+            Crumb::current("My Post"),
+        ];
+        let html = breadcrumb(&crumbs).into_string();
+        assert!(html.contains(r#"href="/""#), "{html}");
+        assert!(html.contains(r#"href="/posts""#), "{html}");
+    }
+
+    #[test]
+    fn breadcrumb_last_crumb_is_not_a_link() {
+        let crumbs = [Crumb::link("Home", "/"), Crumb::current("Current Page")];
+        let html = breadcrumb(&crumbs).into_string();
+        // "Current Page" must not be wrapped in an <a>; it carries aria-current="page" instead.
+        assert!(html.contains("Current Page"), "{html}");
+        // The current page span must not itself be a link.
+        assert!(!html.contains("<a href=\"\">Current Page"), "{html}");
+        assert!(html.contains("aria-current=\"page\">Current Page"), "{html}");
+    }
+
+    #[test]
+    fn breadcrumb_single_crumb_no_leading_separator() {
+        let crumbs = [Crumb::current("Only Page")];
+        let html = breadcrumb(&crumbs).into_string();
+        // No separator before the first (and only) item
+        assert!(!html.contains("aria-hidden"), "{html}");
+        assert!(html.contains("Only Page"), "{html}");
+    }
+
+    #[test]
+    fn breadcrumb_single_crumb_has_aria_current_page() {
+        let crumbs = [Crumb::current("Only Page")];
+        let html = breadcrumb(&crumbs).into_string();
+        assert!(html.contains(r#"aria-current="page""#), "{html}");
+    }
+
+    #[test]
+    fn breadcrumb_separators_are_aria_hidden() {
+        let crumbs = [
+            Crumb::link("Home", "/"),
+            Crumb::link("Posts", "/posts"),
+            Crumb::current("Current"),
+        ];
+        let html = breadcrumb(&crumbs).into_string();
+        // Every separator must carry aria-hidden="true"
+        assert!(html.contains(r#"aria-hidden="true""#), "{html}");
+    }
+
+    #[test]
+    fn breadcrumb_label_containing_html_is_escaped() {
+        let crumbs = [
+            Crumb::link("<script>alert(1)</script>", "/"),
+            Crumb::current("Safe"),
+        ];
+        let html = breadcrumb(&crumbs).into_string();
+        assert!(!html.contains("<script>"), "{html}");
+        assert!(html.contains("&lt;script&gt;"), "{html}");
+    }
+
+    #[test]
+    fn breadcrumb_href_containing_html_is_escaped() {
+        let crumbs = [
+            Crumb::link("Home", r#"/" onerror="bad"#),
+            Crumb::current("Page"),
+        ];
+        let html = breadcrumb(&crumbs).into_string();
+        assert!(!html.contains("onerror=\"bad"), "{html}");
+    }
+
+    #[test]
+    fn breadcrumb_crumb_link_constructor() {
+        let c = Crumb::link("Posts", "/posts");
+        assert_eq!(c.label, "Posts");
+        assert_eq!(c.href, Some("/posts"));
+    }
+
+    #[test]
+    fn breadcrumb_crumb_current_constructor() {
+        let c = Crumb::current("My Page");
+        assert_eq!(c.label, "My Page");
+        assert!(c.href.is_none());
     }
 
     // ── property_list ──────────────────────────────────────────────────
