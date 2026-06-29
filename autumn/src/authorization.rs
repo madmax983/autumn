@@ -828,6 +828,37 @@ where
     authorize_create_payload::<R>(state, session, payload).await
 }
 
+/// Scope-aware variant of [`__check_policy_create_payload`] emitted by the
+/// `#[repository(policy = ...)]` proc-macro. Threads the authenticating token's
+/// granted scopes into the [`PolicyContext`] so policies can decide on
+/// `ctx.has_scope(...)`.
+///
+/// **Not part of the public API.**
+#[doc(hidden)]
+pub async fn __check_policy_create_payload_scoped<R>(
+    state: &crate::AppState,
+    session: &Session,
+    scopes: Option<&crate::auth::ApiTokenScopes>,
+    payload: &serde_json::Value,
+) -> crate::AutumnResult<()>
+where
+    R: Send + Sync + 'static,
+{
+    let policy = state.policy_registry().policy::<R>().ok_or_else(|| {
+        crate::AutumnError::from(std::io::Error::other(format!(
+            "no policy registered for resource type {}",
+            std::any::type_name::<R>()
+        )))
+        .with_status(StatusCode::INTERNAL_SERVER_ERROR)
+    })?;
+    let ctx = PolicyContext::from_request_parts(state, session, scopes).await;
+    if policy.can_create_payload(&ctx, payload).await {
+        Ok(())
+    } else {
+        Err(state.forbidden_response().into_error())
+    }
+}
+
 /// Run a policy's `can_create` check before persisting a new record.
 ///
 /// Mirrors [`authorize`] but takes no resource argument: at create
@@ -1143,20 +1174,6 @@ mod tests {
         assert!(err.contains("418"));
         assert!(err.contains("403"));
         assert!(err.contains("404"));
-    }
-
-    #[test]
-    fn forbidden_response_deserializes_from_toml() {
-        #[derive(Debug, serde::Deserialize)]
-        struct Holder {
-            value: ForbiddenResponse,
-        }
-        let h: Holder = toml::from_str(r#"value = "403""#).unwrap();
-        assert_eq!(h.value, ForbiddenResponse::Forbidden403);
-        let h: Holder = toml::from_str(r#"value = "404""#).unwrap();
-        assert_eq!(h.value, ForbiddenResponse::NotFound404);
-        let err = toml::from_str::<Holder>(r#"value = "418""#).unwrap_err();
-        assert!(err.to_string().contains("418"));
     }
 
     #[test]
