@@ -207,8 +207,9 @@ fn render_tauri_conf(package_name: &str) -> String {
       "../autumn.toml": "autumn.toml",
       "configs/autumn-prod.toml": "autumn-prod.toml",
       "configs/autumn-production.toml": "autumn-production.toml",
-      "configs/autumn-staging.toml": "autumn-staging.toml",
+      "configs/autumn-dev.toml": "autumn-dev.toml",
       "configs/autumn-development.toml": "autumn-development.toml",
+      "configs/autumn-staging.toml": "autumn-staging.toml",
       "configs/autumn-test.toml": "autumn-test.toml"
     }}
   }},
@@ -553,12 +554,43 @@ else
        "src-tauri/binaries/{package_name}-${{TARGET_TRIPLE}}"
     echo "Staged: src-tauri/binaries/{package_name}-${{TARGET_TRIPLE}}"
 fi
-# Stage profile config files so tauri.conf.json's static resource entries are
-# always satisfiable at bundle time, regardless of when the files were created
-# relative to when `autumn generate tauri` was run.  An empty TOML file is
-# valid and results in no overrides; AutumnConfig treats it as a no-op.
+# Stage profile config files into src-tauri/configs/ so tauri.conf.json resource
+# entries are always satisfiable at bundle time.
+# For alias pairs (prod/production, dev/development): AutumnConfig stops at the
+# first existing file in its ordered lookup list.  Copy the available file to
+# BOTH names so the profile resolves correctly regardless of AUTUMN_ENV spelling,
+# avoiding an empty stub from shadowing real config in the other alias.
 mkdir -p src-tauri/configs
-for f in autumn-prod.toml autumn-production.toml autumn-staging.toml autumn-development.toml autumn-test.toml; do
+# prod/production alias pair
+if [ -f "autumn-prod.toml" ] && [ -f "autumn-production.toml" ]; then
+    cp autumn-prod.toml src-tauri/configs/autumn-prod.toml
+    cp autumn-production.toml src-tauri/configs/autumn-production.toml
+elif [ -f "autumn-prod.toml" ]; then
+    cp autumn-prod.toml src-tauri/configs/autumn-prod.toml
+    cp autumn-prod.toml src-tauri/configs/autumn-production.toml
+elif [ -f "autumn-production.toml" ]; then
+    cp autumn-production.toml src-tauri/configs/autumn-prod.toml
+    cp autumn-production.toml src-tauri/configs/autumn-production.toml
+else
+    : > src-tauri/configs/autumn-prod.toml
+    : > src-tauri/configs/autumn-production.toml
+fi
+# dev/development alias pair (same logic)
+if [ -f "autumn-dev.toml" ] && [ -f "autumn-development.toml" ]; then
+    cp autumn-dev.toml src-tauri/configs/autumn-dev.toml
+    cp autumn-development.toml src-tauri/configs/autumn-development.toml
+elif [ -f "autumn-dev.toml" ]; then
+    cp autumn-dev.toml src-tauri/configs/autumn-dev.toml
+    cp autumn-dev.toml src-tauri/configs/autumn-development.toml
+elif [ -f "autumn-development.toml" ]; then
+    cp autumn-development.toml src-tauri/configs/autumn-dev.toml
+    cp autumn-development.toml src-tauri/configs/autumn-development.toml
+else
+    : > src-tauri/configs/autumn-dev.toml
+    : > src-tauri/configs/autumn-development.toml
+fi
+# Standalone profiles (no aliases)
+for f in autumn-staging.toml autumn-test.toml; do
     if [ -f "$f" ]; then
         cp "$f" "src-tauri/configs/$f"
     else
@@ -603,12 +635,43 @@ New-Item -ItemType Directory -Force -Path src-tauri\binaries | Out-Null
 Copy-Item "$TargetDir\$TargetTriple\release\{package_name}.exe" `
           "src-tauri\binaries\{package_name}-$TargetTriple.exe"
 Write-Host "Staged: src-tauri/binaries/{package_name}-$TargetTriple.exe"
-# Stage profile config files so tauri.conf.json's static resource entries are
-# always satisfiable at bundle time, regardless of when the files were created
-# relative to when `autumn generate tauri` was run.  An empty TOML file is
-# valid and results in no overrides; AutumnConfig treats it as a no-op.
+# Stage profile config files into src-tauri\configs\ so tauri.conf.json resource
+# entries are always satisfiable at bundle time.
+# For alias pairs (prod/production, dev/development): AutumnConfig stops at the
+# first existing file in its ordered lookup list.  Copy the available file to
+# BOTH names so the profile resolves correctly regardless of AUTUMN_ENV spelling,
+# avoiding an empty stub from shadowing real config in the other alias.
 New-Item -ItemType Directory -Force -Path src-tauri\configs | Out-Null
-foreach ($f in @("autumn-prod.toml", "autumn-production.toml", "autumn-staging.toml", "autumn-development.toml", "autumn-test.toml")) {{
+# prod/production alias pair
+if ((Test-Path autumn-prod.toml) -and (Test-Path autumn-production.toml)) {{
+    Copy-Item autumn-prod.toml src-tauri\configs\autumn-prod.toml
+    Copy-Item autumn-production.toml src-tauri\configs\autumn-production.toml
+}} elseif (Test-Path autumn-prod.toml) {{
+    Copy-Item autumn-prod.toml src-tauri\configs\autumn-prod.toml
+    Copy-Item autumn-prod.toml src-tauri\configs\autumn-production.toml
+}} elseif (Test-Path autumn-production.toml) {{
+    Copy-Item autumn-production.toml src-tauri\configs\autumn-prod.toml
+    Copy-Item autumn-production.toml src-tauri\configs\autumn-production.toml
+}} else {{
+    New-Item -ItemType File -Force -Path src-tauri\configs\autumn-prod.toml | Out-Null
+    New-Item -ItemType File -Force -Path src-tauri\configs\autumn-production.toml | Out-Null
+}}
+# dev/development alias pair (same logic)
+if ((Test-Path autumn-dev.toml) -and (Test-Path autumn-development.toml)) {{
+    Copy-Item autumn-dev.toml src-tauri\configs\autumn-dev.toml
+    Copy-Item autumn-development.toml src-tauri\configs\autumn-development.toml
+}} elseif (Test-Path autumn-dev.toml) {{
+    Copy-Item autumn-dev.toml src-tauri\configs\autumn-dev.toml
+    Copy-Item autumn-dev.toml src-tauri\configs\autumn-development.toml
+}} elseif (Test-Path autumn-development.toml) {{
+    Copy-Item autumn-development.toml src-tauri\configs\autumn-dev.toml
+    Copy-Item autumn-development.toml src-tauri\configs\autumn-development.toml
+}} else {{
+    New-Item -ItemType File -Force -Path src-tauri\configs\autumn-dev.toml | Out-Null
+    New-Item -ItemType File -Force -Path src-tauri\configs\autumn-development.toml | Out-Null
+}}
+# Standalone profiles (no aliases)
+foreach ($f in @("autumn-staging.toml", "autumn-test.toml")) {{
     if (Test-Path $f) {{
         Copy-Item $f "src-tauri\configs\$f"
     }} else {{
@@ -890,6 +953,48 @@ mod tests {
         assert!(
             ps1.contains("autumn-prod.toml"),
             "stage-sidecar.ps1 must stage autumn-prod.toml into configs\\"
+        );
+    }
+
+    // When only one of a prod/production (or dev/development) alias pair exists, the
+    // staging script must copy it to BOTH names so an empty stub can never shadow
+    // real config because AutumnConfig stops at the first existing file in the lookup list.
+    #[test]
+    fn stage_sidecar_sh_copies_alias_to_both_names() {
+        let sh = render_stage_sidecar_sh("my-app");
+        // Must handle the case where only autumn-production.toml exists by copying it
+        // to autumn-prod.toml as well — look for the elif + both cp lines.
+        assert!(
+            sh.contains("autumn-production.toml") && sh.contains("autumn-prod.toml"),
+            "stage-sidecar.sh must handle prod/production alias pair explicitly"
+        );
+        // The alias-pair logic copies to BOTH names from a single source, so each
+        // destination path must appear at least twice (once in the both-exist branch
+        // and once in the single-file branch).
+        assert!(
+            sh.matches("autumn-prod.toml").count() >= 2,
+            "stage-sidecar.sh must copy to autumn-prod.toml in multiple alias branches"
+        );
+        assert!(
+            sh.contains("autumn-dev.toml") && sh.contains("autumn-development.toml"),
+            "stage-sidecar.sh must handle dev/development alias pair explicitly"
+        );
+    }
+
+    #[test]
+    fn stage_sidecar_ps1_copies_alias_to_both_names() {
+        let ps1 = render_stage_sidecar_ps1("my-app");
+        assert!(
+            ps1.contains("autumn-production.toml") && ps1.contains("autumn-prod.toml"),
+            "stage-sidecar.ps1 must handle prod/production alias pair explicitly"
+        );
+        assert!(
+            ps1.matches("autumn-prod.toml").count() >= 2,
+            "stage-sidecar.ps1 must copy to autumn-prod.toml in multiple alias branches"
+        );
+        assert!(
+            ps1.contains("autumn-dev.toml") && ps1.contains("autumn-development.toml"),
+            "stage-sidecar.ps1 must handle dev/development alias pair explicitly"
         );
     }
 
@@ -1247,16 +1352,38 @@ mod tests {
             "tauri.conf.json must not emit resource glob entries — Tauri fails with \
              GlobPathNotFound when the glob matches no files (common for fresh projects)"
         );
-        // Profile configs must always be included from configs/ so they are bundled
-        // regardless of when the files were created relative to `autumn generate tauri`.
-        // The staging script creates the files (or empty stubs) at build time.
+        // Both alias names for prod and dev must be included so the staging script's
+        // alias-pair copy logic always has a resource destination for each name,
+        // and the sidecar finds the config regardless of AUTUMN_ENV spelling.
         let has_prod = resources
             .keys()
-            .any(|k| k.contains("configs/") && k.contains("prod"));
+            .any(|k| k.contains("configs/") && k.contains("autumn-prod.toml"));
         assert!(
             has_prod,
-            "tauri.conf.json must include profile config entries from configs/ so \
-             autumn-prod.toml is bundled even when added after `autumn generate tauri`"
+            "tauri.conf.json must include configs/autumn-prod.toml so autumn-prod.toml \
+             is bundled even when added after `autumn generate tauri`"
+        );
+        let has_production = resources
+            .keys()
+            .any(|k| k.contains("configs/") && k.contains("autumn-production.toml"));
+        assert!(
+            has_production,
+            "tauri.conf.json must include configs/autumn-production.toml (prod alias)"
+        );
+        let has_dev = resources
+            .keys()
+            .any(|k| k.contains("configs/") && k.contains("autumn-dev.toml"));
+        assert!(
+            has_dev,
+            "tauri.conf.json must include configs/autumn-dev.toml so the dev alias \
+             is bundled alongside autumn-development.toml"
+        );
+        let has_development = resources
+            .keys()
+            .any(|k| k.contains("configs/") && k.contains("autumn-development.toml"));
+        assert!(
+            has_development,
+            "tauri.conf.json must include configs/autumn-development.toml (dev alias)"
         );
     }
 
