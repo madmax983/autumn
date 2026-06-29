@@ -71,7 +71,7 @@ fn build_embedded(debug: bool, profile: &str, package: Option<&str>, bin: Option
     // Resolve the selected package's directory so `-p <pkg>` fingerprints that
     // package's `static/` (which `embed_static!` reads via $CARGO_MANIFEST_DIR),
     // not whatever `static/` happens to sit next to the CLI's cwd.
-    let (_, manifest_dir) = find_binary(debug, package);
+    let (_, manifest_dir) = find_binary(debug, package, bin);
     let static_dir = manifest_dir
         .unwrap_or_else(|| std::env::current_dir().expect("current dir"))
         .join("static");
@@ -114,7 +114,7 @@ pub fn run(debug: bool, embed: bool, package: Option<&str>, bin: Option<&str>) {
         fingerprint_static_assets();
     }
 
-    let (binary, manifest_dir) = find_binary(debug, package);
+    let (binary, manifest_dir) = find_binary(debug, package, bin);
     eprintln!("\nRunning static renderer...\n");
 
     let mut cmd = Command::new(&binary);
@@ -353,10 +353,18 @@ fn is_fingerprinted_filename(filename: &str) -> bool {
 /// Otherwise falls back to matching the package whose manifest is in
 /// the current directory.
 ///
+/// When `bin` is `Some`, it is used as the binary name directly instead of
+/// resolving via `default-run` or target scanning — mirrors the `--bin` flag
+/// passed to `cargo build`.
+///
 /// Returns `(binary_path, manifest_dir)` so the caller can set
 /// `AUTUMN_MANIFEST_DIR` when the binary is run from a different CWD
 /// (e.g. `autumn build -p reddit-clone` from the workspace root).
-fn find_binary(debug: bool, package: Option<&str>) -> (PathBuf, Option<PathBuf>) {
+fn find_binary(
+    debug: bool,
+    package: Option<&str>,
+    bin: Option<&str>,
+) -> (PathBuf, Option<PathBuf>) {
     let output = Command::new("cargo")
         .args(["metadata", "--format-version=1", "--no-deps"])
         .output()
@@ -371,7 +379,7 @@ fn find_binary(debug: bool, package: Option<&str>) -> (PathBuf, Option<PathBuf>)
         serde_json::from_slice(&output.stdout).expect("parse cargo metadata");
     let cwd = std::env::current_dir().expect("current dir");
 
-    resolve_binary_from_metadata(&metadata, debug, package, &cwd).unwrap_or_else(|error| {
+    resolve_binary_from_metadata(&metadata, debug, package, bin, &cwd).unwrap_or_else(|error| {
         eprintln!("\u{2717} {error}");
         std::process::exit(1);
     })
@@ -381,6 +389,7 @@ fn resolve_binary_from_metadata(
     metadata: &serde_json::Value,
     debug: bool,
     package: Option<&str>,
+    bin: Option<&str>,
     cwd: &Path,
 ) -> Result<(PathBuf, Option<PathBuf>), String> {
     let target_dir = metadata["target_directory"]
@@ -413,9 +422,12 @@ fn resolve_binary_from_metadata(
     let (bin_name, manifest_dir) = matching_packages
         .iter()
         .find_map(|pkg| {
-            // Prefer `default-run` so packages with multiple binaries always
-            // start the right one. Mirror the same logic as `dev.rs`.
-            let name = if let Some(name) = pkg["default_run"].as_str() {
+            // --bin wins when the caller already knows which target to run.
+            // Otherwise prefer `default-run` so packages with multiple binaries
+            // always start the right one. Mirror the same logic as `dev.rs`.
+            let name = if let Some(explicit) = bin {
+                explicit.to_owned()
+            } else if let Some(name) = pkg["default_run"].as_str() {
                 name.to_owned()
             } else {
                 pkg["targets"].as_array()?.iter().find_map(|t| {
@@ -523,9 +535,14 @@ mod tests {
     #[test]
     fn resolve_binary_by_package_name() {
         let metadata = sample_metadata("/tmp/target", "hello", "/projects/hello");
-        let (bin, manifest_dir) =
-            resolve_binary_from_metadata(&metadata, true, Some("hello"), Path::new("/projects"))
-                .unwrap();
+        let (bin, manifest_dir) = resolve_binary_from_metadata(
+            &metadata,
+            true,
+            Some("hello"),
+            None,
+            Path::new("/projects"),
+        )
+        .unwrap();
         assert_eq!(bin, expected_binary("/tmp/target/debug/hello"));
         assert_eq!(manifest_dir, Some(PathBuf::from("/projects/hello")));
     }
@@ -534,7 +551,7 @@ mod tests {
     fn resolve_binary_by_cwd() {
         let metadata = sample_metadata("/tmp/target", "hello", "/projects/hello");
         let (bin, manifest_dir) =
-            resolve_binary_from_metadata(&metadata, true, None, Path::new("/projects/hello"))
+            resolve_binary_from_metadata(&metadata, true, None, None, Path::new("/projects/hello"))
                 .unwrap();
         assert_eq!(bin, expected_binary("/tmp/target/debug/hello"));
         assert_eq!(manifest_dir, Some(PathBuf::from("/projects/hello")));
@@ -543,17 +560,27 @@ mod tests {
     #[test]
     fn resolve_binary_uses_release_profile() {
         let metadata = sample_metadata("/tmp/target", "hello", "/projects/hello");
-        let (bin, _) =
-            resolve_binary_from_metadata(&metadata, false, Some("hello"), Path::new("/projects"))
-                .unwrap();
+        let (bin, _) = resolve_binary_from_metadata(
+            &metadata,
+            false,
+            Some("hello"),
+            None,
+            Path::new("/projects"),
+        )
+        .unwrap();
         assert_eq!(bin, expected_binary("/tmp/target/release/hello"));
     }
 
     #[test]
     fn resolve_binary_reports_missing_package() {
         let metadata = sample_metadata("/tmp/target", "hello", "/projects/hello");
-        let result =
-            resolve_binary_from_metadata(&metadata, true, Some("missing"), Path::new("/projects"));
+        let result = resolve_binary_from_metadata(
+            &metadata,
+            true,
+            Some("missing"),
+            None,
+            Path::new("/projects"),
+        );
         assert!(result.unwrap_err().contains("package 'missing'"));
     }
 
@@ -568,8 +595,13 @@ mod tests {
             }]
         });
 
-        let result =
-            resolve_binary_from_metadata(&metadata, true, Some("hello"), Path::new("/projects"));
+        let result = resolve_binary_from_metadata(
+            &metadata,
+            true,
+            Some("hello"),
+            None,
+            Path::new("/projects"),
+        );
         assert!(result.unwrap_err().contains("package 'hello'"));
     }
 
@@ -587,10 +619,41 @@ mod tests {
                 ]
             }]
         });
-        let (bin, _) =
-            resolve_binary_from_metadata(&metadata, true, Some("todo-app"), Path::new("/projects"))
-                .unwrap();
+        let (bin, _) = resolve_binary_from_metadata(
+            &metadata,
+            true,
+            Some("todo-app"),
+            None,
+            Path::new("/projects"),
+        )
+        .unwrap();
         assert_eq!(bin, expected_binary("/tmp/target/debug/todo-app"));
+    }
+
+    #[test]
+    fn resolve_binary_explicit_bin_overrides_default_run() {
+        // --bin wins over default-run so the static renderer runs the requested target.
+        let metadata = serde_json::json!({
+            "target_directory": "/tmp/target",
+            "packages": [{
+                "name": "todo-app",
+                "manifest_path": "/projects/todo-app/Cargo.toml",
+                "default_run": "todo-app",
+                "targets": [
+                    { "name": "seed", "kind": ["bin"], "src_path": "/projects/todo-app/src/bin/seed.rs" },
+                    { "name": "todo-app", "kind": ["bin"], "src_path": "/projects/todo-app/src/main.rs" }
+                ]
+            }]
+        });
+        let (bin, _) = resolve_binary_from_metadata(
+            &metadata,
+            true,
+            Some("todo-app"),
+            Some("seed"),
+            Path::new("/projects"),
+        )
+        .unwrap();
+        assert_eq!(bin, expected_binary("/tmp/target/debug/seed"));
     }
 
     #[test]
@@ -608,6 +671,7 @@ mod tests {
             &metadata,
             false,
             Some("reddit-clone"),
+            None,
             Path::new("/workspace"),
         )
         .unwrap();
