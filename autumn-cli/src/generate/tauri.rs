@@ -190,7 +190,9 @@ fn read_package_meta(project_root: &Path) -> Result<(String, String, String, boo
     //   3. `[package] default-run` — the developer's declared preference when there
     //      are multiple explicit [[bin]] entries and no src/main.rs.
     //   4. `bins.first()` — last resort when only one [[bin]] is declared.
-    //   5. The package name (Cargo default when no [[bin]] is declared).
+    //   5. No [[bin]] table at all: honour `default-run` first; then if exactly one
+    //      `src/bin/*.rs` file exists, Cargo auto-discovers it (named after the stem,
+    //      not the package), so use that stem; otherwise fall back to the package name.
     let default_run = pkg
         .get("default-run")
         .and_then(|v| v.as_str())
@@ -199,8 +201,35 @@ fn read_package_meta(project_root: &Path) -> Result<(String, String, String, boo
         .get("bin")
         .and_then(|b| b.as_array())
         .map_or_else(
-            // Step 5: no [[bin]] at all — package name is the binary name.
-            || name.clone(),
+            // Step 5: no [[bin]] table — honour default-run, then src/bin/ discovery,
+            // then fall back to the package name (which Cargo uses for src/main.rs).
+            || {
+                if let Some(dr) = &default_run {
+                    return dr.clone();
+                }
+                // Inspect src/bin/ for auto-discovered binaries.  Cargo names each
+                // binary after the file stem (not the package), so `src/bin/web.rs`
+                // produces a `web` binary, not `<package>`.
+                if let Ok(entries) = std::fs::read_dir(project_root.join("src/bin")) {
+                    let stems: Vec<String> = entries
+                        .filter_map(std::result::Result::ok)
+                        .filter_map(|e| {
+                            let p = e.path();
+                            if p.extension().is_some_and(|x| x == "rs") {
+                                p.file_stem()
+                                    .and_then(|s| s.to_str())
+                                    .map(str::to_owned)
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+                    if stems.len() == 1 {
+                        return stems.into_iter().next().unwrap();
+                    }
+                }
+                name.clone()
+            },
             |bins| {
                 // Step 1: explicit [[bin]] entry whose path is src/main.rs.
                 bins.iter()
@@ -534,6 +563,14 @@ fn setup(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {{
         // the wrong database or skipping production security settings.
         .env("AUTUMN_ENV", "")
         .env("AUTUMN_PROFILE", "")
+        // Clear one-off mode flags inherited from the calling environment.
+        // If any of these are set, AppBuilder::run() enters a non-serving mode
+        // (asset fingerprinting, route dump, task execution) and exits before
+        // binding the HTTP port — leaving the TCP health probe to time out.
+        .env("AUTUMN_BUILD_STATIC", "")
+        .env("AUTUMN_DUMP_ROUTES", "")
+        .env("AUTUMN_LIST_TASKS", "")
+        .env("AUTUMN_RUN_TASK", "")
         .spawn()?;
     *app.state::<SidecarHandle>().0.lock().unwrap() = Some(child);
 
@@ -1042,6 +1079,27 @@ mod tests {
         tmp
     }
 
+    /// Project with a single `src/bin/<bin_name>.rs` and no `src/main.rs` or
+    /// `[[bin]]` — Cargo auto-discovers the binary named after the file stem.
+    fn project_with_src_bin(pkg_name: &str, bin_stem: &str) -> TempDir {
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join("Cargo.toml"),
+            format!(
+                "[package]\nname=\"{pkg_name}\"\nversion=\"0.1.0\"\nedition=\"2024\"\n\
+                 \n[dependencies]\nautumn-web = \"0.5.0\"\n"
+            ),
+        )
+        .unwrap();
+        fs::create_dir_all(tmp.path().join("src/bin")).unwrap();
+        fs::write(
+            tmp.path().join(format!("src/bin/{bin_stem}.rs")),
+            "fn main() {}\n",
+        )
+        .unwrap();
+        tmp
+    }
+
     // ── plan_tauri: error cases ───────────────────────────────────────────────
 
     #[test]
@@ -1448,6 +1506,34 @@ mod tests {
     }
 
     #[test]
+    fn plan_detects_src_bin_auto_discovered_binary() {
+        // A package with src/bin/web.rs and no src/main.rs or [[bin]] table —
+        // Cargo auto-discovers it as binary "web" (file stem, not package name).
+        let tmp = project_with_src_bin("my-app", "web");
+        let plan = plan_tauri(tmp.path()).unwrap();
+        let sh: &str = plan
+            .actions
+            .iter()
+            .find(|a| a.path().to_string_lossy().ends_with("stage-sidecar.sh"))
+            .and_then(|a| {
+                if let crate::generate::emit::Action::Create { contents, .. } = a {
+                    Some(contents.as_str())
+                } else {
+                    None
+                }
+            })
+            .expect("stage-sidecar.sh action not found");
+        assert!(
+            sh.contains("--bin web"),
+            "staging script must use the src/bin/ file stem 'web', not the package name 'my-app'"
+        );
+        assert!(
+            !sh.contains("--bin my-app"),
+            "staging script must not use the package name when a src/bin/ binary is auto-discovered"
+        );
+    }
+
+    #[test]
     fn stage_sidecar_sh_uses_app_embed_feature_when_defined() {
         // When the app defines an `embed-assets` Cargo feature, the staging
         // script must pass it (not just the dep path) so that
@@ -1804,6 +1890,23 @@ mod tests {
             lib.contains("\"AUTUMN_PROFILE\", \"\""),
             "lib.rs must clear AUTUMN_PROFILE (legacy alias) for the same reason"
         );
+    }
+
+    #[test]
+    fn lib_rs_clears_one_off_mode_env_vars() {
+        let lib = render_shell_lib_rs("my-app", "my-app");
+        for var in &[
+            "AUTUMN_BUILD_STATIC",
+            "AUTUMN_DUMP_ROUTES",
+            "AUTUMN_LIST_TASKS",
+            "AUTUMN_RUN_TASK",
+        ] {
+            assert!(
+                lib.contains(&format!("\"{var}\", \"\"")),
+                "lib.rs must clear {var} so an inherited one-off mode flag \
+                 doesn't prevent the sidecar from binding its HTTP port"
+            );
+        }
     }
 
     #[test]
