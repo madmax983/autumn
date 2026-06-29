@@ -681,21 +681,27 @@ pub fn add_mail_preview_to_app(existing: &str, mailer_type: &str) -> String {
     )
 }
 
-/// Append `mailer_type` inside an already-present `mail_previews![...]`.
-fn augment_mail_previews_list(existing: &str, body_start: usize, mailer_type: &str) -> String {
+/// Splice `entry` into the body of a `macro![...]` call starting at `body_start`.
+///
+/// Idempotent: returns `existing` unchanged if `entry` is already present.
+/// Returns `existing` unchanged if no closing `]` is found.
+fn splice_into_macro_body(existing: &str, body_start: usize, entry: &str) -> String {
     let rest = &existing[body_start..];
     let Some(end_offset) = rest.find(']') else {
         return existing.to_owned();
     };
     let body = &rest[..end_offset];
 
-    // Idempotency: skip if type is already registered.
-    if body.split(',').map(str::trim).any(|t| t == mailer_type) {
+    // Idempotency: skip if entry is already registered.
+    if body.split(',').map(str::trim).any(|t| t == entry) {
         return existing.to_owned();
     }
 
-    let separator = if body.trim().is_empty() { "" } else { ", " };
-    let new_body = format!("{}{}{}", body.trim_end(), separator, mailer_type);
+    // Trim whitespace and any trailing comma so `cargo fmt`-formatted multi-line
+    // macro bodies (which may end with a trailing comma) don't produce `entry1,, entry2`.
+    let trimmed_body = body.trim().trim_end_matches(',');
+    let separator = if trimmed_body.is_empty() { "" } else { ", " };
+    let new_body = format!("{trimmed_body}{separator}{entry}");
     [
         &existing[..body_start],
         &new_body,
@@ -704,35 +710,98 @@ fn augment_mail_previews_list(existing: &str, body_start: usize, mailer_type: &s
     .concat()
 }
 
-/// Insert `.mail_previews(mail_previews![mailer_type])` before `.run()`.
-fn insert_mail_previews_call(existing: &str, mailer_type: &str) -> String {
-    let mut out = String::with_capacity(existing.len() + 80);
+/// Append `mailer_type` inside an already-present `mail_previews![...]`.
+fn augment_mail_previews_list(existing: &str, body_start: usize, mailer_type: &str) -> String {
+    splice_into_macro_body(existing, body_start, mailer_type)
+}
+
+/// Insert `line_to_insert` (without trailing newline) before the first `.run()`
+/// line in an `AppBuilder` chain, preserving the same indentation.
+///
+/// Returns `existing` unchanged when no `.run()` line can be found.
+fn insert_before_run_call(existing: &str, line_to_insert: &str) -> String {
+    let mut out = String::with_capacity(existing.len() + line_to_insert.len() + 4);
     let mut inserted = false;
-    for line in existing.split('\n') {
+    for line in existing.lines() {
         let trimmed = line.trim_start();
         if !inserted && trimmed.starts_with(".run()") {
             let indent_len = line.len() - trimmed.len();
             let indent = &line[..indent_len];
             out.push_str(indent);
-            out.push_str(".mail_previews(mail_previews![");
-            out.push_str(mailer_type);
-            out.push_str("])\n");
+            out.push_str(line_to_insert);
+            out.push('\n');
             inserted = true;
         }
         out.push_str(line);
         out.push('\n');
     }
-    // split('\n') always produces a trailing empty slice for strings ending
-    // with '\n', so we have one extra '\n'. Trim it if the original didn't
-    // end with a newline.
+    // lines() doesn't yield the trailing empty segment that split('\n') would,
+    // so remove the surplus '\n' only when the original had no trailing newline.
     if !existing.ends_with('\n') && out.ends_with('\n') {
         out.pop();
     }
-    // Remove the extra trailing newline produced by the final empty segment.
-    if existing.ends_with('\n') && out.ends_with("\n\n") {
-        out.pop();
-    }
     out
+}
+
+/// Insert `.mail_previews(mail_previews![mailer_type])` before `.run()`.
+fn insert_mail_previews_call(existing: &str, mailer_type: &str) -> String {
+    insert_before_run_call(
+        existing,
+        &format!(".mail_previews(mail_previews![{mailer_type}])"),
+    )
+}
+
+// ── Job registration helpers ──────────────────────────────────────────────
+
+/// Inject `.jobs(jobs::registered_jobs())` into the `AppBuilder` chain in
+/// `src/main.rs`, immediately before the `.run()` line.
+///
+/// Idempotent: if `.jobs(jobs::registered_jobs())` is already present the
+/// function returns `existing` unchanged.  Returns `existing` unchanged when
+/// no `.run()` line can be found.
+#[must_use]
+pub fn add_jobs_registration_to_app(existing: &str) -> String {
+    const JOBS_CALL: &str = ".jobs(jobs::registered_jobs())";
+    if existing.contains(JOBS_CALL) {
+        return existing.to_owned();
+    }
+    insert_jobs_call(existing)
+}
+
+/// Insert `.jobs(jobs::registered_jobs())` before the first `.run()` line.
+fn insert_jobs_call(existing: &str) -> String {
+    insert_before_run_call(existing, ".jobs(jobs::registered_jobs())")
+}
+
+/// Idempotently add `entry` (e.g. `"send_welcome_email::send_welcome_email"`)
+/// to the `jobs![...]` macro invocation inside `src/jobs/mod.rs`.
+///
+/// If no `jobs![` call exists yet, the full `registered_jobs()` function is
+/// appended.  If it already exists, only the new entry is spliced in (using
+/// the same bracket-scan logic as `augment_routes_body` / `augment_mail_previews_list`).
+/// Idempotent: a second call with the same entry is a no-op.
+#[must_use]
+pub fn augment_registered_jobs(existing: &str, entry: &str) -> String {
+    const JOBS_MACRO: &str = "jobs![";
+    existing.find(JOBS_MACRO).map_or_else(
+        || {
+            // Append a fresh registered_jobs() fn.
+            let trimmed = existing.trim_end();
+            let sep = if trimmed.is_empty() { "" } else { "\n\n" };
+            format!(
+                "{trimmed}{sep}#[must_use]\npub fn registered_jobs() -> Vec<autumn_web::job::JobInfo> {{\n    autumn_web::jobs![{entry}]\n}}\n"
+            )
+        },
+        |macro_start| {
+            let body_start = macro_start + JOBS_MACRO.len();
+            splice_jobs_list(existing, body_start, entry)
+        },
+    )
+}
+
+/// Splice `entry` into an already-present `jobs![...]` body.
+fn splice_jobs_list(existing: &str, body_start: usize, entry: &str) -> String {
+    splice_into_macro_body(existing, body_start, entry)
 }
 
 // ── Cargo.toml: feature injection ────────────────────────────────────────
@@ -2635,6 +2704,122 @@ async fn main() {\n\
         let updated = add_mail_preview_to_app(app_main(), "mailers::welcome::WelcomeMailer");
         assert!(updated.contains(".run()"), ".run() must still be present");
         assert!(updated.contains(".await;"), ".await must still be present");
+    }
+
+    // ── add_jobs_registration_to_app ─────────────────────────────────────
+
+    #[test]
+    fn add_jobs_registration_inserts_before_run() {
+        let updated = add_jobs_registration_to_app(app_main());
+        assert!(
+            updated.contains(".jobs(jobs::registered_jobs())"),
+            "must insert .jobs call: {updated}"
+        );
+        let jobs_pos = updated.find(".jobs(").unwrap();
+        let run_pos = updated.find(".run()").unwrap();
+        assert!(
+            jobs_pos < run_pos,
+            ".jobs() must appear before .run(): {updated}"
+        );
+    }
+
+    #[test]
+    fn add_jobs_registration_idempotent() {
+        let first = add_jobs_registration_to_app(app_main());
+        let second = add_jobs_registration_to_app(&first);
+        assert_eq!(first, second, "second call must be a no-op");
+    }
+
+    #[test]
+    fn add_jobs_registration_preserves_run_await() {
+        let updated = add_jobs_registration_to_app(app_main());
+        assert!(updated.contains(".run()"), ".run() must still be present");
+        assert!(updated.contains(".await;"), ".await must still be present");
+    }
+
+    #[test]
+    fn add_jobs_registration_single_call_even_with_two_jobs() {
+        let after_first = add_jobs_registration_to_app(app_main());
+        // Simulates running generate job a second time — .jobs(...) is already there.
+        let after_second = add_jobs_registration_to_app(&after_first);
+        assert_eq!(
+            after_second
+                .matches(".jobs(jobs::registered_jobs())")
+                .count(),
+            1,
+            "must not duplicate the .jobs() call"
+        );
+    }
+
+    // ── augment_registered_jobs ───────────────────────────────────────────
+
+    #[test]
+    fn augment_registered_jobs_creates_fn_when_absent() {
+        let mod_rs = "pub mod send_welcome_email;\n";
+        let updated = augment_registered_jobs(mod_rs, "send_welcome_email::send_welcome_email");
+        assert!(
+            updated.contains("pub fn registered_jobs()"),
+            "must create registered_jobs fn: {updated}"
+        );
+        assert!(
+            updated.contains("jobs![send_welcome_email::send_welcome_email]"),
+            "must include the new entry: {updated}"
+        );
+    }
+
+    #[test]
+    fn augment_registered_jobs_splices_into_existing() {
+        let mod_rs = "pub mod send_welcome_email;\n\n\
+            #[must_use]\n\
+            pub fn registered_jobs() -> Vec<autumn_web::job::JobInfo> {\n    \
+                autumn_web::jobs![send_welcome_email::send_welcome_email]\n}\n";
+        let updated = augment_registered_jobs(mod_rs, "post_notification::post_notification");
+        assert!(
+            updated.contains("send_welcome_email::send_welcome_email"),
+            "must preserve existing entry"
+        );
+        assert!(
+            updated.contains("post_notification::post_notification"),
+            "must include new entry"
+        );
+        assert_eq!(
+            updated.matches("jobs![").count(),
+            1,
+            "must not duplicate jobs![]: {updated}"
+        );
+    }
+
+    #[test]
+    fn augment_registered_jobs_idempotent() {
+        let mod_rs = "pub mod send_welcome_email;\n\n\
+            #[must_use]\n\
+            pub fn registered_jobs() -> Vec<autumn_web::job::JobInfo> {\n    \
+                autumn_web::jobs![send_welcome_email::send_welcome_email]\n}\n";
+        let second = augment_registered_jobs(mod_rs, "send_welcome_email::send_welcome_email");
+        assert_eq!(mod_rs, second, "duplicate entry must be a no-op");
+    }
+
+    #[test]
+    fn augment_registered_jobs_no_double_comma_with_trailing_comma() {
+        // cargo fmt may produce trailing commas inside multi-line macro bodies.
+        let mod_rs = "pub fn registered_jobs() -> Vec<autumn_web::job::JobInfo> {\n    \
+            autumn_web::jobs![\n        send_welcome_email::send_welcome_email,\n    ]\n}\n";
+        let updated = augment_registered_jobs(mod_rs, "post_notification::post_notification");
+        assert!(
+            !updated.contains(",,"),
+            "must not produce double comma: {updated}"
+        );
+        assert!(
+            updated.contains("post_notification::post_notification"),
+            "must include new entry"
+        );
+    }
+
+    #[test]
+    fn augment_registered_jobs_empty_mod_rs_creates_full_fn() {
+        let updated = augment_registered_jobs("", "foo::foo");
+        assert!(updated.contains("pub fn registered_jobs()"));
+        assert!(updated.contains("jobs![foo::foo]"));
     }
 
     // ── ensure_autumn_web_feature ─────────────────────────────────────────

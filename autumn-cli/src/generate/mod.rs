@@ -17,6 +17,7 @@ pub mod dsl;
 pub mod emit;
 pub mod inbound_mail;
 pub mod introspect;
+pub mod job;
 pub mod mailer;
 pub mod migration;
 pub mod model;
@@ -145,6 +146,11 @@ const fn ymd_from_days(days_since_epoch: u64) -> (u64, u64, u64) {
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if m <= 2 { y + 1 } else { y };
     (y as u64, m, d)
+}
+
+/// Read a file to `String`, returning an empty string if the file does not exist.
+pub fn read_or_empty(path: &Path) -> String {
+    std::fs::read_to_string(path).unwrap_or_default()
 }
 
 #[cfg(test)]

@@ -66,6 +66,7 @@ jobs:
   #   generated_scaffold_cargo_checks             (generate.rs)
   #   generated_scaffold_config_cargo_checks      (generate.rs)
   #   generated_auth_totp_cargo_checks            (generate.rs)
+  #   generated_job_cargo_checks                  (generate.rs)
   #
   # Each test scaffolds a project, patches Cargo.toml to point at the local
   # autumn-web crate, and runs `cargo build` / `cargo check`. Failures include
@@ -131,6 +132,11 @@ jobs:
         run: |
           cargo test -p autumn-cli --test generate \
             generated_auth_totp_cargo_checks -- --ignored --exact
+
+      - name: generated_job_cargo_checks
+        run: |
+          cargo test -p autumn-cli --test generate \
+            generated_job_cargo_checks -- --ignored --exact
 
   # ── Postgres e2e gate ────────────────────────────────────────────────────────
   #

@@ -8,6 +8,7 @@ single command. Four subcommands cover the cases you actually hit:
 | `autumn generate model`              | A `#[model]` struct, a Diesel `up.sql`/`down.sql` pair, a `schema.rs` entry      |
 | `autumn generate migration`          | A Diesel migration directory; columns are inferred when the name matches a verb |
 | `autumn generate task`               | A one-off operational `#[task]` skeleton under `tasks/`                         |
+| `autumn generate job`                | A `#[job]` background-job handler with args struct, `registered_jobs()` aggregator, and `.jobs(…)` wiring in `src/main.rs` |
 | `autumn generate scaffold`           | Everything `model` does plus `#[repository]`, HTML routes, smoke test, `routes![]` registration |
 | `autumn generate wizard`             | A session-backed multi-step form wizard with per-step validation and a confirm/commit/cancel flow |
 | `autumn generate admin`              | An `AdminModel` adapter for an existing model, wired to `autumn-admin-plugin`   |
@@ -304,6 +305,74 @@ pub async fn cleanup_users(TaskArgs(args): TaskArgs<CleanupUsersArgs>) -> Autumn
 
 Register the function with `.one_off_tasks(one_off_tasks![...])` before running
 it with `autumn task cleanup_users --dry-run`.
+
+## `autumn generate job`
+
+For background work that should survive process restarts, be retried on failure,
+and be visible in `/actuator/jobs`.
+
+```bash
+autumn generate job SendWelcomeEmail user_id:i64 email:String
+```
+
+Produces:
+
+```
+src/jobs/send_welcome_email.rs    # #[job] handler + SendWelcomeEmailArgs struct
+src/jobs/mod.rs                   # registered_jobs() aggregator (created or appended)
+src/main.rs                       # mod jobs; + .jobs(jobs::registered_jobs()) added in place
+```
+
+The generated `src/jobs/send_welcome_email.rs`:
+
+```rust
+use autumn_web::prelude::*;
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SendWelcomeEmailArgs {
+    pub user_id: i64,
+    pub email: String,
+}
+
+#[job(name = "send_welcome_email", max_attempts = 5, backoff_ms = 500)]
+pub async fn send_welcome_email(
+    _state: AppState,
+    args: SendWelcomeEmailArgs,
+) -> AutumnResult<()> {
+    // TODO: implement send_welcome_email
+    let _ = args;
+    Ok(())
+}
+```
+
+The `#[job]` macro generates a companion struct `SendWelcomeEmailJob` with:
+- `SendWelcomeEmailJob::NAME` — the job's registered name (`"send_welcome_email"`).
+- `SendWelcomeEmailJob::enqueue(args).await?` — at-least-once enqueue (use from most handlers).
+- `autumn_web::job::enqueue_on_conn(SendWelcomeEmailJob::NAME, args, conn).await?` — transactional enqueue (enqueues only if the surrounding DB transaction commits; use when the job outcome must be atomic with a DB write).
+
+The generated `src/jobs/mod.rs` aggregator:
+
+```rust
+pub mod send_welcome_email;
+
+#[must_use]
+pub fn registered_jobs() -> Vec<autumn_web::job::JobInfo> {
+    autumn_web::jobs![send_welcome_email::send_welcome_email]
+}
+```
+
+Running `autumn generate job` a second time with a different name augments `mod.rs` and `registered_jobs()` in place — it never duplicates an entry.
+
+The `.jobs(jobs::registered_jobs())` call added to `src/main.rs` wires the aggregator into the job runtime and automatically populates `/actuator/jobs` with every registered job.
+
+### Slow live job verification
+
+```bash
+cargo test -p autumn-cli --test generate generated_job_cargo_checks -- --ignored --exact
+```
+
+This scaffolds a fresh project, runs `autumn generate job`, and asserts that `cargo check --tests` passes with no hand-editing required.
 
 ## `autumn generate scaffold`
 

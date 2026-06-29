@@ -1369,6 +1369,39 @@ enum GenerateCommands {
         #[arg(long)]
         force: bool,
     },
+    /// Scaffold a `#[job]` background-job handler, args struct,
+    /// `src/jobs/mod.rs` aggregator, and `.jobs(jobs::registered_jobs())`
+    /// registration in `src/main.rs`.
+    ///
+    /// Creates:
+    ///
+    /// - `src/jobs/<snake>.rs` — `<Pascal>Args` struct + `#[job]` handler
+    ///   \+ commented enqueue snippet + smoke test
+    /// - `src/jobs/mod.rs` — created/updated with `pub mod` and
+    ///   idempotent `registered_jobs()` aggregator
+    /// - `src/main.rs` — `mod jobs;` + `.jobs(jobs::registered_jobs())`
+    /// - `Cargo.toml` — `serde` dependency added if missing
+    ///
+    /// The `#[job]` macro generates a companion struct `<Pascal>Job` with
+    /// `NAME`, `enqueue`, `enqueue_in`, and `enqueue_at` methods.
+    ///
+    /// Example:
+    ///
+    ///   autumn generate job `SendWelcomeEmail` `user_id:i64` `email:String`
+    #[command(verbatim_doc_comment)]
+    Job {
+        /// Job name (`PascalCase` or `snake_case`, e.g. `SendWelcomeEmail`).
+        name: String,
+        /// Fields for the args struct in `name:Type` format
+        /// (e.g. `user_id:i64 email:String`).
+        fields: Vec<String>,
+        /// Print the file plan and exit without writing anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Overwrite existing files instead of erroring on collision.
+        #[arg(long)]
+        force: bool,
+    },
     /// Scaffold a `#[mailer]` struct, HTML+text templates, preview
     /// registration, and a smoke test.
     ///
@@ -2427,6 +2460,12 @@ fn run_generate_command(cmd: GenerateCommands) {
             dry_run,
             force,
         } => generate::task::run(&name, generate::Flags { dry_run, force }),
+        GenerateCommands::Job {
+            name,
+            fields,
+            dry_run,
+            force,
+        } => generate::job::run(&name, &fields, generate::Flags { dry_run, force }),
         GenerateCommands::Mailer {
             name,
             list_unsubscribe,
@@ -3205,6 +3244,60 @@ mod tests {
         assert_eq!(name, "cleanup_users");
         assert!(dry_run);
         assert!(!force);
+    }
+
+    #[test]
+    fn parse_generate_job_basic() {
+        let cli = Cli::try_parse_from(["autumn", "generate", "job", "SendWelcomeEmail"]).unwrap();
+        let Commands::Generate(GenerateCommands::Job {
+            name,
+            fields,
+            dry_run,
+            force,
+        }) = cli.command
+        else {
+            panic!("expected generate job");
+        };
+        assert_eq!(name, "SendWelcomeEmail");
+        assert!(fields.is_empty());
+        assert!(!dry_run);
+        assert!(!force);
+    }
+
+    #[test]
+    fn parse_generate_job_with_fields() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "generate",
+            "job",
+            "SendWelcomeEmail",
+            "user_id:i64",
+            "email:String",
+        ])
+        .unwrap();
+        let Commands::Generate(GenerateCommands::Job { name, fields, .. }) = cli.command else {
+            panic!("expected generate job");
+        };
+        assert_eq!(name, "SendWelcomeEmail");
+        assert_eq!(fields, vec!["user_id:i64", "email:String"]);
+    }
+
+    #[test]
+    fn parse_generate_job_with_dry_run_and_force() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "generate",
+            "job",
+            "SendWelcomeEmail",
+            "--dry-run",
+            "--force",
+        ])
+        .unwrap();
+        let Commands::Generate(GenerateCommands::Job { dry_run, force, .. }) = cli.command else {
+            panic!("expected generate job");
+        };
+        assert!(dry_run);
+        assert!(force);
     }
 
     #[test]
