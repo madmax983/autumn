@@ -177,7 +177,15 @@ pub enum SystemTestError {
         "Chromium browser not found. Searched:\n{}\n\n\
          To install: apt-get install chromium-browser\n\
          Or set AUTUMN_CHROMIUM=/path/to/chrome",
-        searched.iter().map(|p| format!("  {}", p.display())).collect::<Vec<_>>().join("\n")
+        {
+            use std::fmt::Write;
+            let mut s = String::new();
+            for (i, p) in searched.iter().enumerate() {
+                if i > 0 { s.push('\n'); }
+                let _ = write!(s, "  {}", p.display());
+            }
+            s
+        }
     )]
     BrowserNotFound {
         /// Paths that were checked.
