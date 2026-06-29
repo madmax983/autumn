@@ -56,7 +56,6 @@ fn layout(title: &str, content: Markup) -> Markup {
     }
 }
 
-
 /// Column definitions shared by the index, by-tag, and search-result views.
 ///
 /// Closures capture nothing from the outer scope, so the lifetime is `'static`.
