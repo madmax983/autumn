@@ -312,28 +312,29 @@ pub fn run() {{
                         .unwrap()
                         .take()
                     {{
-                        // Send a graceful shutdown signal so autumn's on_shutdown
-                        // hooks run (including ManagedPostgresPoolProvider::stop()).
-                        // Fall back to force-kill after 3 s on all platforms.
+                        // On Unix: send SIGTERM so autumn's tokio signal handler
+                        // runs on_shutdown hooks (including ManagedPostgresPoolProvider
+                        // ::stop()), then force-kill after 3 s.
+                        // On Windows: autumn only handles tokio::signal::ctrl_c()
+                        // (CTRL_C_EVENT).  taskkill sends WM_CLOSE/CTRL_CLOSE_EVENT
+                        // which autumn does not handle; graceful shutdown via external
+                        // signal is not achievable without process-group manipulation,
+                        // so force-kill immediately.
+                        #[cfg(unix)]
                         let graceful_pid = child.pid();
                         std::thread::spawn(move || {{
-                            // Unix: SIGTERM triggers autumn's tokio signal handler.
                             #[cfg(unix)]
                             {{
                                 let _ = std::process::Command::new("kill")
                                     .args(["-TERM", &graceful_pid.to_string()])
                                     .status();
+                                std::thread::sleep(std::time::Duration::from_secs(3));
+                                let _ = child.kill();
                             }}
-                            // Windows: taskkill without /f sends CTRL_CLOSE_EVENT /
-                            // WM_CLOSE for a graceful-termination attempt.
                             #[cfg(windows)]
                             {{
-                                let _ = std::process::Command::new("taskkill")
-                                    .args(["/pid", &graceful_pid.to_string()])
-                                    .status();
+                                let _ = child.kill();
                             }}
-                            std::thread::sleep(std::time::Duration::from_secs(3));
-                            let _ = child.kill();
                         }});
                     }}
                 }}
@@ -402,6 +403,14 @@ fn setup(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {{
         // times out and exits.
         .env("AUTUMN_SERVER__UNIX_SOCKET", "")
         .env("AUTUMN_SERVE_FORCE_UNIX_SOCKET", "")
+        // Clear inherited profile-selection vars so the sidecar's compile-time
+        // AUTUMN_IS_DEBUG (baked in by #[autumn_web::main]: "0" for release
+        // builds, "1" for debug) determines the active profile.  Without this,
+        // a shell that exports AUTUMN_ENV=dev causes the installed desktop app
+        // to load dev config regardless of build mode, potentially connecting to
+        // the wrong database or skipping production security settings.
+        .env("AUTUMN_ENV", "")
+        .env("AUTUMN_PROFILE", "")
         .spawn()?;
     *app.state::<SidecarHandle>().0.lock().unwrap() = Some(child);
 
@@ -1289,20 +1298,41 @@ mod tests {
     #[test]
     fn lib_rs_sends_graceful_shutdown_signal_before_kill() {
         let lib = render_shell_lib_rs("my-app");
-        // Graceful shutdown lets autumn's on_shutdown hooks run (including pg.stop()).
-        // Force-kill is the fallback after a timeout.  Both Unix (SIGTERM) and Windows
-        // (taskkill without /f) paths must be present for cross-platform correctness.
+        // Unix: SIGTERM triggers autumn's tokio signal handler so on_shutdown hooks run.
+        // Windows: autumn only handles ctrl_c() (CTRL_C_EVENT); taskkill sends
+        // WM_CLOSE/CTRL_CLOSE_EVENT which autumn does not handle, so we force-kill
+        // immediately without a delay rather than waiting 3 s for a signal that
+        // never arrives.
         assert!(
             lib.contains("SIGTERM") || lib.contains("-TERM"),
             "lib.rs on_window_event must send SIGTERM on Unix before force-killing"
         );
         assert!(
-            lib.contains("taskkill"),
-            "lib.rs on_window_event must use taskkill on Windows for graceful shutdown"
+            !lib.contains("Command::new(\"taskkill\")"),
+            "lib.rs must not invoke taskkill — it sends WM_CLOSE/CTRL_CLOSE_EVENT which \
+             autumn does not handle; use child.kill() directly on Windows"
         );
         assert!(
             lib.contains("pid()"),
-            "lib.rs must call child.pid() to get the sidecar PID for signal/taskkill"
+            "lib.rs must call child.pid() to get the sidecar PID for the Unix kill signal"
+        );
+    }
+
+    #[test]
+    fn lib_rs_clears_inherited_profile_env_vars() {
+        let lib = render_shell_lib_rs("my-app");
+        // If AUTUMN_ENV or AUTUMN_PROFILE is set in the shell that launches the desktop
+        // app, the sidecar would inherit it and load the wrong profile (e.g. dev config
+        // on an installed release app).  Clearing them lets the sidecar's compile-time
+        // AUTUMN_IS_DEBUG auto-detection determine the active profile.
+        assert!(
+            lib.contains("\"AUTUMN_ENV\", \"\""),
+            "lib.rs must clear AUTUMN_ENV so inherited shell profile vars don't \
+             override the sidecar's compile-time profile auto-detection"
+        );
+        assert!(
+            lib.contains("\"AUTUMN_PROFILE\", \"\""),
+            "lib.rs must clear AUTUMN_PROFILE (legacy alias) for the same reason"
         );
     }
 
