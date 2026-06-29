@@ -74,4 +74,32 @@ mod tests {
             panic!("Expected title to be Set");
         }
     }
+
+    #[test]
+    fn test_pages_list_snippet() {
+        use crate::models::Page;
+        let pages = vec![Page {
+            id: 1,
+            title: "Test Page".into(),
+            slug: "test-page".into(),
+            body: "Test Body".into(),
+            status: "published".into(),
+            lock_version: 0,
+            created_at: chrono::Utc::now().naive_utc(),
+            updated_at: chrono::Utc::now().naive_utc(),
+        }];
+
+        let markup = crate::routes::pages::pages_list_snippet(&pages);
+        let html_string = markup.into_string();
+        assert!(html_string.contains("Test Page"));
+        assert!(html_string.contains("test-page"));
+    }
+
+    #[test]
+    fn test_pages_list_snippet_empty() {
+        let pages = vec![];
+        let markup = crate::routes::pages::pages_list_snippet(&pages);
+        let html_string = markup.into_string();
+        assert!(html_string.contains("No pages found"));
+    }
 }
