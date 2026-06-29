@@ -61,12 +61,17 @@ pub fn plan_tauri(project_root: &Path) -> Result<Plan, GenerateError> {
     // Detect profile override config files that exist now so they can be bundled
     // as concrete Tauri resources.  A glob entry would cause `cargo tauri build` to
     // fail with GlobPathNotFound when no files match (common for fresh projects).
-    let profile_configs: Vec<String> = ["autumn-prod.toml", "autumn-production.toml",
-        "autumn-staging.toml", "autumn-development.toml", "autumn-test.toml"]
-        .iter()
-        .filter(|f| project_root.join(f).is_file())
-        .map(|f| (*f).to_owned())
-        .collect();
+    let profile_configs: Vec<String> = [
+        "autumn-prod.toml",
+        "autumn-production.toml",
+        "autumn-staging.toml",
+        "autumn-development.toml",
+        "autumn-test.toml",
+    ]
+    .iter()
+    .filter(|f| project_root.join(f).is_file())
+    .map(|f| (*f).to_owned())
+    .collect();
 
     // Core Tauri project files
     plan.create(
@@ -499,16 +504,33 @@ cd "$APP_DIR"
 # TAURI_ENV_TARGET_TRIPLE is set by `cargo tauri build` for cross-compilation;
 # fall back to the host triple when running the script manually.
 TARGET_TRIPLE="${{TAURI_ENV_TARGET_TRIPLE:-$(rustc -Vv | awk '/^host/{{print $2}}')}}";
-# Build with both autumn-web features so the sidecar binary embeds static assets
-# and bundles Postgres.  Both are specified via the dependency path so this script
-# works with any autumn project regardless of whether the app's Cargo.toml defines
-# a top-level `embed-assets` feature alias.
-cargo build --release --target "${{TARGET_TRIPLE}}" \
-  --features autumn-web/embed-assets,autumn-web/managed-pg-bundled
+# Resolve the real Cargo output directory.  Workspace members share the workspace
+# root's target/ and CARGO_TARGET_DIR / .cargo/config.toml can redirect it.
+TARGET_DIR="${{CARGO_TARGET_DIR:-$(cargo metadata --no-deps --format-version 1 --quiet \
+    | sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')}}"
 mkdir -p src-tauri/binaries
-cp "target/${{TARGET_TRIPLE}}/release/{package_name}" \
-   "src-tauri/binaries/{package_name}-${{TARGET_TRIPLE}}"
-echo "Staged: src-tauri/binaries/{package_name}-${{TARGET_TRIPLE}}"
+# universal-apple-darwin is a Tauri meta-target, not a rustc triple.  Build both
+# Darwin slices separately and combine with lipo(1) into a fat binary.
+if [ "${{TARGET_TRIPLE}}" = "universal-apple-darwin" ]; then
+    for ARCH in x86_64-apple-darwin aarch64-apple-darwin; do
+        cargo build --release --target "$ARCH" \
+          --features autumn-web/embed-assets,autumn-web/managed-pg-bundled
+    done
+    lipo -create -output "src-tauri/binaries/{package_name}-universal-apple-darwin" \
+      "${{TARGET_DIR}}/x86_64-apple-darwin/release/{package_name}" \
+      "${{TARGET_DIR}}/aarch64-apple-darwin/release/{package_name}"
+    echo "Staged (universal): src-tauri/binaries/{package_name}-universal-apple-darwin"
+else
+    # Build with both autumn-web features so the sidecar binary embeds static assets
+    # and bundles Postgres.  Both are specified via the dependency path so this script
+    # works with any autumn project regardless of whether the app's Cargo.toml defines
+    # a top-level `embed-assets` feature alias.
+    cargo build --release --target "${{TARGET_TRIPLE}}" \
+      --features autumn-web/embed-assets,autumn-web/managed-pg-bundled
+    cp "${{TARGET_DIR}}/${{TARGET_TRIPLE}}/release/{package_name}" \
+       "src-tauri/binaries/{package_name}-${{TARGET_TRIPLE}}"
+    echo "Staged: src-tauri/binaries/{package_name}-${{TARGET_TRIPLE}}"
+fi
 "#
     )
 }
@@ -531,6 +553,12 @@ $TargetTriple = $Env:TAURI_ENV_TARGET_TRIPLE
 if (-not $TargetTriple) {{
     $TargetTriple = (rustc -Vv | Select-String "^host").Line.Split()[1]
 }}
+# Resolve the real Cargo output directory.  Workspace members share the workspace
+# root's target\ and CARGO_TARGET_DIR / .cargo/config.toml can redirect it.
+$TargetDir = $Env:CARGO_TARGET_DIR
+if (-not $TargetDir) {{
+    $TargetDir = (cargo metadata --no-deps --format-version 1 --quiet | ConvertFrom-Json).target_directory
+}}
 # Build with both autumn-web features so the sidecar binary embeds static assets
 # and bundles Postgres.  Both are specified via the dependency path so this script
 # works with any autumn project regardless of whether the app's Cargo.toml defines
@@ -538,7 +566,7 @@ if (-not $TargetTriple) {{
 cargo build --release --target "$TargetTriple" `
   --features autumn-web/embed-assets,autumn-web/managed-pg-bundled
 New-Item -ItemType Directory -Force -Path src-tauri\binaries | Out-Null
-Copy-Item "target\$TargetTriple\release\{package_name}.exe" `
+Copy-Item "$TargetDir\$TargetTriple\release\{package_name}.exe" `
           "src-tauri\binaries\{package_name}-$TargetTriple.exe"
 Write-Host "Staged: src-tauri/binaries/{package_name}-$TargetTriple.exe"
 "#
@@ -729,6 +757,63 @@ mod tests {
     fn plan_creates_stage_sidecar_ps1() {
         let tmp = project("my-app");
         assert!(has_action(&tmp, "src-tauri/stage-sidecar.ps1"));
+    }
+
+    #[test]
+    fn stage_sidecar_sh_uses_cargo_metadata_for_target_dir() {
+        let sh = render_stage_sidecar_sh("my-app");
+        // cargo metadata resolves the real output dir for workspace members and
+        // respects CARGO_TARGET_DIR overrides.
+        assert!(
+            sh.contains("cargo metadata"),
+            "stage-sidecar.sh must use `cargo metadata` to locate the Cargo target directory"
+        );
+        assert!(
+            sh.contains("TARGET_DIR"),
+            "stage-sidecar.sh must use a TARGET_DIR variable derived from cargo metadata"
+        );
+        // The hardcoded relative path is no longer used — workspace builds would
+        // look in the wrong place if we still had `target/$TARGET_TRIPLE/...`.
+        assert!(
+            !sh.contains(r#""target/$"#) && !sh.contains("\"target/${"),
+            "stage-sidecar.sh must not use a hardcoded `target/` prefix for the copy"
+        );
+    }
+
+    #[test]
+    fn stage_sidecar_sh_handles_universal_apple_darwin() {
+        let sh = render_stage_sidecar_sh("my-app");
+        // universal-apple-darwin is a Tauri meta-target; cargo build --target
+        // universal-apple-darwin fails because rustc doesn't know it.
+        assert!(
+            sh.contains("universal-apple-darwin"),
+            "stage-sidecar.sh must detect universal-apple-darwin and handle it separately"
+        );
+        assert!(
+            sh.contains("lipo"),
+            "stage-sidecar.sh must combine Darwin slices with lipo for universal builds"
+        );
+        assert!(
+            sh.contains("x86_64-apple-darwin") && sh.contains("aarch64-apple-darwin"),
+            "stage-sidecar.sh must build both x86_64 and aarch64 Darwin slices"
+        );
+    }
+
+    #[test]
+    fn stage_sidecar_ps1_uses_cargo_metadata_for_target_dir() {
+        let ps1 = render_stage_sidecar_ps1("my-app");
+        assert!(
+            ps1.contains("cargo metadata"),
+            "stage-sidecar.ps1 must use `cargo metadata` to locate the Cargo target directory"
+        );
+        assert!(
+            ps1.contains("TargetDir"),
+            "stage-sidecar.ps1 must use a $TargetDir variable derived from cargo metadata"
+        );
+        assert!(
+            ps1.contains("ConvertFrom-Json"),
+            "stage-sidecar.ps1 must use ConvertFrom-Json to properly decode the JSON path"
+        );
     }
 
     #[test]
@@ -1029,12 +1114,9 @@ mod tests {
         let resources = parsed["bundle"]["resources"]
             .as_object()
             .expect("bundle.resources must be a map (Tauri v2 schema requirement)");
-        let has_autumn_toml = resources
-            .iter()
-            .any(|(k, v)| {
-                k.contains("autumn.toml")
-                    || v.as_str().is_some_and(|s| s.contains("autumn.toml"))
-            });
+        let has_autumn_toml = resources.iter().any(|(k, v)| {
+            k.contains("autumn.toml") || v.as_str().is_some_and(|s| s.contains("autumn.toml"))
+        });
         assert!(
             has_autumn_toml,
             "tauri.conf.json must bundle autumn.toml as a resource so the installed \
