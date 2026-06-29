@@ -329,6 +329,9 @@ fn setup(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {{
             "AUTUMN_MANAGED_PG_DATA_DIR",
             app_data_dir.to_string_lossy().as_ref(),
         )
+        // Force the health endpoint to /health so the readiness probe below
+        // always works, regardless of what [health].path is configured in the app.
+        .env("AUTUMN_HEALTH__PATH", "/health")
         .spawn()?;
     *app.state::<SidecarHandle>().0.lock().unwrap() = Some(child);
 
@@ -369,6 +372,18 @@ fn setup(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {{
             eprintln!(
                 "[{package_name}] Server did not become ready within 30 s — exiting."
             );
+            // No window has been created yet, so WindowEvent::Destroyed cannot
+            // fire.  Kill the sidecar explicitly before exiting so no orphaned
+            // server process is left behind.
+            if let Some(mut child) = handle
+                .state::<SidecarHandle>()
+                .0
+                .lock()
+                .unwrap()
+                .take()
+            {{
+                let _ = child.kill();
+            }}
             handle.exit(1);
             return;
         }}
@@ -384,6 +399,17 @@ fn setup(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {{
         .build()
         {{
             eprintln!("[{package_name}] Failed to open window: {{e}}");
+            // The window was never created so Destroyed cannot clean up; kill
+            // the sidecar here too.
+            if let Some(mut child) = handle
+                .state::<SidecarHandle>()
+                .0
+                .lock()
+                .unwrap()
+                .take()
+            {{
+                let _ = child.kill();
+            }}
             handle.exit(1);
         }}
     }});
@@ -497,8 +523,9 @@ Required prerequisites for `cargo tauri build`:\n\
        cd src-tauri && cargo tauri build\n\
 \n\
   The sidecar is built with autumn-web/embed-assets (#1004) and\n\
-  autumn-web/managed-pg-bundled (#1119) so the packaged desktop app needs\n\
-  no separately-installed database or loose asset files.\n\
+  autumn-web/managed-pg-bundled (#1119).  For a DB-backed app the bundled\n\
+  Postgres only activates if ManagedPostgresPoolProvider is wired in your\n\
+  app's pool configuration (see docs/guide/managed-pg.md).\n\
 \n\
   Replace the placeholder icons before shipping:\n\
        cargo tauri icon static/icons/icon.svg   (from the app root)\n"
@@ -892,6 +919,30 @@ mod tests {
         assert!(
             lib.contains(".join(\"db\")"),
             "lib.rs must isolate Postgres files in <app-data-dir>/db, not the root"
+        );
+    }
+
+    #[test]
+    fn lib_rs_forces_health_path_env() {
+        let lib = render_shell_lib_rs("my-app");
+        assert!(
+            lib.contains("AUTUMN_HEALTH__PATH"),
+            "lib.rs must set AUTUMN_HEALTH__PATH=/health so the readiness probe works \
+             regardless of the app's configured health path"
+        );
+    }
+
+    #[test]
+    fn lib_rs_kills_sidecar_on_timeout() {
+        let lib = render_shell_lib_rs("my-app");
+        // The timeout branch must kill the sidecar before handle.exit(1);
+        // check that .kill() appears more than once (once for Destroyed, once for timeout).
+        let kill_count = lib.matches(".kill()").count();
+        assert!(
+            kill_count >= 2,
+            "lib.rs must kill the sidecar in both the timeout path and the window-build \
+             failure path, not only in WindowEvent::Destroyed; found {} .kill() call(s)",
+            kill_count
         );
     }
 
