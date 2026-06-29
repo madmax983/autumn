@@ -134,6 +134,7 @@ async fn main() {
             routes::live::subreddit_viewers,
             routes::live::subreddit_viewer_stream,
             routes::live::posts_stream,
+            routes::live::subreddit_posts_stream,
             repositories::subreddit_api_list,
             repositories::subreddit_api_get,
             repositories::post_api_list,
