@@ -332,6 +332,11 @@ fn setup(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {{
         // Force the health endpoint to /health so the readiness probe below
         // always works, regardless of what [health].path is configured in the app.
         .env("AUTUMN_HEALTH__PATH", "/health")
+        // Clear any inherited Unix-socket config so the sidecar always binds
+        // TCP on the loopback address the probe polls.  Without this, an
+        // inherited AUTUMN_SERVER__UNIX_SOCKET would make the sidecar healthy
+        // on a socket path while the TCP health probe times out and exits.
+        .env("AUTUMN_SERVER__UNIX_SOCKET", "")
         .spawn()?;
     *app.state::<SidecarHandle>().0.lock().unwrap() = Some(child);
 
@@ -929,6 +934,16 @@ mod tests {
             lib.contains("AUTUMN_HEALTH__PATH"),
             "lib.rs must set AUTUMN_HEALTH__PATH=/health so the readiness probe works \
              regardless of the app's configured health path"
+        );
+    }
+
+    #[test]
+    fn lib_rs_clears_unix_socket_env() {
+        let lib = render_shell_lib_rs("my-app");
+        assert!(
+            lib.contains("AUTUMN_SERVER__UNIX_SOCKET"),
+            "lib.rs must clear AUTUMN_SERVER__UNIX_SOCKET so an inherited env var \
+             cannot redirect the sidecar to a Unix socket the TCP probe cannot reach"
         );
     }
 

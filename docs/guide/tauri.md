@@ -112,7 +112,7 @@ From inside `src-tauri/`:
 
 ```bash
 # Stage the sidecar binary (called automatically by tauri build, but can run standalone):
-sh stage-sidecar.sh          # Unix
+bash stage-sidecar.sh        # Unix (script uses bash-specific features)
 .\stage-sidecar.ps1          # Windows PowerShell
 
 # Build the installer for the host OS:
