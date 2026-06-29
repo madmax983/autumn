@@ -106,22 +106,17 @@ async fn cast_vote(
         }
     }
 
-    // Recompute score atomically using sum of vote values
-    let new_score: i64 = votes::table
-        .filter(votes::post_id.eq(post_id))
-        .select(diesel::dsl::sum(votes::value))
-        .first::<Option<i64>>(&mut **db)
-        .await?
-        .unwrap_or(0);
-
-    // Update the score on the post in database
-    diesel::update(posts::table.find(post_id))
-        .set(posts::score.eq(new_score))
-        .execute(&mut **db)
-        .await?;
+    // Recompute score atomically in a single statement — no read-then-write race.
+    diesel::sql_query(
+        "UPDATE posts SET score = COALESCE((SELECT SUM(value::bigint) FROM votes WHERE post_id = $1), 0) WHERE id = $1"
+    )
+    .bind::<diesel::sql_types::BigInt, _>(post_id)
+    .execute(&mut **db)
+    .await?;
 
     // Load the updated post to broadcast it
     let post: Post = posts::table.find(post_id).first(&mut **db).await?;
+    let new_score = post.score;
 
     // Load the subreddit to get its slug
     let sub: crate::models::Subreddit = crate::schema::subreddits::table
@@ -129,20 +124,38 @@ async fn cast_vote(
         .first(&mut **db)
         .await?;
 
-    // Broadcast the update so all SSE clients see the new score live
-    let _ = state.broadcast().publish_oob(
-        "posts",
-        &post.dom_id(),
-        &autumn_web::htmx::OobSwap::OuterHTML,
-        &post.render_fragment(),
-    );
+    // Load the author to get their username
+    let author: crate::models::User = crate::schema::users::table
+        .find(post.author_id)
+        .first(&mut **db)
+        .await?;
 
-    let _ = state.broadcast().publish_oob(
-        &format!("posts:r/{}", sub.slug),
-        &post.dom_id(),
-        &autumn_web::htmx::OobSwap::OuterHTML,
-        &post.render_fragment(),
-    );
+    let lookup = crate::repositories::PostRelationsLookup {
+        author_name: author.username,
+        sub_name: sub.name,
+        sub_slug: sub.slug.clone(),
+    };
+
+    let sse_state = state.clone();
+    let sse_post = post.clone();
+    let sse_sub_slug = sub.slug.clone();
+    crate::repositories::CURRENT_POST_RELATIONS
+        .scope(lookup, async move {
+            let _ = sse_state.broadcast().publish_oob(
+                "posts",
+                &sse_post.dom_id(),
+                &autumn_web::htmx::OobSwap::OuterHTML,
+                &sse_post.render_fragment(),
+            );
+
+            let _ = sse_state.broadcast().publish_oob(
+                &format!("posts:r/{}", sse_sub_slug),
+                &sse_post.dom_id(),
+                &autumn_web::htmx::OobSwap::OuterHTML,
+                &sse_post.render_fragment(),
+            );
+        })
+        .await;
 
     Ok(vote_controls(post_id, new_score))
 }

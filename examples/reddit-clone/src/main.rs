@@ -99,9 +99,6 @@ async fn main() {
         .with_error_reporter(StructuredReporter)
         .state_initializer(move |state| {
             state.insert_extension(experiment_svc);
-            if let Some(pool) = state.pool() {
-                let _ = reddit_clone::GLOBAL_DB_POOL.set(pool.clone());
-            }
         })
         .routes(routes![
             routes::posts::front_page,

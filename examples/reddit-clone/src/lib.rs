@@ -23,12 +23,6 @@ use autumn_web::runtime_config::{ConfigStore, InMemoryConfigStore, RuntimeConfig
 
 static CONFIG_SVC: OnceLock<Arc<RuntimeConfigService>> = OnceLock::new();
 
-pub static GLOBAL_DB_POOL: OnceLock<
-    autumn_web::reexports::diesel_async::pooled_connection::deadpool::Pool<
-        autumn_web::reexports::diesel_async::AsyncPgConnection,
-    >,
-> = OnceLock::new();
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RuntimeConfigStoreKind {
     InMemory,

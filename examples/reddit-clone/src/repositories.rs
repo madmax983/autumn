@@ -43,6 +43,17 @@ pub trait PostRepository {
     fn find_by_author_id(author_id: i64) -> Vec<Post>;
 }
 
+#[derive(Clone, Debug)]
+pub struct PostRelationsLookup {
+    pub author_name: String,
+    pub sub_name: String,
+    pub sub_slug: String,
+}
+
+tokio::task_local! {
+    pub static CURRENT_POST_RELATIONS: PostRelationsLookup;
+}
+
 // LiveFragment renders a compact list-item fragment for each post.
 // The macro uses this to build the hx-swap-oob payload when save/update/delete fires.
 impl autumn_web::live::LiveFragment for Post {
@@ -55,42 +66,21 @@ impl autumn_web::live::LiveFragment for Post {
     }
 
     fn render_fragment(&self) -> maud::Markup {
-        use crate::models::{Subreddit, User};
-        use diesel::prelude::*;
-        use diesel_async::RunQueryDsl;
-
-        let (author_name, sub_name, sub_slug) = if let Some(pool) = crate::GLOBAL_DB_POOL.get() {
-            tokio::task::block_in_place(|| {
-                let rt = tokio::runtime::Handle::current();
-                rt.block_on(async {
-                    let mut conn = pool.get().await.ok()?;
-                    let author: User = crate::schema::users::table
-                        .find(self.author_id)
-                        .first(&mut conn)
-                        .await
-                        .ok()?;
-                    let sub: Subreddit = crate::schema::subreddits::table
-                        .find(self.subreddit_id)
-                        .first(&mut conn)
-                        .await
-                        .ok()?;
-                    Some((author.username, sub.name, sub.slug))
-                })
+        let (author_name, sub_name, sub_slug) = CURRENT_POST_RELATIONS
+            .try_with(|lookup| {
+                (
+                    lookup.author_name.clone(),
+                    lookup.sub_name.clone(),
+                    lookup.sub_slug.clone(),
+                )
             })
-            .unwrap_or_else(|| {
+            .unwrap_or_else(|_| {
                 (
                     "deleted_user".to_string(),
                     "unknown".to_string(),
                     "unknown".to_string(),
                 )
-            })
-        } else {
-            (
-                "deleted_user".to_string(),
-                "unknown".to_string(),
-                "unknown".to_string(),
-            )
-        };
+            });
 
         let card_url = format!("/r/{}/posts/{}", sub_slug, self.slug);
 

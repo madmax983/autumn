@@ -429,39 +429,60 @@ pub async fn submit(
 
     let post = repo.save(&new_post).await?;
 
-    diesel::insert_into(crate::schema::votes::table)
-        .values((
-            crate::schema::votes::user_id.eq(user_id),
-            crate::schema::votes::post_id.eq(post.id),
-            crate::schema::votes::value.eq(1_i16),
-        ))
-        .execute(&mut *db)
+    let post_id = post.id;
+    let post: Post = db
+        .tx(move |conn| {
+            async move {
+                diesel::insert_into(crate::schema::votes::table)
+                    .values((
+                        crate::schema::votes::user_id.eq(user_id),
+                        crate::schema::votes::post_id.eq(post_id),
+                        crate::schema::votes::value.eq(1_i16),
+                    ))
+                    .execute(conn)
+                    .await?;
+
+                diesel::update(posts::table.find(post_id))
+                    .set(posts::score.eq(1_i64))
+                    .execute(conn)
+                    .await?;
+
+                let post: Post = posts::table.find(post_id).first(conn).await?;
+                Ok::<_, AutumnError>(post)
+            }
+            .scope_boxed()
+        })
         .await?;
 
-    diesel::update(posts::table.find(post.id))
-        .set(posts::score.eq(1_i64))
-        .execute(&mut *db)
-        .await?;
+    let lookup = crate::repositories::PostRelationsLookup {
+        author_name: author_username.clone(),
+        sub_name: sub.name.clone(),
+        sub_slug: sub.slug.clone(),
+    };
 
-    // Reload the post to get the updated fields
-    let post: Post = posts::table.find(post.id).first(&mut *db).await?;
+    let sse_state = state.clone();
+    let sse_post = post.clone();
+    let sse_sub_slug = subreddit_slug.clone();
+    crate::repositories::CURRENT_POST_RELATIONS
+        .scope(lookup, async move {
+            let _ = sse_state.broadcast().publish_oob(
+                "posts",
+                &sse_post.dom_id(),
+                &autumn_web::htmx::OobSwap::OuterHTML,
+                &sse_post.render_fragment(),
+            );
 
-    let _ = state.broadcast().publish_oob(
-        "posts",
-        &post.dom_id(),
-        &autumn_web::htmx::OobSwap::OuterHTML,
-        &post.render_fragment(),
-    );
-
-    let _ = state.broadcast().publish_oob(
-        &format!("posts:r/{}", subreddit_slug),
-        &post.dom_id(),
-        &autumn_web::htmx::OobSwap::Target(
-            autumn_web::htmx::OobMethod::BeforeEnd,
-            "#posts-list".to_string(),
-        ),
-        &post.render_fragment(),
-    );
+            let _ = sse_state.broadcast().publish_oob(
+                &format!("posts:r/{}", sse_sub_slug),
+                &sse_post.dom_id(),
+                &autumn_web::htmx::OobSwap::Target(
+                    autumn_web::htmx::OobMethod::BeforeEnd,
+                    "#posts-list".to_string(),
+                ),
+                &sse_post.render_fragment(),
+            );
+        })
+        .await;
 
     // Enqueue the publication job. Note that since PgPostRepository::save manages its
     // own transaction internally, we do not need to call autumn_web::job::enqueue_on_conn here.
