@@ -457,7 +457,7 @@ fn form_pairs_to_nested_json(pairs: Vec<(String, String)>) -> serde_json::Value 
 fn bracket_key_segments(key: &str) -> Vec<String> {
     // Dot notation: split on '.' first (only if no brackets present)
     if key.contains('[') {
-        let pos = key.find('[').unwrap();
+        let pos = key.find('[').unwrap_or(key.len());
         let mut parts = vec![key[..pos].to_owned()];
         for seg in key[pos + 1..].split('[') {
             let seg = seg.trim_end_matches(']');
