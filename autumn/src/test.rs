@@ -276,8 +276,15 @@ impl crate::interceptor::MailInterceptor for MailRecorder {
                 + 'a,
         >,
     > {
-        self.mails.lock().unwrap().push(SentMail::from(mail));
-        next
+        let snapshot = SentMail::from(mail);
+        let mails = std::sync::Arc::clone(&self.mails);
+        Box::pin(async move {
+            let result = next.await;
+            if result.is_ok() {
+                mails.lock().unwrap().push(snapshot);
+            }
+            result
+        })
     }
 }
 
