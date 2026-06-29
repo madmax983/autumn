@@ -94,7 +94,11 @@ is reused as the Tauri icon source automatically.
 
 2. **Spawn sidecar**: the Tauri `setup` hook uses `tauri-plugin-shell` to launch
    the autumn binary with `AUTUMN_SERVER__HOST=127.0.0.1`,
-   `AUTUMN_SERVER__PORT={port}`, and `AUTUMN_MANAGED_PG_DATA_DIR={app-data-dir}/db`.
+   `AUTUMN_SERVER__PORT={port}`, `AUTUMN_MANAGED_PG_DATA_DIR={app-data-dir}/db`,
+   and `AUTUMN_MANIFEST_DIR={resource-dir}` so the sidecar finds the bundled
+   `autumn.toml` on the installed machine (see below). `AUTUMN_HEALTH__PATH` is
+   forced to `/health` so the readiness probe always works regardless of any
+   `[health].path` configuration in the app.
 
 3. **Wait for ready**: the setup hook polls `GET /health` (the existing autumn
    health endpoint) over raw TCP until it gets an `HTTP/1.1 200` response or
@@ -105,6 +109,19 @@ is reused as the Tauri icon source automatically.
 
 5. **Clean shutdown**: on `WindowEvent::Destroyed`, the stored `CommandChild`
    handle is killed. No orphaned server process survives after the window closes.
+
+## App configuration (`autumn.toml`)
+
+`autumn.toml` is automatically included in the installer as a Tauri bundle resource
+(via `bundle.resources` in `tauri.conf.json`). The generated shell sets
+`AUTUMN_MANIFEST_DIR` to the resource directory when spawning the sidecar, so
+`AutumnConfig::load_with_env` finds it on the installed machine.
+
+This means your production `autumn.toml` — auth keys, SEO settings, security
+headers, `auto_migrate_in_production`, and anything else you configure there — is
+packaged with the installer and takes effect at runtime. Secrets that should not be
+committed to source control (e.g. `database.primary_url`, third-party API keys)
+should be supplied via environment variables as normal.
 
 ## Building a native installer
 

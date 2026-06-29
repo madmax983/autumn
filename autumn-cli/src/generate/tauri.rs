@@ -195,6 +195,9 @@ fn render_tauri_conf(package_name: &str) -> String {
     ],
     "externalBin": [
       "binaries/{package_name}"
+    ],
+    "resources": [
+      {{ "from": "../autumn.toml", "to": "autumn.toml" }}
     ]
   }},
   "app": {{
@@ -318,6 +321,13 @@ fn setup(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {{
     let app_data_dir = app.path().app_data_dir()?.join("db");
     std::fs::create_dir_all(&app_data_dir)?;
 
+    // autumn.toml is bundled as a resource (see tauri.conf.json bundle.resources).
+    // Point the sidecar at the resource directory so AutumnConfig::load_with_env()
+    // finds autumn.toml on the installed machine — without this, the sidecar looks
+    // in its CWD and falls back to compiled-in defaults, silently missing production
+    // settings such as auth, SEO, auto-migrate, and security configuration.
+    let resource_dir = app.path().resource_dir()?;
+
     // 3. Spawn the autumn server sidecar (built with autumn-web/embed-assets + managed-pg-bundled).
     //    The sidecar() argument is the binary basename matching externalBin in tauri.conf.json.
     let (_rx, child) = app
@@ -328,6 +338,10 @@ fn setup(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {{
         .env(
             "AUTUMN_MANAGED_PG_DATA_DIR",
             app_data_dir.to_string_lossy().as_ref(),
+        )
+        .env(
+            "AUTUMN_MANIFEST_DIR",
+            resource_dir.to_string_lossy().as_ref(),
         )
         // Force the health endpoint to /health so the readiness probe below
         // always works, regardless of what [health].path is configured in the app.
@@ -944,6 +958,41 @@ mod tests {
             lib.contains("AUTUMN_SERVER__UNIX_SOCKET"),
             "lib.rs must clear AUTUMN_SERVER__UNIX_SOCKET so an inherited env var \
              cannot redirect the sidecar to a Unix socket the TCP probe cannot reach"
+        );
+    }
+
+    #[test]
+    fn lib_rs_sets_autumn_manifest_dir() {
+        let lib = render_shell_lib_rs("my-app");
+        assert!(
+            lib.contains("AUTUMN_MANIFEST_DIR"),
+            "lib.rs must set AUTUMN_MANIFEST_DIR to the Tauri resource dir so the \
+             sidecar finds the bundled autumn.toml on the installed machine"
+        );
+    }
+
+    #[test]
+    fn tauri_conf_bundles_autumn_toml_as_resource() {
+        let conf = render_tauri_conf("my-app");
+        let parsed: serde_json::Value = serde_json::from_str(&conf).unwrap();
+        let resources = parsed["bundle"]["resources"]
+            .as_array()
+            .expect("bundle.resources must be an array");
+        let has_autumn_toml = resources.iter().any(|r| {
+            // resource entries can be strings or {"from": "...", "to": "..."}
+            r.as_str()
+                .map(|s| s.contains("autumn.toml"))
+                .unwrap_or_else(|| {
+                    r["from"]
+                        .as_str()
+                        .map(|s| s.contains("autumn.toml"))
+                        .unwrap_or(false)
+                })
+        });
+        assert!(
+            has_autumn_toml,
+            "tauri.conf.json must bundle autumn.toml as a resource so the installed \
+             sidecar can find the app's production configuration"
         );
     }
 
