@@ -697,8 +697,11 @@ fn splice_into_macro_body(existing: &str, body_start: usize, entry: &str) -> Str
         return existing.to_owned();
     }
 
-    let separator = if body.trim().is_empty() { "" } else { ", " };
-    let new_body = format!("{}{}{}", body.trim_end(), separator, entry);
+    // Trim whitespace and any trailing comma so `cargo fmt`-formatted multi-line
+    // macro bodies (which may end with a trailing comma) don't produce `entry1,, entry2`.
+    let trimmed_body = body.trim().trim_end_matches(',');
+    let separator = if trimmed_body.is_empty() { "" } else { ", " };
+    let new_body = format!("{trimmed_body}{separator}{entry}");
     [
         &existing[..body_start],
         &new_body,
@@ -719,7 +722,7 @@ fn augment_mail_previews_list(existing: &str, body_start: usize, mailer_type: &s
 fn insert_before_run_call(existing: &str, line_to_insert: &str) -> String {
     let mut out = String::with_capacity(existing.len() + line_to_insert.len() + 4);
     let mut inserted = false;
-    for line in existing.split('\n') {
+    for line in existing.lines() {
         let trimmed = line.trim_start();
         if !inserted && trimmed.starts_with(".run()") {
             let indent_len = line.len() - trimmed.len();
@@ -732,14 +735,9 @@ fn insert_before_run_call(existing: &str, line_to_insert: &str) -> String {
         out.push_str(line);
         out.push('\n');
     }
-    // split('\n') always produces a trailing empty slice for strings ending
-    // with '\n', so we have one extra '\n'. Trim it if the original didn't
-    // end with a newline.
+    // lines() doesn't yield the trailing empty segment that split('\n') would,
+    // so remove the surplus '\n' only when the original had no trailing newline.
     if !existing.ends_with('\n') && out.ends_with('\n') {
-        out.pop();
-    }
-    // Remove the extra trailing newline produced by the final empty segment.
-    if existing.ends_with('\n') && out.ends_with("\n\n") {
         out.pop();
     }
     out
@@ -2799,6 +2797,22 @@ async fn main() {\n\
                 autumn_web::jobs![send_welcome_email::send_welcome_email]\n}\n";
         let second = augment_registered_jobs(mod_rs, "send_welcome_email::send_welcome_email");
         assert_eq!(mod_rs, second, "duplicate entry must be a no-op");
+    }
+
+    #[test]
+    fn augment_registered_jobs_no_double_comma_with_trailing_comma() {
+        // cargo fmt may produce trailing commas inside multi-line macro bodies.
+        let mod_rs = "pub fn registered_jobs() -> Vec<autumn_web::job::JobInfo> {\n    \
+            autumn_web::jobs![\n        send_welcome_email::send_welcome_email,\n    ]\n}\n";
+        let updated = augment_registered_jobs(mod_rs, "post_notification::post_notification");
+        assert!(
+            !updated.contains(",,"),
+            "must not produce double comma: {updated}"
+        );
+        assert!(
+            updated.contains("post_notification::post_notification"),
+            "must include new entry"
+        );
     }
 
     #[test]
