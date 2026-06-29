@@ -1823,12 +1823,12 @@ mod tests {
     fn breadcrumb_non_last_crumb_without_href_renders_span_not_bare_text() {
         // A Crumb with href:None in a non-last position must still be wrapped
         // in a <span> so it has an accessible element, not invisible bare text.
-        let crumbs = [
-            Crumb::current("Unlinked Middle"),
-            Crumb::current("Current"),
-        ];
+        let crumbs = [Crumb::current("Unlinked Middle"), Crumb::current("Current")];
         let html = breadcrumb(&crumbs).into_string();
-        assert!(html.contains("<span class=\"autumn-breadcrumb__text\">Unlinked Middle</span>"), "{html}");
+        assert!(
+            html.contains("<span class=\"autumn-breadcrumb__text\">Unlinked Middle</span>"),
+            "{html}"
+        );
         // Only the last item carries aria-current
         assert_eq!(html.matches(r#"aria-current="page""#).count(), 1, "{html}");
     }
