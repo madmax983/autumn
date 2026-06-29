@@ -58,10 +58,20 @@ pub fn plan_tauri(project_root: &Path) -> Result<Plan, GenerateError> {
     let mut plan = Plan::new(project_root);
     let tauri = project_root.join("src-tauri");
 
+    // Detect profile override config files that exist now so they can be bundled
+    // as concrete Tauri resources.  A glob entry would cause `cargo tauri build` to
+    // fail with GlobPathNotFound when no files match (common for fresh projects).
+    let profile_configs: Vec<String> = ["autumn-prod.toml", "autumn-production.toml",
+        "autumn-staging.toml", "autumn-development.toml", "autumn-test.toml"]
+        .iter()
+        .filter(|f| project_root.join(f).is_file())
+        .map(|f| (*f).to_owned())
+        .collect();
+
     // Core Tauri project files
     plan.create(
         tauri.join("tauri.conf.json"),
-        render_tauri_conf(&package_name),
+        render_tauri_conf(&package_name, &profile_configs),
     );
     plan.create(
         tauri.join("Cargo.toml"),
@@ -147,7 +157,7 @@ fn read_package_name(project_root: &Path) -> Result<String, GenerateError> {
 
 // ── Content renderers ─────────────────────────────────────────────────────────
 
-fn render_tauri_conf(package_name: &str) -> String {
+fn render_tauri_conf(package_name: &str, profile_configs: &[String]) -> String {
     // Bundle identifier: reverse-DNS with underscores replaced by hyphens.
     // Apple's spec allows only alphanumerics, hyphens, and periods — underscores are invalid.
     let identifier = format!("com.example.{}", package_name.replace('_', "-"));
@@ -173,6 +183,14 @@ fn render_tauri_conf(package_name: &str) -> String {
     } else {
         "bash stage-sidecar.sh"
     };
+    // Concrete resource entries for profile config files that exist at plan time.
+    // We emit only files that are present so Tauri doesn't fail with GlobPathNotFound
+    // when no profile overrides exist (the common case for fresh projects).
+    let profile_resources: String = profile_configs.iter().fold(String::new(), |mut acc, f| {
+        use std::fmt::Write as _;
+        let _ = write!(acc, ",\n      \"../{f}\": \"{f}\"");
+        acc
+    });
     format!(
         r#"{{
   "$schema": "https://schema.tauri.app/config/2",
@@ -197,8 +215,7 @@ fn render_tauri_conf(package_name: &str) -> String {
       "binaries/{package_name}"
     ],
     "resources": {{
-      "../autumn.toml": "autumn.toml",
-      "../autumn-*.toml": "."
+      "../autumn.toml": "autumn.toml"{profile_resources}
     }}
   }},
   "app": {{
@@ -352,9 +369,6 @@ fn setup(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {{
             "AUTUMN_MANIFEST_DIR",
             resource_dir.to_string_lossy().as_ref(),
         )
-        // Force the health endpoint to /health so the readiness probe below
-        // always works, regardless of what [health].path is configured in the app.
-        .env("AUTUMN_HEALTH__PATH", "/health")
         // Clear any inherited Unix-socket config so the sidecar always binds
         // TCP on the loopback address the probe polls.  Without this, an
         // inherited AUTUMN_SERVER__UNIX_SOCKET would make the sidecar healthy
@@ -363,9 +377,13 @@ fn setup(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {{
         .spawn()?;
     *app.state::<SidecarHandle>().0.lock().unwrap() = Some(child);
 
-    // 4. Poll /health in a background thread so setup() returns immediately and the
-    //    Tauri event loop starts.  Blocking here freezes the UI and can trigger OS
-    //    ANR watchdogs on macOS and Windows.
+    // 4. Poll for server readiness in a background thread so setup() returns immediately
+    //    and the Tauri event loop starts.  Blocking here freezes the UI and can trigger
+    //    OS ANR watchdogs on macOS and Windows.
+    //    We probe the root path and accept ANY valid HTTP response (any status code) as
+    //    the readiness signal.  This avoids depending on a specific route path, which
+    //    would conflict if the app has a custom GET /health or configures [health].path
+    //    differently (Axum panics on duplicate route registration).
     let handle = app.handle().clone();
     std::thread::spawn(move || {{
         // Build SocketAddr directly to avoid repeated string formatting and parse() panics.
@@ -383,12 +401,13 @@ fn setup(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {{
                 // Bound the read so a silent connection doesn't stall the loop.
                 let _ = stream.set_read_timeout(Some(poll_timeout));
                 use std::io::{{Read, Write}};
-                let req = format!(
-                    "GET /health HTTP/1.1\r\nHost: 127.0.0.1:{{port}}\r\nConnection: close\r\n\r\n"
-                );
+                let req =
+                    "GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n";
                 if stream.write_all(req.as_bytes()).is_ok() {{
-                    let mut buf = [0u8; 16];
-                    if stream.read(&mut buf).is_ok() && buf.starts_with(b"HTTP/1.1 200") {{
+                    let mut buf = [0u8; 8];
+                    // Any valid HTTP response (200, 301, 401, 404, …) means the server
+                    // is up and routing — accept the `HTTP/` prefix regardless of status.
+                    if stream.read(&mut buf).is_ok() && buf.starts_with(b"HTTP/") {{
                         ready = true;
                         break;
                     }}
@@ -744,7 +763,7 @@ mod tests {
 
     #[test]
     fn tauri_conf_is_valid_json() {
-        let conf = render_tauri_conf("my-app");
+        let conf = render_tauri_conf("my-app", &[]);
         let parsed: serde_json::Value =
             serde_json::from_str(&conf).expect("tauri.conf.json must be valid JSON");
         assert!(parsed.is_object());
@@ -752,7 +771,7 @@ mod tests {
 
     #[test]
     fn tauri_conf_has_identifier() {
-        let conf = render_tauri_conf("my-app");
+        let conf = render_tauri_conf("my-app", &[]);
         let parsed: serde_json::Value = serde_json::from_str(&conf).unwrap();
         assert!(
             parsed["identifier"].is_string(),
@@ -766,7 +785,7 @@ mod tests {
 
     #[test]
     fn tauri_conf_has_product_name() {
-        let conf = render_tauri_conf("my-app");
+        let conf = render_tauri_conf("my-app", &[]);
         let parsed: serde_json::Value = serde_json::from_str(&conf).unwrap();
         assert!(
             parsed["productName"].is_string(),
@@ -776,7 +795,7 @@ mod tests {
 
     #[test]
     fn tauri_conf_has_external_bin() {
-        let conf = render_tauri_conf("my-app");
+        let conf = render_tauri_conf("my-app", &[]);
         let parsed: serde_json::Value = serde_json::from_str(&conf).unwrap();
         let bins = parsed["bundle"]["externalBin"]
             .as_array()
@@ -791,7 +810,7 @@ mod tests {
 
     #[test]
     fn tauri_conf_has_icon_array() {
-        let conf = render_tauri_conf("my-app");
+        let conf = render_tauri_conf("my-app", &[]);
         let parsed: serde_json::Value = serde_json::from_str(&conf).unwrap();
         let icons = parsed["bundle"]["icon"]
             .as_array()
@@ -805,7 +824,7 @@ mod tests {
 
     #[test]
     fn tauri_conf_has_before_build_command() {
-        let conf = render_tauri_conf("my-app");
+        let conf = render_tauri_conf("my-app", &[]);
         let parsed: serde_json::Value = serde_json::from_str(&conf).unwrap();
         let cmd = parsed["build"]["beforeBuildCommand"]
             .as_str()
@@ -915,11 +934,17 @@ mod tests {
     }
 
     #[test]
-    fn lib_rs_polls_health_endpoint() {
+    fn lib_rs_polls_for_http_response() {
         let lib = render_shell_lib_rs("my-app");
+        // Probe accepts any valid HTTP response rather than a specific path/status,
+        // so it works regardless of the app's health route configuration.
         assert!(
-            lib.contains("/health"),
-            "lib.rs must poll GET /health to wait for server ready"
+            lib.contains("HTTP/"),
+            "lib.rs readiness probe must accept any HTTP response prefix"
+        );
+        assert!(
+            lib.contains("GET /"),
+            "lib.rs must send a GET request to probe server readiness"
         );
     }
 
@@ -951,12 +976,15 @@ mod tests {
     }
 
     #[test]
-    fn lib_rs_forces_health_path_env() {
+    fn lib_rs_does_not_override_health_path() {
         let lib = render_shell_lib_rs("my-app");
+        // Setting AUTUMN_HEALTH__PATH=/health can cause Axum to panic when the app
+        // already has a custom GET /health route (duplicate route registration).
+        // The probe instead accepts any HTTP response so no specific path is needed.
         assert!(
-            lib.contains("AUTUMN_HEALTH__PATH"),
-            "lib.rs must set AUTUMN_HEALTH__PATH=/health so the readiness probe works \
-             regardless of the app's configured health path"
+            !lib.contains("AUTUMN_HEALTH__PATH"),
+            "lib.rs must NOT set AUTUMN_HEALTH__PATH — overriding it can conflict with \
+             app-defined routes and cause Axum to panic on duplicate registration"
         );
     }
 
@@ -995,7 +1023,7 @@ mod tests {
 
     #[test]
     fn tauri_conf_bundles_autumn_toml_as_resource() {
-        let conf = render_tauri_conf("my-app");
+        let conf = render_tauri_conf("my-app", &[]);
         let parsed: serde_json::Value = serde_json::from_str(&conf).unwrap();
         // Tauri v2 resources must be a map { source_path: dest_path }, not an array.
         let resources = parsed["bundle"]["resources"]
@@ -1012,13 +1040,14 @@ mod tests {
             "tauri.conf.json must bundle autumn.toml as a resource so the installed \
              sidecar can find the app's production configuration"
         );
-        // Profile override files (autumn-prod.toml, autumn-production.toml, etc.) must
-        // also be bundled so the sidecar picks them up at runtime under the active profile.
-        let has_profile_glob = resources.iter().any(|(k, _)| k.contains("autumn-*.toml"));
+        // With no profile configs passed, resources should contain only the base entry.
+        // A glob entry must NOT be emitted because it causes GlobPathNotFound failures
+        // in cargo tauri build when no profile files exist.
+        let has_glob = resources.iter().any(|(k, _)| k.contains('*'));
         assert!(
-            has_profile_glob,
-            "tauri.conf.json must include a glob for autumn-*.toml resources so profile \
-             config overrides are bundled alongside the base autumn.toml"
+            !has_glob,
+            "tauri.conf.json must not emit resource glob entries — Tauri fails with \
+             GlobPathNotFound when the glob matches no files (common for fresh projects)"
         );
     }
 
@@ -1037,7 +1066,7 @@ mod tests {
 
     #[test]
     fn tauri_conf_identifier_replaces_underscores() {
-        let conf = render_tauri_conf("my_app");
+        let conf = render_tauri_conf("my_app", &[]);
         let parsed: serde_json::Value = serde_json::from_str(&conf).unwrap();
         let id = parsed["identifier"].as_str().unwrap();
         assert!(
@@ -1052,7 +1081,7 @@ mod tests {
 
     #[test]
     fn tauri_conf_security_is_under_app() {
-        let conf = render_tauri_conf("my-app");
+        let conf = render_tauri_conf("my-app", &[]);
         let parsed: serde_json::Value = serde_json::from_str(&conf).unwrap();
         assert!(
             parsed["app"]["security"].is_object(),
@@ -1415,7 +1444,7 @@ mod tests {
 
     #[test]
     fn tauri_conf_product_name_handles_underscore_separator() {
-        let conf = render_tauri_conf("my_app");
+        let conf = render_tauri_conf("my_app", &[]);
         let parsed: serde_json::Value = serde_json::from_str(&conf).unwrap();
         let name = parsed["productName"].as_str().unwrap();
         assert!(
