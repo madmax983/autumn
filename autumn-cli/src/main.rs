@@ -15,6 +15,7 @@ mod dev_loop_bench;
 mod dev_loop_scaling;
 mod doctor;
 mod experiments;
+mod explore;
 mod export;
 mod flags;
 mod generate;
@@ -213,6 +214,12 @@ enum Commands {
         /// Polling interval in seconds
         #[arg(short, long, default_value = "1")]
         interval: u64,
+    },
+    /// Interactive Ratatui TUI to explore an Autumn application's `OpenAPI` schema.
+    Explore {
+        /// URL of the running Autumn application
+        #[arg(short, long, default_value = "http://localhost:3000")]
+        url: String,
     },
     /// Export an offline diagnostic snapshot of the application
     Export {
@@ -1864,6 +1871,7 @@ fn run_command(command: Commands) {
             CanaryCommands::Status => canary::run_status(None),
         },
         Commands::Monitor { url, interval } => monitor::run(&url, interval),
+        Commands::Explore { url } => explore::run(&url),
         Commands::Export { url, output } => export::run(&url, &output),
         Commands::Data(DataCommands::Export {
             model,
@@ -3126,6 +3134,28 @@ mod tests {
                 assert_eq!(interval, 5);
             }
             _ => panic!("expected Monitor command"),
+        }
+    }
+
+    #[test]
+    fn parse_explore_defaults() {
+        let cli = Cli::try_parse_from(["autumn", "explore"]).unwrap();
+        match cli.command {
+            Commands::Explore { url } => {
+                assert_eq!(url, "http://localhost:3000");
+            }
+            _ => panic!("expected Explore command"),
+        }
+    }
+
+    #[test]
+    fn parse_explore_custom_url() {
+        let cli = Cli::try_parse_from(["autumn", "explore", "-u", "http://prod:8080"]).unwrap();
+        match cli.command {
+            Commands::Explore { url } => {
+                assert_eq!(url, "http://prod:8080");
+            }
+            _ => panic!("expected Explore command"),
         }
     }
 
