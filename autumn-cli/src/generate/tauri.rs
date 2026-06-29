@@ -321,11 +321,15 @@ fn setup(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {{
     let app_data_dir = app.path().app_data_dir()?.join("db");
     std::fs::create_dir_all(&app_data_dir)?;
 
-    // autumn.toml is bundled as a resource (see tauri.conf.json bundle.resources).
-    // Point the sidecar at the resource directory so AutumnConfig::load_with_env()
-    // finds autumn.toml on the installed machine — without this, the sidecar looks
-    // in its CWD and falls back to compiled-in defaults, silently missing production
-    // settings such as auth, SEO, auto-migrate, and security configuration.
+    // autumn.toml is bundled as a Tauri resource (see tauri.conf.json bundle.resources).
+    // The sidecar's working directory is set to resource_dir so AutumnConfig finds it.
+    //
+    // Why CWD and not AUTUMN_MANIFEST_DIR env var:
+    //   OsEnv::var("AUTUMN_MANIFEST_DIR") returns the compile-time CARGO_MANIFEST_DIR
+    //   set by #[autumn_web::main], overriding the process environment.  That path
+    //   doesn't exist on the installed machine, so find_config_file_named() falls back
+    //   to PathBuf::from("autumn.toml") — i.e. the current working directory.
+    //   Setting CWD to resource_dir makes that CWD fallback find the bundled config.
     let resource_dir = app.path().resource_dir()?;
 
     // 3. Spawn the autumn server sidecar (built with autumn-web/embed-assets + managed-pg-bundled).
@@ -333,12 +337,16 @@ fn setup(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {{
     let (_rx, child) = app
         .shell()
         .sidecar("{package_name}")?
+        // Working directory = resource dir so autumn.toml is found via CWD fallback.
+        .current_dir(&resource_dir)
         .env("AUTUMN_SERVER__HOST", "127.0.0.1")
         .env("AUTUMN_SERVER__PORT", port.to_string())
         .env(
             "AUTUMN_MANAGED_PG_DATA_DIR",
             app_data_dir.to_string_lossy().as_ref(),
         )
+        // Belt-and-suspenders for apps not using #[autumn_web::main] where
+        // AUTUMN_MANIFEST_DIR env var IS consulted before the CWD fallback.
         .env(
             "AUTUMN_MANIFEST_DIR",
             resource_dir.to_string_lossy().as_ref(),
@@ -968,6 +976,19 @@ mod tests {
             lib.contains("AUTUMN_MANIFEST_DIR"),
             "lib.rs must set AUTUMN_MANIFEST_DIR to the Tauri resource dir so the \
              sidecar finds the bundled autumn.toml on the installed machine"
+        );
+    }
+
+    #[test]
+    fn lib_rs_sets_sidecar_cwd_to_resource_dir() {
+        let lib = render_shell_lib_rs("my-app");
+        assert!(
+            lib.contains(".current_dir("),
+            "lib.rs must set the sidecar's working directory to resource_dir; \
+             OsEnv::var(AUTUMN_MANIFEST_DIR) returns the compile-time CARGO_MANIFEST_DIR \
+             (which is absent on installed machines), so AutumnConfig falls back to \
+             PathBuf::from(\"autumn.toml\") — setting CWD to resource_dir makes that \
+             fallback find the bundled autumn.toml"
         );
     }
 

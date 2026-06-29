@@ -93,11 +93,13 @@ is reused as the Tauri icon source automatically.
    needs it. No hardcoded ports, no firewall rules.
 
 2. **Spawn sidecar**: the Tauri `setup` hook uses `tauri-plugin-shell` to launch
-   the autumn binary with `AUTUMN_SERVER__HOST=127.0.0.1`,
+   the autumn binary with its working directory set to the Tauri resource directory
+   (where `autumn.toml` is bundled), plus `AUTUMN_SERVER__HOST=127.0.0.1`,
    `AUTUMN_SERVER__PORT={port}`, `AUTUMN_MANAGED_PG_DATA_DIR={app-data-dir}/db`,
-   and `AUTUMN_MANIFEST_DIR={resource-dir}` so the sidecar finds the bundled
-   `autumn.toml` on the installed machine (see below). `AUTUMN_HEALTH__PATH` is
-   forced to `/health` so the readiness probe always works regardless of any
+   and `AUTUMN_MANIFEST_DIR={resource-dir}`. Setting the working directory is the
+   key mechanism: `AutumnConfig` falls back to a CWD-relative `autumn.toml` lookup
+   when the compile-time path is absent on the installed machine. `AUTUMN_HEALTH__PATH`
+   is forced to `/health` so the readiness probe always works regardless of any
    `[health].path` configuration in the app.
 
 3. **Wait for ready**: the setup hook polls `GET /health` (the existing autumn
