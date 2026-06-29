@@ -179,8 +179,14 @@ fn read_package_meta(project_root: &Path) -> Result<(String, String, String), Ge
     //   2. If `src/main.rs` exists on disk but isn't in [[bin]], Cargo auto-discovers
     //      it under the package name; any explicit [[bin]] entries are auxiliary bins
     //      and must NOT override the primary target.
-    //   3. The first (and only) [[bin]] when there is no `src/main.rs` at all.
-    //   4. The package name (Cargo default when no [[bin]] is declared).
+    //   3. `[package] default-run` — the developer's declared preference when there
+    //      are multiple explicit [[bin]] entries and no src/main.rs.
+    //   4. `bins.first()` — last resort when only one [[bin]] is declared.
+    //   5. The package name (Cargo default when no [[bin]] is declared).
+    let default_run = pkg
+        .get("default-run")
+        .and_then(|v| v.as_str())
+        .map(str::to_owned);
     let bin_name = {
         let explicit_bins = doc.get("bin").and_then(|b| b.as_array());
         if let Some(bins) = explicit_bins {
@@ -201,16 +207,19 @@ fn read_package_meta(project_root: &Path) -> Result<(String, String, String), Ge
                         // The [[bin]] entries are for other auxiliary programs.
                         Some(name.clone())
                     } else {
-                        // Step 3: no src/main.rs — the first declared bin IS the app.
-                        bins.first()
-                            .and_then(|b| b.get("name"))
-                            .and_then(|n| n.as_str())
-                            .map(str::to_owned)
+                        // Step 3: honour [package] default-run when set.
+                        default_run.clone().or_else(|| {
+                            // Step 4: single or first explicit [[bin]] as last resort.
+                            bins.first()
+                                .and_then(|b| b.get("name"))
+                                .and_then(|n| n.as_str())
+                                .map(str::to_owned)
+                        })
                     }
                 })
                 .unwrap_or_else(|| name.clone())
         } else {
-            // Step 4: no [[bin]] at all — package name is the binary name.
+            // Step 5: no [[bin]] at all — package name is the binary name.
             name.clone()
         }
     };
@@ -951,6 +960,31 @@ mod tests {
         tmp
     }
 
+    /// Project with `[package] default-run` and multiple explicit `[[bin]]`
+    /// targets but no `src/main.rs`.  The generator must pick the `default-run`
+    /// binary, not the first manifest entry.
+    fn project_with_default_run(pkg_name: &str, default_run: &str, bins: &[&str]) -> TempDir {
+        let tmp = TempDir::new().unwrap();
+        let bin_sections: String = bins
+            .iter()
+            .map(|b| format!("\n[[bin]]\nname=\"{b}\"\npath=\"src/{b}.rs\"\n"))
+            .collect();
+        fs::write(
+            tmp.path().join("Cargo.toml"),
+            format!(
+                "[package]\nname=\"{pkg_name}\"\nversion=\"0.1.0\"\nedition=\"2024\"\n\
+                 default-run=\"{default_run}\"\n\
+                 {bin_sections}\n[dependencies]\nautumn-web = \"0.5.0\"\n"
+            ),
+        )
+        .unwrap();
+        fs::create_dir_all(tmp.path().join("src")).unwrap();
+        for b in bins {
+            fs::write(tmp.path().join(format!("src/{b}.rs")), "fn main() {}\n").unwrap();
+        }
+        tmp
+    }
+
     fn project_with_workspace_version(pkg_name: &str, ws_version: &str) -> TempDir {
         let tmp = TempDir::new().unwrap();
         fs::write(
@@ -1341,6 +1375,34 @@ mod tests {
         assert!(
             !sh.contains("/release/worker") && !sh.contains("--bin worker"),
             "stage-sidecar.sh must not use the auxiliary [[bin]] name 'worker' as the primary target"
+        );
+    }
+
+    #[test]
+    fn plan_honours_default_run_over_first_bin() {
+        // A package with multiple explicit [[bin]] entries and `default-run = "web"`
+        // must stage the "web" binary, not the first-listed one (e.g. "seed").
+        let tmp = project_with_default_run("my-app", "web", &["seed", "web", "worker"]);
+        let plan = plan_tauri(tmp.path()).unwrap();
+        let sh: &str = plan
+            .actions
+            .iter()
+            .find(|a| a.path().to_string_lossy().ends_with("stage-sidecar.sh"))
+            .and_then(|a| {
+                if let crate::generate::emit::Action::Create { contents, .. } = a {
+                    Some(contents.as_str())
+                } else {
+                    None
+                }
+            })
+            .expect("stage-sidecar.sh action not found");
+        assert!(
+            sh.contains("--bin web"),
+            "stage-sidecar.sh must use the default-run binary 'web', not the first [[bin]] entry"
+        );
+        assert!(
+            !sh.contains("--bin seed"),
+            "stage-sidecar.sh must not use 'seed' (first [[bin]] entry) when default-run is set"
         );
     }
 
