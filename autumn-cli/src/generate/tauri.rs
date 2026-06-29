@@ -198,17 +198,15 @@ fn read_package_meta(project_root: &Path) -> Result<(String, String, String, boo
     // is set, `cargo build` writes that name (not the package name) under
     // `target/.../release/`.
     //
-    // Priority:
-    //   1. A [[bin]] entry whose path is explicitly `src/main.rs` (renamed main).
-    //   2. If `src/main.rs` exists on disk but isn't in [[bin]], Cargo auto-discovers
-    //      it under the package name; any explicit [[bin]] entries are auxiliary bins
-    //      and must NOT override the primary target.
-    //   3. `[package] default-run` — the developer's declared preference when there
-    //      are multiple explicit [[bin]] entries and no src/main.rs.
+    // Priority when [[bin]] entries are present:
+    //   1. `[package] default-run` — the developer's explicit selection; takes
+    //      precedence over any auto-discovered src/main.rs target.
+    //   2. A [[bin]] entry whose path is explicitly `src/main.rs` (renamed main).
+    //   3. If `src/main.rs` exists on disk but isn't in [[bin]], Cargo auto-discovers
+    //      it under the package name; any explicit [[bin]] entries are auxiliary bins.
     //   4. `bins.first()` — last resort when only one [[bin]] is declared.
-    //   5. No [[bin]] table at all: honour `default-run` first; then if exactly one
-    //      `src/bin/*.rs` file exists, Cargo auto-discovers it (named after the stem,
-    //      not the package), so use that stem; otherwise fall back to the package name.
+    // When there are no [[bin]] entries:
+    //   5. `default-run` first, then `src/main.rs`, then `src/bin/` discovery.
     let default_run = pkg
         .get("default-run")
         .and_then(|v| v.as_str())
@@ -216,7 +214,14 @@ fn read_package_meta(project_root: &Path) -> Result<(String, String, String, boo
     // Resolve bin name in a Result-returning block so ambiguous cases can error.
     let bin_name: String = (|| -> Result<String, GenerateError> {
         if let Some(bins) = doc.get("bin").and_then(|b| b.as_array()) {
-            // Step 1: explicit [[bin]] entry whose path resolves to src/main.rs.
+            // Step 1: honour [package] default-run — the developer's explicit selection.
+            // Must come before src/main.rs auto-discovery so a project that has
+            // src/main.rs *plus* explicit [[bin]] targets and sets default-run = "web"
+            // stages the declared default, not the package-named auto-discovered bin.
+            if let Some(dr) = &default_run {
+                return Ok(dr.clone());
+            }
+            // Step 2: explicit [[bin]] entry whose path resolves to src/main.rs.
             // Canonicalize by splitting on both separators and filtering empty and
             // CurDir (".") segments so "src/./main.rs", "./src/main.rs", and
             // "src/main.rs" all match identically.
@@ -235,17 +240,12 @@ fn read_package_meta(project_root: &Path) -> Result<(String, String, String, boo
             {
                 return Ok(n.to_owned());
             }
+            // Step 3: src/main.rs exists but is not declared in [[bin]];
+            // Cargo auto-discovers it as the package-named binary.
             if project_root.join("src/main.rs").is_file() {
-                // Step 2: src/main.rs exists but is not declared in [[bin]];
-                // Cargo auto-discovers it as the package-named binary.
-                // The [[bin]] entries are for other auxiliary programs.
                 return Ok(name.clone());
             }
-            // Step 3: honour [package] default-run when set.
-            if let Some(dr) = &default_run {
-                return Ok(dr.clone());
-            }
-            // Step 4: single or first explicit [[bin]] as last resort.
+            // Step 4: first explicit [[bin]] as last resort.
             return Ok(bins
                 .first()
                 .and_then(|b| b.get("name"))
@@ -590,7 +590,7 @@ fn setup(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {{
     std::fs::create_dir_all(&app_data_dir)?;
     // Per-install signing secret: autumn requires one in prod mode.  Generate 32
     // random bytes on first launch and persist them so tokens survive restarts.
-    let signing_secret = load_or_generate_signing_secret(&data_root);
+    let signing_secret = load_or_generate_signing_secret(&data_root)?;
 
     // autumn.toml is bundled as a Tauri resource (see tauri.conf.json bundle.resources).
     // The sidecar's working directory is set to resource_dir so AutumnConfig finds it.
@@ -766,19 +766,24 @@ fn setup(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {{
 /// Autumn requires a signing secret in prod mode to sign JWTs / session tokens.
 /// Without this, the release sidecar calls `fail_fast_on_invalid_signing_secret`
 /// and exits before binding the HTTP port, leaving the TCP probe to time out.
-fn load_or_generate_signing_secret(data_root: &std::path::Path) -> String {{
+/// Returns `Err` (and aborts startup) on RNG failure so no predictable all-zero
+/// secret is silently accepted.
+fn load_or_generate_signing_secret(
+    data_root: &std::path::Path,
+) -> Result<String, Box<dyn std::error::Error>> {{
     let path = data_root.join("signing_secret.txt");
     if let Ok(s) = std::fs::read_to_string(&path) {{
         let s = s.trim().to_owned();
         if s.len() >= 32 {{
-            return s;
+            return Ok(s);
         }}
     }}
     let mut bytes = [0u8; 32];
-    getrandom::getrandom(&mut bytes).unwrap_or(());
+    // Propagate RNG failure — an all-zero secret would be trivially guessable.
+    getrandom::getrandom(&mut bytes)?;
     let hex: String = bytes.iter().map(|b| format!("{{b:02x}}")).collect();
     let _ = std::fs::write(&path, &hex);
-    hex
+    Ok(hex)
 }}
 "#
     )
@@ -1205,6 +1210,39 @@ mod tests {
         fs::write(tmp.path().join("src/main.rs"), "fn main() {}\n").unwrap();
         // The explicit auxiliary bin.
         fs::write(tmp.path().join("src/worker.rs"), "fn main() {}\n").unwrap();
+        tmp
+    }
+
+    /// Project with `[package] default-run`, explicit `[[bin]]` entries for other
+    /// binaries, AND `src/main.rs` present.  The generator must honour `default-run`
+    /// even when `src/main.rs` exists (which would otherwise be auto-discovered under
+    /// the package name).
+    fn project_with_default_run_and_main_rs(
+        pkg_name: &str,
+        default_run: &str,
+        extra_bins: &[&str],
+    ) -> TempDir {
+        let tmp = TempDir::new().unwrap();
+        let bin_sections = extra_bins.iter().fold(String::new(), |mut acc, b| {
+            write!(acc, "\n[[bin]]\nname=\"{b}\"\npath=\"src/{b}.rs\"\n").unwrap();
+            acc
+        });
+        fs::write(
+            tmp.path().join("Cargo.toml"),
+            format!(
+                "[package]\nname=\"{pkg_name}\"\nversion=\"0.1.0\"\nedition=\"2024\"\n\
+                 default-run=\"{default_run}\"\
+                 {bin_sections}\n[dependencies]\nautumn-web = \"0.5.0\"\n"
+            ),
+        )
+        .unwrap();
+        fs::create_dir_all(tmp.path().join("src")).unwrap();
+        // src/main.rs is present — without the default-run check it would be
+        // auto-discovered and the package name would be used instead.
+        fs::write(tmp.path().join("src/main.rs"), "fn main() {}\n").unwrap();
+        for b in extra_bins {
+            fs::write(tmp.path().join(format!("src/{b}.rs")), "fn main() {}\n").unwrap();
+        }
         tmp
     }
 
@@ -1810,6 +1848,39 @@ mod tests {
         assert!(
             !sh.contains("--bin seed"),
             "stage-sidecar.sh must not use 'seed' (first [[bin]] entry) when default-run is set"
+        );
+    }
+
+    #[test]
+    fn plan_honours_default_run_over_main_rs_when_explicit_bins_exist() {
+        // When src/main.rs is present alongside explicit [[bin]] entries and
+        // [package] default-run = "web", the generator must use "web" (not the
+        // package-named auto-discovered binary from src/main.rs).
+        // Matches `autumn dev`/`autumn build` behaviour which prefers default_run.
+        let tmp =
+            project_with_default_run_and_main_rs("my-app", "web", &["web", "seed"]);
+        let plan = plan_tauri(tmp.path()).unwrap();
+        let sh: &str = plan
+            .actions
+            .iter()
+            .find(|a| a.path().to_string_lossy().ends_with("stage-sidecar.sh"))
+            .and_then(|a| {
+                if let crate::generate::emit::Action::Create { contents, .. } = a {
+                    Some(contents.as_str())
+                } else {
+                    None
+                }
+            })
+            .expect("stage-sidecar.sh action not found");
+        assert!(
+            sh.contains("--bin web"),
+            "stage-sidecar.sh must use the default-run binary 'web' even when src/main.rs \
+             also exists; the package-named auto-bin must not override default-run"
+        );
+        assert!(
+            !sh.contains("--bin my-app"),
+            "stage-sidecar.sh must not use the package name 'my-app' when default-run = 'web' \
+             is set, even though src/main.rs would be auto-discovered as 'my-app'"
         );
     }
 
@@ -2461,6 +2532,18 @@ mod tests {
             "load_or_generate_signing_secret must persist the secret to a file so it \
              survives app restarts; re-generating on every launch would invalidate all \
              existing sessions"
+        );
+        // Must NOT silently continue with zero bytes on RNG failure.
+        assert!(
+            !lib.contains("unwrap_or(())"),
+            "getrandom failure must propagate as an error, not be silently swallowed with \
+             unwrap_or(()); an all-zero signing secret is trivially guessable"
+        );
+        // The function must return a Result so the caller can propagate the error.
+        assert!(
+            lib.contains("Result<String,") || lib.contains("Result<String, "),
+            "load_or_generate_signing_secret must return Result<String, ...> so getrandom \
+             failure aborts setup() rather than continuing with a predictable zero secret"
         );
     }
 
