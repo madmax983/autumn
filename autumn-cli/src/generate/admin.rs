@@ -18,7 +18,7 @@ use super::dsl::{Field, FieldKind, parse_fields};
 use super::emit::Plan;
 use super::naming::{pascal, pluralize, snake};
 use super::schema_edit::add_mod_declaration;
-use super::{Flags, GenerateError, ensure_project_root};
+use super::{Flags, GenerateError, ensure_project_root, read_or_empty};
 
 /// A parsed `--select FIELD=val1,val2,...` spec.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -217,10 +217,6 @@ pub fn run(name: &str, field_tokens: &[String], flags: Flags, options: &AdminOpt
             std::process::exit(1);
         }
     }
-}
-
-fn read_or_empty(path: &Path) -> String {
-    std::fs::read_to_string(path).unwrap_or_default()
 }
 
 /// Returns true if the model struct `pascal_name` has a primary-key field `id`

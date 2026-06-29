@@ -148,6 +148,11 @@ const fn ymd_from_days(days_since_epoch: u64) -> (u64, u64, u64) {
     (y as u64, m, d)
 }
 
+/// Read a file to `String`, returning an empty string if the file does not exist.
+pub fn read_or_empty(path: &Path) -> String {
+    std::fs::read_to_string(path).unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

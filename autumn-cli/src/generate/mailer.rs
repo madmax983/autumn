@@ -29,7 +29,7 @@ use super::naming::{pascal, snake};
 use super::schema_edit::{
     add_mail_preview_to_app, add_mod_declaration, ensure_autumn_web_feature, update_main_rs,
 };
-use super::{Flags, GenerateError, ensure_project_root, timestamp_now};
+use super::{Flags, GenerateError, ensure_project_root, read_or_empty, timestamp_now};
 
 /// Compute the file actions for `autumn generate mailer`.
 ///
@@ -143,10 +143,10 @@ pub fn plan_mailer(
 
     // ── src/main.rs: add mod mailers; and .mail_previews(…) ────────────────
     let main_path = project_root.join("src").join("main.rs");
-    let main_existing = std::fs::read_to_string(&main_path).map_err(|_| {
+    let main_existing = std::fs::read_to_string(&main_path).map_err(|e| {
         GenerateError::Io(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            format!("missing {}", main_path.display()),
+            e.kind(),
+            format!("{}: {e}", main_path.display()),
         ))
     })?;
     let with_mods = update_main_rs(&main_existing, &["mailers"], &[]);
@@ -230,10 +230,6 @@ CREATE TABLE mail_unsubscribes (
 ";
 
 const UNSUBSCRIBE_MIGRATION_DOWN: &str = "DROP TABLE mail_unsubscribes;\n";
-
-fn read_or_empty(path: &Path) -> String {
-    std::fs::read_to_string(path).unwrap_or_default()
-}
 
 fn render_mailer_file(
     struct_name: &str,

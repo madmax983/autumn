@@ -16,7 +16,7 @@ use super::emit::Plan;
 use super::model::validate_resource_name;
 use super::naming::{pascal, snake};
 use super::schema_edit::{add_mod_declaration, ensure_autumn_web_feature, update_main_rs};
-use super::{Flags, GenerateError, ensure_project_root};
+use super::{Flags, GenerateError, ensure_project_root, read_or_empty};
 
 /// Compute the file actions for `autumn generate inbound_mail <name>`.
 ///
@@ -84,10 +84,6 @@ pub fn plan_inbound_mail(project_root: &Path, name: &str) -> Result<Plan, Genera
     }
 
     Ok(plan)
-}
-
-fn read_or_empty(path: &Path) -> String {
-    std::fs::read_to_string(path).unwrap_or_default()
 }
 
 fn render_handler_file(struct_name: &str, handler_fn: &str, _snake_name: &str) -> String {

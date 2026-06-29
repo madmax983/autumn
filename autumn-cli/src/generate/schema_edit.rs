@@ -681,21 +681,24 @@ pub fn add_mail_preview_to_app(existing: &str, mailer_type: &str) -> String {
     )
 }
 
-/// Append `mailer_type` inside an already-present `mail_previews![...]`.
-fn augment_mail_previews_list(existing: &str, body_start: usize, mailer_type: &str) -> String {
+/// Splice `entry` into the body of a `macro![...]` call starting at `body_start`.
+///
+/// Idempotent: returns `existing` unchanged if `entry` is already present.
+/// Returns `existing` unchanged if no closing `]` is found.
+fn splice_into_macro_body(existing: &str, body_start: usize, entry: &str) -> String {
     let rest = &existing[body_start..];
     let Some(end_offset) = rest.find(']') else {
         return existing.to_owned();
     };
     let body = &rest[..end_offset];
 
-    // Idempotency: skip if type is already registered.
-    if body.split(',').map(str::trim).any(|t| t == mailer_type) {
+    // Idempotency: skip if entry is already registered.
+    if body.split(',').map(str::trim).any(|t| t == entry) {
         return existing.to_owned();
     }
 
     let separator = if body.trim().is_empty() { "" } else { ", " };
-    let new_body = format!("{}{}{}", body.trim_end(), separator, mailer_type);
+    let new_body = format!("{}{}{}", body.trim_end(), separator, entry);
     [
         &existing[..body_start],
         &new_body,
@@ -704,9 +707,17 @@ fn augment_mail_previews_list(existing: &str, body_start: usize, mailer_type: &s
     .concat()
 }
 
-/// Insert `.mail_previews(mail_previews![mailer_type])` before `.run()`.
-fn insert_mail_previews_call(existing: &str, mailer_type: &str) -> String {
-    let mut out = String::with_capacity(existing.len() + 80);
+/// Append `mailer_type` inside an already-present `mail_previews![...]`.
+fn augment_mail_previews_list(existing: &str, body_start: usize, mailer_type: &str) -> String {
+    splice_into_macro_body(existing, body_start, mailer_type)
+}
+
+/// Insert `line_to_insert` (without trailing newline) before the first `.run()`
+/// line in an `AppBuilder` chain, preserving the same indentation.
+///
+/// Returns `existing` unchanged when no `.run()` line can be found.
+fn insert_before_run_call(existing: &str, line_to_insert: &str) -> String {
+    let mut out = String::with_capacity(existing.len() + line_to_insert.len() + 4);
     let mut inserted = false;
     for line in existing.split('\n') {
         let trimmed = line.trim_start();
@@ -714,9 +725,8 @@ fn insert_mail_previews_call(existing: &str, mailer_type: &str) -> String {
             let indent_len = line.len() - trimmed.len();
             let indent = &line[..indent_len];
             out.push_str(indent);
-            out.push_str(".mail_previews(mail_previews![");
-            out.push_str(mailer_type);
-            out.push_str("])\n");
+            out.push_str(line_to_insert);
+            out.push('\n');
             inserted = true;
         }
         out.push_str(line);
@@ -733,6 +743,14 @@ fn insert_mail_previews_call(existing: &str, mailer_type: &str) -> String {
         out.pop();
     }
     out
+}
+
+/// Insert `.mail_previews(mail_previews![mailer_type])` before `.run()`.
+fn insert_mail_previews_call(existing: &str, mailer_type: &str) -> String {
+    insert_before_run_call(
+        existing,
+        &format!(".mail_previews(mail_previews![{mailer_type}])"),
+    )
 }
 
 // ── Job registration helpers ──────────────────────────────────────────────
@@ -754,28 +772,7 @@ pub fn add_jobs_registration_to_app(existing: &str) -> String {
 
 /// Insert `.jobs(jobs::registered_jobs())` before the first `.run()` line.
 fn insert_jobs_call(existing: &str) -> String {
-    let mut out = String::with_capacity(existing.len() + 48);
-    let mut inserted = false;
-    for line in existing.split('\n') {
-        let trimmed = line.trim_start();
-        if !inserted && trimmed.starts_with(".run()") {
-            let indent_len = line.len() - trimmed.len();
-            let indent = &line[..indent_len];
-            out.push_str(indent);
-            out.push_str(".jobs(jobs::registered_jobs())\n");
-            inserted = true;
-        }
-        out.push_str(line);
-        out.push('\n');
-    }
-    // split('\n') produces a trailing empty slice for strings ending with '\n'.
-    if !existing.ends_with('\n') && out.ends_with('\n') {
-        out.pop();
-    }
-    if existing.ends_with('\n') && out.ends_with("\n\n") {
-        out.pop();
-    }
-    out
+    insert_before_run_call(existing, ".jobs(jobs::registered_jobs())")
 }
 
 /// Idempotently add `entry` (e.g. `"send_welcome_email::send_welcome_email"`)
@@ -806,25 +803,7 @@ pub fn augment_registered_jobs(existing: &str, entry: &str) -> String {
 
 /// Splice `entry` into an already-present `jobs![...]` body.
 fn splice_jobs_list(existing: &str, body_start: usize, entry: &str) -> String {
-    let rest = &existing[body_start..];
-    let Some(end_offset) = rest.find(']') else {
-        return existing.to_owned();
-    };
-    let body = &rest[..end_offset];
-
-    // Idempotency: skip if entry is already registered.
-    if body.split(',').map(str::trim).any(|t| t == entry) {
-        return existing.to_owned();
-    }
-
-    let separator = if body.trim().is_empty() { "" } else { ", " };
-    let new_body = format!("{}{}{}", body.trim_end(), separator, entry);
-    [
-        &existing[..body_start],
-        &new_body,
-        &existing[body_start + end_offset..],
-    ]
-    .concat()
+    splice_into_macro_body(existing, body_start, entry)
 }
 
 // ── Cargo.toml: feature injection ────────────────────────────────────────

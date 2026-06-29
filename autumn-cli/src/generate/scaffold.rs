@@ -19,7 +19,7 @@ use super::model::{
 };
 use super::naming::{pascal, pluralize, snake};
 use super::schema_edit::{add_mod_declaration, ensure_autumn_web_feature, update_main_rs};
-use super::{Flags, GenerateError, ensure_project_root, timestamp_now};
+use super::{Flags, GenerateError, ensure_project_root, read_or_empty, timestamp_now};
 
 /// Extra dependencies the *scaffold* generator's output requires on top of
 /// [`super::model::MODEL_DEPS`] — `maud` for HTML rendering and URL-encoded
@@ -289,10 +289,6 @@ pub fn run(name: &str, field_tokens: &[String], flags: Flags, options: &Scaffold
             std::process::exit(1);
         }
     }
-}
-
-fn read_or_empty(path: &std::path::Path) -> String {
-    std::fs::read_to_string(path).unwrap_or_default()
 }
 
 fn parse_query_specs(

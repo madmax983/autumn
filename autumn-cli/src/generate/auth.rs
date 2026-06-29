@@ -22,7 +22,7 @@ use super::naming::{pascal, pluralize, snake};
 use super::schema_edit::{
     add_mod_declaration, append_schema_table, schema_has_table, update_main_rs,
 };
-use super::{Flags, GenerateError, ensure_project_root, timestamp_now};
+use super::{Flags, GenerateError, ensure_project_root, read_or_empty, timestamp_now};
 
 /// Extra Cargo dependencies the auth generator needs on top of the model deps.
 const AUTH_EXTRA_DEPS: &[(&str, &str)] = &[
@@ -1180,10 +1180,6 @@ pub fn run_with_options(
             std::process::exit(1);
         }
     }
-}
-
-fn read_or_empty(path: &Path) -> String {
-    std::fs::read_to_string(path).unwrap_or_default()
 }
 
 /// Ensure `autumn-web` in `[dependencies]` has `features = ["mail"]`.

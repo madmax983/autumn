@@ -18,11 +18,7 @@ use std::path::Path;
 use super::emit::Plan;
 use super::naming::{pascal, snake};
 use super::schema_edit::add_mod_declaration;
-use super::{Flags, GenerateError, ensure_project_root};
-
-fn read_or_empty(path: &std::path::Path) -> String {
-    std::fs::read_to_string(path).unwrap_or_default()
-}
+use super::{Flags, GenerateError, ensure_project_root, read_or_empty};
 
 /// Minimum two steps are required.
 const MIN_STEPS: usize = 2;

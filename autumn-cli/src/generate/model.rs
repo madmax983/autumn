@@ -11,7 +11,7 @@ use super::schema_edit::{
     add_mod_declaration, append_schema_table_with_id, create_table_sql_with_metadata_and_id,
     drop_table_sql,
 };
-use super::{GenerateError, ensure_project_root};
+use super::{GenerateError, ensure_project_root, read_or_empty};
 
 /// Optional metadata applied to generated model fields.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -486,10 +486,6 @@ fn validate_field_names(fields: &[Field]) -> Result<(), GenerateError> {
         }
     }
     Ok(())
-}
-
-fn read_or_empty(path: &Path) -> String {
-    std::fs::read_to_string(path).unwrap_or_default()
 }
 
 pub fn parse_model_metadata(
