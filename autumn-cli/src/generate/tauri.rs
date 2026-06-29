@@ -227,15 +227,19 @@ fn read_package_meta(project_root: &Path) -> Result<(String, String, String, boo
                 return name.clone();
             }
             // Inspect src/bin/ for auto-discovered binaries.  Cargo names each
-            // binary after the file stem (not the package), so `src/bin/web.rs`
-            // produces a `web` binary, not `<package>`.
+            // binary after the file stem (for `src/bin/web.rs`) or the directory
+            // name (for `src/bin/web/main.rs`), not the package name.
             if let Ok(entries) = std::fs::read_dir(project_root.join("src/bin")) {
                 let stems: Vec<String> = entries
                     .filter_map(std::result::Result::ok)
                     .filter_map(|e| {
                         let p = e.path();
                         if p.extension().is_some_and(|x| x == "rs") {
+                            // Flat file: src/bin/web.rs → "web"
                             p.file_stem().and_then(|s| s.to_str()).map(str::to_owned)
+                        } else if p.is_dir() && p.join("main.rs").is_file() {
+                            // Directory-style: src/bin/web/main.rs → "web"
+                            p.file_name().and_then(|s| s.to_str()).map(str::to_owned)
                         } else {
                             None
                         }
@@ -1176,6 +1180,27 @@ mod tests {
         tmp
     }
 
+    /// Project with a directory-style `src/bin/<bin_stem>/main.rs` and no
+    /// `src/main.rs` or `[[bin]]` — Cargo auto-discovers the binary as `<bin_stem>`.
+    fn project_with_src_bin_dir(pkg_name: &str, bin_stem: &str) -> TempDir {
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join("Cargo.toml"),
+            format!(
+                "[package]\nname=\"{pkg_name}\"\nversion=\"0.1.0\"\nedition=\"2024\"\n\
+                 \n[dependencies]\nautumn-web = \"0.5.0\"\n"
+            ),
+        )
+        .unwrap();
+        fs::create_dir_all(tmp.path().join(format!("src/bin/{bin_stem}"))).unwrap();
+        fs::write(
+            tmp.path().join(format!("src/bin/{bin_stem}/main.rs")),
+            "fn main() {}\n",
+        )
+        .unwrap();
+        tmp
+    }
+
     // ── plan_tauri: error cases ───────────────────────────────────────────────
 
     #[test]
@@ -1636,6 +1661,34 @@ mod tests {
         assert!(
             !sh.contains("--bin my-app"),
             "staging script must not use the package name when a src/bin/ binary is auto-discovered"
+        );
+    }
+
+    #[test]
+    fn plan_detects_src_bin_dir_style_binary() {
+        // A package with src/bin/web/main.rs and no src/main.rs or [[bin]] table —
+        // Cargo auto-discovers it as binary "web" (directory name, not package name).
+        let tmp = project_with_src_bin_dir("my-app", "web");
+        let plan = plan_tauri(tmp.path()).unwrap();
+        let sh: &str = plan
+            .actions
+            .iter()
+            .find(|a| a.path().to_string_lossy().ends_with("stage-sidecar.sh"))
+            .and_then(|a| {
+                if let crate::generate::emit::Action::Create { contents, .. } = a {
+                    Some(contents.as_str())
+                } else {
+                    None
+                }
+            })
+            .expect("stage-sidecar.sh action not found");
+        assert!(
+            sh.contains("--bin web"),
+            "staging script must detect src/bin/web/main.rs directory-style bin as 'web'"
+        );
+        assert!(
+            !sh.contains("--bin my-app"),
+            "staging script must not fall back to the package name for a directory-style bin"
         );
     }
 

@@ -98,13 +98,12 @@ is reused as the Tauri icon source automatically.
    `AUTUMN_SERVER__PORT={port}`, `AUTUMN_MANAGED_PG_DATA_DIR={app-data-dir}/db`,
    and `AUTUMN_MANIFEST_DIR={resource-dir}`. Setting the working directory is the
    key mechanism: `AutumnConfig` falls back to a CWD-relative `autumn.toml` lookup
-   when the compile-time path is absent on the installed machine. `AUTUMN_HEALTH__PATH`
-   is forced to `/health` so the readiness probe always works regardless of any
-   `[health].path` configuration in the app.
+   when the compile-time path is absent on the installed machine.
 
-3. **Wait for ready**: the setup hook polls `GET /health` (the existing autumn
-   health endpoint) over raw TCP until it gets an `HTTP/1.1 200` response or
-   times out after 30 seconds.
+3. **Wait for ready**: the setup hook sends `GET /` over raw TCP and accepts any
+   valid HTTP response (any status code) as the readiness signal, then waits up
+   to 30 seconds. Using `GET /` rather than a specific health path avoids a
+   duplicate-route panic if your app already defines a `GET /health` handler.
 
 4. **Open window**: once the server is ready, the webview navigates to
    `http://127.0.0.1:{port}`.
@@ -169,21 +168,38 @@ cargo tauri icon icons/icon.svg
 
 ## Dev workflow
 
-During development you can run the autumn server normally (`autumn dev` or
-`cargo run`) and open the Tauri shell against it:
+`cargo tauri dev` is self-contained — no separate `autumn dev` process is needed
+or should be running alongside it:
 
 ```bash
-# Terminal 1 — run the autumn server
-autumn dev
-
-# Terminal 2 — run the Tauri shell in dev mode
 cd src-tauri
 cargo tauri dev
 ```
 
-`tauri dev` hot-reloads the webview when the server's HTML changes; the
-`beforeDevCommand` in `tauri.conf.json` is intentionally left empty so
-`cargo tauri dev` does not try to start a second server instance.
+What happens:
+
+1. `beforeDevCommand` (in `tauri.linux.conf.json` / `tauri.macos.conf.json` /
+   `tauri.windows.conf.json`) runs the staging script with `"wait": true`,
+   building the autumn binary and copying it to `binaries/`.
+2. Tauri compiles the shell crate and launches it.
+3. The generated `lib.rs` spawns the staged sidecar as a child process on an
+   ephemeral loopback port, waits for it to respond to HTTP, then opens the
+   webview.
+
+**Do not** run `autumn dev` in a separate terminal alongside `cargo tauri dev`:
+the shell always spawns its own sidecar instance, so you would have two server
+processes on different ports and the webview would connect to the sidecar, not
+the external `autumn dev` server.
+
+For rapid iteration rebuild with `cargo tauri dev` again after changing server
+code. Template changes that don't affect the binary (e.g. pure CSS tweaks)
+don't require re-staging; re-run to pick them up once the binary is rebuilt.
+
+> **Note:** Tauri's webview live-reload is not applicable here because the server
+> is a supervised sidecar, not a URL the webview watches externally. Full
+> hot-reload in the sidecar model would require a separate mechanism (e.g.
+> `cargo-watch` rebuilding the sidecar binary and signalling the shell to
+> restart it) which is out of scope for the generator.
 
 ## Relationship to PWA support
 
