@@ -54,7 +54,7 @@ use super::{Flags, GenerateError, ensure_project_root};
 pub fn plan_tauri(project_root: &Path) -> Result<Plan, GenerateError> {
     ensure_project_root(project_root)?;
 
-    let (package_name, package_version, bin_name, has_embed_assets) =
+    let (package_name, package_version, bin_name, has_embed_assets, dep_key) =
         read_package_meta(project_root)?;
     let mut plan = Plan::new(project_root);
     let tauri = project_root.join("src-tauri");
@@ -115,11 +115,11 @@ pub fn plan_tauri(project_root: &Path) -> Result<Plan, GenerateError> {
     // Staging scripts
     plan.create(
         tauri.join("stage-sidecar.sh"),
-        render_stage_sidecar_sh(&package_name, &bin_name, has_embed_assets),
+        render_stage_sidecar_sh(&package_name, &bin_name, has_embed_assets, &dep_key),
     );
     plan.create(
         tauri.join("stage-sidecar.ps1"),
-        render_stage_sidecar_ps1(&package_name, &bin_name, has_embed_assets),
+        render_stage_sidecar_ps1(&package_name, &bin_name, has_embed_assets, &dep_key),
     );
     plan.create(tauri.join(".gitignore"), render_gitignore());
 
@@ -169,6 +169,34 @@ pub fn run(flags: Flags) {
 /// `--features autumn-web/embed-assets` (dep path only), so that the app's
 /// `#[cfg(feature = "embed-assets")]` guard on `.embedded_static()` is
 /// satisfied — mirroring what `autumn build --embed` does.
+/// Find the `[dependencies]` key used to depend on `package_name`.
+///
+/// Cargo feature syntax requires the *dependency key*, not the package name.
+/// An aliased dep like `autumn_web = {{ package = "autumn-web" }}` must be
+/// referenced as `autumn_web/feature`, not `autumn-web/feature`.
+/// Returns `package_name` itself when no alias is found.
+fn resolve_dep_key(doc: &toml::Value, package_name: &str) -> String {
+    let Some(deps) = doc.get("dependencies").and_then(toml::Value::as_table) else {
+        return package_name.to_owned();
+    };
+    for (key, val) in deps {
+        // Direct dependency: key matches package name.
+        if key == package_name {
+            return key.clone();
+        }
+        // Aliased dependency: table entry has `package = <package_name>`.
+        if val
+            .as_table()
+            .and_then(|t| t.get("package"))
+            .and_then(toml::Value::as_str)
+            == Some(package_name)
+        {
+            return key.clone();
+        }
+    }
+    package_name.to_owned()
+}
+
 /// Resolve the Cargo binary target name for the Tauri sidecar.
 ///
 /// Priority when `[[bin]]` entries are present:
@@ -267,7 +295,9 @@ fn resolve_bin_name(
     Ok(name.to_owned())
 }
 
-fn read_package_meta(project_root: &Path) -> Result<(String, String, String, bool), GenerateError> {
+fn read_package_meta(
+    project_root: &Path,
+) -> Result<(String, String, String, bool, String), GenerateError> {
     let cargo_path = project_root.join("Cargo.toml");
     let content = std::fs::read_to_string(&cargo_path).map_err(GenerateError::Io)?;
     let doc: toml::Value = toml::from_str(&content)
@@ -312,7 +342,12 @@ fn read_package_meta(project_root: &Path) -> Result<(String, String, String, boo
         .and_then(toml::Value::as_table)
         .is_some_and(|features| features.contains_key("embed-assets"));
 
-    Ok((name, version, bin_name, has_embed_assets_feature))
+    // Resolve the dependency key for autumn-web.  Apps may alias it (e.g.
+    // `autumn_web = { package = "autumn-web" }`); Cargo feature selectors
+    // must use the key (`autumn_web/feature`), not the package name.
+    let dep_key = resolve_dep_key(&doc, "autumn-web");
+
+    Ok((name, version, bin_name, has_embed_assets_feature, dep_key))
 }
 
 /// Walk from `project_root` upward looking for a `Cargo.toml` that declares
@@ -781,7 +816,22 @@ fn load_or_generate_signing_secret(
     // Propagate RNG failure — an all-zero secret would be trivially guessable.
     getrandom::getrandom(&mut bytes)?;
     let hex: String = bytes.iter().map(|b| format!("{{b:02x}}")).collect();
-    let _ = std::fs::write(&path, &hex);
+    // Write with restricted permissions: signing secrets must not be world-readable.
+    // On Unix create the file with mode 0600; on other platforms use the default ACLs.
+    #[cfg(unix)]
+    {{
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let _ = std::fs::OpenOptions::new()
+            .write(true).create(true).truncate(true)
+            .mode(0o600)
+            .open(&path)
+            .and_then(|mut f| f.write_all(hex.as_bytes()));
+    }}
+    #[cfg(not(unix))]
+    {{
+        let _ = std::fs::write(&path, &hex);
+    }}
     Ok(hex)
 }}
 "#
@@ -801,12 +851,18 @@ fn render_placeholder_icon_svg() -> String {
     .to_owned()
 }
 
-fn render_stage_sidecar_sh(package_name: &str, bin_name: &str, has_embed_assets: bool) -> String {
-    // Use the app-level alias when present; fall back to the crate feature path.
+fn render_stage_sidecar_sh(
+    package_name: &str,
+    bin_name: &str,
+    has_embed_assets: bool,
+    dep_key: &str,
+) -> String {
+    // dep_key is the [dependencies] key for autumn-web; may differ from the
+    // package name when the app aliases it (e.g. `autumn_web = { package = ... }`).
     let embed_feature = if has_embed_assets {
-        "embed-assets,autumn-web/managed-pg-bundled"
+        format!("embed-assets,{dep_key}/managed-pg-bundled")
     } else {
-        "autumn-web/embed-assets,autumn-web/managed-pg-bundled"
+        format!("{dep_key}/embed-assets,{dep_key}/managed-pg-bundled")
     };
     // Only fingerprint when the app-level alias exists; `autumn build --embed` passes
     // --features embed-assets (app-level), which fails for apps without that alias.
@@ -901,11 +957,16 @@ done
     )
 }
 
-fn render_stage_sidecar_ps1(package_name: &str, bin_name: &str, has_embed_assets: bool) -> String {
+fn render_stage_sidecar_ps1(
+    package_name: &str,
+    bin_name: &str,
+    has_embed_assets: bool,
+    dep_key: &str,
+) -> String {
     let embed_feature = if has_embed_assets {
-        "embed-assets,autumn-web/managed-pg-bundled"
+        format!("embed-assets,{dep_key}/managed-pg-bundled")
     } else {
-        "autumn-web/embed-assets,autumn-web/managed-pg-bundled"
+        format!("{dep_key}/embed-assets,{dep_key}/managed-pg-bundled")
     };
     let fingerprint = if has_embed_assets {
         format!(
@@ -1494,7 +1555,7 @@ mod tests {
 
     #[test]
     fn stage_sidecar_sh_uses_cargo_metadata_for_target_dir() {
-        let sh = render_stage_sidecar_sh("my-app", "my-app", true);
+        let sh = render_stage_sidecar_sh("my-app", "my-app", true, "autumn-web");
         // cargo metadata resolves the real output dir for workspace members and
         // respects CARGO_TARGET_DIR overrides.
         assert!(
@@ -1515,7 +1576,7 @@ mod tests {
 
     #[test]
     fn stage_sidecar_sh_handles_universal_apple_darwin() {
-        let sh = render_stage_sidecar_sh("my-app", "my-app", true);
+        let sh = render_stage_sidecar_sh("my-app", "my-app", true, "autumn-web");
         // universal-apple-darwin is a Tauri meta-target; cargo build --target
         // universal-apple-darwin fails because rustc doesn't know it.
         assert!(
@@ -1534,7 +1595,7 @@ mod tests {
 
     #[test]
     fn stage_sidecar_ps1_uses_cargo_metadata_for_target_dir() {
-        let ps1 = render_stage_sidecar_ps1("my-app", "my-app", true);
+        let ps1 = render_stage_sidecar_ps1("my-app", "my-app", true, "autumn-web");
         assert!(
             ps1.contains("cargo metadata"),
             "stage-sidecar.ps1 must use `cargo metadata` to locate the Cargo target directory"
@@ -1551,7 +1612,7 @@ mod tests {
 
     #[test]
     fn stage_sidecar_sh_stages_profile_configs() {
-        let sh = render_stage_sidecar_sh("my-app", "my-app", true);
+        let sh = render_stage_sidecar_sh("my-app", "my-app", true, "autumn-web");
         // Profile configs are staged at build time (beforeBuildCommand) so that the
         // static resource entries in tauri.conf.json are always satisfiable — even when
         // autumn-prod.toml is created after `autumn generate tauri` was run.
@@ -1568,7 +1629,7 @@ mod tests {
 
     #[test]
     fn stage_sidecar_ps1_stages_profile_configs() {
-        let ps1 = render_stage_sidecar_ps1("my-app", "my-app", true);
+        let ps1 = render_stage_sidecar_ps1("my-app", "my-app", true, "autumn-web");
         assert!(
             ps1.contains("src-tauri\\configs") || ps1.contains("src-tauri/configs"),
             "stage-sidecar.ps1 must create src-tauri\\configs\\ and populate it with \
@@ -1585,7 +1646,7 @@ mod tests {
     // real config because AutumnConfig stops at the first existing file in the lookup list.
     #[test]
     fn stage_sidecar_sh_copies_alias_to_both_names() {
-        let sh = render_stage_sidecar_sh("my-app", "my-app", true);
+        let sh = render_stage_sidecar_sh("my-app", "my-app", true, "autumn-web");
         // Must handle the case where only autumn-production.toml exists by copying it
         // to autumn-prod.toml as well — look for the elif + both cp lines.
         assert!(
@@ -1607,7 +1668,7 @@ mod tests {
 
     #[test]
     fn stage_sidecar_ps1_copies_alias_to_both_names() {
-        let ps1 = render_stage_sidecar_ps1("my-app", "my-app", true);
+        let ps1 = render_stage_sidecar_ps1("my-app", "my-app", true, "autumn-web");
         assert!(
             ps1.contains("autumn-production.toml") && ps1.contains("autumn-prod.toml"),
             "stage-sidecar.ps1 must handle prod/production alias pair explicitly"
@@ -1689,7 +1750,7 @@ mod tests {
 
     #[test]
     fn stage_sidecar_sh_uses_bin_name_for_binary() {
-        let sh = render_stage_sidecar_sh("my-app", "my-server", true);
+        let sh = render_stage_sidecar_sh("my-app", "my-server", true, "autumn-web");
         assert!(
             sh.contains("my-server"),
             "stage-sidecar.sh must reference the binary target name in copy commands"
@@ -1703,7 +1764,7 @@ mod tests {
 
     #[test]
     fn stage_sidecar_ps1_uses_bin_name_for_binary() {
-        let ps1 = render_stage_sidecar_ps1("my-app", "my-server", true);
+        let ps1 = render_stage_sidecar_ps1("my-app", "my-server", true, "autumn-web");
         assert!(
             ps1.contains("my-server"),
             "stage-sidecar.ps1 must reference the binary target name in copy commands"
@@ -2071,7 +2132,7 @@ mod tests {
         // When the app defines an `embed-assets` Cargo feature, the staging
         // script must pass it (not just the dep path) so that
         // `#[cfg(feature = "embed-assets")]` guards in app code are active.
-        let sh = render_stage_sidecar_sh("my-app", "my-app", true);
+        let sh = render_stage_sidecar_sh("my-app", "my-app", true, "autumn-web");
         assert!(
             sh.contains("--features embed-assets,autumn-web/managed-pg-bundled"),
             "when app has embed-assets feature the script must use the app-crate feature flag"
@@ -2080,7 +2141,7 @@ mod tests {
 
     #[test]
     fn stage_sidecar_sh_falls_back_to_dep_path_when_no_app_feature() {
-        let sh = render_stage_sidecar_sh("my-app", "my-app", false);
+        let sh = render_stage_sidecar_sh("my-app", "my-app", false, "autumn-web");
         assert!(
             sh.contains("--features autumn-web/embed-assets,autumn-web/managed-pg-bundled"),
             "without app-level embed-assets, script must use the dep feature path"
@@ -2113,7 +2174,7 @@ mod tests {
 
     #[test]
     fn stage_sidecar_sh_creates_autumn_toml_when_absent() {
-        let sh = render_stage_sidecar_sh("my-app", "my-app", true);
+        let sh = render_stage_sidecar_sh("my-app", "my-app", true, "autumn-web");
         assert!(
             sh.contains(": > autumn.toml") || sh.contains("> autumn.toml"),
             "staging script must create an empty autumn.toml when none exists \
@@ -2123,7 +2184,7 @@ mod tests {
 
     #[test]
     fn stage_sidecar_ps1_creates_autumn_toml_when_absent() {
-        let ps1 = render_stage_sidecar_ps1("my-app", "my-app", true);
+        let ps1 = render_stage_sidecar_ps1("my-app", "my-app", true, "autumn-web");
         assert!(
             ps1.contains("autumn.toml"),
             "PowerShell staging script must handle a missing autumn.toml"
@@ -2662,7 +2723,7 @@ mod tests {
 
     #[test]
     fn staging_sh_fingerprints_before_embed() {
-        let sh = render_stage_sidecar_sh("my-app", "my-app", true);
+        let sh = render_stage_sidecar_sh("my-app", "my-app", true, "autumn-web");
         let fingerprint_pos = sh.find("autumn build --embed").unwrap_or(usize::MAX);
         let cargo_pos = sh.find("cargo build --release").unwrap_or(usize::MAX);
         assert!(
@@ -2675,7 +2736,7 @@ mod tests {
 
     #[test]
     fn staging_sh_fingerprints_includes_package_name() {
-        let sh = render_stage_sidecar_sh("my-app", "my-app", true);
+        let sh = render_stage_sidecar_sh("my-app", "my-app", true, "autumn-web");
         assert!(
             sh.contains("autumn build --embed -p my-app"),
             "stage-sidecar.sh must pass -p <package> to autumn build --embed so workspace \
@@ -2685,13 +2746,106 @@ mod tests {
 
     #[test]
     fn staging_ps1_fingerprints_before_embed() {
-        let ps1 = render_stage_sidecar_ps1("my-app", "my-app", true);
+        let ps1 = render_stage_sidecar_ps1("my-app", "my-app", true, "autumn-web");
         let fingerprint_pos = ps1.find("autumn build --embed").unwrap_or(usize::MAX);
         let cargo_pos = ps1.find("cargo build --release").unwrap_or(usize::MAX);
         assert!(
             fingerprint_pos < cargo_pos,
             "stage-sidecar.ps1 must run `autumn build --embed` before the embed cargo build \
              to fingerprint static/ (mirror the 3-phase autumn build --embed process)"
+        );
+    }
+
+    #[test]
+    fn staging_sh_uses_dep_key_not_package_name_for_features() {
+        // When the app aliases autumn-web as `autumn_web = { package = "autumn-web" }`,
+        // the feature selector must use the dep key "autumn_web", not "autumn-web".
+        let sh = render_stage_sidecar_sh("my-app", "my-app", false, "autumn_web");
+        assert!(
+            sh.contains("autumn_web/embed-assets"),
+            "stage-sidecar.sh must use the dependency key 'autumn_web' in feature selectors, \
+             not the package name 'autumn-web'; got: {sh}"
+        );
+        assert!(
+            sh.contains("autumn_web/managed-pg-bundled"),
+            "stage-sidecar.sh must use the dependency key 'autumn_web' for managed-pg feature; \
+             got: {sh}"
+        );
+    }
+
+    #[test]
+    fn staging_sh_with_embed_assets_uses_dep_key_for_managed_pg() {
+        let sh = render_stage_sidecar_sh("my-app", "my-app", true, "autumn_web");
+        // The app-level embed-assets feature stays as-is; only dep features use the key.
+        assert!(
+            sh.contains("embed-assets,autumn_web/managed-pg-bundled"),
+            "with has_embed_assets=true and dep_key='autumn_web', the feature string must be \
+             'embed-assets,autumn_web/managed-pg-bundled'"
+        );
+    }
+
+    #[test]
+    fn staging_ps1_uses_dep_key_not_package_name_for_features() {
+        let ps1 = render_stage_sidecar_ps1("my-app", "my-app", false, "autumn_web");
+        assert!(
+            ps1.contains("autumn_web/embed-assets") && ps1.contains("autumn_web/managed-pg-bundled"),
+            "stage-sidecar.ps1 must use the dependency key 'autumn_web' in feature selectors"
+        );
+    }
+
+    #[test]
+    fn plan_uses_dep_key_alias_in_staging_scripts() {
+        // An app that aliases autumn-web as autumn_web must generate staging scripts
+        // with the correct feature key; cargo fails with "Package 'foo' does not have
+        // feature 'autumn-web/managed-pg-bundled'" when the package name is used.
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[package]\nname=\"my-app\"\nversion=\"0.1.0\"\nedition=\"2024\"\n\
+             \n[dependencies]\nautumn_web = { package = \"autumn-web\", version = \"0.5\" }\n",
+        )
+        .unwrap();
+        fs::create_dir_all(tmp.path().join("src")).unwrap();
+        fs::write(tmp.path().join("src/main.rs"), "fn main() {}\n").unwrap();
+        let plan = plan_tauri(tmp.path()).unwrap();
+        let sh: &str = plan
+            .actions
+            .iter()
+            .find(|a| a.path().to_string_lossy().ends_with("stage-sidecar.sh"))
+            .and_then(|a| {
+                if let crate::generate::emit::Action::Create { contents, .. } = a {
+                    Some(contents.as_str())
+                } else {
+                    None
+                }
+            })
+            .expect("stage-sidecar.sh action not found");
+        assert!(
+            sh.contains("autumn_web/managed-pg-bundled"),
+            "stage-sidecar.sh must use the dep key 'autumn_web' (not package name 'autumn-web') \
+             when the app aliases the dependency; got: {sh}"
+        );
+        assert!(
+            !sh.contains("autumn-web/managed-pg-bundled"),
+            "stage-sidecar.sh must not contain 'autumn-web/managed-pg-bundled' when the dep is \
+             aliased as 'autumn_web'; Cargo would reject it with 'Package does not have feature'"
+        );
+    }
+
+    #[test]
+    fn lib_rs_writes_signing_secret_with_restricted_permissions() {
+        let lib = render_shell_lib_rs("my-app", "my-app");
+        // The generated code must use platform-specific file creation so the secret
+        // is not world-readable on Unix (default umask 022 → 0644).
+        assert!(
+            lib.contains("0o600") || lib.contains("OpenOptionsExt"),
+            "load_or_generate_signing_secret must write the secret file with mode 0600 on Unix; \
+             std::fs::write uses the default umask and leaves the file world-readable"
+        );
+        assert!(
+            lib.contains("#[cfg(unix)]"),
+            "signing secret write must be gated on #[cfg(unix)] to use mode 0600 there \
+             while falling back to platform defaults elsewhere"
         );
     }
 
