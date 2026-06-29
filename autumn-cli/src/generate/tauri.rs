@@ -169,6 +169,104 @@ pub fn run(flags: Flags) {
 /// `--features autumn-web/embed-assets` (dep path only), so that the app's
 /// `#[cfg(feature = "embed-assets")]` guard on `.embedded_static()` is
 /// satisfied — mirroring what `autumn build --embed` does.
+/// Resolve the Cargo binary target name for the Tauri sidecar.
+///
+/// Priority when `[[bin]]` entries are present:
+///
+///   1. `[package] default-run` — the developer's explicit selection.
+///   2. An explicit `[[bin]]` whose path resolves to `src/main.rs`.
+///   3. `src/main.rs` on disk (only when `autobins != false`).
+///   4. Single `[[bin]]` → use it; multiple without `default-run` → error.
+///
+/// When there are no `[[bin]]` entries:
+///
+///   5. `default-run` → `src/main.rs` (autobins guard) → `src/bin/` discovery.
+fn resolve_bin_name(
+    project_root: &Path,
+    name: &str,
+    default_run: Option<&str>,
+    autobins: bool,
+    doc: &toml::Value,
+) -> Result<String, GenerateError> {
+    if let Some(bins) = doc.get("bin").and_then(toml::Value::as_array) {
+        if let Some(dr) = default_run {
+            return Ok(dr.to_owned());
+        }
+        let main_bin = bins.iter().find(|b| {
+            b.get("path").and_then(|p| p.as_str()).is_some_and(|p| {
+                let segs: Vec<&str> = p
+                    .split(['/', '\\'])
+                    .filter(|&s| !s.is_empty() && s != ".")
+                    .collect();
+                segs == ["src", "main.rs"]
+            })
+        });
+        if let Some(n) = main_bin
+            .and_then(|b| b.get("name"))
+            .and_then(|n| n.as_str())
+        {
+            return Ok(n.to_owned());
+        }
+        if autobins && project_root.join("src/main.rs").is_file() {
+            return Ok(name.to_owned());
+        }
+        if bins.len() > 1 {
+            let mut names: Vec<&str> = bins
+                .iter()
+                .filter_map(|b| b.get("name").and_then(|n| n.as_str()))
+                .collect();
+            names.sort_unstable();
+            return Err(GenerateError::Config(format!(
+                "ambiguous sidecar target: found multiple explicit [[bin]] entries ({}) \
+                 and no [package] default-run is set; add `default-run = \"<bin>\"` to \
+                 Cargo.toml to select one",
+                names.join(", ")
+            )));
+        }
+        return Ok(bins
+            .first()
+            .and_then(|b| b.get("name"))
+            .and_then(|n| n.as_str())
+            .map_or_else(|| name.to_owned(), str::to_owned));
+    }
+    if let Some(dr) = default_run {
+        return Ok(dr.to_owned());
+    }
+    if autobins && project_root.join("src/main.rs").is_file() {
+        return Ok(name.to_owned());
+    }
+    if let Ok(entries) = std::fs::read_dir(project_root.join("src/bin")) {
+        let stems: Vec<String> = entries
+            .filter_map(std::result::Result::ok)
+            .filter_map(|e| {
+                let p = e.path();
+                if p.extension().is_some_and(|x| x == "rs") {
+                    p.file_stem().and_then(|s| s.to_str()).map(str::to_owned)
+                } else if p.is_dir() && p.join("main.rs").is_file() {
+                    p.file_name().and_then(|s| s.to_str()).map(str::to_owned)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        match stems.len() {
+            1 => return Ok(stems.into_iter().next().unwrap()),
+            0 => {}
+            _ => {
+                let mut sorted = stems;
+                sorted.sort();
+                return Err(GenerateError::Config(format!(
+                    "ambiguous sidecar target: found multiple auto-discovered \
+                     src/bin/ binaries ({}) and no [package] default-run is set; \
+                     add `default-run = \"<bin>\"` to Cargo.toml to select one",
+                    sorted.join(", ")
+                )));
+            }
+        }
+    }
+    Ok(name.to_owned())
+}
+
 fn read_package_meta(project_root: &Path) -> Result<(String, String, String, bool), GenerateError> {
     let cargo_path = project_root.join("Cargo.toml");
     let content = std::fs::read_to_string(&cargo_path).map_err(GenerateError::Io)?;
@@ -194,114 +292,15 @@ fn read_package_meta(project_root: &Path) -> Result<(String, String, String, boo
         _ => "0.1.0".to_owned(),
     };
 
-    // Derive the binary target name from [[bin]] sections.  When a custom name
-    // is set, `cargo build` writes that name (not the package name) under
-    // `target/.../release/`.
-    //
-    // Priority when [[bin]] entries are present:
-    //   1. `[package] default-run` — the developer's explicit selection; takes
-    //      precedence over any auto-discovered src/main.rs target.
-    //   2. A [[bin]] entry whose path is explicitly `src/main.rs` (renamed main).
-    //   3. If `src/main.rs` exists on disk but isn't in [[bin]], Cargo auto-discovers
-    //      it under the package name; any explicit [[bin]] entries are auxiliary bins.
-    //   4. `bins.first()` — last resort when only one [[bin]] is declared.
-    // When there are no [[bin]] entries:
-    //   5. `default-run` first, then `src/main.rs`, then `src/bin/` discovery.
     let default_run = pkg
         .get("default-run")
         .and_then(|v| v.as_str())
         .map(str::to_owned);
-    // Resolve bin name in a Result-returning block so ambiguous cases can error.
-    let bin_name: String = (|| -> Result<String, GenerateError> {
-        if let Some(bins) = doc.get("bin").and_then(|b| b.as_array()) {
-            // Step 1: honour [package] default-run — the developer's explicit selection.
-            // Must come before src/main.rs auto-discovery so a project that has
-            // src/main.rs *plus* explicit [[bin]] targets and sets default-run = "web"
-            // stages the declared default, not the package-named auto-discovered bin.
-            if let Some(dr) = &default_run {
-                return Ok(dr.clone());
-            }
-            // Step 2: explicit [[bin]] entry whose path resolves to src/main.rs.
-            // Canonicalize by splitting on both separators and filtering empty and
-            // CurDir (".") segments so "src/./main.rs", "./src/main.rs", and
-            // "src/main.rs" all match identically.
-            let main_bin = bins.iter().find(|b| {
-                b.get("path").and_then(|p| p.as_str()).is_some_and(|p| {
-                    let segs: Vec<&str> = p
-                        .split(['/', '\\'])
-                        .filter(|&s| !s.is_empty() && s != ".")
-                        .collect();
-                    segs == ["src", "main.rs"]
-                })
-            });
-            if let Some(n) = main_bin
-                .and_then(|b| b.get("name"))
-                .and_then(|n| n.as_str())
-            {
-                return Ok(n.to_owned());
-            }
-            // Step 3: src/main.rs exists but is not declared in [[bin]];
-            // Cargo auto-discovers it as the package-named binary.
-            if project_root.join("src/main.rs").is_file() {
-                return Ok(name.clone());
-            }
-            // Step 4: first explicit [[bin]] as last resort.
-            return Ok(bins
-                .first()
-                .and_then(|b| b.get("name"))
-                .and_then(|n| n.as_str())
-                .map_or_else(|| name.clone(), str::to_owned));
-        }
-        // Step 5: no [[bin]] table — honour default-run, then check src/main.rs,
-        // then src/bin/ discovery; error on ambiguous multi-bin packages.
-        if let Some(dr) = &default_run {
-            return Ok(dr.clone());
-        }
-        // Step 5a: src/main.rs exists → Cargo auto-discovers it as the
-        // package-named binary, even when src/bin/ also has files.
-        if project_root.join("src/main.rs").is_file() {
-            return Ok(name.clone());
-        }
-        // Inspect src/bin/ for auto-discovered binaries.  Cargo names each
-        // binary after the file stem (for `src/bin/web.rs`) or the directory
-        // name (for `src/bin/web/main.rs`), not the package name.
-        if let Ok(entries) = std::fs::read_dir(project_root.join("src/bin")) {
-            let stems: Vec<String> = entries
-                .filter_map(std::result::Result::ok)
-                .filter_map(|e| {
-                    let p = e.path();
-                    if p.extension().is_some_and(|x| x == "rs") {
-                        // Flat file: src/bin/web.rs → "web"
-                        p.file_stem().and_then(|s| s.to_str()).map(str::to_owned)
-                    } else if p.is_dir() && p.join("main.rs").is_file() {
-                        // Directory-style: src/bin/web/main.rs → "web"
-                        p.file_name().and_then(|s| s.to_str()).map(str::to_owned)
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-            match stems.len() {
-                1 => return Ok(stems.into_iter().next().unwrap()),
-                0 => {}
-                _ => {
-                    // Multiple src/bin/ targets with no default-run: Cargo cannot
-                    // build `--bin <package>` because that name doesn't exist.
-                    // Fail fast so the developer sees a clear error rather than
-                    // staging scripts that reference a nonexistent binary.
-                    let mut sorted = stems;
-                    sorted.sort();
-                    return Err(GenerateError::Config(format!(
-                        "ambiguous sidecar target: found multiple auto-discovered \
-                         src/bin/ binaries ({}) and no [package] default-run is set; \
-                         add `default-run = \"<bin>\"` to Cargo.toml to select one",
-                        sorted.join(", ")
-                    )));
-                }
-            }
-        }
-        Ok(name.clone())
-    })()?;
+    let autobins = pkg
+        .get("autobins")
+        .and_then(toml::Value::as_bool)
+        .unwrap_or(true);
+    let bin_name = resolve_bin_name(project_root, &name, default_run.as_deref(), autobins, &doc)?;
 
     // Check whether the app defines an `embed-assets` Cargo feature.
     // `autumn new` generates this; it typically expands to
@@ -1271,6 +1270,55 @@ mod tests {
         tmp
     }
 
+    /// Project with `autobins = false` and one explicit `[[bin]]`, plus `src/main.rs`.
+    /// With autobins disabled, Cargo does NOT auto-discover `src/main.rs`; the
+    /// generator must use the explicit bin name, not the package name.
+    fn project_with_autobins_false(pkg_name: &str, bin_name: &str) -> TempDir {
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join("Cargo.toml"),
+            format!(
+                "[package]\nname=\"{pkg_name}\"\nversion=\"0.1.0\"\nedition=\"2024\"\n\
+                 autobins=false\n\
+                 \n[[bin]]\nname=\"{bin_name}\"\npath=\"src/{bin_name}.rs\"\n\
+                 \n[dependencies]\nautumn-web = \"0.5.0\"\n"
+            ),
+        )
+        .unwrap();
+        fs::create_dir_all(tmp.path().join("src")).unwrap();
+        // src/main.rs exists but is NOT a Cargo target because autobins=false.
+        fs::write(tmp.path().join("src/main.rs"), "fn main() {}\n").unwrap();
+        fs::write(
+            tmp.path().join(format!("src/{bin_name}.rs")),
+            "fn main() {}\n",
+        )
+        .unwrap();
+        tmp
+    }
+
+    /// Project with multiple explicit `[[bin]]` entries, no `default-run`, and no
+    /// `src/main.rs`.  The generator must error rather than silently pick the first bin.
+    fn project_with_multiple_bins_no_default(pkg_name: &str, bins: &[&str]) -> TempDir {
+        let tmp = TempDir::new().unwrap();
+        let bin_sections = bins.iter().fold(String::new(), |mut acc, b| {
+            write!(acc, "\n[[bin]]\nname=\"{b}\"\npath=\"src/{b}.rs\"\n").unwrap();
+            acc
+        });
+        fs::write(
+            tmp.path().join("Cargo.toml"),
+            format!(
+                "[package]\nname=\"{pkg_name}\"\nversion=\"0.1.0\"\nedition=\"2024\"\
+                 {bin_sections}\n[dependencies]\nautumn-web = \"0.5.0\"\n"
+            ),
+        )
+        .unwrap();
+        fs::create_dir_all(tmp.path().join("src")).unwrap();
+        for b in bins {
+            fs::write(tmp.path().join(format!("src/{b}.rs")), "fn main() {}\n").unwrap();
+        }
+        tmp
+    }
+
     fn project_with_workspace_version(pkg_name: &str, ws_version: &str) -> TempDir {
         let tmp = TempDir::new().unwrap();
         fs::write(
@@ -1911,6 +1959,54 @@ mod tests {
         assert!(
             !sh.contains("--bin worker"),
             "staging script must not use the src/bin/ stem 'worker' when src/main.rs is present"
+        );
+    }
+
+    #[test]
+    fn plan_respects_autobins_false_ignores_main_rs() {
+        // autobins=false disables src/main.rs auto-discovery.  The explicit [[bin]]
+        // target must be used even though src/main.rs exists.
+        let tmp = project_with_autobins_false("my-app", "web");
+        let plan = plan_tauri(tmp.path()).unwrap();
+        let sh: &str = plan
+            .actions
+            .iter()
+            .find(|a| a.path().to_string_lossy().ends_with("stage-sidecar.sh"))
+            .and_then(|a| {
+                if let crate::generate::emit::Action::Create { contents, .. } = a {
+                    Some(contents.as_str())
+                } else {
+                    None
+                }
+            })
+            .expect("stage-sidecar.sh action not found");
+        assert!(
+            sh.contains("--bin web"),
+            "with autobins=false the explicit [[bin]] name 'web' must be used; \
+             src/main.rs is not a Cargo target when autobins is disabled"
+        );
+        assert!(
+            !sh.contains("--bin my-app"),
+            "with autobins=false the package name 'my-app' must NOT be used; \
+             there is no auto-discovered binary for src/main.rs"
+        );
+    }
+
+    #[test]
+    fn plan_errors_on_multiple_explicit_bins_without_default_run() {
+        // Multiple [[bin]] entries with no default-run and no src/main.rs must error
+        // rather than silently pick the first entry (which may be an auxiliary binary).
+        let tmp = project_with_multiple_bins_no_default("my-app", &["worker", "web"]);
+        let err = plan_tauri(tmp.path()).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("ambiguous") || msg.contains("default-run"),
+            "expected an ambiguous-sidecar error when multiple explicit [[bin]] entries \
+             exist and no default-run is set; got: {msg}"
+        );
+        assert!(
+            msg.contains("web") && msg.contains("worker"),
+            "error message must list the ambiguous bin names; got: {msg}"
         );
     }
 
