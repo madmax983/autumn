@@ -127,6 +127,8 @@ fn normalize_exclusions(exclude: Vec<String>) -> Arc<[String]> {
             let trimmed = prefix.trim_end_matches('/');
             if trimmed.len() == prefix.len() {
                 prefix
+            } else if trimmed.is_empty() {
+                "/".to_owned()
             } else {
                 trimmed.to_owned()
             }
@@ -324,7 +326,13 @@ mod tests {
     #[test]
     fn empty_or_slash_only_prefixes_exclude_nothing() {
         assert!(!is_excluded("/users/1", &exclude(&[""])));
-        assert!(!is_excluded("/users/1", &exclude(&["/"])));
         assert!(!is_excluded("/users/1", &[]));
+    }
+
+    #[test]
+    fn is_excluded_handles_root_path_correctly() {
+        assert!(is_excluded("/", &exclude(&["/"])));
+        assert!(is_excluded("/", &exclude(&["", "/"])));
+        assert!(!is_excluded("/", &exclude(&["/health"])));
     }
 }
