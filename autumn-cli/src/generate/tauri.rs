@@ -58,25 +58,10 @@ pub fn plan_tauri(project_root: &Path) -> Result<Plan, GenerateError> {
     let mut plan = Plan::new(project_root);
     let tauri = project_root.join("src-tauri");
 
-    // Detect profile override config files that exist now so they can be bundled
-    // as concrete Tauri resources.  A glob entry would cause `cargo tauri build` to
-    // fail with GlobPathNotFound when no files match (common for fresh projects).
-    let profile_configs: Vec<String> = [
-        "autumn-prod.toml",
-        "autumn-production.toml",
-        "autumn-staging.toml",
-        "autumn-development.toml",
-        "autumn-test.toml",
-    ]
-    .iter()
-    .filter(|f| project_root.join(f).is_file())
-    .map(|f| (*f).to_owned())
-    .collect();
-
     // Core Tauri project files
     plan.create(
         tauri.join("tauri.conf.json"),
-        render_tauri_conf(&package_name, &profile_configs),
+        render_tauri_conf(&package_name),
     );
     plan.create(
         tauri.join("Cargo.toml"),
@@ -162,7 +147,7 @@ fn read_package_name(project_root: &Path) -> Result<String, GenerateError> {
 
 // ── Content renderers ─────────────────────────────────────────────────────────
 
-fn render_tauri_conf(package_name: &str, profile_configs: &[String]) -> String {
+fn render_tauri_conf(package_name: &str) -> String {
     // Bundle identifier: reverse-DNS with underscores replaced by hyphens.
     // Apple's spec allows only alphanumerics, hyphens, and periods — underscores are invalid.
     let identifier = format!("com.example.{}", package_name.replace('_', "-"));
@@ -188,14 +173,13 @@ fn render_tauri_conf(package_name: &str, profile_configs: &[String]) -> String {
     } else {
         "bash stage-sidecar.sh"
     };
-    // Concrete resource entries for profile config files that exist at plan time.
-    // We emit only files that are present so Tauri doesn't fail with GlobPathNotFound
-    // when no profile overrides exist (the common case for fresh projects).
-    let profile_resources: String = profile_configs.iter().fold(String::new(), |mut acc, f| {
-        use std::fmt::Write as _;
-        let _ = write!(acc, ",\n      \"../{f}\": \"{f}\"");
-        acc
-    });
+    // Profile config entries always point to src-tauri/configs/, which the staging
+    // script (beforeBuildCommand) populates at build time — copying real files or
+    // creating empty stubs for profiles that don't yet exist.  An empty TOML file
+    // is valid and results in no overrides (AutumnConfig treats it as a no-op).
+    // This keeps the resource list in sync regardless of when profile files are created,
+    // avoiding the silent loss of production settings when autumn-prod.toml is added
+    // after `autumn generate tauri` was run.
     format!(
         r#"{{
   "$schema": "https://schema.tauri.app/config/2",
@@ -220,7 +204,12 @@ fn render_tauri_conf(package_name: &str, profile_configs: &[String]) -> String {
       "binaries/{package_name}"
     ],
     "resources": {{
-      "../autumn.toml": "autumn.toml"{profile_resources}
+      "../autumn.toml": "autumn.toml",
+      "configs/autumn-prod.toml": "autumn-prod.toml",
+      "configs/autumn-production.toml": "autumn-production.toml",
+      "configs/autumn-staging.toml": "autumn-staging.toml",
+      "configs/autumn-development.toml": "autumn-development.toml",
+      "configs/autumn-test.toml": "autumn-test.toml"
     }}
   }},
   "app": {{
@@ -289,6 +278,8 @@ fn render_shell_lib_rs(package_name: &str) -> String {
 //!   2. Spawn the autumn server sidecar with `AUTUMN_SERVER__PORT` set to that port.
 //!      `AUTUMN_MANAGED_PG_DATA_DIR` is set to `<app-data-dir>/db` so the managed
 //!      Postgres cluster (autumn feature #1119) persists across restarts.
+//!      `AUTUMN_MANAGED_PG_ATTACH_URL` is cleared so an inherited attach URL cannot
+//!      redirect the sidecar to a foreign cluster instead of the bundled one.
 //!   3. Poll GET /health in a background thread until the server is ready (up to 30 s),
 //!      then open the webview window pointing at http://127.0.0.1:<port>.
 //!      On timeout, the app exits with a non-zero code rather than showing a blank window.
@@ -320,19 +311,27 @@ pub fn run() {{
                         .unwrap()
                         .take()
                     {{
-                        // Send SIGTERM first so autumn's on_shutdown hooks run
-                        // (including ManagedPostgresPoolProvider::stop() if wired).
-                        // Fall back to SIGKILL / TerminateProcess after 3 s.
-                        #[cfg(unix)]
-                        let graceful_pid = child.pid() as i32;
+                        // Send a graceful shutdown signal so autumn's on_shutdown
+                        // hooks run (including ManagedPostgresPoolProvider::stop()).
+                        // Fall back to force-kill after 3 s on all platforms.
+                        let graceful_pid = child.pid();
                         std::thread::spawn(move || {{
+                            // Unix: SIGTERM triggers autumn's tokio signal handler.
                             #[cfg(unix)]
                             {{
                                 let _ = std::process::Command::new("kill")
                                     .args(["-TERM", &graceful_pid.to_string()])
                                     .status();
-                                std::thread::sleep(std::time::Duration::from_secs(3));
                             }}
+                            // Windows: taskkill without /f sends CTRL_CLOSE_EVENT /
+                            // WM_CLOSE for a graceful-termination attempt.
+                            #[cfg(windows)]
+                            {{
+                                let _ = std::process::Command::new("taskkill")
+                                    .args(["/pid", &graceful_pid.to_string()])
+                                    .status();
+                            }}
+                            std::thread::sleep(std::time::Duration::from_secs(3));
                             let _ = child.kill();
                         }});
                     }}
@@ -554,6 +553,18 @@ else
        "src-tauri/binaries/{package_name}-${{TARGET_TRIPLE}}"
     echo "Staged: src-tauri/binaries/{package_name}-${{TARGET_TRIPLE}}"
 fi
+# Stage profile config files so tauri.conf.json's static resource entries are
+# always satisfiable at bundle time, regardless of when the files were created
+# relative to when `autumn generate tauri` was run.  An empty TOML file is
+# valid and results in no overrides; AutumnConfig treats it as a no-op.
+mkdir -p src-tauri/configs
+for f in autumn-prod.toml autumn-production.toml autumn-staging.toml autumn-development.toml autumn-test.toml; do
+    if [ -f "$f" ]; then
+        cp "$f" "src-tauri/configs/$f"
+    else
+        : > "src-tauri/configs/$f"
+    fi
+done
 "#
     )
 }
@@ -592,12 +603,24 @@ New-Item -ItemType Directory -Force -Path src-tauri\binaries | Out-Null
 Copy-Item "$TargetDir\$TargetTriple\release\{package_name}.exe" `
           "src-tauri\binaries\{package_name}-$TargetTriple.exe"
 Write-Host "Staged: src-tauri/binaries/{package_name}-$TargetTriple.exe"
+# Stage profile config files so tauri.conf.json's static resource entries are
+# always satisfiable at bundle time, regardless of when the files were created
+# relative to when `autumn generate tauri` was run.  An empty TOML file is
+# valid and results in no overrides; AutumnConfig treats it as a no-op.
+New-Item -ItemType Directory -Force -Path src-tauri\configs | Out-Null
+foreach ($f in @("autumn-prod.toml", "autumn-production.toml", "autumn-staging.toml", "autumn-development.toml", "autumn-test.toml")) {{
+    if (Test-Path $f) {{
+        Copy-Item $f "src-tauri\configs\$f"
+    }} else {{
+        New-Item -ItemType File -Force -Path "src-tauri\configs\$f" | Out-Null
+    }}
+}}
 "#
     )
 }
 
 fn render_gitignore() -> String {
-    "/target\n/binaries\n/gen\n".to_owned()
+    "/target\n/binaries\n/configs\n/gen\n".to_owned()
 }
 
 /// Human-readable prerequisites message printed after a successful scaffold.
@@ -840,6 +863,37 @@ mod tests {
     }
 
     #[test]
+    fn stage_sidecar_sh_stages_profile_configs() {
+        let sh = render_stage_sidecar_sh("my-app");
+        // Profile configs are staged at build time (beforeBuildCommand) so that the
+        // static resource entries in tauri.conf.json are always satisfiable — even when
+        // autumn-prod.toml is created after `autumn generate tauri` was run.
+        assert!(
+            sh.contains("src-tauri/configs"),
+            "stage-sidecar.sh must create src-tauri/configs/ and populate it with \
+             profile config files (or empty stubs) so tauri.conf.json resource entries resolve"
+        );
+        assert!(
+            sh.contains("autumn-prod.toml"),
+            "stage-sidecar.sh must stage autumn-prod.toml into configs/"
+        );
+    }
+
+    #[test]
+    fn stage_sidecar_ps1_stages_profile_configs() {
+        let ps1 = render_stage_sidecar_ps1("my-app");
+        assert!(
+            ps1.contains("src-tauri\\configs") || ps1.contains("src-tauri/configs"),
+            "stage-sidecar.ps1 must create src-tauri\\configs\\ and populate it with \
+             profile config files (or empty stubs)"
+        );
+        assert!(
+            ps1.contains("autumn-prod.toml"),
+            "stage-sidecar.ps1 must stage autumn-prod.toml into configs\\"
+        );
+    }
+
+    #[test]
     fn plan_creates_gitignore() {
         let tmp = project("my-app");
         assert!(has_action(&tmp, "src-tauri/.gitignore"));
@@ -871,7 +925,7 @@ mod tests {
 
     #[test]
     fn tauri_conf_is_valid_json() {
-        let conf = render_tauri_conf("my-app", &[]);
+        let conf = render_tauri_conf("my-app");
         let parsed: serde_json::Value =
             serde_json::from_str(&conf).expect("tauri.conf.json must be valid JSON");
         assert!(parsed.is_object());
@@ -879,7 +933,7 @@ mod tests {
 
     #[test]
     fn tauri_conf_has_identifier() {
-        let conf = render_tauri_conf("my-app", &[]);
+        let conf = render_tauri_conf("my-app");
         let parsed: serde_json::Value = serde_json::from_str(&conf).unwrap();
         assert!(
             parsed["identifier"].is_string(),
@@ -893,7 +947,7 @@ mod tests {
 
     #[test]
     fn tauri_conf_has_product_name() {
-        let conf = render_tauri_conf("my-app", &[]);
+        let conf = render_tauri_conf("my-app");
         let parsed: serde_json::Value = serde_json::from_str(&conf).unwrap();
         assert!(
             parsed["productName"].is_string(),
@@ -903,7 +957,7 @@ mod tests {
 
     #[test]
     fn tauri_conf_has_external_bin() {
-        let conf = render_tauri_conf("my-app", &[]);
+        let conf = render_tauri_conf("my-app");
         let parsed: serde_json::Value = serde_json::from_str(&conf).unwrap();
         let bins = parsed["bundle"]["externalBin"]
             .as_array()
@@ -918,7 +972,7 @@ mod tests {
 
     #[test]
     fn tauri_conf_has_icon_array() {
-        let conf = render_tauri_conf("my-app", &[]);
+        let conf = render_tauri_conf("my-app");
         let parsed: serde_json::Value = serde_json::from_str(&conf).unwrap();
         let icons = parsed["bundle"]["icon"]
             .as_array()
@@ -932,7 +986,7 @@ mod tests {
 
     #[test]
     fn tauri_conf_has_before_build_command() {
-        let conf = render_tauri_conf("my-app", &[]);
+        let conf = render_tauri_conf("my-app");
         let parsed: serde_json::Value = serde_json::from_str(&conf).unwrap();
         let cmd = parsed["build"]["beforeBuildCommand"]
             .as_str()
@@ -1128,18 +1182,22 @@ mod tests {
     }
 
     #[test]
-    fn lib_rs_sends_sigterm_before_kill() {
+    fn lib_rs_sends_graceful_shutdown_signal_before_kill() {
         let lib = render_shell_lib_rs("my-app");
-        // Graceful SIGTERM lets autumn's on_shutdown hooks run (including pg.stop()).
-        // Force-kill is the fallback after a timeout.
+        // Graceful shutdown lets autumn's on_shutdown hooks run (including pg.stop()).
+        // Force-kill is the fallback after a timeout.  Both Unix (SIGTERM) and Windows
+        // (taskkill without /f) paths must be present for cross-platform correctness.
         assert!(
             lib.contains("SIGTERM") || lib.contains("-TERM"),
-            "lib.rs on_window_event must send SIGTERM before force-killing the sidecar \
-             so ManagedPostgresPoolProvider::stop() runs during graceful shutdown"
+            "lib.rs on_window_event must send SIGTERM on Unix before force-killing"
+        );
+        assert!(
+            lib.contains("taskkill"),
+            "lib.rs on_window_event must use taskkill on Windows for graceful shutdown"
         );
         assert!(
             lib.contains("pid()"),
-            "lib.rs must call child.pid() to get the sidecar PID for SIGTERM"
+            "lib.rs must call child.pid() to get the sidecar PID for signal/taskkill"
         );
     }
 
@@ -1168,7 +1226,7 @@ mod tests {
 
     #[test]
     fn tauri_conf_bundles_autumn_toml_as_resource() {
-        let conf = render_tauri_conf("my-app", &[]);
+        let conf = render_tauri_conf("my-app");
         let parsed: serde_json::Value = serde_json::from_str(&conf).unwrap();
         // Tauri v2 resources must be a map { source_path: dest_path }, not an array.
         let resources = parsed["bundle"]["resources"]
@@ -1182,14 +1240,23 @@ mod tests {
             "tauri.conf.json must bundle autumn.toml as a resource so the installed \
              sidecar can find the app's production configuration"
         );
-        // With no profile configs passed, resources should contain only the base entry.
-        // A glob entry must NOT be emitted because it causes GlobPathNotFound failures
-        // in cargo tauri build when no profile files exist.
+        // No glob entries — globs cause GlobPathNotFound when no files match.
         let has_glob = resources.iter().any(|(k, _)| k.contains('*'));
         assert!(
             !has_glob,
             "tauri.conf.json must not emit resource glob entries — Tauri fails with \
              GlobPathNotFound when the glob matches no files (common for fresh projects)"
+        );
+        // Profile configs must always be included from configs/ so they are bundled
+        // regardless of when the files were created relative to `autumn generate tauri`.
+        // The staging script creates the files (or empty stubs) at build time.
+        let has_prod = resources
+            .keys()
+            .any(|k| k.contains("configs/") && k.contains("prod"));
+        assert!(
+            has_prod,
+            "tauri.conf.json must include profile config entries from configs/ so \
+             autumn-prod.toml is bundled even when added after `autumn generate tauri`"
         );
     }
 
@@ -1208,7 +1275,7 @@ mod tests {
 
     #[test]
     fn tauri_conf_identifier_replaces_underscores() {
-        let conf = render_tauri_conf("my_app", &[]);
+        let conf = render_tauri_conf("my_app");
         let parsed: serde_json::Value = serde_json::from_str(&conf).unwrap();
         let id = parsed["identifier"].as_str().unwrap();
         assert!(
@@ -1223,7 +1290,7 @@ mod tests {
 
     #[test]
     fn tauri_conf_security_is_under_app() {
-        let conf = render_tauri_conf("my-app", &[]);
+        let conf = render_tauri_conf("my-app");
         let parsed: serde_json::Value = serde_json::from_str(&conf).unwrap();
         assert!(
             parsed["app"]["security"].is_object(),
@@ -1466,6 +1533,10 @@ mod tests {
             gi.contains("/binaries"),
             ".gitignore must exclude /binaries"
         );
+        assert!(
+            gi.contains("/configs"),
+            ".gitignore must exclude /configs (staging area for profile config files)"
+        );
     }
 
     #[test]
@@ -1586,7 +1657,7 @@ mod tests {
 
     #[test]
     fn tauri_conf_product_name_handles_underscore_separator() {
-        let conf = render_tauri_conf("my_app", &[]);
+        let conf = render_tauri_conf("my_app");
         let parsed: serde_json::Value = serde_json::from_str(&conf).unwrap();
         let name = parsed["productName"].as_str().unwrap();
         assert!(
