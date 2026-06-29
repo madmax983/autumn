@@ -1458,9 +1458,9 @@ fn edit_value_expr(field: &Field) -> String {
 /// Produce the cell-body expression for a data_table column closure.
 ///
 /// Every arm must evaluate to a type that implements `maud::Render` (`&str`,
-/// `String`, `Cow<str>`, integers, `bool`). `Option<T>`, chrono types, `Uuid`,
-/// `Vec<u8>`, and `Blob` do NOT implement `Render`, so we always coerce via
-/// `to_string()` / `unwrap_or_default()`.
+/// `String`, `Cow<str>`, integers). `bool`, `Option<T>`, chrono types, `Uuid`,
+/// `Vec<u8>`, and `Blob` do NOT implement `Render` in maud 0.27, so we always
+/// coerce via `to_string()` / `unwrap_or_default()`.
 fn cell_value_expr(field: &Field) -> String {
     let name = &field.name;
     match (field.nullable, field.kind) {
@@ -1473,16 +1473,22 @@ fn cell_value_expr(field: &Field) -> String {
                 "row.{name}.as_ref().map(|v| String::from_utf8_lossy(v).to_string()).unwrap_or_default()"
             )
         }
+        // Nullable String/Text: use as_deref to avoid heap allocation.
+        (true, FieldKind::String | FieldKind::Text) => {
+            format!("row.{name}.as_deref().unwrap_or_default()")
+        }
         // Nullable: Option<T> — no Render impl; unwrap to String.
         (true, _) => format!("row.{name}.as_ref().map(ToString::to_string).unwrap_or_default()"),
         // Non-nullable Bytea: Cow<str> does implement Render.
         (false, FieldKind::Bytea) => format!("String::from_utf8_lossy(&row.{name})"),
         // String/Text: implement Render directly.
         (false, FieldKind::String | FieldKind::Text) => format!("row.{name}.as_str()"),
-        // Numerics and bool: implement Render directly.
-        (false, FieldKind::I32 | FieldKind::I64 | FieldKind::F32 | FieldKind::F64 | FieldKind::Bool) => {
+        // Numerics (i32, i64, f32, f64): implement Render directly.
+        (false, FieldKind::I32 | FieldKind::I64 | FieldKind::F32 | FieldKind::F64) => {
             format!("row.{name}")
         }
+        // Bool: no Render impl in maud 0.27; convert via Display like Uuid/chrono.
+        (false, FieldKind::Bool) => format!("row.{name}.to_string()"),
         // Uuid, chrono types: no Render impl; convert to String.
         (false, _) => format!("row.{name}.to_string()"),
     }
@@ -1495,7 +1501,7 @@ fn cell_value_expr(field: &Field) -> String {
 /// ordering per-column is out of scope; dead sort links would be worse than none.
 fn render_columns_vec(pascal_name: &str, plural: &str, fields: &[Field]) -> String {
     use std::fmt::Write as _;
-    let mut out = String::new();
+    let mut out = String::with_capacity(fields.len() * 150 + 300);
     let _ = writeln!(
         out,
         "    let columns: Vec<autumn_web::widgets::Column<{pascal_name}>> = vec!["
@@ -2579,7 +2585,11 @@ async fn main() {
         let plan = plan_scaffold(
             tmp.path(),
             "Post",
-            &["title:String".into(), "body:Text".into(), "published:bool".into()],
+            &[
+                "title:String".into(),
+                "body:Text".into(),
+                "published:bool".into(),
+            ],
             "20260427000000",
         )
         .unwrap();
@@ -2588,7 +2598,10 @@ async fn main() {
         assert!(routes.contains("data_table("), "{routes}");
         assert!(routes.contains("DataTableConfig::new("), "{routes}");
         assert!(routes.contains("Column::new(\"Title\""), "{routes}");
-        assert!(!routes.contains("ul id=\"posts-list\""), "still uses ul: {routes}");
+        assert!(
+            !routes.contains("ul id=\"posts-list\""),
+            "still uses ul: {routes}"
+        );
     }
 
     #[test]

@@ -880,6 +880,11 @@ pub fn data_table<T>(
     config: &DataTableConfig<'_>,
 ) -> maud::Markup {
     let col_count = columns.len();
+    // Hoist loop-invariant: query/drop-keys are the same for every sortable column.
+    let filtered = dt_filter_query(
+        config.query,
+        &[config.sort_param, config.dir_param, config.page_param],
+    );
 
     maud::html! {
         table class=[config.class] {
@@ -902,24 +907,24 @@ pub fn data_table<T>(
                             } else {
                                 "none"
                             };
-                            @let filtered = dt_filter_query(
-                                config.query,
-                                &[config.sort_param, config.dir_param, config.page_param],
-                            );
                             @let href = if filtered.is_empty() {
                                 format!(
                                     "{}?{}={}&{}={}",
                                     config.base_path,
-                                    config.sort_param, sort_key,
-                                    config.dir_param, link_dir.param_value(),
+                                    config.sort_param,
+                                    sort_key,
+                                    config.dir_param,
+                                    link_dir.param_value(),
                                 )
                             } else {
                                 format!(
                                     "{}?{}&{}={}&{}={}",
                                     config.base_path,
                                     filtered,
-                                    config.sort_param, sort_key,
-                                    config.dir_param, link_dir.param_value(),
+                                    config.sort_param,
+                                    sort_key,
+                                    config.dir_param,
+                                    link_dir.param_value(),
                                 )
                             };
                             th scope="col" aria-sort=(aria_sort) {
@@ -1619,21 +1624,29 @@ mod tests {
 
     #[test]
     fn data_table_renders_tbody_rows_and_cells() {
-        let cols: Vec<Column<&str>> = vec![
-            Column::new("Word", |row| maud::html! { (*row) }),
-        ];
-        let html = data_table(&["hello", "world"], &cols, &DataTableConfig::new("empty")).into_string();
+        let cols: Vec<Column<&str>> = vec![Column::new("Word", |row| maud::html! { (*row) })];
+        let html =
+            data_table(&["hello", "world"], &cols, &DataTableConfig::new("empty")).into_string();
         assert!(html.contains("<tbody"), "{html}");
         assert!(html.contains("hello"), "{html}");
         assert!(html.contains("world"), "{html}");
         // Two data rows
-        assert_eq!(html.matches("<tr").count(), 3, "1 header row + 2 data rows: {html}");
+        assert_eq!(
+            html.matches("<tr").count(),
+            3,
+            "1 header row + 2 data rows: {html}"
+        );
     }
 
     #[test]
     fn data_table_caption_when_set() {
         let cols: Vec<Column<i32>> = vec![Column::new("X", |_| maud::html! { "x" })];
-        let html = data_table(&[1i32], &cols, &DataTableConfig::new("e").caption("My Table")).into_string();
+        let html = data_table(
+            &[1i32],
+            &cols,
+            &DataTableConfig::new("e").caption("My Table"),
+        )
+        .into_string();
         assert!(html.contains("<caption"), "{html}");
         assert!(html.contains("My Table"), "{html}");
     }
@@ -1648,7 +1661,8 @@ mod tests {
     #[test]
     fn data_table_applies_class_when_set() {
         let cols: Vec<Column<i32>> = vec![Column::new("X", |_| maud::html! { "x" })];
-        let html = data_table(&[1i32], &cols, &DataTableConfig::new("e").class("styled")).into_string();
+        let html =
+            data_table(&[1i32], &cols, &DataTableConfig::new("e").class("styled")).into_string();
         assert!(html.contains(r#"class="styled""#), "{html}");
     }
 
@@ -1686,9 +1700,8 @@ mod tests {
 
     #[test]
     fn data_table_sortable_inactive_has_link_and_aria_sort_none() {
-        let cols: Vec<Column<i32>> = vec![
-            Column::new("Title", |_| maud::html! { "t" }).sortable("title"),
-        ];
+        let cols: Vec<Column<i32>> =
+            vec![Column::new("Title", |_| maud::html! { "t" }).sortable("title")];
         let cfg = DataTableConfig::new("e").base_path("/posts");
         let html = data_table(&[1i32], &cols, &cfg).into_string();
         assert!(html.contains(r#"aria-sort="none""#), "{html}");
@@ -1698,9 +1711,8 @@ mod tests {
 
     #[test]
     fn data_table_sortable_active_reflects_dir_and_toggles() {
-        let cols: Vec<Column<i32>> = vec![
-            Column::new("Title", |_| maud::html! { "t" }).sortable("title"),
-        ];
+        let cols: Vec<Column<i32>> =
+            vec![Column::new("Title", |_| maud::html! { "t" }).sortable("title")];
         let cfg = DataTableConfig::new("e")
             .base_path("/posts")
             .active_sort("title")
@@ -1713,9 +1725,8 @@ mod tests {
 
     #[test]
     fn data_table_sortable_link_preserves_other_query_params() {
-        let cols: Vec<Column<i32>> = vec![
-            Column::new("Name", |_| maud::html! { "n" }).sortable("name"),
-        ];
+        let cols: Vec<Column<i32>> =
+            vec![Column::new("Name", |_| maud::html! { "n" }).sortable("name")];
         let cfg = DataTableConfig::new("e")
             .base_path("/posts")
             .query("q=hello");
@@ -1725,9 +1736,8 @@ mod tests {
 
     #[test]
     fn data_table_sortable_link_drops_existing_sort_dir_page() {
-        let cols: Vec<Column<i32>> = vec![
-            Column::new("Name", |_| maud::html! { "n" }).sortable("name"),
-        ];
+        let cols: Vec<Column<i32>> =
+            vec![Column::new("Name", |_| maud::html! { "n" }).sortable("name")];
         let cfg = DataTableConfig::new("e")
             .base_path("/posts")
             .query("q=foo&sort=old&dir=asc&page=3");

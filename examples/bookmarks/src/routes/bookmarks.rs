@@ -145,8 +145,7 @@ pub async fn index(repo: PgBookmarkRepository) -> AutumnResult<Markup> {
     .debounce(400)
     .min_length(2);
     let columns = bookmark_columns();
-    let table_config =
-        DataTableConfig::new("No bookmarks yet.").base_path("/bookmarks");
+    let table_config = DataTableConfig::new("No bookmarks yet.").base_path("/bookmarks");
 
     Ok(layout(
         "All",
@@ -204,8 +203,7 @@ pub async fn show(id: Path<i64>, mut db: Db) -> AutumnResult<Markup> {
 pub async fn by_tag(Path(tag): Path<String>, repo: PgBookmarkRepository) -> AutumnResult<Markup> {
     let tagged = repo.find_by_tag(tag.clone()).await?;
     let columns = bookmark_columns();
-    let table_config =
-        DataTableConfig::new("No bookmarks with this tag.").base_path("/bookmarks");
+    let table_config = DataTableConfig::new("No bookmarks with this tag.").base_path("/bookmarks");
 
     Ok(layout(
         &format!("#{tag}"),
