@@ -369,7 +369,7 @@ pub async fn submit(
     State(state): State<AppState>,
     session: Session,
     mut db: Db,
-    repo: PgPostRepository,
+    _repo: PgPostRepository,
     flash: Flash,
     form: Form<SubmitPostForm>,
 ) -> AutumnResult<Redirect> {
@@ -427,12 +427,20 @@ pub async fn submit(
         subreddit_id,
     };
 
-    let post = repo.save(&new_post).await?;
-
-    let post_id = post.id;
+    let subreddit_slug_for_job = subreddit_slug.clone();
+    let author_username_for_job = author_username.clone();
     let post: Post = db
         .tx(move |conn| {
+            let new_post = new_post.clone();
+            let subreddit_slug = subreddit_slug_for_job.clone();
+            let author_username = author_username_for_job.clone();
             async move {
+                let post: Post = diesel::insert_into(posts::table)
+                    .values(&new_post)
+                    .get_result(conn)
+                    .await?;
+
+                let post_id = post.id;
                 diesel::insert_into(crate::schema::votes::table)
                     .values((
                         crate::schema::votes::user_id.eq(user_id),
@@ -448,6 +456,18 @@ pub async fn submit(
                     .await?;
 
                 let post: Post = posts::table.find(post_id).first(conn).await?;
+
+                // Enqueue the publication job inside the transaction
+                let payload = serde_json::to_value(PostPublicationArgs::new(
+                    post.id,
+                    &post.title,
+                    &post.slug,
+                    &subreddit_slug,
+                    &author_username,
+                ))
+                .unwrap();
+                autumn_web::job::enqueue_on_conn(PostPublicationJob::NAME, &payload, conn).await?;
+
                 Ok::<_, AutumnError>(post)
             }
             .scope_boxed()
@@ -483,18 +503,6 @@ pub async fn submit(
             );
         })
         .await;
-
-    // Enqueue the publication job. Note that since PgPostRepository::save manages its
-    // own transaction internally, we do not need to call autumn_web::job::enqueue_on_conn here.
-    let payload = serde_json::to_value(PostPublicationArgs::new(
-        post.id,
-        &title,
-        &slug,
-        &subreddit_slug,
-        &author_username,
-    ))
-    .unwrap();
-    autumn_web::job::enqueue(PostPublicationJob::NAME, payload).await?;
 
     flash.success("Post created.").await;
     Ok(Redirect::to(&super::subreddits::__autumn_path_show(
@@ -845,7 +853,25 @@ pub async fn update(
         body: Patch::Set(form.0.body.trim().to_string()),
         ..Default::default()
     };
-    repo.update(post.id, &changes).await?;
+    let sub: Subreddit = subreddits::table
+        .find(post.subreddit_id)
+        .first(&mut *db)
+        .await?;
+
+    let author: crate::models::User = crate::schema::users::table
+        .find(post.author_id)
+        .first(&mut *db)
+        .await?;
+
+    let lookup = crate::repositories::PostRelationsLookup {
+        author_name: author.username,
+        sub_name: sub.name.clone(),
+        sub_slug: sub.slug.clone(),
+    };
+
+    crate::repositories::CURRENT_POST_RELATIONS
+        .scope(lookup, async move { repo.update(post.id, &changes).await })
+        .await?;
 
     flash.success("Post updated.").await;
     Ok(Redirect::to(&paths::show(&sub_slug, &new_slug)))
