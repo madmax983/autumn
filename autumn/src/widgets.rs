@@ -683,7 +683,7 @@ impl<'a, T> Column<'a, T> {
     ///
     /// The server owns the actual ordering; the widget only renders the link.
     #[must_use]
-    pub fn sortable(mut self, sort_key: &'a str) -> Self {
+    pub const fn sortable(mut self, sort_key: &'a str) -> Self {
         self.sort_key = Some(sort_key);
         self
     }
@@ -796,7 +796,7 @@ impl<'a> DataTableConfig<'a> {
 /// Intentional duplication of the same helper in `ui::pagination` — that one is
 /// private to its module. Both are small enough that sharing outweighs coupling.
 #[cfg(feature = "maud")]
-fn dt_filter_query<'a>(query: &'a str, drop_keys: &[&str]) -> String {
+fn dt_filter_query(query: &str, drop_keys: &[&str]) -> String {
     let query = query.strip_prefix('?').unwrap_or(query);
     query
         .split('&')
