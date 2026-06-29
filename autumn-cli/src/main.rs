@@ -108,6 +108,9 @@ enum Commands {
         /// Package to build (for workspaces)
         #[arg(short, long)]
         package: Option<String>,
+        /// Binary target to build (for packages with multiple [[bin]] targets)
+        #[arg(long)]
+        bin: Option<String>,
         /// Embed static assets + i18n locales into the binary for a true
         /// single-binary deploy (enables the `autumn-web/embed-assets` feature
         /// and fingerprints before compiling so the manifest is baked in).
@@ -1758,8 +1761,9 @@ fn run_command(command: Commands) {
         Commands::Build {
             debug,
             package,
+            bin,
             embed,
-        } => build::run(debug, embed, package.as_deref()),
+        } => build::run(debug, embed, package.as_deref(), bin.as_deref()),
         Commands::Dev {
             package,
             show_config,
@@ -2933,6 +2937,7 @@ mod tests {
             Commands::Build {
                 debug: false,
                 package: None,
+                bin: None,
                 embed: false
             }
         ));
@@ -2946,6 +2951,7 @@ mod tests {
             Commands::Build {
                 debug: true,
                 package: None,
+                bin: None,
                 embed: false
             }
         ));
@@ -2958,11 +2964,25 @@ mod tests {
             Commands::Build {
                 debug,
                 package,
+                bin,
                 embed,
             } => {
                 assert!(!debug);
                 assert!(!embed);
+                assert!(bin.is_none());
                 assert_eq!(package.as_deref(), Some("blog"));
+            }
+            _ => panic!("expected Build command"),
+        }
+    }
+
+    #[test]
+    fn parse_build_with_bin() {
+        let cli = Cli::try_parse_from(["autumn", "build", "--embed", "--bin", "server"]).unwrap();
+        match cli.command {
+            Commands::Build { embed, bin, .. } => {
+                assert!(embed);
+                assert_eq!(bin.as_deref(), Some("server"));
             }
             _ => panic!("expected Build command"),
         }

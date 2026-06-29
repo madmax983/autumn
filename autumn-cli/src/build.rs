@@ -20,7 +20,12 @@ use sha2::{Digest, Sha256};
 /// Factored out so the flags are unit-testable. With `embed`, the
 /// `autumn-web/embed-assets` feature is enabled so the binary bakes in the
 /// `static/` tree (and its manifest) plus i18n locales.
-fn build_cargo_command(debug: bool, embed: bool, package: Option<&str>) -> Command {
+fn build_cargo_command(
+    debug: bool,
+    embed: bool,
+    package: Option<&str>,
+    bin: Option<&str>,
+) -> Command {
     let mut cargo = Command::new("cargo");
     cargo.arg("build");
     if !debug {
@@ -28,6 +33,9 @@ fn build_cargo_command(debug: bool, embed: bool, package: Option<&str>) -> Comma
     }
     if let Some(pkg) = package {
         cargo.args(["-p", pkg]);
+    }
+    if let Some(b) = bin {
+        cargo.args(["--bin", b]);
     }
     if embed {
         // Enable the app crate's `embed-assets` feature, which the scaffold
@@ -59,7 +67,7 @@ fn run_cargo_or_exit(mut cargo: Command) {
 ///    (not the CLI cwd), writing the manifest + hashed copies.
 /// 3. Recompile **with** the embed feature so `include_dir!` bakes the
 ///    fingerprinted tree into the binary.
-fn build_embedded(debug: bool, profile: &str, package: Option<&str>) {
+fn build_embedded(debug: bool, profile: &str, package: Option<&str>, bin: Option<&str>) {
     // Resolve the selected package's directory so `-p <pkg>` fingerprints that
     // package's `static/` (which `embed_static!` reads via $CARGO_MANIFEST_DIR),
     // not whatever `static/` happens to sit next to the CLI's cwd.
@@ -69,19 +77,19 @@ fn build_embedded(debug: bool, profile: &str, package: Option<&str>) {
         .join("static");
 
     eprintln!("Compiling ({profile} profile)...");
-    run_cargo_or_exit(build_cargo_command(debug, false, package));
+    run_cargo_or_exit(build_cargo_command(debug, false, package, bin));
 
     eprintln!("\nFingerprinting static assets for embedding...");
     fingerprint_assets_in(&static_dir);
 
     eprintln!("\nEmbedding assets and locales into the binary...");
-    run_cargo_or_exit(build_cargo_command(debug, true, package));
+    run_cargo_or_exit(build_cargo_command(debug, true, package, bin));
 
     eprintln!("\n\u{1F342} Build complete! Assets and locales embedded into the binary.");
 }
 
 /// Run the static build pipeline.
-pub fn run(debug: bool, embed: bool, package: Option<&str>) {
+pub fn run(debug: bool, embed: bool, package: Option<&str>, bin: Option<&str>) {
     eprintln!("\u{1F342} autumn build\n");
 
     let profile = if debug { "dev" } else { "release" };
@@ -91,12 +99,12 @@ pub fn run(debug: bool, embed: bool, package: Option<&str>) {
     // routes and the app's runtime state) and lets dynamic-server apps build a
     // single binary without a database or pre-render step.
     if embed {
-        build_embedded(debug, profile, package);
+        build_embedded(debug, profile, package, bin);
         return;
     }
 
     eprintln!("Compiling ({profile} profile)...");
-    run_cargo_or_exit(build_cargo_command(debug, embed, package));
+    run_cargo_or_exit(build_cargo_command(debug, embed, package, bin));
 
     // Release builds fingerprint *after* the compile (the runtime reads the
     // manifest from disk, so order doesn't matter, and the static renderer below
@@ -447,8 +455,13 @@ fn resolve_binary_from_metadata(
 mod tests {
     use super::*;
 
-    fn cargo_args(debug: bool, embed: bool, package: Option<&str>) -> Vec<String> {
-        build_cargo_command(debug, embed, package)
+    fn cargo_args(
+        debug: bool,
+        embed: bool,
+        package: Option<&str>,
+        bin: Option<&str>,
+    ) -> Vec<String> {
+        build_cargo_command(debug, embed, package, bin)
             .get_args()
             .map(|a| a.to_string_lossy().into_owned())
             .collect()
@@ -456,7 +469,7 @@ mod tests {
 
     #[test]
     fn embed_build_enables_feature_in_release() {
-        let args = cargo_args(false, true, None);
+        let args = cargo_args(false, true, None, None);
         assert!(args.contains(&"--release".to_string()));
         assert!(
             args.windows(2).any(|w| w == ["--features", "embed-assets"]),
@@ -466,10 +479,20 @@ mod tests {
 
     #[test]
     fn non_embed_build_omits_embed_feature() {
-        let args = cargo_args(false, false, Some("blog"));
+        let args = cargo_args(false, false, Some("blog"), None);
         assert!(
             !args.iter().any(|a| a.contains("embed-assets")),
             "non-embed build must not enable embed-assets: {args:?}"
+        );
+        assert!(args.windows(2).any(|w| w == ["-p", "blog"]));
+    }
+
+    #[test]
+    fn bin_arg_is_passed_to_cargo() {
+        let args = cargo_args(false, true, Some("blog"), Some("blog-server"));
+        assert!(
+            args.windows(2).any(|w| w == ["--bin", "blog-server"]),
+            "--bin must be forwarded to cargo: {args:?}"
         );
         assert!(args.windows(2).any(|w| w == ["-p", "blog"]));
     }

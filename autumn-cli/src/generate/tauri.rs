@@ -169,13 +169,49 @@ pub fn run(flags: Flags) {
 /// `--features autumn-web/embed-assets` (dep path only), so that the app's
 /// `#[cfg(feature = "embed-assets")]` guard on `.embedded_static()` is
 /// satisfied — mirroring what `autumn build --embed` does.
+/// Walk ancestor `Cargo.toml` files to find the `package` field of a
+/// workspace-inherited dependency entry.
+///
+/// When a member has `autumn_web = { workspace = true }`, the `package` alias
+/// is recorded in `[workspace.dependencies]` of an ancestor, not the member.
+/// Returns `None` when the dep key is not found or has no `package` field.
+fn resolve_workspace_dep_package(project_root: &Path, dep_key: &str) -> Option<String> {
+    let mut dir: Option<&Path> = Some(project_root);
+    while let Some(d) = dir {
+        let cargo = d.join("Cargo.toml");
+        if cargo.is_file()
+            && let Ok(content) = std::fs::read_to_string(&cargo)
+            && let Ok(ws_doc) = toml::from_str::<toml::Value>(&content)
+        {
+            if let Some(pkg_name) = ws_doc
+                .get("workspace")
+                .and_then(|w| w.get("dependencies"))
+                .and_then(|deps| deps.get(dep_key))
+                .and_then(toml::Value::as_table)
+                .and_then(|t| t.get("package"))
+                .and_then(toml::Value::as_str)
+            {
+                return Some(pkg_name.to_owned());
+            }
+            // Stop at the workspace root even when the dep is not there.
+            if ws_doc.get("workspace").is_some() {
+                return None;
+            }
+        }
+        dir = d.parent();
+    }
+    None
+}
+
 /// Find the `[dependencies]` key used to depend on `package_name`.
 ///
 /// Cargo feature syntax requires the *dependency key*, not the package name.
-/// An aliased dep like `autumn_web = {{ package = "autumn-web" }}` must be
-/// referenced as `autumn_web/feature`, not `autumn-web/feature`.
+/// An aliased dep like `autumn_web = { package = "autumn-web" }` must be
+/// referenced as `autumn_web/feature`, not `autumn-web/feature`.  Handles
+/// workspace-inherited deps (`autumn_web = { workspace = true }`) by walking
+/// up to the workspace `Cargo.toml` to read the effective `package` there.
 /// Returns `package_name` itself when no alias is found.
-fn resolve_dep_key(doc: &toml::Value, package_name: &str) -> String {
+fn resolve_dep_key(project_root: &Path, doc: &toml::Value, package_name: &str) -> String {
     let Some(deps) = doc.get("dependencies").and_then(toml::Value::as_table) else {
         return package_name.to_owned();
     };
@@ -184,13 +220,22 @@ fn resolve_dep_key(doc: &toml::Value, package_name: &str) -> String {
         if key == package_name {
             return key.clone();
         }
-        // Aliased dependency: table entry has `package = <package_name>`.
-        if val
+        // Determine the effective package name for this entry.
+        let effective_pkg = if val
             .as_table()
-            .and_then(|t| t.get("package"))
-            .and_then(toml::Value::as_str)
-            == Some(package_name)
+            .and_then(|t| t.get("workspace"))
+            .and_then(toml::Value::as_bool)
+            == Some(true)
         {
+            // Workspace-inherited: package alias lives in [workspace.dependencies].
+            resolve_workspace_dep_package(project_root, key)
+        } else {
+            val.as_table()
+                .and_then(|t| t.get("package"))
+                .and_then(toml::Value::as_str)
+                .map(str::to_owned)
+        };
+        if effective_pkg.as_deref() == Some(package_name) {
             return key.clone();
         }
     }
@@ -343,9 +388,10 @@ fn read_package_meta(
         .is_some_and(|features| features.contains_key("embed-assets"));
 
     // Resolve the dependency key for autumn-web.  Apps may alias it (e.g.
-    // `autumn_web = { package = "autumn-web" }`); Cargo feature selectors
-    // must use the key (`autumn_web/feature`), not the package name.
-    let dep_key = resolve_dep_key(&doc, "autumn-web");
+    // `autumn_web = { package = "autumn-web" }` or via workspace inheritance);
+    // Cargo feature selectors must use the key (`autumn_web/feature`), not the
+    // package name.
+    let dep_key = resolve_dep_key(project_root, &doc, "autumn-web");
 
     Ok((name, version, bin_name, has_embed_assets_feature, dep_key))
 }
@@ -867,7 +913,7 @@ fn render_stage_sidecar_sh(
     // Only fingerprint when the app-level alias exists; `autumn build --embed` passes
     // --features embed-assets (app-level), which fails for apps without that alias.
     let fingerprint = if has_embed_assets {
-        format!("autumn build --embed -p {package_name}\n")
+        format!("autumn build --embed -p {package_name} --bin {bin_name}\n")
     } else {
         String::new()
     };
@@ -972,7 +1018,7 @@ fn render_stage_sidecar_ps1(
         format!(
             "# Fingerprint static/ before the embed compile (mirrors autumn build --embed phases 1-2):\n\
              # compile → write .autumn-manifest.json → the cargo build below embeds it.\n\
-             autumn build --embed -p {package_name}\n"
+             autumn build --embed -p {package_name} --bin {bin_name}\n"
         )
     } else {
         String::new()
@@ -1966,8 +2012,7 @@ mod tests {
         // [package] default-run = "web", the generator must use "web" (not the
         // package-named auto-discovered binary from src/main.rs).
         // Matches `autumn dev`/`autumn build` behaviour which prefers default_run.
-        let tmp =
-            project_with_default_run_and_main_rs("my-app", "web", &["web", "seed"]);
+        let tmp = project_with_default_run_and_main_rs("my-app", "web", &["web", "seed"]);
         let plan = plan_tauri(tmp.path()).unwrap();
         let sh: &str = plan
             .actions
@@ -2735,12 +2780,13 @@ mod tests {
     }
 
     #[test]
-    fn staging_sh_fingerprints_includes_package_name() {
-        let sh = render_stage_sidecar_sh("my-app", "my-app", true, "autumn-web");
+    fn staging_sh_fingerprints_includes_package_and_bin_name() {
+        let sh = render_stage_sidecar_sh("my-app", "my-server", true, "autumn-web");
         assert!(
-            sh.contains("autumn build --embed -p my-app"),
-            "stage-sidecar.sh must pass -p <package> to autumn build --embed so workspace \
-             members fingerprint the correct package's static/ directory"
+            sh.contains("autumn build --embed -p my-app --bin my-server"),
+            "stage-sidecar.sh must pass both -p <package> and --bin <bin> to autumn build \
+             --embed so workspace members fingerprint the correct package and only the \
+             sidecar binary is compiled (not all [[bin]] targets); got:\n{sh}"
         );
     }
 
@@ -2788,7 +2834,8 @@ mod tests {
     fn staging_ps1_uses_dep_key_not_package_name_for_features() {
         let ps1 = render_stage_sidecar_ps1("my-app", "my-app", false, "autumn_web");
         assert!(
-            ps1.contains("autumn_web/embed-assets") && ps1.contains("autumn_web/managed-pg-bundled"),
+            ps1.contains("autumn_web/embed-assets")
+                && ps1.contains("autumn_web/managed-pg-bundled"),
             "stage-sidecar.ps1 must use the dependency key 'autumn_web' in feature selectors"
         );
     }
@@ -2829,6 +2876,54 @@ mod tests {
             !sh.contains("autumn-web/managed-pg-bundled"),
             "stage-sidecar.sh must not contain 'autumn-web/managed-pg-bundled' when the dep is \
              aliased as 'autumn_web'; Cargo would reject it with 'Package does not have feature'"
+        );
+    }
+
+    #[test]
+    fn plan_uses_dep_key_for_workspace_inherited_alias() {
+        // When a workspace member has `autumn_web = { workspace = true }` and the
+        // workspace Cargo.toml defines `autumn_web = { package = "autumn-web" }`,
+        // resolve_dep_key must return "autumn_web" (the alias key), not "autumn-web".
+        let tmp = TempDir::new().unwrap();
+        // Write workspace root Cargo.toml with [workspace.dependencies] alias.
+        fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[workspace]\nmembers = [\"app\"]\n\
+             \n[workspace.dependencies]\nautumn_web = { package = \"autumn-web\", version = \"0.5\" }\n",
+        )
+        .unwrap();
+        let app_dir = tmp.path().join("app");
+        fs::create_dir_all(&app_dir).unwrap();
+        fs::write(
+            app_dir.join("Cargo.toml"),
+            "[package]\nname=\"my-app\"\nversion=\"0.1.0\"\nedition=\"2024\"\n\
+             \n[dependencies]\nautumn_web = { workspace = true }\n",
+        )
+        .unwrap();
+        fs::create_dir_all(app_dir.join("src")).unwrap();
+        fs::write(app_dir.join("src/main.rs"), "fn main() {}\n").unwrap();
+        let plan = plan_tauri(&app_dir).unwrap();
+        let sh: &str = plan
+            .actions
+            .iter()
+            .find(|a| a.path().to_string_lossy().ends_with("stage-sidecar.sh"))
+            .and_then(|a| {
+                if let crate::generate::emit::Action::Create { contents, .. } = a {
+                    Some(contents.as_str())
+                } else {
+                    None
+                }
+            })
+            .expect("stage-sidecar.sh action not found");
+        assert!(
+            sh.contains("autumn_web/managed-pg-bundled"),
+            "resolve_dep_key must resolve the workspace-inherited alias 'autumn_web' \
+             (not 'autumn-web') when the member dep has workspace = true; got:\n{sh}"
+        );
+        assert!(
+            !sh.contains("autumn-web/managed-pg-bundled"),
+            "stage-sidecar.sh must not use the package name 'autumn-web' when it is \
+             aliased as 'autumn_web' via workspace inheritance; got:\n{sh}"
         );
     }
 
