@@ -718,6 +718,13 @@ impl TestApp {
     /// against a standard axum Router.  The probe state returned by
     /// [`TestClient::probes`] will be in the default ready state; it is not
     /// connected to any handler in the supplied router.
+    ///
+    /// **Note:** [`TestClient::sent_mail`] will always return an empty list for
+    /// clients built this way.  The built-in mail recorder is wired in during
+    /// [`TestApp::build`]; because `from_router` receives an already-constructed
+    /// `AppState` (with the mailer already installed), the recorder cannot be
+    /// injected into its interceptor chain.  Use [`TestApp::new().merge(router).build()`](TestApp::merge)
+    /// to get recording support.
     #[must_use]
     pub fn from_router(router: axum::Router, state: AppState) -> TestClient {
         TestClient {
