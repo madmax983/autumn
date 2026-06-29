@@ -35,7 +35,7 @@
 
 use proc_macro2::{Span, TokenStream};
 use quote::quote;
-use syn::parse::{Parse, ParseStream, Parser as _};
+use syn::parse::{Parse, ParseStream};
 use syn::{Attribute, Expr, ExprLit, Ident, Lit, LitBool, LitStr, Token};
 
 /// Parsed `#[api_doc(...)]` attribute arguments.
@@ -712,16 +712,31 @@ fn extract_roles_from_marker_expr(expr: &syn::Expr) -> Option<Vec<String>> {
 }
 
 fn extract_secured_roles(attr: &syn::Attribute) -> Vec<String> {
+    use proc_macro2::TokenTree;
+
     let syn::Meta::List(list) = &attr.meta else {
         return Vec::new();
     };
-    let roles: syn::Result<syn::punctuated::Punctuated<syn::LitStr, syn::Token![,]>> =
-        syn::punctuated::Punctuated::<syn::LitStr, syn::Token![,]>::parse_terminated
-            .parse2(list.tokens.clone());
-    match roles {
-        Ok(r) => r.iter().map(syn::LitStr::value).collect(),
-        Err(_) => Vec::new(),
+    // Roles are the leading bare string literals; a trailing `scopes = [...]`
+    // (token abilities) may follow and is not a role, so peel literals
+    // directly rather than parsing the whole list as `LitStr`s.
+    let mut roles = Vec::new();
+    let mut iter = list.tokens.clone().into_iter().peekable();
+    while let Some(TokenTree::Literal(lit)) = iter.peek() {
+        match syn::parse2::<syn::LitStr>(quote! { #lit }) {
+            Ok(s) => roles.push(s.value()),
+            Err(_) => break,
+        }
+        iter.next();
+        if let Some(TokenTree::Punct(p)) = iter.peek()
+            && p.as_char() == ','
+        {
+            iter.next();
+        } else {
+            break;
+        }
     }
+    roles
 }
 
 fn emit_static_str_slice(items: &[String]) -> TokenStream {

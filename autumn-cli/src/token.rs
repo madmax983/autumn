@@ -11,24 +11,81 @@ use std::path::Path;
 use std::process::Command;
 
 /// Issue a new API token for `principal_id` and print the raw token to stdout.
-pub fn run_issue(principal_id: &str) {
+///
+/// `name` is a human-readable label, `scopes` are flat permission strings
+/// (e.g. `posts:read`) stored as a JSON array, and `expires_at` is an optional
+/// SQL/ISO-8601 timestamp after which the token is rejected.
+pub fn run_issue(principal_id: &str, name: &str, scopes: &[String], expires_at: Option<&str>) {
     let database_url = resolve_database_url();
     check_psql();
 
     let raw_token = generate_token();
     let token_hash = sha256_hex(&raw_token);
+    let scopes_json = scopes_to_json(scopes);
+    let expires_at = expires_at.unwrap_or("");
 
     // Use psql variable substitution (:'var') to avoid any SQL injection risk.
-    // :'hash' and :'principal' are quoted by psql, no manual escaping needed.
+    // psql quotes each value as a SQL string literal, so no manual escaping is
+    // needed. `:'scopes'::jsonb` casts the JSON array text into the JSONB
+    // column; an empty `:'expires_at'` becomes NULL via NULLIF.
     run_psql_with_vars_or_die(
         &database_url,
-        "INSERT INTO api_tokens (token_hash, principal_id) VALUES (:'hash', :'principal');",
-        &[("hash", &token_hash), ("principal", principal_id)],
+        "INSERT INTO api_tokens (token_hash, principal_id, name, scopes, expires_at) \
+         VALUES (:'hash', :'principal', :'name', :'scopes'::jsonb, \
+         NULLIF(:'expires_at', '')::timestamp);",
+        &[
+            ("hash", &token_hash),
+            ("principal", principal_id),
+            ("name", name),
+            ("scopes", &scopes_json),
+            ("expires_at", expires_at),
+        ],
     );
 
     // Print raw token last so it's easy to capture with $(...)
     println!("{raw_token}");
     eprintln!("\u{2713} Token issued for principal: {principal_id}");
+}
+
+/// List non-secret metadata for a principal's tokens.
+pub fn run_list(principal_id: &str) {
+    let database_url = resolve_database_url();
+    check_psql();
+
+    run_psql_with_vars_or_die(
+        &database_url,
+        "SELECT id, name, principal_id, scopes, created_at, expires_at, last_used_at, revoked_at \
+         FROM api_tokens WHERE principal_id = :'principal' ORDER BY id;",
+        &[("principal", principal_id)],
+    );
+}
+
+/// Rotate a token: revoke `raw_token` and issue a replacement carrying the same
+/// name, scopes, and expiry. Prints the new raw token to stdout.
+pub fn run_rotate(raw_token: &str) {
+    let database_url = resolve_database_url();
+    check_psql();
+
+    let old_hash = sha256_hex(raw_token);
+    let new_token = generate_token();
+    let new_hash = sha256_hex(&new_token);
+
+    // Revoke the old row and copy its name/scopes/expiry onto a new row in a
+    // single statement so the rotation is atomic.
+    run_psql_with_vars_or_die(
+        &database_url,
+        "WITH rotated AS ( \
+            UPDATE api_tokens SET revoked_at = NOW() \
+            WHERE token_hash = :'oldhash' AND revoked_at IS NULL \
+            RETURNING principal_id, name, scopes, expires_at \
+         ) \
+         INSERT INTO api_tokens (token_hash, principal_id, name, scopes, expires_at) \
+         SELECT :'newhash', principal_id, name, scopes, expires_at FROM rotated;",
+        &[("oldhash", &old_hash), ("newhash", &new_hash)],
+    );
+
+    println!("{new_token}");
+    eprintln!("\u{2713} Token rotated.");
 }
 
 /// Revoke the token identified by `raw_token`.
@@ -50,6 +107,15 @@ pub fn run_revoke(raw_token: &str) {
 
 fn sha256_hex(input: &str) -> String {
     hex_encode(Sha256::digest(input.as_bytes()))
+}
+
+/// Render flat scope strings as a JSON array for the `scopes` JSONB column.
+fn scopes_to_json(scopes: &[String]) -> String {
+    let items: Vec<serde_json::Value> = scopes
+        .iter()
+        .map(|s| serde_json::Value::String(s.clone()))
+        .collect();
+    serde_json::Value::Array(items).to_string()
 }
 
 /// Produce 32 random bytes from the OS and return them as a 64-char hex string.
@@ -189,6 +255,15 @@ mod tests {
     #[test]
     fn sha256_hex_differs_on_different_input() {
         assert_ne!(sha256_hex("abc"), sha256_hex("xyz"));
+    }
+
+    #[test]
+    fn scopes_to_json_renders_array() {
+        assert_eq!(scopes_to_json(&[]), "[]");
+        assert_eq!(
+            scopes_to_json(&["posts:read".to_owned(), "posts:write".to_owned()]),
+            r#"["posts:read","posts:write"]"#
+        );
     }
 
     #[test]

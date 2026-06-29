@@ -51,7 +51,8 @@ fn stmt_is_generated_replay_guard(stmt: &Stmt) -> bool {
 fn stmt_is_generated_auth_prologue(stmt: &Stmt) -> bool {
     if matches!(
         stmt,
-        Stmt::Item(Item::Const(item)) if item.ident == "__AUTUMN_SECURED_ROLES"
+        Stmt::Item(Item::Const(item))
+            if item.ident == "__AUTUMN_SECURED_ROLES" || item.ident == "__AUTUMN_SECURED_SCOPES"
     ) {
         return true;
     }
@@ -145,6 +146,20 @@ fn expr_is_generated_auth_check_call(expr: &Expr) -> bool {
                     .iter()
                     .nth(2)
                     .is_some_and(|arg| path_expr_ends_with(arg, "__AUTUMN_SECURED_ROLES"))
+        }
+        Expr::Call(call)
+            if path_expr_matches(
+                &call.func,
+                &["autumn_web", "auth", "__check_secured_scopes"],
+            ) =>
+        {
+            // __check_secured_scopes(__autumn_token_scopes…, __AUTUMN_SECURED_SCOPES)
+            call.args.len() == 2
+                && call
+                    .args
+                    .iter()
+                    .nth(1)
+                    .is_some_and(|arg| path_expr_ends_with(arg, "__AUTUMN_SECURED_SCOPES"))
         }
         Expr::Call(call)
             if path_expr_matches(
