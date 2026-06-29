@@ -285,7 +285,7 @@ impl AdminModel for TokenAdminModel {
                 .await
                 .map_err(|e| AdminError::Database(e.to_string()))?;
             diesel::sql_query(
-                "UPDATE api_tokens SET revoked_at = NOW() \
+                "UPDATE api_tokens SET revoked_at = NOW() AT TIME ZONE 'utc' \
                  WHERE id = $1 AND revoked_at IS NULL",
             )
             .bind::<diesel::sql_types::BigInt, _>(id)

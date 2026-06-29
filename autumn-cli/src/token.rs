@@ -72,15 +72,21 @@ pub fn run_rotate(raw_token: &str) {
 
     // Revoke the old row and copy its name/scopes/expiry onto a new row in a
     // single statement so the rotation is atomic.
+    // The SELECT 1/COUNT(*) forces psql to error if the old token was not found
+    // (already revoked or never existed), preventing a silent no-op rotation.
     run_psql_with_vars_or_die(
         &database_url,
         "WITH rotated AS ( \
-            UPDATE api_tokens SET revoked_at = NOW() \
+            UPDATE api_tokens SET revoked_at = NOW() AT TIME ZONE 'utc' \
             WHERE token_hash = :'oldhash' AND revoked_at IS NULL \
             RETURNING principal_id, name, scopes, expires_at \
+         ), \
+         inserted AS ( \
+            INSERT INTO api_tokens (token_hash, principal_id, name, scopes, expires_at) \
+            SELECT :'newhash', principal_id, name, scopes, expires_at FROM rotated \
+            RETURNING 1 \
          ) \
-         INSERT INTO api_tokens (token_hash, principal_id, name, scopes, expires_at) \
-         SELECT :'newhash', principal_id, name, scopes, expires_at FROM rotated;",
+         SELECT 1 / COUNT(*) FROM inserted;",
         &[("oldhash", &old_hash), ("newhash", &new_hash)],
     );
 
@@ -97,7 +103,7 @@ pub fn run_revoke(raw_token: &str) {
 
     run_psql_with_vars_or_die(
         &database_url,
-        "UPDATE api_tokens SET revoked_at = NOW() WHERE token_hash = :'hash' AND revoked_at IS NULL;",
+        "UPDATE api_tokens SET revoked_at = NOW() AT TIME ZONE 'utc' WHERE token_hash = :'hash' AND revoked_at IS NULL;",
         &[("hash", &token_hash)],
     );
     eprintln!("\u{2713} Token revoked.");

@@ -670,6 +670,16 @@ async fn model_create(
     flash
         .success(format!("{} created.", model.display_name()))
         .await;
+    // If the model returned a one-time secret (e.g. a raw API token), surface
+    // it in a flash message so it is visible exactly once on the detail page.
+    // The secret is never persisted in the DB; after this redirect it is gone.
+    if let Some(Value::String(secret)) = record.get("token") {
+        flash
+            .info(format!(
+                "Copy your token now — it will not be shown again: {secret}"
+            ))
+            .await;
+    }
     Ok(Redirect::to(&format!("{prefix}/{slug}/{new_id}")).into_response())
 }
 
