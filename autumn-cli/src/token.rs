@@ -32,7 +32,7 @@ pub fn run_issue(principal_id: &str, name: &str, scopes: &[String], expires_at: 
         &database_url,
         "INSERT INTO api_tokens (token_hash, principal_id, name, scopes, expires_at) \
          VALUES (:'hash', :'principal', :'name', :'scopes'::jsonb, \
-         NULLIF(:'expires_at', '')::timestamp);",
+         NULLIF(:'expires_at', '')::timestamptz AT TIME ZONE 'UTC');",
         &[
             ("hash", &token_hash),
             ("principal", principal_id),
@@ -79,6 +79,7 @@ pub fn run_rotate(raw_token: &str) {
         "WITH rotated AS ( \
             UPDATE api_tokens SET revoked_at = NOW() AT TIME ZONE 'utc' \
             WHERE token_hash = :'oldhash' AND revoked_at IS NULL \
+                AND (expires_at IS NULL OR expires_at > NOW() AT TIME ZONE 'utc') \
             RETURNING principal_id, name, scopes, expires_at \
          ), \
          inserted AS ( \

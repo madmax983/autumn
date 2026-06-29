@@ -2490,6 +2490,7 @@ mod db_store {
                         UPDATE api_tokens \
                         SET revoked_at = NOW() AT TIME ZONE 'utc' \
                         WHERE token_hash = $1 AND revoked_at IS NULL \
+                            AND (expires_at IS NULL OR expires_at > NOW() AT TIME ZONE 'utc') \
                         RETURNING principal_id, name, scopes, expires_at \
                      ), \
                      inserted AS ( \
