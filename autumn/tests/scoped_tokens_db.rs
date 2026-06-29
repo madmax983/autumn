@@ -73,6 +73,7 @@ fn scopes(items: &[&str]) -> Vec<String> {
 }
 
 #[tokio::test]
+#[ignore = "requires Docker"]
 async fn db_store_issue_list_revoke_rotate_round_trip() {
     let (pool, _container) = setup_pool().await;
     let store = DbApiTokenStore::new(pool);
@@ -115,6 +116,7 @@ async fn db_store_issue_list_revoke_rotate_round_trip() {
 }
 
 #[tokio::test]
+#[ignore = "requires Docker"]
 async fn db_store_filters_expired_tokens_in_sql() {
     let (pool, _container) = setup_pool().await;
     let now = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
@@ -135,6 +137,7 @@ async fn db_store_filters_expired_tokens_in_sql() {
 }
 
 #[tokio::test]
+#[ignore = "requires Docker"]
 async fn db_store_records_last_used_at() {
     let (pool, _container) = setup_pool().await;
     let now = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
@@ -163,6 +166,7 @@ async fn db_store_records_last_used_at() {
 }
 
 #[tokio::test]
+#[ignore = "requires Docker"]
 async fn db_store_verifies_legacy_shaped_row() {
     // A row written before scopes existed (name = '', scopes = '[]') must still
     // authenticate — proving the additive migration is backward compatible.
