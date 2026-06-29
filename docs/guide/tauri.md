@@ -114,16 +114,20 @@ is reused as the Tauri icon source automatically.
 
 ## App configuration (`autumn.toml`)
 
-`autumn.toml` is automatically included in the installer as a Tauri bundle resource
-(via `bundle.resources` in `tauri.conf.json`). The generated shell sets
-`AUTUMN_MANIFEST_DIR` to the resource directory when spawning the sidecar, so
-`AutumnConfig::load_with_env` finds it on the installed machine.
+`autumn.toml` and any profile override files (`autumn-prod.toml`,
+`autumn-production.toml`, etc.) are automatically included in the installer as Tauri
+bundle resources (via `bundle.resources` in `tauri.conf.json`). The generated shell
+sets the sidecar's working directory to the resource directory, so
+`AutumnConfig::load_with_env` finds them on the installed machine via its CWD
+fallback.
 
 This means your production `autumn.toml` — auth keys, SEO settings, security
 headers, `auto_migrate_in_production`, and anything else you configure there — is
-packaged with the installer and takes effect at runtime. Secrets that should not be
-committed to source control (e.g. `database.primary_url`, third-party API keys)
-should be supplied via environment variables as normal.
+packaged with the installer and takes effect at runtime. Profile files must exist in
+the project root at the time you run `cargo tauri build` to be included; Tauri skips
+glob entries that match no files. Secrets that should not be committed to source
+control (e.g. `database.primary_url`, third-party API keys) should be supplied via
+environment variables as normal.
 
 ## Building a native installer
 

@@ -197,7 +197,8 @@ fn render_tauri_conf(package_name: &str) -> String {
       "binaries/{package_name}"
     ],
     "resources": {{
-      "../autumn.toml": "autumn.toml"
+      "../autumn.toml": "autumn.toml",
+      "../autumn-*.toml": "."
     }}
   }},
   "app": {{
@@ -1010,6 +1011,14 @@ mod tests {
             has_autumn_toml,
             "tauri.conf.json must bundle autumn.toml as a resource so the installed \
              sidecar can find the app's production configuration"
+        );
+        // Profile override files (autumn-prod.toml, autumn-production.toml, etc.) must
+        // also be bundled so the sidecar picks them up at runtime under the active profile.
+        let has_profile_glob = resources.iter().any(|(k, _)| k.contains("autumn-*.toml"));
+        assert!(
+            has_profile_glob,
+            "tauri.conf.json must include a glob for autumn-*.toml resources so profile \
+             config overrides are bundled alongside the base autumn.toml"
         );
     }
 
