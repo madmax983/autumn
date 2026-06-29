@@ -8027,9 +8027,10 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     }
                 };
                 if let ::core::result::Result::Err(err) =
-                    ::autumn_web::authorization::__check_policy_create_payload::<#model_name>(
+                    ::autumn_web::authorization::__check_policy_create_payload_scoped::<#model_name>(
                         &__autumn_state,
                         &__autumn_session,
+                        __autumn_token_scopes.as_ref().map(|__e| &__e.0),
                         &__autumn_new_payload,
                     )
                     .await
@@ -8091,9 +8092,10 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     }
                 };
                 if let ::core::result::Result::Err(err) =
-                    ::autumn_web::authorization::__check_policy::<#model_name>(
+                    ::autumn_web::authorization::__check_policy_scoped::<#model_name>(
                         &__autumn_state,
                         &__autumn_session,
+                        __autumn_token_scopes.as_ref().map(|__e| &__e.0),
                         "update",
                         &__existing,
                     )
@@ -8174,9 +8176,10 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     }
                 };
                 if let ::core::result::Result::Err(err) =
-                    ::autumn_web::authorization::__check_policy::<#model_name>(
+                    ::autumn_web::authorization::__check_policy_scoped::<#model_name>(
                         &__autumn_state,
                         &__autumn_session,
+                        __autumn_token_scopes.as_ref().map(|__e| &__e.0),
                         "delete",
                         &__existing,
                     )
