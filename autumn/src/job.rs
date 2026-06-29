@@ -10,9 +10,9 @@ use std::pin::Pin;
 pub(crate) use std::sync::{Arc, OnceLock, RwLock};
 
 #[cfg(loom)]
-pub(crate) use std::sync::OnceLock;
-#[cfg(loom)]
 pub(crate) use loom::sync::{Arc, RwLock};
+#[cfg(loom)]
+pub(crate) use std::sync::OnceLock;
 
 use futures::FutureExt as _;
 #[cfg(feature = "redis")]
