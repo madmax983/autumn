@@ -664,14 +664,14 @@ pub struct Column<'a, T> {
     /// If `Some`, this column is sortable and the value is the `sort=` query param.
     pub sort_key: Option<&'a str>,
     /// Cell renderer: maps a row reference to rendered `Markup`.
-    pub cell: Box<dyn Fn(&T) -> maud::Markup + 'a>,
+    pub cell: Box<dyn Fn(&T) -> maud::Markup + Send + 'a>,
 }
 
 #[cfg(feature = "maud")]
 impl<'a, T> Column<'a, T> {
     /// Create a new non-sortable column with a header label and cell closure.
     #[must_use]
-    pub fn new(header: &'a str, cell: impl Fn(&T) -> maud::Markup + 'a) -> Self {
+    pub fn new(header: &'a str, cell: impl Fn(&T) -> maud::Markup + Send + 'a) -> Self {
         Self {
             header,
             sort_key: None,

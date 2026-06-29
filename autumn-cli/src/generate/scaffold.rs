@@ -813,17 +813,17 @@ fn render_routes_file(
     };
 
     // For non-live paths, generate the data_table columns and call.
-    let columns_let = if !live {
-        render_columns_vec(pascal_name, plural, fields)
-    } else {
+    let columns_let = if live {
         String::new()
+    } else {
+        render_columns_vec(pascal_name, plural, fields)
     };
-    let table_render = if !live {
+    let table_render = if live {
+        String::new()
+    } else {
         format!(
             r#"(autumn_web::widgets::data_table(&page_data.content, &columns, &autumn_web::widgets::DataTableConfig::new("No {plural} yet.").base_path("/{plural}")))"#
         )
-    } else {
-        String::new()
     };
 
     let list_render = if live { &live_ul_render } else { &table_render };
@@ -1455,7 +1455,7 @@ fn edit_value_expr(field: &Field) -> String {
     }
 }
 
-/// Produce the cell-body expression for a data_table column closure.
+/// Produce the cell-body expression for a `data_table` column closure.
 ///
 /// Every arm must evaluate to a type that implements `maud::Render` (`&str`,
 /// `String`, `Cow<str>`, integers). `bool`, `Option<T>`, chrono types, `Uuid`,
@@ -1487,9 +1487,7 @@ fn cell_value_expr(field: &Field) -> String {
         (false, FieldKind::I32 | FieldKind::I64 | FieldKind::F32 | FieldKind::F64) => {
             format!("row.{name}")
         }
-        // Bool: no Render impl in maud 0.27; convert via Display like Uuid/chrono.
-        (false, FieldKind::Bool) => format!("row.{name}.to_string()"),
-        // Uuid, chrono types: no Render impl; convert to String.
+        // Bool, Uuid, chrono types: no Render impl in maud 0.27; convert via Display.
         (false, _) => format!("row.{name}.to_string()"),
     }
 }
@@ -1534,10 +1532,7 @@ fn title_case(s: &str) -> String {
     s.split('_')
         .map(|word| {
             let mut chars = word.chars();
-            match chars.next() {
-                None => String::new(),
-                Some(c) => c.to_uppercase().to_string() + chars.as_str(),
-            }
+            chars.next().map_or_else(String::new, |c| c.to_uppercase().to_string() + chars.as_str())
         })
         .collect::<Vec<_>>()
         .join(" ")
