@@ -196,9 +196,9 @@ fn render_tauri_conf(package_name: &str) -> String {
     "externalBin": [
       "binaries/{package_name}"
     ],
-    "resources": [
-      {{ "from": "../autumn.toml", "to": "autumn.toml" }}
-    ]
+    "resources": {{
+      "../autumn.toml": "autumn.toml"
+    }}
   }},
   "app": {{
     "security": {{
@@ -975,20 +975,13 @@ mod tests {
     fn tauri_conf_bundles_autumn_toml_as_resource() {
         let conf = render_tauri_conf("my-app");
         let parsed: serde_json::Value = serde_json::from_str(&conf).unwrap();
+        // Tauri v2 resources must be a map { source_path: dest_path }, not an array.
         let resources = parsed["bundle"]["resources"]
-            .as_array()
-            .expect("bundle.resources must be an array");
-        let has_autumn_toml = resources.iter().any(|r| {
-            // resource entries can be strings or {"from": "...", "to": "..."}
-            r.as_str()
-                .map(|s| s.contains("autumn.toml"))
-                .unwrap_or_else(|| {
-                    r["from"]
-                        .as_str()
-                        .map(|s| s.contains("autumn.toml"))
-                        .unwrap_or(false)
-                })
-        });
+            .as_object()
+            .expect("bundle.resources must be a map (Tauri v2 schema requirement)");
+        let has_autumn_toml = resources
+            .iter()
+            .any(|(k, v)| k.contains("autumn.toml") || v.as_str().map(|s| s.contains("autumn.toml")).unwrap_or(false));
         assert!(
             has_autumn_toml,
             "tauri.conf.json must bundle autumn.toml as a resource so the installed \
