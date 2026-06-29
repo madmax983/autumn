@@ -388,11 +388,16 @@ fn render_tauri_conf(package_name: &str, version: &str, bin_name: &str) -> Strin
 /// Platform-specific Tauri config overlays — Tauri CLI merges these at build/dev time.
 /// Keeping `beforeBuildCommand` / `beforeDevCommand` here (not in `tauri.conf.json`)
 /// means the generated scaffold is host-OS-agnostic.
+///
+/// `beforeDevCommand` uses the object form with `"wait": true` because Tauri v2 treats
+/// a plain string as `{ "wait": false }` for dev commands (designed for long-running dev
+/// servers). The staging script must complete before Tauri tries to spawn the sidecar,
+/// so we must opt in to blocking behaviour explicitly.
 fn render_tauri_linux_conf() -> String {
     r#"{
   "build": {
     "beforeBuildCommand": "bash stage-sidecar.sh",
-    "beforeDevCommand": "bash stage-sidecar.sh"
+    "beforeDevCommand": { "script": "bash stage-sidecar.sh", "wait": true }
   }
 }
 "#
@@ -403,7 +408,7 @@ fn render_tauri_macos_conf() -> String {
     r#"{
   "build": {
     "beforeBuildCommand": "bash stage-sidecar.sh",
-    "beforeDevCommand": "bash stage-sidecar.sh"
+    "beforeDevCommand": { "script": "bash stage-sidecar.sh", "wait": true }
   }
 }
 "#
@@ -414,7 +419,7 @@ fn render_tauri_windows_conf() -> String {
     r#"{
   "build": {
     "beforeBuildCommand": "powershell -ExecutionPolicy Bypass -File stage-sidecar.ps1",
-    "beforeDevCommand": "powershell -ExecutionPolicy Bypass -File stage-sidecar.ps1"
+    "beforeDevCommand": { "script": "powershell -ExecutionPolicy Bypass -File stage-sidecar.ps1", "wait": true }
   }
 }
 "#
@@ -1781,14 +1786,24 @@ mod tests {
         let conf = render_tauri_linux_conf();
         let parsed: serde_json::Value = serde_json::from_str(&conf).expect("valid JSON");
         let build_cmd = parsed["build"]["beforeBuildCommand"].as_str().unwrap_or("");
-        let dev_cmd = parsed["build"]["beforeDevCommand"].as_str().unwrap_or("");
+        // beforeDevCommand is the object form { script, wait: true } — not a plain string.
+        let dev_script = parsed["build"]["beforeDevCommand"]["script"]
+            .as_str()
+            .unwrap_or("");
+        let dev_wait = parsed["build"]["beforeDevCommand"]["wait"]
+            .as_bool()
+            .unwrap_or(false);
         assert!(
             build_cmd.contains("stage-sidecar"),
             "linux conf must have beforeBuildCommand referencing the staging script"
         );
         assert!(
-            dev_cmd.contains("stage-sidecar"),
-            "linux conf must have beforeDevCommand so `cargo tauri dev` stages the sidecar"
+            dev_script.contains("stage-sidecar"),
+            "linux conf must have beforeDevCommand.script referencing the staging script"
+        );
+        assert!(
+            dev_wait,
+            "linux beforeDevCommand must set wait:true so staging completes before sidecar spawn"
         );
         assert!(
             build_cmd.contains("bash"),
@@ -1801,14 +1816,23 @@ mod tests {
         let conf = render_tauri_macos_conf();
         let parsed: serde_json::Value = serde_json::from_str(&conf).expect("valid JSON");
         let build_cmd = parsed["build"]["beforeBuildCommand"].as_str().unwrap_or("");
-        let dev_cmd = parsed["build"]["beforeDevCommand"].as_str().unwrap_or("");
+        let dev_script = parsed["build"]["beforeDevCommand"]["script"]
+            .as_str()
+            .unwrap_or("");
+        let dev_wait = parsed["build"]["beforeDevCommand"]["wait"]
+            .as_bool()
+            .unwrap_or(false);
         assert!(
             build_cmd.contains("stage-sidecar"),
             "macos conf must have beforeBuildCommand referencing the staging script"
         );
         assert!(
-            dev_cmd.contains("stage-sidecar"),
-            "macos conf must have beforeDevCommand so `cargo tauri dev` stages the sidecar"
+            dev_script.contains("stage-sidecar"),
+            "macos conf must have beforeDevCommand.script referencing the staging script"
+        );
+        assert!(
+            dev_wait,
+            "macos beforeDevCommand must set wait:true so staging completes before sidecar spawn"
         );
         assert!(
             build_cmd.contains("bash"),
@@ -1821,14 +1845,23 @@ mod tests {
         let conf = render_tauri_windows_conf();
         let parsed: serde_json::Value = serde_json::from_str(&conf).expect("valid JSON");
         let build_cmd = parsed["build"]["beforeBuildCommand"].as_str().unwrap_or("");
-        let dev_cmd = parsed["build"]["beforeDevCommand"].as_str().unwrap_or("");
+        let dev_script = parsed["build"]["beforeDevCommand"]["script"]
+            .as_str()
+            .unwrap_or("");
+        let dev_wait = parsed["build"]["beforeDevCommand"]["wait"]
+            .as_bool()
+            .unwrap_or(false);
         assert!(
             build_cmd.contains("stage-sidecar"),
             "windows conf must have beforeBuildCommand referencing the staging script"
         );
         assert!(
-            dev_cmd.contains("stage-sidecar"),
-            "windows conf must have beforeDevCommand so `cargo tauri dev` stages the sidecar"
+            dev_script.contains("stage-sidecar"),
+            "windows conf must have beforeDevCommand.script referencing the staging script"
+        );
+        assert!(
+            dev_wait,
+            "windows beforeDevCommand must set wait:true so staging completes before sidecar spawn"
         );
         assert!(
             build_cmd.contains("powershell") || build_cmd.contains("ps1"),
