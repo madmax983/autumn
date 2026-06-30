@@ -152,6 +152,15 @@ fn validate_path(path: &LitStr) -> Result<(), TokenStream> {
         .to_compile_error());
     }
 
+    let val = path.value();
+    if val.contains("/../") || val.contains("/./") || val.ends_with("/..") || val.ends_with("/.") {
+        return Err(syn::Error::new(
+            path.span(),
+            "Route path must not contain traversal sequences like `..` or `.`",
+        )
+        .to_compile_error());
+    }
+
     Ok(())
 }
 

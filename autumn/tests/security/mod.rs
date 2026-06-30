@@ -12,5 +12,6 @@ pub mod ctf;
 pub mod fallback_middleware_bypass;
 pub mod maintenance;
 pub mod rate_limit_xff_bypass;
+pub mod route_traversal;
 pub mod session_exhaustion;
 pub mod session_fixation;
