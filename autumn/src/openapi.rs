@@ -793,18 +793,19 @@ fn operation_for(
         });
     }
 
-    // Security requirement: scope-secured routes use BearerAuth; all others use SessionAuth.
+    // Security requirements:
+    //   - scopes-only  (#[secured(scopes=[…])])            → BearerAuth
+    //   - roles+scopes (#[secured("r", scopes=[…])])       → SessionAuth AND BearerAuth
+    //   - roles-only / bare #[secured]                     → SessionAuth
+    // Both entries in one BTreeMap object means AND per the OpenAPI spec.
+    // HTTP-bearer scheme value arrays must be empty (non-empty arrays are OAuth2 scopes).
     let security = if api_doc.secured {
         let mut req = BTreeMap::new();
-        if api_doc.required_scopes.is_empty() {
-            req.insert("SessionAuth".to_owned(), Vec::new());
-        } else {
-            let scopes: Vec<String> = api_doc
-                .required_scopes
-                .iter()
-                .map(|s| (*s).to_owned())
-                .collect();
-            req.insert("BearerAuth".to_owned(), scopes);
+        if !api_doc.required_scopes.is_empty() {
+            req.insert("BearerAuth".to_owned(), Vec::<String>::new());
+        }
+        if api_doc.required_scopes.is_empty() || !api_doc.required_roles.is_empty() {
+            req.insert("SessionAuth".to_owned(), Vec::<String>::new());
         }
         vec![req]
     } else {
