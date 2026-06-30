@@ -115,14 +115,20 @@ vendor_in_tree_autumn_web() {
   # workspace root, so these crate dirs are source-only and cheap to copy.
   cp -R "${REPO_ROOT}/autumn" "${vendor_dir}/autumn"
   cp -R "${REPO_ROOT}/autumn-macros" "${vendor_dir}/autumn-macros"
+  cp -R "${REPO_ROOT}/autumn-cli" "${vendor_dir}/autumn-cli"
   # Drop any stray build artifacts so the context stays small and deterministic.
-  rm -rf "${vendor_dir}/autumn/target" "${vendor_dir}/autumn-macros/target"
+  rm -rf "${vendor_dir}/autumn/target" "${vendor_dir}/autumn-macros/target" \
+         "${vendor_dir}/autumn-cli/target"
 
   # A workspace root so the vendored crates' `*.workspace = true` keys,
   # `[workspace.dependencies]`, and `[workspace.lints]` resolve exactly as in the
-  # real tree. Derived from the real root manifest (members trimmed to the two
+  # real tree. Derived from the real root manifest (members trimmed to the three
   # vendored crates) so it stays in sync automatically.
-  sed 's|^members = \[.*\]|members = ["autumn", "autumn-macros"]|' \
+  # autumn-cli is included so that `cargo install --path ./vendor/autumn-cli` (used
+  # by inject_local_autumn_binary) resolves workspace dependencies correctly and
+  # compiles inside Docker against the builder's glibc — avoiding the glibc version
+  # mismatch that arises when copying a runner-built binary into the container.
+  sed 's|^members = \[.*\]|members = ["autumn", "autumn-macros", "autumn-cli"]|' \
     "${REPO_ROOT}/Cargo.toml" > "${vendor_dir}/Cargo.toml"
 
   # The scaffold's own Cargo.toml declares an (empty) `[workspace]`, which makes
@@ -160,16 +166,17 @@ stage_vendor_before_chef_cook() {
     "${PROJECT_DIR}/Dockerfile"
 }
 
-# Inject the locally-built autumn binary into the Docker build context so the
-# generated Dockerfile's `RUN autumn build --embed` uses the in-tree CLI rather
-# than the last published crates.io release (which may lack new sub-commands like
-# `--embed`). The generated Dockerfile is unchanged from what users receive.
+# Patch the generated Dockerfile to install autumn-cli from the vendored in-tree
+# source rather than from crates.io. This avoids the glibc version mismatch that
+# arises when a runner-built binary is copied into the Docker builder container
+# (the runner may link against a newer glibc than the Debian Bookworm base image),
+# and ensures sub-commands like `autumn build --embed` that post-date the last
+# published release are available inside the build.  The generated Dockerfile is
+# unchanged from what users receive.
 inject_local_autumn_binary() {
-  log "Injecting locally-built autumn binary into Docker build context"
-  cp "${AUTUMN}" "${PROJECT_DIR}/autumn-ci-bin"
-  chmod +x "${PROJECT_DIR}/autumn-ci-bin"
+  log "Patching Dockerfile to install autumn-cli from in-tree vendor source"
   sed -i \
-    's|^RUN cargo install --locked autumn-cli.*$|COPY ./autumn-ci-bin /usr/local/bin/autumn|' \
+    's|^RUN cargo install --locked autumn-cli.*$|RUN cargo install --locked --path ./vendor/autumn-cli|' \
     "${PROJECT_DIR}/Dockerfile"
 }
 
