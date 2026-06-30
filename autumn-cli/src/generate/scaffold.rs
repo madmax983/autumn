@@ -1612,7 +1612,7 @@ fn render_update_columns(plural: &str, fields: &[Field]) -> String {
     out
 }
 
-fn sample_scalar_value(kind: FieldKind) -> (&'static str, &'static str) {
+const fn sample_scalar_value(kind: FieldKind) -> (&'static str, &'static str) {
     // returns (json_value, url-encoded form value)
     match kind {
         FieldKind::String | FieldKind::Text => ("\\\"test\\\"", "test"),
