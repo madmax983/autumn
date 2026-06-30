@@ -324,14 +324,34 @@ fn resolve_bin_name(
         if autobins && project_root.join("src/main.rs").is_file() {
             return Ok(name.to_owned());
         }
-        if bins.len() > 1 {
+        // Count auto-discovered src/bin/ entries alongside the explicit ones so
+        // that a layout like `[[bin]] path="src/server.rs"` + `src/bin/helper.rs`
+        // is correctly flagged as ambiguous rather than silently picking the
+        // explicit entry.
+        let auto_bin_count = if autobins {
+            std::fs::read_dir(project_root.join("src/bin"))
+                .map(|entries| {
+                    entries
+                        .filter_map(std::result::Result::ok)
+                        .filter(|e| {
+                            let p = e.path();
+                            p.extension().is_some_and(|x| x == "rs")
+                                || (p.is_dir() && p.join("main.rs").is_file())
+                        })
+                        .count()
+                })
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        if bins.len() + auto_bin_count > 1 {
             let mut names: Vec<&str> = bins
                 .iter()
                 .filter_map(|b| b.get("name").and_then(|n| n.as_str()))
                 .collect();
             names.sort_unstable();
             return Err(GenerateError::Config(format!(
-                "ambiguous sidecar target: found multiple explicit [[bin]] entries ({}) \
+                "ambiguous sidecar target: found multiple binary targets ({}) \
                  and no [package] default-run is set; add `default-run = \"<bin>\"` to \
                  Cargo.toml to select one",
                 names.join(", ")
