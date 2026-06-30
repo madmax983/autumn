@@ -257,7 +257,15 @@ fn normalize_manifest_path(p: &str) -> Vec<&str> {
         match seg {
             "" | "." => {}
             ".." => {
-                segs.pop();
+                // Only pop when there is a real segment to cancel.  When the stack is
+                // empty (or the top is already ".."), the path escapes the package root;
+                // preserve the ".." so that "../src/main.rs" stays distinct from
+                // "src/main.rs" and is never mistaken for the package main binary.
+                if segs.last().map_or(false, |&s| s != "..") {
+                    segs.pop();
+                } else {
+                    segs.push("..");
+                }
             }
             s => segs.push(s),
         }
@@ -2264,6 +2272,27 @@ mod tests {
             normalize_manifest_path("a/b/../../src/main.rs"),
             vec!["src", "main.rs"],
             "a/b/../../src/main.rs must normalize to [src, main.rs]"
+        );
+        // A leading ".." escapes the package root.  The result must NOT equal
+        // ["src", "main.rs"] so that an external helper bin is never mistaken
+        // for the package's own main binary.
+        assert_ne!(
+            normalize_manifest_path("../src/main.rs"),
+            vec!["src", "main.rs"],
+            "../src/main.rs must preserve the leading '..' and must NOT normalize \
+             to [src, main.rs]; otherwise an out-of-package helper bin is \
+             incorrectly treated as the package main binary"
+        );
+        assert_eq!(
+            normalize_manifest_path("../src/main.rs"),
+            vec!["..", "src", "main.rs"],
+            "../src/main.rs must normalize to ['..', 'src', 'main.rs']"
+        );
+        // Multiple leading ".." are all preserved.
+        assert_eq!(
+            normalize_manifest_path("../../lib/main.rs"),
+            vec!["..", "..", "lib", "main.rs"],
+            "../../lib/main.rs must preserve both leading '..' segments"
         );
     }
 
