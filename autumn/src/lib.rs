@@ -820,8 +820,15 @@ pub use auth::ApiToken;
 /// Tower layer that validates `Authorization: Bearer <token>` on API routes.
 ///
 /// Verifies tokens against any [`auth::ApiTokenStore`] implementation.
-/// Returns `401 Unauthorized` for missing, unknown, or revoked tokens.
+/// Returns `401 Unauthorized` for missing, unknown, revoked, or expired tokens.
 pub use auth::RequireApiToken;
+
+/// Scoped service-token types and helpers: mint named, scoped, optionally
+/// expiring tokens whose granted scopes flow into the policy layer.
+pub use auth::{
+    ApiTokenScopes, IssueTokenSpec, TokenMetadata, VerifiedToken, issue_scoped_api_token,
+    list_api_tokens, rotate_api_token,
+};
 
 /// Postgres-backed API token store (requires `db` feature).
 ///

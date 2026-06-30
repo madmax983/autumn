@@ -42,6 +42,7 @@ db = [
     "dep:tokio-postgres",
     "diesel/postgres",
     "diesel/chrono",
+    "diesel/serde_json",
 ]
 test-support = ["dep:testcontainers", "dep:testcontainers-modules"]
 telemetry-otlp = [

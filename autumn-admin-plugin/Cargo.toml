@@ -29,6 +29,10 @@ tracing = { workspace = true }
 chrono = { workspace = true }
 
 [dev-dependencies]
+diesel = { workspace = true }
+diesel-async = { workspace = true }
+testcontainers = { workspace = true }
+testcontainers-modules = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt"] }
 tower = { workspace = true, features = ["util"] }
 

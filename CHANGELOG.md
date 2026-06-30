@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **auth:** scoped service tokens whose scopes flow into policy checks (#1158).
+  Mint named, optionally-expiring API tokens carrying a set of flat scopes
+  (e.g. `posts:read`) via `IssueTokenSpec` + `issue_scoped_api_token`; tokens
+  stay hashed at rest. The `ApiTokenStore` trait gains additive,
+  default-implemented `issue_scoped` / `verify_scoped` / `list` / `rotate`
+  methods (existing impls keep compiling), and the built-in `InMemoryApiTokenStore`
+  / `DbApiTokenStore` record `last_used_at` and reject expired tokens (401).
+  `PolicyContext` gains `has_scope` / `has_any_scope` / `has_all_scopes`
+  mirroring the role accessors, populated from the authenticating token via the
+  new `ApiTokenScopes` request extension and `authorize_with_scopes` /
+  `PolicyContext::from_request_parts`. `#[secured(scopes = ["posts:write"])]`
+  gates a handler on token scopes (default-deny, `403` when missing) and works
+  for pure service principals with no session; `#[secured("admin", scopes = […])]`
+  requires both. Management surface: helper API, `autumn token`
+  (`issue --name/--scope/--expires-at`, `list`, `rotate`), and an
+  `autumn-admin-plugin` `TokenAdminModel` panel. Additive `api_tokens` columns
+  (`name`, `scopes` JSONB, `expires_at`, `last_used_at`) via a new framework
+  migration; minor version bump, no breaking change to `autumn-web`.
 - **cli:** `autumn generate tauri` — scaffolds a complete `src-tauri/` sidecar
   project so any existing autumn app ships as a native desktop installer with a
   single additional command (`cargo tauri build`). Uses the Tauri v2 sidecar

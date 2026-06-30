@@ -1132,6 +1132,40 @@ enum TokenCommands {
     Issue {
         /// Principal identifier to associate with the token (e.g. `user:42`).
         principal_id: String,
+        /// Human-readable name for the token (e.g. `ci`, `partner-integration`).
+        #[arg(long, default_value = "")]
+        name: String,
+        /// Grant a scope (flat string, e.g. `posts:read`). Repeatable.
+        #[arg(long = "scope")]
+        scope: Vec<String>,
+        /// Optional expiry as an ISO-8601 / SQL timestamp (e.g.
+        /// `2026-12-31T23:59:59`). Omit for a non-expiring token.
+        #[arg(long)]
+        expires_at: Option<String>,
+    },
+    /// List non-secret metadata for a principal's API tokens.
+    ///
+    /// Prints name, scopes, expiry, last-used, and revocation status. The raw
+    /// token and its hash are never shown.
+    ///
+    /// # Example
+    ///
+    ///   autumn token list service:ci
+    #[command(verbatim_doc_comment)]
+    List {
+        /// Principal identifier whose tokens to list (e.g. `service:ci`).
+        principal_id: String,
+    },
+    /// Rotate an API token: revoke it and issue a replacement with the same
+    /// name and scopes. Prints the new raw token once.
+    ///
+    /// # Example
+    ///
+    ///   autumn token rotate `<RAW_TOKEN>`
+    #[command(verbatim_doc_comment)]
+    Rotate {
+        /// The raw bearer token string to rotate.
+        raw_token: String,
     },
     /// Revoke an existing API bearer token.
     ///
@@ -2047,7 +2081,14 @@ fn run_command(command: Commands) {
         ),
         Commands::Release(cmd) => run_release_command(cmd),
         Commands::Token(cmd) => match cmd {
-            TokenCommands::Issue { principal_id } => token::run_issue(&principal_id),
+            TokenCommands::Issue {
+                principal_id,
+                name,
+                scope,
+                expires_at,
+            } => token::run_issue(&principal_id, &name, &scope, expires_at.as_deref()),
+            TokenCommands::List { principal_id } => token::run_list(&principal_id),
+            TokenCommands::Rotate { raw_token } => token::run_rotate(&raw_token),
             TokenCommands::Revoke { raw_token } => token::run_revoke(&raw_token),
         },
         Commands::Check {
@@ -4149,11 +4190,50 @@ mod tests {
 
     #[test]
     fn parse_token_issue() {
-        let cli = Cli::try_parse_from(["autumn", "token", "issue", "user:42"]).unwrap();
-        let Commands::Token(TokenCommands::Issue { principal_id }) = cli.command else {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "token",
+            "issue",
+            "user:42",
+            "--name",
+            "ci",
+            "--scope",
+            "posts:read",
+            "--scope",
+            "posts:write",
+        ])
+        .unwrap();
+        let Commands::Token(TokenCommands::Issue {
+            principal_id,
+            name,
+            scope,
+            expires_at,
+        }) = cli.command
+        else {
             panic!("expected token issue");
         };
         assert_eq!(principal_id, "user:42");
+        assert_eq!(name, "ci");
+        assert_eq!(scope, vec!["posts:read", "posts:write"]);
+        assert!(expires_at.is_none());
+    }
+
+    #[test]
+    fn parse_token_list() {
+        let cli = Cli::try_parse_from(["autumn", "token", "list", "service:ci"]).unwrap();
+        let Commands::Token(TokenCommands::List { principal_id }) = cli.command else {
+            panic!("expected token list");
+        };
+        assert_eq!(principal_id, "service:ci");
+    }
+
+    #[test]
+    fn parse_token_rotate() {
+        let cli = Cli::try_parse_from(["autumn", "token", "rotate", "abc123"]).unwrap();
+        let Commands::Token(TokenCommands::Rotate { raw_token }) = cli.command else {
+            panic!("expected token rotate");
+        };
+        assert_eq!(raw_token, "abc123");
     }
 
     #[test]
