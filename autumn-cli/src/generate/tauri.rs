@@ -1203,7 +1203,12 @@ if (Test-Path "src-tauri\configs\credentials") {
 }
 New-Item -ItemType Directory -Force -Path "src-tauri\configs\credentials" | Out-Null
 if (Test-Path "config\credentials") {
-    Copy-Item -Recurse -Force "config\credentials\*" "src-tauri\configs\credentials\"
+    # Guard against an empty directory: Copy-Item with a wildcard and
+    # $ErrorActionPreference = "Stop" throws when there are no matches.
+    $credItems = Get-ChildItem "config\credentials" -ErrorAction SilentlyContinue
+    if ($credItems) {
+        Copy-Item -Recurse -Force "config\credentials\*" "src-tauri\configs\credentials\"
+    }
 }
 "#
 }
@@ -3252,6 +3257,32 @@ mod tests {
             ps1.contains("autumn_web/embed-assets")
                 && ps1.contains("autumn_web/managed-pg-bundled"),
             "stage-sidecar.ps1 must use the dependency key 'autumn_web' in feature selectors"
+        );
+    }
+
+    #[test]
+    fn staging_ps1_guards_empty_credentials_dir_before_copy() {
+        // When config\credentials exists but is empty, Copy-Item with a wildcard
+        // source ("config\credentials\*") matches nothing.  With
+        // $ErrorActionPreference = "Stop" that becomes a terminating error.
+        // The generated script must check for children before calling Copy-Item.
+        let ps1 = render_stage_sidecar_ps1("my-app", "my-app", true, "autumn-web");
+        // Must gate Copy-Item behind a Get-ChildItem / count check.
+        assert!(
+            ps1.contains("Get-ChildItem") || ps1.contains("Measure-Object"),
+            "stage-sidecar.ps1 must guard Copy-Item with Get-ChildItem so an empty \
+             config\\credentials directory does not abort the script under \
+             $ErrorActionPreference = 'Stop'"
+        );
+        // The guard must appear before the Copy-Item call for credentials.
+        let guard_pos = ps1
+            .find("Get-ChildItem")
+            .or_else(|| ps1.find("Measure-Object"))
+            .unwrap_or(usize::MAX);
+        let copy_pos = ps1.rfind("Copy-Item").unwrap_or(usize::MAX);
+        assert!(
+            guard_pos < copy_pos,
+            "Get-ChildItem guard must appear before the Copy-Item credentials call"
         );
     }
 
