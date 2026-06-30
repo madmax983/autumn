@@ -4069,10 +4069,8 @@ mod tests {
         fs::create_dir_all(tmp.path().join("src/bin")).unwrap();
         // A non-.rs file: triggers the `None` arm of the filter_map.
         fs::write(tmp.path().join("src/bin/README.md"), "# ignore me").unwrap();
-        let doc: toml::Value = toml::from_str(
-            "[package]\nname=\"my-app\"\nversion=\"0.1.0\"\n",
-        )
-        .unwrap();
+        let doc: toml::Value =
+            toml::from_str("[package]\nname=\"my-app\"\nversion=\"0.1.0\"\n").unwrap();
         let err = resolve_bin_name(tmp.path(), "my-app", None, true, &doc).unwrap_err();
         assert!(
             err.to_string().contains("no binary target"),
