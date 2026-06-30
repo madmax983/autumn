@@ -916,8 +916,13 @@ fn render_stage_sidecar_sh(
     };
     // Only fingerprint when the app-level alias exists; `autumn build --embed` passes
     // --features embed-assets (app-level), which fails for apps without that alias.
+    // We also pass managed-pg-bundled so apps wiring ManagedPostgresPoolProvider
+    // (without a cfg gate) can compile during the fingerprint phase 1.
     let fingerprint = if has_embed_assets {
-        format!("autumn build --embed -p {package_name} --bin {bin_name}\n")
+        format!(
+            "autumn build --embed -p {package_name} --bin {bin_name} \
+             --features {dep_key}/managed-pg-bundled\n"
+        )
     } else {
         String::new()
     };
@@ -1022,7 +1027,10 @@ fn render_stage_sidecar_ps1(
         format!(
             "# Fingerprint static/ before the embed compile (mirrors autumn build --embed phases 1-2):\n\
              # compile → write .autumn-manifest.json → the cargo build below embeds it.\n\
-             autumn build --embed -p {package_name} --bin {bin_name}\n"
+             # --features passes managed-pg-bundled so apps wiring ManagedPostgresPoolProvider\n\
+             # without a cfg gate can compile during the fingerprint phase.\n\
+             autumn build --embed -p {package_name} --bin {bin_name} \
+             --features {dep_key}/managed-pg-bundled\n"
         )
     } else {
         String::new()
@@ -2791,6 +2799,11 @@ mod tests {
             "stage-sidecar.sh must pass both -p <package> and --bin <bin> to autumn build \
              --embed so workspace members fingerprint the correct package and only the \
              sidecar binary is compiled (not all [[bin]] targets); got:\n{sh}"
+        );
+        assert!(
+            sh.contains("--features autumn-web/managed-pg-bundled"),
+            "fingerprint line must pass --features <dep_key>/managed-pg-bundled so apps \
+             wiring ManagedPostgresPoolProvider compile in the pre-embed phase; got:\n{sh}"
         );
     }
 

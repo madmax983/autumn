@@ -116,6 +116,11 @@ enum Commands {
         /// and fingerprints before compiling so the manifest is baked in).
         #[arg(long)]
         embed: bool,
+        /// Extra Cargo features to enable (comma-separated). Forwarded to both
+        /// the fingerprint phase and the embed compile so features like
+        /// `autumn-web/managed-pg-bundled` are active throughout all build steps.
+        #[arg(long, value_name = "FEATURES")]
+        features: Option<String>,
     },
     /// Start the dev server with hot reload (watch mode)
     Dev {
@@ -1763,7 +1768,14 @@ fn run_command(command: Commands) {
             package,
             bin,
             embed,
-        } => build::run(debug, embed, package.as_deref(), bin.as_deref()),
+            features,
+        } => build::run(
+            debug,
+            embed,
+            package.as_deref(),
+            bin.as_deref(),
+            features.as_deref(),
+        ),
         Commands::Dev {
             package,
             show_config,
@@ -2938,7 +2950,8 @@ mod tests {
                 debug: false,
                 package: None,
                 bin: None,
-                embed: false
+                embed: false,
+                features: None,
             }
         ));
     }
@@ -2952,7 +2965,8 @@ mod tests {
                 debug: true,
                 package: None,
                 bin: None,
-                embed: false
+                embed: false,
+                features: None,
             }
         ));
     }
@@ -2966,6 +2980,7 @@ mod tests {
                 package,
                 bin,
                 embed,
+                ..
             } => {
                 assert!(!debug);
                 assert!(!embed);
@@ -3007,6 +3022,31 @@ mod tests {
             Commands::Build { debug, package, .. } => {
                 assert!(debug);
                 assert_eq!(package.as_deref(), Some("blog"));
+            }
+            _ => panic!("expected Build command"),
+        }
+    }
+
+    #[test]
+    fn parse_build_with_features() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "build",
+            "--embed",
+            "--features",
+            "autumn-web/managed-pg-bundled",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Build {
+                embed, features, ..
+            } => {
+                assert!(embed);
+                assert_eq!(
+                    features.as_deref(),
+                    Some("autumn-web/managed-pg-bundled"),
+                    "--features must be captured"
+                );
             }
             _ => panic!("expected Build command"),
         }

@@ -25,6 +25,7 @@ fn build_cargo_command(
     embed: bool,
     package: Option<&str>,
     bin: Option<&str>,
+    extra_features: Option<&str>,
 ) -> Command {
     let mut cargo = Command::new("cargo");
     cargo.arg("build");
@@ -37,13 +38,22 @@ fn build_cargo_command(
     if let Some(b) = bin {
         cargo.args(["--bin", b]);
     }
-    if embed {
-        // Enable the app crate's `embed-assets` feature, which the scaffold
-        // defines as `["autumn-web/embed-assets"]`. Using the app-crate feature
-        // (rather than `autumn-web/embed-assets` directly) lets app code gate the
-        // `.embedded_static()` / `.embedded_locales()` wiring on
-        // `#[cfg(feature = "embed-assets")]`.
-        cargo.args(["--features", "embed-assets"]);
+    // Build the feature string. `embed-assets` (the app-crate feature that pulls
+    // in `autumn-web/embed-assets`) is added when we are in the embed phase.
+    // `extra_features` (e.g. `autumn-web/managed-pg-bundled`) is forwarded from
+    // the CLI so that apps wiring ManagedPostgresPoolProvider can compile in both
+    // the fingerprint phase and the final embed phase without feature-gate errors.
+    match (embed, extra_features) {
+        (true, Some(extra)) => {
+            cargo.args(["--features", &format!("embed-assets,{extra}")]);
+        }
+        (true, None) => {
+            cargo.args(["--features", "embed-assets"]);
+        }
+        (false, Some(extra)) => {
+            cargo.args(["--features", extra]);
+        }
+        (false, None) => {}
     }
     cargo
 }
@@ -67,7 +77,13 @@ fn run_cargo_or_exit(mut cargo: Command) {
 ///    (not the CLI cwd), writing the manifest + hashed copies.
 /// 3. Recompile **with** the embed feature so `include_dir!` bakes the
 ///    fingerprinted tree into the binary.
-fn build_embedded(debug: bool, profile: &str, package: Option<&str>, bin: Option<&str>) {
+fn build_embedded(
+    debug: bool,
+    profile: &str,
+    package: Option<&str>,
+    bin: Option<&str>,
+    features: Option<&str>,
+) {
     // Resolve the selected package's directory so `-p <pkg>` fingerprints that
     // package's `static/` (which `embed_static!` reads via $CARGO_MANIFEST_DIR),
     // not whatever `static/` happens to sit next to the CLI's cwd.
@@ -77,19 +93,29 @@ fn build_embedded(debug: bool, profile: &str, package: Option<&str>, bin: Option
         .join("static");
 
     eprintln!("Compiling ({profile} profile)...");
-    run_cargo_or_exit(build_cargo_command(debug, false, package, bin));
+    // Phase 1: compile WITHOUT embed-assets so build scripts populate static/.
+    // Pass extra features (e.g. managed-pg-bundled) so apps wiring
+    // ManagedPostgresPoolProvider can compile even in this pre-embed phase.
+    run_cargo_or_exit(build_cargo_command(debug, false, package, bin, features));
 
     eprintln!("\nFingerprinting static assets for embedding...");
     fingerprint_assets_in(&static_dir);
 
     eprintln!("\nEmbedding assets and locales into the binary...");
-    run_cargo_or_exit(build_cargo_command(debug, true, package, bin));
+    // Phase 3: recompile WITH embed-assets so include_dir! bakes the tree in.
+    run_cargo_or_exit(build_cargo_command(debug, true, package, bin, features));
 
     eprintln!("\n\u{1F342} Build complete! Assets and locales embedded into the binary.");
 }
 
 /// Run the static build pipeline.
-pub fn run(debug: bool, embed: bool, package: Option<&str>, bin: Option<&str>) {
+pub fn run(
+    debug: bool,
+    embed: bool,
+    package: Option<&str>,
+    bin: Option<&str>,
+    features: Option<&str>,
+) {
     eprintln!("\u{1F342} autumn build\n");
 
     let profile = if debug { "dev" } else { "release" };
@@ -99,12 +125,12 @@ pub fn run(debug: bool, embed: bool, package: Option<&str>, bin: Option<&str>) {
     // routes and the app's runtime state) and lets dynamic-server apps build a
     // single binary without a database or pre-render step.
     if embed {
-        build_embedded(debug, profile, package, bin);
+        build_embedded(debug, profile, package, bin, features);
         return;
     }
 
     eprintln!("Compiling ({profile} profile)...");
-    run_cargo_or_exit(build_cargo_command(debug, embed, package, bin));
+    run_cargo_or_exit(build_cargo_command(debug, embed, package, bin, features));
 
     // Resolve the selected package's directory before fingerprinting so that
     // when --bin selects a member of a workspace without -p, we fingerprint
@@ -501,8 +527,9 @@ mod tests {
         embed: bool,
         package: Option<&str>,
         bin: Option<&str>,
+        extra_features: Option<&str>,
     ) -> Vec<String> {
-        build_cargo_command(debug, embed, package, bin)
+        build_cargo_command(debug, embed, package, bin, extra_features)
             .get_args()
             .map(|a| a.to_string_lossy().into_owned())
             .collect()
@@ -510,7 +537,7 @@ mod tests {
 
     #[test]
     fn embed_build_enables_feature_in_release() {
-        let args = cargo_args(false, true, None, None);
+        let args = cargo_args(false, true, None, None, None);
         assert!(args.contains(&"--release".to_string()));
         assert!(
             args.windows(2).any(|w| w == ["--features", "embed-assets"]),
@@ -520,7 +547,7 @@ mod tests {
 
     #[test]
     fn non_embed_build_omits_embed_feature() {
-        let args = cargo_args(false, false, Some("blog"), None);
+        let args = cargo_args(false, false, Some("blog"), None, None);
         assert!(
             !args.iter().any(|a| a.contains("embed-assets")),
             "non-embed build must not enable embed-assets: {args:?}"
@@ -529,8 +556,46 @@ mod tests {
     }
 
     #[test]
+    fn extra_features_forwarded_to_cargo() {
+        // Non-embed: only the extra feature is added.
+        let args = cargo_args(
+            false,
+            false,
+            None,
+            None,
+            Some("autumn-web/managed-pg-bundled"),
+        );
+        assert!(
+            args.windows(2)
+                .any(|w| w == ["--features", "autumn-web/managed-pg-bundled"]),
+            "extra_features must be forwarded when embed is false: {args:?}"
+        );
+        assert!(
+            !args.iter().any(|a| a.contains("embed-assets")),
+            "embed-assets must not appear in non-embed build: {args:?}"
+        );
+    }
+
+    #[test]
+    fn extra_features_combined_with_embed_assets() {
+        // Embed: extra feature is combined with embed-assets in one --features flag.
+        let args = cargo_args(
+            false,
+            true,
+            None,
+            None,
+            Some("autumn-web/managed-pg-bundled"),
+        );
+        assert!(
+            args.windows(2)
+                .any(|w| w == ["--features", "embed-assets,autumn-web/managed-pg-bundled"]),
+            "embed + extra_features must produce a combined --features value: {args:?}"
+        );
+    }
+
+    #[test]
     fn bin_arg_is_passed_to_cargo() {
-        let args = cargo_args(false, true, Some("blog"), Some("blog-server"));
+        let args = cargo_args(false, true, Some("blog"), Some("blog-server"), None);
         assert!(
             args.windows(2).any(|w| w == ["--bin", "blog-server"]),
             "--bin must be forwarded to cargo: {args:?}"
