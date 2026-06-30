@@ -161,8 +161,13 @@ TOML
 # post-processing is CI-only and matches the CI-only vendoring above; the
 # generated artifact a user gets is unchanged.
 stage_vendor_before_chef_cook() {
+  # Also stage the root Cargo.lock into vendor/ so that
+  # `cargo install --locked --path ./vendor/autumn-cli` resolves to the same
+  # pinned dependency versions used by the main workspace.  Without it, cargo
+  # resolves freely and may pick an incompatible combination (e.g. cookie-0.18.1
+  # with time-0.3.52, which broke the time::parse() API).
   sed -i \
-    's|^COPY --from=planner /app/recipe.json recipe.json$|COPY --from=planner /app/vendor vendor\nCOPY --from=planner /app/recipe.json recipe.json|' \
+    's|^COPY --from=planner /app/recipe.json recipe.json$|COPY --from=planner /app/vendor vendor\nCOPY --from=planner /app/Cargo.lock vendor/Cargo.lock\nCOPY --from=planner /app/recipe.json recipe.json|' \
     "${PROJECT_DIR}/Dockerfile"
 }
 
