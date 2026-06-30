@@ -771,11 +771,14 @@ fn setup(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {{
         // Encrypted credentials (config/credentials/<profile>.toml.enc) are bundled
         // into resource_dir/config/credentials/ by the staging script.  Autumn loads
         // them automatically when AUTUMN_MANIFEST_DIR is set.  If the app reads
-        // secrets via `config.credentials()`, set AUTUMN_MASTER_KEY to the hex
-        // master key at launch time (e.g. via Tauri's deep-link or an OS keychain
-        // integration) so the bundled .toml.enc files can be decrypted.  Leaving it
-        // unset is safe for apps that don't use the credentials store: autumn returns
-        // an empty CredentialsStore when no .toml.enc file is found.
+        // secrets via `config.credentials()`, provide the decryption key via either:
+        //   • AUTUMN_MASTER_KEY env var (hex string), or
+        //   • resource_dir/config/master.key file (hex string, one line).
+        // The key file path is `<AUTUMN_MANIFEST_DIR>/config/master.key`; it must
+        // be staged alongside the .toml.enc files (do NOT ship it in the installer —
+        // deliver it out-of-band, e.g. via OS keychain or a secure download on first
+        // launch).  Leaving both absent is safe when the app has no credentials store:
+        // autumn returns CredentialsStore::default() when no .toml.enc file is found.
         // Clear any inherited Unix-socket config so the sidecar always binds
         // TCP on the loopback address the probe polls.  Without this, an
         // inherited AUTUMN_SERVER__UNIX_SOCKET or AUTUMN_SERVE_FORCE_UNIX_SOCKET
@@ -809,6 +812,14 @@ fn setup(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {{
         // the force-kill window.  Setting it to 0 lets on_shutdown hooks (including
         // ManagedPostgresPoolProvider::stop()) run immediately after SIGTERM.
         .env("AUTUMN_SERVER__PRESTOP_GRACE_SECS", "0")
+        // The webview loads the app over plain HTTP (http://127.0.0.1:<port>).
+        // Autumn's prod profile sets session.secure = true, which emits the
+        // `Secure` attribute on session/CSRF/flash cookies.  Browsers never send
+        // Secure cookies over non-HTTPS origins, so sessions, auth, and flash
+        // messages silently stop working on installed release bundles.
+        // Setting secure=false is safe here: the sidecar is loopback-only and
+        // no external network can reach it; cookie confidentiality is not at risk.
+        .env("AUTUMN_SESSION__SECURE", "false")
         // Clear one-off mode flags inherited from the calling environment.
         // If any of these are set, AppBuilder::run() enters a non-serving mode
         // (asset fingerprinting, route dump, task execution) and exits before
@@ -1103,7 +1114,7 @@ done
 # The staging directory is always created so the tauri.conf.json resource entry
 # is satisfiable at bundle time (an empty dir is a no-op for apps with no credentials).
 # Note: decryption at runtime requires the AUTUMN_MASTER_KEY env var (or the
-# .autumn-master-key key file placed in the resource dir).  See the Tauri section
+# config/master.key file placed in the resource dir).  See the Tauri section
 # of the Autumn docs for recommended key distribution strategies.
 # Remove and recreate the staging directory so stale .toml.enc files from a
 # previous build (deleted or rotated credentials) are not carried into the
@@ -1224,7 +1235,7 @@ foreach ($f in @("autumn-staging.toml", "autumn-test.toml")) {{
 # The staging directory is always created so the tauri.conf.json resource entry
 # is satisfiable at bundle time (an empty dir is a no-op for apps with no credentials).
 # Note: decryption at runtime requires the AUTUMN_MASTER_KEY env var (or the
-# .autumn-master-key key file placed in the resource dir).  See the Tauri section
+# config/master.key file placed in the resource dir).  See the Tauri section
 # of the Autumn docs for recommended key distribution strategies.
 # Remove and recreate the staging directory so stale .toml.enc files from a
 # previous build (deleted or rotated credentials) are not carried into the
@@ -3470,6 +3481,40 @@ mod tests {
             "lib.rs must mention AUTUMN_MASTER_KEY so developers wiring \
              config.credentials() know how to pass the decryption key to the sidecar \
              at desktop launch time"
+        );
+    }
+
+    #[test]
+    fn lib_rs_documents_config_master_key_file_path() {
+        let lib = render_shell_lib_rs("my-app", "my-app");
+        // The key file is `<AUTUMN_MANIFEST_DIR>/config/master.key`, not
+        // `.autumn-master-key`.  Documenting the wrong path leads to NoKeyFound
+        // errors for developers who follow the comment.
+        assert!(
+            lib.contains("config/master.key"),
+            "lib.rs must document the correct key file path (config/master.key) so \
+             developers who follow the comment can place the key where autumn's \
+             credentials resolver actually looks; the resolver checks AUTUMN_MASTER_KEY \
+             env var first, then <base_dir>/config/master.key"
+        );
+    }
+
+    #[test]
+    fn lib_rs_disables_secure_cookies_for_loopback() {
+        let lib = render_shell_lib_rs("my-app", "my-app");
+        // Prod profile's session.secure=true emits the Secure attribute.
+        // Browsers never send Secure cookies over plain HTTP, so sessions, auth,
+        // and flash messages silently fail on http://127.0.0.1:<port>.
+        assert!(
+            lib.contains("AUTUMN_SESSION__SECURE"),
+            "lib.rs must set AUTUMN_SESSION__SECURE=false; prod profile sets \
+             session.secure=true which prevents cookies being sent over the \
+             non-HTTPS loopback origin, silently breaking sessions/auth/flash"
+        );
+        assert!(
+            lib.contains("\"AUTUMN_SESSION__SECURE\", \"false\""),
+            "AUTUMN_SESSION__SECURE must be set to \"false\"; the sidecar is \
+             loopback-only so Secure cookies add no security but break functionality"
         );
     }
 
