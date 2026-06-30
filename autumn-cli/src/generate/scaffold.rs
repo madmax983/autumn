@@ -1612,22 +1612,32 @@ fn render_update_columns(plural: &str, fields: &[Field]) -> String {
     out
 }
 
-fn build_sample_json(fields: &[Field]) -> String {
-    let mut parts = Vec::new();
-    for f in fields {
-        let val = match f.kind {
-            FieldKind::String | FieldKind::Text => "\\\"test\\\"",
-            FieldKind::Bool => "true",
-            FieldKind::I32 | FieldKind::I64 => "1",
-            FieldKind::F32 | FieldKind::F64 => "1.0",
-            FieldKind::Uuid => "\\\"00000000-0000-0000-0000-000000000000\\\"",
-            FieldKind::NaiveDateTime => "\\\"2026-06-08T00:00:00\\\"",
-            FieldKind::DateTime => "\\\"2026-06-08T00:00:00Z\\\"",
-            FieldKind::Bytea => "[]",
-            FieldKind::Attachment => "null",
-        };
-        parts.push(format!("\\\"{}\\\": {}", f.name, val));
+fn sample_scalar_value(kind: FieldKind) -> (&'static str, &'static str) {
+    // returns (json_value, url-encoded form value)
+    match kind {
+        FieldKind::String | FieldKind::Text => ("\\\"test\\\"", "test"),
+        FieldKind::Bool => ("true", "true"),
+        FieldKind::I32 | FieldKind::I64 => ("1", "1"),
+        FieldKind::F32 | FieldKind::F64 => ("1.0", "1.0"),
+        FieldKind::Uuid => (
+            "\\\"00000000-0000-0000-0000-000000000000\\\"",
+            "00000000-0000-0000-0000-000000000000",
+        ),
+        FieldKind::NaiveDateTime => ("\\\"2026-06-08T00:00:00\\\"", "2026-06-08T00%3A00%3A00"),
+        FieldKind::DateTime => ("\\\"2026-06-08T00:00:00Z\\\"", "2026-06-08T00%3A00%3A00Z"),
+        FieldKind::Bytea => ("[]", ""),
+        FieldKind::Attachment => ("null", ""),
     }
+}
+
+fn build_sample_json(fields: &[Field]) -> String {
+    let parts: Vec<String> = fields
+        .iter()
+        .map(|f| {
+            let (json_val, _) = sample_scalar_value(f.kind);
+            format!("\\\"{}\\\": {}", f.name, json_val)
+        })
+        .collect();
     format!("{{ {} }}", parts.join(", "))
 }
 
@@ -1635,17 +1645,8 @@ fn build_sample_form(fields: &[Field]) -> String {
     let parts: Vec<String> = fields
         .iter()
         .map(|f| {
-            let val = match f.kind {
-                FieldKind::String | FieldKind::Text => "test",
-                FieldKind::Bool => "true",
-                FieldKind::I32 | FieldKind::I64 => "1",
-                FieldKind::F32 | FieldKind::F64 => "1.0",
-                FieldKind::Uuid => "00000000-0000-0000-0000-000000000000",
-                FieldKind::NaiveDateTime => "2026-06-08T00%3A00%3A00",
-                FieldKind::DateTime => "2026-06-08T00%3A00%3A00Z",
-                FieldKind::Bytea | FieldKind::Attachment => "",
-            };
-            format!("{}={}", f.name, val)
+            let (_, form_val) = sample_scalar_value(f.kind);
+            format!("{}={}", f.name, form_val)
         })
         .collect();
     parts.join("&")
@@ -1689,6 +1690,10 @@ fn render_smoke_test(
                      return;\n\
                  }};\n\
                  let base = base.trim_end_matches('/');\n\
+                 if base.starts_with(\"https://\") {{\n\
+                     eprintln!(\"skipping: raw TcpStream helper does not support TLS; run against http://\");\n\
+                     return;\n\
+                 }}\n\
                  let host_port = base\n\
                      .trim_start_matches(\"http://\")\n\
                      .trim_start_matches(\"https://\");\n\
@@ -1809,6 +1814,10 @@ fn render_smoke_test(
                  // preferred HTTP client they should replace this body.\n\
                  let base = base.trim_end_matches('/');\n\
                  let url = format!(\"{{base}}/{plural}\");\n\
+                 if base.starts_with(\"https://\") {{\n\
+                     eprintln!(\"skipping: raw TcpStream helper does not support TLS; run against http://\");\n\
+                     return;\n\
+                 }}\n\
                  let host_port = base\n\
                      .trim_start_matches(\"http://\")\n\
                      .trim_start_matches(\"https://\");\n\
@@ -1839,6 +1848,10 @@ fn render_smoke_test(
                      return;\n\
                  }};\n\
                  let base = base.trim_end_matches('/');\n\
+                 if base.starts_with(\"https://\") {{\n\
+                     eprintln!(\"skipping: raw TcpStream helper does not support TLS; run against http://\");\n\
+                     return;\n\
+                 }}\n\
                  let host_port = base\n\
                      .trim_start_matches(\"http://\")\n\
                      .trim_start_matches(\"https://\");\n\
@@ -1876,6 +1889,9 @@ fn render_smoke_test(
                  }}\n\
                  \n\
                  // 1. Snapshot existing IDs before creating.\n\
+                 // Note: calls find_all which fetches every row; on large tables this\n\
+                 // will be slow. This is a limitation of the smoke test; consider\n\
+                 // truncating the table or adding a filter before running it.\n\
                  let (list_before_h, list_before_b) = request(host_port, \"GET\", \"/api/{plural}\", None);\n\
                  assert!(\n\
                      list_before_h.starts_with(\"HTTP/1.1 200\") || list_before_h.starts_with(\"HTTP/1.0 200\"),\n\
@@ -1884,6 +1900,10 @@ fn render_smoke_test(
                  let before_json: autumn_web::reexports::serde_json::Value =\n\
                      autumn_web::reexports::serde_json::from_str(&list_before_b)\n\
                          .unwrap_or_else(|_| panic!(\"failed to parse list: {{list_before_b}}\"));\n\
+                 assert!(\n\
+                     before_json.is_array(),\n\
+                     \"GET /api/{plural} did not return a JSON array:\\n{{list_before_b}}\"\n\
+                 );\n\
                  let before_ids: std::collections::HashSet<{id_hs_type}> = before_json\n\
                      .as_array()\n\
                      .map(|arr| arr.iter().{id_hs_collect})\n\
@@ -1897,7 +1917,11 @@ fn render_smoke_test(
                      Some((\"application/x-www-form-urlencoded\", form_body)),\n\
                  );\n\
                  if create_h.starts_with(\"HTTP/1.1 403\") || create_h.starts_with(\"HTTP/1.0 403\") {{\n\
-                     eprintln!(\"skipping: CSRF enforced, cannot seed data without token\");\n\
+                     eprintln!(\"skipping: CSRF enforced on create -- the delete route is also untested; disable CSRF in dev or run with a real session cookie\");\n\
+                     return;\n\
+                 }}\n\
+                 if create_h.starts_with(\"HTTP/1.1 401\") || create_h.starts_with(\"HTTP/1.0 401\") {{\n\
+                     eprintln!(\"skipping: create returned 401 (auth required); run with a valid session cookie\");\n\
                      return;\n\
                  }}\n\
                  assert!(\n\
@@ -1916,12 +1940,22 @@ fn render_smoke_test(
                  let after_json: autumn_web::reexports::serde_json::Value =\n\
                      autumn_web::reexports::serde_json::from_str(&list_after_b)\n\
                          .unwrap_or_else(|_| panic!(\"failed to parse list: {{list_after_b}}\"));\n\
-                 let id = after_json\n\
+                 assert!(\n\
+                     after_json.is_array(),\n\
+                     \"GET /api/{plural} after create did not return a JSON array:\\n{{list_after_b}}\"\n\
+                 );\n\
+                 let new_ids: Vec<_> = after_json\n\
                      .as_array()\n\
-                     .and_then(|arr| arr.iter().find_map(|v| {{\n\
+                     .map(|arr| arr.iter().filter_map(|v| {{\n\
                          {vid_extract}\n\
                          {vid_guard}\n\
-                     }}))\n\
+                     }}).collect())\n\
+                     .unwrap_or_default();\n\
+                 if new_ids.len() > 1 {{\n\
+                     eprintln!(\"skipping: {{}} new rows appeared between snapshots; cannot isolate created row\", new_ids.len());\n\
+                     return;\n\
+                 }}\n\
+                 let id = new_ids.into_iter().next()\n\
                      .expect(\"created item not found in list after POST /{plural}\");\n\
                  \n\
                  // 4. Delete via HTML route — POST /{plural}/{{id}}/delete.\n\
@@ -1931,6 +1965,14 @@ fn render_smoke_test(
                      host_port, \"POST\", &delete_path,\n\
                      Some((\"application/x-www-form-urlencoded\", \"\")),\n\
                  );\n\
+                 if del_h.starts_with(\"HTTP/1.1 403\") || del_h.starts_with(\"HTTP/1.0 403\") {{\n\
+                     eprintln!(\"skipping: CSRF enforced on delete; cannot verify deletion without a session token\");\n\
+                     return;\n\
+                 }}\n\
+                 if del_h.starts_with(\"HTTP/1.1 401\") || del_h.starts_with(\"HTTP/1.0 401\") {{\n\
+                     eprintln!(\"skipping: delete returned 401 (auth required); cannot verify deletion\");\n\
+                     return;\n\
+                 }}\n\
                  assert!(\n\
                      del_h.starts_with(\"HTTP/1.1 200\") || del_h.starts_with(\"HTTP/1.0 200\"),\n\
                      \"POST {{delete_path}} did not return 200:\\n{{del_h}}\"\n\
