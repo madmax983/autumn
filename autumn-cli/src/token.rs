@@ -8,7 +8,7 @@
 use hex::encode as hex_encode;
 use sha2::{Digest as _, Sha256};
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 /// Issue a new API token for `principal_id` and print the raw token to stdout.
 ///
@@ -74,7 +74,7 @@ pub fn run_rotate(raw_token: &str) {
     // single statement so the rotation is atomic.
     // The SELECT 1/COUNT(*) forces psql to error if the old token was not found
     // (already revoked or never existed), preventing a silent no-op rotation.
-    run_psql_with_vars_or_die(
+    run_psql_silent(
         &database_url,
         "WITH rotated AS ( \
             UPDATE api_tokens SET revoked_at = NOW() AT TIME ZONE 'utc' \
@@ -224,12 +224,26 @@ fn check_psql() {
 /// may reference them as `:'name'` (psql quotes the value as a SQL string
 /// literal, preventing SQL injection).
 fn run_psql_with_vars_or_die(database_url: &str, sql: &str, vars: &[(&str, &str)]) {
+    run_psql_impl(database_url, sql, vars, false);
+}
+
+/// Like [`run_psql_with_vars_or_die`] but discards psql stdout so that
+/// validation-only SELECT results don't pollute the caller's stdout capture
+/// (e.g. `TOKEN=$(autumn token rotate …)`).
+fn run_psql_silent(database_url: &str, sql: &str, vars: &[(&str, &str)]) {
+    run_psql_impl(database_url, sql, vars, true);
+}
+
+fn run_psql_impl(database_url: &str, sql: &str, vars: &[(&str, &str)], suppress_stdout: bool) {
     let mut cmd = Command::new("psql");
     cmd.arg(database_url);
     for (name, value) in vars {
         cmd.args(["-v", &format!("{name}={value}")]);
     }
     cmd.args(["-c", sql]);
+    if suppress_stdout {
+        cmd.stdout(Stdio::null());
+    }
     match cmd.status() {
         Ok(s) if s.success() => {}
         Ok(_) => {
