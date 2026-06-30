@@ -119,6 +119,11 @@ vendor_in_tree_autumn_web() {
   # Drop any stray build artifacts so the context stays small and deterministic.
   rm -rf "${vendor_dir}/autumn/target" "${vendor_dir}/autumn-macros/target" \
          "${vendor_dir}/autumn-cli/target"
+  # Copy the monorepo Cargo.lock into vendor/ so `cargo install --locked` inside
+  # Docker uses the same pinned dependency versions as the main workspace (e.g.
+  # time=0.3.47, which is compatible with cookie-0.18.1; free resolution picks
+  # time=0.3.52 which broke the time::parse() API).
+  cp "${REPO_ROOT}/Cargo.lock" "${vendor_dir}/Cargo.lock"
 
   # A workspace root so the vendored crates' `*.workspace = true` keys,
   # `[workspace.dependencies]`, and `[workspace.lints]` resolve exactly as in the
@@ -161,13 +166,8 @@ TOML
 # post-processing is CI-only and matches the CI-only vendoring above; the
 # generated artifact a user gets is unchanged.
 stage_vendor_before_chef_cook() {
-  # Also stage the root Cargo.lock into vendor/ so that
-  # `cargo install --locked --path ./vendor/autumn-cli` resolves to the same
-  # pinned dependency versions used by the main workspace.  Without it, cargo
-  # resolves freely and may pick an incompatible combination (e.g. cookie-0.18.1
-  # with time-0.3.52, which broke the time::parse() API).
   sed -i \
-    's|^COPY --from=planner /app/recipe.json recipe.json$|COPY --from=planner /app/vendor vendor\nCOPY --from=planner /app/Cargo.lock vendor/Cargo.lock\nCOPY --from=planner /app/recipe.json recipe.json|' \
+    's|^COPY --from=planner /app/recipe.json recipe.json$|COPY --from=planner /app/vendor vendor\nCOPY --from=planner /app/recipe.json recipe.json|' \
     "${PROJECT_DIR}/Dockerfile"
 }
 
