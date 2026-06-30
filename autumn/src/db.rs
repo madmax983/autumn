@@ -274,20 +274,19 @@ pub trait DbState {
 /// Called after the opening `'` has already been consumed. Handles
 /// `\'` backslash-escaped quotes so they do not prematurely close the string.
 fn consume_estring_body(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
-    loop {
-        match chars.next() {
-            None => break,
-            Some('\'') => {
+    while let Some(c) = chars.next() {
+        match c {
+            '\'' => {
                 if chars.peek() == Some(&'\'') {
                     chars.next(); // consume the doubled quote
                 } else {
                     break;
                 }
             }
-            Some('\\') => {
+            '\\' => {
                 chars.next(); // skip the character after the backslash
             }
-            Some(_) => {}
+            _ => {}
         }
     }
 }
@@ -356,19 +355,15 @@ pub fn scrub_sql(sql: &str) -> String {
         if c == '\'' {
             out.push_str("'?'");
             prev_is_sep = false;
-            loop {
-                match chars.next() {
-                    None => break,
-                    Some('\'') => {
-                        if chars.peek() == Some(&'\'') {
-                            // Escaped quote ('') — consume both, stay inside string
-                            chars.next();
-                        } else {
-                            // Closing quote
-                            break;
-                        }
+            while let Some(sc) = chars.next() {
+                if sc == '\'' {
+                    if chars.peek() == Some(&'\'') {
+                        // Escaped quote ('') — consume both, stay inside string
+                        chars.next();
+                    } else {
+                        // Closing quote
+                        break;
                     }
-                    Some(_) => {}
                 }
             }
             continue;
