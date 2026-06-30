@@ -1,3 +1,4 @@
+#![allow(clippy::needless_pass_by_value)]
 //! Integration tests for first-class inbound email handling (issue #822).
 //!
 //! These tests follow TDD: they drive the public API contract for
@@ -32,6 +33,7 @@ fn encode_form(pairs: &[(&str, &str)]) -> String {
 /// Build a valid Mailgun form body with the correct signature.
 fn mailgun_form(key: &str, ts: &str, token: &str, extra: &[(&str, &str)]) -> String {
     let sig = compute_mailgun_signature(ts, token, key);
+    #[allow(clippy::collection_is_never_read)]
     let mut pairs: Vec<(&str, &str)> = vec![
         ("timestamp", ts),
         ("token", token),
@@ -55,7 +57,7 @@ fn mailgun_form(key: &str, ts: &str, token: &str, extra: &[(&str, &str)]) -> Str
     }
 }
 
-/// Dummy route so TestApp is happy (it requires at least one route).
+/// Dummy route so `TestApp` is happy (it requires at least one route).
 #[get("/_ping")]
 async fn ping() -> &'static str {
     "pong"
@@ -72,9 +74,7 @@ fn inbound_email_has_all_required_fields() {
         subject: "Test subject".to_string(),
         text_body: Some("Hello world".to_string()),
         html_body: Some("<p>Hello</p>".to_string()),
-        headers: [("x-mailer".to_string(), "Test/1.0".to_string())]
-            .into_iter()
-            .collect(),
+        headers: std::iter::once(("x-mailer".to_string(), "Test/1.0".to_string())).collect(),
         attachments: vec![],
         spam_report: None,
         raw: Bytes::from_static(b""),
@@ -111,6 +111,7 @@ fn inbound_email_plus_token_accessor() {
         subject: "Re: ticket".to_string(),
         text_body: None,
         html_body: None,
+        #[allow(clippy::default_trait_access)]
         headers: Default::default(),
         attachments: vec![],
         spam_report: None,
@@ -125,8 +126,11 @@ fn inbound_email_plus_token_accessor() {
 
 #[test]
 fn provider_enum_has_all_variants() {
+    #[allow(clippy::no_effect_underscore_binding)]
     let _m = InboundMailProvider::Mailgun;
+    #[allow(clippy::no_effect_underscore_binding)]
     let _s = InboundMailProvider::Ses;
+    #[allow(clippy::no_effect_underscore_binding)]
     let _g = InboundMailProvider::Generic;
 }
 
@@ -706,7 +710,7 @@ fn generic_fn(
     Box<dyn std::future::Future<Output = autumn_web::AutumnResult<()>> + Send + 'static>,
 > {
     GENERIC_CALLS.fetch_add(1, Ordering::SeqCst);
-    *GENERIC_SUBJECT.lock().unwrap() = email.subject.clone();
+    *GENERIC_SUBJECT.lock().unwrap() = email.subject;
     Box::pin(async { Ok(()) })
 }
 
@@ -914,7 +918,7 @@ fn multipart_fn(
 ) -> std::pin::Pin<
     Box<dyn std::future::Future<Output = autumn_web::AutumnResult<()>> + Send + 'static>,
 > {
-    *MULTIPART_SUBJECT.lock().unwrap() = email.subject.clone();
+    *MULTIPART_SUBJECT.lock().unwrap() = email.subject;
     Box::pin(async { Ok(()) })
 }
 
