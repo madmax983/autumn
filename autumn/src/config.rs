@@ -182,6 +182,12 @@ pub struct OsEnv;
 impl Env for OsEnv {
     fn var(&self, key: &str) -> Result<String, std::env::VarError> {
         if key == "AUTUMN_MANIFEST_DIR" {
+            // Process env takes priority over the compile-time baked-in path so
+            // installed apps (e.g. Tauri sidecars) can redirect config loading to
+            // their bundled resource dir by setting AUTUMN_MANIFEST_DIR at launch.
+            if let Ok(override_val) = std::env::var(key) {
+                return Ok(override_val);
+            }
             if let Some(dir) = MACRO_MANIFEST_DIR.get() {
                 return Ok(dir.clone());
             }

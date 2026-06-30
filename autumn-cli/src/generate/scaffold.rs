@@ -166,6 +166,7 @@ pub fn plan_scaffold_with_options(
                 &snake_name,
                 &plural,
                 &form_fields,
+                &fields,
                 options_with_key.model.sharded,
                 options_with_key.model.soft_delete,
                 options_with_key.model.id_type,
@@ -613,6 +614,7 @@ fn render_routes_file(
     snake_name: &str,
     plural: &str,
     fields: &[Field],
+    all_fields: &[Field],
     sharded: bool,
     soft_delete: bool,
     id_type: IdType,
@@ -768,15 +770,27 @@ fn render_routes_file(
 
     // The `index` handler: when sharded, use from_shard explicitly so the
     // generated code shows the canonical sharding pattern.
+    //
+    // Live (SSE) variant: keep the <ul>/<li> structure intact. LiveFragment
+    // renders `li id=…` and insert_swap() targets `#{plural}-list` via
+    // OobSwap::Target(BeforeEnd, …). Swapping to <table> would cause the SSE
+    // broadcast to append <li> into a <table> at runtime (invalid HTML). The
+    // table migration for the live path is a follow-up once LiveFragment
+    // supports <tr> fragments.
+    //
+    // Non-live variants: use data_table so the index shows real fields out of
+    // the box — no hand-authored <table>/<th>/<td> tags needed.
     let li_render = if live {
         format!(
             r#"li id=(format!("{snake_name}-{{}}", row.id)) {{ a href=(format!("/{plural}/{{}}", row.id)) {{ "{pascal_name} #{{}}" (row.id) }} }}"#
         )
     } else {
-        format!(r#"li {{ a href=(format!("/{plural}/{{}}", row.id)) {{ (row.id) }} }}"#)
+        String::new() // unused in the non-live path
     };
 
-    let ul_list_render = if live {
+    // For the live path we keep the original <ul> list so the SSE OOB-swap
+    // contract remains valid.
+    let live_ul_render = if live {
         format!(
             r#"@if page_req.page() == 1 {{
             ul id="{plural}-list" hx-ext="sse" sse-connect="/{plural}/events" sse-swap="message" hx-swap="none" {{
@@ -793,18 +807,30 @@ fn render_routes_file(
         }}"#
         )
     } else {
+        String::new()
+    };
+
+    // For non-live paths, generate the data_table columns and call.
+    let columns_let = if live {
+        String::new()
+    } else {
+        render_columns_vec(pascal_name, plural, fields)
+    };
+    let table_render = if live {
+        String::new()
+    } else {
         format!(
-            r#"ul id="{plural}-list" {{
-            @for row in &page_data.content {{
-                {li_render}
-            }}
-        }}"#
+            r#"(autumn_web::widgets::data_table(&page_data.content, &columns, &autumn_web::widgets::DataTableConfig::new("No {plural} yet.").base_path("/{plural}")))"#
         )
     };
 
+    let list_render = if live { &live_ul_render } else { &table_render };
+    let show_rows = render_show_property_rows(all_fields);
+
     let index_handler = if sharded {
-        format!(
-            r#"/// `GET /{plural}` — paginated list of {snake_name}s.
+        if live {
+            format!(
+                r#"/// `GET /{plural}` — paginated list of {snake_name}s.
 ///
 /// Accepts `?page=N&size=M` query parameters via the [`PageRequest`] extractor.
 /// Out-of-range or missing values are clamped silently — list endpoints never
@@ -820,7 +846,53 @@ pub async fn index(
     Ok(layout("{pascal_name} index", flash.render().await, html! {{
         h1 {{ "{pascal_name}s" }}
         a href="/{plural}/new" {{ "New {pascal_name}" }}
-        {ul_list_render}
+        {list_render}
+        (pagination_nav(&page_data, &PagerOptions::new("/{plural}")))
+    }}))
+}}"#
+            )
+        } else {
+            format!(
+                r#"/// `GET /{plural}` — paginated list of {snake_name}s.
+///
+/// Accepts `?page=N&size=M` query parameters via the [`PageRequest`] extractor.
+/// Out-of-range or missing values are clamped silently — list endpoints never
+/// return HTTP 400 for bad paging parameters.
+#[get("/{plural}")]
+pub async fn index(
+    page_req: PageRequest,
+    db: ShardedDb,
+    flash: Flash,
+) -> AutumnResult<Markup> {{
+    let repo = Pg{pascal_name}Repository::from_shard(&db);
+    let page_data: Page<{pascal_name}> = repo.page(&page_req).await?;
+{columns_let}    Ok(layout("{pascal_name} index", flash.render().await, html! {{
+        h1 {{ "{pascal_name}s" }}
+        a href="/{plural}/new" {{ "New {pascal_name}" }}
+        {list_render}
+        (pagination_nav(&page_data, &PagerOptions::new("/{plural}")))
+    }}))
+}}"#
+            )
+        }
+    } else if live {
+        format!(
+            r#"/// `GET /{plural}` — paginated list of {snake_name}s.
+///
+/// Accepts `?page=N&size=M` query parameters via the [`PageRequest`] extractor.
+/// Out-of-range or missing values are clamped silently — list endpoints never
+/// return HTTP 400 for bad paging parameters.
+#[get("/{plural}")]
+pub async fn index(
+    page_req: PageRequest,
+    repo: Pg{pascal_name}Repository,
+    flash: Flash,
+) -> AutumnResult<Markup> {{
+    let page_data: Page<{pascal_name}> = repo.page(&page_req).await?;
+    Ok(layout("{pascal_name} index", flash.render().await, html! {{
+        h1 {{ "{pascal_name}s" }}
+        a href="/{plural}/new" {{ "New {pascal_name}" }}
+        {list_render}
         (pagination_nav(&page_data, &PagerOptions::new("/{plural}")))
     }}))
 }}"#
@@ -839,10 +911,10 @@ pub async fn index(
     flash: Flash,
 ) -> AutumnResult<Markup> {{
     let page_data: Page<{pascal_name}> = repo.page(&page_req).await?;
-    Ok(layout("{pascal_name} index", flash.render().await, html! {{
+{columns_let}    Ok(layout("{pascal_name} index", flash.render().await, html! {{
         h1 {{ "{pascal_name}s" }}
         a href="/{plural}/new" {{ "New {pascal_name}" }}
-        {ul_list_render}
+        {list_render}
         (pagination_nav(&page_data, &PagerOptions::new("/{plural}")))
     }}))
 }}"#
@@ -1080,8 +1152,11 @@ pub async fn show(id: Path<{id_rust}>, mut db: {db_ty}, flash: Flash) -> AutumnR
         .first(&mut *db)
         .await
         .map_err(AutumnError::not_found)?;
+    let props: Vec<(&str, maud::Markup)> = vec![
+{show_rows}    ];
     Ok(layout(&format!("{pascal_name} #{{}}", row.id), flash.render().await, html! {{
         h1 {{ "{pascal_name} #" (row.id) }}
+        (autumn_web::widgets::property_list(&props))
         a href="/{plural}" {{ "Back to list" }}
         " "
         a href=(format!("/{plural}/{{}}/edit", row.id)) {{ "Edit" }}
@@ -1380,6 +1455,123 @@ fn edit_value_expr(field: &Field) -> String {
         }
         (false, _) => format!("row.{name}.to_string()"),
     }
+}
+
+/// Produce the cell-body expression for a `data_table` column closure.
+///
+/// Every arm must evaluate to a type that implements `maud::Render` (`&str`,
+/// `String`, `Cow<str>`, integers). `bool`, `Option<T>`, chrono types, `Uuid`,
+/// `Vec<u8>`, and `Blob` do NOT implement `Render` in maud 0.27, so we always
+/// coerce via `to_string()` / `unwrap_or_default()`.
+fn cell_value_expr(field: &Field) -> String {
+    let name = &field.name;
+    match (field.nullable, field.kind) {
+        // Attachment: always Option<Blob>; show presence only, no Blob internals.
+        (_, FieldKind::Attachment) => {
+            format!("if row.{name}.is_some() {{ \"attachment\" }} else {{ \"—\" }}")
+        }
+        (true, FieldKind::Bytea) => {
+            format!(
+                "row.{name}.as_ref().map(|v| String::from_utf8_lossy(v).to_string()).unwrap_or_default()"
+            )
+        }
+        // Nullable String/Text: use as_deref to avoid heap allocation.
+        (true, FieldKind::String | FieldKind::Text) => {
+            format!("row.{name}.as_deref().unwrap_or_default()")
+        }
+        // Nullable: Option<T> — no Render impl; unwrap to String.
+        (true, _) => format!("row.{name}.as_ref().map(ToString::to_string).unwrap_or_default()"),
+        // Non-nullable Bytea: Cow<str> does implement Render.
+        (false, FieldKind::Bytea) => format!("String::from_utf8_lossy(&row.{name})"),
+        // String/Text: &String implements Render via deref coercion.
+        (false, FieldKind::String | FieldKind::Text) => format!("&row.{name}"),
+        // Numerics (i32, i64, f32, f64): implement Render directly.
+        (false, FieldKind::I32 | FieldKind::I64 | FieldKind::F32 | FieldKind::F64) => {
+            format!("row.{name}")
+        }
+        // Bool, Uuid, chrono types: no Render impl in maud 0.27; convert via Display.
+        (false, _) => format!("row.{name}.to_string()"),
+    }
+}
+
+/// Emit the `let columns: Vec<Column<Pascal>> = vec![…];` block for the index handler.
+///
+/// Includes an "Id" column, one column per scaffold field (title-cased header),
+/// and a trailing "Show" actions column. All columns are non-sortable — server-side
+/// ordering per-column is out of scope; dead sort links would be worse than none.
+fn render_columns_vec(pascal_name: &str, plural: &str, fields: &[Field]) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(fields.len() * 150 + 300);
+    let _ = writeln!(
+        out,
+        "    let columns: Vec<autumn_web::widgets::Column<{pascal_name}>> = vec!["
+    );
+    // ID column
+    let _ = writeln!(
+        out,
+        "        autumn_web::widgets::Column::new(\"Id\", |row: &{pascal_name}| maud::html! {{ (row.id) }}),"
+    );
+    // One column per field
+    for f in fields {
+        let header = title_case(&f.name);
+        let cell_expr = cell_value_expr(f);
+        let _ = writeln!(
+            out,
+            "        autumn_web::widgets::Column::new(\"{header}\", |row: &{pascal_name}| maud::html! {{ ({cell_expr}) }}),"
+        );
+    }
+    // Show link column
+    let _ = writeln!(
+        out,
+        "        autumn_web::widgets::Column::new(\"\", |row: &{pascal_name}| maud::html! {{ a href=(format!(\"/{plural}/{{}}\", row.id)) {{ \"Show\" }} }}),"
+    );
+    let _ = writeln!(out, "    ];");
+    out
+}
+
+/// Emit the `vec![…]` body for the `props` binding in the `show` handler.
+///
+/// Produces one `("Label", maud::html! { value_expr })` tuple per row:
+/// `id`, every DSL-declared field (humanized label), then `created_at`.
+fn render_show_property_rows(fields: &[Field]) -> String {
+    let mut out = String::with_capacity(fields.len() * 100 + 150);
+    out.push_str("        (\"Id\", maud::html! { (row.id) }),\n");
+    for f in fields {
+        let label = humanize(&f.name);
+        let cell_expr = cell_value_expr(f);
+        out.push_str("        (\"");
+        out.push_str(&label);
+        out.push_str("\", maud::html! { (");
+        out.push_str(&cell_expr);
+        out.push_str(") }),\n");
+    }
+    out.push_str("        (\"Created at\", maud::html! { (row.created_at.to_string()) }),\n");
+    out
+}
+
+/// Humanize a `snake_case` field name: capitalize only the first word.
+///
+/// `created_at` → `"Created at"`, `user_name` → `"User name"`.
+/// Matches the humanization convention used in Phoenix / Rails form labels.
+fn humanize(s: &str) -> String {
+    let replaced = s.replace('_', " ");
+    let mut chars = replaced.chars();
+    chars.next().map_or_else(String::new, |c| {
+        c.to_uppercase().to_string() + chars.as_str()
+    })
+}
+
+/// Convert `snake_case` field name to `Title Case` header label.
+fn title_case(s: &str) -> String {
+    s.split('_')
+        .map(|word| {
+            let mut chars = word.chars();
+            chars.next().map_or_else(String::new, |c| {
+                c.to_uppercase().to_string() + chars.as_str()
+            })
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn render_nullable_field_match(fields: &[Field]) -> String {
@@ -2416,6 +2608,114 @@ async fn main() {
         assert!(!test_file.contains("contains(\"Posts\")"));
     }
 
+    // ── data_table scaffold integration ────────────────────────────────
+
+    #[test]
+    fn index_uses_data_table_not_ul() {
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &[
+                "title:String".into(),
+                "body:Text".into(),
+                "published:bool".into(),
+            ],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+        assert!(routes.contains("data_table("), "{routes}");
+        assert!(routes.contains("DataTableConfig::new("), "{routes}");
+        assert!(routes.contains("Column::new(\"Title\""), "{routes}");
+        assert!(
+            !routes.contains("ul id=\"posts-list\""),
+            "still uses ul: {routes}"
+        );
+    }
+
+    #[test]
+    fn index_data_table_cell_handles_nullable_field() {
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &["title:Option<String>".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+        assert!(routes.contains("unwrap_or_default"), "{routes}");
+    }
+
+    #[test]
+    fn index_data_table_has_show_link_column() {
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &["title:String".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+        assert!(routes.contains("/posts/{}"), "{routes}");
+        assert!(routes.contains("row.id"), "{routes}");
+    }
+
+    #[test]
+    fn sharded_index_uses_data_table() {
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &["tenant_id:i64".into(), "title:String".into()],
+            "20260427000000",
+            &ScaffoldOptions {
+                model: ModelOptions {
+                    sharded: true,
+                    shard_key: Some("tenant_id".into()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+        assert!(routes.contains("data_table("), "{routes}");
+        assert!(routes.contains("from_shard"), "{routes}");
+    }
+
+    #[test]
+    fn live_index_keeps_sse_list_container() {
+        let tmp = project_with_main(default_main());
+        fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[package]\nname=\"x\"\n\n[dependencies]\nautumn-web = \"0.5.0\"\n",
+        )
+        .unwrap();
+        let plan = plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &["title:String".into()],
+            "20260427000000",
+            &ScaffoldOptions {
+                live: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+        // Live variant must keep the ul/li SSE contract intact
+        assert!(routes.contains("ul id=\"posts-list\""), "{routes}");
+        assert!(routes.contains("sse-connect=\"/posts/events\""), "{routes}");
+    }
+
     #[test]
     fn plan_scaffold_live_views() {
         let tmp = project_with_main(default_main());
@@ -2456,5 +2756,105 @@ async fn main() {
         assert!(cargo.contains("\"ws\""));
         assert!(cargo.contains("\"maud\""));
         assert!(cargo.contains("\"htmx\""));
+    }
+
+    // ── property_list scaffold conformance (issue #1120) ──────────────────
+
+    #[test]
+    fn show_uses_property_list_widget_with_declared_fields() {
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &[
+                "title:String".into(),
+                "body:Text".into(),
+                "published:bool".into(),
+            ],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+        // show handler references property_list widget
+        assert!(
+            routes.contains("autumn_web::widgets::property_list"),
+            "show must use property_list widget: {routes}"
+        );
+        // Each declared field appears with humanized label
+        assert!(
+            routes.contains("\"Title\""),
+            "show must list 'title' field: {routes}"
+        );
+        assert!(
+            routes.contains("\"Body\""),
+            "show must list 'body' field: {routes}"
+        );
+        assert!(
+            routes.contains("\"Published\""),
+            "show must list 'published' field: {routes}"
+        );
+        // id and created_at always present
+        assert!(routes.contains("\"Id\""), "show must include id: {routes}");
+        assert!(
+            routes.contains("\"Created at\""),
+            "show must include created_at: {routes}"
+        );
+    }
+
+    #[test]
+    fn show_property_list_label_humanization() {
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &[
+                "published_at:NaiveDateTime".into(),
+                "user_name:String".into(),
+            ],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+        // humanized: first word capitalized, rest lowercase (snake_case → "Word rest")
+        assert!(
+            routes.contains("\"Published at\""),
+            "humanize must produce 'Published at': {routes}"
+        );
+        assert!(
+            routes.contains("\"User name\""),
+            "humanize must produce 'User name': {routes}"
+        );
+    }
+
+    #[test]
+    fn show_includes_defaulted_fields_in_property_list() {
+        // Regression test: fields with `#[default]` are excluded from the
+        // form (form_fields), but must still appear in the show property list.
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "views:i64".into()],
+            "20260427000000",
+            &ScaffoldOptions {
+                model: ModelOptions {
+                    defaults: vec!["views=0".to_string()],
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+        assert!(
+            routes.contains("\"Views\""),
+            "show must include defaulted field 'views': {routes}"
+        );
     }
 }

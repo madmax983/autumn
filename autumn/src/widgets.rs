@@ -592,6 +592,511 @@ pub fn autocomplete_empty_state(message: &str) -> maud::Markup {
     }
 }
 
+// ── property_list ─────────────────────────────────────────────────────────
+
+/// Render a property list (definition list) for a record's fields.
+///
+/// Emits a `<dl class="autumn-property-list">` with one `<dt>`/`<dd>` pair per
+/// entry. Labels (`&str`) are HTML-escaped; values are pre-escaped [`Markup`](maud::Markup)
+/// so callers can pass plain text, a formatted date, or a nested link/badge
+/// without escaping foot-guns.
+///
+/// An empty `rows` slice renders an empty `<dl>`, never panics.
+///
+/// # CSS hooks
+///
+/// | Selector | Element |
+/// |---|---|
+/// | `.autumn-property-list` | The `<dl>` wrapper |
+/// | `.autumn-property-list dt` | Label term |
+/// | `.autumn-property-list dd` | Value description |
+///
+/// # Example
+///
+/// ```rust
+/// use autumn_web::widgets::property_list;
+/// use maud::html;
+///
+/// struct Post { id: i64, title: String, published: bool }
+/// let post = Post { id: 1, title: "Hello".into(), published: true };
+///
+/// let rows = vec![
+///     ("Id", html! { (post.id) }),
+///     ("Title", html! { (&post.title) }),
+///     ("Published", html! { (post.published.to_string()) }),
+/// ];
+/// let markup = property_list(&rows);
+/// let html = markup.into_string();
+/// assert!(html.contains(r#"class="autumn-property-list""#));
+/// assert!(html.contains("<dt>Id</dt>"));
+/// assert!(html.contains("<dd>1</dd>"));
+/// ```
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn property_list(rows: &[(&str, maud::Markup)]) -> maud::Markup {
+    maud::html! {
+        dl class="autumn-property-list" {
+            @for (label, value) in rows {
+                dt { (label) }
+                dd { (value) }
+            }
+        }
+    }
+}
+
+// ── data_table ────────────────────────────────────────────────────────────
+
+/// Sort direction for a [`data_table`] sortable column header.
+///
+/// `Asc` is the default. Use [`SortDir::toggled`] to flip the direction
+/// when building sort links for the active column.
+#[cfg(feature = "maud")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SortDir {
+    /// Ascending order (default).
+    #[default]
+    Asc,
+    /// Descending order.
+    Desc,
+}
+
+#[cfg(feature = "maud")]
+impl SortDir {
+    /// Query-parameter value: `"asc"` or `"desc"`.
+    #[must_use]
+    pub const fn param_value(self) -> &'static str {
+        match self {
+            Self::Asc => "asc",
+            Self::Desc => "desc",
+        }
+    }
+
+    /// `aria-sort` attribute value: `"ascending"` or `"descending"`.
+    #[must_use]
+    pub const fn aria_value(self) -> &'static str {
+        match self {
+            Self::Asc => "ascending",
+            Self::Desc => "descending",
+        }
+    }
+
+    /// Returns the opposite direction.
+    #[must_use]
+    pub const fn toggled(self) -> Self {
+        match self {
+            Self::Asc => Self::Desc,
+            Self::Desc => Self::Asc,
+        }
+    }
+}
+
+/// A single column definition for [`data_table`].
+///
+/// Each column carries a header label, an optional sort key (opt-in via
+/// [`Column::sortable`]), and a cell closure that maps a row reference to
+/// `Markup`.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use autumn_web::widgets::{Column, data_table, DataTableConfig};
+///
+/// struct Post { id: i64, title: String }
+///
+/// let cols: Vec<Column<Post>> = vec![
+///     Column::new("ID", |row| html! { (row.id) }),
+///     Column::new("Title", |row| html! { (row.title.as_str()) })
+///         .sortable("title"),
+/// ];
+/// ```
+#[cfg(feature = "maud")]
+pub struct Column<'a, T> {
+    /// Column header label shown in `<th>`.
+    pub header: &'a str,
+    /// If `Some`, this column is sortable and the value is the `sort=` query param.
+    pub sort_key: Option<&'a str>,
+    /// Cell renderer: maps a row reference to rendered `Markup`.
+    pub cell: Box<dyn Fn(&T) -> maud::Markup + Send + 'a>,
+}
+
+#[cfg(feature = "maud")]
+impl<'a, T> Column<'a, T> {
+    /// Create a new non-sortable column with a header label and cell closure.
+    #[must_use]
+    pub fn new(header: &'a str, cell: impl Fn(&T) -> maud::Markup + Send + 'a) -> Self {
+        Self {
+            header,
+            sort_key: None,
+            cell: Box::new(cell),
+        }
+    }
+
+    /// Make this column sortable, linking the header with `sort={sort_key}` query params.
+    ///
+    /// The server owns the actual ordering; the widget only renders the link.
+    #[must_use]
+    pub const fn sortable(mut self, sort_key: &'a str) -> Self {
+        self.sort_key = Some(sort_key);
+        self
+    }
+}
+
+/// Configuration for a [`data_table`] widget.
+///
+/// Build with [`DataTableConfig::new`] and chain builder methods for optional overrides.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use autumn_web::widgets::DataTableConfig;
+///
+/// let config = DataTableConfig::new("No posts found.")
+///     .base_path("/posts")
+///     .query("q=foo")
+///     .active_sort("title")
+///     .caption("Posts");
+/// ```
+#[cfg(feature = "maud")]
+#[derive(Debug, Clone)]
+pub struct DataTableConfig<'a> {
+    /// Optional `<caption>` for the table (table name/description, not the empty state).
+    pub caption: Option<&'a str>,
+    /// Message shown when `rows` is empty (required).
+    pub empty_message: &'a str,
+    /// Base path for sort links, e.g. `"/posts"`.
+    pub base_path: &'a str,
+    /// Raw query string of the current request (preserved on sort links).
+    pub query: &'a str,
+    /// Query parameter name for the sort column (default `"sort"`).
+    pub sort_param: &'a str,
+    /// Query parameter name for the sort direction (default `"dir"`).
+    pub dir_param: &'a str,
+    /// Query parameter name for the page (stripped on sort, default `"page"`).
+    pub page_param: &'a str,
+    /// The currently active sort column key, if any.
+    pub active_sort: Option<&'a str>,
+    /// Direction of the active sort (default [`SortDir::Asc`]).
+    pub active_dir: SortDir,
+    /// Optional CSS class to add to the `<table>` element.
+    pub class: Option<&'a str>,
+}
+
+#[cfg(feature = "maud")]
+impl<'a> DataTableConfig<'a> {
+    /// Create a new config with the given empty-state message and sensible defaults.
+    #[must_use]
+    pub const fn new(empty_message: &'a str) -> Self {
+        Self {
+            caption: None,
+            empty_message,
+            base_path: "",
+            query: "",
+            sort_param: "sort",
+            dir_param: "dir",
+            page_param: "page",
+            active_sort: None,
+            active_dir: SortDir::Asc,
+            class: None,
+        }
+    }
+
+    /// Set the table `<caption>` (table name; use for accessibility, not for empty state).
+    #[must_use]
+    pub const fn caption(mut self, caption: &'a str) -> Self {
+        self.caption = Some(caption);
+        self
+    }
+
+    /// Set the base path for sort links (default `""`).
+    #[must_use]
+    pub const fn base_path(mut self, base_path: &'a str) -> Self {
+        self.base_path = base_path;
+        self
+    }
+
+    /// Preserve the current request query string on sort links.
+    #[must_use]
+    pub const fn query(mut self, query: &'a str) -> Self {
+        self.query = query;
+        self
+    }
+
+    /// Set the active sort column key.
+    #[must_use]
+    pub const fn active_sort(mut self, key: &'a str) -> Self {
+        self.active_sort = Some(key);
+        self
+    }
+
+    /// Set the active sort direction.
+    #[must_use]
+    pub const fn active_dir(mut self, dir: SortDir) -> Self {
+        self.active_dir = dir;
+        self
+    }
+
+    /// Add a CSS class to the `<table>` element.
+    #[must_use]
+    pub const fn class(mut self, class: &'a str) -> Self {
+        self.class = Some(class);
+        self
+    }
+}
+
+/// Strip named params from a raw query string, returning the preserved remainder.
+///
+/// Intentional duplication of the same helper in `ui::pagination` — that one is
+/// private to its module. Both are small enough that sharing outweighs coupling.
+#[cfg(feature = "maud")]
+fn dt_filter_query(query: &str, drop_keys: &[&str]) -> String {
+    let query = query.strip_prefix('?').unwrap_or(query);
+    query
+        .split('&')
+        .filter(|pair| {
+            if pair.is_empty() {
+                return false;
+            }
+            let key = pair.split('=').next().unwrap_or(pair);
+            !drop_keys.contains(&key)
+        })
+        .collect::<Vec<&str>>()
+        .join("&")
+}
+
+/// Render a column-driven data table from a slice of records.
+///
+/// Emits a semantic, accessible `<table>` with a `<thead>` row of `<th scope="col">`
+/// headers and a `<tbody>` of `<tr>`/`<td>` cells. Empty rows render a single
+/// placeholder row spanning all columns. Sortable columns (opt-in via
+/// [`Column::sortable`]) carry `aria-sort` on the `<th>` and a link that toggles
+/// direction while preserving the current query string (sort resets pagination).
+///
+/// # Composes with `active_search` and `pagination_nav`
+///
+/// ```rust
+/// # use autumn_web::pagination::{Page, PageRequest};
+/// # use autumn_web::ui::pagination::{pagination_nav, PagerOptions};
+/// # use autumn_web::widgets::{Column, DataTableConfig, data_table};
+/// # struct Post { id: i64, title: String }
+/// # let req = PageRequest::new(1, 10);
+/// # let rows: Vec<Post> = vec![];
+/// # let page: Page<Post> = Page::new(rows, 0, &req);
+/// let cols: Vec<Column<Post>> = vec![
+///     Column::new("ID", |row: &Post| maud::html! { (row.id) }),
+///     Column::new("Title", |row: &Post| maud::html! { (row.title.as_str()) }),
+/// ];
+/// let html = maud::html! {
+///     (data_table(&page.content, &cols, &DataTableConfig::new("No posts yet.").base_path("/posts")))
+///     (pagination_nav(&page, &PagerOptions::new("/posts")))
+/// };
+/// assert!(html.into_string().contains("<table"));
+/// ```
+///
+/// # Example with sortable columns
+///
+/// ```rust,ignore
+/// use autumn_web::prelude::*;
+/// use autumn_web::widgets::{Column, DataTableConfig, SortDir, data_table};
+/// use serde::Deserialize;
+///
+/// #[derive(Deserialize)]
+/// struct SortQuery { sort: Option<String>, dir: Option<String> }
+///
+/// #[get("/posts")]
+/// async fn index(
+///     Query(q): Query<SortQuery>,
+///     page_req: PageRequest,
+///     repo: PgPostRepository,
+/// ) -> AutumnResult<Markup> {
+///     let active_dir = if q.dir.as_deref() == Some("desc") { SortDir::Desc } else { SortDir::Asc };
+///     let page_data = repo.page(&page_req).await?;
+///     let cols: Vec<Column<Post>> = vec![
+///         Column::new("Title", |row| html! { (row.title.as_str()) }).sortable("title"),
+///         Column::new("", |row| html! { a href=(format!("/posts/{}", row.id)) { "Show" } }),
+///     ];
+///     let config = DataTableConfig::new("No posts yet.")
+///         .base_path("/posts")
+///         .active_sort(q.sort.as_deref().unwrap_or(""))
+///         .active_dir(active_dir);
+///     Ok(layout("Posts", html! {
+///         (data_table(&page_data.content, &cols, &config))
+///         (pagination_nav(&page_data, &PagerOptions::new("/posts")))
+///     }))
+/// }
+/// ```
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn data_table<T>(
+    rows: &[T],
+    columns: &[Column<'_, T>],
+    config: &DataTableConfig<'_>,
+) -> maud::Markup {
+    let col_count = columns.len();
+    // Hoist loop-invariant: query/drop-keys are the same for every sortable column.
+    let filtered = dt_filter_query(
+        config.query,
+        &[config.sort_param, config.dir_param, config.page_param],
+    );
+
+    maud::html! {
+        table class=[config.class] {
+            @if let Some(caption) = config.caption {
+                caption { (caption) }
+            }
+            thead {
+                tr {
+                    @for col in columns {
+                        @if let Some(sort_key) = col.sort_key {
+                            // Determine sort direction for this column's link.
+                            @let is_active = config.active_sort == Some(sort_key);
+                            @let link_dir = if is_active {
+                                config.active_dir.toggled()
+                            } else {
+                                SortDir::Asc
+                            };
+                            @let aria_sort = if is_active {
+                                config.active_dir.aria_value()
+                            } else {
+                                "none"
+                            };
+                            @let href = if filtered.is_empty() {
+                                format!(
+                                    "{}?{}={}&{}={}",
+                                    config.base_path,
+                                    config.sort_param,
+                                    sort_key,
+                                    config.dir_param,
+                                    link_dir.param_value(),
+                                )
+                            } else {
+                                format!(
+                                    "{}?{}&{}={}&{}={}",
+                                    config.base_path,
+                                    filtered,
+                                    config.sort_param,
+                                    sort_key,
+                                    config.dir_param,
+                                    link_dir.param_value(),
+                                )
+                            };
+                            th scope="col" aria-sort=(aria_sort) {
+                                a href=(href) { (col.header) }
+                            }
+                        } @else {
+                            th scope="col" { (col.header) }
+                        }
+                    }
+                }
+            }
+            tbody {
+                @if rows.is_empty() {
+                    tr {
+                        td colspan=(col_count) {
+                            span role="status" { (config.empty_message) }
+                        }
+                    }
+                } @else {
+                    @for row in rows {
+                        tr {
+                            @for col in columns {
+                                td { ((col.cell)(row)) }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ── breadcrumb ────────────────────────────────────────────────────────────
+
+/// A single crumb in a [`breadcrumb`] navigation trail.
+///
+/// Build with [`Crumb::link`] for a linked crumb or [`Crumb::current`] for the
+/// current (non-linked) page. The last item in the slice passed to [`breadcrumb`]
+/// is always treated as the current page regardless of whether `href` is set.
+#[cfg(feature = "maud")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Crumb<'a> {
+    /// Visible label for this crumb. HTML-escaped by Maud.
+    pub label: &'a str,
+    /// Optional URL for this crumb. `None` on the last crumb (current page).
+    pub href: Option<&'a str>,
+}
+
+#[cfg(feature = "maud")]
+impl<'a> Crumb<'a> {
+    /// Create a linked crumb.
+    #[must_use]
+    pub const fn link(label: &'a str, href: &'a str) -> Self {
+        Self {
+            label,
+            href: Some(href),
+        }
+    }
+
+    /// Create the current-page crumb (no link).
+    #[must_use]
+    pub const fn current(label: &'a str) -> Self {
+        Self { label, href: None }
+    }
+}
+
+/// Render an accessible breadcrumb navigation trail.
+///
+/// Emits a `<nav aria-label="Breadcrumb">` containing an `<ol>`. Every crumb
+/// except the last renders as an `<a>` link (using `href` when provided); the
+/// last crumb renders as the current page marked with `aria-current="page"`.
+/// Separators are wrapped in `<span aria-hidden="true">` so screen readers
+/// announce only the crumb labels.
+///
+/// An empty slice renders empty [`maud::Markup`] (no output, no panic).
+/// A single crumb renders without a leading separator.
+///
+/// # Example
+///
+/// ```rust
+/// use autumn_web::widgets::{Crumb, breadcrumb};
+///
+/// let crumbs = [
+///     Crumb::link("Home", "/"),
+///     Crumb::link("Posts", "/posts"),
+///     Crumb::current("My Post"),
+/// ];
+/// let html = breadcrumb(&crumbs).into_string();
+/// assert!(html.contains(r#"aria-current="page""#));
+/// assert!(html.contains(r#"href="/posts""#));
+/// ```
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn breadcrumb(crumbs: &[Crumb<'_>]) -> maud::Markup {
+    if crumbs.is_empty() {
+        return maud::html! {};
+    }
+    let last = crumbs.len() - 1;
+    maud::html! {
+        nav aria-label="Breadcrumb" class="autumn-breadcrumb" {
+            ol class="autumn-breadcrumb__list" {
+                @for (i, crumb) in crumbs.iter().enumerate() {
+                    li class="autumn-breadcrumb__item" {
+                        @if i > 0 {
+                            span aria-hidden="true" class="autumn-breadcrumb__separator" { "›" }
+                        }
+                        @if i == last {
+                            span aria-current="page" class="autumn-breadcrumb__current" { (crumb.label) }
+                        } @else if let Some(href) = crumb.href {
+                            a href=(href) class="autumn-breadcrumb__link" { (crumb.label) }
+                        } @else {
+                            span class="autumn-breadcrumb__text" { (crumb.label) }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 // ── Tests ──────────────────────────────────────────────────────────────────
 
 #[cfg(all(test, feature = "maud"))]
@@ -1190,5 +1695,391 @@ mod tests {
             html.contains(r#"role="status""#) || html.contains("aria-live"),
             "{html}"
         );
+    }
+
+    // ── breadcrumb ─────────────────────────────────────────────────────
+
+    #[test]
+    fn breadcrumb_empty_slice_renders_nothing_no_panic() {
+        let html = breadcrumb(&[]).into_string();
+        assert!(html.is_empty(), "expected empty output, got: {html}");
+    }
+
+    #[test]
+    fn breadcrumb_wrapped_in_nav_with_aria_label() {
+        let crumbs = [Crumb::link("Home", "/"), Crumb::current("Posts")];
+        let html = breadcrumb(&crumbs).into_string();
+        assert!(html.contains("<nav"), "{html}");
+        assert!(html.contains("aria-label"), "{html}");
+    }
+
+    #[test]
+    fn breadcrumb_contains_ordered_list() {
+        let crumbs = [Crumb::link("Home", "/"), Crumb::current("Posts")];
+        let html = breadcrumb(&crumbs).into_string();
+        assert!(html.contains("<ol"), "{html}");
+        assert!(html.contains("</ol>"), "{html}");
+    }
+
+    #[test]
+    fn breadcrumb_last_crumb_has_aria_current_page() {
+        let crumbs = [
+            Crumb::link("Home", "/"),
+            Crumb::link("Posts", "/posts"),
+            Crumb::current("My Post"),
+        ];
+        let html = breadcrumb(&crumbs).into_string();
+        assert!(html.contains(r#"aria-current="page""#), "{html}");
+    }
+
+    #[test]
+    fn breadcrumb_preceding_crumbs_render_as_links() {
+        let crumbs = [
+            Crumb::link("Home", "/"),
+            Crumb::link("Posts", "/posts"),
+            Crumb::current("My Post"),
+        ];
+        let html = breadcrumb(&crumbs).into_string();
+        assert!(html.contains(r#"href="/""#), "{html}");
+        assert!(html.contains(r#"href="/posts""#), "{html}");
+    }
+
+    #[test]
+    fn breadcrumb_last_crumb_is_not_a_link() {
+        let crumbs = [Crumb::link("Home", "/"), Crumb::current("Current Page")];
+        let html = breadcrumb(&crumbs).into_string();
+        // "Current Page" must not be wrapped in an <a>; it carries aria-current="page" instead.
+        assert!(html.contains("Current Page"), "{html}");
+        // The current page span must not itself be a link.
+        assert!(!html.contains("<a href=\"\">Current Page"), "{html}");
+        assert!(html.contains("aria-current=\"page\""), "{html}");
+        assert!(html.contains("autumn-breadcrumb__current"), "{html}");
+    }
+
+    #[test]
+    fn breadcrumb_single_crumb_no_leading_separator() {
+        let crumbs = [Crumb::current("Only Page")];
+        let html = breadcrumb(&crumbs).into_string();
+        // No separator before the first (and only) item
+        assert!(!html.contains("aria-hidden"), "{html}");
+        assert!(html.contains("Only Page"), "{html}");
+    }
+
+    #[test]
+    fn breadcrumb_single_crumb_has_aria_current_page() {
+        let crumbs = [Crumb::current("Only Page")];
+        let html = breadcrumb(&crumbs).into_string();
+        assert!(html.contains(r#"aria-current="page""#), "{html}");
+    }
+
+    #[test]
+    fn breadcrumb_separators_are_aria_hidden() {
+        let crumbs = [
+            Crumb::link("Home", "/"),
+            Crumb::link("Posts", "/posts"),
+            Crumb::current("Current"),
+        ];
+        let html = breadcrumb(&crumbs).into_string();
+        // Every separator must carry aria-hidden="true"
+        assert!(html.contains(r#"aria-hidden="true""#), "{html}");
+    }
+
+    #[test]
+    fn breadcrumb_label_containing_html_is_escaped() {
+        let crumbs = [
+            Crumb::link("<script>alert(1)</script>", "/"),
+            Crumb::current("Safe"),
+        ];
+        let html = breadcrumb(&crumbs).into_string();
+        assert!(!html.contains("<script>"), "{html}");
+        assert!(html.contains("&lt;script&gt;"), "{html}");
+    }
+
+    #[test]
+    fn breadcrumb_href_containing_html_is_escaped() {
+        let crumbs = [
+            Crumb::link("Home", r#"/" onerror="bad"#),
+            Crumb::current("Page"),
+        ];
+        let html = breadcrumb(&crumbs).into_string();
+        assert!(!html.contains("onerror=\"bad"), "{html}");
+    }
+
+    #[test]
+    fn breadcrumb_crumb_link_constructor() {
+        let c = Crumb::link("Posts", "/posts");
+        assert_eq!(c.label, "Posts");
+        assert_eq!(c.href, Some("/posts"));
+    }
+
+    #[test]
+    fn breadcrumb_crumb_current_constructor() {
+        let c = Crumb::current("My Page");
+        assert_eq!(c.label, "My Page");
+        assert!(c.href.is_none());
+    }
+
+    #[test]
+    fn breadcrumb_non_last_crumb_without_href_renders_span_not_bare_text() {
+        // A Crumb with href:None in a non-last position must still be wrapped
+        // in a <span> so it has an accessible element, not invisible bare text.
+        let crumbs = [Crumb::current("Unlinked Middle"), Crumb::current("Current")];
+        let html = breadcrumb(&crumbs).into_string();
+        assert!(
+            html.contains("<span class=\"autumn-breadcrumb__text\">Unlinked Middle</span>"),
+            "{html}"
+        );
+        // Only the last item carries aria-current
+        assert_eq!(html.matches(r#"aria-current="page""#).count(), 1, "{html}");
+    }
+
+    // ── property_list ──────────────────────────────────────────────────
+
+    #[test]
+    fn property_list_empty_slice_renders_empty_dl_never_panics() {
+        let html = property_list(&[]).into_string();
+        assert!(html.contains("<dl"), "{html}");
+        assert!(!html.contains("<dt"), "{html}");
+    }
+
+    #[test]
+    fn property_list_has_autumn_property_list_class() {
+        let html = property_list(&[]).into_string();
+        assert!(html.contains(r#"class="autumn-property-list""#), "{html}");
+    }
+
+    #[test]
+    fn property_list_renders_dt_and_dd_per_row() {
+        let rows = vec![
+            ("Title", maud::html! { "My Post" }),
+            ("Published", maud::html! { "true" }),
+        ];
+        let html = property_list(&rows).into_string();
+        assert!(html.contains("<dt>Title</dt>"), "{html}");
+        assert!(html.contains("<dt>Published</dt>"), "{html}");
+        assert!(html.contains("<dd>My Post</dd>"), "{html}");
+        assert!(html.contains("<dd>true</dd>"), "{html}");
+    }
+
+    #[test]
+    fn property_list_escapes_label() {
+        let rows = vec![("<script>alert(1)</script>", maud::html! { "safe" })];
+        let html = property_list(&rows).into_string();
+        assert!(!html.contains("<script>"), "{html}");
+        assert!(html.contains("&lt;script&gt;"), "{html}");
+    }
+
+    #[test]
+    fn property_list_renders_markup_value_unescaped() {
+        let rows = vec![("Link", maud::html! { a href="/foo" { "click" } })];
+        let html = property_list(&rows).into_string();
+        assert!(html.contains(r#"<a href="/foo">click</a>"#), "{html}");
+    }
+
+    #[test]
+    fn property_list_multiple_rows_all_rendered() {
+        let rows = vec![
+            ("A", maud::html! { "1" }),
+            ("B", maud::html! { "2" }),
+            ("C", maud::html! { "3" }),
+        ];
+        let html = property_list(&rows).into_string();
+        assert_eq!(html.matches("<dt>").count(), 3, "{html}");
+        assert_eq!(html.matches("<dd>").count(), 3, "{html}");
+    }
+
+    // ── data_table ─────────────────────────────────────────────────────
+
+    #[test]
+    fn sortdir_param_value() {
+        assert_eq!(SortDir::Asc.param_value(), "asc");
+        assert_eq!(SortDir::Desc.param_value(), "desc");
+    }
+
+    #[test]
+    fn sortdir_aria_value() {
+        assert_eq!(SortDir::Asc.aria_value(), "ascending");
+        assert_eq!(SortDir::Desc.aria_value(), "descending");
+    }
+
+    #[test]
+    fn sortdir_toggled() {
+        assert_eq!(SortDir::Asc.toggled(), SortDir::Desc);
+        assert_eq!(SortDir::Desc.toggled(), SortDir::Asc);
+    }
+
+    #[test]
+    fn data_table_config_defaults() {
+        let cfg = DataTableConfig::new("No items");
+        assert_eq!(cfg.empty_message, "No items");
+        assert_eq!(cfg.sort_param, "sort");
+        assert_eq!(cfg.dir_param, "dir");
+        assert_eq!(cfg.page_param, "page");
+        assert!(cfg.active_sort.is_none());
+        assert_eq!(cfg.active_dir, SortDir::Asc);
+        assert!(cfg.caption.is_none());
+        assert!(cfg.class.is_none());
+        assert_eq!(cfg.base_path, "");
+        assert_eq!(cfg.query, "");
+    }
+
+    #[test]
+    fn data_table_config_builders() {
+        let cfg = DataTableConfig::new("No items")
+            .base_path("/posts")
+            .query("q=foo")
+            .caption("Posts table")
+            .active_sort("title")
+            .active_dir(SortDir::Desc)
+            .class("my-table");
+        assert_eq!(cfg.base_path, "/posts");
+        assert_eq!(cfg.query, "q=foo");
+        assert_eq!(cfg.caption, Some("Posts table"));
+        assert_eq!(cfg.active_sort, Some("title"));
+        assert_eq!(cfg.active_dir, SortDir::Desc);
+        assert_eq!(cfg.class, Some("my-table"));
+    }
+
+    #[test]
+    fn data_table_has_thead_th_scope_col() {
+        let cols: Vec<Column<i32>> = vec![
+            Column::new("Name", |_| maud::html! { "n" }),
+            Column::new("Age", |_| maud::html! { "a" }),
+        ];
+        let html = data_table(&[1i32], &cols, &DataTableConfig::new("empty")).into_string();
+        assert!(html.contains("<thead"), "{html}");
+        assert!(html.contains(r#"scope="col""#), "{html}");
+        assert!(html.contains("Name"), "{html}");
+        assert!(html.contains("Age"), "{html}");
+    }
+
+    #[test]
+    fn data_table_renders_tbody_rows_and_cells() {
+        let cols: Vec<Column<&str>> = vec![Column::new("Word", |row| maud::html! { (*row) })];
+        let html =
+            data_table(&["hello", "world"], &cols, &DataTableConfig::new("empty")).into_string();
+        assert!(html.contains("<tbody"), "{html}");
+        assert!(html.contains("hello"), "{html}");
+        assert!(html.contains("world"), "{html}");
+        // Two data rows
+        assert_eq!(
+            html.matches("<tr").count(),
+            3,
+            "1 header row + 2 data rows: {html}"
+        );
+    }
+
+    #[test]
+    fn data_table_caption_when_set() {
+        let cols: Vec<Column<i32>> = vec![Column::new("X", |_| maud::html! { "x" })];
+        let html = data_table(
+            &[1i32],
+            &cols,
+            &DataTableConfig::new("e").caption("My Table"),
+        )
+        .into_string();
+        assert!(html.contains("<caption"), "{html}");
+        assert!(html.contains("My Table"), "{html}");
+    }
+
+    #[test]
+    fn data_table_no_caption_by_default() {
+        let cols: Vec<Column<i32>> = vec![Column::new("X", |_| maud::html! { "x" })];
+        let html = data_table(&[1i32], &cols, &DataTableConfig::new("e")).into_string();
+        assert!(!html.contains("<caption"), "{html}");
+    }
+
+    #[test]
+    fn data_table_applies_class_when_set() {
+        let cols: Vec<Column<i32>> = vec![Column::new("X", |_| maud::html! { "x" })];
+        let html =
+            data_table(&[1i32], &cols, &DataTableConfig::new("e").class("styled")).into_string();
+        assert!(html.contains(r#"class="styled""#), "{html}");
+    }
+
+    #[test]
+    fn data_table_empty_renders_single_colspan_row() {
+        let cols: Vec<Column<i32>> = vec![
+            Column::new("A", |_| maud::html! { "a" }),
+            Column::new("B", |_| maud::html! { "b" }),
+            Column::new("C", |_| maud::html! { "c" }),
+        ];
+        let html = data_table(&[], &cols, &DataTableConfig::new("Nothing here")).into_string();
+        assert!(html.contains("Nothing here"), "{html}");
+        assert!(html.contains(r#"colspan="3""#), "{html}");
+        // Only the header tr, no data rows
+        assert_eq!(html.matches("<tr").count(), 2, "header + empty row: {html}");
+    }
+
+    #[test]
+    fn data_table_empty_message_announced() {
+        let cols: Vec<Column<i32>> = vec![Column::new("X", |_| maud::html! { "x" })];
+        let html = data_table(&[], &cols, &DataTableConfig::new("No results")).into_string();
+        assert!(html.contains(r#"role="status""#), "{html}");
+    }
+
+    #[test]
+    fn data_table_nonsortable_header_is_plain() {
+        let cols: Vec<Column<i32>> = vec![Column::new("Title", |_| maud::html! { "t" })];
+        let html = data_table(&[1i32], &cols, &DataTableConfig::new("e")).into_string();
+        // No sort link in header
+        let thead_end = html.find("</thead>").unwrap_or(html.len());
+        let thead = &html[..thead_end];
+        assert!(!thead.contains("<a "), "{html}");
+        assert!(!thead.contains("aria-sort"), "{html}");
+    }
+
+    #[test]
+    fn data_table_sortable_inactive_has_link_and_aria_sort_none() {
+        let cols: Vec<Column<i32>> =
+            vec![Column::new("Title", |_| maud::html! { "t" }).sortable("title")];
+        let cfg = DataTableConfig::new("e").base_path("/posts");
+        let html = data_table(&[1i32], &cols, &cfg).into_string();
+        assert!(html.contains(r#"aria-sort="none""#), "{html}");
+        assert!(html.contains("sort=title"), "{html}");
+        assert!(html.contains("dir=asc"), "{html}");
+    }
+
+    #[test]
+    fn data_table_sortable_active_reflects_dir_and_toggles() {
+        let cols: Vec<Column<i32>> =
+            vec![Column::new("Title", |_| maud::html! { "t" }).sortable("title")];
+        let cfg = DataTableConfig::new("e")
+            .base_path("/posts")
+            .active_sort("title")
+            .active_dir(SortDir::Asc);
+        let html = data_table(&[1i32], &cols, &cfg).into_string();
+        assert!(html.contains(r#"aria-sort="ascending""#), "{html}");
+        // toggled dir link
+        assert!(html.contains("dir=desc"), "{html}");
+    }
+
+    #[test]
+    fn data_table_sortable_link_preserves_other_query_params() {
+        let cols: Vec<Column<i32>> =
+            vec![Column::new("Name", |_| maud::html! { "n" }).sortable("name")];
+        let cfg = DataTableConfig::new("e")
+            .base_path("/posts")
+            .query("q=hello");
+        let html = data_table(&[1i32], &cols, &cfg).into_string();
+        assert!(html.contains("q=hello"), "{html}");
+    }
+
+    #[test]
+    fn data_table_sortable_link_drops_existing_sort_dir_page() {
+        let cols: Vec<Column<i32>> =
+            vec![Column::new("Name", |_| maud::html! { "n" }).sortable("name")];
+        let cfg = DataTableConfig::new("e")
+            .base_path("/posts")
+            .query("q=foo&sort=old&dir=asc&page=3");
+        let html = data_table(&[1i32], &cols, &cfg).into_string();
+        // old sort params stripped, new sort=name present
+        assert!(html.contains("sort=name"), "{html}");
+        // page stripped (reset to page 1)
+        assert!(!html.contains("page=3"), "{html}");
+        // q preserved
+        assert!(html.contains("q=foo"), "{html}");
+        // no duplicate old sort
+        assert!(!html.contains("sort=old"), "{html}");
     }
 }

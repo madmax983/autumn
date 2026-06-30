@@ -137,6 +137,10 @@ pub async fn show(
     Ok(layout(
         &page.title,
         html! {
+            (breadcrumb(&[
+                Crumb::link("Wiki", &paths::list()),
+                Crumb::current(&page.title),
+            ]))
             article {
                 div class="flex justify-between items-center mb-4" {
                     h1 class="text-3xl font-bold" { (page.title) }
@@ -191,6 +195,10 @@ pub async fn new_form() -> Markup {
     layout(
         "New Page",
         html! {
+            (breadcrumb(&[
+                Crumb::link("Wiki", &paths::list()),
+                Crumb::current("New Page"),
+            ]))
             h1 class="text-2xl font-bold mb-6" { "New Page" }
             form action=(paths::create()) method="post"
                  class="space-y-4 bg-white rounded shadow p-6" {
@@ -254,6 +262,11 @@ pub async fn edit_form(Path(slug): Path<String>, repo: PgPageRepository) -> Autu
     Ok(layout(
         &format!("Edit: {}", page.title),
         html! {
+            (breadcrumb(&[
+                Crumb::link("Wiki", &paths::list()),
+                Crumb::link(&page.title, &paths::show(page.slug.clone())),
+                Crumb::current("Edit"),
+            ]))
             h1 class="text-2xl font-bold mb-6" { "Edit: " (page.title) }
             form action=(paths::update(page.slug.clone())) method="post"
                  class="space-y-4 bg-white rounded shadow p-6" {
@@ -375,6 +388,11 @@ pub async fn history(
     Ok(layout(
         &format!("History: {}", page.title),
         html! {
+            (breadcrumb(&[
+                Crumb::link("Wiki", &paths::list()),
+                Crumb::link(&page.title, &paths::show(page.slug.clone())),
+                Crumb::current("History"),
+            ]))
             div class="flex justify-between items-center mb-6" {
                 h1 class="text-2xl font-bold" { "History: " (page.title) }
                 a href=(paths::show(page.slug.clone()))

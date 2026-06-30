@@ -2,7 +2,9 @@
 //!
 //! # Usage
 //!
+//! ```text
 //!   autumn generate wizard <name> <step1> <step2> ...
+//! ```
 //!
 //! # Example
 //!

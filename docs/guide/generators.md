@@ -12,6 +12,7 @@ single command. Four subcommands cover the cases you actually hit:
 | `autumn generate scaffold`           | Everything `model` does plus `#[repository]`, HTML routes, smoke test, `routes![]` registration |
 | `autumn generate wizard`             | A session-backed multi-step form wizard with per-step validation and a confirm/commit/cancel flow |
 | `autumn generate admin`              | An `AdminModel` adapter for an existing model, wired to `autumn-admin-plugin`   |
+| `autumn generate tauri`              | A complete `src-tauri/` sidecar project so the app ships as a native desktop installer (see [Tauri guide](tauri.md)) |
 
 The generators only emit code that uses macros and conventions Autumn already
 ships (`#[model]`, `#[repository]`, `#[get]/#[post]`, the `i64`-PK convention,
