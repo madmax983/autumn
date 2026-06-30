@@ -707,6 +707,11 @@ fn setup(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {{
             "AUTUMN_STORAGE__LOCAL__ROOT",
             data_root.join("blobs").to_string_lossy().as_ref(),
         )
+        // Autumn's StorageConfig::backend_plan rejects local-backend configs in prod
+        // mode unless this flag is set, aborting startup before the window opens.
+        // A loopback-only desktop sidecar is single-user and the storage root is
+        // already in app-data, so local storage is safe and intentional here.
+        .env("AUTUMN_STORAGE__ALLOW_LOCAL_IN_PRODUCTION", "true")
         // Clear any inherited attach URL so the sidecar owns its bundled Postgres
         // cluster rather than connecting to a stale or foreign database.
         // ManagedPostgresPoolProvider checks AUTUMN_MANAGED_PG_ATTACH_URL before
@@ -877,19 +882,21 @@ fn load_or_generate_signing_secret(
     let hex: String = bytes.iter().map(|b| format!("{{b:02x}}")).collect();
     // Write with restricted permissions: signing secrets must not be world-readable.
     // On Unix create the file with mode 0600; on other platforms use the default ACLs.
+    // Propagate write failures: a disk-full or permission error must abort startup
+    // rather than silently returning an ephemeral secret that rotates every launch.
     #[cfg(unix)]
     {{
         use std::io::Write;
         use std::os::unix::fs::OpenOptionsExt;
-        let _ = std::fs::OpenOptions::new()
+        std::fs::OpenOptions::new()
             .write(true).create(true).truncate(true)
             .mode(0o600)
             .open(&path)
-            .and_then(|mut f| f.write_all(hex.as_bytes()));
+            .and_then(|mut f| f.write_all(hex.as_bytes()))?;
     }}
     #[cfg(not(unix))]
     {{
-        let _ = std::fs::write(&path, &hex);
+        std::fs::write(&path, &hex)?;
     }}
     Ok(hex)
 }}
@@ -2782,6 +2789,22 @@ mod tests {
     }
 
     #[test]
+    fn lib_rs_allows_local_storage_in_production() {
+        let lib = render_shell_lib_rs("my-app", "my-app");
+        assert!(
+            lib.contains("AUTUMN_STORAGE__ALLOW_LOCAL_IN_PRODUCTION"),
+            "lib.rs must set AUTUMN_STORAGE__ALLOW_LOCAL_IN_PRODUCTION=true; \
+             StorageConfig::backend_plan rejects local-backend configs in prod mode \
+             without this flag, aborting sidecar startup before the window opens"
+        );
+        assert!(
+            lib.contains("\"AUTUMN_STORAGE__ALLOW_LOCAL_IN_PRODUCTION\", \"true\""),
+            "AUTUMN_STORAGE__ALLOW_LOCAL_IN_PRODUCTION must be set to \"true\"; \
+             the loopback-only sidecar with app-data blob root is single-user and safe"
+        );
+    }
+
+    #[test]
     fn lib_rs_generates_per_install_signing_secret() {
         let lib = render_shell_lib_rs("my-app", "my-app");
         assert!(
@@ -2812,6 +2835,15 @@ mod tests {
             lib.contains("Result<String,") || lib.contains("Result<String, "),
             "load_or_generate_signing_secret must return Result<String, ...> so getrandom \
              failure aborts setup() rather than continuing with a predictable zero secret"
+        );
+        // Write failures must also propagate — a disk-full or permission error must abort
+        // startup rather than silently returning an ephemeral secret that rotates every launch.
+        assert!(
+            !lib.contains("let _ = std::fs::write")
+                && !lib.contains("let _ = std::fs::OpenOptions"),
+            "signing-secret write errors must propagate with `?`, not be silently discarded \
+             with `let _ = ...`; a failed write leaves a truncated file and the app runs \
+             with an ephemeral secret that rotates on every restart"
         );
     }
 
