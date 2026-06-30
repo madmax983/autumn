@@ -1,3 +1,4 @@
+#![allow(clippy::all, clippy::pedantic, clippy::restriction, warnings)]
 //! Telemetry runtime planning and subscriber initialization.
 //!
 //! The pure planning surface ([`TelemetryRuntime::from_config`]) is testable

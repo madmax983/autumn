@@ -1203,7 +1203,7 @@ mod tests {
 
     #[tokio::test]
     async fn session_layer_sets_cookie_on_new_session() {
-        use crate::state::AppState;
+        use crate::AppState;
         async fn handler(session: Session) -> String {
             session.insert("visited", "true").await;
             "ok".to_owned()

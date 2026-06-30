@@ -192,7 +192,7 @@ pub async fn method_override_rejection_filter(
     request: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
-    use crate::middleware::exception_filter::AutumnErrorInfo;
+    use super::exception_filter::AutumnErrorInfo;
     use axum::response::IntoResponse;
 
     if let Some(rejection) = request
@@ -559,7 +559,7 @@ where
                 if res.status() == StatusCode::METHOD_NOT_ALLOWED
                     || res.status() == StatusCode::NOT_FOUND
                 {
-                    use crate::middleware::exception_filter::AutumnErrorInfo;
+                    use super::exception_filter::AutumnErrorInfo;
                     let (parts, _body) = res.into_parts();
                     let mut res = Response::from_parts(
                         parts,
@@ -613,7 +613,7 @@ where
                     if res.status() == StatusCode::METHOD_NOT_ALLOWED
                         || res.status() == StatusCode::NOT_FOUND
                     {
-                        use crate::middleware::exception_filter::AutumnErrorInfo;
+                        use super::exception_filter::AutumnErrorInfo;
                         let (parts, _body) = res.into_parts();
                         let mut res = Response::from_parts(
                             parts,
@@ -1483,7 +1483,7 @@ mod tests {
     /// the same as a handler-generated error response.
     #[tokio::test]
     async fn rejection_response_carries_autumn_error_info() {
-        use crate::middleware::exception_filter::AutumnErrorInfo;
+        use super::super::exception_filter::AutumnErrorInfo;
 
         let app = layered_router();
         let response = app

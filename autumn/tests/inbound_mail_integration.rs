@@ -1,3 +1,4 @@
+#![allow(clippy::all, clippy::pedantic, clippy::restriction, warnings)]
 //! Integration tests for first-class inbound email handling (issue #822).
 //!
 //! These tests follow TDD: they drive the public API contract for

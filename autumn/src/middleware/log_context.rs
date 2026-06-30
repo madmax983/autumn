@@ -171,9 +171,9 @@ impl<B: HttpBody> HttpBody for LogContextBody<B> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::request_id::RequestIdLayer;
     use super::*;
     use crate::log::context;
-    use crate::middleware::RequestIdLayer;
     use axum::Router;
     use axum::body::Body;
     use axum::routing::get;
