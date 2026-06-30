@@ -1590,10 +1590,9 @@ mod tests {
             .await
             .expect("scope grants create");
 
-        let err =
-            __check_policy_create_payload_scoped::<Note>(&state, &session, None, &payload)
-                .await
-                .unwrap_err();
+        let err = __check_policy_create_payload_scoped::<Note>(&state, &session, None, &payload)
+            .await
+            .unwrap_err();
         assert_eq!(err.status(), StatusCode::FORBIDDEN);
     }
 

@@ -8,10 +8,10 @@
 
 use autumn_admin_plugin::tokens::TokenAdminModel;
 use autumn_admin_plugin::{AdminModel, ListParams};
+use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::pooled_connection::deadpool::Pool;
-use diesel_async::AsyncPgConnection;
 use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::postgres::Postgres;
 
@@ -29,7 +29,10 @@ const CREATE_TABLE_SQL: &str = "
     )
 ";
 
-async fn setup_pool() -> (Pool<AsyncPgConnection>, testcontainers::ContainerAsync<Postgres>) {
+async fn setup_pool() -> (
+    Pool<AsyncPgConnection>,
+    testcontainers::ContainerAsync<Postgres>,
+) {
     let container = Postgres::default()
         .start()
         .await
@@ -85,7 +88,10 @@ async fn token_admin_create_returns_raw_token_and_get_round_trips() {
     let fetched = model.get(&pool, id).await.unwrap().expect("record");
     assert_eq!(fetched["name"], "ci-token");
     assert_eq!(fetched["principal_id"], "service:ci");
-    assert!(fetched.get("token").is_none(), "raw token must not reappear");
+    assert!(
+        fetched.get("token").is_none(),
+        "raw token must not reappear"
+    );
 
     // Scopes are parsed back from JSONB.
     let scopes = fetched["scopes"].as_array().expect("scopes array");
