@@ -699,7 +699,7 @@ async fn model_create(
     // minutes; the detail handler reads it exactly once and clears it.
     if let Some(Value::String(secret)) = record.get("token") {
         let cookie = format!(
-            "__autumn_reveal={secret}; HttpOnly; SameSite=Strict; Path={detail_path}; Max-Age=300"
+            "__autumn_reveal={secret}; HttpOnly; Secure; SameSite=Strict; Path={detail_path}; Max-Age=300"
         );
         if let Ok(hv) = axum::http::HeaderValue::from_str(&cookie) {
             response
@@ -770,7 +770,7 @@ async fn model_detail(
     // Clear the reveal cookie so a page refresh does not show the token again.
     if reveal_secret.is_some() {
         let clear = format!(
-            "__autumn_reveal=; HttpOnly; SameSite=Strict; Path={prefix}/{slug}/{id}; Max-Age=0"
+            "__autumn_reveal=; HttpOnly; Secure; SameSite=Strict; Path={prefix}/{slug}/{id}; Max-Age=0"
         );
         if let Ok(hv) = axum::http::HeaderValue::from_str(&clear) {
             response

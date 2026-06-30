@@ -5,6 +5,7 @@
 //! is resolved from `autumn.toml` or environment variables using the same
 //! logic as `autumn migrate`.
 
+use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime};
 use hex::encode as hex_encode;
 use sha2::{Digest as _, Sha256};
 use std::process::{Command, Stdio};
@@ -21,17 +22,31 @@ pub fn run_issue(principal_id: &str, name: &str, scopes: &[String], expires_at: 
     let raw_token = generate_token();
     let token_hash = sha256_hex(&raw_token);
     let scopes_json = scopes_to_json(scopes);
-    let expires_at = expires_at.unwrap_or("");
+    // Normalize expires_at to a UTC naive timestamp string before passing to
+    // psql.  The column is TIMESTAMP (no time zone), storing UTC; we cast with
+    // ::timestamp so PostgreSQL never applies a session-timezone conversion.
+    // Without normalization, '2026-12-31T23:59:59'::timestamptz would be
+    // interpreted in the session's TimeZone and then stripped of its zone,
+    // causing tokens to expire hours early/late on non-UTC DB sessions.
+    let expires_at_owned;
+    let expires_at = match expires_at {
+        Some(s) if !s.trim().is_empty() => {
+            expires_at_owned = normalize_expires_at_utc(s);
+            expires_at_owned.as_str()
+        }
+        _ => "",
+    };
 
     // Use psql variable substitution (:'var') to avoid any SQL injection risk.
     // psql quotes each value as a SQL string literal, so no manual escaping is
     // needed. `:'scopes'::jsonb` casts the JSON array text into the JSONB
-    // column; an empty `:'expires_at'` becomes NULL via NULLIF.
+    // column; an empty `:'expires_at'` becomes NULL via NULLIF.  The ::timestamp
+    // cast is safe here because expires_at is already UTC-normalized above.
     run_psql_silent(
         &database_url,
         "INSERT INTO api_tokens (token_hash, principal_id, name, scopes, expires_at) \
          VALUES (:'hash', :'principal', :'name', :'scopes'::jsonb, \
-         NULLIF(:'expires_at', '')::timestamptz AT TIME ZONE 'UTC');",
+         NULLIF(:'expires_at', '')::timestamp);",
         &[
             ("hash", &token_hash),
             ("principal", principal_id),
@@ -113,6 +128,33 @@ pub fn run_revoke(raw_token: &str) {
 
 fn sha256_hex(input: &str) -> String {
     hex_encode(Sha256::digest(input.as_bytes()))
+}
+
+/// Normalize an `expires_at` string to a UTC naive datetime suitable for a
+/// `TIMESTAMP` (no time zone) column that stores UTC values.
+///
+/// Accepts RFC 3339 (with offset) and bare ISO 8601-ish forms (no offset,
+/// treated as UTC).  Returns the input unchanged if none of the known formats
+/// match, letting psql produce a clear error.
+fn normalize_expires_at_utc(s: &str) -> String {
+    let s = s.trim();
+    // Try RFC 3339 / ISO 8601 with explicit offset — convert to UTC.
+    if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
+        return dt.naive_utc().format("%Y-%m-%dT%H:%M:%S").to_string();
+    }
+    // Datetime without offset — treat as UTC directly.
+    for fmt in ["%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M", "%Y-%m-%d %H:%M:%S"] {
+        if let Ok(naive) = NaiveDateTime::parse_from_str(s, fmt) {
+            return naive.format("%Y-%m-%dT%H:%M:%S").to_string();
+        }
+    }
+    // Date only — midnight UTC.
+    if let Ok(date) = NaiveDate::parse_from_str(s, "%Y-%m-%d") {
+        return NaiveDateTime::new(date, NaiveTime::from_hms_opt(0, 0, 0).unwrap())
+            .format("%Y-%m-%dT%H:%M:%S")
+            .to_string();
+    }
+    s.to_owned()
 }
 
 /// Render flat scope strings as a JSON array for the `scopes` JSONB column.
@@ -272,5 +314,43 @@ mod tests {
         {
             check_psql();
         }
+    }
+
+    #[test]
+    fn normalize_utc_strips_offset_and_converts_to_utc() {
+        // +05:30 → subtract 5h30m to get UTC
+        assert_eq!(
+            normalize_expires_at_utc("2026-12-31T23:59:59+05:30"),
+            "2026-12-31T18:29:59"
+        );
+    }
+
+    #[test]
+    fn normalize_utc_z_suffix_passthrough() {
+        assert_eq!(
+            normalize_expires_at_utc("2026-12-31T23:59:59Z"),
+            "2026-12-31T23:59:59"
+        );
+    }
+
+    #[test]
+    fn normalize_utc_no_offset_treated_as_utc() {
+        assert_eq!(
+            normalize_expires_at_utc("2026-12-31T23:59:59"),
+            "2026-12-31T23:59:59"
+        );
+    }
+
+    #[test]
+    fn normalize_utc_date_only_pads_time() {
+        assert_eq!(
+            normalize_expires_at_utc("2026-12-31"),
+            "2026-12-31T00:00:00"
+        );
+    }
+
+    #[test]
+    fn normalize_utc_unknown_format_passthrough() {
+        assert_eq!(normalize_expires_at_utc("not-a-date"), "not-a-date");
     }
 }
