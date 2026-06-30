@@ -154,11 +154,19 @@ fn normalize_expires_at_utc(s: &str) -> String {
             }
         }
     }
-    // Compact-offset forms (no colon in offset, e.g. `date +%Y-%m-%dT%H:%M:%S%z` →
-    // "2026-12-31T23:59:59-0500"). `parse_from_rfc3339` requires "±HH:MM"; use
-    // chrono's `%z` specifier which accepts "±HHMM". Must come before the naive
-    // formats so the offset is applied rather than silently stripped.
-    for fmt in ["%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%dT%H:%M%z"] {
+    // Offset-aware formats not accepted by `parse_from_rfc3339`:
+    //   - compact offset (e.g. "2026-12-31T23:59:59-0500" from `date +%Y-%m-%dT%H:%M:%S%z`)
+    //   - space-separated SQL form with extended or compact offset
+    //     (e.g. "2026-12-31 23:59:59-05:00" from psql or ORMs)
+    // Must come before the naive formats so offsets are applied, not silently stripped.
+    for fmt in [
+        "%Y-%m-%dT%H:%M:%S%z",  // T, compact offset, seconds
+        "%Y-%m-%dT%H:%M%z",     // T, compact offset, minute-precision
+        "%Y-%m-%d %H:%M:%S%:z", // space, extended offset, seconds
+        "%Y-%m-%d %H:%M:%S%z",  // space, compact offset, seconds
+        "%Y-%m-%d %H:%M%:z",    // space, extended offset, minute-precision
+        "%Y-%m-%d %H:%M%z",     // space, compact offset, minute-precision
+    ] {
         if let Ok(dt) = DateTime::parse_from_str(s, fmt) {
             return dt.naive_utc().format("%Y-%m-%dT%H:%M:%S").to_string();
         }
@@ -416,6 +424,24 @@ mod tests {
         assert_eq!(
             normalize_expires_at_utc("2026-12-31T23:59-0500"),
             "2027-01-01T04:59:00"
+        );
+    }
+
+    #[test]
+    fn normalize_utc_space_separator_extended_offset() {
+        // SQL/psql form: "2026-12-31 23:59:59-05:00"; 23:59:59 EST = 04:59:59 UTC next day
+        assert_eq!(
+            normalize_expires_at_utc("2026-12-31 23:59:59-05:00"),
+            "2027-01-01T04:59:59"
+        );
+    }
+
+    #[test]
+    fn normalize_utc_space_separator_compact_offset() {
+        // Space separator + compact offset: "2026-12-31 23:59:59-0500"
+        assert_eq!(
+            normalize_expires_at_utc("2026-12-31 23:59:59-0500"),
+            "2027-01-01T04:59:59"
         );
     }
 }

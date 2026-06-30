@@ -829,7 +829,7 @@ fn operation_for(
         x_required_scopes: api_doc
             .required_scopes
             .iter()
-            .map(|s| s.to_string())
+            .map(ToString::to_string)
             .collect(),
     }
 }
