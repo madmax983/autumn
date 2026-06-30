@@ -12,7 +12,7 @@ use std::convert::Infallible;
 use std::sync::LazyLock;
 
 use autumn_web::extract::Multipart;
-use autumn_web::flash::Flash;
+use autumn_web::flash::{Flash, FlashLevel, FlashMessage};
 use autumn_web::job::{JobAdminQuery, JobAdminSnapshot, JobScheduleSummary, job_admin_backend};
 use autumn_web::prelude::HxResponseExt;
 use autumn_web::security::{CsrfFormField, CsrfToken, CsrfTokenHeader};
@@ -642,11 +642,15 @@ async fn model_new_form(
 }
 
 /// `POST /admin/{slug}` — Create a record.
+#[allow(clippy::too_many_arguments)]
 async fn model_create(
     State(state): State<AppState>,
     axum::Extension(registry): axum::Extension<Arc<AdminRegistry>>,
     axum::Extension(AdminPrefix(prefix)): axum::Extension<AdminPrefix>,
+    axum::Extension(ActuatorPrefix(actuator_prefix)): axum::Extension<ActuatorPrefix>,
+    axum::Extension(HasRuntimeConfig(show_config)): axum::Extension<HasRuntimeConfig>,
     Path(slug): Path<String>,
+    csrf: AdminCsrf,
     flash: Flash,
     axum::extract::Form(form_data): axum::extract::Form<Value>,
 ) -> AutumnResult<Response> {
@@ -670,15 +674,36 @@ async fn model_create(
     flash
         .success(format!("{} created.", model.display_name()))
         .await;
-    // If the model returned a one-time secret (e.g. a raw API token), surface
-    // it in a flash message so it is visible exactly once on the detail page.
-    // The secret is never persisted in the DB; after this redirect it is gone.
+    // If the model returned a one-time secret (e.g. a raw API token), render the
+    // detail page inline rather than routing the secret through flash.  Flash::push
+    // stores messages in the Session, and SessionLayer persists dirty sessions to
+    // Redis/the DB — putting a raw bearer token there even briefly is a plaintext
+    // secret-storage violation.  Instead, consume the session flash messages into
+    // an in-memory Vec, append the token message there, and render directly.
     if let Some(Value::String(secret)) = record.get("token") {
-        flash
-            .info(format!(
-                "Copy your token now — it will not be shown again: {secret}"
-            ))
-            .await;
+        let display = model.record_display(&record);
+        let mut messages = flash.consume().await;
+        messages.push(FlashMessage {
+            level: FlashLevel::Info,
+            message: format!("Copy your token now — it will not be shown again: {secret}"),
+        });
+        return Ok(render(templates::model_detail_page(
+            &registry,
+            &slug,
+            model.display_name(),
+            model.display_name_plural(),
+            &fields,
+            &record,
+            &display,
+            new_id,
+            &messages,
+            csrf.token(),
+            csrf.token_header(),
+            &prefix,
+            &actuator_prefix,
+            model.has_history(),
+            show_config,
+        )));
     }
     Ok(Redirect::to(&format!("{prefix}/{slug}/{new_id}")).into_response())
 }
