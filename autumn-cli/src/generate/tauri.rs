@@ -3947,4 +3947,220 @@ mod tests {
             "productName for 'my_app' must not contain underscores, got: {name}"
         );
     }
+
+    // ── resolve_dep_key unit tests ────────────────────────────────────────────
+
+    #[test]
+    fn resolve_dep_key_no_dependencies_section_returns_package_name() {
+        // When Cargo.toml has no [dependencies] table, resolve_dep_key must fall
+        // through the early-return path and return the raw package name unchanged.
+        let doc: toml::Value =
+            toml::from_str("[package]\nname=\"foo\"\nversion=\"0.1.0\"\n").unwrap();
+        let result = resolve_dep_key(Path::new("/"), &doc, "autumn-web");
+        assert_eq!(
+            result, "autumn-web",
+            "resolve_dep_key must return the package name when no [dependencies] table exists"
+        );
+    }
+
+    #[test]
+    fn resolve_dep_key_direct_package_alias() {
+        // When a dep entry has `package = "autumn-web"` under a different key, the
+        // function must return the alias key, not the package name.
+        let doc: toml::Value = toml::from_str(
+            "[package]\nname=\"foo\"\nversion=\"0.1.0\"\n\
+             \n[dependencies]\nautumn_web = { version = \"0.5\", package = \"autumn-web\" }\n",
+        )
+        .unwrap();
+        let result = resolve_dep_key(Path::new("/"), &doc, "autumn-web");
+        assert_eq!(
+            result, "autumn_web",
+            "resolve_dep_key must return the alias key 'autumn_web' for package 'autumn-web'"
+        );
+    }
+
+    #[test]
+    fn resolve_dep_key_no_matching_dep_returns_package_name() {
+        // When none of the [dependencies] entries match the target package name,
+        // resolve_dep_key must return the package name itself as fallback.
+        let doc: toml::Value = toml::from_str(
+            "[package]\nname=\"foo\"\nversion=\"0.1.0\"\n\
+             \n[dependencies]\nserde = \"1.0\"\ntokio = { version = \"1.0\" }\n",
+        )
+        .unwrap();
+        let result = resolve_dep_key(Path::new("/"), &doc, "autumn-web");
+        assert_eq!(
+            result, "autumn-web",
+            "resolve_dep_key must return the package name when no entry matches it"
+        );
+    }
+
+    // ── resolve_workspace_dep_package unit tests ──────────────────────────────
+
+    #[test]
+    fn resolve_workspace_dep_package_stops_at_workspace_root_without_dep() {
+        // When the workspace root Cargo.toml exists but has no [workspace.dependencies]
+        // entry for the key, the function must stop (not walk further) and return None.
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[workspace]\nmembers = [\"app\"]\n",
+        )
+        .unwrap();
+        let app = tmp.path().join("app");
+        fs::create_dir_all(&app).unwrap();
+        fs::write(
+            app.join("Cargo.toml"),
+            "[package]\nname=\"my-app\"\nversion=\"0.1.0\"\n\
+             \n[dependencies]\nautumn_web = { workspace = true }\n",
+        )
+        .unwrap();
+        // resolve_workspace_dep_package must find the workspace root Cargo.toml,
+        // see that [workspace] exists but has no matching dep, and return None.
+        let result = resolve_workspace_dep_package(&app, "autumn_web");
+        assert_eq!(
+            result, None,
+            "must return None when workspace root has no matching [workspace.dependencies] entry"
+        );
+    }
+
+    #[test]
+    fn resolve_workspace_dep_package_returns_none_when_no_workspace_found() {
+        // When walking from the project root finds no Cargo.toml with [workspace],
+        // the function exhausts all ancestors and returns None.
+        let tmp = TempDir::new().unwrap();
+        // No Cargo.toml with [workspace] — the function will walk up past tmp root
+        // to filesystem root without finding one.
+        let result = resolve_workspace_dep_package(tmp.path(), "autumn_web");
+        assert_eq!(
+            result, None,
+            "must return None when no ancestor Cargo.toml contains [workspace]"
+        );
+    }
+
+    // ── resolve_bin_name unit tests ────────────────────────────────────────────
+
+    #[test]
+    fn resolve_bin_name_default_run_without_bin_section() {
+        // When [package] has default-run but no [[bin]] array, resolve_bin_name
+        // must return the default-run value (the path after the [[bin]] block is
+        // absent, so control reaches the second default_run check at line 328).
+        let tmp = TempDir::new().unwrap();
+        let doc: toml::Value = toml::from_str(
+            "[package]\nname=\"my-app\"\nversion=\"0.1.0\"\ndefault-run=\"webserver\"\n\
+             \n[dependencies]\nautumn-web = \"0.5.0\"\n",
+        )
+        .unwrap();
+        let result = resolve_bin_name(tmp.path(), "my-app", Some("webserver"), true, &doc);
+        assert_eq!(
+            result.unwrap(),
+            "webserver",
+            "resolve_bin_name must return default_run when there is no [[bin]] section"
+        );
+    }
+
+    #[test]
+    fn resolve_bin_name_empty_src_bin_dir_errors_with_no_binary_target() {
+        // When src/bin/ exists but contains no .rs files and no dir/main.rs,
+        // the 0 => {} match arm is hit (no binary found there either) and the
+        // function falls through to the final Err path.  Also exercises the
+        // `None` arm in the filter_map for non-.rs files.
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("src/bin")).unwrap();
+        // A non-.rs file: triggers the `None` arm of the filter_map.
+        fs::write(tmp.path().join("src/bin/README.md"), "# ignore me").unwrap();
+        let doc: toml::Value = toml::from_str(
+            "[package]\nname=\"my-app\"\nversion=\"0.1.0\"\n",
+        )
+        .unwrap();
+        let err = resolve_bin_name(tmp.path(), "my-app", None, true, &doc).unwrap_err();
+        assert!(
+            err.to_string().contains("no binary target"),
+            "must error about no binary target; got: {err}"
+        );
+    }
+
+    // ── version fallback unit test ─────────────────────────────────────────────
+
+    #[test]
+    fn plan_uses_fallback_version_when_no_version_field_in_cargo_toml() {
+        // When [package] has no version field at all, the `_ => "0.1.0"` arm in
+        // read_package_meta must fire and the plan must succeed with version "0.1.0".
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[package]\nname=\"no-version-app\"\nedition=\"2024\"\n\
+             \n[dependencies]\nautumn-web = \"0.5.0\"\n",
+        )
+        .unwrap();
+        fs::create_dir_all(tmp.path().join("src")).unwrap();
+        fs::write(tmp.path().join("src/main.rs"), "fn main() {}\n").unwrap();
+        let plan = plan_tauri(tmp.path()).unwrap();
+        let conf_action = plan
+            .actions
+            .iter()
+            .find(|a| a.path().to_string_lossy().ends_with("tauri.conf.json"))
+            .expect("tauri.conf.json action must be present");
+        let contents = match conf_action {
+            crate::generate::emit::Action::Create { contents, .. } => contents.as_str(),
+            _ => panic!("expected Create action for tauri.conf.json"),
+        };
+        let parsed: serde_json::Value = serde_json::from_str(contents).unwrap();
+        assert_eq!(
+            parsed["version"].as_str(),
+            Some("0.1.0"),
+            "when no version field is present, tauri.conf.json must default to '0.1.0'"
+        );
+    }
+
+    // ── resolve_workspace_version unit tests ──────────────────────────────────
+
+    #[test]
+    fn resolve_workspace_version_walks_up_to_find_workspace_package_version() {
+        // When the project is a workspace member and the version lives in the
+        // parent Cargo.toml under [workspace.package], resolve_workspace_version
+        // must walk up (hitting the dir = d.parent() line) and return the version.
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[workspace]\nmembers = [\"app\"]\n\
+             \n[workspace.package]\nversion = \"2.7.0\"\n",
+        )
+        .unwrap();
+        let app = tmp.path().join("app");
+        fs::create_dir_all(app.join("src")).unwrap();
+        fs::write(
+            app.join("Cargo.toml"),
+            "[package]\nname=\"my-app\"\nversion.workspace = true\nedition=\"2024\"\n\
+             \n[dependencies]\nautumn-web = \"0.5.0\"\n",
+        )
+        .unwrap();
+        fs::write(app.join("src/main.rs"), "fn main() {}\n").unwrap();
+        // resolve_workspace_version must walk from app/ up to root and find "2.7.0".
+        let version = resolve_workspace_version(&app);
+        assert_eq!(
+            version.as_deref(),
+            Some("2.7.0"),
+            "must walk up to parent workspace and return the workspace.package.version"
+        );
+    }
+
+    #[test]
+    fn resolve_workspace_version_returns_none_when_no_ancestor_has_workspace_version() {
+        // When no ancestor Cargo.toml has [workspace.package] version, the function
+        // exhausts the directory tree and returns None (the final None after the loop).
+        let tmp = TempDir::new().unwrap();
+        // A bare Cargo.toml with no [workspace.package] section.
+        fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[package]\nname=\"my-app\"\nversion.workspace = true\nedition=\"2024\"\n\
+             \n[dependencies]\nautumn-web = \"0.5.0\"\n",
+        )
+        .unwrap();
+        let version = resolve_workspace_version(tmp.path());
+        assert_eq!(
+            version, None,
+            "must return None when no ancestor has [workspace.package] version"
+        );
+    }
 }
