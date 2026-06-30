@@ -334,34 +334,32 @@ fn resolve_bin_name(
     // `autobins = false` is set in [package], Cargo does not auto-discover
     // src/bin/ entries, so scanning it here would return names that Cargo
     // itself would reject in `cargo build --bin <name>`.
-    if autobins {
-        if let Ok(entries) = std::fs::read_dir(project_root.join("src/bin")) {
-            let stems: Vec<String> = entries
-                .filter_map(std::result::Result::ok)
-                .filter_map(|e| {
-                    let p = e.path();
-                    if p.extension().is_some_and(|x| x == "rs") {
-                        p.file_stem().and_then(|s| s.to_str()).map(str::to_owned)
-                    } else if p.is_dir() && p.join("main.rs").is_file() {
-                        p.file_name().and_then(|s| s.to_str()).map(str::to_owned)
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-            match stems.len() {
-                1 => return Ok(stems.into_iter().next().unwrap()),
-                0 => {}
-                _ => {
-                    let mut sorted = stems;
-                    sorted.sort();
-                    return Err(GenerateError::Config(format!(
-                        "ambiguous sidecar target: found multiple auto-discovered \
-                         src/bin/ binaries ({}) and no [package] default-run is set; \
-                         add `default-run = \"<bin>\"` to Cargo.toml to select one",
-                        sorted.join(", ")
-                    )));
+    if autobins && let Ok(entries) = std::fs::read_dir(project_root.join("src/bin")) {
+        let stems: Vec<String> = entries
+            .filter_map(std::result::Result::ok)
+            .filter_map(|e| {
+                let p = e.path();
+                if p.extension().is_some_and(|x| x == "rs") {
+                    p.file_stem().and_then(|s| s.to_str()).map(str::to_owned)
+                } else if p.is_dir() && p.join("main.rs").is_file() {
+                    p.file_name().and_then(|s| s.to_str()).map(str::to_owned)
+                } else {
+                    None
                 }
+            })
+            .collect();
+        match stems.len() {
+            1 => return Ok(stems.into_iter().next().unwrap()),
+            0 => {}
+            _ => {
+                let mut sorted = stems;
+                sorted.sort();
+                return Err(GenerateError::Config(format!(
+                    "ambiguous sidecar target: found multiple auto-discovered \
+                     src/bin/ binaries ({}) and no [package] default-run is set; \
+                     add `default-run = \"<bin>\"` to Cargo.toml to select one",
+                    sorted.join(", ")
+                )));
             }
         }
     }
@@ -1002,65 +1000,8 @@ fn render_placeholder_icon_svg() -> String {
     .to_owned()
 }
 
-fn render_stage_sidecar_sh(
-    package_name: &str,
-    bin_name: &str,
-    has_embed_assets: bool,
-    dep_key: &str,
-) -> String {
-    // dep_key is the [dependencies] key for autumn-web; may differ from the
-    // package name when the app aliases it (e.g. `autumn_web = { package = ... }`).
-    let embed_feature = if has_embed_assets {
-        format!("embed-assets,{dep_key}/managed-pg-bundled")
-    } else {
-        format!("{dep_key}/embed-assets,{dep_key}/managed-pg-bundled")
-    };
-    // Only fingerprint when the app-level alias exists; `autumn build --embed` passes
-    // --features embed-assets (app-level), which fails for apps without that alias.
-    // We also pass managed-pg-bundled so apps wiring ManagedPostgresPoolProvider
-    // (without a cfg gate) can compile during the fingerprint phase 1.
-    let fingerprint = if has_embed_assets {
-        format!(
-            "autumn build --embed -p {package_name} --bin {bin_name} \
-             --features {dep_key}/managed-pg-bundled\n"
-        )
-    } else {
-        String::new()
-    };
-    format!(
-        r#"#!/usr/bin/env bash
-# Build the autumn server sidecar (embedded assets + managed Postgres) and
-# place it in src-tauri/binaries/ for Tauri to bundle.
-# Wired into tauri.conf.json > build.beforeBuildCommand.
-# Run manually: bash src-tauri/stage-sidecar.sh
-set -euo pipefail
-SCRIPT_DIR="$(cd "$(dirname "${{BASH_SOURCE[0]}}")" && pwd)"
-APP_DIR="$(dirname "$SCRIPT_DIR")"
-cd "$APP_DIR"
-# TAURI_ENV_TARGET_TRIPLE is set by Tauri for cross-compilation; fall back to host.
-TARGET_TRIPLE="${{TAURI_ENV_TARGET_TRIPLE:-$(rustc -Vv | awk '/^host/{{print $2}}')}}";
-# Resolve Cargo output dir (CARGO_TARGET_DIR or workspace target/).
-TARGET_DIR="${{CARGO_TARGET_DIR:-$(cargo metadata --no-deps --format-version 1 --quiet \
-    | sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')}}"
-mkdir -p src-tauri/binaries
-{fingerprint}# universal-apple-darwin: build both Darwin slices and lipo them together.
-if [ "${{TARGET_TRIPLE}}" = "universal-apple-darwin" ]; then
-    for ARCH in x86_64-apple-darwin aarch64-apple-darwin; do
-        cargo build --release -p {package_name} --target "$ARCH" --bin {bin_name} \
-          --features {embed_feature}
-    done
-    lipo -create -output "src-tauri/binaries/{bin_name}-universal-apple-darwin" \
-      "${{TARGET_DIR}}/x86_64-apple-darwin/release/{bin_name}" \
-      "${{TARGET_DIR}}/aarch64-apple-darwin/release/{bin_name}"
-    echo "Staged (universal): src-tauri/binaries/{bin_name}-universal-apple-darwin"
-else
-    cargo build --release -p {package_name} --target "${{TARGET_TRIPLE}}" --bin {bin_name} \
-      --features {embed_feature}
-    cp "${{TARGET_DIR}}/${{TARGET_TRIPLE}}/release/{bin_name}" \
-       "src-tauri/binaries/{bin_name}-${{TARGET_TRIPLE}}"
-    echo "Staged: src-tauri/binaries/{bin_name}-${{TARGET_TRIPLE}}"
-fi
-# Stage profile config files into src-tauri/configs/ so tauri.conf.json resource
+const fn render_stage_configs_sh() -> &'static str {
+    r#"# Stage profile config files into src-tauri/configs/ so tauri.conf.json resource
 # entries are always satisfiable at bundle time.
 # For alias pairs (prod/production, dev/development): AutumnConfig stops at the
 # first existing file in its ordered lookup list.  Copy the available file to
@@ -1126,7 +1067,140 @@ if [ -d "config/credentials" ]; then
     cp -r config/credentials/. src-tauri/configs/credentials/
 fi
 "#
+}
+
+fn render_stage_sidecar_sh(
+    package_name: &str,
+    bin_name: &str,
+    has_embed_assets: bool,
+    dep_key: &str,
+) -> String {
+    // dep_key is the [dependencies] key for autumn-web; may differ from the
+    // package name when the app aliases it (e.g. `autumn_web = { package = ... }`).
+    let embed_feature = if has_embed_assets {
+        format!("embed-assets,{dep_key}/managed-pg-bundled")
+    } else {
+        format!("{dep_key}/embed-assets,{dep_key}/managed-pg-bundled")
+    };
+    // Only fingerprint when the app-level alias exists; `autumn build --embed` passes
+    // --features embed-assets (app-level), which fails for apps without that alias.
+    // We also pass managed-pg-bundled so apps wiring ManagedPostgresPoolProvider
+    // (without a cfg gate) can compile during the fingerprint phase 1.
+    let fingerprint = if has_embed_assets {
+        format!(
+            "autumn build --embed -p {package_name} --bin {bin_name} \
+             --features {dep_key}/managed-pg-bundled\n"
+        )
+    } else {
+        String::new()
+    };
+    let configs = render_stage_configs_sh();
+    format!(
+        r#"#!/usr/bin/env bash
+# Build the autumn server sidecar (embedded assets + managed Postgres) and
+# place it in src-tauri/binaries/ for Tauri to bundle.
+# Wired into tauri.conf.json > build.beforeBuildCommand.
+# Run manually: bash src-tauri/stage-sidecar.sh
+set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${{BASH_SOURCE[0]}}")" && pwd)"
+APP_DIR="$(dirname "$SCRIPT_DIR")"
+cd "$APP_DIR"
+# TAURI_ENV_TARGET_TRIPLE is set by Tauri for cross-compilation; fall back to host.
+TARGET_TRIPLE="${{TAURI_ENV_TARGET_TRIPLE:-$(rustc -Vv | awk '/^host/{{print $2}}')}}";
+# Resolve Cargo output dir (CARGO_TARGET_DIR or workspace target/).
+TARGET_DIR="${{CARGO_TARGET_DIR:-$(cargo metadata --no-deps --format-version 1 --quiet \
+    | sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')}}"
+mkdir -p src-tauri/binaries
+{fingerprint}# universal-apple-darwin: build both Darwin slices and lipo them together.
+if [ "${{TARGET_TRIPLE}}" = "universal-apple-darwin" ]; then
+    for ARCH in x86_64-apple-darwin aarch64-apple-darwin; do
+        cargo build --release -p {package_name} --target "$ARCH" --bin {bin_name} \
+          --features {embed_feature}
+    done
+    lipo -create -output "src-tauri/binaries/{bin_name}-universal-apple-darwin" \
+      "${{TARGET_DIR}}/x86_64-apple-darwin/release/{bin_name}" \
+      "${{TARGET_DIR}}/aarch64-apple-darwin/release/{bin_name}"
+    echo "Staged (universal): src-tauri/binaries/{bin_name}-universal-apple-darwin"
+else
+    cargo build --release -p {package_name} --target "${{TARGET_TRIPLE}}" --bin {bin_name} \
+      --features {embed_feature}
+    cp "${{TARGET_DIR}}/${{TARGET_TRIPLE}}/release/{bin_name}" \
+       "src-tauri/binaries/{bin_name}-${{TARGET_TRIPLE}}"
+    echo "Staged: src-tauri/binaries/{bin_name}-${{TARGET_TRIPLE}}"
+fi
+{configs}"#
     )
+}
+
+const fn render_stage_configs_ps1() -> &'static str {
+    r#"# Stage profile config files into src-tauri\configs\ so tauri.conf.json resource
+# entries are always satisfiable at bundle time.
+# For alias pairs (prod/production, dev/development): AutumnConfig stops at the
+# first existing file in its ordered lookup list.  Copy the available file to
+# BOTH names so the profile resolves correctly regardless of AUTUMN_ENV spelling,
+# avoiding an empty stub from shadowing real config in the other alias.
+New-Item -ItemType Directory -Force -Path src-tauri\configs | Out-Null
+# Ensure autumn.toml exists at the project root — tauri.conf.json always
+# lists it as a bundle resource.  Projects without a config file use
+# AutumnConfig defaults; an empty TOML is a valid no-op.
+if (-not (Test-Path autumn.toml)) {
+    New-Item -ItemType File -Force -Path autumn.toml | Out-Null
+}
+# prod/production alias pair
+if ((Test-Path autumn-prod.toml) -and (Test-Path autumn-production.toml)) {
+    Copy-Item autumn-prod.toml src-tauri\configs\autumn-prod.toml
+    Copy-Item autumn-production.toml src-tauri\configs\autumn-production.toml
+} elseif (Test-Path autumn-prod.toml) {
+    Copy-Item autumn-prod.toml src-tauri\configs\autumn-prod.toml
+    Copy-Item autumn-prod.toml src-tauri\configs\autumn-production.toml
+} elseif (Test-Path autumn-production.toml) {
+    Copy-Item autumn-production.toml src-tauri\configs\autumn-prod.toml
+    Copy-Item autumn-production.toml src-tauri\configs\autumn-production.toml
+} else {
+    New-Item -ItemType File -Force -Path src-tauri\configs\autumn-prod.toml | Out-Null
+    New-Item -ItemType File -Force -Path src-tauri\configs\autumn-production.toml | Out-Null
+}
+# dev/development alias pair (same logic)
+if ((Test-Path autumn-dev.toml) -and (Test-Path autumn-development.toml)) {
+    Copy-Item autumn-dev.toml src-tauri\configs\autumn-dev.toml
+    Copy-Item autumn-development.toml src-tauri\configs\autumn-development.toml
+} elseif (Test-Path autumn-dev.toml) {
+    Copy-Item autumn-dev.toml src-tauri\configs\autumn-dev.toml
+    Copy-Item autumn-dev.toml src-tauri\configs\autumn-development.toml
+} elseif (Test-Path autumn-development.toml) {
+    Copy-Item autumn-development.toml src-tauri\configs\autumn-dev.toml
+    Copy-Item autumn-development.toml src-tauri\configs\autumn-development.toml
+} else {
+    New-Item -ItemType File -Force -Path src-tauri\configs\autumn-dev.toml | Out-Null
+    New-Item -ItemType File -Force -Path src-tauri\configs\autumn-development.toml | Out-Null
+}
+# Standalone profiles (no aliases)
+foreach ($f in @("autumn-staging.toml", "autumn-test.toml")) {
+    if (Test-Path $f) {
+        Copy-Item $f "src-tauri\configs\$f"
+    } else {
+        New-Item -ItemType File -Force -Path "src-tauri\configs\$f" | Out-Null
+    }
+}
+# Stage encrypted credentials so apps using `config.credentials()` find them at
+# AUTUMN_MANIFEST_DIR\config\credentials\<profile>.toml.enc in the installed bundle.
+# The staging directory is always created so the tauri.conf.json resource entry
+# is satisfiable at bundle time (an empty dir is a no-op for apps with no credentials).
+# Note: decryption at runtime requires the AUTUMN_MASTER_KEY env var (or the
+# config/master.key file placed in the resource dir).  See the Tauri section
+# of the Autumn docs for recommended key distribution strategies.
+# Remove and recreate the staging directory so stale .toml.enc files from a
+# previous build (deleted or rotated credentials) are not carried into the
+# installer.  Autumn loads any .toml.enc it finds via AUTUMN_MANIFEST_DIR, so
+# a stale file from a prior build would silently keep a revoked secret active.
+if (Test-Path "src-tauri\configs\credentials") {
+    Remove-Item -Recurse -Force "src-tauri\configs\credentials"
+}
+New-Item -ItemType Directory -Force -Path "src-tauri\configs\credentials" | Out-Null
+if (Test-Path "config\credentials") {
+    Copy-Item -Recurse -Force "config\credentials\*" "src-tauri\configs\credentials\"
+}
+"#
 }
 
 fn render_stage_sidecar_ps1(
@@ -1152,6 +1226,7 @@ fn render_stage_sidecar_ps1(
     } else {
         String::new()
     };
+    let configs = render_stage_configs_ps1();
     format!(
         r#"# Build the autumn server sidecar with embedded assets and managed Postgres,
 # then place it in src-tauri\binaries\ for Tauri to bundle.
@@ -1181,74 +1256,7 @@ cargo build --release -p {package_name} --target "$TargetTriple" --bin {bin_name
 Copy-Item "$TargetDir\$TargetTriple\release\{bin_name}.exe" `
           "src-tauri\binaries\{bin_name}-$TargetTriple.exe"
 Write-Host "Staged: src-tauri/binaries/{bin_name}-$TargetTriple.exe"
-# Stage profile config files into src-tauri\configs\ so tauri.conf.json resource
-# entries are always satisfiable at bundle time.
-# For alias pairs (prod/production, dev/development): AutumnConfig stops at the
-# first existing file in its ordered lookup list.  Copy the available file to
-# BOTH names so the profile resolves correctly regardless of AUTUMN_ENV spelling,
-# avoiding an empty stub from shadowing real config in the other alias.
-New-Item -ItemType Directory -Force -Path src-tauri\configs | Out-Null
-# Ensure autumn.toml exists at the project root — tauri.conf.json always
-# lists it as a bundle resource.  Projects without a config file use
-# AutumnConfig defaults; an empty TOML is a valid no-op.
-if (-not (Test-Path autumn.toml)) {{
-    New-Item -ItemType File -Force -Path autumn.toml | Out-Null
-}}
-# prod/production alias pair
-if ((Test-Path autumn-prod.toml) -and (Test-Path autumn-production.toml)) {{
-    Copy-Item autumn-prod.toml src-tauri\configs\autumn-prod.toml
-    Copy-Item autumn-production.toml src-tauri\configs\autumn-production.toml
-}} elseif (Test-Path autumn-prod.toml) {{
-    Copy-Item autumn-prod.toml src-tauri\configs\autumn-prod.toml
-    Copy-Item autumn-prod.toml src-tauri\configs\autumn-production.toml
-}} elseif (Test-Path autumn-production.toml) {{
-    Copy-Item autumn-production.toml src-tauri\configs\autumn-prod.toml
-    Copy-Item autumn-production.toml src-tauri\configs\autumn-production.toml
-}} else {{
-    New-Item -ItemType File -Force -Path src-tauri\configs\autumn-prod.toml | Out-Null
-    New-Item -ItemType File -Force -Path src-tauri\configs\autumn-production.toml | Out-Null
-}}
-# dev/development alias pair (same logic)
-if ((Test-Path autumn-dev.toml) -and (Test-Path autumn-development.toml)) {{
-    Copy-Item autumn-dev.toml src-tauri\configs\autumn-dev.toml
-    Copy-Item autumn-development.toml src-tauri\configs\autumn-development.toml
-}} elseif (Test-Path autumn-dev.toml) {{
-    Copy-Item autumn-dev.toml src-tauri\configs\autumn-dev.toml
-    Copy-Item autumn-dev.toml src-tauri\configs\autumn-development.toml
-}} elseif (Test-Path autumn-development.toml) {{
-    Copy-Item autumn-development.toml src-tauri\configs\autumn-dev.toml
-    Copy-Item autumn-development.toml src-tauri\configs\autumn-development.toml
-}} else {{
-    New-Item -ItemType File -Force -Path src-tauri\configs\autumn-dev.toml | Out-Null
-    New-Item -ItemType File -Force -Path src-tauri\configs\autumn-development.toml | Out-Null
-}}
-# Standalone profiles (no aliases)
-foreach ($f in @("autumn-staging.toml", "autumn-test.toml")) {{
-    if (Test-Path $f) {{
-        Copy-Item $f "src-tauri\configs\$f"
-    }} else {{
-        New-Item -ItemType File -Force -Path "src-tauri\configs\$f" | Out-Null
-    }}
-}}
-# Stage encrypted credentials so apps using `config.credentials()` find them at
-# AUTUMN_MANIFEST_DIR\config\credentials\<profile>.toml.enc in the installed bundle.
-# The staging directory is always created so the tauri.conf.json resource entry
-# is satisfiable at bundle time (an empty dir is a no-op for apps with no credentials).
-# Note: decryption at runtime requires the AUTUMN_MASTER_KEY env var (or the
-# config/master.key file placed in the resource dir).  See the Tauri section
-# of the Autumn docs for recommended key distribution strategies.
-# Remove and recreate the staging directory so stale .toml.enc files from a
-# previous build (deleted or rotated credentials) are not carried into the
-# installer.  Autumn loads any .toml.enc it finds via AUTUMN_MANIFEST_DIR, so
-# a stale file from a prior build would silently keep a revoked secret active.
-if (Test-Path "src-tauri\configs\credentials") {{
-    Remove-Item -Recurse -Force "src-tauri\configs\credentials"
-}}
-New-Item -ItemType Directory -Force -Path "src-tauri\configs\credentials" | Out-Null
-if (Test-Path "config\credentials") {{
-    Copy-Item -Recurse -Force "config\credentials\*" "src-tauri\configs\credentials\"
-}}
-"#
+{configs}"#
     )
 }
 
