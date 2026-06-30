@@ -405,8 +405,35 @@ mod tests {
     }
 
     #[test]
+    fn record_display_uses_name_when_present() {
+        let m = TokenAdminModel;
+        let with_name = serde_json::json!({"name": "ci-token"});
+        assert_eq!(m.record_display(&with_name), "Token: ci-token");
+    }
+
+    #[test]
+    fn record_display_falls_back_when_name_missing_or_empty() {
+        let m = TokenAdminModel;
+        assert_eq!(m.record_display(&serde_json::json!({})), "API Token");
+        assert_eq!(
+            m.record_display(&serde_json::json!({"name": ""})),
+            "API Token"
+        );
+    }
+
+    #[test]
     fn parse_scopes_accepts_json_text_and_arrays() {
         assert_eq!(parse_scopes(None).unwrap(), Vec::<String>::new());
+        // Explicit JSON null → empty (same as absent)
+        assert_eq!(
+            parse_scopes(Some(&Value::Null)).unwrap(),
+            Vec::<String>::new()
+        );
+        // Empty string → empty
+        assert_eq!(
+            parse_scopes(Some(&Value::String(String::new()))).unwrap(),
+            Vec::<String>::new()
+        );
         assert_eq!(
             parse_scopes(Some(&Value::String("[\"a\",\"b\"]".into()))).unwrap(),
             vec!["a".to_owned(), "b".to_owned()]
@@ -416,6 +443,8 @@ mod tests {
             vec!["x".to_owned()]
         );
         assert!(parse_scopes(Some(&Value::String("not json".into()))).is_err());
+        // Non-string, non-array, non-null → error
+        assert!(parse_scopes(Some(&Value::Bool(true))).is_err());
     }
 
     #[test]
@@ -426,8 +455,21 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+        // RFC3339 with timezone
+        assert!(
+            parse_expires_at(Some(&Value::String("2026-12-31T23:59:59Z".into())))
+                .unwrap()
+                .is_some()
+        );
+        // Without timezone (naive datetime format)
         assert!(
             parse_expires_at(Some(&Value::String("2026-12-31T23:59:59".into())))
+                .unwrap()
+                .is_some()
+        );
+        // Minute-precision format
+        assert!(
+            parse_expires_at(Some(&Value::String("2026-12-31T23:59".into())))
                 .unwrap()
                 .is_some()
         );

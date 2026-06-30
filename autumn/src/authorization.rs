@@ -1470,4 +1470,145 @@ mod tests {
         // surfaces only at `.load()` time, not at `scope(&ctx)` time.
         assert!(ctx.policy_registry.scope::<Note>().is_none());
     }
+
+    // ── authorize_with_scopes ──────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn authorize_with_scopes_returns_500_when_no_policy_registered() {
+        let state = crate::AppState::detached();
+        let session = session_with(None, None);
+        let err =
+            authorize_with_scopes::<Note>(&state, &session, None, "update", &Note { author_id: 1 })
+                .await
+                .unwrap_err();
+        assert_eq!(err.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
+    async fn authorize_with_scopes_returns_deny_when_policy_denies() {
+        let state =
+            crate::AppState::detached().with_forbidden_response(ForbiddenResponse::Forbidden403);
+        state
+            .policy_registry()
+            .register_policy::<Note, _>(AdminOrOwnerPolicy);
+        let session = session_with(Some("99"), None); // not owner, no admin role
+        let n = Note { author_id: 42 };
+        let err = authorize_with_scopes::<Note>(&state, &session, None, "update", &n)
+            .await
+            .unwrap_err();
+        assert_eq!(err.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn authorize_with_scopes_threads_scopes_into_policy_context() {
+        struct ScopeGatedPolicy;
+        impl Policy<Note> for ScopeGatedPolicy {
+            fn can_update<'a>(
+                &'a self,
+                ctx: &'a PolicyContext,
+                _doc: &'a Note,
+            ) -> BoxFuture<'a, bool> {
+                Box::pin(async move { ctx.has_scope("posts:write") })
+            }
+        }
+
+        let state = crate::AppState::detached();
+        state
+            .policy_registry()
+            .register_policy::<Note, _>(ScopeGatedPolicy);
+        let session = session_with(None, None);
+        let n = Note { author_id: 1 };
+        let scopes = crate::auth::ApiTokenScopes(vec!["posts:write".to_owned()]);
+
+        // Scopes present → allow.
+        authorize_with_scopes::<Note>(&state, &session, Some(&scopes), "update", &n)
+            .await
+            .expect("scope allows update");
+
+        // No scopes → deny (default 404).
+        authorize_with_scopes::<Note>(&state, &session, None, "update", &n)
+            .await
+            .unwrap_err();
+    }
+
+    #[tokio::test]
+    async fn from_request_parts_propagates_scopes() {
+        let state = crate::AppState::detached();
+        let session = session_with(Some("7"), Some("admin"));
+        let scopes = crate::auth::ApiTokenScopes(vec!["posts:write".to_owned()]);
+        let ctx = PolicyContext::from_request_parts(&state, &session, Some(&scopes)).await;
+        assert_eq!(ctx.user_id.as_deref(), Some("7"));
+        assert!(ctx.has_role("admin"));
+        assert!(ctx.has_scope("posts:write"));
+        assert!(!ctx.has_scope("posts:read"));
+    }
+
+    #[tokio::test]
+    async fn from_request_parts_with_no_scopes_leaves_scopes_empty() {
+        let state = crate::AppState::detached();
+        let session = session_with(Some("7"), None);
+        let ctx = PolicyContext::from_request_parts(&state, &session, None).await;
+        assert!(ctx.scopes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn check_policy_scoped_round_trips_through_authorize_with_scopes() {
+        let state = crate::AppState::detached();
+        state
+            .policy_registry()
+            .register_policy::<Note, _>(AdminOrOwnerPolicy);
+        let session = session_with(Some("42"), None); // owner
+        let n = Note { author_id: 42 };
+        __check_policy_scoped::<Note>(&state, &session, None, "update", &n)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn check_policy_create_payload_scoped_threads_scopes() {
+        struct ScopedCreatePolicy;
+        impl Policy<Note> for ScopedCreatePolicy {
+            fn can_create_payload<'a>(
+                &'a self,
+                ctx: &'a PolicyContext,
+                _payload: &'a serde_json::Value,
+            ) -> BoxFuture<'a, bool> {
+                Box::pin(async move { ctx.has_scope("posts:write") })
+            }
+        }
+
+        let state =
+            crate::AppState::detached().with_forbidden_response(ForbiddenResponse::Forbidden403);
+        state
+            .policy_registry()
+            .register_policy::<Note, _>(ScopedCreatePolicy);
+        let session = session_with(None, None);
+        let payload = serde_json::json!({"title": "Hello"});
+        let scopes = crate::auth::ApiTokenScopes(vec!["posts:write".to_owned()]);
+
+        __check_policy_create_payload_scoped::<Note>(&state, &session, Some(&scopes), &payload)
+            .await
+            .expect("scope grants create");
+
+        let err =
+            __check_policy_create_payload_scoped::<Note>(&state, &session, None, &payload)
+                .await
+                .unwrap_err();
+        assert_eq!(err.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn check_policy_create_payload_scoped_returns_500_when_no_policy() {
+        let state = crate::AppState::detached();
+        let session = session_with(None, None);
+        let err = __check_policy_create_payload_scoped::<Note>(
+            &state,
+            &session,
+            None,
+            &serde_json::json!({}),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
 }

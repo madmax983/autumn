@@ -1932,4 +1932,48 @@ mod tests {
         assert_eq!(parse_form_bool("y"), None);
         assert_eq!(parse_form_bool("2"), None);
     }
+
+    // ── extract_reveal_cookie ─────────────────────────────────────────────────
+
+    fn headers_with_cookie(cookie: &str) -> axum::http::HeaderMap {
+        let mut map = axum::http::HeaderMap::new();
+        map.insert(
+            axum::http::header::COOKIE,
+            axum::http::HeaderValue::from_str(cookie).unwrap(),
+        );
+        map
+    }
+
+    #[test]
+    fn extract_reveal_cookie_returns_none_when_no_cookie_header() {
+        let headers = axum::http::HeaderMap::new();
+        assert!(extract_reveal_cookie(&headers).is_none());
+    }
+
+    #[test]
+    fn extract_reveal_cookie_returns_none_when_cookie_absent_from_header() {
+        let headers = headers_with_cookie("session=abc; other=xyz");
+        assert!(extract_reveal_cookie(&headers).is_none());
+    }
+
+    #[test]
+    fn extract_reveal_cookie_returns_none_when_value_is_empty() {
+        let headers = headers_with_cookie("__autumn_reveal=; session=abc");
+        assert!(extract_reveal_cookie(&headers).is_none());
+    }
+
+    #[test]
+    fn extract_reveal_cookie_returns_value_when_present() {
+        let headers = headers_with_cookie("session=abc; __autumn_reveal=tok123; other=xyz");
+        assert_eq!(extract_reveal_cookie(&headers).as_deref(), Some("tok123"));
+    }
+
+    #[test]
+    fn extract_reveal_cookie_handles_leading_only_cookie() {
+        let headers = headers_with_cookie("__autumn_reveal=supersecret");
+        assert_eq!(
+            extract_reveal_cookie(&headers).as_deref(),
+            Some("supersecret")
+        );
+    }
 }
