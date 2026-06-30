@@ -160,6 +160,19 @@ stage_vendor_before_chef_cook() {
     "${PROJECT_DIR}/Dockerfile"
 }
 
+# Inject the locally-built autumn binary into the Docker build context so the
+# generated Dockerfile's `RUN autumn build --embed` uses the in-tree CLI rather
+# than the last published crates.io release (which may lack new sub-commands like
+# `--embed`). The generated Dockerfile is unchanged from what users receive.
+inject_local_autumn_binary() {
+  log "Injecting locally-built autumn binary into Docker build context"
+  cp "${AUTUMN}" "${PROJECT_DIR}/autumn-ci-bin"
+  chmod +x "${PROJECT_DIR}/autumn-ci-bin"
+  sed -i \
+    's|^RUN cargo install --locked autumn-cli.*$|COPY ./autumn-ci-bin /usr/local/bin/autumn|' \
+    "${PROJECT_DIR}/Dockerfile"
+}
+
 vendor_in_tree_autumn_web
 
 # ── health probe helper ─────────────────────────────────────────────────────
@@ -226,6 +239,7 @@ run_default_target() {
   log "release init (bare/default target)"
   ( cd "${PROJECT_DIR}" && "${AUTUMN}" release init --force )
   stage_vendor_before_chef_cook
+  inject_local_autumn_binary
 
   log "docker build the generated image"
   if ! ( cd "${PROJECT_DIR}" && docker build -t "${IMAGE_TAG}" . 2>&1 | tee "${WORKDIR}/build.log" ); then
@@ -275,6 +289,7 @@ run_compose_target() {
   log "release init --target docker-compose"
   ( cd "${PROJECT_DIR}" && "${AUTUMN}" release init --force --target docker-compose )
   stage_vendor_before_chef_cook
+  inject_local_autumn_binary
 
   # The generated compose app runs in the prod profile, which requires a
   # non-empty trusted-host allowlist to bind. Inject it (and a signing secret)
