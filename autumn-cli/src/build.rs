@@ -412,6 +412,18 @@ fn find_binary(
     })
 }
 
+/// Return `true` when `pkg`'s target list contains a binary named `bin_name`.
+fn pkg_owns_bin(pkg: &serde_json::Value, bin_name: &str) -> bool {
+    pkg["targets"].as_array().is_some_and(|ts| {
+        ts.iter().any(|t| {
+            t["name"].as_str() == Some(bin_name)
+                && t["kind"]
+                    .as_array()
+                    .is_some_and(|ks| ks.iter().any(|k| k == "bin"))
+        })
+    })
+}
+
 fn resolve_binary_from_metadata(
     metadata: &serde_json::Value,
     debug: bool,
@@ -446,6 +458,26 @@ fn resolve_binary_from_metadata(
         },
     );
 
+    // Guard: when --bin is given without -p, reject the request if more than one
+    // package in the workspace owns a binary with that name.  Cargo would build
+    // all matching targets and emit an output-filename-collision warning; we must
+    // error here so the caller gets a clear message rather than silently using
+    // the first match's manifest_dir with the last-written binary on disk.
+    if let (Some(explicit), None) = (bin, package) {
+        let owners: Vec<&str> = matching_packages
+            .iter()
+            .filter(|pkg| pkg_owns_bin(pkg, explicit))
+            .filter_map(|pkg| pkg["name"].as_str())
+            .collect();
+        if owners.len() > 1 {
+            return Err(format!(
+                "binary target '{explicit}' is defined in multiple packages: {}; \
+                 use -p <package> to select one",
+                owners.join(", ")
+            ));
+        }
+    }
+
     let (bin_name, manifest_dir) = matching_packages
         .iter()
         .find_map(|pkg| {
@@ -458,15 +490,7 @@ fn resolve_binary_from_metadata(
                 // members matching the CWD filter would always pick the first
                 // member regardless of which one owns the bin, giving the wrong
                 // manifest_dir for fingerprinting and static rendering.
-                let has_target = pkg["targets"].as_array().is_some_and(|ts| {
-                    ts.iter().any(|t| {
-                        t["name"].as_str() == Some(explicit)
-                            && t["kind"]
-                                .as_array()
-                                .is_some_and(|ks| ks.iter().any(|k| k == "bin"))
-                    })
-                });
-                if !has_target {
+                if !pkg_owns_bin(pkg, explicit) {
                     return None;
                 }
                 explicit.to_owned()
@@ -783,6 +807,45 @@ mod tests {
             manifest_dir,
             Some(PathBuf::from("/workspace/app-b")),
             "--bin web must resolve to app-b's manifest_dir, not app-a's"
+        );
+    }
+
+    #[test]
+    fn resolve_binary_bin_ambiguous_across_workspace_members_errors() {
+        // When two workspace members expose the same binary name and no -p is
+        // given, cargo would produce an output-filename collision; autumn must
+        // reject the request so the user is told to pass -p.
+        let metadata = serde_json::json!({
+            "target_directory": "/workspace/target",
+            "packages": [
+                {
+                    "name": "app-a",
+                    "manifest_path": "/workspace/app-a/Cargo.toml",
+                    "targets": [{ "name": "web", "kind": ["bin"], "src_path": "/workspace/app-a/src/main.rs" }]
+                },
+                {
+                    "name": "app-b",
+                    "manifest_path": "/workspace/app-b/Cargo.toml",
+                    "targets": [{ "name": "web", "kind": ["bin"], "src_path": "/workspace/app-b/src/main.rs" }]
+                }
+            ]
+        });
+        let result = resolve_binary_from_metadata(
+            &metadata,
+            false,
+            None,
+            Some("web"),
+            Path::new("/workspace"),
+        );
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("web") && err.contains("app-a") && err.contains("app-b"),
+            "error must name the binary and the conflicting packages so the user \
+             knows to add -p; got: {err}"
+        );
+        assert!(
+            err.contains("-p"),
+            "error must suggest -p <package> to disambiguate; got: {err}"
         );
     }
 
