@@ -46,6 +46,7 @@ pub struct SelectOption {
 /// Metadata for a single model field.
 #[derive(Debug, Clone)]
 #[allow(clippy::struct_excessive_bools)] // orthogonal flags on a plain config record
+#[non_exhaustive]
 pub struct AdminField {
     /// Column name in the database / struct field name.
     pub name: &'static str,
