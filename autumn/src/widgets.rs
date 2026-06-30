@@ -8,11 +8,11 @@
 //!
 //! | Widget | Use |
 //! |--------|-----|
-//! | [`card`] | Titled content panel with optional header action and footer |
-//! | [`stat_card`] | Metric tile: label / value / optional link |
-//! | [`property_list`] | `<dl>` of label/value rows for a record detail view |
-//! | [`data_table`] | Column-driven, sortable `<table>` |
-//! | [`breadcrumb`] | Accessible `<nav>` breadcrumb trail |
+//! | `card` | Titled content panel with optional header action and footer |
+//! | `stat_card` | Metric tile: label / value / optional link |
+//! | `property_list` | `<dl>` of label/value rows for a record detail view |
+//! | `data_table` | Column-driven, sortable `<table>` |
+//! | `breadcrumb` | Accessible `<nav>` breadcrumb trail |
 //!
 //! # Interactive / search widgets
 //!
