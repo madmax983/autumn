@@ -63,7 +63,7 @@ pub struct AdminField {
     pub required: bool,
     /// Whether this field is editable (false for IDs, timestamps, etc.).
     pub editable: bool,
-    /// Editable only on create; shown as read-only on edit (e.g. principal_id, expires_at).
+    /// Editable only on create; shown as read-only on edit (e.g. `principal_id`, `expires_at`).
     /// `strip_meta_fields` drops these on update submissions so the model never sees them.
     pub create_only: bool,
     /// Sort priority in list view (None = not sortable).
@@ -163,7 +163,7 @@ impl AdminField {
         self
     }
 
-    /// Editable on create, read-only on edit (e.g. principal_id, expires_at).
+    /// Editable on create, read-only on edit (e.g. `principal_id`, `expires_at`).
     /// The field renders normally in the create form but as a disabled display
     /// in the edit form; update submissions never receive its value.
     #[must_use]

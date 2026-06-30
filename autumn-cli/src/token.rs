@@ -7,7 +7,6 @@
 
 use hex::encode as hex_encode;
 use sha2::{Digest as _, Sha256};
-use std::path::Path;
 use std::process::{Command, Stdio};
 
 /// Issue a new API token for `principal_id` and print the raw token to stdout.
@@ -28,7 +27,7 @@ pub fn run_issue(principal_id: &str, name: &str, scopes: &[String], expires_at: 
     // psql quotes each value as a SQL string literal, so no manual escaping is
     // needed. `:'scopes'::jsonb` casts the JSON array text into the JSONB
     // column; an empty `:'expires_at'` becomes NULL via NULLIF.
-    run_psql_with_vars_or_die(
+    run_psql_silent(
         &database_url,
         "INSERT INTO api_tokens (token_hash, principal_id, name, scopes, expires_at) \
          VALUES (:'hash', :'principal', :'name', :'scopes'::jsonb, \
@@ -137,71 +136,8 @@ fn os_random_bytes() -> [u8; 32] {
     buf
 }
 
-/// Resolve the database URL from autumn.toml and environment variables.
-///
-/// Precedence (highest to lowest):
-/// 1. `AUTUMN_DATABASE__PRIMARY_URL` environment variable
-/// 2. `AUTUMN_DATABASE__URL` environment variable
-/// 3. `DATABASE_URL` environment variable
-/// 4. `database.primary_url` from `autumn.toml`
-/// 5. `database.url` from `autumn.toml`
 fn resolve_database_url() -> String {
-    let config_table = read_autumn_toml_table();
-    if let Some(url) =
-        resolve_primary_database_url_from_sources(|key| std::env::var(key), config_table.as_ref())
-    {
-        return url;
-    }
-
-    eprintln!("\u{2717} No database URL found.");
-    eprintln!(
-        "  Set database.primary_url (or database.url) in autumn.toml, or set AUTUMN_DATABASE__PRIMARY_URL / AUTUMN_DATABASE__URL / DATABASE_URL."
-    );
-    std::process::exit(1);
-}
-
-fn read_autumn_toml_table() -> Option<toml::Table> {
-    let config_path = Path::new("autumn.toml");
-    if !config_path.exists() {
-        return None;
-    }
-
-    std::fs::read_to_string(config_path)
-        .ok()
-        .and_then(|contents| toml::from_str::<toml::Table>(&contents).ok())
-}
-
-fn resolve_primary_database_url_from_sources<F>(
-    env_var: F,
-    table: Option<&toml::Table>,
-) -> Option<String>
-where
-    F: Fn(&str) -> Result<String, std::env::VarError>,
-{
-    for var in [
-        "AUTUMN_DATABASE__PRIMARY_URL",
-        "AUTUMN_DATABASE__URL",
-        "DATABASE_URL",
-    ] {
-        if let Ok(url) = env_var(var)
-            && !url.is_empty()
-        {
-            return Some(url);
-        }
-    }
-
-    let database = table?.get("database").and_then(toml::Value::as_table)?;
-    for key in ["primary_url", "url"] {
-        if let Some(url) = database
-            .get(key)
-            .and_then(toml::Value::as_str)
-            .filter(|url| !url.is_empty())
-        {
-            return Some(url.to_owned());
-        }
-    }
-
-    None
+    crate::config::resolve_database_url()
 }
 
 fn check_psql() {
