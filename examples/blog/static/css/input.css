@@ -262,3 +262,48 @@
     background-color: #ede9fe;
     color: #4f46e5;
 }
+
+/* ── Breadcrumb navigation (autumn-breadcrumb) ────────────────────────────── */
+
+.autumn-breadcrumb {
+    margin-bottom: 1rem;
+}
+
+.autumn-breadcrumb__list {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    list-style: none;
+    padding: 0;
+    margin: 0;
+    gap: 0.25rem;
+    font-size: 0.875rem;
+}
+
+.autumn-breadcrumb__item {
+    display: flex;
+    align-items: center;
+    gap: 0.25rem;
+}
+
+.autumn-breadcrumb__link {
+    color: #4f46e5;
+    text-decoration: none;
+}
+
+.autumn-breadcrumb__link:hover {
+    text-decoration: underline;
+}
+
+.autumn-breadcrumb__separator {
+    color: #9ca3af;
+    user-select: none;
+}
+
+.autumn-breadcrumb__current {
+    color: #6b7280;
+}
+
+.autumn-breadcrumb__text {
+    color: #374151;
+}
