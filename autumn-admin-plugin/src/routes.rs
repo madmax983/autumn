@@ -386,18 +386,13 @@ fn render(markup: maud::Markup) -> Response {
 
 /// Extract the value of the `__autumn_reveal` cookie from request headers.
 fn extract_reveal_cookie(headers: &axum::http::HeaderMap) -> Option<String> {
-    let cookie_str = headers
-        .get(axum::http::header::COOKIE)?
-        .to_str()
-        .ok()?;
-    cookie_str
-        .split(';')
-        .find_map(|part| {
-            part.trim()
-                .strip_prefix("__autumn_reveal=")
-                .filter(|v| !v.is_empty())
-                .map(str::to_owned)
-        })
+    let cookie_str = headers.get(axum::http::header::COOKIE)?.to_str().ok()?;
+    cookie_str.split(';').find_map(|part| {
+        part.trim()
+            .strip_prefix("__autumn_reveal=")
+            .filter(|v| !v.is_empty())
+            .map(str::to_owned)
+    })
 }
 
 // ── Handlers ────────────────────────────────────────────────────────
