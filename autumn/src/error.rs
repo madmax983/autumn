@@ -928,10 +928,18 @@ impl IntoResponse for AutumnError {
             None,
             true,
         );
+
+        let body_bytes = serde_json::to_vec(&body).unwrap_or_default();
+        let content_length = body_bytes.len();
+
         let mut response = (status, axum::Json(body)).into_response();
         response.headers_mut().insert(
             header::CONTENT_TYPE,
             HeaderValue::from_static("application/problem+json"),
+        );
+        response.headers_mut().insert(
+            header::CONTENT_LENGTH,
+            HeaderValue::from(content_length),
         );
         if status == StatusCode::CONFLICT {
             response.headers_mut().insert(

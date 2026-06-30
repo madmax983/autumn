@@ -4,10 +4,7 @@ fn main() {
     println!("cargo:rerun-if-changed=tailwind.config.js");
 
     let Some(tailwind) = find_tailwind_cli() else {
-        println!(
-            "cargo:warning=Tailwind CSS CLI not found — CSS will not be compiled. \
-             Run `autumn setup` or install tailwindcss manually."
-        );
+        // Tailwind CLI is optional, no warning emitted if not found.
         return;
     };
 

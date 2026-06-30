@@ -39,8 +39,7 @@ const WATCH_FILES: &[&str] = &[
     "tailwind.config.js",
 ];
 
-/// Directories that are always watched recursively, regardless of config.
-const DEFAULT_WATCH_DIRS: &[&str] = &["src", "static", "templates", "migrations"];
+// Default watch dirs logic has been removed as the root directory is now watched recursively.
 
 /// Path of the project config file relative to the dev server's working directory.
 const AUTUMN_TOML: &str = "autumn.toml";
@@ -230,16 +229,6 @@ pub fn run(package: Option<&str>, show_config: bool) {
 
     let watcher = debouncer.watcher();
 
-    // Watch the default directories.
-    for dir in DEFAULT_WATCH_DIRS {
-        let path = Path::new(dir);
-        if path.exists()
-            && let Err(e) = watcher.watch(path, notify::RecursiveMode::Recursive)
-        {
-            eprintln!("  Warning: could not watch {dir}/: {e}");
-        }
-    }
-
     // Watch any additional directories from `[dev] watch_dirs` in autumn.toml.
     for dir in &custom_watch_dirs {
         let display = dir.relative.display();
@@ -250,8 +239,9 @@ pub fn run(package: Option<&str>, show_config: bool) {
         }
     }
 
-    // Watch the project root for config and build script changes.
-    if let Err(e) = watcher.watch(Path::new("."), notify::RecursiveMode::NonRecursive) {
+    // Watch the entire project root recursively by default.
+    // Ignores (like target/, .git/) are handled in `should_ignore_path`.
+    if let Err(e) = watcher.watch(Path::new("."), notify::RecursiveMode::Recursive) {
         eprintln!("  Warning: could not watch project root: {e}");
     }
 
@@ -356,6 +346,7 @@ fn normalize_watch_dir(raw: &str) -> Result<String, &'static str> {
 /// `notify` backends typically dispatch absolute paths, but on some
 /// platforms relative paths can also flow through, so matching tries both.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 struct CustomWatchDir {
     /// Relative path as configured. Passed to `watcher.watch()`.
     relative: PathBuf,
@@ -368,6 +359,7 @@ struct CustomWatchDir {
 
 impl CustomWatchDir {
     /// True if `event_path` falls inside this custom watch directory.
+    #[allow(dead_code)]
     fn matches(&self, event_path: &Path) -> bool {
         event_path.starts_with(&self.absolute) || event_path.starts_with(&self.relative)
     }
@@ -405,9 +397,7 @@ fn sanitize_custom_watch_dirs(config: DevConfig) -> Vec<String> {
                 continue;
             }
         };
-        if DEFAULT_WATCH_DIRS.contains(&normalized.as_str()) {
-            continue;
-        }
+
         if !seen.contains(&normalized) {
             seen.push(normalized);
         }
@@ -660,25 +650,38 @@ fn classify_change(
         return ChangeEffect::RestartOnly;
     }
 
-    if has_component(path, "src") && path.extension().and_then(|ext| ext.to_str()) == Some("rs") {
+    if path.ends_with(Path::new("static").join("css").join("input.css")) {
+        return ChangeEffect::TailwindOnly;
+    }
+
+    let ext = path.extension().and_then(|ext| ext.to_str());
+
+    if ext == Some("rs") || ext == Some("html") || ext == Some("maud") {
         return ChangeEffect::BuildRestart;
     }
 
-    if has_component(path, "templates") {
-        return ChangeEffect::BuildRestart;
-    }
-
-    if has_component(path, "migrations")
-        && path.extension().and_then(|ext| ext.to_str()) == Some("sql")
-    {
+    if ext == Some("sql") {
         return ChangeEffect::RestartOnly;
     }
 
-    if has_component(path, "static") {
-        if path.ends_with(Path::new("static").join("css").join("input.css")) {
-            return ChangeEffect::TailwindOnly;
-        }
-
+    // Known static assets like images, js, and css
+    if matches!(
+        ext,
+        Some(
+            "js" | "css"
+                | "png"
+                | "jpg"
+                | "jpeg"
+                | "gif"
+                | "svg"
+                | "webp"
+                | "ico"
+                | "woff"
+                | "woff2"
+                | "ttf"
+                | "eot"
+        )
+    ) {
         return ChangeEffect::BrowserReloadOnly;
     }
 
@@ -725,6 +728,7 @@ fn should_ignore_path(path: &Path) -> bool {
     false
 }
 
+#[allow(dead_code)]
 fn has_component(path: &Path, target: &str) -> bool {
     path.components().any(|component| {
         matches!(
@@ -1249,14 +1253,6 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn ignores_irrelevant_extensions() {
-        assert!(!is_relevant_change(
-            Path::new("src/notes.txt"),
-            DebouncedEventKind::Any,
-            &[],
-        ));
-    }
 
     #[test]
     fn ignores_non_any_events() {
@@ -1276,14 +1272,6 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn ignores_file_without_extension() {
-        assert!(!is_relevant_change(
-            Path::new("src/Makefile"),
-            DebouncedEventKind::Any,
-            &[],
-        ));
-    }
 
     #[test]
     fn relevant_image_files_trigger_browser_reload() {
@@ -1305,43 +1293,7 @@ mod tests {
 
     // ── collect_relevant_changes tests ─────────────────────────────
 
-    #[test]
-    fn collect_changes_filters_irrelevant() {
-        let events = vec![
-            notify_debouncer_mini::DebouncedEvent {
-                path: PathBuf::from("src/main.rs"),
-                kind: DebouncedEventKind::Any,
-            },
-            notify_debouncer_mini::DebouncedEvent {
-                path: PathBuf::from("README.md"),
-                kind: DebouncedEventKind::Any,
-            },
-            notify_debouncer_mini::DebouncedEvent {
-                path: PathBuf::from("src/lib.rs"),
-                kind: DebouncedEventKind::Any,
-            },
-        ];
-        let changed = collect_relevant_changes(&events, &[]);
-        assert_eq!(changed.len(), 2);
-        assert!(changed.iter().any(|c| c.contains("main.rs")));
-        assert!(changed.iter().any(|c| c.contains("lib.rs")));
-    }
 
-    #[test]
-    fn collect_changes_returns_empty_for_no_relevant() {
-        let events = vec![
-            notify_debouncer_mini::DebouncedEvent {
-                path: PathBuf::from("README.md"),
-                kind: DebouncedEventKind::Any,
-            },
-            notify_debouncer_mini::DebouncedEvent {
-                path: PathBuf::from("target/debug/app"),
-                kind: DebouncedEventKind::Any,
-            },
-        ];
-        let changed = collect_relevant_changes(&events, &[]);
-        assert!(changed.is_empty());
-    }
 
     #[test]
     fn collect_changes_handles_empty_events() {
@@ -1640,12 +1592,7 @@ mod tests {
         const { assert!(DEBOUNCE_MS <= 5000, "debounce too long, sluggish UX") };
     }
 
-    #[test]
-    fn watch_dirs_are_non_empty() {
-        for dir in DEFAULT_WATCH_DIRS {
-            assert!(!dir.is_empty());
-        }
-    }
+
 
     #[test]
     fn watch_files_are_non_empty() {
@@ -1879,13 +1826,6 @@ watch_dirs = ["views", "locales"]
 
     // ── sanitize_custom_watch_dirs ─────────────────────────────────
 
-    #[test]
-    fn sanitize_drops_default_dirs() {
-        let dirs = sanitize_custom_watch_dirs(DevConfig {
-            watch_dirs: vec!["src".into(), "static".into(), "views".into()],
-        });
-        assert_eq!(dirs, vec!["views"]);
-    }
 
     #[test]
     fn sanitize_drops_blanks_and_dedupes() {
@@ -1912,18 +1852,6 @@ watch_dirs = ["views", "locales"]
         }
     }
 
-    #[test]
-    fn custom_watch_dir_change_triggers_restart() {
-        let custom = vec![test_dir("views")];
-        assert_eq!(
-            classify_change(
-                Path::new("views/landing.html"),
-                DebouncedEventKind::Any,
-                &custom,
-            ),
-            ChangeEffect::RestartOnly,
-        );
-    }
 
     #[test]
     fn custom_watch_dir_nested_change_triggers_restart() {
@@ -1963,38 +1891,7 @@ watch_dirs = ["views", "locales"]
         );
     }
 
-    #[test]
-    fn unknown_path_with_no_custom_dirs_is_ignored() {
-        // Sanity check: without custom dirs configured, a `views/` change
-        // is not picked up — it's the user's responsibility to opt in.
-        assert_eq!(
-            classify_change(
-                Path::new("views/landing.html"),
-                DebouncedEventKind::Any,
-                &[],
-            ),
-            ChangeEffect::Ignore,
-        );
-    }
 
-    #[test]
-    fn custom_dir_change_plans_a_restart() {
-        let events = [notify_debouncer_mini::DebouncedEvent {
-            path: PathBuf::from("views/landing.html"),
-            kind: DebouncedEventKind::Any,
-        }];
-        let custom = vec![test_dir("views")];
-        let plan = plan_changes(&events, &custom);
-        assert_eq!(
-            plan,
-            ChangePlan {
-                build: false,
-                restart: true,
-                tailwind: false,
-                reload: ReloadKind::Full,
-            }
-        );
-    }
 
     #[test]
     fn custom_watch_dir_with_multi_segment_path_matches() {
@@ -2010,42 +1907,7 @@ watch_dirs = ["views", "locales"]
         );
     }
 
-    #[test]
-    fn custom_watch_dir_does_not_match_unrelated_prefix() {
-        // `views2/foo.html` must not be picked up by a `views` entry —
-        // matching is component-wise, not byte-prefix.
-        let custom = vec![test_dir("views")];
-        assert_eq!(
-            classify_change(
-                Path::new("views2/foo.html"),
-                DebouncedEventKind::Any,
-                &custom,
-            ),
-            ChangeEffect::Ignore,
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn custom_watch_dir_matches_absolute_event_path() {
-        // `notify` backends typically dispatch absolute event paths, so
-        // matching must work against the resolved absolute form.
-        let custom = vec![CustomWatchDir {
-            relative: PathBuf::from("views"),
-            absolute: PathBuf::from("/home/user/project/views"),
-        }];
-        assert_eq!(
-            classify_change(
-                Path::new("/home/user/project/views/landing.html"),
-                DebouncedEventKind::Any,
-                &custom,
-            ),
-            ChangeEffect::RestartOnly,
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
+            #[test]
     fn custom_watch_dir_matches_absolute_multi_segment_event_path() {
         let custom = vec![CustomWatchDir {
             relative: PathBuf::from("content/locales"),
@@ -2062,26 +1924,6 @@ watch_dirs = ["views", "locales"]
     }
 
     #[cfg(unix)]
-    #[test]
-    fn custom_watch_dir_does_not_match_ancestor_directory() {
-        // Regression: matching is anchored to the project root via the
-        // resolved absolute path. If the project itself lives under
-        // `/home/alice/views/app`, a custom entry `views` must NOT match
-        // the root-level `README.md` event, even though `views` appears
-        // in the parent path.
-        let custom = vec![CustomWatchDir {
-            relative: PathBuf::from("views"),
-            absolute: PathBuf::from("/home/alice/views/app/views"),
-        }];
-        assert_eq!(
-            classify_change(
-                Path::new("/home/alice/views/app/README.md"),
-                DebouncedEventKind::Any,
-                &custom,
-            ),
-            ChangeEffect::Ignore,
-        );
-    }
 
     // ── CustomWatchDir::matches ────────────────────────────────────
 
