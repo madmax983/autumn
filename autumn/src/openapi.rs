@@ -114,6 +114,9 @@ pub struct ApiDoc {
     pub secured: bool,
     /// Roles required by `#[secured("role1")]`. Empty means any authenticated user.
     pub required_roles: &'static [&'static str],
+    /// Scopes required by `#[secured(scopes = ["scope"])]`. When non-empty the
+    /// route is documented as `BearerAuth` instead of `SessionAuth`.
+    pub required_scopes: &'static [&'static str],
     /// Optional runtime hook that lets a handler register any extra
     /// component schemas with the generator.
     pub register_schemas: Option<fn(&mut SchemaRegistry)>,
@@ -561,6 +564,7 @@ pub fn generate_spec_at(
         std::collections::BTreeSet::new();
 
     let mut any_secured = false;
+    let mut any_scoped = false;
 
     for api_doc in routes {
         if api_doc.hidden {
@@ -568,6 +572,9 @@ pub fn generate_spec_at(
         }
         if api_doc.secured {
             any_secured = true;
+        }
+        if !api_doc.required_scopes.is_empty() {
+            any_scoped = true;
         }
         if let Some(register) = api_doc.register_schemas {
             (register)(&mut registry);
@@ -613,7 +620,7 @@ pub fn generate_spec_at(
         }
     }
 
-    // Register the same cookie-backed session auth that `#[secured]` uses at runtime.
+    // Register auth security schemes used by secured routes.
     let mut security_schemes: BTreeMap<String, serde_json::Value> = BTreeMap::new();
     if any_secured {
         security_schemes.insert(
@@ -623,6 +630,16 @@ pub fn generate_spec_at(
                 "in": "cookie",
                 "name": config.session_cookie_name.clone(),
                 "description": "Autumn session cookie. Secured routes check the configured auth.session_key inside the server-side session.",
+            }),
+        );
+    }
+    if any_scoped {
+        security_schemes.insert(
+            "BearerAuth".to_owned(),
+            serde_json::json!({
+                "type": "http",
+                "scheme": "bearer",
+                "description": "API bearer token. Scope-secured routes require a valid token whose scopes include all required values.",
             }),
         );
     }
@@ -776,10 +793,19 @@ fn operation_for(
         });
     }
 
-    // Security requirement: `#[secured]` is backed by the Autumn session cookie.
+    // Security requirement: scope-secured routes use BearerAuth; all others use SessionAuth.
     let security = if api_doc.secured {
         let mut req = BTreeMap::new();
-        req.insert("SessionAuth".to_owned(), Vec::new());
+        if api_doc.required_scopes.is_empty() {
+            req.insert("SessionAuth".to_owned(), Vec::new());
+        } else {
+            let scopes: Vec<String> = api_doc
+                .required_scopes
+                .iter()
+                .map(|s| (*s).to_owned())
+                .collect();
+            req.insert("BearerAuth".to_owned(), scopes);
+        }
         vec![req]
     } else {
         Vec::new()
