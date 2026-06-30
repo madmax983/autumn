@@ -222,7 +222,7 @@ where
             .extensions
             .get::<Self>()
             .cloned()
-            .unwrap_or_else(|| Session::new(String::new(), HashMap::new()));
+            .unwrap_or_else(|| Self::new(String::new(), HashMap::new()));
         async move { Ok(session) }
     }
 }

@@ -2473,6 +2473,12 @@ mod db_store {
         ) -> Pin<Box<dyn Future<Output = crate::AutumnResult<Option<String>>> + Send + 'a>>
         {
             Box::pin(async move {
+                #[derive(diesel::QueryableByName)]
+                struct CountRow {
+                    #[diesel(sql_type = diesel::sql_types::BigInt)]
+                    count: i64,
+                }
+
                 let old_hash = hash_api_token(raw_token);
                 let new_raw = generate_raw_token();
                 let new_hash = hash_api_token(&new_raw);
@@ -2481,11 +2487,6 @@ mod db_store {
                 // the same name/scopes/expiry in a single statement. If the old hash
                 // is unknown or already revoked the UPDATE returns 0 rows, the INSERT
                 // is a no-op, and COUNT(*) returns 0 — the caller sees None.
-                #[derive(diesel::QueryableByName)]
-                struct CountRow {
-                    #[diesel(sql_type = diesel::sql_types::BigInt)]
-                    count: i64,
-                }
                 let row: CountRow = diesel::sql_query(
                     "WITH rotated AS ( \
                         UPDATE api_tokens \
