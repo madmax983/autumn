@@ -17,6 +17,9 @@
 //! For the full set of Axum extractors, use
 //! `autumn_web::reexports::axum::extract`.
 
+#[cfg(feature = "csv")]
+pub use crate::data::csv::Csv;
+
 use axum::extract::{FromRequest, FromRequestParts};
 use axum::response::{IntoResponse, Response};
 

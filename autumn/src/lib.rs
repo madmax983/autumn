@@ -1073,6 +1073,10 @@ pub use maud::html;
 /// ```
 pub use crate::extract::Json;
 
+/// CSV response type.
+#[cfg(feature = "csv")]
+pub use crate::extract::Csv;
+
 /// Path extractor.
 ///
 /// Extract typed path parameters from the URL.

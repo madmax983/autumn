@@ -61,6 +61,9 @@ pub use crate::db::Db;
 /// lives at [`crate::events::Event`] (kept out of the prelude to avoid clashing
 /// with [`crate::sse::Event`]).
 pub use crate::events::Events;
+/// CSV response type.
+#[cfg(feature = "csv")]
+pub use crate::extract::Csv;
 /// Form data extractor.
 pub use crate::extract::Form;
 /// JSON request/response type.
