@@ -843,10 +843,12 @@ fn setup(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {{
     // 4. Poll for server readiness in a background thread so setup() returns immediately
     //    and the Tauri event loop starts.  Blocking here freezes the UI and can trigger
     //    OS ANR watchdogs on macOS and Windows.
-    //    We probe the root path and accept ANY valid HTTP response (any status code) as
-    //    the readiness signal.  This avoids depending on a specific route path, which
-    //    would conflict if the app has a custom GET /health or configures [health].path
-    //    differently (Axum panics on duplicate route registration).
+    //    We probe GET /health — the cheap readiness endpoint autumn always registers.
+    //    Even if [health].path is customised to a different path, the server still
+    //    accepts the TCP connection and returns a fast HTTP response (e.g. 404), which
+    //    starts with "HTTP/" and is enough to confirm the server is up and routing.
+    //    Using /health instead of / avoids timing out against a slow app root handler
+    //    (e.g. a DB-backed dashboard that queries before writing headers).
     let handle = app.handle().clone();
     std::thread::spawn(move || {{
         // Build SocketAddr directly to avoid repeated string formatting and parse() panics.
@@ -867,7 +869,7 @@ fn setup(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {{
                 let _ = stream.set_read_timeout(Some(poll_timeout));
                 use std::io::{{Read, Write}};
                 let req =
-                    "GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n";
+                    "GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n";
                 if stream.write_all(req.as_bytes()).is_ok() {{
                     let mut buf = [0u8; 8];
                     // Any valid HTTP response (200, 301, 401, 404, …) means the server
@@ -2763,15 +2765,17 @@ mod tests {
     #[test]
     fn lib_rs_polls_for_http_response() {
         let lib = render_shell_lib_rs("my-app", "my-app");
-        // Probe accepts any valid HTTP response rather than a specific path/status,
-        // so it works regardless of the app's health route configuration.
+        // Probe /health — autumn always registers this endpoint and it responds cheaply.
+        // Any valid HTTP response (200, 404, …) starts with "HTTP/" and signals the
+        // server is up, avoiding a timeout against a slow app root handler.
         assert!(
             lib.contains("HTTP/"),
             "lib.rs readiness probe must accept any HTTP response prefix"
         );
         assert!(
-            lib.contains("GET /"),
-            "lib.rs must send a GET request to probe server readiness"
+            lib.contains("GET /health"),
+            "lib.rs must probe GET /health — a cheap readiness endpoint autumn always \
+             registers — instead of GET / which can time out for slow app root handlers"
         );
     }
 
@@ -2805,13 +2809,14 @@ mod tests {
     #[test]
     fn lib_rs_does_not_override_health_path() {
         let lib = render_shell_lib_rs("my-app", "my-app");
-        // Setting AUTUMN_HEALTH__PATH=/health can cause Axum to panic when the app
-        // already has a custom GET /health route (duplicate route registration).
-        // The probe instead accepts any HTTP response so no specific path is needed.
+        // The sidecar env must NOT set AUTUMN_HEALTH__PATH.  The probe already targets
+        // GET /health directly; overriding the path via env would only move where autumn
+        // registers the endpoint, not change what the probe hits.  Leave the app's
+        // [health].path config untouched so developer expectations are not violated.
         assert!(
             !lib.contains("AUTUMN_HEALTH__PATH"),
-            "lib.rs must NOT set AUTUMN_HEALTH__PATH — overriding it can conflict with \
-             app-defined routes and cause Axum to panic on duplicate registration"
+            "lib.rs must NOT set AUTUMN_HEALTH__PATH — the probe targets /health directly \
+             and overriding the env var only moves the framework endpoint unnecessarily"
         );
     }
 
