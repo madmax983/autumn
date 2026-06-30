@@ -308,32 +308,38 @@ fn resolve_bin_name(
     if autobins && project_root.join("src/main.rs").is_file() {
         return Ok(name.to_owned());
     }
-    if let Ok(entries) = std::fs::read_dir(project_root.join("src/bin")) {
-        let stems: Vec<String> = entries
-            .filter_map(std::result::Result::ok)
-            .filter_map(|e| {
-                let p = e.path();
-                if p.extension().is_some_and(|x| x == "rs") {
-                    p.file_stem().and_then(|s| s.to_str()).map(str::to_owned)
-                } else if p.is_dir() && p.join("main.rs").is_file() {
-                    p.file_name().and_then(|s| s.to_str()).map(str::to_owned)
-                } else {
-                    None
+    // Only scan src/bin/ when autobins is enabled (the default).  When
+    // `autobins = false` is set in [package], Cargo does not auto-discover
+    // src/bin/ entries, so scanning it here would return names that Cargo
+    // itself would reject in `cargo build --bin <name>`.
+    if autobins {
+        if let Ok(entries) = std::fs::read_dir(project_root.join("src/bin")) {
+            let stems: Vec<String> = entries
+                .filter_map(std::result::Result::ok)
+                .filter_map(|e| {
+                    let p = e.path();
+                    if p.extension().is_some_and(|x| x == "rs") {
+                        p.file_stem().and_then(|s| s.to_str()).map(str::to_owned)
+                    } else if p.is_dir() && p.join("main.rs").is_file() {
+                        p.file_name().and_then(|s| s.to_str()).map(str::to_owned)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            match stems.len() {
+                1 => return Ok(stems.into_iter().next().unwrap()),
+                0 => {}
+                _ => {
+                    let mut sorted = stems;
+                    sorted.sort();
+                    return Err(GenerateError::Config(format!(
+                        "ambiguous sidecar target: found multiple auto-discovered \
+                         src/bin/ binaries ({}) and no [package] default-run is set; \
+                         add `default-run = \"<bin>\"` to Cargo.toml to select one",
+                        sorted.join(", ")
+                    )));
                 }
-            })
-            .collect();
-        match stems.len() {
-            1 => return Ok(stems.into_iter().next().unwrap()),
-            0 => {}
-            _ => {
-                let mut sorted = stems;
-                sorted.sort();
-                return Err(GenerateError::Config(format!(
-                    "ambiguous sidecar target: found multiple auto-discovered \
-                     src/bin/ binaries ({}) and no [package] default-run is set; \
-                     add `default-run = \"<bin>\"` to Cargo.toml to select one",
-                    sorted.join(", ")
-                )));
             }
         }
     }
@@ -806,8 +812,10 @@ fn setup(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {{
         );
         let poll_timeout = std::time::Duration::from_millis(200);
         let mut ready = false;
-        // 150 × 200 ms = 30 s total — enough headroom for cold Postgres initialisation.
-        for _ in 0..150 {{
+        // 1500 × 200 ms = 300 s total — matches autumn serve's READY_TIMEOUT_MANAGED_PG.
+        // A first-launch managed-Postgres cluster must initialise (pg_ctl init) and then
+        // run migrations before serving HTTP; on slow disks this can take several minutes.
+        for _ in 0..1500 {{
             if let Ok(mut stream) =
                 std::net::TcpStream::connect_timeout(&addr, poll_timeout)
             {{
@@ -830,7 +838,7 @@ fn setup(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {{
         }}
         if !ready {{
             eprintln!(
-                "[{package_name}] Server did not become ready within 30 s — exiting."
+                "[{package_name}] Server did not become ready within 300 s — exiting."
             );
             // No window has been created yet, so WindowEvent::Destroyed cannot
             // fire.  Kill the sidecar explicitly before exiting so no orphaned
@@ -2161,6 +2169,46 @@ mod tests {
     }
 
     #[test]
+    fn plan_respects_autobins_false_ignores_src_bin_dir() {
+        // autobins=false means Cargo does NOT auto-discover src/bin/ entries.
+        // The generator must not scan src/bin/ in this case — doing so would
+        // return a name that `cargo build --bin <name>` would reject because Cargo
+        // itself does not register those as targets.
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[package]\nname=\"my-app\"\nversion=\"0.1.0\"\nedition=\"2024\"\nautobins=false\n\
+             \n[dependencies]\nautumn-web = \"0.5.0\"\n",
+        )
+        .unwrap();
+        fs::create_dir_all(tmp.path().join("src/bin")).unwrap();
+        // src/bin/web.rs exists on disk but autobins=false → NOT a Cargo target.
+        fs::write(tmp.path().join("src/bin/web.rs"), "fn main() {}\n").unwrap();
+        // With autobins=false and no explicit [[bin]], cargo metadata returns no
+        // bin targets for this package; plan_tauri must not discover "web" from
+        // src/bin/ and must not include `--bin web` in the staging scripts.
+        let plan = plan_tauri(tmp.path()).unwrap();
+        let sh: &str = plan
+            .actions
+            .iter()
+            .find(|a| a.path().to_string_lossy().ends_with("stage-sidecar.sh"))
+            .and_then(|a| {
+                if let crate::generate::emit::Action::Create { contents, .. } = a {
+                    Some(contents.as_str())
+                } else {
+                    None
+                }
+            })
+            .expect("stage-sidecar.sh action not found");
+        assert!(
+            !sh.contains("--bin web"),
+            "with autobins=false, src/bin/web.rs must NOT be discovered; \
+             Cargo does not register it as a target so `--bin web` would be rejected; \
+             got:\n{sh}"
+        );
+    }
+
+    #[test]
     fn plan_errors_on_multiple_explicit_bins_without_default_run() {
         // Multiple [[bin]] entries with no default-run and no src/main.rs must error
         // rather than silently pick the first entry (which may be an auxiliary binary).
@@ -2780,6 +2828,27 @@ mod tests {
             has_adequate_timeout,
             "lib.rs kill timeout must be >= 5 s (the default prestop grace) so \
              on_shutdown hooks complete before the force-kill; got:\n{lib}"
+        );
+    }
+
+    #[test]
+    fn lib_rs_waits_300s_for_managed_postgres_cold_start() {
+        let lib = render_shell_lib_rs("my-app", "my-app");
+        // A first-launch managed-Postgres cluster must initialise (pg_ctl init) and
+        // run migrations before serving HTTP; on slow disks this can take several
+        // minutes.  autumn serve uses READY_TIMEOUT_MANAGED_PG = 300 s; the generated
+        // shell must match so the first-launch window is not rejected prematurely.
+        // We look for 1500 iterations × 200 ms = 300 s, or any explicit "300" in context.
+        assert!(
+            lib.contains("0..1500") || lib.contains("300 s") || lib.contains("300s"),
+            "lib.rs readiness poll must allow at least 300 s (1500 × 200 ms) for \
+             managed-Postgres cold-start; the current limit is too short and will kill \
+             the sidecar before the cluster finishes initialising on a slow disk; \
+             got a snippet:\n{}",
+            lib.lines()
+                .filter(|l| l.contains("150") || l.contains("1500") || l.contains("300"))
+                .collect::<Vec<_>>()
+                .join("\n")
         );
     }
 
