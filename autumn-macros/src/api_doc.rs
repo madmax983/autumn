@@ -812,15 +812,9 @@ fn extract_secured_scopes_marker_from_stmt(stmt: &syn::Stmt) -> Option<Vec<Strin
 
 fn extract_secured_scopes_marker_from_expr(expr: &syn::Expr) -> Option<Vec<String>> {
     match expr {
-        syn::Expr::Block(block) => {
-            extract_secured_scopes_marker_from_stmts(&block.block.stmts)
-        }
-        syn::Expr::Async(block) => {
-            extract_secured_scopes_marker_from_stmts(&block.block.stmts)
-        }
-        syn::Expr::Unsafe(block) => {
-            extract_secured_scopes_marker_from_stmts(&block.block.stmts)
-        }
+        syn::Expr::Block(block) => extract_secured_scopes_marker_from_stmts(&block.block.stmts),
+        syn::Expr::Async(block) => extract_secured_scopes_marker_from_stmts(&block.block.stmts),
+        syn::Expr::Unsafe(block) => extract_secured_scopes_marker_from_stmts(&block.block.stmts),
         _ => None,
     }
 }
