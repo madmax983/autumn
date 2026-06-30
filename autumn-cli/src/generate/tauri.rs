@@ -329,17 +329,16 @@ fn resolve_bin_name(
         // is correctly flagged as ambiguous rather than silently picking the
         // explicit entry.
         let auto_bin_count = if autobins {
-            std::fs::read_dir(project_root.join("src/bin"))
-                .map_or(0, |entries| {
-                    entries
-                        .filter_map(std::result::Result::ok)
-                        .filter(|e| {
-                            let p = e.path();
-                            p.extension().is_some_and(|x| x == "rs")
-                                || (p.is_dir() && p.join("main.rs").is_file())
-                        })
-                        .count()
-                })
+            std::fs::read_dir(project_root.join("src/bin")).map_or(0, |entries| {
+                entries
+                    .filter_map(std::result::Result::ok)
+                    .filter(|e| {
+                        let p = e.path();
+                        p.extension().is_some_and(|x| x == "rs")
+                            || (p.is_dir() && p.join("main.rs").is_file())
+                    })
+                    .count()
+            })
         } else {
             0
         };
