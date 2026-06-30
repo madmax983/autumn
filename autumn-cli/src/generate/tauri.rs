@@ -622,7 +622,10 @@ pub fn run() {{
                     {{
                         // On Unix: send SIGTERM so autumn's tokio signal handler
                         // runs on_shutdown hooks (including ManagedPostgresPoolProvider
-                        // ::stop()), then force-kill after 3 s.
+                        // ::stop()), then force-kill after 5 s.
+                        // AUTUMN_SERVER__PRESTOP_GRACE_SECS is set to 0 above so the
+                        // listener drain is skipped; the full 5 s budget is available
+                        // for on_shutdown hooks (e.g. pg_ctl stop -m fast).
                         // On Windows: autumn only handles tokio::signal::ctrl_c()
                         // (CTRL_C_EVENT).  taskkill sends WM_CLOSE/CTRL_CLOSE_EVENT
                         // which autumn does not handle; graceful shutdown via external
@@ -636,7 +639,7 @@ pub fn run() {{
                                 let _ = std::process::Command::new("kill")
                                     .args(["-TERM", &graceful_pid.to_string()])
                                     .status();
-                                std::thread::sleep(std::time::Duration::from_secs(3));
+                                std::thread::sleep(std::time::Duration::from_secs(5));
                                 let _ = child.kill();
                             }}
                             #[cfg(windows)]
@@ -747,6 +750,12 @@ fn setup(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {{
         // Clear AUTUMN_PROFILE regardless — it is the legacy spelling of AUTUMN_ENV
         // and should never be inherited from the calling shell environment.
         .env("AUTUMN_PROFILE", "")
+        // Skip the prestop listener-drain on desktop: no load balancer drains
+        // connections to the loopback-only sidecar, so the 5-second default grace
+        // (server.prestop_grace_secs) only delays managed-Postgres cleanup past
+        // the force-kill window.  Setting it to 0 lets on_shutdown hooks (including
+        // ManagedPostgresPoolProvider::stop()) run immediately after SIGTERM.
+        .env("AUTUMN_SERVER__PRESTOP_GRACE_SECS", "0")
         // Clear one-off mode flags inherited from the calling environment.
         // If any of these are set, AppBuilder::run() enters a non-serving mode
         // (asset fingerprinting, route dump, task execution) and exits before
@@ -2230,6 +2239,25 @@ mod tests {
     }
 
     #[test]
+    fn new_project_template_defines_embed_assets_feature() {
+        // `autumn new` must scaffold the `embed-assets` Cargo feature so that:
+        //   1. `autumn generate tauri` detects it (has_embed_assets=true) and uses
+        //      the app-crate feature path instead of the dep-only path.
+        //   2. The `#[cfg(feature = "embed-assets")]` guards in main.rs.tmpl are
+        //      activated by `--features embed-assets`, so `.embedded_static()` is
+        //      wired and desktop apps ship their CSS/JS in the sidecar binary.
+        let tmpl = include_str!("../templates/Cargo.toml.tmpl");
+        assert!(
+            tmpl.contains("embed-assets"),
+            "Cargo.toml.tmpl must define an `embed-assets` feature mapping to \
+             `autumn-web/embed-assets`; without it `autumn generate tauri` falls back \
+             to the dep-only feature path and `.embedded_static()` is never called \
+             (main.rs.tmpl guards it on #[cfg(feature = \"embed-assets\")]); \
+             got:\n{tmpl}"
+        );
+    }
+
+    #[test]
     fn stage_sidecar_sh_creates_autumn_toml_when_absent() {
         let sh = render_stage_sidecar_sh("my-app", "my-app", true, "autumn-web");
         assert!(
@@ -2686,6 +2714,32 @@ mod tests {
                  doesn't prevent the sidecar from binding its HTTP port"
             );
         }
+    }
+
+    #[test]
+    fn lib_rs_sets_prestop_grace_to_zero() {
+        let lib = render_shell_lib_rs("my-app", "my-app");
+        assert!(
+            lib.contains("AUTUMN_SERVER__PRESTOP_GRACE_SECS") && lib.contains("\"0\""),
+            "lib.rs must set AUTUMN_SERVER__PRESTOP_GRACE_SECS=0 so the sidecar skips \
+             the listener-drain delay; without this, the default 5-second prestop grace \
+             causes on_shutdown hooks (managed Postgres cleanup) to run after the \
+             force-kill fires; got:\n{lib}"
+        );
+    }
+
+    #[test]
+    fn lib_rs_kill_timeout_exceeds_default_prestop_grace() {
+        let lib = render_shell_lib_rs("my-app", "my-app");
+        // The default prestop_grace_secs is 5; the force-kill must wait at least
+        // that long so shutdown hooks finish even if the env override is absent.
+        // Look for from_secs(N) where N >= 5.
+        let has_adequate_timeout = (5u64..=60).any(|n| lib.contains(&format!("from_secs({n})")));
+        assert!(
+            has_adequate_timeout,
+            "lib.rs kill timeout must be >= 5 s (the default prestop grace) so \
+             on_shutdown hooks complete before the force-kill; got:\n{lib}"
+        );
     }
 
     #[test]
