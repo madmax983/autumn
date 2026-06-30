@@ -157,12 +157,17 @@ fn normalize_expires_at_utc(s: &str) -> String {
     // Hour-only offset forms (ISO 8601 allows ±HH with no minutes, e.g.
     // "2026-12-31T23:59:59-05" or "2026-12-31 23:59:59-05"). Expand the
     // offset to ±HH:00 and re-run so the existing parsers handle the rest.
-    // Termination is guaranteed: the expanded string ends with ±HH:MM so
-    // `b[n-3]` will be `:`, not `+`/`-`, and this branch is not re-entered.
+    // Guard: require a datetime separator (T or space) at position 10 to
+    // avoid treating the day-separator in date-only strings ("2026-12-31")
+    // as an offset sign (the `-` before `31` would otherwise be mistaken
+    // for a `-HH` hour-offset, causing `2026-12-31:00` → passthrough).
+    // Termination: the expanded string ends with ±HH:MM; `b[n-3]` = `:`
+    // so this branch is never re-entered.
     {
         let b = s.as_bytes();
         let n = b.len();
-        if n >= 4
+        if n >= 14
+            && matches!(b[10], b'T' | b' ')
             && matches!(b[n - 3], b'+' | b'-')
             && b[n - 2].is_ascii_digit()
             && b[n - 1].is_ascii_digit()
