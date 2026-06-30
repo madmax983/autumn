@@ -659,7 +659,6 @@ async fn model_create(
     axum::Extension(AdminPrefix(prefix)): axum::Extension<AdminPrefix>,
     Path(slug): Path<String>,
     flash: Flash,
-    request_headers: axum::http::HeaderMap,
     axum::extract::Form(form_data): axum::extract::Form<Value>,
 ) -> AutumnResult<Response> {
     let (pool, model) = resolve(&state, &registry, &slug)?;
@@ -694,16 +693,13 @@ async fn model_create(
     // The reveal cookie is path-scoped to the detail page and expires in 5
     // minutes; the detail handler reads it exactly once and clears it.
     if let Some(Value::String(secret)) = record.get("token") {
-        // Mirror the session cookie's Secure flag: only add it when the
-        // browser is talking HTTPS (direct TLS or via a proxy that sets
-        // X-Forwarded-Proto).  HTTP-only deployments (session.secure = false)
-        // must not set Secure or the browser silently drops the cookie before
-        // the redirect lands on the detail page.
-        let is_https = request_headers
-            .get("x-forwarded-proto")
-            .and_then(|v| v.to_str().ok())
-            .is_some_and(|proto| proto.eq_ignore_ascii_case("https"));
-        let secure_attr = if is_https { "; Secure" } else { "" };
+        // Mirror the session cookie's Secure flag so the reveal cookie is
+        // accepted in both HTTPS and explicit HTTP-only deployments.
+        let secure_attr = if state.config().session.secure {
+            "; Secure"
+        } else {
+            ""
+        };
         let cookie = format!(
             "__autumn_reveal={secret}; HttpOnly{secure_attr}; SameSite=Strict; Path={detail_path}; Max-Age=300"
         );
@@ -774,14 +770,13 @@ async fn model_detail(
     .into_response();
 
     // Clear the reveal cookie so a page refresh does not show the token again.
-    // Mirror the Secure decision from model_create: only add it on HTTPS so
-    // the browser accepts the clearing cookie on HTTP-only deployments too.
+    // Mirror the session cookie's Secure flag for consistency.
     if reveal_secret.is_some() {
-        let is_https = request_headers
-            .get("x-forwarded-proto")
-            .and_then(|v| v.to_str().ok())
-            .is_some_and(|proto| proto.eq_ignore_ascii_case("https"));
-        let secure_attr = if is_https { "; Secure" } else { "" };
+        let secure_attr = if state.config().session.secure {
+            "; Secure"
+        } else {
+            ""
+        };
         let clear = format!(
             "__autumn_reveal=; HttpOnly{secure_attr}; SameSite=Strict; Path={prefix}/{slug}/{id}; Max-Age=0"
         );
