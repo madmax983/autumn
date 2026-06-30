@@ -307,4 +307,21 @@ mod tests {
         let clock = FixedClock::at(pre_epoch);
         assert_eq!(clock_unix_duration(&clock), std::time::Duration::ZERO);
     }
+
+    #[test]
+    fn clock_unix_duration_correct_for_post_epoch() {
+        let post_epoch = Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
+        let clock = FixedClock::at(post_epoch);
+        let duration = clock_unix_duration(&clock);
+        assert_eq!(duration.as_secs(), post_epoch.timestamp().cast_unsigned());
+        assert_eq!(duration.subsec_nanos(), post_epoch.timestamp_subsec_nanos());
+    }
+
+    #[test]
+    fn clock_extractor_deref_and_now() {
+        let dt = Utc.with_ymd_and_hms(2025, 1, 1, 12, 0, 0).unwrap();
+        let clock = Clock(dt);
+        assert_eq!(clock.now(), dt);
+        assert_eq!(*clock, dt);
+    }
 }
