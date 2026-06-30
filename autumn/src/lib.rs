@@ -200,6 +200,15 @@ pub(crate) mod repository_commit_hooks;
 #[cfg(feature = "db")]
 pub use repository::RepositoryError;
 
+/// Read-your-own-writes routing support.
+///
+/// When `database.read_your_writes` is `request` or `session`, generated
+/// repository read methods consult the per-request task-local at acquire time
+/// and redirect replica-eligible reads to the primary when a write has
+/// occurred in the same request (or within the session cookie window).
+#[cfg(feature = "db")]
+pub mod read_your_writes;
+
 /// Automatic record version history for `#[repository]` writes.
 ///
 /// See [`version_history`] module documentation for the full API.

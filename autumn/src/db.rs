@@ -1109,7 +1109,7 @@ where
             .ok_or_else(|| AutumnError::service_unavailable_msg("Database not configured"))?;
         let ctx = RequestDbContext::from_parts(parts, state);
 
-        Self::checkout(DbCheckoutParams {
+        let result = Self::checkout(DbCheckoutParams {
             pool,
             pool_name: "primary",
             shard: None,
@@ -1119,7 +1119,13 @@ where
             slow_query_threshold: ctx.slow_query_threshold,
             interceptors: ctx.interceptors,
         })
-        .await
+        .await;
+        // Notify the RYWW task-local that a primary connection was checked out.
+        // No-op when read_your_writes = "off" (task-local absent).
+        if result.is_ok() {
+            crate::read_your_writes::mark_write();
+        }
+        result
     }
 }
 

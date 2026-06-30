@@ -3636,6 +3636,51 @@ impl std::str::FromStr for ReplicaFallback {
     }
 }
 
+/// Strategy for routing reads that follow a write within the same request or
+/// client session.
+///
+/// Replication is asynchronous: a read immediately after a write can land on a
+/// lagging replica and return stale data (the read-your-own-writes anomaly).
+/// This setting lets Autumn pin such reads to the primary.
+///
+/// Configured via `database.read_your_writes` in `autumn.toml` or
+/// `AUTUMN_DATABASE__READ_YOUR_WRITES` in the environment.
+///
+/// Default: `off` (preserves today's behavior — no post-write pinning).
+#[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum ReadYourWrites {
+    /// No post-write read pinning. Replica reads are always served from the
+    /// replica. This is the default and preserves existing behavior exactly.
+    #[default]
+    Off,
+    /// Once the current request checks out a **primary** connection (via `Db`
+    /// or a generated mutating repository method), all subsequent
+    /// replica-eligible reads within the same request are redirected to the
+    /// primary. Analogous to Laravel's "sticky" behavior.
+    Request,
+    /// Like `request`, and additionally pins a client's reads to the primary
+    /// for [`pin_after_write_secs`](DatabaseConfig::pin_after_write_secs)
+    /// seconds after a write, via a signed `autumn.ryw` cookie. Reads within
+    /// that window are served from the primary even if the request itself
+    /// performed no write. Analogous to Rails' automatic role switching.
+    Session,
+}
+
+impl std::str::FromStr for ReadYourWrites {
+    type Err = ();
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "off" => Ok(Self::Off),
+            "request" => Ok(Self::Request),
+            "session" => Ok(Self::Session),
+            _ => Err(()),
+        }
+    }
+}
+
 /// A logical slot assignment entry in a shard's `slots` list.
 ///
 /// Accepts a single slot index (`5`) or an inclusive range written as a
@@ -3864,6 +3909,26 @@ pub struct DatabaseConfig {
     /// reads. Default: fail readiness.
     #[serde(default)]
     pub replica_fallback: ReplicaFallback,
+
+    /// Post-write read pinning strategy. Default: `off` (no pinning).
+    ///
+    /// Set to `request` to pin reads to the primary for the remainder of the
+    /// request after the first write. Set to `session` to additionally pin
+    /// reads across requests via a signed cookie.
+    ///
+    /// Override via `AUTUMN_DATABASE__READ_YOUR_WRITES`.
+    #[serde(default)]
+    pub read_your_writes: ReadYourWrites,
+
+    /// Duration (seconds) for cross-request session pins.
+    ///
+    /// Only used when `read_your_writes = "session"`. A signed `autumn.ryw`
+    /// cookie pins the client's reads to the primary for this many seconds
+    /// after a write. Default: `5`.
+    ///
+    /// Override via `AUTUMN_DATABASE__PIN_AFTER_WRITE_SECS`.
+    #[serde(default = "default_pin_after_write_secs")]
+    pub pin_after_write_secs: u64,
 
     /// Seconds to wait while acquiring a pooled connection, including
     /// creating a new connection when the pool grows.
@@ -4796,6 +4861,10 @@ const fn default_connect_timeout() -> u64 {
     5
 }
 
+const fn default_pin_after_write_secs() -> u64 {
+    5
+}
+
 fn default_log_level() -> String {
     "info".to_owned()
 }
@@ -4869,6 +4938,8 @@ impl Default for DatabaseConfig {
             primary_pool_size: None,
             replica_pool_size: None,
             replica_fallback: ReplicaFallback::default(),
+            read_your_writes: ReadYourWrites::default(),
+            pin_after_write_secs: default_pin_after_write_secs(),
             connect_timeout_secs: default_connect_timeout(),
             startup_wait_secs: 0,
             auto_migrate_in_production: false,
