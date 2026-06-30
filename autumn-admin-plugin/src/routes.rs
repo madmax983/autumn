@@ -659,6 +659,7 @@ async fn model_create(
     axum::Extension(AdminPrefix(prefix)): axum::Extension<AdminPrefix>,
     Path(slug): Path<String>,
     flash: Flash,
+    request_headers: axum::http::HeaderMap,
     axum::extract::Form(form_data): axum::extract::Form<Value>,
 ) -> AutumnResult<Response> {
     let (pool, model) = resolve(&state, &registry, &slug)?;
@@ -693,8 +694,18 @@ async fn model_create(
     // The reveal cookie is path-scoped to the detail page and expires in 5
     // minutes; the detail handler reads it exactly once and clears it.
     if let Some(Value::String(secret)) = record.get("token") {
+        // Mirror the session cookie's Secure flag: only add it when the
+        // browser is talking HTTPS (direct TLS or via a proxy that sets
+        // X-Forwarded-Proto).  HTTP-only deployments (session.secure = false)
+        // must not set Secure or the browser silently drops the cookie before
+        // the redirect lands on the detail page.
+        let is_https = request_headers
+            .get("x-forwarded-proto")
+            .and_then(|v| v.to_str().ok())
+            .map_or(false, |proto| proto.eq_ignore_ascii_case("https"));
+        let secure_attr = if is_https { "; Secure" } else { "" };
         let cookie = format!(
-            "__autumn_reveal={secret}; HttpOnly; Secure; SameSite=Strict; Path={detail_path}; Max-Age=300"
+            "__autumn_reveal={secret}; HttpOnly{secure_attr}; SameSite=Strict; Path={detail_path}; Max-Age=300"
         );
         if let Ok(hv) = axum::http::HeaderValue::from_str(&cookie) {
             response
