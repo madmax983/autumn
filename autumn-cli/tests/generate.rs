@@ -4082,3 +4082,267 @@ fn generate_scaffold_auto_discovery_ignores_per_resource_recipe() {
         "CLI fields must be used, not the recipe's fields; got:\n{model}"
     );
 }
+
+// ── autumn generate tauri ─────────────────────────────────────────────────────
+
+#[test]
+fn generate_tauri_scaffolds_expected_files() {
+    let (_tmp, project) = fresh_project("tauri-scaffold-app");
+    run_autumn(&project, &["generate", "tauri"]);
+
+    // Core Tauri project files must exist
+    assert!(
+        project.join("src-tauri/tauri.conf.json").is_file(),
+        "src-tauri/tauri.conf.json must be created"
+    );
+    assert!(
+        project.join("src-tauri/Cargo.toml").is_file(),
+        "src-tauri/Cargo.toml must be created"
+    );
+    assert!(
+        project.join("src-tauri/build.rs").is_file(),
+        "src-tauri/build.rs must be created"
+    );
+    assert!(
+        project.join("src-tauri/src/main.rs").is_file(),
+        "src-tauri/src/main.rs must be created"
+    );
+    assert!(
+        project.join("src-tauri/src/lib.rs").is_file(),
+        "src-tauri/src/lib.rs must be created"
+    );
+
+    // Platform-specific Tauri config overlays (beforeBuildCommand/beforeDevCommand)
+    assert!(
+        project.join("src-tauri/tauri.linux.conf.json").is_file(),
+        "tauri.linux.conf.json must be created"
+    );
+    assert!(
+        project.join("src-tauri/tauri.macos.conf.json").is_file(),
+        "tauri.macos.conf.json must be created"
+    );
+    assert!(
+        project.join("src-tauri/tauri.windows.conf.json").is_file(),
+        "tauri.windows.conf.json must be created"
+    );
+
+    // Staging scripts
+    assert!(
+        project.join("src-tauri/stage-sidecar.sh").is_file(),
+        "stage-sidecar.sh must be created"
+    );
+    assert!(
+        project.join("src-tauri/stage-sidecar.ps1").is_file(),
+        "stage-sidecar.ps1 must be created"
+    );
+
+    // Icons
+    assert!(
+        project.join("src-tauri/icons/icon.svg").is_file(),
+        "icons/icon.svg must be created"
+    );
+    for name in &["32x32.png", "128x128.png", "128x128@2x.png", "icon.png"] {
+        assert!(
+            project.join("src-tauri/icons").join(name).is_file(),
+            "icons/{name} must be created"
+        );
+    }
+    assert!(
+        project.join("src-tauri/icons/icon.ico").is_file(),
+        "icons/icon.ico must be created"
+    );
+    assert!(
+        project.join("src-tauri/icons/icon.icns").is_file(),
+        "icons/icon.icns must be created"
+    );
+
+    // .gitignore
+    assert!(
+        project.join("src-tauri/.gitignore").is_file(),
+        "src-tauri/.gitignore must be created"
+    );
+}
+
+#[test]
+fn generate_tauri_conf_is_valid_json_with_required_fields() {
+    let (_tmp, project) = fresh_project("tauri-conf-app");
+    run_autumn(&project, &["generate", "tauri"]);
+
+    let conf = fs::read_to_string(project.join("src-tauri/tauri.conf.json")).unwrap();
+    let parsed: serde_json::Value =
+        serde_json::from_str(&conf).expect("tauri.conf.json must be valid JSON");
+
+    assert!(parsed["identifier"].is_string(), "must have identifier");
+    assert!(parsed["productName"].is_string(), "must have productName");
+    assert!(
+        parsed["bundle"]["externalBin"].is_array(),
+        "must have bundle.externalBin"
+    );
+    assert!(
+        !parsed["bundle"]["externalBin"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "externalBin must not be empty"
+    );
+    assert!(parsed["bundle"]["icon"].is_array(), "must have bundle.icon");
+    // beforeBuildCommand lives in platform-specific overlay files, not the main conf.
+    assert!(
+        parsed["build"]["beforeBuildCommand"].is_null(),
+        "beforeBuildCommand must be absent from tauri.conf.json (lives in platform overlays)"
+    );
+    // The externalBin must reference the app name
+    let bins = parsed["bundle"]["externalBin"].as_array().unwrap();
+    assert!(
+        bins.iter()
+            .any(|b| b.as_str().unwrap_or("").contains("tauri-conf-app")),
+        "externalBin must reference the app package name"
+    );
+}
+
+#[test]
+fn generate_tauri_shell_cargo_toml_has_own_workspace() {
+    let (_tmp, project) = fresh_project("tauri-ws-app");
+    run_autumn(&project, &["generate", "tauri"]);
+
+    let cargo = fs::read_to_string(project.join("src-tauri/Cargo.toml")).unwrap();
+    assert!(
+        cargo.contains("[workspace]"),
+        "src-tauri/Cargo.toml must have its own [workspace] so it is independent"
+    );
+    assert!(cargo.contains("tauri"), "must depend on tauri");
+    assert!(
+        cargo.contains("tauri-plugin-shell"),
+        "must depend on tauri-plugin-shell"
+    );
+}
+
+#[test]
+fn generate_tauri_lib_rs_has_sidecar_lifecycle() {
+    let (_tmp, project) = fresh_project("tauri-lifecycle-app");
+    run_autumn(&project, &["generate", "tauri"]);
+
+    let lib = fs::read_to_string(project.join("src-tauri/src/lib.rs")).unwrap();
+    assert!(
+        lib.contains("127.0.0.1:0"),
+        "must bind ephemeral loopback port"
+    );
+    assert!(
+        lib.contains("AUTUMN_SERVER__PORT"),
+        "must pass port env to sidecar"
+    );
+    assert!(
+        lib.contains("AUTUMN_MANAGED_PG_DATA_DIR"),
+        "must pass DB dir env (#1119)"
+    );
+    assert!(lib.contains(".sidecar("), "must spawn sidecar");
+    assert!(lib.contains("/health"), "must poll /health for readiness");
+    assert!(lib.contains(".kill()"), "must kill sidecar on window close");
+    assert!(
+        lib.contains("Destroyed"),
+        "must handle WindowEvent::Destroyed"
+    );
+}
+
+#[test]
+fn generate_tauri_prints_prerequisites() {
+    let (_tmp, project) = fresh_project("tauri-prereq-app");
+    let (stdout, _stderr) = run_autumn(&project, &["generate", "tauri"]);
+    assert!(
+        stdout.contains("tauri-cli") || stdout.contains("cargo tauri"),
+        "must print Tauri CLI prerequisite; got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("embed-assets"),
+        "must mention embed-assets (#1004); got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("managed-pg"),
+        "must mention managed-pg (#1119); got:\n{stdout}"
+    );
+}
+
+#[test]
+fn generate_tauri_is_additive_no_app_files_modified() {
+    let (_tmp, project) = fresh_project("tauri-additive-app");
+    let original_main = fs::read_to_string(project.join("src/main.rs")).unwrap();
+    let original_cargo = fs::read_to_string(project.join("Cargo.toml")).unwrap();
+
+    run_autumn(&project, &["generate", "tauri"]);
+
+    assert_eq!(
+        original_main,
+        fs::read_to_string(project.join("src/main.rs")).unwrap(),
+        "src/main.rs must be unchanged after generate tauri"
+    );
+    assert_eq!(
+        original_cargo,
+        fs::read_to_string(project.join("Cargo.toml")).unwrap(),
+        "root Cargo.toml must be unchanged after generate tauri"
+    );
+}
+
+#[test]
+fn generate_tauri_dry_run_writes_nothing() {
+    let (_tmp, project) = fresh_project("tauri-dry-run-app");
+    let (stdout, _stderr) = run_autumn(&project, &["generate", "tauri", "--dry-run"]);
+    assert!(
+        !project.join("src-tauri").exists(),
+        "dry-run must not create src-tauri/; got stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("tauri.conf.json") || stdout.contains("Would create"),
+        "dry-run must print the file plan; got:\n{stdout}"
+    );
+}
+
+#[test]
+fn generate_tauri_collision_without_force_exits_nonzero() {
+    let (_tmp, project) = fresh_project("tauri-collision-app");
+    run_autumn(&project, &["generate", "tauri"]);
+
+    let (_, stderr, code) = run_autumn_failing(&project, &["generate", "tauri"]);
+    assert_eq!(code, Some(1), "re-running without --force must exit 1");
+    assert!(
+        stderr.contains("would overwrite") || stderr.contains("already exists"),
+        "must explain collision; got stderr:\n{stderr}"
+    );
+}
+
+#[test]
+fn generate_tauri_force_is_idempotent() {
+    let (_tmp, project) = fresh_project("tauri-force-app");
+    run_autumn(&project, &["generate", "tauri"]);
+    run_autumn(&project, &["generate", "tauri", "--force"]);
+
+    // After --force, the JSON must still be valid
+    let conf = fs::read_to_string(project.join("src-tauri/tauri.conf.json")).unwrap();
+    let _: serde_json::Value =
+        serde_json::from_str(&conf).expect("tauri.conf.json must still be valid after --force");
+}
+
+#[test]
+fn generate_tauri_reuses_pwa_icon() {
+    let (_tmp, project) = fresh_project("tauri-pwa-icon-app");
+    // Simulate PWA generator having run
+    run_autumn(&project, &["generate", "pwa"]);
+
+    // Read the PWA icon before running the Tauri generator
+    let pwa_icon =
+        fs::read_to_string(project.join("static/icons/icon.svg")).expect("PWA icon must exist");
+
+    run_autumn(&project, &["generate", "tauri"]);
+
+    // The Tauri icon.svg must contain the same content as the PWA icon
+    let tauri_icon = fs::read_to_string(project.join("src-tauri/icons/icon.svg"))
+        .expect("src-tauri/icons/icon.svg must be created");
+    assert_eq!(
+        pwa_icon, tauri_icon,
+        "src-tauri/icons/icon.svg must contain the same content as the PWA icon"
+    );
+    // Original PWA icon must be untouched
+    assert!(
+        project.join("static/icons/icon.svg").is_file(),
+        "PWA icon must still exist"
+    );
+}

@@ -108,11 +108,19 @@ enum Commands {
         /// Package to build (for workspaces)
         #[arg(short, long)]
         package: Option<String>,
+        /// Binary target to build (for packages with multiple \[\[bin\]\] targets)
+        #[arg(long)]
+        bin: Option<String>,
         /// Embed static assets + i18n locales into the binary for a true
         /// single-binary deploy (enables the `autumn-web/embed-assets` feature
         /// and fingerprints before compiling so the manifest is baked in).
         #[arg(long)]
         embed: bool,
+        /// Extra Cargo features to enable (comma-separated). Forwarded to both
+        /// the fingerprint phase and the embed compile so features like
+        /// `autumn-web/managed-pg-bundled` are active throughout all build steps.
+        #[arg(long, value_name = "FEATURES")]
+        features: Option<String>,
     },
     /// Start the dev server with hot reload (watch mode)
     Dev {
@@ -869,7 +877,7 @@ enum MigrateCommands {
     ///   # Revert the last 3 applied user migrations:
     ///   autumn migrate down --steps 3
     ///
-    ///   # Revert until <version> is the latest applied:
+    ///   # Revert until VERSION is the latest applied:
     ///   autumn migrate down --to 20260101000000
     ///
     ///   # Required when the active profile is prod/production:
@@ -1569,12 +1577,12 @@ enum GenerateCommands {
     ///
     /// Example:
     ///
-    ///   autumn generate system-test <Name>
-    ///   autumn generate system-test <Name> --dry-run
+    ///   autumn generate system-test NAME
+    ///   autumn generate system-test NAME --dry-run
     ///
     /// After generation, run with:
     ///
-    ///   cargo test --features system-tests --test <name> -- --include-ignored
+    ///   cargo test --features system-tests --test NAME -- --include-ignored
     #[command(name = "system-test", verbatim_doc_comment)]
     SystemTest {
         /// Test name (`PascalCase` or `snake_case`, e.g. `TodoFlow`).
@@ -1603,6 +1611,38 @@ enum GenerateCommands {
     ///   autumn generate pwa --dry-run
     #[command(verbatim_doc_comment)]
     Pwa {
+        /// Print the file plan and exit without writing anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Overwrite existing files instead of erroring on collision.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Scaffold a Tauri desktop wrapper that ships the autumn app as a native installer.
+    ///
+    /// Uses the **sidecar model**: the autumn server binary runs as a supervised child
+    /// of the Tauri shell, and the webview loads the app from a free loopback port.
+    /// The existing autumn app (routes, Maud/htmx, sessions) runs unmodified.
+    ///
+    /// The sidecar is built with `autumn-web/embed-assets` (#1004) and
+    /// `autumn-web/managed-pg-bundled` (#1119) so the packaged desktop app needs
+    /// no separately-installed database or loose asset files.
+    ///
+    /// Creates:
+    ///   - `src-tauri/`                 — standalone Tauri shell crate
+    ///   - `src-tauri/tauri.conf.json`  — Tauri v2 config (productName, bundle, sidecar)
+    ///   - `src-tauri/src/lib.rs`       — sidecar lifecycle glue (ephemeral port,
+    ///     /health polling, kill-on-close)
+    ///   - `src-tauri/icons/`           — placeholder icons for immediate buildability
+    ///   - `src-tauri/stage-sidecar.sh` — build + stage the sidecar (Unix)
+    ///   - `src-tauri/stage-sidecar.ps1`— build + stage the sidecar (Windows)
+    ///
+    /// Example:
+    ///
+    ///   autumn generate tauri
+    ///   autumn generate tauri --dry-run
+    #[command(verbatim_doc_comment)]
+    Tauri {
         /// Print the file plan and exit without writing anything.
         #[arg(long)]
         dry_run: bool,
@@ -1726,8 +1766,16 @@ fn run_command(command: Commands) {
         Commands::Build {
             debug,
             package,
+            bin,
             embed,
-        } => build::run(debug, embed, package.as_deref()),
+            features,
+        } => build::run(
+            debug,
+            embed,
+            package.as_deref(),
+            bin.as_deref(),
+            features.as_deref(),
+        ),
         Commands::Dev {
             package,
             show_config,
@@ -2491,6 +2539,9 @@ fn run_generate_command(cmd: GenerateCommands) {
         GenerateCommands::Pwa { dry_run, force } => {
             generate::pwa::run(generate::Flags { dry_run, force });
         }
+        GenerateCommands::Tauri { dry_run, force } => {
+            generate::tauri::run(generate::Flags { dry_run, force });
+        }
         GenerateCommands::Auth {
             name,
             oauth,
@@ -2898,7 +2949,9 @@ mod tests {
             Commands::Build {
                 debug: false,
                 package: None,
-                embed: false
+                bin: None,
+                embed: false,
+                features: None,
             }
         ));
     }
@@ -2911,7 +2964,9 @@ mod tests {
             Commands::Build {
                 debug: true,
                 package: None,
-                embed: false
+                bin: None,
+                embed: false,
+                features: None,
             }
         ));
     }
@@ -2923,11 +2978,26 @@ mod tests {
             Commands::Build {
                 debug,
                 package,
+                bin,
                 embed,
+                ..
             } => {
                 assert!(!debug);
                 assert!(!embed);
+                assert!(bin.is_none());
                 assert_eq!(package.as_deref(), Some("blog"));
+            }
+            _ => panic!("expected Build command"),
+        }
+    }
+
+    #[test]
+    fn parse_build_with_bin() {
+        let cli = Cli::try_parse_from(["autumn", "build", "--embed", "--bin", "server"]).unwrap();
+        match cli.command {
+            Commands::Build { embed, bin, .. } => {
+                assert!(embed);
+                assert_eq!(bin.as_deref(), Some("server"));
             }
             _ => panic!("expected Build command"),
         }
@@ -2952,6 +3022,31 @@ mod tests {
             Commands::Build { debug, package, .. } => {
                 assert!(debug);
                 assert_eq!(package.as_deref(), Some("blog"));
+            }
+            _ => panic!("expected Build command"),
+        }
+    }
+
+    #[test]
+    fn parse_build_with_features() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "build",
+            "--embed",
+            "--features",
+            "autumn-web/managed-pg-bundled",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Build {
+                embed, features, ..
+            } => {
+                assert!(embed);
+                assert_eq!(
+                    features.as_deref(),
+                    Some("autumn-web/managed-pg-bundled"),
+                    "--features must be captured"
+                );
             }
             _ => panic!("expected Build command"),
         }
@@ -5321,6 +5416,40 @@ mod tests {
         let cli = Cli::try_parse_from(["autumn", "generate", "pwa", "--force"]).unwrap();
         let Commands::Generate(GenerateCommands::Pwa { dry_run, force }) = cli.command else {
             panic!("expected Pwa variant");
+        };
+        assert!(!dry_run);
+        assert!(force);
+    }
+
+    // ── autumn generate tauri ──────────────────────────────────────────────
+
+    #[test]
+    fn parse_generate_tauri() {
+        let cli = Cli::try_parse_from(["autumn", "generate", "tauri"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Generate(GenerateCommands::Tauri {
+                dry_run: false,
+                force: false
+            })
+        ));
+    }
+
+    #[test]
+    fn parse_generate_tauri_dry_run() {
+        let cli = Cli::try_parse_from(["autumn", "generate", "tauri", "--dry-run"]).unwrap();
+        let Commands::Generate(GenerateCommands::Tauri { dry_run, force }) = cli.command else {
+            panic!("expected Tauri variant");
+        };
+        assert!(dry_run);
+        assert!(!force);
+    }
+
+    #[test]
+    fn parse_generate_tauri_force() {
+        let cli = Cli::try_parse_from(["autumn", "generate", "tauri", "--force"]).unwrap();
+        let Commands::Generate(GenerateCommands::Tauri { dry_run, force }) = cli.command else {
+            panic!("expected Tauri variant");
         };
         assert!(!dry_run);
         assert!(force);

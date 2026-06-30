@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **cli:** `autumn generate tauri` — scaffolds a complete `src-tauri/` sidecar
+  project so any existing autumn app ships as a native desktop installer with a
+  single additional command (`cargo tauri build`). Uses the Tauri v2 sidecar
+  model: the autumn server binary is supervised by the Tauri shell and the
+  webview loads from an ephemeral loopback port chosen at runtime. Fully
+  self-contained at runtime via managed local Postgres (#1119,
+  `managed-pg-bundled`) and single-binary asset embedding (#1004,
+  `embed-assets`). Generator is purely additive — never rewrites your app's
+  `src/main.rs` or root `Cargo.toml`. Idempotent, dry-run capable, prints
+  required external prerequisites after scaffolding (#1150).
 - **ui:** reusable Maud pagination-nav renderer — `autumn_web::ui::pagination::{pagination_nav, cursor_pagination_nav, PagerOptions}`,
   re-exported from the prelude. Renders an accessible (`<nav>` with
   `aria-current="page"` and non-focusable disabled prev/next), filter-preserving
