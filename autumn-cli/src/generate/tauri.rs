@@ -300,8 +300,22 @@ fn resolve_bin_name(
                 // or `./src/main.rs` all compare equal to `src/main.rs`.  We process
                 // components into a stack so that `..` properly pops its parent, just
                 // as Cargo does when resolving [[bin]] paths in the manifest.
-                let segs = normalize_manifest_path(p);
-                segs == ["src", "main.rs"]
+                //
+                // For absolute paths (Cargo permits them) strip the project root
+                // first so that `/abs/path/to/project/src/main.rs` is treated
+                // the same as the relative `src/main.rs`.
+                let path = Path::new(p);
+                if path.is_absolute() {
+                    match path.strip_prefix(project_root) {
+                        Ok(rel) => {
+                            let rel_str = rel.to_string_lossy();
+                            normalize_manifest_path(rel_str.as_ref()) == ["src", "main.rs"]
+                        }
+                        Err(_) => false,
+                    }
+                } else {
+                    normalize_manifest_path(p) == ["src", "main.rs"]
+                }
             })
         });
         if let Some(n) = main_bin
@@ -4140,6 +4154,55 @@ mod tests {
         assert!(
             err.to_string().contains("no binary target"),
             "must error about no binary target; got: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_bin_name_absolute_path_to_src_main_matches_package_name() {
+        // Cargo permits absolute [[bin]] path values.  When the absolute path
+        // points to <project_root>/src/main.rs it must be treated the same as
+        // the relative "src/main.rs" so the package-name bin is chosen.
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/main.rs"), "fn main() {}").unwrap();
+
+        let abs_path = root.join("src/main.rs");
+        let abs_str = abs_path.to_string_lossy();
+        // Escape backslashes for TOML (matters on Windows paths in tests).
+        let toml_path = abs_str.replace('\\', "\\\\");
+        let manifest = format!(
+            "[package]\nname=\"my-app\"\nversion=\"0.1.0\"\n\
+             [[bin]]\nname=\"my-app\"\npath=\"{toml_path}\"\n"
+        );
+        let doc: toml::Value = toml::from_str(&manifest).unwrap();
+        let result = resolve_bin_name(root, "my-app", None, true, &doc).unwrap();
+        assert_eq!(
+            result, "my-app",
+            "absolute path to src/main.rs must resolve to the package-name bin"
+        );
+    }
+
+    #[test]
+    fn resolve_bin_name_absolute_path_outside_project_root_is_not_main() {
+        // An absolute [[bin]] path that does not live under project_root cannot
+        // be the package's src/main.rs; strip_prefix fails → treated as non-main.
+        // Use autobins=false so the autobins guard doesn't fire and the single-bin
+        // fallback picks up the "external" name directly.
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/main.rs"), "fn main() {}").unwrap();
+
+        // Point the single [[bin]] to an arbitrary absolute path outside root.
+        let manifest = "[package]\nname=\"my-app\"\nversion=\"0.1.0\"\nautobins=false\n\
+             [[bin]]\nname=\"external\"\npath=\"/some/other/location/main.rs\"\n";
+        let doc: toml::Value = toml::from_str(manifest).unwrap();
+        // The single non-main bin must be returned directly.
+        let result = resolve_bin_name(root, "my-app", None, false, &doc).unwrap();
+        assert_eq!(
+            result, "external",
+            "a single non-main absolute-path bin must be returned as-is"
         );
     }
 
