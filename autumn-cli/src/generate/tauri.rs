@@ -244,6 +244,27 @@ fn resolve_dep_key(project_root: &Path, doc: &toml::Value, package_name: &str) -
 
 /// Resolve the Cargo binary target name for the Tauri sidecar.
 ///
+/// Normalize a Cargo manifest path component-by-component, resolving both `.`
+/// (current-dir) and `..` (parent-dir) segments, and accepting both `/` and `\`
+/// as separators.  Returns the logical path segments as a `Vec<&str>`.
+///
+/// This mirrors the normalization Cargo applies when resolving `[[bin]] path =
+/// "…"` entries, so that e.g. `"src/../src/main.rs"` and `"./src/main.rs"` both
+/// produce `["src", "main.rs"]`.
+fn normalize_manifest_path(p: &str) -> Vec<&str> {
+    let mut segs: Vec<&str> = Vec::new();
+    for seg in p.split(['/', '\\']) {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                segs.pop();
+            }
+            s => segs.push(s),
+        }
+    }
+    segs
+}
+
 /// Priority when `[[bin]]` entries are present:
 ///
 ///   1. `[package] default-run` — the developer's explicit selection.
@@ -267,10 +288,11 @@ fn resolve_bin_name(
         }
         let main_bin = bins.iter().find(|b| {
             b.get("path").and_then(|p| p.as_str()).is_some_and(|p| {
-                let segs: Vec<&str> = p
-                    .split(['/', '\\'])
-                    .filter(|&s| !s.is_empty() && s != ".")
-                    .collect();
+                // Fully normalize the path so that variants like `src/../src/main.rs`
+                // or `./src/main.rs` all compare equal to `src/main.rs`.  We process
+                // components into a stack so that `..` properly pops its parent, just
+                // as Cargo does when resolving [[bin]] paths in the manifest.
+                let segs = normalize_manifest_path(p);
                 segs == ["src", "main.rs"]
             })
         });
@@ -778,13 +800,6 @@ fn setup(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {{
         // the force-kill window.  Setting it to 0 lets on_shutdown hooks (including
         // ManagedPostgresPoolProvider::stop()) run immediately after SIGTERM.
         .env("AUTUMN_SERVER__PRESTOP_GRACE_SECS", "0")
-        // Auto-apply pending migrations on every launch so that a freshly
-        // provisioned managed-Postgres cluster (first launch, or after data-dir
-        // wipe) has a fully migrated schema before the first request arrives.
-        // Autumn's default requires `database.auto_migrate_in_production = true`
-        // in autumn.toml; for the desktop bundle we inject it via env so the app's
-        // production autumn.toml stays server-deployment-friendly (default off).
-        .env("AUTUMN_DATABASE__AUTO_MIGRATE_IN_PRODUCTION", "true")
         // Clear one-off mode flags inherited from the calling environment.
         // If any of these are set, AppBuilder::run() enters a non-serving mode
         // (asset fingerprinting, route dump, task execution) and exits before
@@ -793,6 +808,14 @@ fn setup(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {{
         .env("AUTUMN_DUMP_ROUTES", "")
         .env("AUTUMN_LIST_TASKS", "")
         .env("AUTUMN_RUN_TASK", "")
+        // ── Opt-in: auto-migrate managed-Postgres on first launch ──────────────
+        // If this app wires ManagedPostgresPoolProvider (desktop-bundled Postgres),
+        // uncomment the next line so a fresh local cluster is migrated before the
+        // first request arrives.  Leave it commented out when the sidecar connects
+        // to a remote / shared database — enabling it there would run pending
+        // migrations against that shared DB on every desktop client launch.
+        // .env("AUTUMN_DATABASE__AUTO_MIGRATE_IN_PRODUCTION", "true")
+        // ───────────────────────────────────────────────────────────────────────
         .spawn()?;
     *app.state::<SidecarHandle>().0.lock().unwrap() = Some(child);
 
@@ -2139,6 +2162,40 @@ mod tests {
     }
 
     #[test]
+    fn normalize_manifest_path_resolves_dotdot_and_dot() {
+        // Cargo normalizes manifest paths before matching, so `src/../src/main.rs`
+        // is equivalent to `src/main.rs`.  Our helper must do the same so we
+        // don't miss the main_bin match and fall through to the wrong fallback.
+        assert_eq!(
+            normalize_manifest_path("src/../src/main.rs"),
+            vec!["src", "main.rs"],
+            "src/../src/main.rs must normalize to [src, main.rs]"
+        );
+        assert_eq!(
+            normalize_manifest_path("./src/main.rs"),
+            vec!["src", "main.rs"],
+            "./src/main.rs must normalize to [src, main.rs]"
+        );
+        assert_eq!(
+            normalize_manifest_path("src/main.rs"),
+            vec!["src", "main.rs"],
+            "plain src/main.rs must pass through unchanged"
+        );
+        // Windows-style separator.
+        assert_eq!(
+            normalize_manifest_path(r"src\main.rs"),
+            vec!["src", "main.rs"],
+            r"src\main.rs must normalize to [src, main.rs]"
+        );
+        // Multiple consecutive .. resolve correctly.
+        assert_eq!(
+            normalize_manifest_path("a/b/../../src/main.rs"),
+            vec!["src", "main.rs"],
+            "a/b/../../src/main.rs must normalize to [src, main.rs]"
+        );
+    }
+
+    #[test]
     fn plan_respects_autobins_false_ignores_main_rs() {
         // autobins=false disables src/main.rs auto-discovery.  The explicit [[bin]]
         // target must be used even though src/main.rs exists.
@@ -3011,22 +3068,32 @@ mod tests {
     }
 
     #[test]
-    fn lib_rs_auto_migrates_on_desktop_launch() {
+    fn lib_rs_documents_managed_pg_auto_migrate_opt_in() {
         let lib = render_shell_lib_rs("my-app", "my-app");
-        // A fresh managed-Postgres cluster starts with no schema; without
-        // auto-migration the first route that touches a table returns 500.
-        // The prod autumn.toml default is off (server-friendly), so we inject
-        // the override via env for the desktop bundle only.
+        // AUTUMN_DATABASE__AUTO_MIGRATE_IN_PRODUCTION is safe only for desktop
+        // apps that use ManagedPostgresPoolProvider (bundled Postgres).  Emitting
+        // it unconditionally would run pending migrations against any remote /
+        // shared database on every desktop client launch.  The generated shell must
+        // include the env var as a commented-out opt-in with an explanation.
         assert!(
             lib.contains("AUTUMN_DATABASE__AUTO_MIGRATE_IN_PRODUCTION"),
-            "lib.rs must set AUTUMN_DATABASE__AUTO_MIGRATE_IN_PRODUCTION=true so a \
-             fresh managed-Postgres cluster is migrated on first launch; otherwise \
-             routes that touch migrated tables fail with 500 on first desktop launch"
+            "lib.rs must mention AUTUMN_DATABASE__AUTO_MIGRATE_IN_PRODUCTION (as a \
+             commented-out opt-in) so developers wiring ManagedPostgresPoolProvider \
+             know to uncomment it; without it, a fresh cluster is never migrated and \
+             routes fail with 500 on first desktop launch"
         );
+        // Must NOT be emitted as a live .env() call — that would run migrations
+        // against any remote/shared database on every desktop client launch.
+        let live = lib.lines().any(|line| {
+            !line.trim_start().starts_with("//")
+                && line.contains("AUTUMN_DATABASE__AUTO_MIGRATE_IN_PRODUCTION")
+        });
         assert!(
-            lib.contains("\"AUTUMN_DATABASE__AUTO_MIGRATE_IN_PRODUCTION\", \"true\""),
-            "AUTUMN_DATABASE__AUTO_MIGRATE_IN_PRODUCTION must be set to \"true\"; \
-             an empty string or \"false\" would leave the fresh cluster unmigrated"
+            !live,
+            "AUTUMN_DATABASE__AUTO_MIGRATE_IN_PRODUCTION must be commented out in \
+             lib.rs, not emitted as a live .env() call; enabling it unconditionally \
+             would run pending migrations against any remote/shared database on every \
+             desktop client launch, overriding the user's prod-config default-off"
         );
     }
 
