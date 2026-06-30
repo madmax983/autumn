@@ -1,0 +1,14 @@
+[advisories]
+ignore = [
+    # Cannot fix due to aws-smithy-http-client depending on older rustls version which pins older rustls-webpki.
+    # We bumped aws-sdk-s3 to 1.137.0 but the underlying smithy client didn't bump the rustls requirement enough.
+    "RUSTSEC-2026-0098",
+    "RUSTSEC-2026-0104",
+    "RUSTSEC-2026-0099",
+    # rsa Marvin Attack. No fix available, and jsonwebtoken update causes dependency conflicts.
+    "RUSTSEC-2023-0071",
+    # unmaintained proc-macro-error2. Updating validator causes conflicts.
+    "RUSTSEC-2026-0173",
+    # diesel-async padding bytes. Only affects mysql, we use postgres. Bumping causes breaking changes.
+    "RUSTSEC-2026-0138"
+]
