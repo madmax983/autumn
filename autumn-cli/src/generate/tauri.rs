@@ -504,7 +504,8 @@ fn render_tauri_conf(package_name: &str, version: &str, bin_name: &str) -> Strin
       "configs/autumn-dev.toml": "autumn-dev.toml",
       "configs/autumn-development.toml": "autumn-development.toml",
       "configs/autumn-staging.toml": "autumn-staging.toml",
-      "configs/autumn-test.toml": "autumn-test.toml"
+      "configs/autumn-test.toml": "autumn-test.toml",
+      "configs/credentials": "config/credentials"
     }}
   }},
   "app": {{
@@ -767,6 +768,14 @@ fn setup(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {{
             "AUTUMN_MANIFEST_DIR",
             resource_dir.to_string_lossy().as_ref(),
         )
+        // Encrypted credentials (config/credentials/<profile>.toml.enc) are bundled
+        // into resource_dir/config/credentials/ by the staging script.  Autumn loads
+        // them automatically when AUTUMN_MANIFEST_DIR is set.  If the app reads
+        // secrets via `config.credentials()`, set AUTUMN_MASTER_KEY to the hex
+        // master key at launch time (e.g. via Tauri's deep-link or an OS keychain
+        // integration) so the bundled .toml.enc files can be decrypted.  Leaving it
+        // unset is safe for apps that don't use the credentials store: autumn returns
+        // an empty CredentialsStore when no .toml.enc file is found.
         // Clear any inherited Unix-socket config so the sidecar always binds
         // TCP on the loopback address the probe polls.  Without this, an
         // inherited AUTUMN_SERVER__UNIX_SOCKET or AUTUMN_SERVE_FORCE_UNIX_SOCKET
@@ -1089,6 +1098,17 @@ for f in autumn-staging.toml autumn-test.toml; do
         : > "src-tauri/configs/$f"
     fi
 done
+# Stage encrypted credentials so apps using `config.credentials()` find them at
+# AUTUMN_MANIFEST_DIR/config/credentials/<profile>.toml.enc in the installed bundle.
+# The staging directory is always created so the tauri.conf.json resource entry
+# is satisfiable at bundle time (an empty dir is a no-op for apps with no credentials).
+# Note: decryption at runtime requires the AUTUMN_MASTER_KEY env var (or the
+# .autumn-master-key key file placed in the resource dir).  See the Tauri section
+# of the Autumn docs for recommended key distribution strategies.
+mkdir -p src-tauri/configs/credentials
+if [ -d "config/credentials" ]; then
+    cp -r config/credentials/. src-tauri/configs/credentials/
+fi
 "#
     )
 }
@@ -1193,6 +1213,17 @@ foreach ($f in @("autumn-staging.toml", "autumn-test.toml")) {{
     }} else {{
         New-Item -ItemType File -Force -Path "src-tauri\configs\$f" | Out-Null
     }}
+}}
+# Stage encrypted credentials so apps using `config.credentials()` find them at
+# AUTUMN_MANIFEST_DIR\config\credentials\<profile>.toml.enc in the installed bundle.
+# The staging directory is always created so the tauri.conf.json resource entry
+# is satisfiable at bundle time (an empty dir is a no-op for apps with no credentials).
+# Note: decryption at runtime requires the AUTUMN_MASTER_KEY env var (or the
+# .autumn-master-key key file placed in the resource dir).  See the Tauri section
+# of the Autumn docs for recommended key distribution strategies.
+New-Item -ItemType Directory -Force -Path "src-tauri\configs\credentials" | Out-Null
+if (Test-Path "config\credentials") {{
+    Copy-Item -Recurse -Force "config\credentials\*" "src-tauri\configs\credentials\"
 }}
 "#
     )
@@ -3335,6 +3366,60 @@ mod tests {
         assert!(
             has_development,
             "tauri.conf.json must include configs/autumn-development.toml (dev alias)"
+        );
+    }
+
+    #[test]
+    fn tauri_conf_bundles_credentials_directory_as_resource() {
+        let conf = render_tauri_conf("my-app", "0.1.0", "my-app");
+        let parsed: serde_json::Value = serde_json::from_str(&conf).unwrap();
+        let resources = parsed["bundle"]["resources"]
+            .as_object()
+            .expect("bundle.resources must be a map");
+        // The staging script always creates src-tauri/configs/credentials/ (possibly
+        // empty), and the resource entry maps it to config/credentials/ in the bundle
+        // so AutumnConfig can find .toml.enc files at AUTUMN_MANIFEST_DIR/config/credentials/.
+        let has_credentials = resources.iter().any(|(k, v)| {
+            k.contains("credentials") || v.as_str().is_some_and(|s| s.contains("credentials"))
+        });
+        assert!(
+            has_credentials,
+            "tauri.conf.json must bundle configs/credentials as a resource so apps \
+             using config.credentials() find their .toml.enc files in the installed \
+             bundle at AUTUMN_MANIFEST_DIR/config/credentials/<profile>.toml.enc"
+        );
+    }
+
+    #[test]
+    fn staging_sh_stages_credentials_directory() {
+        let sh = render_stage_sidecar_sh("my-app", "my-app", true, "autumn-web");
+        assert!(
+            sh.contains("credentials"),
+            "stage-sidecar.sh must create src-tauri/configs/credentials/ and copy \
+             config/credentials/ into it so the tauri.conf.json resource entry is \
+             satisfiable and .toml.enc files are bundled for installed apps"
+        );
+        assert!(
+            sh.contains("mkdir") && sh.contains("configs/credentials"),
+            "stage-sidecar.sh must always create src-tauri/configs/credentials/ \
+             (even when empty) so the tauri.conf.json resource entry never causes \
+             a GlobPathNotFound/missing-source error at bundle time"
+        );
+        assert!(
+            sh.contains("AUTUMN_MASTER_KEY"),
+            "stage-sidecar.sh must mention AUTUMN_MASTER_KEY so developers know how \
+             to provide the decryption key for bundled .toml.enc credential files"
+        );
+    }
+
+    #[test]
+    fn lib_rs_documents_autumn_master_key() {
+        let lib = render_shell_lib_rs("my-app", "my-app");
+        assert!(
+            lib.contains("AUTUMN_MASTER_KEY"),
+            "lib.rs must mention AUTUMN_MASTER_KEY so developers wiring \
+             config.credentials() know how to pass the decryption key to the sidecar \
+             at desktop launch time"
         );
     }
 
