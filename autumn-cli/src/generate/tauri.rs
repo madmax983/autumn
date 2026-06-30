@@ -671,6 +671,17 @@ fn setup(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {{
     // Postgres cluster (#1119) in db/.  Create proactively; the sidecar won't if absent.
     let app_data_dir = data_root.join("db");
     std::fs::create_dir_all(&app_data_dir)?;
+    // Local blob storage in blobs/.  Create before the sidecar spawns so we can
+    // restrict the directory to owner-only — LocalBlobStore::new/put use
+    // create_dir_all/write which inherit the process umask (typically 0755/0644),
+    // leaving private uploads readable by other local accounts on multi-user systems.
+    let blobs_dir = data_root.join("blobs");
+    std::fs::create_dir_all(&blobs_dir)?;
+    #[cfg(unix)]
+    {{
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&blobs_dir, std::fs::Permissions::from_mode(0o700))?;
+    }}
     // Per-install signing secret: autumn requires one in prod mode.  Generate 32
     // random bytes on first launch and persist them so tokens survive restarts.
     let signing_secret = load_or_generate_signing_secret(&data_root)?;
@@ -2785,6 +2796,27 @@ mod tests {
             lib.contains("data_root") && lib.contains("join(\"blobs\")"),
             "AUTUMN_STORAGE__LOCAL__ROOT must point to a writable subdirectory of \
              app_data_dir (e.g. data_root.join(\"blobs\")), not the read-only resource_dir"
+        );
+    }
+
+    #[test]
+    fn lib_rs_restricts_blob_storage_dir_permissions() {
+        let lib = render_shell_lib_rs("my-app", "my-app");
+        // The blobs/ directory must be created explicitly before the sidecar spawns
+        // so we can apply 0700 on Unix — LocalBlobStore uses create_dir_all which
+        // inherits the process umask (typically 0755), leaving files 0644 and readable
+        // by other local accounts.
+        assert!(
+            lib.contains("blobs_dir") && lib.contains("create_dir_all"),
+            "lib.rs must create the blobs/ directory explicitly (not rely on \
+             LocalBlobStore::new) so permissions can be restricted before any \
+             data is written"
+        );
+        assert!(
+            lib.contains("set_permissions") && lib.contains("0o700"),
+            "lib.rs must restrict the blobs/ directory to 0700 on Unix; otherwise \
+             LocalBlobStore creates it with the process umask (typically 0755) and \
+             other local accounts can read private uploads from disk"
         );
     }
 
