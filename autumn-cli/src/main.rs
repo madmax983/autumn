@@ -108,7 +108,7 @@ enum Commands {
         /// Package to build (for workspaces)
         #[arg(short, long)]
         package: Option<String>,
-        /// Binary target to build (for packages with multiple [[bin]] targets)
+        /// Binary target to build (for packages with multiple \[\[bin\]\] targets)
         #[arg(long)]
         bin: Option<String>,
         /// Embed static assets + i18n locales into the binary for a true
