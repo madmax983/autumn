@@ -665,7 +665,7 @@ fn render_shell_lib_rs(package_name: &str, bin_name: &str) -> String {
 
 use std::net::TcpListener;
 use tauri::{{Manager, App}};
-use tauri_plugin_shell::{{ShellExt, process::CommandChild}};
+use tauri_plugin_shell::{{ShellExt, process::{{CommandChild, CommandEvent}}}};
 
 struct SidecarHandle(std::sync::Mutex<Option<CommandChild>>);
 
@@ -767,7 +767,7 @@ fn setup(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {{
 
     // 3. Spawn the autumn server sidecar (built with autumn-web/embed-assets + managed-pg-bundled).
     //    The sidecar() argument is the binary basename matching externalBin in tauri.conf.json.
-    let (_rx, child) = app
+    let (mut rx, child) = app
         .shell()
         .sidecar("{bin_name}")?
         // Working directory = resource dir so autumn.toml is found via CWD fallback.
@@ -900,6 +900,29 @@ fn setup(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {{
         // A first-launch managed-Postgres cluster must initialise (pg_ctl init) and then
         // run migrations before serving HTTP; on slow disks this can take several minutes.
         for _ in 0..1500 {{
+            // Fail fast: if the sidecar has already terminated (bad bundled config,
+            // migration panic, missing runtime dependency, …) there is no point
+            // waiting the full 300 s for a TCP connection that will never arrive.
+            while let Ok(event) = rx.try_recv() {{
+                if let CommandEvent::Terminated(p) = event {{
+                    eprintln!(
+                        "[{package_name}] Sidecar exited before becoming ready \
+                         (code={{:?}}, signal={{:?}}) — aborting.",
+                        p.code, p.signal
+                    );
+                    if let Some(mut c) = handle
+                        .state::<SidecarHandle>()
+                        .0
+                        .lock()
+                        .unwrap()
+                        .take()
+                    {{
+                        let _ = c.kill();
+                    }}
+                    handle.exit(1);
+                    return;
+                }}
+            }}
             if let Ok(mut stream) =
                 std::net::TcpStream::connect_timeout(&addr, poll_timeout)
             {{
@@ -3630,6 +3653,23 @@ mod tests {
             lib.contains("\"AUTUMN_SESSION__SECURE\", \"false\""),
             "AUTUMN_SESSION__SECURE must be set to \"false\"; the sidecar is \
              loopback-only so Secure cookies add no security but break functionality"
+        );
+    }
+
+    #[test]
+    fn lib_rs_aborts_readiness_poll_on_sidecar_terminated_event() {
+        let lib = render_shell_lib_rs("my-app", "my-app");
+        assert!(
+            lib.contains("CommandEvent::Terminated"),
+            "readiness poll must check for early sidecar termination via CommandEvent::Terminated"
+        );
+        assert!(
+            lib.contains("try_recv"),
+            "readiness poll must drain the event receiver with try_recv() each iteration"
+        );
+        assert!(
+            lib.contains("CommandEvent"),
+            "CommandEvent must be imported so Terminated variant is in scope"
         );
     }
 
