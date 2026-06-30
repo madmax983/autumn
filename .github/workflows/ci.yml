@@ -101,6 +101,8 @@ jobs:
             --test repository_shard_replica_routing -- --ignored
           cargo llvm-cov --no-report -p autumn-web --all-features \
             --test feature_flags_pg_integration -- --ignored
+          cargo llvm-cov --no-report -p autumn-web --all-features \
+            --test scoped_tokens_db -- --ignored
           cargo llvm-cov report --lcov --output-path lcov.info
       - name: Upload to Codecov
         uses: codecov/codecov-action@v6
