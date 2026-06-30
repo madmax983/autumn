@@ -384,6 +384,22 @@ fn render(markup: maud::Markup) -> Response {
     Html(markup.into_string()).into_response()
 }
 
+/// Extract the value of the `__autumn_reveal` cookie from request headers.
+fn extract_reveal_cookie(headers: &axum::http::HeaderMap) -> Option<String> {
+    let cookie_str = headers
+        .get(axum::http::header::COOKIE)?
+        .to_str()
+        .ok()?;
+    cookie_str
+        .split(';')
+        .find_map(|part| {
+            part.trim()
+                .strip_prefix("__autumn_reveal=")
+                .filter(|v| !v.is_empty())
+                .map(str::to_owned)
+        })
+}
+
 // ── Handlers ────────────────────────────────────────────────────────
 
 /// `GET /admin` — Dashboard with model counts.
@@ -642,15 +658,11 @@ async fn model_new_form(
 }
 
 /// `POST /admin/{slug}` — Create a record.
-#[allow(clippy::too_many_arguments)]
 async fn model_create(
     State(state): State<AppState>,
     axum::Extension(registry): axum::Extension<Arc<AdminRegistry>>,
     axum::Extension(AdminPrefix(prefix)): axum::Extension<AdminPrefix>,
-    axum::Extension(ActuatorPrefix(actuator_prefix)): axum::Extension<ActuatorPrefix>,
-    axum::Extension(HasRuntimeConfig(show_config)): axum::Extension<HasRuntimeConfig>,
     Path(slug): Path<String>,
-    csrf: AdminCsrf,
     flash: Flash,
     axum::extract::Form(form_data): axum::extract::Form<Value>,
 ) -> AutumnResult<Response> {
@@ -674,38 +686,28 @@ async fn model_create(
     flash
         .success(format!("{} created.", model.display_name()))
         .await;
-    // If the model returned a one-time secret (e.g. a raw API token), render the
-    // detail page inline rather than routing the secret through flash.  Flash::push
-    // stores messages in the Session, and SessionLayer persists dirty sessions to
-    // Redis/the DB — putting a raw bearer token there even briefly is a plaintext
-    // secret-storage violation.  Instead, consume the session flash messages into
-    // an in-memory Vec, append the token message there, and render directly.
+
+    let detail_path = format!("{prefix}/{slug}/{new_id}");
+    let mut response = Redirect::to(&detail_path).into_response();
+
+    // If the model returned a one-time secret (e.g. a raw API token), hand it
+    // off via a short-lived HttpOnly reveal cookie rather than through flash.
+    // Flash::push stores messages in the Session, and SessionLayer persists
+    // dirty sessions to the configured backing store (Redis/DB) — putting a raw
+    // bearer token there even briefly is a plaintext-secret-storage violation.
+    // The reveal cookie is path-scoped to the detail page and expires in 5
+    // minutes; the detail handler reads it exactly once and clears it.
     if let Some(Value::String(secret)) = record.get("token") {
-        let display = model.record_display(&record);
-        let mut messages = flash.consume().await;
-        messages.push(FlashMessage {
-            level: FlashLevel::Info,
-            message: format!("Copy your token now — it will not be shown again: {secret}"),
-        });
-        return Ok(render(templates::model_detail_page(
-            &registry,
-            &slug,
-            model.display_name(),
-            model.display_name_plural(),
-            &fields,
-            &record,
-            &display,
-            new_id,
-            &messages,
-            csrf.token(),
-            csrf.token_header(),
-            &prefix,
-            &actuator_prefix,
-            model.has_history(),
-            show_config,
-        )));
+        let cookie = format!(
+            "__autumn_reveal={secret}; HttpOnly; SameSite=Strict; Path={detail_path}; Max-Age=300"
+        );
+        if let Ok(hv) = axum::http::HeaderValue::from_str(&cookie) {
+            response
+                .headers_mut()
+                .insert(axum::http::header::SET_COOKIE, hv);
+        }
     }
-    Ok(Redirect::to(&format!("{prefix}/{slug}/{new_id}")).into_response())
+    Ok(response)
 }
 
 /// `GET /admin/{slug}/{id}` — Detail view.
@@ -717,6 +719,7 @@ async fn model_detail(
     axum::Extension(ActuatorPrefix(actuator_prefix)): axum::Extension<ActuatorPrefix>,
     axum::Extension(HasRuntimeConfig(show_config)): axum::Extension<HasRuntimeConfig>,
     Path((slug, id)): Path<(String, i64)>,
+    request_headers: axum::http::HeaderMap,
     csrf: AdminCsrf,
     flash: Flash,
 ) -> AutumnResult<Response> {
@@ -732,8 +735,20 @@ async fn model_detail(
 
     let display = model.record_display(&record);
     let fields = model.fields();
-    let messages = flash.consume().await;
-    Ok(render(templates::model_detail_page(
+
+    // Consume the reveal cookie if present (set by model_create for one-time
+    // secrets such as raw API tokens).  The secret is appended to the in-memory
+    // messages slice; it never touches the session store.
+    let reveal_secret = extract_reveal_cookie(&request_headers);
+    let mut messages = flash.consume().await;
+    if let Some(ref secret) = reveal_secret {
+        messages.push(FlashMessage {
+            level: FlashLevel::Info,
+            message: format!("Copy your token now — it will not be shown again: {secret}"),
+        });
+    }
+
+    let mut response = render(templates::model_detail_page(
         &registry,
         &slug,
         model.display_name(),
@@ -749,7 +764,22 @@ async fn model_detail(
         &actuator_prefix,
         model.has_history(),
         show_config,
-    )))
+    ))
+    .into_response();
+
+    // Clear the reveal cookie so a page refresh does not show the token again.
+    if reveal_secret.is_some() {
+        let clear = format!(
+            "__autumn_reveal=; HttpOnly; SameSite=Strict; Path={prefix}/{slug}/{id}; Max-Age=0"
+        );
+        if let Ok(hv) = axum::http::HeaderValue::from_str(&clear) {
+            response
+                .headers_mut()
+                .insert(axum::http::header::SET_COOKIE, hv);
+        }
+    }
+
+    Ok(response)
 }
 
 /// `GET /admin/{slug}/{id}/history` - Version history pane.

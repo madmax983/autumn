@@ -1689,7 +1689,8 @@ pub fn hash_api_token(raw: &str) -> String {
 /// Generate a 256-bit random raw API token as a lowercase hex string.
 ///
 /// Uses two UUID v4 values (128 bits each) concatenated for a 64-char result.
-fn generate_raw_token() -> String {
+#[must_use]
+pub fn generate_raw_token() -> String {
     let u1 = uuid::Uuid::new_v4();
     let u2 = uuid::Uuid::new_v4();
     format!("{}{}", u1.simple(), u2.simple())

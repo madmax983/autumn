@@ -5,9 +5,7 @@
 //! at creation and is never stored or re-displayed; listing exposes only
 //! non-secret metadata (name, principal, scopes, expiry, last-used, revoked).
 
-use autumn_web::auth::{
-    ApiTokenStore, DbApiTokenStore, IssueTokenSpec, hash_api_token, scopes_from_json,
-};
+use autumn_web::auth::{generate_raw_token, hash_api_token, scopes_from_json};
 use chrono::{DateTime, NaiveDateTime, Utc};
 use serde_json::Value;
 
@@ -183,7 +181,6 @@ impl AdminModel for TokenAdminModel {
         pool: &diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>,
         data: Value,
     ) -> AdminFuture<'_, Value> {
-        use diesel::OptionalExtension as _;
         use diesel_async::RunQueryDsl;
 
         let pool = pool.clone();
@@ -197,37 +194,41 @@ impl AdminModel for TokenAdminModel {
             let scopes = parse_scopes(data.get("scopes"))?;
             let expires_at = parse_expires_at(data.get("expires_at"))?;
 
-            // Reuse the production store so hashing/randomness match runtime.
-            let store = DbApiTokenStore::new(pool.clone());
-            let raw = store
-                .issue_scoped(IssueTokenSpec {
-                    principal_id,
-                    name,
-                    scopes: &scopes,
-                    expires_at,
-                })
-                .await
-                .map_err(|e| AdminError::Database(e.to_string()))?;
-
-            // Re-read the freshly inserted row by hash to surface its id/metadata,
-            // then attach the raw token so the UI can show it exactly once.
+            let raw = generate_raw_token();
             let hash = hash_api_token(&raw);
+            let scopes_json = serde_json::Value::Array(
+                scopes
+                    .iter()
+                    .map(|s| serde_json::Value::String(s.clone()))
+                    .collect(),
+            )
+            .to_string();
+            let expires_at_naive = expires_at.map(|dt| dt.naive_utc());
+
             let mut conn = pool
                 .get()
                 .await
                 .map_err(|e| AdminError::Database(e.to_string()))?;
-            let row: Option<TokenRow> = diesel::sql_query(
-                "SELECT id, name, principal_id, scopes::text AS scopes, created_at, \
-                        expires_at, last_used_at, revoked_at \
-                 FROM api_tokens WHERE token_hash = $1",
+            // Atomic INSERT RETURNING: the row's server-assigned columns (id,
+            // created_at, …) come back in the same round-trip as the INSERT so
+            // there is no window in which the token exists in the DB but its
+            // metadata has not been returned to the caller.
+            let row: TokenRow = diesel::sql_query(
+                "INSERT INTO api_tokens (token_hash, principal_id, name, scopes, expires_at) \
+                 VALUES ($1, $2, $3, $4::jsonb, $5) \
+                 RETURNING id, name, principal_id, scopes::text AS scopes, \
+                           created_at, expires_at, last_used_at, revoked_at",
             )
             .bind::<diesel::sql_types::Text, _>(&hash)
+            .bind::<diesel::sql_types::Text, _>(principal_id)
+            .bind::<diesel::sql_types::Text, _>(name)
+            .bind::<diesel::sql_types::Text, _>(&scopes_json)
+            .bind::<diesel::sql_types::Nullable<diesel::sql_types::Timestamp>, _>(expires_at_naive)
             .get_result::<TokenRow>(&mut conn)
             .await
-            .optional()
             .map_err(|e| AdminError::Database(e.to_string()))?;
 
-            let mut json = row.map_or_else(|| serde_json::json!({}), TokenRow::into_json);
+            let mut json = row.into_json();
             if let Value::Object(map) = &mut json {
                 map.insert("token".to_owned(), Value::String(raw));
             }
