@@ -87,7 +87,7 @@ fn build_embedded(
     // Resolve the selected package's directory so `-p <pkg>` fingerprints that
     // package's `static/` (which `embed_static!` reads via $CARGO_MANIFEST_DIR),
     // not whatever `static/` happens to sit next to the CLI's cwd.
-    let (_, manifest_dir) = find_binary(debug, package, bin);
+    let (_, manifest_dir, _) = find_binary(debug, package, bin);
     let static_dir = manifest_dir
         .unwrap_or_else(|| std::env::current_dir().expect("current dir"))
         .join("static");
@@ -135,7 +135,7 @@ pub fn run(
     // Resolve the selected package's directory before fingerprinting so that
     // when --bin selects a member of a workspace without -p, we fingerprint
     // that member's static/ tree rather than the workspace root's.
-    let (binary, manifest_dir) = find_binary(debug, package, bin);
+    let (binary, manifest_dir, resolved_pkg) = find_binary(debug, package, bin);
 
     // Release builds fingerprint *after* the compile (the runtime reads the
     // manifest from disk, so order doesn't matter, and the static renderer below
@@ -161,7 +161,11 @@ pub fn run(
     // redirect the static renderer to the wrong database; re-set it only when a
     // live cluster is discovered.
     cmd.env_remove(crate::serve::MANAGED_PG_ATTACH_URL_ENV);
-    if let Some(pg) = crate::serve::managed_pg_env(package) {
+    // When --bin selects a member without -p, use the resolved package name for
+    // managed-PG namespacing so the static renderer shares the member's cluster
+    // rather than the workspace root's.
+    let effective_pkg = package.or_else(|| bin.and(resolved_pkg.as_deref()));
+    if let Some(pg) = crate::serve::managed_pg_env(effective_pkg) {
         cmd.env(crate::serve::MANAGED_PG_DATA_DIR_ENV, &pg.data_dir);
         if let Some(url) = pg.attach_url {
             cmd.env(crate::serve::MANAGED_PG_ATTACH_URL_ENV, url);
@@ -391,7 +395,7 @@ fn find_binary(
     debug: bool,
     package: Option<&str>,
     bin: Option<&str>,
-) -> (PathBuf, Option<PathBuf>) {
+) -> (PathBuf, Option<PathBuf>, Option<String>) {
     let output = Command::new("cargo")
         .args(["metadata", "--format-version=1", "--no-deps"])
         .output()
@@ -430,7 +434,7 @@ fn resolve_binary_from_metadata(
     package: Option<&str>,
     bin: Option<&str>,
     cwd: &Path,
-) -> Result<(PathBuf, Option<PathBuf>), String> {
+) -> Result<(PathBuf, Option<PathBuf>, Option<String>), String> {
     let target_dir = metadata["target_directory"]
         .as_str()
         .ok_or("target_directory missing from cargo metadata")?;
@@ -478,7 +482,7 @@ fn resolve_binary_from_metadata(
         }
     }
 
-    let (bin_name, manifest_dir) = matching_packages
+    let (bin_name, manifest_dir, resolved_pkg_name) = matching_packages
         .iter()
         .find_map(|pkg| {
             // --bin wins when the caller already knows which target to run.
@@ -509,7 +513,8 @@ fn resolve_binary_from_metadata(
             let dir = pkg["manifest_path"]
                 .as_str()
                 .and_then(|p| Path::new(p).parent().map(PathBuf::from));
-            Some((name, dir))
+            let pkg_name = pkg["name"].as_str().map(ToOwned::to_owned);
+            Some((name, dir, pkg_name))
         })
         .ok_or_else(|| {
             bin.map_or_else(
@@ -539,7 +544,7 @@ fn resolve_binary_from_metadata(
         path.set_extension("exe");
     }
 
-    Ok((path, manifest_dir))
+    Ok((path, manifest_dir, resolved_pkg_name))
 }
 
 #[cfg(test)]
@@ -653,7 +658,7 @@ mod tests {
     #[test]
     fn resolve_binary_by_package_name() {
         let metadata = sample_metadata("/tmp/target", "hello", "/projects/hello");
-        let (bin, manifest_dir) = resolve_binary_from_metadata(
+        let (bin, manifest_dir, _) = resolve_binary_from_metadata(
             &metadata,
             true,
             Some("hello"),
@@ -668,7 +673,7 @@ mod tests {
     #[test]
     fn resolve_binary_by_cwd() {
         let metadata = sample_metadata("/tmp/target", "hello", "/projects/hello");
-        let (bin, manifest_dir) =
+        let (bin, manifest_dir, _) =
             resolve_binary_from_metadata(&metadata, true, None, None, Path::new("/projects/hello"))
                 .unwrap();
         assert_eq!(bin, expected_binary("/tmp/target/debug/hello"));
@@ -678,7 +683,7 @@ mod tests {
     #[test]
     fn resolve_binary_uses_release_profile() {
         let metadata = sample_metadata("/tmp/target", "hello", "/projects/hello");
-        let (bin, _) = resolve_binary_from_metadata(
+        let (bin, _, _) = resolve_binary_from_metadata(
             &metadata,
             false,
             Some("hello"),
@@ -737,7 +742,7 @@ mod tests {
                 ]
             }]
         });
-        let (bin, _) = resolve_binary_from_metadata(
+        let (bin, _, _) = resolve_binary_from_metadata(
             &metadata,
             true,
             Some("todo-app"),
@@ -763,7 +768,7 @@ mod tests {
                 ]
             }]
         });
-        let (bin, _) = resolve_binary_from_metadata(
+        let (bin, _, _) = resolve_binary_from_metadata(
             &metadata,
             true,
             Some("todo-app"),
@@ -794,7 +799,7 @@ mod tests {
             ]
         });
         // Both members are under the CWD (/workspace); --bin web belongs to app-b.
-        let (bin, manifest_dir) = resolve_binary_from_metadata(
+        let (bin, manifest_dir, _) = resolve_binary_from_metadata(
             &metadata,
             true,
             None,
@@ -883,7 +888,7 @@ mod tests {
             }]
         });
         // Simulates: `autumn build -p reddit-clone` from workspace root
-        let (bin, manifest_dir) = resolve_binary_from_metadata(
+        let (bin, manifest_dir, _) = resolve_binary_from_metadata(
             &metadata,
             false,
             Some("reddit-clone"),
@@ -898,6 +903,43 @@ mod tests {
         assert_eq!(
             manifest_dir,
             Some(PathBuf::from("/workspace/examples/reddit-clone"))
+        );
+    }
+
+    #[test]
+    fn resolve_binary_returns_pkg_name_for_bin_without_package() {
+        // When --bin selects a workspace member without -p, the resolved package name
+        // must be returned so managed_pg_env can namespace to the member rather than
+        // the workspace root's CWD-derived identity.
+        let metadata = serde_json::json!({
+            "target_directory": "/workspace/target",
+            "packages": [
+                {
+                    "name": "api",
+                    "manifest_path": "/workspace/api/Cargo.toml",
+                    "targets": [{ "name": "api-server", "kind": ["bin"], "src_path": "/workspace/api/src/main.rs" }]
+                },
+                {
+                    "name": "web",
+                    "manifest_path": "/workspace/web/Cargo.toml",
+                    "targets": [{ "name": "web-server", "kind": ["bin"], "src_path": "/workspace/web/src/main.rs" }]
+                }
+            ]
+        });
+        let (bin, manifest_dir, resolved_pkg) = resolve_binary_from_metadata(
+            &metadata,
+            false,
+            None,
+            Some("api-server"),
+            Path::new("/workspace"),
+        )
+        .unwrap();
+        assert_eq!(bin, expected_binary("/workspace/target/release/api-server"));
+        assert_eq!(manifest_dir, Some(PathBuf::from("/workspace/api")));
+        assert_eq!(
+            resolved_pkg,
+            Some("api".to_owned()),
+            "--bin without -p must return the resolved package name for managed-PG namespacing"
         );
     }
 
