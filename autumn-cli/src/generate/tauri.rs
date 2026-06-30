@@ -772,6 +772,13 @@ fn setup(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {{
         // the force-kill window.  Setting it to 0 lets on_shutdown hooks (including
         // ManagedPostgresPoolProvider::stop()) run immediately after SIGTERM.
         .env("AUTUMN_SERVER__PRESTOP_GRACE_SECS", "0")
+        // Auto-apply pending migrations on every launch so that a freshly
+        // provisioned managed-Postgres cluster (first launch, or after data-dir
+        // wipe) has a fully migrated schema before the first request arrives.
+        // Autumn's default requires `database.auto_migrate_in_production = true`
+        // in autumn.toml; for the desktop bundle we inject it via env so the app's
+        // production autumn.toml stays server-deployment-friendly (default off).
+        .env("AUTUMN_DATABASE__AUTO_MIGRATE_IN_PRODUCTION", "true")
         // Clear one-off mode flags inherited from the calling environment.
         // If any of these are set, AppBuilder::run() enters a non-serving mode
         // (asset fingerprinting, route dump, task execution) and exits before
@@ -884,6 +891,22 @@ fn load_or_generate_signing_secret(
     if let Ok(s) = std::fs::read_to_string(&path) {{
         let s = s.trim().to_owned();
         if s.len() >= 32 {{
+            // Harden permissions on an existing file in case it was created by
+            // an older generated shell (0644) or manually without a mode flag.
+            // Failure is non-fatal: log and continue with the existing secret.
+            #[cfg(unix)]
+            {{
+                use std::os::unix::fs::PermissionsExt;
+                if let Err(e) = std::fs::set_permissions(
+                    &path,
+                    std::fs::Permissions::from_mode(0o600),
+                ) {{
+                    eprintln!(
+                        "[{package_name}] warning: could not restrict signing_secret.txt \
+                         permissions: {{e}}"
+                    );
+                }}
+            }}
             return Ok(s);
         }}
     }}
@@ -2893,6 +2916,48 @@ mod tests {
             lib.contains("signing_secret"),
             "AUTUMN_SECURITY__SIGNING_SECRET must be sourced from the signing_secret local \
              variable returned by load_or_generate_signing_secret"
+        );
+    }
+
+    #[test]
+    fn lib_rs_hardens_existing_signing_secret_permissions() {
+        let lib = render_shell_lib_rs("my-app", "my-app");
+        // If the file already exists (early-return path), we must still chmod it
+        // to 0600 on Unix — an existing file created by an older generated shell
+        // (0644) or manually stays world-readable otherwise.
+        assert!(
+            lib.contains("from_mode(0o600)"),
+            "load_or_generate_signing_secret must call set_permissions(0o600) on \
+             an existing signing_secret.txt before returning it; a file created by \
+             an older shell at 0644 would expose the JWT key to other local accounts"
+        );
+        // The chmod must appear BEFORE the early return, not only in the create path.
+        let chmod_pos = lib.find("from_mode(0o600)").unwrap_or(usize::MAX);
+        let early_return_pos = lib.find("return Ok(s)").unwrap_or(usize::MAX);
+        assert!(
+            chmod_pos < early_return_pos,
+            "set_permissions(0o600) must appear before `return Ok(s)` so the existing \
+             file is hardened on every read, not just on creation"
+        );
+    }
+
+    #[test]
+    fn lib_rs_auto_migrates_on_desktop_launch() {
+        let lib = render_shell_lib_rs("my-app", "my-app");
+        // A fresh managed-Postgres cluster starts with no schema; without
+        // auto-migration the first route that touches a table returns 500.
+        // The prod autumn.toml default is off (server-friendly), so we inject
+        // the override via env for the desktop bundle only.
+        assert!(
+            lib.contains("AUTUMN_DATABASE__AUTO_MIGRATE_IN_PRODUCTION"),
+            "lib.rs must set AUTUMN_DATABASE__AUTO_MIGRATE_IN_PRODUCTION=true so a \
+             fresh managed-Postgres cluster is migrated on first launch; otherwise \
+             routes that touch migrated tables fail with 500 on first desktop launch"
+        );
+        assert!(
+            lib.contains("\"AUTUMN_DATABASE__AUTO_MIGRATE_IN_PRODUCTION\", \"true\""),
+            "AUTUMN_DATABASE__AUTO_MIGRATE_IN_PRODUCTION must be set to \"true\"; \
+             an empty string or \"false\" would leave the fresh cluster unmigrated"
         );
     }
 
