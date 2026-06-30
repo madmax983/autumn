@@ -567,8 +567,8 @@ fn render_tauri_conf(package_name: &str, version: &str, bin_name: &str) -> Strin
 fn render_tauri_linux_conf() -> String {
     r#"{
   "build": {
-    "beforeBuildCommand": "bash stage-sidecar.sh",
-    "beforeDevCommand": { "script": "bash stage-sidecar.sh", "wait": true }
+    "beforeBuildCommand": "bash src-tauri/stage-sidecar.sh",
+    "beforeDevCommand": { "script": "bash src-tauri/stage-sidecar.sh", "wait": true }
   }
 }
 "#
@@ -578,8 +578,8 @@ fn render_tauri_linux_conf() -> String {
 fn render_tauri_macos_conf() -> String {
     r#"{
   "build": {
-    "beforeBuildCommand": "bash stage-sidecar.sh",
-    "beforeDevCommand": { "script": "bash stage-sidecar.sh", "wait": true }
+    "beforeBuildCommand": "bash src-tauri/stage-sidecar.sh",
+    "beforeDevCommand": { "script": "bash src-tauri/stage-sidecar.sh", "wait": true }
   }
 }
 "#
@@ -589,8 +589,8 @@ fn render_tauri_macos_conf() -> String {
 fn render_tauri_windows_conf() -> String {
     r#"{
   "build": {
-    "beforeBuildCommand": "powershell -ExecutionPolicy Bypass -File stage-sidecar.ps1",
-    "beforeDevCommand": { "script": "powershell -ExecutionPolicy Bypass -File stage-sidecar.ps1", "wait": true }
+    "beforeBuildCommand": "powershell -ExecutionPolicy Bypass -File src-tauri\\stage-sidecar.ps1",
+    "beforeDevCommand": { "script": "powershell -ExecutionPolicy Bypass -File src-tauri\\stage-sidecar.ps1", "wait": true }
   }
 }
 "#
@@ -615,7 +615,7 @@ tauri-build = {{ version = "2", features = [] }}
 [dependencies]
 tauri = {{ version = "2", features = [] }}
 tauri-plugin-shell = "2"
-getrandom = "0.2"
+getrandom = {{ version = "0.2", features = ["std"] }}
 
 [profile.release]
 panic = "abort"
@@ -903,23 +903,36 @@ fn setup(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {{
             // migration panic, missing runtime dependency, …) there is no point
             // waiting the full 300 s for a TCP connection that will never arrive.
             while let Ok(event) = rx.try_recv() {{
-                if let CommandEvent::Terminated(p) = event {{
-                    eprintln!(
-                        "[{package_name}] Sidecar exited before becoming ready \
-                         (code={{:?}}, signal={{:?}}) — aborting.",
-                        p.code, p.signal
-                    );
-                    if let Some(mut c) = handle
-                        .state::<SidecarHandle>()
-                        .0
-                        .lock()
-                        .unwrap()
-                        .take()
-                    {{
-                        let _ = c.kill();
+                match event {{
+                    CommandEvent::Stdout(line) => {{
+                        if let Ok(s) = std::str::from_utf8(&line) {{
+                            print!("{{}}", s);
+                        }}
                     }}
-                    handle.exit(1);
-                    return;
+                    CommandEvent::Stderr(line) => {{
+                        if let Ok(s) = std::str::from_utf8(&line) {{
+                            eprint!("{{}}", s);
+                        }}
+                    }}
+                    CommandEvent::Terminated(p) => {{
+                        eprintln!(
+                            "[{package_name}] Sidecar exited before becoming ready \
+                             (code={{:?}}, signal={{:?}}) — aborting.",
+                            p.code, p.signal
+                        );
+                        if let Some(c) = handle
+                            .state::<SidecarHandle>()
+                            .0
+                            .lock()
+                            .unwrap()
+                            .take()
+                        {{
+                            let _ = c.kill();
+                        }}
+                        handle.exit(1);
+                        return;
+                    }}
+                    _ => {{}}
                 }}
             }}
             if let Ok(mut stream) =
@@ -949,7 +962,7 @@ fn setup(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {{
             // No window has been created yet, so WindowEvent::Destroyed cannot
             // fire.  Kill the sidecar explicitly before exiting so no orphaned
             // server process is left behind.
-            if let Some(mut child) = handle
+            if let Some(child) = handle
                 .state::<SidecarHandle>()
                 .0
                 .lock()
@@ -975,7 +988,7 @@ fn setup(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {{
             eprintln!("[{package_name}] Failed to open window: {{e}}");
             // The window was never created so Destroyed cannot clean up; kill
             // the sidecar here too.
-            if let Some(mut child) = handle
+            if let Some(child) = handle
                 .state::<SidecarHandle>()
                 .0
                 .lock()
