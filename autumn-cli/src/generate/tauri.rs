@@ -363,7 +363,10 @@ fn resolve_bin_name(
             }
         }
     }
-    Ok(name.to_owned())
+    Err(GenerateError::Config(format!(
+        "no binary target found for package `{name}`: add `src/main.rs`, \
+         a `[[bin]]` entry, or `default-run = \"<bin>\"` to Cargo.toml"
+    )))
 }
 
 fn read_package_meta(
@@ -2290,9 +2293,9 @@ mod tests {
     #[test]
     fn plan_respects_autobins_false_ignores_src_bin_dir() {
         // autobins=false means Cargo does NOT auto-discover src/bin/ entries.
-        // The generator must not scan src/bin/ in this case — doing so would
-        // return a name that `cargo build --bin <name>` would reject because Cargo
-        // itself does not register those as targets.
+        // With no explicit [[bin]] the package has no bin target at all, so
+        // plan_tauri must error rather than silently use a package-name binary
+        // that `cargo build --bin` would reject.
         let tmp = TempDir::new().unwrap();
         fs::write(
             tmp.path().join("Cargo.toml"),
@@ -2303,27 +2306,36 @@ mod tests {
         fs::create_dir_all(tmp.path().join("src/bin")).unwrap();
         // src/bin/web.rs exists on disk but autobins=false → NOT a Cargo target.
         fs::write(tmp.path().join("src/bin/web.rs"), "fn main() {}\n").unwrap();
-        // With autobins=false and no explicit [[bin]], cargo metadata returns no
-        // bin targets for this package; plan_tauri must not discover "web" from
-        // src/bin/ and must not include `--bin web` in the staging scripts.
-        let plan = plan_tauri(tmp.path()).unwrap();
-        let sh: &str = plan
-            .actions
-            .iter()
-            .find(|a| a.path().to_string_lossy().ends_with("stage-sidecar.sh"))
-            .and_then(|a| {
-                if let crate::generate::emit::Action::Create { contents, .. } = a {
-                    Some(contents.as_str())
-                } else {
-                    None
-                }
-            })
-            .expect("stage-sidecar.sh action not found");
+        let err = plan_tauri(tmp.path()).unwrap_err().to_string();
         assert!(
-            !sh.contains("--bin web"),
-            "with autobins=false, src/bin/web.rs must NOT be discovered; \
-             Cargo does not register it as a target so `--bin web` would be rejected; \
-             got:\n{sh}"
+            err.contains("no binary target"),
+            "expected 'no binary target' error when autobins=false and no [[bin]]; got: {err}"
+        );
+        assert!(
+            !err.contains("web"),
+            "error must not mention 'web' — src/bin/web.rs is not a Cargo target with autobins=false; got: {err}"
+        );
+    }
+
+    #[test]
+    fn plan_errors_when_package_has_no_bin_target() {
+        // A lib-only package (autobins=false, no [[bin]], no src/main.rs) has no
+        // binary target to use as a sidecar.  plan_tauri must return a clear error
+        // instead of fabricating a package-named binary that `cargo build --bin`
+        // would reject.
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[package]\nname=\"my-lib\"\nversion=\"0.1.0\"\nedition=\"2024\"\nautobins=false\n\
+             \n[lib]\nname=\"my_lib\"\n\n[dependencies]\nautumn-web = \"0.5.0\"\n",
+        )
+        .unwrap();
+        fs::create_dir_all(tmp.path().join("src")).unwrap();
+        fs::write(tmp.path().join("src/lib.rs"), "").unwrap();
+        let err = plan_tauri(tmp.path()).unwrap_err().to_string();
+        assert!(
+            err.contains("no binary target"),
+            "expected a 'no binary target' error for a lib-only package; got: {err}"
         );
     }
 
