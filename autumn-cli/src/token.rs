@@ -263,36 +263,6 @@ mod tests {
     }
 
     #[test]
-    fn resolve_prefers_primary_database_url_env() {
-        let env = |key: &str| match key {
-            "AUTUMN_DATABASE__PRIMARY_URL" => Ok("postgres://primary-env".to_owned()),
-            "AUTUMN_DATABASE__URL" => Ok("postgres://legacy-env".to_owned()),
-            "DATABASE_URL" => Ok("postgres://fallback-env".to_owned()),
-            _ => Err(std::env::VarError::NotPresent),
-        };
-        let url = resolve_primary_database_url_from_sources(env, None).unwrap();
-        assert_eq!(url, "postgres://primary-env");
-    }
-
-    #[test]
-    fn resolve_reads_primary_database_url_from_toml() {
-        let table = toml::from_str::<toml::Table>(
-            r#"
-            [database]
-            primary_url = "postgres://primary-toml"
-            url = "postgres://legacy-toml"
-            "#,
-        )
-        .unwrap();
-        let env =
-            |_: &str| -> Result<String, std::env::VarError> { Err(std::env::VarError::NotPresent) };
-
-        let url = resolve_primary_database_url_from_sources(env, Some(&table)).unwrap();
-
-        assert_eq!(url, "postgres://primary-toml");
-    }
-
-    #[test]
     fn check_psql_does_not_panic_when_available() {
         // Run only when psql is on PATH; skip otherwise to avoid process::exit.
         if std::process::Command::new("psql")

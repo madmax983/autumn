@@ -2482,17 +2482,20 @@ mod db_store {
                 let old_hash = hash_api_token(raw_token);
                 let new_raw = generate_raw_token();
                 let new_hash = hash_api_token(&new_raw);
+                let now = self.clock.now().naive_utc();
                 let mut conn = self.conn().await?;
                 // Atomic CTE: revoke the old token and insert a replacement carrying
                 // the same name/scopes/expiry in a single statement. If the old hash
                 // is unknown or already revoked the UPDATE returns 0 rows, the INSERT
                 // is a no-op, and COUNT(*) returns 0 — the caller sees None.
+                // $3 is the store clock's `now` so the expiry predicate matches the
+                // same instant used by verify_scoped, avoiding clock-skew races.
                 let row: CountRow = diesel::sql_query(
                     "WITH rotated AS ( \
                         UPDATE api_tokens \
-                        SET revoked_at = NOW() AT TIME ZONE 'utc' \
+                        SET revoked_at = $3 \
                         WHERE token_hash = $1 AND revoked_at IS NULL \
-                            AND (expires_at IS NULL OR expires_at > NOW() AT TIME ZONE 'utc') \
+                            AND (expires_at IS NULL OR expires_at > $3) \
                         RETURNING principal_id, name, scopes, expires_at \
                      ), \
                      inserted AS ( \
@@ -2504,6 +2507,7 @@ mod db_store {
                 )
                 .bind::<diesel::sql_types::Text, _>(&old_hash)
                 .bind::<diesel::sql_types::Text, _>(&new_hash)
+                .bind::<diesel::sql_types::Timestamp, _>(now)
                 .get_result(&mut conn)
                 .await
                 .map_err(|e| AutumnError::internal_server_error_msg(e.to_string()))?;
