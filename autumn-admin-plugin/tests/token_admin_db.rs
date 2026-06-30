@@ -7,7 +7,7 @@
 //! **Requires Docker** to be running.
 
 use autumn_admin_plugin::tokens::TokenAdminModel;
-use autumn_admin_plugin::{AdminModel, ListParams};
+use autumn_admin_plugin::{AdminModel, ListParams, SortDirection};
 use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
@@ -137,7 +137,7 @@ async fn token_admin_list_paginates_and_searches() {
                 per_page: 10,
                 search: None,
                 sort_by: None,
-                sort_dir: Default::default(),
+                sort_dir: SortDirection::default(),
                 filters: Vec::new(),
             },
         )
@@ -155,7 +155,7 @@ async fn token_admin_list_paginates_and_searches() {
                 per_page: 10,
                 search: Some("token-1".into()),
                 sort_by: None,
-                sort_dir: Default::default(),
+                sort_dir: SortDirection::default(),
                 filters: Vec::new(),
             },
         )
@@ -173,7 +173,7 @@ async fn token_admin_list_paginates_and_searches() {
                 per_page: 10,
                 search: Some("service:2".into()),
                 sort_by: None,
-                sort_dir: Default::default(),
+                sort_dir: SortDirection::default(),
                 filters: Vec::new(),
             },
         )
@@ -190,7 +190,7 @@ async fn token_admin_list_paginates_and_searches() {
                 per_page: 2,
                 search: None,
                 sort_by: None,
-                sort_dir: Default::default(),
+                sort_dir: SortDirection::default(),
                 filters: Vec::new(),
             },
         )
