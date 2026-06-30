@@ -261,7 +261,7 @@ fn normalize_manifest_path(p: &str) -> Vec<&str> {
                 // empty (or the top is already ".."), the path escapes the package root;
                 // preserve the ".." so that "../src/main.rs" stays distinct from
                 // "src/main.rs" and is never mistaken for the package main binary.
-                if segs.last().map_or(false, |&s| s != "..") {
+                if segs.last().is_some_and(|&s| s != "..") {
                     segs.pop();
                 } else {
                     segs.push("..");
@@ -306,13 +306,10 @@ fn resolve_bin_name(
                 // the same as the relative `src/main.rs`.
                 let path = Path::new(p);
                 if path.is_absolute() {
-                    match path.strip_prefix(project_root) {
-                        Ok(rel) => {
-                            let rel_str = rel.to_string_lossy();
-                            normalize_manifest_path(rel_str.as_ref()) == ["src", "main.rs"]
-                        }
-                        Err(_) => false,
-                    }
+                    path.strip_prefix(project_root).is_ok_and(|rel| {
+                        let rel_str = rel.to_string_lossy();
+                        normalize_manifest_path(rel_str.as_ref()) == ["src", "main.rs"]
+                    })
                 } else {
                     normalize_manifest_path(p) == ["src", "main.rs"]
                 }
