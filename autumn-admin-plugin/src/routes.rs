@@ -702,7 +702,7 @@ async fn model_create(
         let is_https = request_headers
             .get("x-forwarded-proto")
             .and_then(|v| v.to_str().ok())
-            .map_or(false, |proto| proto.eq_ignore_ascii_case("https"));
+            .is_some_and(|proto| proto.eq_ignore_ascii_case("https"));
         let secure_attr = if is_https { "; Secure" } else { "" };
         let cookie = format!(
             "__autumn_reveal={secret}; HttpOnly{secure_attr}; SameSite=Strict; Path={detail_path}; Max-Age=300"
@@ -780,7 +780,7 @@ async fn model_detail(
         let is_https = request_headers
             .get("x-forwarded-proto")
             .and_then(|v| v.to_str().ok())
-            .map_or(false, |proto| proto.eq_ignore_ascii_case("https"));
+            .is_some_and(|proto| proto.eq_ignore_ascii_case("https"));
         let secure_attr = if is_https { "; Secure" } else { "" };
         let clear = format!(
             "__autumn_reveal=; HttpOnly{secure_attr}; SameSite=Strict; Path={prefix}/{slug}/{id}; Max-Age=0"
