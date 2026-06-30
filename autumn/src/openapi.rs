@@ -1546,4 +1546,90 @@ mod tests {
         assert!(html.contains("/swagger-ui/swagger-ui.css?x=&lt;y&gt;"));
         assert!(html.contains("A &quot;cool&quot; &amp; fun API"));
     }
+
+    // ── Security requirement generation (#1158) ──────────────────────────────
+
+    fn make_secured_doc(
+        secured: bool,
+        required_roles: &'static [&'static str],
+        required_scopes: &'static [&'static str],
+    ) -> ApiDoc {
+        let mut doc = make_doc();
+        doc.path = "/secured";
+        doc.operation_id = "secured_op";
+        doc.path_params = &[];
+        doc.secured = secured;
+        doc.required_roles = required_roles;
+        doc.required_scopes = required_scopes;
+        doc
+    }
+
+    #[test]
+    fn unsecured_route_has_no_security_requirement() {
+        let doc = make_secured_doc(false, &[], &[]);
+        let config = OpenApiConfig::new("Demo", "1.0.0");
+        let spec = generate_spec(&config, &[&doc]);
+        let op = spec.paths["/secured"].get.as_ref().unwrap();
+        assert!(op.security.is_empty());
+    }
+
+    #[test]
+    fn bare_secured_uses_session_auth() {
+        let doc = make_secured_doc(true, &[], &[]);
+        let config = OpenApiConfig::new("Demo", "1.0.0");
+        let spec = generate_spec(&config, &[&doc]);
+        let op = spec.paths["/secured"].get.as_ref().unwrap();
+        assert_eq!(op.security.len(), 1);
+        assert!(op.security[0].contains_key("SessionAuth"));
+        assert!(!op.security[0].contains_key("BearerAuth"));
+    }
+
+    #[test]
+    fn role_only_uses_session_auth() {
+        let doc = make_secured_doc(true, &["admin"], &[]);
+        let config = OpenApiConfig::new("Demo", "1.0.0");
+        let spec = generate_spec(&config, &[&doc]);
+        let op = spec.paths["/secured"].get.as_ref().unwrap();
+        assert_eq!(op.security.len(), 1);
+        assert!(op.security[0].contains_key("SessionAuth"));
+        assert!(!op.security[0].contains_key("BearerAuth"));
+    }
+
+    #[test]
+    fn scope_only_uses_bearer_auth_with_empty_array() {
+        let doc = make_secured_doc(true, &[], &["posts:write"]);
+        let config = OpenApiConfig::new("Demo", "1.0.0");
+        let spec = generate_spec(&config, &[&doc]);
+        let op = spec.paths["/secured"].get.as_ref().unwrap();
+        assert_eq!(op.security.len(), 1);
+        assert!(op.security[0].contains_key("BearerAuth"));
+        assert!(!op.security[0].contains_key("SessionAuth"));
+        // OpenAPI spec: HTTP bearer value array must be empty (not scope names).
+        assert!(op.security[0]["BearerAuth"].is_empty());
+        // BearerAuth scheme is registered in components.
+        let schemes = &spec.components.as_ref().unwrap().security_schemes;
+        assert!(schemes.contains_key("BearerAuth"));
+        assert_eq!(schemes["BearerAuth"]["scheme"], "bearer");
+    }
+
+    #[test]
+    fn mixed_role_and_scope_uses_both_auth_schemes() {
+        let doc = make_secured_doc(true, &["admin"], &["posts:write"]);
+        let config = OpenApiConfig::new("Demo", "1.0.0");
+        let spec = generate_spec(&config, &[&doc]);
+        let op = spec.paths["/secured"].get.as_ref().unwrap();
+        assert_eq!(op.security.len(), 1);
+        // Both in the same object = AND semantics.
+        assert!(op.security[0].contains_key("SessionAuth"));
+        assert!(op.security[0].contains_key("BearerAuth"));
+    }
+
+    #[test]
+    fn bearer_auth_scheme_registered_only_for_scoped_routes() {
+        let unscoped = make_secured_doc(true, &["admin"], &[]);
+        let config = OpenApiConfig::new("Demo", "1.0.0");
+        let spec = generate_spec(&config, &[&unscoped]);
+        let schemes = &spec.components.as_ref().unwrap().security_schemes;
+        assert!(!schemes.contains_key("BearerAuth"));
+    }
 }

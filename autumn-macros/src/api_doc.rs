@@ -934,4 +934,85 @@ mod tests {
             Some(vec!["admin".to_owned()])
         );
     }
+
+    // ── Scopes extraction (#1158) ────────────────────────────────────────────
+
+    #[test]
+    fn extract_secured_scopes_from_attribute_scopes_only() {
+        let input_fn: syn::ItemFn = syn::parse_quote! {
+            #[secured(scopes = ["posts:read", "posts:write"])]
+            async fn handler() {}
+        };
+        let attr = input_fn
+            .attrs
+            .iter()
+            .find(|a| a.path().is_ident("secured"))
+            .unwrap();
+        assert_eq!(
+            extract_secured_scopes(attr),
+            vec!["posts:read".to_owned(), "posts:write".to_owned()]
+        );
+    }
+
+    #[test]
+    fn extract_secured_scopes_from_attribute_roles_and_scopes() {
+        let input_fn: syn::ItemFn = syn::parse_quote! {
+            #[secured("admin", scopes = ["posts:write"])]
+            async fn handler() {}
+        };
+        let attr = input_fn
+            .attrs
+            .iter()
+            .find(|a| a.path().is_ident("secured"))
+            .unwrap();
+        assert_eq!(extract_secured_scopes(attr), vec!["posts:write".to_owned()]);
+    }
+
+    #[test]
+    fn extract_secured_scopes_returns_empty_for_roles_only() {
+        let input_fn: syn::ItemFn = syn::parse_quote! {
+            #[secured("admin")]
+            async fn handler() {}
+        };
+        let attr = input_fn
+            .attrs
+            .iter()
+            .find(|a| a.path().is_ident("secured"))
+            .unwrap();
+        assert!(extract_secured_scopes(attr).is_empty());
+    }
+
+    #[test]
+    fn scopes_marker_extracted_from_handler_body() {
+        let input_fn: syn::ItemFn = syn::parse_quote! {
+            async fn handler() {
+                const __AUTUMN_SECURED_SCOPES: &[&str] = &["posts:write", "posts:delete"];
+            }
+        };
+        assert_eq!(
+            extract_secured_scopes_marker(&input_fn),
+            Some(vec!["posts:write".to_owned(), "posts:delete".to_owned()])
+        );
+    }
+
+    #[test]
+    fn scopes_marker_empty_array_returns_some_empty_vec() {
+        let input_fn: syn::ItemFn = syn::parse_quote! {
+            async fn handler() {
+                const __AUTUMN_SECURED_SCOPES: &[&str] = &[];
+            }
+        };
+        assert_eq!(
+            extract_secured_scopes_marker(&input_fn),
+            Some(Vec::<String>::new())
+        );
+    }
+
+    #[test]
+    fn scopes_marker_absent_returns_none() {
+        let input_fn: syn::ItemFn = syn::parse_quote! {
+            async fn handler() {}
+        };
+        assert_eq!(extract_secured_scopes_marker(&input_fn), None);
+    }
 }
