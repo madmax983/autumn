@@ -678,10 +678,6 @@ async fn model_create(
             model.display_name()
         ))
     })?;
-    flash
-        .success(format!("{} created.", model.display_name()))
-        .await;
-
     let detail_path = format!("{prefix}/{slug}/{new_id}");
     let mut response = Redirect::to(&detail_path).into_response();
 
@@ -692,6 +688,13 @@ async fn model_create(
     // bearer token there even briefly is a plaintext-secret-storage violation.
     // The reveal cookie is path-scoped to the detail page and expires in 5
     // minutes; the detail handler reads it exactly once and clears it.
+    //
+    // Additionally, skip flash.success() on secret-returning creates: the
+    // session write would dirty the session before the redirect; if the session
+    // store (Redis/DB) is unavailable, SessionLayer replaces the handler's
+    // response with its own error — discarding the Set-Cookie header and
+    // permanently losing the raw credential.  The "copy now" FlashMessage
+    // rendered by model_detail from the reveal cookie is sufficient notification.
     if let Some(Value::String(secret)) = record.get("token") {
         // Mirror the session cookie's Secure flag so the reveal cookie is
         // accepted in both HTTPS and explicit HTTP-only deployments.
@@ -708,6 +711,13 @@ async fn model_create(
                 .headers_mut()
                 .insert(axum::http::header::SET_COOKIE, hv);
         }
+    } else {
+        // Non-secret create: safe to write a flash message (no raw credential
+        // at risk if the session save fails — the record is already committed
+        // and remains accessible via the list view).
+        flash
+            .success(format!("{} created.", model.display_name()))
+            .await;
     }
     Ok(response)
 }
