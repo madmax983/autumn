@@ -142,6 +142,18 @@ fn normalize_expires_at_utc(s: &str) -> String {
     if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
         return dt.naive_utc().format("%Y-%m-%dT%H:%M:%S").to_string();
     }
+    // Minute-precision offset forms (e.g. `date -Iminutes` → "2026-12-31T23:59-05:00").
+    // RFC 3339 requires seconds; pad ":00" after the minutes field so the
+    // full RFC 3339 parser can still apply the offset and produce UTC.
+    if s.len() >= 17 {
+        let b = s.as_bytes();
+        if b[10] == b'T' && b[13] == b':' && matches!(b[16], b'Z' | b'+' | b'-') {
+            let padded = format!("{}:00{}", &s[..16], &s[16..]);
+            if let Ok(dt) = DateTime::parse_from_rfc3339(&padded) {
+                return dt.naive_utc().format("%Y-%m-%dT%H:%M:%S").to_string();
+            }
+        }
+    }
     // Datetime without offset — treat as UTC directly.
     for fmt in ["%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M", "%Y-%m-%d %H:%M:%S"] {
         if let Ok(naive) = NaiveDateTime::parse_from_str(s, fmt) {
@@ -352,5 +364,31 @@ mod tests {
     #[test]
     fn normalize_utc_unknown_format_passthrough() {
         assert_eq!(normalize_expires_at_utc("not-a-date"), "not-a-date");
+    }
+
+    #[test]
+    fn normalize_utc_minute_precision_negative_offset() {
+        // `date -Iminutes` → "2026-12-31T23:59-05:00"; 23:59 EST = 04:59 UTC next day
+        assert_eq!(
+            normalize_expires_at_utc("2026-12-31T23:59-05:00"),
+            "2027-01-01T04:59:00"
+        );
+    }
+
+    #[test]
+    fn normalize_utc_minute_precision_positive_offset() {
+        // +05:30 → 23:59 - 5h30m = 18:29 UTC
+        assert_eq!(
+            normalize_expires_at_utc("2026-12-31T23:59+05:30"),
+            "2026-12-31T18:29:00"
+        );
+    }
+
+    #[test]
+    fn normalize_utc_minute_precision_z_suffix() {
+        assert_eq!(
+            normalize_expires_at_utc("2026-12-31T23:59Z"),
+            "2026-12-31T23:59:00"
+        );
     }
 }
