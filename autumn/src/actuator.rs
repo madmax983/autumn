@@ -2269,6 +2269,18 @@ fn write_builtin_http_metrics(
         snapshot.http.request_timeouts_total
     );
 
+    // autumn_read_your_writes_pins_total
+    out.push_str(
+        "# HELP autumn_read_your_writes_pins_total \
+         Replica reads redirected to the primary by the read-your-own-writes pin\n",
+    );
+    out.push_str("# TYPE autumn_read_your_writes_pins_total counter\n");
+    let _ = writeln!(
+        out,
+        "autumn_read_your_writes_pins_total{{version=\"{version}\"}} {}",
+        snapshot.read_your_writes_pins_total
+    );
+
     // by_route
     if !snapshot.http.by_route.is_empty() {
         out.push_str("# HELP autumn_http_route_requests_total HTTP requests by route and method\n");
@@ -2312,6 +2324,7 @@ pub(crate) async fn prometheus_endpoint<S: ProvideActuatorState + Send + Sync + 
             "autumn_http_request_duration_seconds",
             "autumn_shutdown_aborted_requests_total",
             "autumn_request_timeouts_total",
+            "autumn_read_your_writes_pins_total",
             "autumn_http_route_requests_total",
             "autumn_metrics_source_errors_total",
         ]

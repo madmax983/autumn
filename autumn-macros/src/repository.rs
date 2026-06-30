@@ -10263,7 +10263,6 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             pub fn __autumn_effective_read_route(&self) -> ::autumn_web::repository::ReadRoute {
                 match &self.__autumn_read_route {
                     ::autumn_web::repository::ReadRoute::ReadPool(_)
-                    | ::autumn_web::repository::ReadRoute::Unavailable
                         if ::autumn_web::read_your_writes::is_pinned() =>
                     {
                         ::autumn_web::read_your_writes::note_pin_redirect();
@@ -10338,7 +10337,6 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     if matches!(
                         &self.__autumn_read_route,
                         ::autumn_web::repository::ReadRoute::ReadPool(_)
-                            | ::autumn_web::repository::ReadRoute::Unavailable
                     ) {
                         ::autumn_web::read_your_writes::note_pin_redirect();
                         return self.__autumn_acquire_from(&self.pool).await;

@@ -159,7 +159,13 @@ fn parse_session_cookie(
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    now.saturating_sub(ts) < window_secs
+    // Reject timestamps more than 5 s in the future so clock skew on a signing
+    // server can't produce a cookie that is accepted indefinitely on other nodes.
+    if ts > now {
+        ts - now < 5
+    } else {
+        now - ts < window_secs
+    }
 }
 
 /// Build the value for a `Set-Cookie: autumn.ryw=…` response header.
@@ -419,6 +425,24 @@ mod tests {
         assert!(
             !pin.incoming_pin(),
             "cookie with invalid HMAC must NOT set incoming_pin"
+        );
+    }
+
+    #[test]
+    fn future_cookie_beyond_skew_tolerance_does_not_set_incoming_pin() {
+        let keys = test_keys();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        // 60 s in the future — well beyond the 5 s skew tolerance.
+        let ts = (now + 60).to_string();
+        let sig = keys.sign(ts.as_bytes());
+        let cookie = format!("{ts}.{sig}");
+        let pin = RequestPin::with_session_cookie(&cookie, &keys, 5);
+        assert!(
+            !pin.incoming_pin(),
+            "far-future cookie must NOT set incoming_pin"
         );
     }
 

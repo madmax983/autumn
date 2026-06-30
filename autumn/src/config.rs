@@ -2682,6 +2682,16 @@ impl AutumnConfig {
         );
         parse_env(
             env,
+            "AUTUMN_DATABASE__READ_YOUR_WRITES",
+            &mut self.database.read_your_writes,
+        );
+        parse_env(
+            env,
+            "AUTUMN_DATABASE__PIN_AFTER_WRITE_SECS",
+            &mut self.database.pin_after_write_secs,
+        );
+        parse_env(
+            env,
             "AUTUMN_DATABASE__CONNECT_TIMEOUT_SECS",
             &mut self.database.connect_timeout_secs,
         );
