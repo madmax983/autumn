@@ -6614,7 +6614,7 @@ fn collect_unguarded_repository_writes(
 /// can be unit-tested without going through `tracing` machinery.
 fn format_unguarded_repository_listing(offenders: &[(String, String)]) -> String {
     use std::fmt::Write;
-    let mut s = String::new();
+    let mut s = String::with_capacity(offenders.len() * 128);
     let mut first = true;
     for (name, path) in offenders {
         if !first {
@@ -6728,7 +6728,7 @@ fn collect_unregistered_repository_handlers(
 /// errors. Pure so the format string can be unit-tested.
 fn format_missing_policy_listing(missing: &[(String, String)]) -> String {
     use std::fmt::Write;
-    let mut s = String::new();
+    let mut s = String::with_capacity(missing.len() * 128);
     let mut first = true;
     for (name, path) in missing {
         if !first {
@@ -6744,7 +6744,7 @@ fn format_missing_policy_listing(missing: &[(String, String)]) -> String {
 /// errors. Pure so the format string can be unit-tested.
 fn format_missing_scope_listing(missing: &[(String, String)]) -> String {
     use std::fmt::Write;
-    let mut s = String::new();
+    let mut s = String::with_capacity(missing.len() * 128);
     let mut first = true;
     for (name, path) in missing {
         if !first {
@@ -7292,7 +7292,9 @@ fn format_route_lines(
 ) -> String {
     use std::fmt::Write as _;
 
-    let mut out = String::new();
+    let mut out = String::with_capacity(
+        (routes.len() + scoped_groups.iter().map(|g| g.routes.len()).sum::<usize>()) * 64 + 256,
+    );
     for route in routes {
         let _ = write!(
             out,
@@ -7342,7 +7344,7 @@ fn format_task_lines(tasks: &[crate::task::TaskInfo]) -> Option<String> {
         return None;
     }
 
-    let mut out = String::new();
+    let mut out = String::with_capacity(tasks.len() * 64);
     for task in tasks {
         let schedule = task.schedule.to_string();
         let _ = write!(out, "\n    {} ({schedule})", task.name);
