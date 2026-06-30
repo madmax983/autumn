@@ -2491,6 +2491,13 @@ fn apply_middleware(
         let ryw_mode = config.database.read_your_writes;
         let window_secs = config.database.pin_after_write_secs;
         let keys = signing_keys_for_ryw;
+        if ryw_mode == crate::config::ReadYourWrites::Session && keys.is_none() {
+            tracing::warn!(
+                "read_your_writes = \"session\" requires a configured \
+                 security.signing_secret to sign the autumn.ryw cookie; \
+                 cross-request pinning is disabled until a secret is set"
+            );
+        }
         let metrics = state.metrics().clone();
         router.layer(axum::middleware::from_fn(move |req, next| {
             crate::read_your_writes::middleware(

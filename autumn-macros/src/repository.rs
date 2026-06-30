@@ -10263,6 +10263,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             pub fn __autumn_effective_read_route(&self) -> ::autumn_web::repository::ReadRoute {
                 match &self.__autumn_read_route {
                     ::autumn_web::repository::ReadRoute::ReadPool(_)
+                    | ::autumn_web::repository::ReadRoute::Unavailable
                         if ::autumn_web::read_your_writes::is_pinned() =>
                     {
                         ::autumn_web::read_your_writes::note_pin_redirect();
@@ -10307,10 +10308,14 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     ::autumn_web::reexports::diesel_async::AsyncPgConnection,
                 >,
             > {
-                // Notify the RYWW task-local that a primary connection is being
-                // acquired for a mutating method. No-op when read_your_writes = "off".
-                ::autumn_web::read_your_writes::mark_write();
-                self.__autumn_acquire_from(&self.pool).await
+                let result = self.__autumn_acquire_from(&self.pool).await;
+                // Mark write only after a successful primary checkout, mirroring
+                // the guard in `Db::from_request_parts`. A failed acquire (pool
+                // exhausted, timeout) must not pin subsequent reads to primary.
+                if result.is_ok() {
+                    ::autumn_web::read_your_writes::mark_write();
+                }
+                result
             }
 
             /// Acquire a connection for a generated read-only method,
@@ -10325,12 +10330,26 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     ::autumn_web::reexports::diesel_async::AsyncPgConnection,
                 >,
             > {
-                match self.__autumn_effective_read_route() {
+                // Match by reference to avoid cloning `ReadRoute` on the common
+                // (non-pinned) path. The pin check is inlined here so that
+                // `__autumn_effective_read_route` (the test accessor) retains its
+                // own clone-based return without adding overhead to the hot path.
+                if ::autumn_web::read_your_writes::is_pinned() {
+                    if matches!(
+                        &self.__autumn_read_route,
+                        ::autumn_web::repository::ReadRoute::ReadPool(_)
+                            | ::autumn_web::repository::ReadRoute::Unavailable
+                    ) {
+                        ::autumn_web::read_your_writes::note_pin_redirect();
+                        return self.__autumn_acquire_from(&self.pool).await;
+                    }
+                }
+                match &self.__autumn_read_route {
                     ::autumn_web::repository::ReadRoute::Primary => {
                         self.__autumn_acquire_from(&self.pool).await
                     }
                     ::autumn_web::repository::ReadRoute::ReadPool(pool) => {
-                        self.__autumn_acquire_from(&pool).await
+                        self.__autumn_acquire_from(pool).await
                     }
                     ::autumn_web::repository::ReadRoute::Unavailable => {
                         ::core::result::Result::Err(

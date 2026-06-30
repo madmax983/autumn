@@ -576,7 +576,7 @@ fn is_production_profile(profile: Option<&str>) -> bool {
 // ── Cookie helpers ──────────────────────────────────────────────
 
 /// Extract a named cookie value from the Cookie header.
-fn get_cookie(headers: &http::HeaderMap, name: &str) -> Option<String> {
+pub(crate) fn get_cookie(headers: &http::HeaderMap, name: &str) -> Option<String> {
     let mut found_token = None;
 
     for cookie_header in headers.get_all(COOKIE) {

@@ -20,6 +20,9 @@ struct Inner {
     mode: ReadYourWrites,
     incoming_pin: bool,
     wrote: AtomicBool,
+    /// Set on the first pin-redirect trace so subsequent redirects within the
+    /// same request don't produce unbounded log volume.
+    pin_traced: AtomicBool,
     metrics: Option<crate::middleware::MetricsCollector>,
 }
 
@@ -38,6 +41,7 @@ impl RequestPin {
                 mode,
                 incoming_pin: false,
                 wrote: AtomicBool::new(false),
+                pin_traced: AtomicBool::new(false),
                 metrics: None,
             }),
         }
@@ -54,6 +58,7 @@ impl RequestPin {
                 mode,
                 incoming_pin: false,
                 wrote: AtomicBool::new(false),
+                pin_traced: AtomicBool::new(false),
                 metrics: Some(metrics),
             }),
         }
@@ -76,6 +81,7 @@ impl RequestPin {
                 mode: ReadYourWrites::Session,
                 incoming_pin,
                 wrote: AtomicBool::new(false),
+                pin_traced: AtomicBool::new(false),
                 metrics: None,
             }),
         }
@@ -92,6 +98,7 @@ impl RequestPin {
                 mode,
                 incoming_pin,
                 wrote: AtomicBool::new(false),
+                pin_traced: AtomicBool::new(false),
                 metrics: None,
             }),
         }
@@ -111,6 +118,7 @@ impl RequestPin {
                 mode: ReadYourWrites::Session,
                 incoming_pin,
                 wrote: AtomicBool::new(false),
+                pin_traced: AtomicBool::new(false),
                 metrics: Some(metrics),
             }),
         }
@@ -231,11 +239,15 @@ pub fn note_pin_redirect() {
         if let Some(ref metrics) = pin.inner.metrics {
             metrics.record_read_your_writes_pin();
         }
-        tracing::debug!(
-            target: "autumn::db",
-            ryw_pinned = true,
-            "read redirected to primary (read-your-own-writes pin active)"
-        );
+        // Emit the trace at most once per request to avoid log spam on
+        // read-heavy handlers where every read is redirected.
+        if !pin.inner.pin_traced.swap(true, Ordering::Relaxed) {
+            tracing::debug!(
+                target: "autumn::db",
+                ryw_pinned = true,
+                "read redirected to primary (read-your-own-writes pin active)"
+            );
+        }
     })
     .ok();
 }
@@ -295,22 +307,14 @@ pub async fn middleware(
 }
 
 /// Extract the `autumn.ryw` cookie value from raw `Cookie` headers.
+///
+/// Delegates to `session::get_cookie` so that duplicate-name rejection
+/// (cookie-tossing mitigation) and exact-name matching are handled uniformly
+/// with the session layer.
 fn extract_ryw_cookie_value(
     req: &axum::http::Request<axum::body::Body>,
 ) -> Option<String> {
-    for hv in req.headers().get_all(axum::http::header::COOKIE) {
-        let Ok(s) = hv.to_str() else { continue };
-        for part in s.split(';') {
-            let part = part.trim();
-            if let Some(val) = part.strip_prefix(RYW_COOKIE_NAME) {
-                let val = val.trim_start_matches([' ', '=']);
-                if !val.is_empty() {
-                    return Some(val.to_owned());
-                }
-            }
-        }
-    }
-    None
+    crate::session::get_cookie(req.headers(), RYW_COOKIE_NAME)
 }
 
 #[cfg(test)]
