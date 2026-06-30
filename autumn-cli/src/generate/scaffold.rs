@@ -1939,11 +1939,16 @@ fn render_smoke_test(
                      eprintln!(\"skipping: create returned 401 (auth required); run with a valid session cookie\");\n\
                      return;\n\
                  }}\n\
+                 if create_h.starts_with(\"HTTP/1.1 302\") || create_h.starts_with(\"HTTP/1.0 302\")\n\
+                     || create_h.starts_with(\"HTTP/1.1 303\") || create_h.starts_with(\"HTTP/1.0 303\") {{\n\
+                     // redirect_to() returns 200 (meta-refresh), not 302/303; a redirect here\n\
+                     // means auth/tenant middleware intercepted the request -- no row was created.\n\
+                     eprintln!(\"skipping: POST /{plural} redirected (302/303); auth middleware may have intercepted -- no row was created\");\n\
+                     return;\n\
+                 }}\n\
                  assert!(\n\
-                     create_h.starts_with(\"HTTP/1.1 200\") || create_h.starts_with(\"HTTP/1.0 200\")\n\
-                     || create_h.starts_with(\"HTTP/1.1 302\") || create_h.starts_with(\"HTTP/1.0 302\")\n\
-                     || create_h.starts_with(\"HTTP/1.1 303\") || create_h.starts_with(\"HTTP/1.0 303\"),\n\
-                     \"POST /{plural} did not return 200/302/303:\\n{{create_h}}\\n{{create_b}}\"\n\
+                     create_h.starts_with(\"HTTP/1.1 200\") || create_h.starts_with(\"HTTP/1.0 200\"),\n\
+                     \"POST /{plural} did not return 200:\\n{{create_h}}\\n{{create_b}}\"\n\
                  );\n\
                  \n\
                  // 3. Find the new row's ID by diffing the list.\n\
