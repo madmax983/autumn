@@ -1017,7 +1017,7 @@ pub fn data_table<T>(
 /// current (non-linked) page. The last item in the slice passed to [`breadcrumb`]
 /// is always treated as the current page regardless of whether `href` is set.
 #[cfg(feature = "maud")]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Crumb<'a> {
     /// Visible label for this crumb. HTML-escaped by Maud.
     pub label: &'a str,
