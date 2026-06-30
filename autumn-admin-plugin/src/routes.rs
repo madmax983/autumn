@@ -774,9 +774,16 @@ async fn model_detail(
     .into_response();
 
     // Clear the reveal cookie so a page refresh does not show the token again.
+    // Mirror the Secure decision from model_create: only add it on HTTPS so
+    // the browser accepts the clearing cookie on HTTP-only deployments too.
     if reveal_secret.is_some() {
+        let is_https = request_headers
+            .get("x-forwarded-proto")
+            .and_then(|v| v.to_str().ok())
+            .map_or(false, |proto| proto.eq_ignore_ascii_case("https"));
+        let secure_attr = if is_https { "; Secure" } else { "" };
         let clear = format!(
-            "__autumn_reveal=; HttpOnly; Secure; SameSite=Strict; Path={prefix}/{slug}/{id}; Max-Age=0"
+            "__autumn_reveal=; HttpOnly{secure_attr}; SameSite=Strict; Path={prefix}/{slug}/{id}; Max-Age=0"
         );
         if let Ok(hv) = axum::http::HeaderValue::from_str(&clear) {
             response
