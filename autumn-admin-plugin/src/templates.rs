@@ -671,7 +671,12 @@ fn job_list_card(
         }
         (jobs_pagination(page, page_param, prefix))
     };
-    card(&body, &CardConfig::new().title_html(title_markup).header_action(header_action))
+    card(
+        &body,
+        &CardConfig::new()
+            .title_html(title_markup)
+            .header_action(header_action),
+    )
 }
 
 fn job_row(

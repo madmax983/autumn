@@ -2370,7 +2370,10 @@ mod tests {
     fn card_config_builders_chain() {
         let html = card(
             &maud::html! {},
-            &CardConfig::new().title("T").level(HeadingLevel::H3).class("wide"),
+            &CardConfig::new()
+                .title("T")
+                .level(HeadingLevel::H3)
+                .class("wide"),
         )
         .into_string();
         assert!(html.contains(r#"class="card wide""#), "{html}");
@@ -2405,11 +2408,7 @@ mod tests {
     #[test]
     fn card_title_respects_heading_level() {
         let body = maud::html! {};
-        let html = card(
-            &body,
-            &CardConfig::new().title("X").level(HeadingLevel::H3),
-        )
-        .into_string();
+        let html = card(&body, &CardConfig::new().title("X").level(HeadingLevel::H3)).into_string();
         assert!(html.contains(r#"<h3 class="card-title">"#), "{html}");
         assert!(!html.contains("<h2"), "{html}");
     }
@@ -2467,11 +2466,7 @@ mod tests {
     #[test]
     fn card_escapes_title() {
         let body = maud::html! {};
-        let html = card(
-            &body,
-            &CardConfig::new().title("<script>alert(1)</script>"),
-        )
-        .into_string();
+        let html = card(&body, &CardConfig::new().title("<script>alert(1)</script>")).into_string();
         assert!(html.contains("&lt;script&gt;"), "{html}");
         assert!(!html.contains("<script>alert"), "{html}");
     }
