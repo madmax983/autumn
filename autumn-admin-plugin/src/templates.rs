@@ -134,21 +134,22 @@ const ADMIN_CSS: &str = "
         background: var(--surface);
         border-radius: var(--radius);
         box-shadow: var(--shadow);
-        padding: 1.5rem;
         margin-bottom: 1.5rem;
     }
     .card-header {
         display: flex;
         justify-content: space-between;
         align-items: center;
-        margin-bottom: 1rem;
-        padding-bottom: 0.75rem;
+        padding: 1rem 1.5rem 0.75rem;
         border-bottom: 1px solid var(--border);
     }
     .card-title {
         font-size: 1.125rem;
         font-weight: 600;
         margin: 0;
+    }
+    .card-body {
+        padding: 1.5rem;
     }
 
     /* Buttons */
@@ -632,10 +633,13 @@ fn job_list_card(
             (page.total) " total"
         }
     };
-    let body = html! {
-        div style="font-size: 0.8125rem; color: var(--text-muted); margin-bottom: 0.75rem;" {
+    let title_markup = html! {
+        (title)
+        span style="display: block; font-size: 0.8125rem; color: var(--text-muted); margin-top: 0.25rem; font-weight: 400;" {
             (description)
         }
+    };
+    let body = html! {
         div class="table-wrap" {
             table {
                 thead {
@@ -667,7 +671,7 @@ fn job_list_card(
         }
         (jobs_pagination(page, page_param, prefix))
     };
-    card(&body, &CardConfig::new().title(title).header_action(header_action))
+    card(&body, &CardConfig::new().title_html(title_markup).header_action(header_action))
 }
 
 fn job_row(

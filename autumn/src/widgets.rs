@@ -1154,16 +1154,16 @@ pub struct CardConfig<'a> {
     /// Optional title text rendered in a `<hN class="card-title">` element.
     /// Set via [`CardConfig::title`] (HTML-escaped) or [`CardConfig::title_html`]
     /// (pre-built [`maud::Markup`] for rich content).
-    pub title: Option<maud::Markup>,
+    title: Option<maud::Markup>,
     /// Heading level for the title element (default [`HeadingLevel::H2`]).
-    pub level: HeadingLevel,
+    level: HeadingLevel,
     /// Optional right-side header slot — e.g. action buttons.
     /// Rendered inside `card-header` alongside the title.
-    pub header_action: Option<maud::Markup>,
+    header_action: Option<maud::Markup>,
     /// Optional footer content rendered in `<div class="card-footer">`.
-    pub footer: Option<maud::Markup>,
+    footer: Option<maud::Markup>,
     /// Extra CSS class(es) appended to the root `card` element.
-    pub class: Option<&'a str>,
+    class: Option<&'a str>,
 }
 
 #[cfg(feature = "maud")]
@@ -2357,23 +2357,25 @@ mod tests {
 
     #[test]
     fn card_config_defaults() {
-        let c = CardConfig::new();
-        assert!(c.title.is_none());
-        assert_eq!(c.level, HeadingLevel::H2);
-        assert!(c.header_action.is_none());
-        assert!(c.footer.is_none());
-        assert!(c.class.is_none());
+        // no title/action → no card-header rendered
+        let html = card(&maud::html! {}, &CardConfig::new()).into_string();
+        assert!(!html.contains("card-header"), "{html}");
+        assert!(!html.contains("card-footer"), "{html}");
+        // default heading level is H2: setting a title renders <h2
+        let html2 = card(&maud::html! {}, &CardConfig::new().title("X")).into_string();
+        assert!(html2.contains("<h2"), "{html2}");
     }
 
     #[test]
     fn card_config_builders_chain() {
-        let c = CardConfig::new()
-            .title("T")
-            .level(HeadingLevel::H3)
-            .class("wide");
-        assert!(c.title.is_some());
-        assert_eq!(c.level, HeadingLevel::H3);
-        assert_eq!(c.class, Some("wide"));
+        let html = card(
+            &maud::html! {},
+            &CardConfig::new().title("T").level(HeadingLevel::H3).class("wide"),
+        )
+        .into_string();
+        assert!(html.contains(r#"class="card wide""#), "{html}");
+        assert!(html.contains("<h3"), "{html}");
+        assert!(html.contains("T"), "{html}");
     }
 
     // ── card structure ─────────────────────────────────────────────────
