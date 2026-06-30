@@ -57,7 +57,7 @@ impl AdminModel for TokenAdminModel {
                 .label("Scopes (JSON array)")
                 .optional(),
             AdminField::new("expires_at", AdminFieldKind::DateTime)
-                .label("Expires At")
+                .label("Expires At (UTC)")
                 .optional()
                 .create_only(),
             AdminField::new("last_used_at", AdminFieldKind::DateTime)

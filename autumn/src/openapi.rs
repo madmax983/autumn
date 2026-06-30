@@ -435,6 +435,10 @@ pub struct Operation {
     /// Declares this operation to be deprecated.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub deprecated: Option<bool>,
+    /// Vendor extension: bearer-token scope strings required by this operation.
+    /// Empty for session-only or unsecured routes.
+    #[serde(rename = "x-required-scopes", skip_serializing_if = "Vec::is_empty")]
+    pub x_required_scopes: Vec<String>,
 }
 
 #[cfg(feature = "openapi")]
@@ -822,6 +826,11 @@ fn operation_for(
         responses,
         security,
         deprecated,
+        x_required_scopes: api_doc
+            .required_scopes
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
     }
 }
 
