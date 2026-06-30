@@ -11,8 +11,8 @@
 //! code is reachable from hot paths** — `is_pinned()` fast-returns `false`
 //! without touching the task-local, and no middleware layer is installed.
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::config::ReadYourWrites;
 
@@ -311,9 +311,7 @@ pub async fn middleware(
 /// Delegates to `session::get_cookie` so that duplicate-name rejection
 /// (cookie-tossing mitigation) and exact-name matching are handled uniformly
 /// with the session layer.
-fn extract_ryw_cookie_value(
-    req: &axum::http::Request<axum::body::Body>,
-) -> Option<String> {
+fn extract_ryw_cookie_value(req: &axum::http::Request<axum::body::Body>) -> Option<String> {
     crate::session::get_cookie(req.headers(), RYW_COOKIE_NAME)
 }
 
@@ -372,10 +370,7 @@ mod tests {
 
     // Cookie parsing tests (use pub(crate) ResolvedSigningKeys directly)
     fn test_keys() -> crate::security::config::ResolvedSigningKeys {
-        crate::security::config::ResolvedSigningKeys::new(
-            b"test-key-for-ryw-unit".to_vec(),
-            vec![],
-        )
+        crate::security::config::ResolvedSigningKeys::new(b"test-key-for-ryw-unit".to_vec(), vec![])
     }
 
     fn fresh_cookie(keys: &crate::security::config::ResolvedSigningKeys) -> String {
@@ -393,7 +388,10 @@ mod tests {
         let keys = test_keys();
         let cookie = fresh_cookie(&keys);
         let pin = RequestPin::with_session_cookie(&cookie, &keys, 5);
-        assert!(pin.incoming_pin(), "fresh signed cookie must set incoming_pin");
+        assert!(
+            pin.incoming_pin(),
+            "fresh signed cookie must set incoming_pin"
+        );
     }
 
     #[test]
@@ -457,7 +455,10 @@ mod tests {
         // Manually simulate mark_write on the pin.
         pin.inner.wrote.store(true, Ordering::Relaxed);
         let val = session_cookie_value(&pin, &keys);
-        assert!(val.is_some(), "session mode + wrote must produce a cookie value");
+        assert!(
+            val.is_some(),
+            "session mode + wrote must produce a cookie value"
+        );
         let val = val.unwrap();
         // Must be parseable as a fresh cookie.
         let fresh_pin = RequestPin::with_session_cookie(&val, &keys, 5);
