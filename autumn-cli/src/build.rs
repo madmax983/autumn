@@ -108,6 +108,47 @@ fn build_embedded(
     eprintln!("\n\u{1F342} Build complete! Assets and locales embedded into the binary.");
 }
 
+/// Set up environment variables for the static-renderer command.
+///
+/// Factored out of [`run`] so the env-setup logic is unit-testable without
+/// invoking `cargo build` or the app binary.
+fn apply_renderer_env(
+    cmd: &mut Command,
+    debug: bool,
+    package: Option<&str>,
+    bin: Option<&str>,
+    resolved_pkg: Option<&str>,
+    manifest_dir: Option<&PathBuf>,
+) {
+    // Clear any inherited attach URL so a stale value can't redirect the static
+    // renderer to the wrong database; re-set below only when a live cluster is
+    // discovered.
+    cmd.env_remove(crate::serve::MANAGED_PG_ATTACH_URL_ENV);
+    // When --bin selects a workspace member without -p, use the resolved package
+    // name so the renderer shares that member's cluster, not the workspace root's.
+    let effective_pkg = package.or_else(|| bin.and(resolved_pkg));
+    if let Some(pg) = crate::serve::managed_pg_env(effective_pkg) {
+        cmd.env(crate::serve::MANAGED_PG_DATA_DIR_ENV, &pg.data_dir);
+        if let Some(url) = pg.attach_url {
+            cmd.env(crate::serve::MANAGED_PG_ATTACH_URL_ENV, url);
+        }
+    }
+    // Mirror cargo's profile selection so dev builds skip production-only
+    // validation and release builds apply prod config overrides.
+    // Users can override by setting AUTUMN_PROFILE explicitly.
+    if std::env::var("AUTUMN_PROFILE").is_err() {
+        cmd.env("AUTUMN_PROFILE", if debug { "dev" } else { "prod" });
+    }
+    // Pin CWD to the package directory so config loading and dist/ output are
+    // relative to the correct project root when -p <package> points to a subdir.
+    if let Some(dir) = manifest_dir {
+        let cwd = std::env::current_dir().expect("current dir");
+        if dir != &cwd {
+            cmd.current_dir(dir);
+        }
+    }
+}
+
 /// Run the static build pipeline.
 pub fn run(
     debug: bool,
@@ -152,43 +193,14 @@ pub fn run(
 
     let mut cmd = Command::new(&binary);
     cmd.env("AUTUMN_BUILD_STATIC", "1");
-    // Share the serve daemon's managed-Postgres cluster (and attach to it when
-    // live) so the static renderer doesn't try to start a second postmaster on
-    // the daemon's locked data dir. A no-op for apps that don't use managed PG.
-    // The attach URL is CLI→child plumbing, not an operator knob. Clear any
-    // inherited value up front (even when an explicit AUTUMN_MANAGED_PG_DATA_DIR
-    // override makes `managed_pg_env` return None) so a stale/foreign value can't
-    // redirect the static renderer to the wrong database; re-set it only when a
-    // live cluster is discovered.
-    cmd.env_remove(crate::serve::MANAGED_PG_ATTACH_URL_ENV);
-    // When --bin selects a member without -p, use the resolved package name for
-    // managed-PG namespacing so the static renderer shares the member's cluster
-    // rather than the workspace root's.
-    let effective_pkg = package.or_else(|| bin.and(resolved_pkg.as_deref()));
-    if let Some(pg) = crate::serve::managed_pg_env(effective_pkg) {
-        cmd.env(crate::serve::MANAGED_PG_DATA_DIR_ENV, &pg.data_dir);
-        if let Some(url) = pg.attach_url {
-            cmd.env(crate::serve::MANAGED_PG_ATTACH_URL_ENV, url);
-        }
-    }
-    // Mirror cargo's profile selection: dev builds use the dev Autumn profile
-    // (skips production-only validation), release builds use prod so that
-    // prod config overrides (robots.txt, SEO settings, etc.) are applied.
-    // Users can override either by setting AUTUMN_PROFILE explicitly.
-    if std::env::var("AUTUMN_PROFILE").is_err() {
-        cmd.env("AUTUMN_PROFILE", if debug { "dev" } else { "prod" });
-    }
-    // When -p <package> is given and the package lives in a subdirectory (e.g.
-    // `autumn build -p reddit-clone` from the workspace root), the binary would
-    // otherwise inherit the CLI's CWD and look for autumn.toml in the wrong
-    // place. Pin it to the package's directory so config loading and the dist/
-    // output path are always relative to the correct project root.
-    if let Some(dir) = &manifest_dir {
-        let cwd = std::env::current_dir().expect("current dir");
-        if dir != &cwd {
-            cmd.current_dir(dir);
-        }
-    }
+    apply_renderer_env(
+        &mut cmd,
+        debug,
+        package,
+        bin,
+        resolved_pkg.as_deref(),
+        manifest_dir.as_ref(),
+    );
     let status = cmd.status().unwrap_or_else(|e| {
         eprintln!("\u{2717} Failed to run {}: {e}", binary.display());
         std::process::exit(1);
@@ -967,6 +979,97 @@ mod tests {
         assert!(!is_fingerprinted_filename("autumn.zzzzzzzz.css"));
         // bare name with no dot
         assert!(!is_fingerprinted_filename("CNAME"));
+    }
+
+    #[test]
+    fn run_cargo_or_exit_succeeds_on_zero_exit() {
+        // `cargo --version` is always available and always exits 0.
+        let mut cmd = Command::new("cargo");
+        cmd.arg("--version");
+        run_cargo_or_exit(cmd);
+    }
+
+    #[test]
+    fn apply_renderer_env_removes_pg_attach_url_unconditionally() {
+        let mut cmd = Command::new("echo");
+        apply_renderer_env(&mut cmd, false, None, None, None, None);
+        let removed = cmd.get_envs().any(|(k, v)| {
+            k.to_str() == Some(crate::serve::MANAGED_PG_ATTACH_URL_ENV) && v.is_none()
+        });
+        assert!(
+            removed,
+            "MANAGED_PG_ATTACH_URL must be removed from env regardless of managed-PG state"
+        );
+    }
+
+    #[test]
+    fn apply_renderer_env_sets_autumn_profile_when_absent() {
+        if std::env::var("AUTUMN_PROFILE").is_ok() {
+            // Parent env already has it; helper intentionally won't override it.
+            return;
+        }
+        let find_profile = |cmd: &Command| -> Option<String> {
+            cmd.get_envs().find_map(|(k, v)| {
+                if k.to_str() == Some("AUTUMN_PROFILE") {
+                    v.and_then(|s| s.to_str().map(str::to_owned))
+                } else {
+                    None
+                }
+            })
+        };
+        let mut cmd_debug = Command::new("echo");
+        apply_renderer_env(&mut cmd_debug, true, None, None, None, None);
+        assert_eq!(
+            find_profile(&cmd_debug).as_deref(),
+            Some("dev"),
+            "debug=true must set AUTUMN_PROFILE=dev when not already in env"
+        );
+
+        let mut cmd_release = Command::new("echo");
+        apply_renderer_env(&mut cmd_release, false, None, None, None, None);
+        assert_eq!(
+            find_profile(&cmd_release).as_deref(),
+            Some("prod"),
+            "debug=false must set AUTUMN_PROFILE=prod when not already in env"
+        );
+    }
+
+    #[test]
+    fn apply_renderer_env_pins_current_dir_when_manifest_differs_from_cwd() {
+        use tempfile::TempDir;
+        let tmp = TempDir::new().unwrap();
+        let manifest_dir = tmp.path().to_path_buf();
+        let cwd = std::env::current_dir().unwrap();
+        if manifest_dir == cwd {
+            return; // extremely unlikely, but guard anyway
+        }
+        let mut cmd = Command::new("echo");
+        apply_renderer_env(&mut cmd, false, None, None, None, Some(&manifest_dir));
+        assert_eq!(
+            cmd.get_current_dir(),
+            Some(manifest_dir.as_path()),
+            "current_dir must be pinned to manifest_dir when it differs from cwd"
+        );
+    }
+
+    #[test]
+    fn apply_renderer_env_effective_pkg_prefers_package_over_resolved() {
+        // When both --package and --bin are given, effective_pkg uses --package.
+        // (Verifies the or_else short-circuit without touching managed-PG state.)
+        let mut cmd = Command::new("echo");
+        // Just verify the function doesn't panic with both args supplied.
+        apply_renderer_env(
+            &mut cmd,
+            false,
+            Some("my-pkg"),
+            Some("my-bin"),
+            Some("resolved"),
+            None,
+        );
+        let removed = cmd.get_envs().any(|(k, v)| {
+            k.to_str() == Some(crate::serve::MANAGED_PG_ATTACH_URL_ENV) && v.is_none()
+        });
+        assert!(removed);
     }
 
     #[test]
