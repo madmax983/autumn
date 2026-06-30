@@ -1035,7 +1035,7 @@ mkdir -p src-tauri/binaries
 {fingerprint}# universal-apple-darwin: build both Darwin slices and lipo them together.
 if [ "${{TARGET_TRIPLE}}" = "universal-apple-darwin" ]; then
     for ARCH in x86_64-apple-darwin aarch64-apple-darwin; do
-        cargo build --release --target "$ARCH" --bin {bin_name} \
+        cargo build --release -p {package_name} --target "$ARCH" --bin {bin_name} \
           --features {embed_feature}
     done
     lipo -create -output "src-tauri/binaries/{bin_name}-universal-apple-darwin" \
@@ -1043,7 +1043,7 @@ if [ "${{TARGET_TRIPLE}}" = "universal-apple-darwin" ]; then
       "${{TARGET_DIR}}/aarch64-apple-darwin/release/{bin_name}"
     echo "Staged (universal): src-tauri/binaries/{bin_name}-universal-apple-darwin"
 else
-    cargo build --release --target "${{TARGET_TRIPLE}}" --bin {bin_name} \
+    cargo build --release -p {package_name} --target "${{TARGET_TRIPLE}}" --bin {bin_name} \
       --features {embed_feature}
     cp "${{TARGET_DIR}}/${{TARGET_TRIPLE}}/release/{bin_name}" \
        "src-tauri/binaries/{bin_name}-${{TARGET_TRIPLE}}"
@@ -1105,6 +1105,11 @@ done
 # Note: decryption at runtime requires the AUTUMN_MASTER_KEY env var (or the
 # .autumn-master-key key file placed in the resource dir).  See the Tauri section
 # of the Autumn docs for recommended key distribution strategies.
+# Remove and recreate the staging directory so stale .toml.enc files from a
+# previous build (deleted or rotated credentials) are not carried into the
+# installer.  Autumn loads any .toml.enc it finds via AUTUMN_MANIFEST_DIR, so
+# a stale file from a prior build would silently keep a revoked secret active.
+rm -rf src-tauri/configs/credentials
 mkdir -p src-tauri/configs/credentials
 if [ -d "config/credentials" ]; then
     cp -r config/credentials/. src-tauri/configs/credentials/
@@ -1160,7 +1165,7 @@ if (-not $TargetDir) {{
     $TargetDir = (cargo metadata --no-deps --format-version 1 --quiet | ConvertFrom-Json).target_directory
 }}
 {fingerprint}New-Item -ItemType Directory -Force -Path src-tauri\binaries | Out-Null
-cargo build --release --target "$TargetTriple" --bin {bin_name} `
+cargo build --release -p {package_name} --target "$TargetTriple" --bin {bin_name} `
   --features {embed_feature}
 Copy-Item "$TargetDir\$TargetTriple\release\{bin_name}.exe" `
           "src-tauri\binaries\{bin_name}-$TargetTriple.exe"
@@ -1221,6 +1226,13 @@ foreach ($f in @("autumn-staging.toml", "autumn-test.toml")) {{
 # Note: decryption at runtime requires the AUTUMN_MASTER_KEY env var (or the
 # .autumn-master-key key file placed in the resource dir).  See the Tauri section
 # of the Autumn docs for recommended key distribution strategies.
+# Remove and recreate the staging directory so stale .toml.enc files from a
+# previous build (deleted or rotated credentials) are not carried into the
+# installer.  Autumn loads any .toml.enc it finds via AUTUMN_MANIFEST_DIR, so
+# a stale file from a prior build would silently keep a revoked secret active.
+if (Test-Path "src-tauri\configs\credentials") {{
+    Remove-Item -Recurse -Force "src-tauri\configs\credentials"
+}}
 New-Item -ItemType Directory -Force -Path "src-tauri\configs\credentials" | Out-Null
 if (Test-Path "config\credentials") {{
     Copy-Item -Recurse -Force "config\credentials\*" "src-tauri\configs\credentials\"
@@ -3409,6 +3421,44 @@ mod tests {
             sh.contains("AUTUMN_MASTER_KEY"),
             "stage-sidecar.sh must mention AUTUMN_MASTER_KEY so developers know how \
              to provide the decryption key for bundled .toml.enc credential files"
+        );
+    }
+
+    #[test]
+    fn staging_sh_clears_credentials_before_copying() {
+        let sh = render_stage_sidecar_sh("my-app", "my-app", true, "autumn-web");
+        // Stale .toml.enc files from a prior build (deleted or rotated credentials)
+        // must not survive into the next installer.  The staging directory must be
+        // removed and recreated, not merely appended to.
+        assert!(
+            sh.contains("rm -rf") && sh.contains("configs/credentials"),
+            "stage-sidecar.sh must remove src-tauri/configs/credentials/ before \
+             recreating it so revoked or renamed .toml.enc files from prior builds \
+             are not silently bundled into the next installer"
+        );
+        // rm -rf must come before the mkdir that follows it.
+        let rm_pos = sh.find("rm -rf").unwrap_or(usize::MAX);
+        let mkdir_pos = sh
+            .find("mkdir -p src-tauri/configs/credentials")
+            .unwrap_or(usize::MAX);
+        assert!(
+            rm_pos < mkdir_pos,
+            "stage-sidecar.sh must rm -rf credentials dir BEFORE mkdir; \
+             otherwise the directory is never actually cleared"
+        );
+    }
+
+    #[test]
+    fn staging_sh_passes_package_flag_to_cargo_build() {
+        let sh = render_stage_sidecar_sh("my-app", "my-app", true, "autumn-web");
+        // In workspaces where `default-members` excludes the root package,
+        // `cargo build --bin <name>` fails unless `-p <package>` is also passed.
+        // The fingerprint phase already passes -p; the final cargo build must too.
+        assert!(
+            sh.contains("-p my-app"),
+            "stage-sidecar.sh must pass `-p my-app` to cargo build so the correct \
+             package is selected in workspaces where default-members excludes it; \
+             without -p, Cargo may report 'no bin target named ...' for valid workspaces"
         );
     }
 
