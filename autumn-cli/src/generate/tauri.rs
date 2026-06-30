@@ -330,7 +330,7 @@ fn resolve_bin_name(
         // explicit entry.
         let auto_bin_count = if autobins {
             std::fs::read_dir(project_root.join("src/bin"))
-                .map(|entries| {
+                .map_or(0, |entries| {
                     entries
                         .filter_map(std::result::Result::ok)
                         .filter(|e| {
@@ -340,7 +340,6 @@ fn resolve_bin_name(
                         })
                         .count()
                 })
-                .unwrap_or(0)
         } else {
             0
         };
