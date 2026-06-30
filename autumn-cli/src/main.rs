@@ -877,7 +877,7 @@ enum MigrateCommands {
     ///   # Revert the last 3 applied user migrations:
     ///   autumn migrate down --steps 3
     ///
-    ///   # Revert until <version> is the latest applied:
+    ///   # Revert until VERSION is the latest applied:
     ///   autumn migrate down --to 20260101000000
     ///
     ///   # Required when the active profile is prod/production:
@@ -1577,12 +1577,12 @@ enum GenerateCommands {
     ///
     /// Example:
     ///
-    ///   autumn generate system-test <Name>
-    ///   autumn generate system-test <Name> --dry-run
+    ///   autumn generate system-test NAME
+    ///   autumn generate system-test NAME --dry-run
     ///
     /// After generation, run with:
     ///
-    ///   cargo test --features system-tests --test <name> -- --include-ignored
+    ///   cargo test --features system-tests --test NAME -- --include-ignored
     #[command(name = "system-test", verbatim_doc_comment)]
     SystemTest {
         /// Test name (`PascalCase` or `snake_case`, e.g. `TodoFlow`).
