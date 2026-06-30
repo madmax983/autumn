@@ -154,6 +154,22 @@ fn normalize_expires_at_utc(s: &str) -> String {
             }
         }
     }
+    // Hour-only offset forms (ISO 8601 allows ±HH with no minutes, e.g.
+    // "2026-12-31T23:59:59-05" or "2026-12-31 23:59:59-05"). Expand the
+    // offset to ±HH:00 and re-run so the existing parsers handle the rest.
+    // Termination is guaranteed: the expanded string ends with ±HH:MM so
+    // `b[n-3]` will be `:`, not `+`/`-`, and this branch is not re-entered.
+    {
+        let b = s.as_bytes();
+        let n = b.len();
+        if n >= 4
+            && matches!(b[n - 3], b'+' | b'-')
+            && b[n - 2].is_ascii_digit()
+            && b[n - 1].is_ascii_digit()
+        {
+            return normalize_expires_at_utc(&format!("{s}:00"));
+        }
+    }
     // Offset-aware formats not accepted by `parse_from_rfc3339`:
     //   - compact offset (e.g. "2026-12-31T23:59:59-0500" from `date +%Y-%m-%dT%H:%M:%S%z`)
     //   - space-separated SQL form with extended or compact offset
@@ -441,6 +457,24 @@ mod tests {
         // Space separator + compact offset: "2026-12-31 23:59:59-0500"
         assert_eq!(
             normalize_expires_at_utc("2026-12-31 23:59:59-0500"),
+            "2027-01-01T04:59:59"
+        );
+    }
+
+    #[test]
+    fn normalize_utc_hour_only_offset_t_separator() {
+        // ISO 8601 hour-only offset: "2026-12-31T23:59:59-05"; 23:59:59 UTC-5 = 04:59:59 UTC
+        assert_eq!(
+            normalize_expires_at_utc("2026-12-31T23:59:59-05"),
+            "2027-01-01T04:59:59"
+        );
+    }
+
+    #[test]
+    fn normalize_utc_hour_only_offset_space_separator() {
+        // SQL form with hour-only offset: "2026-12-31 23:59:59-05"
+        assert_eq!(
+            normalize_expires_at_utc("2026-12-31 23:59:59-05"),
             "2027-01-01T04:59:59"
         );
     }
