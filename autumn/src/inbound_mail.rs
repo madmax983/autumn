@@ -151,7 +151,7 @@ mod sns_verify {
         Some((content_start, len))
     }
 
-    /// Extract the DER-encoded SubjectPublicKeyInfo from a DER X.509 certificate.
+    /// Extract the DER-encoded `SubjectPublicKeyInfo` from a DER X.509 certificate.
     pub(super) fn extract_spki_from_der(cert_der: &[u8]) -> Option<Vec<u8>> {
         let mut pos = 0;
         // Certificate SEQUENCE
@@ -209,32 +209,29 @@ mod sns_verify {
         use sha2::Digest as _;
 
         let public_key = rsa::RsaPublicKey::from_public_key_der(spki_der).map_err(|_| ())?;
-        match sig_version {
-            "2" => {
-                let hash = sha2::Sha256::digest(message);
-                public_key
-                    .verify(Pkcs1v15Sign::new::<sha2::Sha256>(), &hash, sig)
-                    .map_err(|_| ())
-            }
-            _ => {
-                // SignatureVersion 1 uses SHA-1.
-                // sha1 0.10 uses const-oid 0.10.x while rsa 0.9 uses const-oid 0.9.x,
-                // so Pkcs1v15Sign::new::<sha1::Sha1>() fails to compile.  Work around
-                // the version split by using new_unprefixed() and prepending the
-                // DigestInfo DER structure (RFC 3447 §9.2) manually.
-                use sha1::Digest as _;
-                let hash = sha1::Sha1::digest(message);
-                // SHA-1 DigestInfo prefix: SEQUENCE { SEQUENCE { OID sha1, NULL }, OCTET STRING }
-                const SHA1_DI_PREFIX: &[u8] = &[
-                    0x30, 0x21, 0x30, 0x09, 0x06, 0x05, 0x2b, 0x0e, 0x03, 0x02, 0x1a, 0x05, 0x00,
-                    0x04, 0x14,
-                ];
-                let mut digest_info = SHA1_DI_PREFIX.to_vec();
-                digest_info.extend_from_slice(&hash);
-                public_key
-                    .verify(Pkcs1v15Sign::new_unprefixed(), &digest_info, sig)
-                    .map_err(|_| ())
-            }
+        if sig_version == "2" {
+            let hash = sha2::Sha256::digest(message);
+            public_key
+                .verify(Pkcs1v15Sign::new::<sha2::Sha256>(), &hash, sig)
+                .map_err(|_| ())
+        } else {
+            // SignatureVersion 1 uses SHA-1.
+            // sha1 0.10 uses const-oid 0.10.x while rsa 0.9 uses const-oid 0.9.x,
+            // so Pkcs1v15Sign::new::<sha1::Sha1>() fails to compile.  Work around
+            // the version split by using new_unprefixed() and prepending the
+            // DigestInfo DER structure (RFC 3447 §9.2) manually.
+            use sha1::Digest as _;
+            let hash = sha1::Sha1::digest(message);
+            // SHA-1 DigestInfo prefix: SEQUENCE { SEQUENCE { OID sha1, NULL }, OCTET STRING }
+            const SHA1_DI_PREFIX: &[u8] = &[
+                0x30, 0x21, 0x30, 0x09, 0x06, 0x05, 0x2b, 0x0e, 0x03, 0x02, 0x1a, 0x05, 0x00,
+                0x04, 0x14,
+            ];
+            let mut digest_info = SHA1_DI_PREFIX.to_vec();
+            digest_info.extend_from_slice(&hash);
+            public_key
+                .verify(Pkcs1v15Sign::new_unprefixed(), &digest_info, sig)
+                .map_err(|_| ())
         }
     }
 
