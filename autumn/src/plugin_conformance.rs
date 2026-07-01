@@ -350,17 +350,21 @@ pub fn check_route_prefix(
 /// Both named params (`{id}`) and catch-all params (`{*rest}`) normalize to
 /// `{}`. matchit (Axum's router) treats a named param and a catch-all at the
 /// same path position as a conflict, so they must map to the same key.
+///
+/// ⚡ Bolt: Optimization - Pre-allocates capacity and removes intermediate `Vec` allocation.
 fn normalize_path_for_collision(path: &str) -> String {
-    path.split('/')
-        .map(|seg| {
-            if seg.starts_with('{') && seg.ends_with('}') {
-                "{}"
-            } else {
-                seg
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("/")
+    let mut out = String::with_capacity(path.len());
+    for (i, seg) in path.split('/').enumerate() {
+        if i > 0 {
+            out.push('/');
+        }
+        if seg.starts_with('{') && seg.ends_with('}') {
+            out.push_str("{}");
+        } else {
+            out.push_str(seg);
+        }
+    }
+    out
 }
 
 /// Detect route collisions: any two routes sharing the same (method, path) pair.
