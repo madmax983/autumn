@@ -63,7 +63,7 @@ impl std::error::Error for StringError {}
 
 /// JSON body for RFC 7807 Problem Details responses.
 #[derive(Clone, Debug, Serialize)]
-pub struct ProblemDetails {
+pub(crate) struct ProblemDetails {
     /// Problem type URI. Autumn uses stable `https://autumn.dev/problems/...`
     /// URIs for framework-generated errors.
     #[serde(rename = "type")]
@@ -86,7 +86,7 @@ pub struct ProblemDetails {
 
 /// Field-level validation detail in the Problem Details `errors` extension.
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
-pub struct ProblemFieldError {
+pub(crate) struct ProblemFieldError {
     /// Field name as seen by the request payload or form.
     pub field: String,
     /// Stable list of validation messages for this field.
@@ -704,18 +704,6 @@ impl std::fmt::Debug for AutumnError {
                 &self.cache_idempotency_response,
             )
             .finish_non_exhaustive()
-    }
-}
-
-impl ProblemDetails {
-    /// Build a Problem Details payload from framework error metadata.
-    #[must_use]
-    pub fn new(
-        status: StatusCode,
-        detail: impl Into<String>,
-        details: Option<&std::collections::HashMap<String, Vec<String>>>,
-    ) -> Self {
-        problem_details(status, detail.into(), details, None, None, None, true)
     }
 }
 

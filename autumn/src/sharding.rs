@@ -44,7 +44,7 @@ use diesel_async::pooled_connection::deadpool::Pool;
 pub use crate::config::SLOT_COUNT;
 use crate::config::{ConfigError, DatabaseConfig, ReplicaFallback};
 use crate::db::{DatabaseTopology, PoolError};
-use crate::error::AutumnError;
+use crate::error::{AutumnError, AutumnResult};
 
 /// Index of a physical shard within the configured shard set.
 ///
@@ -180,7 +180,7 @@ pub trait ShardRouter: Send + Sync + 'static {
         &'a self,
         key: ShardKey<'a>,
         shards: &'a ShardSet,
-    ) -> futures::future::BoxFuture<'a, Result<ShardId, AutumnError>>;
+    ) -> futures::future::BoxFuture<'a, AutumnResult<ShardId>>;
 }
 
 /// `Arc<R>` routes through its inner router. This lets a caller build a single
@@ -196,7 +196,7 @@ impl<R: ShardRouter + ?Sized> ShardRouter for Arc<R> {
         &'a self,
         key: ShardKey<'a>,
         shards: &'a ShardSet,
-    ) -> futures::future::BoxFuture<'a, Result<ShardId, AutumnError>> {
+    ) -> futures::future::BoxFuture<'a, AutumnResult<ShardId>> {
         (**self).route(key, shards)
     }
 }
@@ -211,7 +211,7 @@ impl ShardRouter for HashShardRouter {
         &'a self,
         key: ShardKey<'a>,
         shards: &'a ShardSet,
-    ) -> futures::future::BoxFuture<'a, Result<ShardId, AutumnError>> {
+    ) -> futures::future::BoxFuture<'a, AutumnResult<ShardId>> {
         let slot = shards.slot_for_key(key);
         Box::pin(std::future::ready(
             shards
@@ -571,7 +571,7 @@ impl ShardRouter for DirectoryShardRouter {
         &'a self,
         key: ShardKey<'a>,
         shards: &'a ShardSet,
-    ) -> futures::future::BoxFuture<'a, Result<ShardId, AutumnError>> {
+    ) -> futures::future::BoxFuture<'a, AutumnResult<ShardId>> {
         Box::pin(async move {
             // Only string keys participate in the directory (tenants are
             // strings); numeric/byte keys route straight through the fallback.
@@ -1503,7 +1503,7 @@ fn no_shards_configured() -> AutumnError {
 fn cross_shard_seed(
     set: &ShardSet,
     ctx: &crate::db::RequestDbContext,
-) -> Result<ShardRepositorySeed, AutumnError> {
+) -> AutumnResult<ShardRepositorySeed> {
     let shard = set.iter().next().ok_or_else(no_shards_configured)?;
     let mut seed =
         ShardRepositorySeed::from_ctx(shard.primary_pool(), ctx, shard.name(), shard.read_route());
@@ -1700,10 +1700,10 @@ impl Shards {
     ///     })
     ///     .await;
     /// ```
-    pub async fn each_shard<T, Fut, F>(&self, f: F) -> Vec<(ShardId, Result<T, AutumnError>)>
+    pub async fn each_shard<T, Fut, F>(&self, f: F) -> Vec<(ShardId, AutumnResult<T>)>
     where
         T: Send,
-        Fut: std::future::Future<Output = Result<T, AutumnError>> + Send,
+        Fut: std::future::Future<Output = AutumnResult<T>> + Send,
         F: Fn(&Shard, crate::db::Db) -> Fut + Send + Sync,
     {
         // FuturesUnordered keeps the pipeline full at FAN_OUT_CONCURRENCY
@@ -1714,12 +1714,11 @@ impl Shards {
         // for Send.
         use futures::StreamExt as _;
 
-        let mut results: Vec<Option<(ShardId, Result<T, AutumnError>)>> =
-            std::iter::repeat_with(|| None)
-                .take(self.set.len())
-                .collect();
+        let mut results: Vec<Option<(ShardId, AutumnResult<T>)>> = std::iter::repeat_with(|| None)
+            .take(self.set.len())
+            .collect();
         let mut in_flight: futures::stream::FuturesUnordered<
-            futures::future::BoxFuture<'_, (ShardId, Result<T, AutumnError>)>,
+            futures::future::BoxFuture<'_, (ShardId, AutumnResult<T>)>,
         > = futures::stream::FuturesUnordered::new();
 
         for shard in self.set.iter() {
@@ -1736,14 +1735,10 @@ impl Shards {
         results.into_iter().flatten().collect()
     }
 
-    async fn run_on_shard<T, Fut, F>(
-        &self,
-        shard: &Shard,
-        f: &F,
-    ) -> (ShardId, Result<T, AutumnError>)
+    async fn run_on_shard<T, Fut, F>(&self, shard: &Shard, f: &F) -> (ShardId, AutumnResult<T>)
     where
         T: Send,
-        Fut: std::future::Future<Output = Result<T, AutumnError>> + Send,
+        Fut: std::future::Future<Output = AutumnResult<T>> + Send,
         F: Fn(&Shard, crate::db::Db) -> Fut + Send + Sync,
     {
         let result = match self.checkout_primary(shard).await {
@@ -1919,7 +1914,7 @@ impl ShardedDb {
     /// # Errors
     ///
     /// See [`Db::tx`](crate::db::Db::tx).
-    pub async fn tx<'a, T, E, F>(&'a mut self, f: F) -> Result<T, AutumnError>
+    pub async fn tx<'a, T, E, F>(&'a mut self, f: F) -> AutumnResult<T>
     where
         T: Send + 'a,
         E: From<diesel::result::Error> + Send + Sync + 'a,
@@ -2145,7 +2140,7 @@ impl axum::extract::FromRequestParts<crate::AppState> for ShardedReadDb {
 async fn resolve_shard_key(
     parts: &mut axum::http::request::Parts,
     state: &crate::AppState,
-) -> Result<String, AutumnError> {
+) -> AutumnResult<String> {
     if let Some(overridden) = parts.extensions.get::<ShardKeyOverride>() {
         return Ok(overridden.0.clone());
     }
@@ -2750,7 +2745,7 @@ mod tests {
                 &'a self,
                 _key: ShardKey<'a>,
                 _shards: &'a ShardSet,
-            ) -> futures::future::BoxFuture<'a, Result<ShardId, AutumnError>> {
+            ) -> futures::future::BoxFuture<'a, AutumnResult<ShardId>> {
                 Box::pin(std::future::ready(Ok(ShardId(99))))
             }
         }
