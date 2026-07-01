@@ -2378,7 +2378,7 @@ mod tests {
         .into_string();
         assert!(html.contains(r#"class="card wide""#), "{html}");
         assert!(html.contains("<h3"), "{html}");
-        assert!(html.contains("T"), "{html}");
+        assert!(html.contains('T'), "{html}");
     }
 
     // ── card structure ─────────────────────────────────────────────────
