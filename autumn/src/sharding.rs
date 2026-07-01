@@ -2025,6 +2025,7 @@ impl axum::extract::FromRequestParts<crate::AppState> for ShardedDb {
         );
         let shard_set = shards.set.clone();
         let db = shards.checkout_primary(shard).await?;
+        crate::read_your_writes::mark_write();
         Ok(Self {
             db,
             shard_name,
