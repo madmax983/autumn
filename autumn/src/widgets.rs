@@ -1229,13 +1229,31 @@ impl<'a> CardConfig<'a> {
     }
 }
 
-/// Build the `class` string for the root card element, merging the base `"card"`
-/// with any caller-supplied extra classes.
+/// Build a root element's `class` string, merging `base` with any
+/// caller-supplied extra class. Shared by every widget with a `.class()`
+/// escape hatch (`card`, `hero`, ...).
 #[cfg(feature = "maud")]
-fn merge_class(extra: Option<&str>) -> String {
+fn merge_class(base: &str, extra: Option<&str>) -> String {
     match extra {
-        Some(e) if !e.is_empty() => format!("card {e}"),
-        _ => "card".to_string(),
+        Some(e) if !e.is_empty() => format!("{base} {e}"),
+        _ => base.to_string(),
+    }
+}
+
+/// Render `content` inside the `<h1>`–`<h6>` element selected by `level`, with
+/// `class` applied. Shared by every widget with a configurable heading level
+/// (`card`, `hero`, ...) so an `HeadingLevel` variant is matched in one place.
+#[cfg(feature = "maud")]
+fn heading(level: HeadingLevel, class: &str, content: &maud::Markup) -> maud::Markup {
+    maud::html! {
+        @match level {
+            HeadingLevel::H1 => h1 class=(class) { (content) },
+            HeadingLevel::H2 => h2 class=(class) { (content) },
+            HeadingLevel::H3 => h3 class=(class) { (content) },
+            HeadingLevel::H4 => h4 class=(class) { (content) },
+            HeadingLevel::H5 => h5 class=(class) { (content) },
+            HeadingLevel::H6 => h6 class=(class) { (content) },
+        }
     }
 }
 
@@ -1297,21 +1315,14 @@ fn merge_class(extra: Option<&str>) -> String {
 #[cfg(feature = "maud")]
 #[must_use]
 pub fn card(body: &maud::Markup, config: &CardConfig<'_>) -> maud::Markup {
-    let root_class = merge_class(config.class);
+    let root_class = merge_class("card", config.class);
     let has_header = config.title.is_some() || config.header_action.is_some();
     maud::html! {
         div class=(root_class) {
             @if has_header {
                 div class="card-header" {
                     @if let Some(title) = &config.title {
-                        @match config.level {
-                            HeadingLevel::H1 => h1 class="card-title" { (title) },
-                            HeadingLevel::H2 => h2 class="card-title" { (title) },
-                            HeadingLevel::H3 => h3 class="card-title" { (title) },
-                            HeadingLevel::H4 => h4 class="card-title" { (title) },
-                            HeadingLevel::H5 => h5 class="card-title" { (title) },
-                            HeadingLevel::H6 => h6 class="card-title" { (title) },
-                        }
+                        (heading(config.level, "card-title", title))
                     }
                     @if let Some(action) = &config.header_action {
                         (action)
@@ -1384,36 +1395,39 @@ pub enum CtaStyle {
 
 /// A single call-to-action link rendered by [`hero`].
 ///
-/// Build with [`Cta::primary`] or [`Cta::secondary`].
+/// Build with [`Cta::primary`] or [`Cta::secondary`]. `label` and `href`
+/// accept anything convertible to `String` (a `&str` literal or an owned
+/// `String` built from request data, e.g. `format!("/posts/{id}")`) so
+/// building a CTA from computed values never fights the borrow checker.
 #[cfg(feature = "maud")]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Cta<'a> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Cta {
     /// Visible link text. HTML-escaped by Maud.
-    pub label: &'a str,
+    pub label: String,
     /// Link target URL.
-    pub href: &'a str,
+    pub href: String,
     /// Visual style hint (default [`CtaStyle::Primary`]).
     pub style: CtaStyle,
 }
 
 #[cfg(feature = "maud")]
-impl<'a> Cta<'a> {
+impl Cta {
     /// Create a primary call-to-action link.
     #[must_use]
-    pub const fn primary(label: &'a str, href: &'a str) -> Self {
+    pub fn primary(label: impl Into<String>, href: impl Into<String>) -> Self {
         Self {
-            label,
-            href,
+            label: label.into(),
+            href: href.into(),
             style: CtaStyle::Primary,
         }
     }
 
     /// Create a secondary call-to-action link.
     #[must_use]
-    pub const fn secondary(label: &'a str, href: &'a str) -> Self {
+    pub fn secondary(label: impl Into<String>, href: impl Into<String>) -> Self {
         Self {
-            label,
-            href,
+            label: label.into(),
+            href: href.into(),
             style: CtaStyle::Secondary,
         }
     }
@@ -1438,7 +1452,7 @@ impl<'a> Cta<'a> {
 /// ```
 #[cfg(feature = "maud")]
 #[derive(Debug, Clone)]
-pub struct HeroConfig<'a> {
+pub struct HeroConfig {
     /// Headline text/markup, rendered in a single top-level heading element.
     title: maud::Markup,
     /// Heading level for the title element (default [`HeadingLevel::H1`]).
@@ -1446,13 +1460,13 @@ pub struct HeroConfig<'a> {
     /// Optional subtitle/lede rendered below the title.
     subtitle: Option<maud::Markup>,
     /// Zero or more call-to-action links rendered below the subtitle.
-    ctas: Vec<Cta<'a>>,
+    ctas: Vec<Cta>,
     /// Extra CSS class(es) appended to the root `autumn-hero` element.
-    class: Option<&'a str>,
+    class: Option<String>,
 }
 
 #[cfg(feature = "maud")]
-impl<'a> HeroConfig<'a> {
+impl HeroConfig {
     /// Create a new hero configuration with the required `title`, heading
     /// level `H1`, and no subtitle or CTAs.
     #[must_use]
@@ -1504,15 +1518,15 @@ impl<'a> HeroConfig<'a> {
     /// Append a call-to-action link. May be called multiple times; an empty
     /// CTA list is valid and renders no button container.
     #[must_use]
-    pub fn cta(mut self, cta: Cta<'a>) -> Self {
+    pub fn cta(mut self, cta: Cta) -> Self {
         self.ctas.push(cta);
         self
     }
 
     /// Add extra CSS class(es) to the root `autumn-hero` element.
     #[must_use]
-    pub const fn class(mut self, class: &'a str) -> Self {
-        self.class = Some(class);
+    pub fn class(mut self, class: impl Into<String>) -> Self {
+        self.class = Some(class.into());
         self
     }
 }
@@ -1554,21 +1568,11 @@ impl<'a> HeroConfig<'a> {
 /// ```
 #[cfg(feature = "maud")]
 #[must_use]
-pub fn hero(config: &HeroConfig<'_>) -> maud::Markup {
-    let root_class = match config.class {
-        Some(c) if !c.is_empty() => format!("autumn-hero {c}"),
-        _ => "autumn-hero".to_string(),
-    };
+pub fn hero(config: &HeroConfig) -> maud::Markup {
+    let root_class = merge_class("autumn-hero", config.class.as_deref());
     maud::html! {
         section class=(root_class) {
-            @match config.level {
-                HeadingLevel::H1 => h1 class="autumn-hero__title" { (config.title) },
-                HeadingLevel::H2 => h2 class="autumn-hero__title" { (config.title) },
-                HeadingLevel::H3 => h3 class="autumn-hero__title" { (config.title) },
-                HeadingLevel::H4 => h4 class="autumn-hero__title" { (config.title) },
-                HeadingLevel::H5 => h5 class="autumn-hero__title" { (config.title) },
-                HeadingLevel::H6 => h6 class="autumn-hero__title" { (config.title) },
-            }
+            (heading(config.level, "autumn-hero__title", &config.title))
             @if let Some(subtitle) = &config.subtitle {
                 p class="autumn-hero__subtitle" { (subtitle) }
             }
@@ -2744,19 +2748,18 @@ mod tests {
     }
 
     // ── hero ─────────────────────────────────────────────────────────────
-    // RED phase (issue #1123): these tests target the not-yet-implemented
-    // `hero`/`HeroConfig`/`Cta`/`CtaStyle` API and are expected to fail to
-    // compile until the widget is implemented.
 
     #[test]
     fn hero_title_only() {
         let html = hero(&HeroConfig::new("Welcome")).into_string();
         assert!(html.contains("Welcome"), "{html}");
+        assert!(html.contains(r#"class="autumn-hero""#), "{html}");
         // Single top-level heading, no subtitle, no CTA container.
         assert!(html.contains("<h1"), "{html}");
         assert_eq!(html.matches("<h1").count(), 1, "{html}");
         assert!(!html.contains("autumn-hero__subtitle"), "{html}");
         assert!(!html.contains("autumn-hero__actions"), "{html}");
+        assert!(!html.contains("<a"), "{html}");
     }
 
     #[test]
@@ -2765,7 +2768,6 @@ mod tests {
         assert!(html.contains("Welcome"), "{html}");
         assert!(html.contains(r#"class="autumn-hero__subtitle""#), "{html}");
         assert!(html.contains("A tagline"), "{html}");
-        assert!(!html.contains("autumn-hero__actions"), "{html}");
     }
 
     #[test]
@@ -2784,13 +2786,6 @@ mod tests {
         assert!(html.contains("Learn more"), "{html}");
         assert!(html.contains("autumn-hero__cta--primary"), "{html}");
         assert!(html.contains("autumn-hero__cta--secondary"), "{html}");
-    }
-
-    #[test]
-    fn hero_zero_ctas_no_button_container() {
-        let html = hero(&HeroConfig::new("Welcome")).into_string();
-        assert!(!html.contains("autumn-hero__actions"), "{html}");
-        assert!(!html.contains("<a"), "{html}");
     }
 
     #[test]
@@ -2823,9 +2818,23 @@ mod tests {
     }
 
     #[test]
-    fn hero_root_has_stable_css_hook() {
-        let html = hero(&HeroConfig::new("Welcome")).into_string();
-        assert!(html.contains(r#"class="autumn-hero""#), "{html}");
+    fn hero_cta_and_class_accept_owned_strings_built_inline() {
+        // Cta::primary/secondary and .class() take `impl Into<String>` so a
+        // caller can build them from owned data (e.g. a DB row) in the same
+        // expression, without a `let` binding to extend a temporary's lifetime.
+        let post_id = 42;
+        let html = hero(
+            &HeroConfig::new("Welcome")
+                .class(format!("theme-{post_id}"))
+                .cta(Cta::primary(
+                    format!("Read post {post_id}"),
+                    format!("/posts/{post_id}"),
+                )),
+        )
+        .into_string();
+        assert!(html.contains(r#"class="autumn-hero theme-42""#), "{html}");
+        assert!(html.contains(r#"href="/posts/42""#), "{html}");
+        assert!(html.contains("Read post 42"), "{html}");
     }
 
     #[test]
