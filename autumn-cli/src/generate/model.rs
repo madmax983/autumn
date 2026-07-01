@@ -111,24 +111,7 @@ pub fn plan_model_with_options(
 
     // When soft_delete is enabled, append a virtual `deleted_at` field so
     // the SQL migration and schema.rs block include the nullable column.
-    let schema_fields: std::borrow::Cow<[Field]> = if options.soft_delete {
-        if fields.iter().any(|f| f.name == "deleted_at") {
-            return Err(GenerateError::InvalidField {
-                token: "deleted_at".to_owned(),
-                reason: "'deleted_at' is managed by --soft-delete; remove it from the field list"
-                    .to_owned(),
-            });
-        }
-        let mut augmented = fields.clone();
-        augmented.push(Field {
-            name: "deleted_at".to_owned(),
-            kind: FieldKind::NaiveDateTime,
-            nullable: true,
-        });
-        std::borrow::Cow::Owned(augmented)
-    } else {
-        std::borrow::Cow::Borrowed(&fields)
-    };
+    let schema_fields = augment_fields_for_soft_delete(&fields, options.soft_delete)?;
 
     let mut plan = Plan::new(project_root);
 
@@ -200,6 +183,39 @@ pub fn plan_model_with_options(
     plan_cargo_deps(&mut plan, project_root, &deps);
 
     Ok(plan)
+}
+
+/// Append the virtual `deleted_at` column that `--soft-delete` models add to
+/// their migration and `schema.rs` block, matching what [`plan_model_with_options`]
+/// applies before rendering those files. Shared with the scaffold generator so
+/// the smoke test's throwaway table (built from the same field list) doesn't
+/// drift from the real migration's schema for soft-delete models.
+///
+/// # Errors
+/// Returns [`GenerateError::InvalidField`] when `soft_delete` is set and
+/// `fields` already declares a `deleted_at` field (that name is reserved for
+/// `--soft-delete`).
+pub(super) fn augment_fields_for_soft_delete(
+    fields: &[Field],
+    soft_delete: bool,
+) -> Result<std::borrow::Cow<'_, [Field]>, GenerateError> {
+    if !soft_delete {
+        return Ok(std::borrow::Cow::Borrowed(fields));
+    }
+    if fields.iter().any(|f| f.name == "deleted_at") {
+        return Err(GenerateError::InvalidField {
+            token: "deleted_at".to_owned(),
+            reason: "'deleted_at' is managed by --soft-delete; remove it from the field list"
+                .to_owned(),
+        });
+    }
+    let mut augmented = fields.to_vec();
+    augmented.push(Field {
+        name: "deleted_at".to_owned(),
+        kind: FieldKind::NaiveDateTime,
+        nullable: true,
+    });
+    Ok(std::borrow::Cow::Owned(augmented))
 }
 
 /// Direct dependencies the *model* generator's output requires at compile time.

@@ -970,7 +970,8 @@ fn add_feature_to_multiline_inline_table(
     Some(out)
 }
 
-/// Handle the dotted key form `autumn-web.* = ...` inside a `[dependencies]` section.
+/// Handle the dotted key form `autumn-web.* = ...` inside a dependency section
+/// (`[dependencies]` or `[dev-dependencies]`, per `section`).
 ///
 /// Looks for an existing `autumn-web.features` key in the section to splice into;
 /// if none is found, inserts one immediately after `dep_line_idx`.
@@ -980,10 +981,11 @@ fn patch_dotted_dep(
     existing: &str,
     feature: &str,
     feature_quoted: &str,
+    section: &str,
 ) -> String {
     let section_end = lines[dep_line_idx + 1..]
         .iter()
-        .position(|l| is_toml_table_header(l.trim()))
+        .position(|l| is_section_boundary(l.trim(), section))
         .map_or(lines.len(), |p| dep_line_idx + 1 + p);
 
     if lines[dep_line_idx..section_end].iter().any(|l| {
@@ -1047,22 +1049,36 @@ pub fn ensure_autumn_web_feature(existing: &str, feature: &str) -> String {
 /// was already present.
 #[must_use]
 pub fn ensure_autumn_web_feature_status(existing: &str, feature: &str) -> (String, bool) {
+    ensure_autumn_web_feature_status_in_section(existing, feature, "dependencies")
+}
+
+/// Like [`ensure_autumn_web_feature_status`], but targets an arbitrary
+/// dependency section (`"dependencies"` or `"dev-dependencies"`) instead of
+/// always assuming `[dependencies]`. Shared by [`ensure_autumn_web_feature_status`]
+/// and [`ensure_dev_dependency_test_support`] so both sections get the same
+/// handling of every `autumn-web` declaration shape (inline, dotted-key,
+/// multiline subtable, renamed/aliased dep).
+fn ensure_autumn_web_feature_status_in_section(
+    existing: &str,
+    feature: &str,
+    section: &str,
+) -> (String, bool) {
     let feature_quoted = format!("\"{feature}\"");
     let lines: Vec<&str> = existing.lines().collect();
-    let mut in_deps = false;
+    let mut in_section = false;
 
-    // Pass 1: inline form under [dependencies].
+    // Pass 1: inline form under the section header.
     for (i, &line) in lines.iter().enumerate() {
         let trimmed = line.trim();
-        if is_dependencies_header(trimmed) {
-            in_deps = true;
+        if is_section_header(trimmed, section) {
+            in_section = true;
             continue;
         }
-        if in_deps && is_toml_table_header(trimmed) {
-            in_deps = false;
+        if in_section && is_section_boundary(trimmed, section) {
+            in_section = false;
             continue;
         }
-        if !in_deps {
+        if !in_section {
             continue;
         }
         // Skip commented-out lines so that a commented dep like
@@ -1077,7 +1093,7 @@ pub fn ensure_autumn_web_feature_status(existing: &str, feature: &str) -> (Strin
             if rest.starts_with('.') {
                 // Dotted key form: autumn-web.workspace = true, autumn-web.features = [...], etc.
                 return (
-                    patch_dotted_dep(&lines, i, existing, feature, &feature_quoted),
+                    patch_dotted_dep(&lines, i, existing, feature, &feature_quoted, section),
                     true,
                 );
             }
@@ -1132,11 +1148,12 @@ pub fn ensure_autumn_web_feature_status(existing: &str, feature: &str) -> (Strin
         return (out, true);
     }
 
-    // Pass 2: multiline section form `[dependencies.autumn-web]`.
+    // Pass 2: multiline section form `[<section>.autumn-web]`.
+    let subtable_key = format!("[{section}.autumn-web]");
     for (i, &line) in lines.iter().enumerate() {
         // Strip trailing TOML line-comment before comparing the section header.
         let key_part = line.trim().split('#').next().unwrap_or("").trim();
-        if key_part != "[dependencies.autumn-web]" {
+        if key_part != subtable_key {
             continue;
         }
         return (
@@ -1145,10 +1162,10 @@ pub fn ensure_autumn_web_feature_status(existing: &str, feature: &str) -> (Strin
         );
     }
 
-    // Pass 2b: `[dependencies.autumn_web]` table section whose body declares
+    // Pass 2b: `[<section>.autumn_web]` table section whose body declares
     // `package = "autumn-web"` — Cargo's table-key form of a renamed dep.
-    if let Some(start) =
-        find_section_start_with_autumn_web_package(&lines, "[dependencies.autumn_web]")
+    let renamed_subtable_key = format!("[{section}.autumn_web]");
+    if let Some(start) = find_section_start_with_autumn_web_package(&lines, &renamed_subtable_key)
     {
         return (
             add_feature_to_deps_section(&lines, start, existing, feature, &feature_quoted),
@@ -1170,15 +1187,33 @@ pub fn ensure_autumn_web_feature_status(existing: &str, feature: &str) -> (Strin
 /// dependency in the build graph, so a *dev*-only entry is enough to light up
 /// `TestDb` for `cargo test` while release builds stay lean.
 ///
+/// Reuses [`ensure_autumn_web_feature_status_in_section`] for the "there's
+/// already an `autumn-web` entry in `[dev-dependencies]`" case, so every
+/// declaration shape that function understands for `[dependencies]` (inline,
+/// dotted-key `autumn-web.workspace = true`, multiline `[dev-dependencies.autumn-web]`
+/// subtable, renamed/aliased dep) is handled here too, instead of a
+/// less-capable reimplementation. Only the "no `autumn-web` entry yet" case is
+/// bespoke: unlike `[dependencies]` (which every `autumn new` project already
+/// declares `autumn-web` in), a fresh project's `[dev-dependencies]` has no
+/// `autumn-web` line at all, so this inserts one with an explicit version.
+///
 /// Idempotent: a second call is a no-op once the feature is present.
 #[must_use]
 pub fn ensure_dev_dependency_test_support(existing: &str, autumn_version: &str) -> String {
+    let (updated, found) =
+        ensure_autumn_web_feature_status_in_section(existing, "test-support", "dev-dependencies");
+    if found {
+        return updated;
+    }
+
     let feature_quoted = "\"test-support\"";
+    let new_dep_line =
+        format!("autumn-web = {{ version = \"{autumn_version}\", features = [{feature_quoted}] }}");
     let lines: Vec<&str> = existing.lines().collect();
 
     let Some(header_idx) = lines
         .iter()
-        .position(|l| is_dev_dependencies_header(l.trim()))
+        .position(|l| is_section_header(l.trim(), "dev-dependencies"))
     else {
         // No [dev-dependencies] section yet -- append one. (Every project
         // scaffolded by `autumn new` already has one for the `tokio` test
@@ -1191,72 +1226,24 @@ pub fn ensure_dev_dependency_test_support(existing: &str, autumn_version: &str) 
             out.push('\n');
         }
         out.push_str("[dev-dependencies]\n");
-        let _ = writeln!(
-            out,
-            "autumn-web = {{ version = \"{autumn_version}\", features = [{feature_quoted}] }}"
-        );
+        let _ = writeln!(out, "{new_dep_line}");
         return out;
     };
 
-    let section_end = lines[header_idx + 1..]
-        .iter()
-        .position(|l| {
-            let t = l.trim();
-            t.starts_with('[') && !t.starts_with("[dev-dependencies.")
-        })
-        .map_or(lines.len(), |offset| header_idx + 1 + offset);
-
-    for i in (header_idx + 1)..section_end {
-        let line = lines[i];
-        let trimmed = line.trim_start();
-        if trimmed.starts_with('#') {
-            continue;
-        }
-        let Some(rest) = trimmed.strip_prefix("autumn-web") else {
-            continue;
-        };
-        if rest.starts_with(|c: char| c != '=' && c != '.' && !c.is_whitespace()) {
-            continue;
-        }
-        // Idempotency check: strip any trailing TOML comment first.
-        let line_code = line.split_once('#').map_or(line, |(before, _)| before);
-        if line_code.contains(feature_quoted) {
-            return existing.to_owned();
-        }
-        let new_line = rewrite_dep_with_feature(line, "test-support");
-        let mut out = String::with_capacity(existing.len() + 32);
-        for (j, &l) in lines.iter().enumerate() {
-            out.push_str(if j == i { &new_line } else { l });
-            out.push('\n');
-        }
-        if !existing.ends_with('\n') {
-            out.pop();
-        }
-        return out;
-    }
-
-    // No existing `autumn-web` line in [dev-dependencies] -- insert one right
+    // Section exists but has no `autumn-web` line yet -- insert one right
     // after the section header.
     let mut out = String::with_capacity(existing.len() + 96);
     for (j, &l) in lines.iter().enumerate() {
         out.push_str(l);
         out.push('\n');
         if j == header_idx {
-            let _ = writeln!(
-                out,
-                "autumn-web = {{ version = \"{autumn_version}\", features = [{feature_quoted}] }}"
-            );
+            let _ = writeln!(out, "{new_dep_line}");
         }
     }
     if !existing.ends_with('\n') {
         out.pop();
     }
     out
-}
-
-fn is_dev_dependencies_header(trimmed: &str) -> bool {
-    const HEADER: &str = "[dev-dependencies]";
-    trimmed == HEADER || (trimmed.starts_with(HEADER) && trimmed[HEADER.len()..].trim_start().starts_with('#'))
 }
 
 /// Scan `lines` for a section header matching `key` (after stripping inline TOML comments)
@@ -1431,13 +1418,19 @@ fn rewrite_dep_with_feature(line: &str, feature: &str) -> String {
     line.to_owned()
 }
 
-fn is_dependencies_header(trimmed: &str) -> bool {
-    trimmed == "[dependencies]"
-        || trimmed.starts_with("[dependencies]") && trimmed[13..].trim_start().starts_with('#')
+/// True iff `trimmed` is the TOML section header `[section]`, with or without
+/// a trailing inline comment (e.g. `[dependencies] # shared deps`).
+fn is_section_header(trimmed: &str, section: &str) -> bool {
+    let header = format!("[{section}]");
+    trimmed == header
+        || (trimmed.starts_with(&header) && trimmed[header.len()..].trim_start().starts_with('#'))
 }
 
-fn is_toml_table_header(trimmed: &str) -> bool {
-    trimmed.starts_with('[') && !trimmed.starts_with("[dependencies.")
+/// True iff `trimmed` is a TOML table header that ends a scan of `section`'s
+/// body -- i.e. a `[...]` header other than a `[<section>.subtable]`, which is
+/// still part of the parent section rather than a new sibling table.
+fn is_section_boundary(trimmed: &str, section: &str) -> bool {
+    trimmed.starts_with('[') && !trimmed.starts_with(&format!("[{section}."))
 }
 
 /// SQL for adding a stored generated `search_vector` column and GIN index.
@@ -4027,6 +4020,64 @@ pub struct Comment {
         let updated = ensure_dev_dependency_test_support(cargo, "0.6");
         assert!(updated.contains("[dev-dependencies]"));
         assert!(updated.contains("\"test-support\""));
+    }
+
+    #[test]
+    fn dev_dependency_test_support_handles_dotted_key_form() {
+        // Regression test (code review, issue #1023): `autumn-web.workspace = true`
+        // must not be silently ignored -- that used to leave the Cargo.toml
+        // unmodified with no error, so the generated smoke test failed to
+        // compile with no hint why. Matches `patch_dotted_dep`'s established
+        // shape (see ensure_feature_dotted_workspace_inserts_features_line):
+        // a separate `autumn-web.features = [...]` dotted-key line, not a
+        // rewrite of the `.workspace = true` line itself.
+        let cargo = "[package]\nname=\"x\"\n\n[dev-dependencies]\nautumn-web.workspace = true\n";
+        let updated = ensure_dev_dependency_test_support(cargo, "0.6");
+        assert!(
+            updated.contains("\"test-support\""),
+            "must add test-support to a dotted-key autumn-web entry: {updated}"
+        );
+        assert!(
+            updated.contains("autumn-web.features"),
+            "must use the dotted key form: {updated}"
+        );
+        assert!(updated.contains("autumn-web.workspace = true"));
+    }
+
+    #[test]
+    fn dev_dependency_test_support_handles_subtable_form() {
+        // Regression test (code review, issue #1023): a `[dev-dependencies.autumn-web]`
+        // subtable used to go unrecognized, causing a second, conflicting
+        // `autumn-web = {...}` line to be inserted (a duplicate-key Cargo.toml).
+        let cargo =
+            "[package]\nname=\"x\"\n\n[dev-dependencies.autumn-web]\nversion = \"0.6\"\n";
+        let updated = ensure_dev_dependency_test_support(cargo, "0.6");
+        assert!(
+            updated.contains("test-support"),
+            "must add test-support to a subtable autumn-web entry: {updated}"
+        );
+        assert_eq!(
+            updated.matches("autumn-web").count(),
+            1,
+            "must not insert a duplicate autumn-web entry: {updated}"
+        );
+    }
+
+    #[test]
+    fn dev_dependency_test_support_reuses_shared_feature_logic() {
+        // The dev-dependencies path must go through the same
+        // ensure_autumn_web_feature_status_in_section as [dependencies] does,
+        // so it inherits every declaration shape that function already
+        // understands instead of a smaller reimplementation.
+        let (via_shared, found) = ensure_autumn_web_feature_status_in_section(
+            "[package]\nname=\"x\"\n\n[dev-dependencies]\nautumn-web = \"0.6\"\n",
+            "test-support",
+            "dev-dependencies",
+        );
+        assert!(found);
+        let via_public =
+            ensure_dev_dependency_test_support("[package]\nname=\"x\"\n\n[dev-dependencies]\nautumn-web = \"0.6\"\n", "0.6");
+        assert_eq!(via_shared, via_public);
     }
 
     // ── IdType-aware variants (issue #1400) ────────────────────────────────

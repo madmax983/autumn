@@ -166,11 +166,12 @@ fn extract_index_table_name(normalized: &str) -> Option<&str> {
     if name.is_empty() { None } else { Some(name) }
 }
 
-/// Split `sql` into individual statements, using `;` as the delimiter.
+/// Split `sql` into individual statements, using `;` as the delimiter. Each
+/// returned statement has its terminating `;` stripped.
 ///
 /// Dollar-quoted blocks (`$$…$$`, `$tag$…$tag$`) are kept intact so that
 /// semicolons inside a function body do not produce spurious fragments.
-fn split_statements(sql: &str) -> Vec<String> {
+pub fn split_statements(sql: &str) -> Vec<String> {
     let mut statements = Vec::new();
     let mut current = String::new();
     let mut i = 0;
