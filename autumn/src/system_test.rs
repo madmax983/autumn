@@ -94,9 +94,13 @@ const DEFAULT_HX_SETTLE_TIMEOUT: Duration = Duration::from_secs(2);
 /// Default assertion polling interval.
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
-/// Grace period `expect_no_console_errors` waits for any in-flight CDP
-/// console/exception events to be delivered before declaring the page clean.
-const CONSOLE_ERROR_GRACE: Duration = Duration::from_millis(300);
+/// Grace period `expect_no_console_errors` polls for any in-flight CDP
+/// console/exception events to be delivered before declaring the page
+/// clean. Generous relative to typical sub-10ms local CDP round-trips so it
+/// tolerates CI resource contention (Docker + Chromium + concurrent builds);
+/// an error observed at any point during the window still fails immediately
+/// rather than waiting out the rest of it.
+const CONSOLE_ERROR_GRACE: Duration = Duration::from_millis(500);
 
 // ── BrowserCheck ───────────────────────────────────────────────────────────
 
@@ -364,7 +368,7 @@ impl SystemTest {
         });
 
         // 4. Launch Chromium.
-        let browser = launch_browser(self.browser_timeout).await?;
+        let (browser, user_data_dir) = launch_browser(self.browser_timeout).await?;
 
         let artifact_dir = self
             .artifact_dir_override
@@ -372,8 +376,9 @@ impl SystemTest {
 
         Ok(SystemTestRunner {
             base_url,
-            browser,
+            browser: Some(browser),
             artifact_dir,
+            user_data_dir,
             hx_settle_timeout: self.hx_settle_timeout,
             _shutdown: Some(shutdown_tx),
             _server_handle: Some(server_handle),
@@ -391,15 +396,34 @@ impl SystemTest {
     /// (including [`Page::expect_no_console_errors`]) work identically to
     /// the in-process [`build`](Self::build) path.
     ///
+    /// Uses [`DEFAULT_BROWSER_TIMEOUT`]; use [`Self::attach_with_timeout`] to
+    /// override it (e.g. under CI resource contention).
+    ///
     /// # Errors
     /// - [`SystemTestError::BrowserNotFound`] when no Chromium binary is available.
     /// - [`SystemTestError::Browser`] for CDP launch/connect errors.
     pub async fn attach(base_url: impl Into<String>) -> Result<SystemTestRunner, SystemTestError> {
-        let browser = launch_browser(DEFAULT_BROWSER_TIMEOUT).await?;
+        Self::attach_with_timeout(base_url, DEFAULT_BROWSER_TIMEOUT).await
+    }
+
+    /// Like [`Self::attach`], but with an explicit browser-launch timeout
+    /// instead of [`DEFAULT_BROWSER_TIMEOUT`] — useful when the target
+    /// environment (e.g. several Postgres testcontainers and Chromium
+    /// competing for CPU in CI) makes the default too tight.
+    ///
+    /// # Errors
+    /// - [`SystemTestError::BrowserNotFound`] when no Chromium binary is available.
+    /// - [`SystemTestError::Browser`] for CDP launch/connect errors.
+    pub async fn attach_with_timeout(
+        base_url: impl Into<String>,
+        browser_timeout: Duration,
+    ) -> Result<SystemTestRunner, SystemTestError> {
+        let (browser, user_data_dir) = launch_browser(browser_timeout).await?;
         Ok(SystemTestRunner {
             base_url: base_url.into(),
-            browser,
+            browser: Some(browser),
             artifact_dir: default_artifact_dir(),
+            user_data_dir,
             hx_settle_timeout: DEFAULT_HX_SETTLE_TIMEOUT,
             _shutdown: None,
             _server_handle: None,
@@ -409,12 +433,15 @@ impl SystemTest {
 
 /// Locate and launch a managed headless Chromium, driving its CDP event loop
 /// in a background task. Shared by [`SystemTest::build`] and
-/// [`SystemTest::attach`].
-async fn launch_browser(browser_timeout: Duration) -> Result<Browser, SystemTestError> {
+/// [`SystemTest::attach`]. Returns the browser and the profile directory it
+/// was launched with, so the caller can remove it once the browser closes.
+async fn launch_browser(browser_timeout: Duration) -> Result<(Browser, PathBuf), SystemTestError> {
     let browser_path = find_chromium().ok_or_else(|| {
         let searched = browser_candidates();
         SystemTestError::BrowserNotFound { searched }
     })?;
+
+    let user_data_dir = unique_user_data_dir();
 
     let config = BrowserConfig::builder()
         .chrome_executable(browser_path)
@@ -424,7 +451,7 @@ async fn launch_browser(browser_timeout: Duration) -> Result<Browser, SystemTest
         // `attach()` runner alongside the `build()` server it targets) then
         // collide on Chrome's profile singleton lock and one launch fails.
         // Give every launch its own directory.
-        .user_data_dir(unique_user_data_dir())
+        .user_data_dir(&user_data_dir)
         // `chromiumoxide::browser::argument::Arg`'s `From<&str>` treats the
         // whole string as the flag *name* and prepends its own `--`, so a
         // literal `"--no-sandbox"` here renders as the four-dash garbage flag
@@ -453,7 +480,7 @@ async fn launch_browser(browser_timeout: Duration) -> Result<Browser, SystemTest
         handler.for_each(|_| async {}).await;
     });
 
-    Ok(browser)
+    Ok((browser, user_data_dir))
 }
 
 /// A fresh, never-reused Chrome profile directory for one browser launch.
@@ -481,14 +508,45 @@ fn default_artifact_dir() -> PathBuf {
 /// Returned by [`SystemTest::build`] or [`SystemTest::attach`]. When it owns
 /// an in-process server (the `build` path), that server shuts down when the
 /// runner is dropped; the `attach` path owns only the browser and leaves the
-/// externally-managed application process untouched.
+/// externally-managed application process untouched. Either way, dropping
+/// the runner also removes its per-launch Chrome profile directory.
 pub struct SystemTestRunner {
     base_url: String,
-    browser: Browser,
+    // `Option` so `Drop` can synchronously extract and drop the browser
+    // *before* removing its profile directory — see the `Drop` impl below.
+    browser: Option<Browser>,
     artifact_dir: PathBuf,
+    user_data_dir: PathBuf,
     hx_settle_timeout: Duration,
     _shutdown: Option<tokio::sync::oneshot::Sender<()>>,
     _server_handle: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl Drop for SystemTestRunner {
+    fn drop(&mut self) {
+        // chromiumoxide sets `kill_on_drop(true)` on the underlying child
+        // process, so dropping `Browser` synchronously *sends* the kill
+        // signal (only the OS reaping the process afterward is
+        // asynchronous/unguaranteed-timing). Rust drops a struct's own
+        // fields only *after* a custom `Drop::drop` body returns, so without
+        // this explicit `take()` the profile directory would be removed
+        // before the browser (and thus the signal) is even dropped.
+        // Dropping the taken `Browser` here, before touching the directory,
+        // ensures the kill is at least sent first.
+        drop(self.browser.take());
+
+        // Best-effort cleanup for the per-launch profile directory created
+        // in `launch_browser`/`unique_user_data_dir`. The kill signal above
+        // is sent synchronously, but the OS reaping the process (and
+        // releasing any file handles it held open under this directory) is
+        // not instantaneous or guaranteed-ordered from Rust's perspective;
+        // a short synchronous grace period trades a little Drop latency for
+        // meaningfully higher odds the removal actually succeeds. Errors
+        // (including "still in use") are ignored — this is best-effort, not
+        // a correctness guarantee.
+        std::thread::sleep(Duration::from_millis(50));
+        let _ = std::fs::remove_dir_all(&self.user_data_dir);
+    }
 }
 
 impl SystemTestRunner {
@@ -499,8 +557,17 @@ impl SystemTestRunner {
     ///
     /// # Errors
     /// Propagates CDP errors from `chromiumoxide`.
+    ///
+    /// # Panics
+    /// Only if called while the runner is being dropped — not reachable
+    /// through normal use, since `page()` takes `&self` and a caller can't
+    /// hold that reference once the runner itself has started dropping.
     pub async fn page(&self) -> Result<Page, SystemTestError> {
-        let cdp_page = self.browser.new_page("about:blank").await?;
+        let browser = self
+            .browser
+            .as_ref()
+            .expect("SystemTestRunner::browser is only None during Drop");
+        let cdp_page = browser.new_page("about:blank").await?;
         cdp_page.enable_runtime().await?;
 
         let console_errors: Arc<AsyncMutex<Vec<String>>> = Arc::new(AsyncMutex::new(Vec::new()));
@@ -533,25 +600,39 @@ async fn spawn_console_error_capture(
     let mut exception_events = page.event_listener::<EventExceptionThrown>().await?;
 
     tokio::spawn(async move {
-        loop {
+        // Track each stream's liveness independently: a `select!` branch
+        // guarded by `if <flag>` is skipped once that flag is false, so one
+        // stream ending (e.g. a transient CDP session hiccup) only stops
+        // polling *that* stream — it must not end capture on the other one.
+        // The task only exits once both streams are done.
+        let mut console_open = true;
+        let mut exception_open = true;
+        while console_open || exception_open {
             tokio::select! {
-                event = console_events.next() => {
-                    let Some(event) = event else { break };
-                    if event.r#type == ConsoleApiCalledType::Error {
-                        let text = event
-                            .args
-                            .iter()
-                            .map(remote_object_to_string)
-                            .collect::<Vec<_>>()
-                            .join(" ");
-                        sink.lock().await.push(text);
+                event = console_events.next(), if console_open => {
+                    match event {
+                        Some(event) => {
+                            if event.r#type == ConsoleApiCalledType::Error {
+                                let text = event
+                                    .args
+                                    .iter()
+                                    .map(remote_object_to_string)
+                                    .collect::<Vec<_>>()
+                                    .join(" ");
+                                sink.lock().await.push(text);
+                            }
+                        }
+                        None => console_open = false,
                     }
                 }
-                event = exception_events.next() => {
-                    let Some(event) = event else { break };
-                    sink.lock().await.push(event.exception_details.text.clone());
+                event = exception_events.next(), if exception_open => {
+                    match event {
+                        Some(event) => {
+                            sink.lock().await.push(event.exception_details.text.clone());
+                        }
+                        None => exception_open = false,
+                    }
                 }
-                else => break,
             }
         }
     });
@@ -861,30 +942,38 @@ impl Page {
     /// Assert that the page has produced no `console.error(...)` calls and no
     /// uncaught JavaScript exceptions.
     ///
-    /// Waits a short grace period for any in-flight console/exception CDP
-    /// events to be delivered before checking, so this can be called
-    /// immediately after [`Page::visit`] without a race.
+    /// Polls for the [`CONSOLE_ERROR_GRACE`] window (checking every
+    /// [`POLL_INTERVAL`]) for any in-flight console/exception CDP events to
+    /// be delivered before declaring the page clean, so this can be called
+    /// immediately after [`Page::visit`] without a race. An error observed
+    /// at any point during the window fails immediately rather than waiting
+    /// out the rest of it.
     ///
     /// # Errors
     /// [`SystemTestError::AssertionFailed`] listing every captured message,
     /// with a screenshot + HTML dump written to the artifact directory.
     pub async fn expect_no_console_errors(&self) -> Result<&Self, SystemTestError> {
-        tokio::time::sleep(CONSOLE_ERROR_GRACE).await;
-        let errors = self.console_errors().await;
-        if errors.is_empty() {
-            return Ok(self);
+        let deadline = tokio::time::Instant::now() + CONSOLE_ERROR_GRACE;
+        loop {
+            let errors = self.console_errors().await;
+            if !errors.is_empty() {
+                let artifact = self
+                    .write_failure_artifacts("expect_no_console_errors")
+                    .await
+                    .ok();
+                return Err(SystemTestError::AssertionFailed {
+                    message: format!(
+                        "page produced {} console error(s): {errors:?}",
+                        errors.len()
+                    ),
+                    artifact_path: artifact,
+                });
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Ok(self);
+            }
+            tokio::time::sleep(POLL_INTERVAL).await;
         }
-        let artifact = self
-            .write_failure_artifacts("expect_no_console_errors")
-            .await
-            .ok();
-        Err(SystemTestError::AssertionFailed {
-            message: format!(
-                "page produced {} console error(s): {errors:?}",
-                errors.len()
-            ),
-            artifact_path: artifact,
-        })
     }
 
     // ── SSE helper ────────────────────────────────────────────────────────

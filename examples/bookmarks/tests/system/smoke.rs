@@ -45,4 +45,7 @@ async fn bookmarks_boots_and_serves_list_and_health() {
     page.expect_text("UP")
         .await
         .expect("actuator health reports UP against the freshly migrated DB");
+    page.expect_no_console_errors()
+        .await
+        .expect("no console errors on /actuator/health");
 }

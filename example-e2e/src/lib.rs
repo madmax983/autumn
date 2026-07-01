@@ -49,7 +49,19 @@ impl PgTopology {
 }
 
 /// Start `count` independent Postgres containers and return their
-/// connection URLs (each `postgres://postgres:postgres@127.0.0.1:<port>/postgres`).
+/// connection URLs (`postgres://postgres:postgres@<host>:<port>/postgres`).
+///
+/// Containers are started concurrently (they're fully independent — no data
+/// dependency between them), so provisioning latency is roughly the slowest
+/// single container rather than the sum of all `count`. The returned
+/// [`PgTopology::urls`] preserve the same order as `0..count` regardless of
+/// which container actually finishes starting first — `join_all` resolves
+/// futures out of order but always returns results in input order.
+///
+/// The connection host is resolved via testcontainers' own `get_host()`
+/// (mirroring [`autumn_web::test::TestDb`]) rather than assumed to be
+/// `127.0.0.1`, since the Docker-mapped host isn't always the literal
+/// loopback address (e.g. Docker Desktop, remote Docker contexts).
 ///
 /// # Panics
 /// If Docker is unavailable or a container fails to start. Callers running
@@ -57,22 +69,31 @@ impl PgTopology {
 /// skip with a visible notice instead of calling this — see
 /// `scripts/check-examples-e2e.sh`.
 pub async fn provision_postgres(count: usize) -> PgTopology {
-    let mut containers = Vec::with_capacity(count);
-    let mut urls = Vec::with_capacity(count);
-    for _ in 0..count {
+    let started = futures::future::join_all((0..count).map(|_| async {
         let container = Postgres::default()
             .start()
             .await
             .expect("start Postgres testcontainer");
+        let host = container
+            .get_host()
+            .await
+            .expect("resolve Postgres testcontainer host");
         let port = container
             .get_host_port_ipv4(5432)
             .await
             .expect("resolve Postgres testcontainer host port");
-        urls.push(format!(
-            "postgres://postgres:postgres@127.0.0.1:{port}/postgres"
-        ));
+        let url = format!("postgres://postgres:postgres@{host}:{port}/postgres");
+        (container, url)
+    }))
+    .await;
+
+    let mut containers = Vec::with_capacity(count);
+    let mut urls = Vec::with_capacity(count);
+    for (container, url) in started {
         containers.push(container);
+        urls.push(url);
     }
+
     PgTopology {
         _containers: containers,
         urls,
@@ -104,6 +125,16 @@ pub enum SpawnError {
         /// How long we waited.
         timeout: Duration,
     },
+    /// The spawned process exited before ever reporting healthy — e.g. a
+    /// panic during config/DB setup, before the HTTP listener ever bound.
+    /// Detected immediately rather than waiting out the full timeout.
+    #[error("example exited with {status} before reporting healthy at {base_url}")]
+    ExitedBeforeReady {
+        /// The base URL that was being polled when the process exited.
+        base_url: String,
+        /// The process's exit status.
+        status: std::process::ExitStatus,
+    },
 }
 
 /// A running example binary, spawned as a real OS process bound to an
@@ -125,13 +156,29 @@ impl ExampleProcess {
     }
 
     /// Attach a managed headless-Chromium [`SystemTest`] runner to this
-    /// process's base URL.
+    /// process's base URL, using the framework's default browser-launch
+    /// timeout. Use [`Self::attach_browser_with_timeout`] to override it.
     ///
     /// # Errors
     /// [`SystemTestError::BrowserNotFound`] or CDP launch errors — see
     /// [`SystemTest::attach`].
     pub async fn attach_browser(&self) -> Result<SystemTestRunner, SystemTestError> {
         SystemTest::attach(self.base_url.clone()).await
+    }
+
+    /// Like [`Self::attach_browser`], but with an explicit browser-launch
+    /// timeout — useful when CI resource contention (several Postgres
+    /// testcontainers plus Chromium competing for CPU) makes the default
+    /// too tight for a particular example's smoke.
+    ///
+    /// # Errors
+    /// [`SystemTestError::BrowserNotFound`] or CDP launch errors — see
+    /// [`SystemTest::attach_with_timeout`].
+    pub async fn attach_browser_with_timeout(
+        &self,
+        browser_timeout: Duration,
+    ) -> Result<SystemTestRunner, SystemTestError> {
+        SystemTest::attach_with_timeout(self.base_url.clone(), browser_timeout).await
     }
 }
 
@@ -217,34 +264,56 @@ pub async fn spawn_example(
         command.env(key, value);
     }
 
-    let child = command.spawn().map_err(|source| SpawnError::Spawn {
+    let mut child = command.spawn().map_err(|source| SpawnError::Spawn {
         path: bin_path.to_path_buf(),
         source,
     })?;
 
-    wait_until_healthy(&base_url, timeout)
-        .await
-        .ok_or_else(|| SpawnError::NotReady {
-            base_url: base_url.clone(),
-            timeout,
-        })?;
+    if let Err(err) = wait_until_healthy(&base_url, &mut child, timeout).await {
+        // `child` is a plain `std::process::Child` here, not yet wrapped in
+        // an `ExampleProcess` (whose `Drop` impl does this same
+        // kill-then-reap) — without an explicit kill on this early-return
+        // path, a `NotReady` timeout would leak a still-running orphaned
+        // process. `ExitedBeforeReady` means it's already dead, so `kill()`
+        // here is a harmless no-op for that case.
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(err);
+    }
 
     Ok(ExampleProcess { child, base_url })
 }
 
-/// Poll `{base_url}/health` until it returns a successful status, or `None`
-/// once `timeout` elapses.
-async fn wait_until_healthy(base_url: &str, timeout: Duration) -> Option<()> {
+/// Poll `{base_url}/health` until it returns a successful status.
+///
+/// Also checks `child`'s exit status on every iteration so a process that
+/// dies early (e.g. panics during config/DB setup before ever binding its
+/// listener) is detected and reported immediately, instead of polling a
+/// dead process for the entire `timeout`.
+async fn wait_until_healthy(
+    base_url: &str,
+    child: &mut Child,
+    timeout: Duration,
+) -> Result<(), SpawnError> {
     let deadline = tokio::time::Instant::now() + timeout;
     let url = format!("{base_url}/health");
     loop {
+        if let Ok(Some(status)) = child.try_wait() {
+            return Err(SpawnError::ExitedBeforeReady {
+                base_url: base_url.to_string(),
+                status,
+            });
+        }
         if let Ok(response) = reqwest::get(&url).await
             && response.status().is_success()
         {
-            return Some(());
+            return Ok(());
         }
         if tokio::time::Instant::now() >= deadline {
-            return None;
+            return Err(SpawnError::NotReady {
+                base_url: base_url.to_string(),
+                timeout,
+            });
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }

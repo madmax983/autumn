@@ -43,16 +43,14 @@ die() {
 
 # ---------------------------------------------------------------------------
 # 0. Discover supported examples from the catalog (same marker format
-#    `scripts/check-examples.sh` reads).
+#    `scripts/check-examples.sh` reads — shared via scripts/lib/catalog.sh so
+#    the marker-format regex lives in exactly one place).
 # ---------------------------------------------------------------------------
 [[ -f "$CATALOG" ]] || die "catalog file '$CATALOG' not found — run scripts/check-examples.sh first"
 
-mapfile -t examples < <(
-  grep -E "<!-- catalog:example name=[^ ]+ tier=supported" "$CATALOG" \
-    | grep -oE 'name=[^ >]+' \
-    | sed 's/name=//' \
-    | sort
-)
+source "$root/scripts/lib/catalog.sh"
+
+mapfile -t examples < <(catalog_names_by_tier "$CATALOG" "supported" | sort)
 [[ ${#examples[@]} -gt 0 ]] || die "no supported examples found in $CATALOG"
 
 echo "==> Discovered ${#examples[@]} supported example(s): ${examples[*]}"
@@ -187,6 +185,7 @@ for status in "${result_status[@]}"; do
     PASS) pass_count=$((pass_count + 1)) ;;
     SKIP) skip_count=$((skip_count + 1)) ;;
     FAIL) fail_count=$((fail_count + 1)) ;;
+    *) die "internal error: unrecognized result status '$status' — this is a bug in the harness" ;;
   esac
 done
 echo "  $pass_count passed, $fail_count failed, $skip_count skipped (of ${#examples[@]} supported examples)"
