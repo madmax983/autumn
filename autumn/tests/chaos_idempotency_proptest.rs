@@ -14,7 +14,7 @@ proptest! {
         };
 
         let ttl = Duration::new(ttl_secs, ttl_nanos % 1_000_000_000);
-        store.set("test_key", record.clone(), vec![], ttl);
+        store.set("test_key", record, vec![], ttl);
         store.try_lock("test_key_2", ttl);
     }
 }
