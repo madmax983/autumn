@@ -1,10 +1,20 @@
-//! Active search and autocomplete form primitives with htmx integration.
+//! Server-rendered widget helpers: display primitives and interactive search.
 //!
-//! These helpers generate server-rendered HTML with embedded htmx attributes
-//! so Autumn applications can add live search and autocomplete with zero
-//! custom JavaScript.
+//! All widgets return [`maud::Markup`] and are composable — pass the output of
+//! one as the body of another. Every widget is CSP-safe (no inline JS) and
+//! HTML-escapes caller-supplied text via Maud.
 //!
-//! # Choosing the right primitive
+//! # Display widgets
+//!
+//! | Widget | Use |
+//! |--------|-----|
+//! | `card` | Titled content panel with optional header action and footer |
+//! | `stat_card` | Metric tile: label / value / optional link |
+//! | `property_list` | `<dl>` of label/value rows for a record detail view |
+//! | `data_table` | Column-driven, sortable `<table>` |
+//! | `breadcrumb` | Accessible `<nav>` breadcrumb trail |
+//!
+//! # Interactive / search widgets
 //!
 //! | Situation | Use |
 //! |-----------|-----|
@@ -1097,6 +1107,266 @@ pub fn breadcrumb(crumbs: &[Crumb<'_>]) -> maud::Markup {
     }
 }
 
+// ── card ──────────────────────────────────────────────────────────────────
+
+/// Heading level for the title element inside a [`card`].
+///
+/// Used by [`CardConfig::level`] to pick the `<h1>`–`<h6>` element that wraps
+/// the card title. Defaults to `<h2>`.
+#[cfg(feature = "maud")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HeadingLevel {
+    /// `<h1>`
+    H1,
+    /// `<h2>` (default)
+    #[default]
+    H2,
+    /// `<h3>`
+    H3,
+    /// `<h4>`
+    H4,
+    /// `<h5>`
+    H5,
+    /// `<h6>`
+    H6,
+}
+
+/// Configuration for a [`card`] widget.
+///
+/// Build with [`CardConfig::new`] and chain builder methods for optional slots.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use autumn_web::widgets::{CardConfig, HeadingLevel, card};
+/// use maud::html;
+///
+/// let action = html! { a class="btn" href="/posts/new" { "+ New" } };
+/// let config = CardConfig::new()
+///     .title("Posts")
+///     .level(HeadingLevel::H2)
+///     .header_action(action);
+/// let markup = card(&html! { p { "body" } }, &config);
+/// ```
+#[cfg(feature = "maud")]
+#[derive(Debug, Clone, Default)]
+pub struct CardConfig<'a> {
+    /// Optional title text rendered in a `<hN class="card-title">` element.
+    /// Set via [`CardConfig::title`] (HTML-escaped) or [`CardConfig::title_html`]
+    /// (pre-built [`maud::Markup`] for rich content).
+    title: Option<maud::Markup>,
+    /// Heading level for the title element (default [`HeadingLevel::H2`]).
+    level: HeadingLevel,
+    /// Optional right-side header slot — e.g. action buttons.
+    /// Rendered inside `card-header` alongside the title.
+    header_action: Option<maud::Markup>,
+    /// Optional footer content rendered in `<div class="card-footer">`.
+    footer: Option<maud::Markup>,
+    /// Extra CSS class(es) appended to the root `card` element.
+    class: Option<&'a str>,
+}
+
+#[cfg(feature = "maud")]
+impl<'a> CardConfig<'a> {
+    /// Create a new card configuration with all slots empty and heading level `H2`.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            title: None,
+            level: HeadingLevel::H2,
+            header_action: None,
+            footer: None,
+            class: None,
+        }
+    }
+
+    /// Set the card title from a plain `&str`. The text is HTML-escaped by Maud.
+    ///
+    /// Use [`CardConfig::title_html`] when you need rich markup inside the heading.
+    #[must_use]
+    pub fn title(mut self, title: &str) -> Self {
+        self.title = Some(maud::html! { (title) });
+        self
+    }
+
+    /// Set the card title from pre-built [`maud::Markup`] for rich heading content
+    /// (e.g. a title with an inline badge or count).
+    ///
+    /// Callers are responsible for escaping any user-supplied content inside `title`.
+    #[must_use]
+    pub fn title_html(mut self, title: maud::Markup) -> Self {
+        self.title = Some(title);
+        self
+    }
+
+    /// Set the heading level for the title element (default [`HeadingLevel::H2`]).
+    #[must_use]
+    pub const fn level(mut self, level: HeadingLevel) -> Self {
+        self.level = level;
+        self
+    }
+
+    /// Set the right-side header action slot (e.g. buttons/links).
+    #[must_use]
+    pub fn header_action(mut self, action: maud::Markup) -> Self {
+        self.header_action = Some(action);
+        self
+    }
+
+    /// Set the footer content rendered in `<div class="card-footer">`.
+    #[must_use]
+    pub fn footer(mut self, footer: maud::Markup) -> Self {
+        self.footer = Some(footer);
+        self
+    }
+
+    /// Add extra CSS class(es) to the root `card` element.
+    #[must_use]
+    pub const fn class(mut self, class: &'a str) -> Self {
+        self.class = Some(class);
+        self
+    }
+}
+
+/// Build the `class` string for the root card element, merging the base `"card"`
+/// with any caller-supplied extra classes.
+#[cfg(feature = "maud")]
+fn merge_class(extra: Option<&str>) -> String {
+    match extra {
+        Some(e) if !e.is_empty() => format!("card {e}"),
+        _ => "card".to_string(),
+    }
+}
+
+/// Render a composable card container.
+///
+/// Emits a `<div class="card">` with an optional header (title + action slot),
+/// a `<div class="card-body">` wrapping `body`, and an optional
+/// `<div class="card-footer">`.
+///
+/// The header is rendered only when a title or `header_action` is set.
+/// The title is wrapped in a heading element (`<h2>` by default, configurable
+/// via [`CardConfig::level`]) so screen readers can navigate card titles.
+///
+/// All class names (`card`, `card-header`, `card-title`, `card-body`,
+/// `card-footer`) are stable so existing CSS and the admin plugin can adopt
+/// the widget with no restyling.
+///
+/// # CSS hooks
+///
+/// | Selector | Element |
+/// |---|---|
+/// | `.card` | Root wrapper |
+/// | `.card-header` | Header row (title + action) |
+/// | `.card-title` | Title heading element |
+/// | `.card-body` | Body wrapper |
+/// | `.card-footer` | Footer wrapper |
+///
+/// # Example
+///
+/// ```rust
+/// use autumn_web::widgets::{
+///     card, CardConfig, property_list, data_table, Column, DataTableConfig,
+/// };
+/// use maud::html;
+///
+/// struct Post { id: i64, title: String }
+/// let posts = vec![Post { id: 1, title: "Hello".into() }];
+///
+/// let summary = property_list(&[
+///     ("Total", html! { (posts.len()) }),
+/// ]);
+///
+/// let cols: Vec<Column<Post>> = vec![
+///     Column::new("ID",    |p: &Post| html! { (p.id) }),
+///     Column::new("Title", |p: &Post| html! { (p.title.as_str()) }),
+/// ];
+/// let table = data_table(&posts, &cols, &DataTableConfig::new("No posts."));
+///
+/// let new_btn = html! { a class="btn" href="/posts/new" { "New post" } };
+/// let config = CardConfig::new().title("Posts").header_action(new_btn);
+///
+/// let out = card(&html! { (summary) (table) }, &config).into_string();
+/// assert!(out.contains(r#"class="card-header""#));
+/// assert!(out.contains(r#"<h2 class="card-title">Posts</h2>"#));
+/// assert!(out.contains(r#"class="card-body""#));
+/// assert!(out.contains(r#"class="autumn-property-list""#));
+/// assert!(out.contains("<table"));
+/// ```
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn card(body: &maud::Markup, config: &CardConfig<'_>) -> maud::Markup {
+    let root_class = merge_class(config.class);
+    let has_header = config.title.is_some() || config.header_action.is_some();
+    maud::html! {
+        div class=(root_class) {
+            @if has_header {
+                div class="card-header" {
+                    @if let Some(title) = &config.title {
+                        @match config.level {
+                            HeadingLevel::H1 => h1 class="card-title" { (title) },
+                            HeadingLevel::H2 => h2 class="card-title" { (title) },
+                            HeadingLevel::H3 => h3 class="card-title" { (title) },
+                            HeadingLevel::H4 => h4 class="card-title" { (title) },
+                            HeadingLevel::H5 => h5 class="card-title" { (title) },
+                            HeadingLevel::H6 => h6 class="card-title" { (title) },
+                        }
+                    }
+                    @if let Some(action) = &config.header_action {
+                        (action)
+                    }
+                }
+            }
+            div class="card-body" { (body) }
+            @if let Some(footer) = &config.footer {
+                div class="card-footer" { (footer) }
+            }
+        }
+    }
+}
+
+/// Render a metric stat-card tile: label, value, and an optional "view all" link.
+///
+/// Emits a `<div class="stat-card">` matching the pattern used by the admin
+/// dashboard for model-count tiles. Both `label` and `value` are HTML-escaped.
+///
+/// `link` is `(href, link_text)`; omit with `None` to render without the link row.
+///
+/// # CSS hooks
+///
+/// | Selector | Element |
+/// |---|---|
+/// | `.stat-card` | Root tile |
+/// | `.stat-label` | Metric label |
+/// | `.stat-value` | Metric number/value |
+/// | `.stat-link` | Link row (only present when `link` is `Some`) |
+///
+/// # Example
+///
+/// ```rust
+/// use autumn_web::widgets::stat_card;
+///
+/// let html = stat_card("Users", "1 024", Some(("/users", "View all →"))).into_string();
+/// assert!(html.contains(r#"class="stat-card""#));
+/// assert!(html.contains("1 024"));
+/// assert!(html.contains(r#"href="/users""#));
+/// ```
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn stat_card(label: &str, value: &str, link: Option<(&str, &str)>) -> maud::Markup {
+    maud::html! {
+        div class="stat-card" {
+            div class="stat-label" { (label) }
+            div class="stat-value" { (value) }
+            @if let Some((href, text)) = link {
+                div class="stat-link" {
+                    a href=(href) { (text) }
+                }
+            }
+        }
+    }
+}
+
 // ── Tests ──────────────────────────────────────────────────────────────────
 
 #[cfg(all(test, feature = "maud"))]
@@ -2081,5 +2351,172 @@ mod tests {
         assert!(html.contains("q=foo"), "{html}");
         // no duplicate old sort
         assert!(!html.contains("sort=old"), "{html}");
+    }
+
+    // ── CardConfig builder ─────────────────────────────────────────────
+
+    #[test]
+    fn card_config_defaults() {
+        // no title/action → no card-header rendered
+        let html = card(&maud::html! {}, &CardConfig::new()).into_string();
+        assert!(!html.contains("card-header"), "{html}");
+        assert!(!html.contains("card-footer"), "{html}");
+        // default heading level is H2: setting a title renders <h2
+        let html2 = card(&maud::html! {}, &CardConfig::new().title("X")).into_string();
+        assert!(html2.contains("<h2"), "{html2}");
+    }
+
+    #[test]
+    fn card_config_builders_chain() {
+        let html = card(
+            &maud::html! {},
+            &CardConfig::new()
+                .title("T")
+                .level(HeadingLevel::H3)
+                .class("wide"),
+        )
+        .into_string();
+        assert!(html.contains(r#"class="card wide""#), "{html}");
+        assert!(html.contains("<h3"), "{html}");
+        assert!(html.contains('T'), "{html}");
+    }
+
+    // ── card structure ─────────────────────────────────────────────────
+
+    #[test]
+    fn card_has_root_and_body_classes() {
+        let body = maud::html! { p { "hello" } };
+        let html = card(&body, &CardConfig::new()).into_string();
+        assert!(html.contains(r#"class="card""#), "{html}");
+        assert!(html.contains(r#"class="card-body""#), "{html}");
+        assert!(html.contains("hello"), "{html}");
+        assert!(!html.contains("card-header"), "{html}");
+        assert!(!html.contains("card-footer"), "{html}");
+    }
+
+    #[test]
+    fn card_renders_title_as_h2_by_default() {
+        let body = maud::html! {};
+        let html = card(&body, &CardConfig::new().title("Posts")).into_string();
+        assert!(
+            html.contains(r#"<h2 class="card-title">Posts</h2>"#),
+            "{html}"
+        );
+        assert!(html.contains(r#"class="card-header""#), "{html}");
+    }
+
+    #[test]
+    fn card_title_respects_heading_level() {
+        let body = maud::html! {};
+        let html = card(&body, &CardConfig::new().title("X").level(HeadingLevel::H3)).into_string();
+        assert!(html.contains(r#"<h3 class="card-title">"#), "{html}");
+        assert!(!html.contains("<h2"), "{html}");
+    }
+
+    #[test]
+    fn card_omits_header_when_empty() {
+        let body = maud::html! {};
+        let html = card(&body, &CardConfig::new()).into_string();
+        assert!(!html.contains("card-header"), "{html}");
+    }
+
+    #[test]
+    fn card_renders_header_action() {
+        let action = maud::html! { a class="btn" href="/new" { "New" } };
+        let body = maud::html! {};
+        let html = card(&body, &CardConfig::new().header_action(action)).into_string();
+        assert!(html.contains(r#"class="card-header""#), "{html}");
+        assert!(html.contains(r#"class="btn""#), "{html}");
+        assert!(html.contains(r#"href="/new""#), "{html}");
+    }
+
+    #[test]
+    fn card_header_action_only_no_title() {
+        let action = maud::html! { button { "Click" } };
+        let body = maud::html! {};
+        let html = card(&body, &CardConfig::new().header_action(action)).into_string();
+        assert!(html.contains("card-header"), "{html}");
+        assert!(!html.contains("card-title"), "{html}");
+        assert!(!html.contains("<h2"), "{html}");
+    }
+
+    #[test]
+    fn card_renders_footer() {
+        let footer = maud::html! { span { "Save" } };
+        let body = maud::html! {};
+        let html = card(&body, &CardConfig::new().footer(footer)).into_string();
+        assert!(html.contains(r#"class="card-footer""#), "{html}");
+        assert!(html.contains("Save"), "{html}");
+    }
+
+    #[test]
+    fn card_omits_footer_when_none() {
+        let body = maud::html! {};
+        let html = card(&body, &CardConfig::new()).into_string();
+        assert!(!html.contains("card-footer"), "{html}");
+    }
+
+    #[test]
+    fn card_extra_class_escape_hatch() {
+        let body = maud::html! {};
+        let html = card(&body, &CardConfig::new().class("dashboard")).into_string();
+        assert!(html.contains(r#"class="card dashboard""#), "{html}");
+    }
+
+    #[test]
+    fn card_escapes_title() {
+        let body = maud::html! {};
+        let html = card(&body, &CardConfig::new().title("<script>alert(1)</script>")).into_string();
+        assert!(html.contains("&lt;script&gt;"), "{html}");
+        assert!(!html.contains("<script>alert"), "{html}");
+    }
+
+    #[test]
+    fn card_title_html_passes_markup() {
+        let rich = maud::html! {
+            span { "Posts" }
+            span class="muted" { " (42)" }
+        };
+        let body = maud::html! {};
+        let html = card(&body, &CardConfig::new().title_html(rich)).into_string();
+        assert!(html.contains(r#"class="muted""#), "{html}");
+        assert!(html.contains("(42)"), "{html}");
+    }
+
+    #[test]
+    fn card_body_composes_property_list() {
+        let rows = vec![("Name", maud::html! { "Alice" })];
+        let body = property_list(&rows);
+        let html = card(&body, &CardConfig::new().title("Detail")).into_string();
+        assert!(html.contains(r#"class="card-body""#), "{html}");
+        assert!(html.contains(r#"class="autumn-property-list""#), "{html}");
+    }
+
+    // ── stat_card ──────────────────────────────────────────────────────
+
+    #[test]
+    fn stat_card_renders_label_value() {
+        let html = stat_card("Users", "42", None).into_string();
+        assert!(html.contains(r#"class="stat-card""#), "{html}");
+        assert!(html.contains(r#"class="stat-label""#), "{html}");
+        assert!(html.contains(r#"class="stat-value""#), "{html}");
+        assert!(html.contains("Users"), "{html}");
+        assert!(html.contains("42"), "{html}");
+        assert!(!html.contains("stat-link"), "{html}");
+    }
+
+    #[test]
+    fn stat_card_renders_optional_link() {
+        let html = stat_card("Users", "42", Some(("/users", "View all →"))).into_string();
+        assert!(html.contains(r#"class="stat-link""#), "{html}");
+        assert!(html.contains(r#"href="/users""#), "{html}");
+        assert!(html.contains("View all"), "{html}");
+    }
+
+    #[test]
+    fn stat_card_escapes_value() {
+        let html = stat_card("L", "<b>x</b>", None).into_string();
+        assert!(html.contains("&lt;b&gt;"), "{html}");
+        assert!(!html.contains("<b>x</b>"), "{html}");
     }
 }

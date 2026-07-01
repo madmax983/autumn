@@ -168,15 +168,17 @@ pub use validator::Validate;
 /// See [`crate::form`] for the full surface including Maud rendering helpers.
 pub use crate::form::{Changeset, ChangesetForm, IntoChangeset};
 
-// ── Search & autocomplete widgets ─────────────────────────────────
-/// Active search, autocomplete, data table, and breadcrumb configuration types and rendering helpers.
+// ── Display & search widgets ───────────────────────────────────────
+/// Card, stat tile, active search, autocomplete, data table, property list,
+/// and breadcrumb configuration types and rendering helpers.
 ///
 /// See [`crate::widgets`] for the full API.
 #[cfg(feature = "maud")]
 pub use crate::widgets::{
-    ActiveSearchConfig, AutocompleteConfig, Column, Crumb, DataTableConfig, SearchMethod, SortDir,
-    active_search, active_search_empty_state, active_search_input, active_search_results,
-    autocomplete_empty_state, autocomplete_input, autocomplete_option, breadcrumb, data_table,
+    ActiveSearchConfig, AutocompleteConfig, CardConfig, Column, Crumb, DataTableConfig,
+    HeadingLevel, SearchMethod, SortDir, active_search, active_search_empty_state,
+    active_search_input, active_search_results, autocomplete_empty_state, autocomplete_input,
+    autocomplete_option, breadcrumb, card, data_table, property_list, stat_card,
 };
 
 // ── Hooks ───────────────────────────────────────────────────────

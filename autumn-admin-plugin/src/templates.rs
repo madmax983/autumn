@@ -11,6 +11,7 @@ use autumn_web::job::{
 use autumn_web::pagination::Page;
 use autumn_web::runtime_config::{ConfigChangeRecord, ConfigEntry};
 use autumn_web::ui::pagination::{PagerOptions, pagination_nav};
+use autumn_web::widgets::{CardConfig, card, stat_card};
 use maud::{DOCTYPE, Markup, PreEscaped, html};
 use serde_json::Value;
 
@@ -133,20 +134,22 @@ const ADMIN_CSS: &str = "
         background: var(--surface);
         border-radius: var(--radius);
         box-shadow: var(--shadow);
-        padding: 1.5rem;
         margin-bottom: 1.5rem;
     }
     .card-header {
         display: flex;
         justify-content: space-between;
         align-items: center;
-        margin-bottom: 1rem;
-        padding-bottom: 0.75rem;
+        padding: 1rem 1.5rem 0.75rem;
         border-bottom: 1px solid var(--border);
     }
     .card-title {
         font-size: 1.125rem;
         font-weight: 600;
+        margin: 0;
+    }
+    .card-body {
+        padding: 1.5rem;
     }
 
     /* Buttons */
@@ -625,51 +628,55 @@ fn job_list_card(
     csrf_form_field: &str,
     prefix: &str,
 ) -> Markup {
-    html! {
-        div class="card" {
-            div class="card-header" {
-                div {
-                    span class="card-title" { (title) }
-                    div style="font-size: 0.8125rem; color: var(--text-muted); margin-top: 0.25rem;" {
-                        (description)
+    let header_action = html! {
+        span style="font-size: 0.875rem; color: var(--text-muted);" {
+            (page.total) " total"
+        }
+    };
+    let title_markup = html! {
+        (title)
+        span style="display: block; font-size: 0.8125rem; color: var(--text-muted); margin-top: 0.25rem; font-weight: 400;" {
+            (description)
+        }
+    };
+    let body = html! {
+        div class="table-wrap" {
+            table {
+                thead {
+                    tr {
+                        th { "Job" }
+                        th { "Enqueued At" }
+                        th { "Started At" }
+                        th { "Finished At" }
+                        th { "Attempts" }
+                        th { "Principal" }
+                        th { "Correlation" }
+                        th { "Last Error" }
+                        th { "Actions" }
                     }
                 }
-                span style="font-size: 0.875rem; color: var(--text-muted);" {
-                    (page.total) " total"
-                }
-            }
-            div class="table-wrap" {
-                table {
-                    thead {
+                tbody {
+                    @if page.records.is_empty() {
                         tr {
-                            th { "Job" }
-                            th { "Enqueued At" }
-                            th { "Started At" }
-                            th { "Finished At" }
-                            th { "Attempts" }
-                            th { "Principal" }
-                            th { "Correlation" }
-                            th { "Last Error" }
-                            th { "Actions" }
-                        }
-                    }
-                    tbody {
-                        @if page.records.is_empty() {
-                            tr {
-                                td colspan="9" style="text-align: center; padding: 1.5rem; color: var(--text-muted);" {
-                                    "No jobs."
-                                }
+                            td colspan="9" style="text-align: center; padding: 1.5rem; color: var(--text-muted);" {
+                                "No jobs."
                             }
                         }
-                        @for record in &page.records {
-                            (job_row(record, csrf_token, csrf_form_field, prefix))
-                        }
+                    }
+                    @for record in &page.records {
+                        (job_row(record, csrf_token, csrf_form_field, prefix))
                     }
                 }
             }
-            (jobs_pagination(page, page_param, prefix))
         }
-    }
+        (jobs_pagination(page, page_param, prefix))
+    };
+    card(
+        &body,
+        &CardConfig::new()
+            .title_html(title_markup)
+            .header_action(header_action),
+    )
 }
 
 fn job_row(
@@ -774,42 +781,38 @@ fn jobs_pagination(page: &JobAdminPage, page_param: &str, prefix: &str) -> Marku
 }
 
 fn job_schedules_card(schedules: &[JobScheduleSummary]) -> Markup {
-    html! {
-        div class="card" {
-            div class="card-header" {
-                span class="card-title" { "Recurring Schedules" }
-            }
-            div class="table-wrap" {
-                table {
-                    thead {
+    let body = html! {
+        div class="table-wrap" {
+            table {
+                thead {
+                    tr {
+                        th { "Name" }
+                        th { "Schedule" }
+                        th { "Next Run At" }
+                        th { "Last Run Status" }
+                    }
+                }
+                tbody {
+                    @if schedules.is_empty() {
                         tr {
-                            th { "Name" }
-                            th { "Schedule" }
-                            th { "Next Run At" }
-                            th { "Last Run Status" }
+                            td colspan="4" style="text-align: center; padding: 1.5rem; color: var(--text-muted);" {
+                                "No scheduled tasks registered."
+                            }
                         }
                     }
-                    tbody {
-                        @if schedules.is_empty() {
-                            tr {
-                                td colspan="4" style="text-align: center; padding: 1.5rem; color: var(--text-muted);" {
-                                    "No scheduled tasks registered."
-                                }
-                            }
-                        }
-                        @for schedule in schedules {
-                            tr {
-                                td { (schedule.name) }
-                                td { (schedule.schedule) }
-                                td { (optional_text(schedule.next_run_at.as_deref())) }
-                                td { (optional_text(schedule.last_run_status.as_deref())) }
-                            }
+                    @for schedule in schedules {
+                        tr {
+                            td { (schedule.name) }
+                            td { (schedule.schedule) }
+                            td { (optional_text(schedule.next_run_at.as_deref())) }
+                            td { (optional_text(schedule.last_run_status.as_deref())) }
                         }
                     }
                 }
             }
         }
-    }
+    };
+    card(&body, &CardConfig::new().title("Recurring Schedules"))
 }
 
 fn optional_text(value: Option<&str>) -> Markup {
@@ -840,26 +843,22 @@ pub fn dashboard_page(
 
         div class="stats-grid" {
             @for (slug, name, count) in model_counts {
-                div class="stat-card" {
-                    div class="stat-label" { (name) }
-                    div class="stat-value" { (count) }
-                    div class="stat-link" {
-                        a href={ (prefix) "/" (slug) } { "View all →" }
-                    }
-                }
+                (stat_card(name, &count.to_string(), Some((&format!("{prefix}/{slug}"), "View all →"))))
             }
         }
 
         // Actuator summary (loaded via HTMX)
-        div class="card" {
-            div class="card-header" {
-                span class="card-title" { "System Health" }
+        ({
+            let action = html! {
                 a href={ (actuator_prefix) "/ui" } class="btn btn-sm" { "Full Dashboard →" }
-            }
-            div hx-get={ (actuator_prefix) "/ui/metrics" } hx-trigger="load, every 5s" {
-                "Loading metrics…"
-            }
-        }
+            };
+            let body = html! {
+                div hx-get={ (actuator_prefix) "/ui/metrics" } hx-trigger="load, every 5s" {
+                    "Loading metrics…"
+                }
+            };
+            card(&body, &CardConfig::new().title("System Health").header_action(action))
+        })
     };
     admin_layout(
         registry,
@@ -946,14 +945,14 @@ pub fn model_list_page(
             span { (model_name_plural) }
         }
 
-        div class="card" {
-            div class="card-header" {
-                span class="card-title" {
-                    (model_name_plural)
-                    span style="font-weight: 400; color: var(--text-muted); margin-left: 0.5rem;" {
-                        "(" (result.total) ")"
-                    }
+        ({
+            let title = html! {
+                (model_name_plural)
+                span style="font-weight: 400; color: var(--text-muted); margin-left: 0.5rem;" {
+                    "(" (result.total) ")"
                 }
+            };
+            let header_action = html! {
                 div style="display: flex; gap: 0.5rem; align-items: center;" {
                     @if supports_csv_export {
                         a href=(export_csv_url) class="btn btn-sm"
@@ -971,101 +970,102 @@ pub fn model_list_page(
                         "+ Add " (model_slug.trim_end_matches('s'))
                     }
                 }
-            }
-
-            // Search. Hidden inputs preserve any active filters so both
-            // full-form GET submits AND live-search HTMX requests carry
-            // the filter set forward (htmx only includes the triggering
-            // element by default — `hx-include="closest form"` pulls in
-            // every input in the form, including the filter hiddens).
-            form class="search-bar" method="get" {
-                input type="search" name="q" placeholder="Search…"
-                    value=(search_query)
-                    hx-get={ (prefix) "/" (model_slug) }
-                    hx-trigger="input changed delay:300ms"
-                    hx-include="closest form"
-                    hx-target="closest .card"
-                    hx-select=".card > *"
-                    hx-push-url="true" {}
-                @for (k, v) in filters {
-                    input type="hidden" name={ "filter." (k) } value=(v);
-                }
-            }
-
-            // Bulk-action form wraps the table so the row checkboxes
-            // submit alongside the action selector.
-            form method="post" action={ (prefix) "/" (model_slug) "/actions" } {
-                (csrf_hidden_input(csrf_token, csrf_form_field))
-
-            // Table
-            div class="table-wrap" {
-                table {
-                    thead {
-                        tr {
-                            th class="checkbox-cell" {
-                                // Wired up by admin.js via event delegation on #select-all.
-                                input type="checkbox" id="select-all";
-                            }
-                            @for field in &list_fields {
-                                @let is_sorted = sort_by == Some(field.name);
-                                @let next_dir = if is_sorted { sort_dir.flipped() } else { SortDirection::Asc };
-                                th {
-                                    @if field.sortable {
-                                        a href={ (prefix) "/" (model_slug) "?sort=" (field.name) "&dir=" (next_dir.as_str())
-                                            @if !search_enc.is_empty() { "&q=" (search_enc) }
-                                            (filters_enc)
-                                        }
-                                        style="color: inherit; text-decoration: none;" {
-                                            (field.label)
-                                            @if is_sorted {
-                                                span class="sort-icon" {
-                                                    @if matches!(sort_dir, SortDirection::Asc) { "▲" } @else { "▼" }
-                                                }
-                                            }
-                                        }
-                                    } @else {
-                                        (field.label)
-                                    }
-                                }
-                            }
-                            th { "Actions" }
-                        }
+            };
+            let body = html! {
+                // Search. Hidden inputs preserve any active filters so both
+                // full-form GET submits AND live-search HTMX requests carry
+                // the filter set forward (htmx only includes the triggering
+                // element by default — `hx-include="closest form"` pulls in
+                // every input in the form, including the filter hiddens).
+                form class="search-bar" method="get" {
+                    input type="search" name="q" placeholder="Search…"
+                        value=(search_query)
+                        hx-get={ (prefix) "/" (model_slug) }
+                        hx-trigger="input changed delay:300ms"
+                        hx-include="closest form"
+                        hx-target="closest .card"
+                        hx-select=".card > *"
+                        hx-push-url="true" {}
+                    @for (k, v) in filters {
+                        input type="hidden" name={ "filter." (k) } value=(v);
                     }
-                    tbody {
-                        @if result.records.is_empty() {
+                }
+
+                // Bulk-action form wraps the table so the row checkboxes
+                // submit alongside the action selector.
+                form method="post" action={ (prefix) "/" (model_slug) "/actions" } {
+                    (csrf_hidden_input(csrf_token, csrf_form_field))
+
+                // Table
+                div class="table-wrap" {
+                    table {
+                        thead {
                             tr {
-                                td colspan=(list_fields.len() + 2)
-                                    style="text-align: center; padding: 2rem; color: var(--text-muted);" {
-                                    "No records found."
-                                }
-                            }
-                        }
-                        @for record in &result.records {
-                            @let row_id = record_id(record);
-                            tr {
-                                td class="checkbox-cell" {
-                                    // Only emit a bulk-action checkbox for rows with a
-                                    // routable id — otherwise the form would post id="" or
-                                    // the wrong record.
-                                    @if let Some(id) = row_id {
-                                        input type="checkbox" class="row-check"
-                                            name="ids" value=(id);
-                                    }
+                                th class="checkbox-cell" {
+                                    // Wired up by admin.js via event delegation on #select-all.
+                                    input type="checkbox" id="select-all";
                                 }
                                 @for field in &list_fields {
-                                    td { (render_cell_value(record, field)) }
+                                    @let is_sorted = sort_by == Some(field.name);
+                                    @let next_dir = if is_sorted { sort_dir.flipped() } else { SortDirection::Asc };
+                                    th {
+                                        @if field.sortable {
+                                            a href={ (prefix) "/" (model_slug) "?sort=" (field.name) "&dir=" (next_dir.as_str())
+                                                @if !search_enc.is_empty() { "&q=" (search_enc) }
+                                                (filters_enc)
+                                            }
+                                            style="color: inherit; text-decoration: none;" {
+                                                (field.label)
+                                                @if is_sorted {
+                                                    span class="sort-icon" {
+                                                        @if matches!(sort_dir, SortDirection::Asc) { "▲" } @else { "▼" }
+                                                    }
+                                                }
+                                            }
+                                        } @else {
+                                            (field.label)
+                                        }
+                                    }
                                 }
-                                td {
-                                    @if let Some(id) = row_id {
-                                        a href={ (prefix) "/" (model_slug) "/" (id) }
-                                            class="btn btn-sm" { "View" }
-                                        " "
-                                        a href={ (prefix) "/" (model_slug) "/" (id) "/edit" }
-                                            class="btn btn-sm" { "Edit" }
-                                    } @else {
-                                        // Surface the issue rather than rendering links to /0.
-                                        span style="color: var(--text-muted); font-size: 0.75rem;" {
-                                            "no id"
+                                th { "Actions" }
+                            }
+                        }
+                        tbody {
+                            @if result.records.is_empty() {
+                                tr {
+                                    td colspan=(list_fields.len() + 2)
+                                        style="text-align: center; padding: 2rem; color: var(--text-muted);" {
+                                        "No records found."
+                                    }
+                                }
+                            }
+                            @for record in &result.records {
+                                @let row_id = record_id(record);
+                                tr {
+                                    td class="checkbox-cell" {
+                                        // Only emit a bulk-action checkbox for rows with a
+                                        // routable id — otherwise the form would post id="" or
+                                        // the wrong record.
+                                        @if let Some(id) = row_id {
+                                            input type="checkbox" class="row-check"
+                                                name="ids" value=(id);
+                                        }
+                                    }
+                                    @for field in &list_fields {
+                                        td { (render_cell_value(record, field)) }
+                                    }
+                                    td {
+                                        @if let Some(id) = row_id {
+                                            a href={ (prefix) "/" (model_slug) "/" (id) }
+                                                class="btn btn-sm" { "View" }
+                                            " "
+                                            a href={ (prefix) "/" (model_slug) "/" (id) "/edit" }
+                                                class="btn btn-sm" { "Edit" }
+                                        } @else {
+                                            // Surface the issue rather than rendering links to /0.
+                                            span style="color: var(--text-muted); font-size: 0.75rem;" {
+                                                "no id"
+                                            }
                                         }
                                     }
                                 }
@@ -1073,35 +1073,36 @@ pub fn model_list_page(
                         }
                     }
                 }
-            }
 
-                // Bulk-action bar — only rendered when the model declares
-                // at least one action. Sits below the table inside the
-                // wrapping form.
-                @if !actions.is_empty() {
-                    div class="action-bar" {
-                        label for="bulk-action" { "With selected:" }
-                        select name="action" id="bulk-action" class="form-input"
-                            style="width: auto; display: inline-block;" {
-                            @for a in actions {
-                                option value=(a.name) data-confirm=[a.confirm.then_some("1")] {
-                                    (a.label)
+                    // Bulk-action bar — only rendered when the model declares
+                    // at least one action. Sits below the table inside the
+                    // wrapping form.
+                    @if !actions.is_empty() {
+                        div class="action-bar" {
+                            label for="bulk-action" { "With selected:" }
+                            select name="action" id="bulk-action" class="form-input"
+                                style="width: auto; display: inline-block;" {
+                                @for a in actions {
+                                    option value=(a.name) data-confirm=[a.confirm.then_some("1")] {
+                                        (a.label)
+                                    }
                                 }
                             }
-                        }
-                        button type="submit" class="btn" data-bulk-submit="1" {
-                            "Apply"
+                            button type="submit" class="btn" data-bulk-submit="1" {
+                                "Apply"
+                            }
                         }
                     }
+
+                } // /form
+
+                // Pagination
+                @if result.total_pages() > 1 {
+                    (render_pagination(result, model_slug, &search_enc, sort_by, sort_dir, &filters_enc, prefix))
                 }
-
-            } // /form
-
-            // Pagination
-            @if result.total_pages() > 1 {
-                (render_pagination(result, model_slug, &search_enc, sort_by, sort_dir, &filters_enc, prefix))
-            }
-        }
+            };
+            card(&body, &CardConfig::new().title_html(title).header_action(header_action))
+        })
     };
     admin_layout(
         registry,
@@ -1142,12 +1143,9 @@ pub fn model_import_form_page(
             span { "Import CSV" }
         }
 
-        div class="card" {
-            div class="card-header" {
-                span class="card-title" { "Import " (model_name_plural) " from CSV" }
-            }
-
-            div style="padding: 1.5rem;" {
+        ({
+            let title = html! { "Import " (model_name_plural) " from CSV" };
+            let body = html! {
                 p style="color: var(--text-muted); margin-bottom: 1rem;" {
                     "Upload a CSV file with a header row. Column names must match the model's field names."
                 }
@@ -1200,8 +1198,9 @@ pub fn model_import_form_page(
                         }
                     }
                 }
-            }
-        }
+            };
+            card(&body, &CardConfig::new().title_html(title))
+        })
     };
 
     admin_layout(
@@ -1248,12 +1247,9 @@ pub fn model_import_result_page(
             span { "Import Result" }
         }
 
-        div class="card" {
-            div class="card-header" {
-                span class="card-title" { "Import Report — " (mode_label) }
-            }
-
-            div style="padding: 1.5rem;" {
+        ({
+            let title = html! { "Import Report — " (mode_label) };
+            let body = html! {
                 div style="display: grid; grid-template-columns: repeat(4, 1fr); gap: 1rem; margin-bottom: 1.5rem;" {
                     div style="text-align: center; padding: 1rem; background: var(--success-light); border-radius: 0.375rem;" {
                         div style="font-size: 1.5rem; font-weight: 700; color: var(--success);" { (report.inserted) }
@@ -1316,8 +1312,9 @@ pub fn model_import_result_page(
                     a href={ (prefix) "/" (model_slug) } class="btn btn-primary" { "Back to list" }
                     a href={ (prefix) "/" (model_slug) "/import" } class="btn" { "Import another file" }
                 }
-            }
-        }
+            };
+            card(&body, &CardConfig::new().title_html(title))
+        })
     };
 
     admin_layout(
@@ -1367,9 +1364,8 @@ pub fn model_detail_page(
             span { (record_display) }
         }
 
-        div class="card" {
-            div class="card-header" {
-                span class="card-title" { (record_display) }
+        ({
+            let header_action = html! {
                 div {
                     @if has_history {
                         a href={ (prefix) "/" (model_slug) "/" (id) "/history" }
@@ -1386,17 +1382,19 @@ pub fn model_detail_page(
                         "Delete"
                     }
                 }
-            }
-
-            div class="detail-grid" {
-                @for field in fields {
-                    div class="detail-label" { (field.label) }
-                    div class="detail-value" {
-                        (render_detail_value(record, field))
+            };
+            let body = html! {
+                div class="detail-grid" {
+                    @for field in fields {
+                        div class="detail-label" { (field.label) }
+                        div class="detail-value" {
+                            (render_detail_value(record, field))
+                        }
                     }
                 }
-            }
-        }
+            };
+            card(&body, &CardConfig::new().title(record_display).header_action(header_action))
+        })
     };
     admin_layout(
         registry,
@@ -1452,49 +1450,48 @@ pub fn model_form_page(
             span { (title) }
         }
 
-        div class="card" {
-            div class="card-header" {
-                span class="card-title" { (title) }
-            }
+        ({
+            let body = html! {
+                form method="post"
+                    action={
+                        @if let Some(id) = id {
+                            (prefix) "/" (model_slug) "/" (id)
+                        } @else {
+                            (prefix) "/" (model_slug)
+                        }
+                    } {
+                    (csrf_hidden_input(csrf_token, csrf_form_field))
 
-            form method="post"
-                action={
-                    @if let Some(id) = id {
-                        (prefix) "/" (model_slug) "/" (id)
-                    } @else {
-                        (prefix) "/" (model_slug)
-                    }
-                } {
-                (csrf_hidden_input(csrf_token, csrf_form_field))
-
-                @for field in &editable_fields {
-                    div class="form-group" {
-                        label class="form-label" for=(field.name) {
-                            (field.label)
-                            @if field.required && !(is_edit && field.create_only) {
-                                span class="required" { "*" }
+                    @for field in &editable_fields {
+                        div class="form-group" {
+                            label class="form-label" for=(field.name) {
+                                (field.label)
+                                @if field.required && !(is_edit && field.create_only) {
+                                    span class="required" { "*" }
+                                }
+                            }
+                            @if is_edit && field.create_only {
+                                // Immutable-after-create: show current value as read-only text
+                                // so the admin can see it but cannot change it.
+                                (render_readonly_display(field, record))
+                            } @else {
+                                (render_form_widget(field, record))
                             }
                         }
-                        @if is_edit && field.create_only {
-                            // Immutable-after-create: show current value as read-only text
-                            // so the admin can see it but cannot change it.
-                            (render_readonly_display(field, record))
-                        } @else {
-                            (render_form_widget(field, record))
+                    }
+
+                    div style="display: flex; gap: 0.75rem; margin-top: 1.5rem;" {
+                        button type="submit" class="btn btn-primary" {
+                            @if is_edit { "Save Changes" } @else { "Create" }
+                        }
+                        a href={ (prefix) "/" (model_slug) } class="btn" {
+                            "Cancel"
                         }
                     }
                 }
-
-                div style="display: flex; gap: 0.75rem; margin-top: 1.5rem;" {
-                    button type="submit" class="btn btn-primary" {
-                        @if is_edit { "Save Changes" } @else { "Create" }
-                    }
-                    a href={ (prefix) "/" (model_slug) } class="btn" {
-                        "Cancel"
-                    }
-                }
-            }
-        }
+            };
+            card(&body, &CardConfig::new().title(&title))
+        })
     };
     admin_layout(
         registry,
@@ -1539,7 +1536,7 @@ pub fn config_page(
         }
 
         @if entries.is_empty() {
-            div class="card" {
+            (card(&html! {
                 p style="color: var(--text-muted); padding: 1rem;" {
                     "No config keys have been registered. Declare keys with "
                     code { "ConfigRegistry::define" }
@@ -1547,9 +1544,9 @@ pub fn config_page(
                     code { "AdminPlugin::with_runtime_config" }
                     "."
                 }
-            }
+            }, &CardConfig::new()))
         } @else {
-            div class="card" {
+            (card(&html! {
                 table class="table" {
                     thead {
                         tr {
@@ -1617,7 +1614,7 @@ pub fn config_page(
                         }
                     }
                 }
-            }
+            }, &CardConfig::new()))
         }
     };
     admin_layout(
@@ -1660,7 +1657,7 @@ pub fn config_history_page(
             "History: " (key)
         }
 
-        div class="card" {
+        (card(&html! {
             @if history.is_empty() {
                 p style="color: var(--text-muted); padding: 1rem;" {
                     "No changes recorded for this key yet."
@@ -1711,7 +1708,7 @@ pub fn config_history_page(
                     }
                 }
             }
-        }
+        }, &CardConfig::new()))
 
         a href={ (prefix) "/config" } class="btn" style="margin-top: 1rem;" {
             "← Back to Runtime Config"
@@ -2162,69 +2159,67 @@ pub fn model_history_page(
             span { "History" }
         }
 
-        div class="card" {
-            div class="card-header" {
-                span class="card-title" { "Version History" }
-                small { " " (history.total) " entries" }
-            }
-
-            @if history.entries.is_empty() {
-                p class="text-muted" style="padding:1rem" { "No history entries yet." }
-            } @else {
-                table class="admin-table" {
-                    thead {
-                        tr {
-                            th { "#" }
-                            th { "Operation" }
-                            th { "Actor" }
-                            th { "Request ID" }
-                            th { "Changes" }
-                            th { "Recorded At" }
-                        }
-                    }
-                    tbody {
-                        @for entry in &history.entries {
+        ({
+            let header_action = html! { small { " " (history.total) " entries" } };
+            let body = html! {
+                @if history.entries.is_empty() {
+                    p class="text-muted" style="padding:1rem" { "No history entries yet." }
+                } @else {
+                    table class="admin-table" {
+                        thead {
                             tr {
-                                td { (entry.id) }
-                                td {
-                                    span class={ "badge badge-" (entry.op) } { (entry.op) }
-                                }
-                                td { code { (entry.actor) } }
-                                td {
-                                    @if let Some(ref req_id) = entry.request_id {
-                                        code class="text-muted" { (req_id) }
-                                    } @else {
-                                        span class="text-muted" { "—" }
+                                th { "#" }
+                                th { "Operation" }
+                                th { "Actor" }
+                                th { "Request ID" }
+                                th { "Changes" }
+                                th { "Recorded At" }
+                            }
+                        }
+                        tbody {
+                            @for entry in &history.entries {
+                                tr {
+                                    td { (entry.id) }
+                                    td {
+                                        span class={ "badge badge-" (entry.op) } { (entry.op) }
                                     }
-                                }
-                                td {
-                                    @if entry.changes.is_empty() {
-                                        span class="text-muted" { "no changes" }
-                                    } @else {
-                                        details {
-                                            summary { (entry.changes.len()) " column(s)" }
-                                            ul class="change-list" {
-                                                @for change in &entry.changes {
-                                                    li {
-                                                        @if let Some(col) = change.get("column").and_then(Value::as_str) {
-                                                            code { (col) }
-                                                        }
-                                                        @if change.get("sensitive").and_then(Value::as_bool).unwrap_or(false) {
-                                                            span class="badge-sensitive" { " [sensitive]" }
-                                                        } @else {
-                                                            " "
-                                                            span class="text-muted" { "before: " }
-                                                            @if let Some(before) = change.get("before") {
-                                                                code { (before) }
-                                                            } @else {
-                                                                em { "null" }
+                                    td { code { (entry.actor) } }
+                                    td {
+                                        @if let Some(ref req_id) = entry.request_id {
+                                            code class="text-muted" { (req_id) }
+                                        } @else {
+                                            span class="text-muted" { "—" }
+                                        }
+                                    }
+                                    td {
+                                        @if entry.changes.is_empty() {
+                                            span class="text-muted" { "no changes" }
+                                        } @else {
+                                            details {
+                                                summary { (entry.changes.len()) " column(s)" }
+                                                ul class="change-list" {
+                                                    @for change in &entry.changes {
+                                                        li {
+                                                            @if let Some(col) = change.get("column").and_then(Value::as_str) {
+                                                                code { (col) }
                                                             }
-                                                            " → "
-                                                            span class="text-muted" { "after: " }
-                                                            @if let Some(after) = change.get("after") {
-                                                                code { (after) }
+                                                            @if change.get("sensitive").and_then(Value::as_bool).unwrap_or(false) {
+                                                                span class="badge-sensitive" { " [sensitive]" }
                                                             } @else {
-                                                                em { "null" }
+                                                                " "
+                                                                span class="text-muted" { "before: " }
+                                                                @if let Some(before) = change.get("before") {
+                                                                    code { (before) }
+                                                                } @else {
+                                                                    em { "null" }
+                                                                }
+                                                                " → "
+                                                                span class="text-muted" { "after: " }
+                                                                @if let Some(after) = change.get("after") {
+                                                                    code { (after) }
+                                                                } @else {
+                                                                    em { "null" }
+                                                                }
                                                             }
                                                         }
                                                     }
@@ -2232,32 +2227,33 @@ pub fn model_history_page(
                                             }
                                         }
                                     }
-                                }
-                                td {
-                                    time datetime=(entry.recorded_at.to_rfc3339()) {
-                                        (entry.recorded_at.format("%Y-%m-%d %H:%M:%S UTC"))
+                                    td {
+                                        time datetime=(entry.recorded_at.to_rfc3339()) {
+                                            (entry.recorded_at.format("%Y-%m-%d %H:%M:%S UTC"))
+                                        }
                                     }
                                 }
                             }
                         }
                     }
-                }
 
-                @if history.total_pages() > 1 {
-                    div class="pagination" {
-                        @if history.page > 1 {
-                            a href=(history_page_href(history.page - 1))
-                                class="btn btn-secondary btn-sm" { "← Prev" }
-                        }
-                        span { " Page " (history.page) " of " (history.total_pages()) " " }
-                        @if history.has_next_page() {
-                            a href=(history_page_href(history.page + 1))
-                                class="btn btn-secondary btn-sm" { "Next →" }
+                    @if history.total_pages() > 1 {
+                        div class="pagination" {
+                            @if history.page > 1 {
+                                a href=(history_page_href(history.page - 1))
+                                    class="btn btn-secondary btn-sm" { "← Prev" }
+                            }
+                            span { " Page " (history.page) " of " (history.total_pages()) " " }
+                            @if history.has_next_page() {
+                                a href=(history_page_href(history.page + 1))
+                                    class="btn btn-secondary btn-sm" { "Next →" }
+                            }
                         }
                     }
                 }
-            }
-        }
+            };
+            card(&body, &CardConfig::new().title("Version History").header_action(header_action))
+        })
     };
     admin_layout(
         registry,
