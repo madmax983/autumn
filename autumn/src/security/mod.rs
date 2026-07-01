@@ -139,6 +139,7 @@
 
 pub mod captcha;
 pub(crate) mod config;
+pub mod constant_time;
 pub(crate) mod csrf;
 pub(crate) mod headers;
 pub mod proxy;

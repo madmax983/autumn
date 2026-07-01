@@ -253,12 +253,6 @@ pub fn hmac_sha256_hex(key: &[u8], message: &[u8]) -> String {
     })
 }
 
-/// Constant-time string comparison for HMAC verification.
-fn ct_eq_str(a: &str, b: &str) -> bool {
-    use subtle::ConstantTimeEq;
-    a.as_bytes().ct_eq(b.as_bytes()).into()
-}
-
 /// Generate a random 32-byte ephemeral key from two UUID v4 values.
 fn generate_ephemeral_key() -> Vec<u8> {
     let a = uuid::Uuid::new_v4();
@@ -303,11 +297,11 @@ impl ResolvedSigningKeys {
     /// Returns `true` when `hex_sig` is a valid HMAC-SHA256 of `message` under
     /// any key (current first, then previous). All comparisons are constant-time.
     pub fn verify(&self, message: &[u8], hex_sig: &str) -> bool {
-        if ct_eq_str(&hmac_sha256_hex(&self.current, message), hex_sig) {
+        if crate::security::constant_time::constant_time_eq_str(&hmac_sha256_hex(&self.current, message), hex_sig) {
             return true;
         }
         for prev in &self.previous {
-            if ct_eq_str(&hmac_sha256_hex(prev, message), hex_sig) {
+            if crate::security::constant_time::constant_time_eq_str(&hmac_sha256_hex(prev, message), hex_sig) {
                 return true;
             }
         }

@@ -831,11 +831,6 @@ impl InboundMailRouter {
 
 // ── Provider parsing ──────────────────────────────────────────────────────────
 
-fn subtle_eq(a: &[u8], b: &[u8]) -> bool {
-    use subtle::ConstantTimeEq as _;
-    a.ct_eq(b).into()
-}
-
 /// Strip a display-name from an RFC 5322 address, returning only the addr-spec.
 ///
 /// `"Support <support@company.com>"` → `"support@company.com"`
@@ -896,7 +891,7 @@ pub(crate) fn parse_mailgun(
     }
 
     let expected = compute_mailgun_signature(timestamp, token, signing_key);
-    if !subtle_eq(expected.as_bytes(), signature.as_bytes()) {
+    if !crate::security::constant_time::constant_time_eq(expected.as_bytes(), signature.as_bytes()) {
         tracing::warn!("inbound_mail.mailgun: invalid signature — request rejected");
         return Err(StatusCode::UNAUTHORIZED);
     }
@@ -1113,7 +1108,7 @@ pub(crate) fn parse_generic(
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
         let expected = crate::security::config::hmac_sha256_hex(key.as_bytes(), &raw_body);
-        if !subtle_eq(expected.as_bytes(), provided.as_bytes()) {
+        if !crate::security::constant_time::constant_time_eq(expected.as_bytes(), provided.as_bytes()) {
             tracing::warn!("inbound_mail.generic: invalid signature — request rejected");
             return Err(StatusCode::UNAUTHORIZED);
         }
