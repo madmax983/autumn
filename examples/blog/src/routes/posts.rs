@@ -247,8 +247,8 @@ pub async fn index(locale: Locale, mut db: Db) -> AutumnResult<Markup> {
         "Autumn Blog",
         html! {
             (hero(
-                &HeroConfig::new("Welcome to the Blog")
-                    .subtitle("Thoughts, tutorials, and stories — powered by Autumn.")
+                &HeroConfig::new(&t!(locale, "home.hero.title"))
+                    .subtitle(&t!(locale, "home.hero.subtitle"))
             ))
 
             @if published_posts.is_empty() {
