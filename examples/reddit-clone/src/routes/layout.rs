@@ -96,6 +96,10 @@ pub fn layout(
                 meta charset="utf-8";
                 meta name="viewport" content="width=device-width, initial-scale=1";
                 title { (title) " — Autumn Reddit" }
+                link rel="manifest" href="/manifest.webmanifest";
+                meta name="theme-color" content="#ffffff";
+                link rel="apple-touch-icon" href="/static/icons/icon.svg";
+                script src="/pwa-register.js" {}
                 // Embed CSRF token in a meta tag so htmx JS can read it
                 // (the autumn-csrf cookie is HttpOnly and inaccessible to JS)
                 @if let Some(token) = csrf_token {

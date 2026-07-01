@@ -79,6 +79,54 @@ static EMBEDDED_STATIC: autumn_web::include_dir::Dir = autumn_web::embed_static!
 
 const MIGRATIONS: EmbeddedMigrations = embed_migrations!();
 
+#[get("/manifest.webmanifest")]
+async fn pwa_manifest() -> impl IntoResponse {
+(
+[
+("content-type", "application/manifest+json"),
+("cache-control", "public, max-age=3600"),
+],
+include_str!("../static/manifest.webmanifest"),
+)
+}
+
+#[get("/service-worker.js")]
+async fn pwa_service_worker() -> impl IntoResponse {
+(
+[
+("content-type", "text/javascript; charset=utf-8"),
+("service-worker-allowed", "/"),
+("cache-control", "no-cache"),
+],
+include_str!("../static/service-worker.js"),
+)
+}
+
+#[get("/pwa-register.js")]
+async fn pwa_register_js() -> impl IntoResponse {
+(
+[
+("content-type", "text/javascript; charset=utf-8"),
+("cache-control", "public, max-age=3600"),
+],
+include_str!("../static/pwa-register.js"),
+)
+}
+
+#[get("/offline")]
+async fn pwa_offline(flash: Flash) -> maud::Markup {
+    reddit_clone::routes::layout::layout(
+        "Offline",
+        None,
+        None,
+        maud::html! {
+            (flash.render().await)
+            h1 { "You are offline" }
+            p { "Check your internet connection and try again." }
+        },
+    )
+}
+
 #[autumn_web::main]
 async fn main() {
     let webhook_store = Arc::new(InMemoryOutboundWebhookStore::new());
@@ -149,7 +197,11 @@ async fn main() {
             routes::errors::trigger_error,
             routes::errors::trigger_panic,
             routes::errors::trigger_404,
-        ])
+            pwa_manifest,
+            pwa_service_worker,
+            pwa_register_js,
+            pwa_offline,
+])
         .mail_previews(routes::auth::mail_previews())
         .policy::<Post, _>(PostPolicy)
         .static_routes(static_routes![routes::about::about])

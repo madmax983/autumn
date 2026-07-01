@@ -563,8 +563,32 @@ fn has_mod_declaration(existing: &str, name: &str) -> bool {
 
 /// Insert each entry into the body of the *first* `routes![ ... ]` macro
 /// invocation. Skips entries already present.
+fn is_on_comment_line(text: &str, pos: usize) -> bool {
+    let mut current = pos;
+    while current > 0 {
+        current -= 1;
+        if text.as_bytes()[current] == b'\n' {
+            current += 1;
+            break;
+        }
+    }
+    text[current..pos].contains("//")
+}
+
 fn ensure_routes_entries(existing: &str, entries: &[String]) -> String {
-    let Some(start) = existing.find("routes![") else {
+    let mut start_pos = 0;
+    let start = loop {
+        if let Some(pos) = existing[start_pos..].find("routes![") {
+            let actual_pos = start_pos + pos;
+            if !is_on_comment_line(existing, actual_pos) {
+                break Some(actual_pos);
+            }
+            start_pos = actual_pos + "routes![".len();
+        } else {
+            break None;
+        }
+    };
+    let Some(start) = start else {
         return existing.to_owned();
     };
     let body_start = start + "routes![".len();
