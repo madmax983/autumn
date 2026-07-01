@@ -307,3 +307,57 @@
 .autumn-breadcrumb__text {
     color: #374151;
 }
+
+/* ── Hero banner (autumn-hero) ─────────────────────────────────────────────── */
+
+.autumn-hero {
+    margin-bottom: 2.5rem;
+}
+
+.autumn-hero__title {
+    font-size: 1.875rem;
+    font-weight: 700;
+    letter-spacing: -0.025em;
+    color: #1c1917;
+    margin: 0 0 0.5rem 0;
+}
+
+.autumn-hero__subtitle {
+    color: #57534e;
+    margin: 0;
+}
+
+.autumn-hero__actions {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    margin-top: 1.25rem;
+}
+
+.autumn-hero__cta {
+    display: inline-flex;
+    align-items: center;
+    padding: 0.625rem 1.25rem;
+    border-radius: 0.5rem;
+    font-size: 0.875rem;
+    font-weight: 500;
+    text-decoration: none;
+    transition: background-color 0.15s ease, color 0.15s ease;
+}
+
+.autumn-hero__cta--primary {
+    background-color: #b45309;
+    color: #fff;
+}
+
+.autumn-hero__cta--primary:hover {
+    background-color: #92400e;
+}
+
+.autumn-hero__cta--secondary {
+    color: #57534e;
+}
+
+.autumn-hero__cta--secondary:hover {
+    color: #292524;
+}
