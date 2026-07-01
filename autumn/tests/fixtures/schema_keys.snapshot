@@ -26,9 +26,11 @@ database.url
 dev
 health
 http
+i18n
 idempotency
 jobs
 log
+mail
 openapi
 reporting
 resilience
@@ -45,6 +47,7 @@ server.timeouts
 server.timeouts.request_timeout_ms
 server.unix_socket
 session
+storage
 telemetry
 tenancy
 time_zone
