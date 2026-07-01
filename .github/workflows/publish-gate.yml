@@ -90,6 +90,19 @@ jobs:
         id: setup-chrome
         uses: browser-actions/setup-chrome@v1
 
+      # Every example's layout references its Tailwind-compiled
+      # `/static/css/autumn.css`. Without this, each example's build.rs finds
+      # no `tailwindcss` binary and skips regenerating it (a warning, not a
+      # build failure) — the smoke would then boot against a real app that's
+      # 404ing on its own stylesheet, which the browser reports as a
+      # `Log.entryAdded` error (see `SystemTest`'s console-error capture)
+      # even though nothing is actually broken. `autumn setup` is the
+      # project's own first-party installer (downloads to
+      # `target/autumn/tailwindcss`, where every example's build.rs already
+      # looks first).
+      - name: Install Tailwind CSS CLI
+        run: cargo run -p autumn-cli --bin autumn -- setup
+
       - name: Build and Chromium-smoke every example
         env:
           AUTUMN_CHROMIUM: ${{ steps.setup-chrome.outputs.chrome-path }}

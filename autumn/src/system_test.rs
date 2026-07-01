@@ -73,6 +73,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use chromiumoxide::cdp::browser_protocol::log::{EventEntryAdded, LogEntryLevel};
 use chromiumoxide::cdp::js_protocol::runtime::{
     ConsoleApiCalledType, EventConsoleApiCalled, EventExceptionThrown,
 };
@@ -573,6 +574,7 @@ impl SystemTestRunner {
             .expect("SystemTestRunner::browser is only None during Drop");
         let cdp_page = browser.new_page("about:blank").await?;
         cdp_page.enable_runtime().await?;
+        cdp_page.enable_log().await?;
 
         let console_errors: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         spawn_console_error_capture(&cdp_page, Arc::clone(&console_errors)).await?;
@@ -593,25 +595,33 @@ impl SystemTestRunner {
     }
 }
 
-/// Subscribe to `Runtime.consoleAPICalled` (level `error`) and
-/// `Runtime.exceptionThrown` CDP events on `page` and append formatted
-/// messages to `sink` as they arrive, for the lifetime of the page.
+/// Subscribe to `Runtime.consoleAPICalled` (level `error`),
+/// `Runtime.exceptionThrown`, and `Log.entryAdded` (level `error`) CDP
+/// events on `page` and append formatted messages to `sink` as they arrive,
+/// for the lifetime of the page.
+///
+/// `Log.entryAdded` is a separate CDP domain from `Runtime` and is where
+/// Chrome reports browser-level errors — failed resource loads (e.g. a
+/// missing `/static` asset), CSP violations, mixed-content warnings — none
+/// of which fire a `Runtime.consoleAPICalled` or `exceptionThrown` event.
 async fn spawn_console_error_capture(
     page: &chromiumoxide::page::Page,
     sink: Arc<Mutex<Vec<String>>>,
 ) -> Result<(), SystemTestError> {
     let mut console_events = page.event_listener::<EventConsoleApiCalled>().await?;
     let mut exception_events = page.event_listener::<EventExceptionThrown>().await?;
+    let mut log_events = page.event_listener::<EventEntryAdded>().await?;
 
     tokio::spawn(async move {
         // Track each stream's liveness independently: a `select!` branch
         // guarded by `if <flag>` is skipped once that flag is false, so one
         // stream ending (e.g. a transient CDP session hiccup) only stops
-        // polling *that* stream — it must not end capture on the other one.
-        // The task only exits once both streams are done.
+        // polling *that* stream — it must not end capture on the others.
+        // The task only exits once all streams are done.
         let mut console_open = true;
         let mut exception_open = true;
-        while console_open || exception_open {
+        let mut log_open = true;
+        while console_open || exception_open || log_open {
             tokio::select! {
                 event = console_events.next(), if console_open => {
                     match event {
@@ -635,6 +645,16 @@ async fn spawn_console_error_capture(
                             sink.lock().unwrap().push(event.exception_details.text.clone());
                         }
                         None => exception_open = false,
+                    }
+                }
+                event = log_events.next(), if log_open => {
+                    match event {
+                        Some(event) => {
+                            if event.entry.level == LogEntryLevel::Error {
+                                sink.lock().unwrap().push(event.entry.text.clone());
+                            }
+                        }
+                        None => log_open = false,
                     }
                 }
             }

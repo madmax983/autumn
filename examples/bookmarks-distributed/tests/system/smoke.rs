@@ -14,6 +14,13 @@
 //! own config to a scratch directory containing a minimal `autumn.toml`
 //! carrying the two testcontainer URLs.
 //!
+//! `AUTUMN_MANIFEST_DIR` also redirects the framework's `/static` file
+//! serving (`project_dir("static", ...)` in `router.rs`) to
+//! `<AUTUMN_MANIFEST_DIR>/static` — so the scratch dir gets a symlink to the
+//! real project's `static/` alongside the scratch `autumn.toml`, keeping the
+//! rendered page's actual `<link>`/`<script>` asset paths (e.g.
+//! `static/css/autumn.css`) served exactly as the unmodified binary would.
+//!
 //! The framework only auto-migrates the *primary* on boot (a real replica
 //! already has the schema via streaming replication); since the "replica"
 //! here is a second independent empty database rather than a true
@@ -72,6 +79,16 @@ replica_fallback = "fail_readiness"
         ),
     )
     .expect("write scratch autumn.toml");
+
+    // See module docs: redirecting AUTUMN_MANIFEST_DIR to the scratch dir
+    // also redirects `/static` file serving there, so without this the page
+    // would 404 on its real CSS/JS instead of exercising them.
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("static"),
+        scratch_dir.join("static"),
+    )
+    .expect("symlink scratch static dir to the real project's static dir");
 
     let app = example_e2e::spawn_example(
         env!("CARGO_BIN_EXE_bookmarks-distributed"),
