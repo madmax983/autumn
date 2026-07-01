@@ -65,11 +65,12 @@ async fn bookmarks_sharded_boots_and_fans_out_across_shards() {
     // `/api/stats` sits behind the app's global header-based tenancy
     // middleware (every route requires `X-Tenant-Id`, not just the
     // tenant-scoped ones), and a plain navigation can't set a custom
-    // request header. First load *some* same-origin page (a 400 from the
-    // tenancy check is still a real, same-origin response) so `evaluate()`
-    // can `fetch()` with the header from that origin, then write the
-    // response into the DOM for `expect_text` to poll.
-    page.visit("/api/stats").await.expect("visit /api/stats");
+    // request header. `/health` is exempt from that middleware (public
+    // probe endpoint) and always 200s, so load it first purely to land in
+    // the app's origin, then `evaluate()` can `fetch()` `/api/stats` with
+    // the header from there and write the response into the DOM for
+    // `expect_text` to poll.
+    page.visit("/health").await.expect("visit /health");
     page.evaluate(
         "fetch('/api/stats', { headers: { 'X-Tenant-Id': 'acme' } })\
          .then(r => r.text())\
