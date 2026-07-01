@@ -2464,6 +2464,11 @@ fn apply_middleware(
     // session, logs, and trace context.
     let router = router.layer(RequestIdLayer);
 
+    // Pre-clone signing keys for the RYWW middleware (session mode needs to
+    // sign/verify the `autumn.ryw` cookie; `signing_keys_opt` is consumed below).
+    #[cfg(feature = "db")]
+    let signing_keys_for_ryw = signing_keys_opt.clone();
+
     let router = crate::session::apply_session_layer(
         router,
         &config.session,
@@ -2472,6 +2477,39 @@ fn apply_middleware(
         signing_keys_opt,
     )?;
     tracing::debug!(backend = ?config.session.backend, "Session management enabled");
+
+    // Read-your-own-writes middleware: installed only when the mode is not
+    // `off`. When active, it scopes a per-request task-local `RequestPin`
+    // that generated repository read methods consult at acquire time.
+    // Inner to Session so the task-local wraps the handler; the `autumn.ryw`
+    // cookie is parsed from raw `Cookie` headers and does not require the
+    // Session extractor to have run first.
+    #[cfg(feature = "db")]
+    let router = if config.database.read_your_writes == crate::config::ReadYourWrites::Off {
+        router
+    } else {
+        let ryw_mode = config.database.read_your_writes;
+        let window_secs = config.database.pin_after_write_secs;
+        let keys = signing_keys_for_ryw;
+        if ryw_mode == crate::config::ReadYourWrites::Session && keys.is_none() {
+            tracing::warn!(
+                "read_your_writes = \"session\" requires a configured \
+                 security.signing_secret to sign the autumn.ryw cookie; \
+                 cross-request pinning is disabled until a secret is set"
+            );
+        }
+        let metrics = state.metrics().clone();
+        router.layer(axum::middleware::from_fn(move |req, next| {
+            crate::read_your_writes::middleware(
+                req,
+                next,
+                ryw_mode,
+                window_secs,
+                keys.clone(),
+                metrics.clone(),
+            )
+        }))
+    };
 
     // Error page filter: renders HTML error pages for browser requests.
     // Always registered (uses default renderer if no custom one is provided).

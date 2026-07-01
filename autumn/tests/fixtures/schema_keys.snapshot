@@ -10,9 +10,11 @@ database.auto_migrate_in_production
 database.connect_timeout_secs
 database.directory_shard_router
 database.max_connections_warn_threshold
+database.pin_after_write_secs
 database.pool_size
 database.primary_pool_size
 database.primary_url
+database.read_your_writes
 database.replica_fallback
 database.replica_pool_size
 database.replica_url

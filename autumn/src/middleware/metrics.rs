@@ -56,6 +56,9 @@ struct MetricsInner {
     /// Requests that exceeded the configured per-request timeout.
     /// Exposed as `autumn_request_timeouts_total`.
     request_timeouts_total: AtomicU64,
+    /// Replica reads redirected to the primary by the RYWW pin.
+    /// Exposed as `autumn_read_your_writes_pins_total`.
+    read_your_writes_pins_total: AtomicU64,
 }
 
 #[derive(Debug, Default)]
@@ -106,6 +109,7 @@ impl MetricsCollector {
                 idempotency_conflicts: AtomicU64::new(0),
                 shutdown_aborted_requests: AtomicU64::new(0),
                 request_timeouts_total: AtomicU64::new(0),
+                read_your_writes_pins_total: AtomicU64::new(0),
             }),
         }
     }
@@ -124,6 +128,13 @@ impl MetricsCollector {
     pub fn record_request_timeout(&self) {
         self.inner
             .request_timeouts_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Increment the read-your-own-writes pin redirect counter.
+    pub fn record_read_your_writes_pin(&self) {
+        self.inner
+            .read_your_writes_pins_total
             .fetch_add(1, Ordering::Relaxed);
     }
 
@@ -344,6 +355,10 @@ impl MetricsCollector {
                 conflicts: self.inner.idempotency_conflicts.load(Ordering::Relaxed),
             },
             db_queries,
+            read_your_writes_pins_total: self
+                .inner
+                .read_your_writes_pins_total
+                .load(Ordering::Relaxed),
         }
     }
 }
@@ -373,6 +388,9 @@ pub struct MetricsSnapshot {
     /// Database queries tracked.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub db_queries: HashMap<String, DbQueryMetric>,
+    /// Read-your-own-writes: number of replica reads redirected to the primary
+    /// due to an active RYWW pin. Zero when `read_your_writes = "off"`.
+    pub read_your_writes_pins_total: u64,
 }
 
 /// Idempotency-key middleware counters.
