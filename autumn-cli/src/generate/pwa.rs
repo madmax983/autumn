@@ -467,25 +467,26 @@ async fn pwa_offline(flash: Flash) -> maud::Markup {\n\
 }\n\
 \n";
 
-    // Insert before `#[autumn_web::main]`, or append at end as fallback.
-    source.find("#[autumn_web::main]").map_or_else(
-        || {
-            let mut result = source.to_owned();
-            if !result.ends_with('\n') {
-                result.push('\n');
-            }
+    // Insert before the line that is exactly `#[autumn_web::main]`, or append at end as fallback.
+    let lines: Vec<&str> = source.lines().collect();
+    if let Some(pos) = lines.iter().position(|l| l.trim() == "#[autumn_web::main]") {
+        let mut result = lines[..pos].join("\n");
+        result.push('\n');
+        result.push_str(handlers);
+        result.push_str(&lines[pos..].join("\n"));
+        if source.ends_with('\n') {
             result.push('\n');
-            result.push_str(handlers);
-            result
-        },
-        |pos| {
-            let mut result = String::with_capacity(source.len() + handlers.len());
-            result.push_str(&source[..pos]);
-            result.push_str(handlers);
-            result.push_str(&source[pos..]);
-            result
-        },
-    )
+        }
+        result
+    } else {
+        let mut result = source.to_owned();
+        if !result.ends_with('\n') {
+            result.push('\n');
+        }
+        result.push('\n');
+        result.push_str(handlers);
+        result
+    }
 }
 
 fn indent_count(line: &str) -> usize {

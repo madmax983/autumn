@@ -45,4 +45,9 @@ tracing-subscriber = "0.3"
 unsafe_code = "forbid"
 
 [features]
+system-tests = ["autumn-web/system-tests"]
 embed-assets = ["autumn-web/embed-assets"]
+
+[[test]]
+name = "pwa_smoke"
+path = "tests/system/pwa_smoke.rs"
