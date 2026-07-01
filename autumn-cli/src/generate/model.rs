@@ -731,11 +731,28 @@ fn render_model_file(
         }
         let _ = writeln!(out, "    pub {}: {},", f.name, f.rust_type());
     }
-    out.push_str("    #[default]\n");
-    out.push_str("    pub created_at: chrono::NaiveDateTime,\n");
     if soft_delete {
+        // `deleted_at` must come *before* `created_at` here, matching the
+        // column order `create_table_sql_with_metadata_and_id`/
+        // `schema_table_block_with_id` emit (they append the soft-delete
+        // field to the field list, then always append `created_at` last).
+        // The repository macro's generated insert-then-`RETURNING` query
+        // loads into this struct positionally, so a struct field order that
+        // doesn't match the table's column order produces a Diesel
+        // `CompatibleType` mismatch at compile time.
+        //
+        // `deleted_at` is otherwise DB-managed (NULL on insert, set only by
+        // the destroy handler): the migration declares it nullable with no
+        // explicit SQL DEFAULT, so Postgres inserts NULL whenever it's
+        // omitted from the INSERT column list. `#[default]` excludes it from
+        // `NewX`/`UpdateX` accordingly -- without it, the `#[model]` macro
+        // treats `deleted_at` as a required field, and neither the
+        // `create`/`update` handler ever populates it.
+        out.push_str("    #[default]\n");
         out.push_str("    pub deleted_at: Option<chrono::NaiveDateTime>,\n");
     }
+    out.push_str("    #[default]\n");
+    out.push_str("    pub created_at: chrono::NaiveDateTime,\n");
     out.push_str("}\n");
     out
 }

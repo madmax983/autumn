@@ -2495,6 +2495,38 @@ async fn main() {
             model.contains("deleted_at"),
             "model struct must include deleted_at field when soft_delete is enabled: {model}"
         );
+        // Regression test: `deleted_at` must be excluded from `NewX`/`UpdateX`
+        // via `#[default]` -- it's DB-managed (NULL on insert, set only by the
+        // destroy handler), so neither the create nor update handler ever
+        // populates it. Without `#[default]` here, `#[model]` treats it as a
+        // required field and the generated `create` handler fails to compile
+        // (`NewPost { .. }` missing `deleted_at`).
+        assert!(
+            model.contains("#[default]\n    pub deleted_at:"),
+            "deleted_at must be #[default] (DB-managed, excluded from NewX/UpdateX): {model}"
+        );
+        // Regression test: the model struct's field order must match the
+        // column order `create_table_sql_with_metadata_and_id`/
+        // `schema_table_block_with_id` emit for the migration and
+        // `schema.rs` (soft-delete field before `created_at`, which is
+        // always appended last). The `#[repository]` macro's generated
+        // insert-then-`RETURNING` query loads into this struct positionally,
+        // so a mismatched order produces a Diesel `CompatibleType` error at
+        // compile time rather than at the point of the actual typo.
+        let deleted_at_pos = model.find("pub deleted_at:").expect("deleted_at field");
+        let created_at_pos = model.find("pub created_at:").expect("created_at field");
+        assert!(
+            deleted_at_pos < created_at_pos,
+            "deleted_at must be declared before created_at, matching schema.rs's column order: {model}"
+        );
+
+        let schema = fs::read_to_string(tmp.path().join("src/schema.rs")).unwrap();
+        let schema_deleted_at_pos = schema.find("deleted_at ->").expect("deleted_at column");
+        let schema_created_at_pos = schema.find("created_at ->").expect("created_at column");
+        assert!(
+            schema_deleted_at_pos < schema_created_at_pos,
+            "schema.rs must declare deleted_at before created_at: {schema}"
+        );
     }
 
     #[test]

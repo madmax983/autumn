@@ -3767,6 +3767,47 @@ fn generated_sharded_scaffold_cargo_checks() {
     );
 }
 
+/// Slow end-to-end check: scaffold a `--soft-delete` project, patch Cargo.toml
+/// to the local autumn-web, and `cargo check --tests` the result. Regression
+/// coverage for a bug where the generated model's `deleted_at` field lacked
+/// `#[default]` (so `NewX`/`UpdateX` required it, but no handler populated
+/// it) and was declared in the wrong position relative to `created_at`
+/// (mismatching the migration/schema.rs column order the `#[repository]`
+/// macro's positional insert-`RETURNING` query relies on).
+///
+/// Run with: `cargo test -p autumn-cli -- --ignored generated_soft_delete_scaffold_cargo_checks`
+#[test]
+#[ignore = "slow: cargo-checks a fresh soft-delete scaffold — run with `cargo test -p autumn-cli -- --ignored`"]
+fn generated_soft_delete_scaffold_cargo_checks() {
+    let (_tmp, project) = fresh_project("soft-delete-build");
+
+    patch_generated_cargo_toml(&project);
+
+    run_autumn(
+        &project,
+        &[
+            "generate",
+            "scaffold",
+            "Post",
+            "title:String",
+            "body:Text",
+            "--soft-delete",
+        ],
+    );
+
+    let check = Command::new("cargo")
+        .args(["check", "--tests"])
+        .current_dir(&project)
+        .output()
+        .unwrap();
+    assert!(
+        check.status.success(),
+        "cargo check on generated soft-delete scaffold failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&check.stdout),
+        String::from_utf8_lossy(&check.stderr),
+    );
+}
+
 // ── UUID primary-key option (issue #1400) ──────────────────────────────────
 
 /// AC1 + AC4: `--id uuid` generates UUID PK in model and migration;
