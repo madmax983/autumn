@@ -20,8 +20,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
-use testcontainers::{ContainerAsync, ImageExt};
 use testcontainers::runners::AsyncRunner;
+use testcontainers::{ContainerAsync, ImageExt};
 use testcontainers_modules::postgres::Postgres;
 
 /// Every example's own `docker-compose.yml` targets Postgres 16 — the
@@ -327,7 +327,8 @@ async fn wait_until_healthy(
                 status,
             });
         }
-        if let Ok(Ok(response)) = tokio::time::timeout(Duration::from_secs(1), reqwest::get(&url)).await
+        if let Ok(Ok(response)) =
+            tokio::time::timeout(Duration::from_secs(1), reqwest::get(&url)).await
             && response.status().is_success()
         {
             return Ok(());
