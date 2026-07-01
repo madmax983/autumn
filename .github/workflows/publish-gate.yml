@@ -93,6 +93,11 @@ jobs:
       - name: Build and Chromium-smoke every example
         env:
           AUTUMN_CHROMIUM: ${{ steps.setup-chrome.outputs.chrome-path }}
+          # This job provisions Chromium and Docker specifically so every
+          # example gets real coverage — a SKIP here means that provisioning
+          # silently broke, so it must fail the release gate rather than let
+          # "all checks passed" mask degraded coverage.
+          REQUIRE_FULL_COVERAGE: "1"
         run: ./scripts/check-examples-e2e.sh
 
   # ---------------------------------------------------------------------------

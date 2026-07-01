@@ -20,9 +20,16 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
-use testcontainers::ContainerAsync;
+use testcontainers::{ContainerAsync, ImageExt};
 use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::postgres::Postgres;
+
+/// Every example's own `docker-compose.yml` targets Postgres 16 — the
+/// testcontainers-modules default (`11-alpine`) predates generated columns
+/// (used by e.g. wiki's full-text-search migration) and other features
+/// examples rely on, so smokes must provision the same major version the
+/// examples are actually built and deployed against.
+const POSTGRES_TAG: &str = "16-alpine";
 
 // ── Postgres provisioning ───────────────────────────────────────────────────
 
@@ -71,6 +78,7 @@ impl PgTopology {
 pub async fn provision_postgres(count: usize) -> PgTopology {
     let started = futures::future::join_all((0..count).map(|_| async {
         let container = Postgres::default()
+            .with_tag(POSTGRES_TAG)
             .start()
             .await
             .expect("start Postgres testcontainer");
@@ -144,7 +152,9 @@ pub enum SpawnError {
 /// period, then a hard kill on Unix; `kill()` elsewhere) so a panicking or
 /// early-returning smoke never leaks the spawned server.
 pub struct ExampleProcess {
-    child: Child,
+    // `Option` so `Drop` can synchronously `take()` the child and hand it to
+    // a background thread — see the `Drop` impl below.
+    child: Option<Child>,
     base_url: String,
 }
 
@@ -184,20 +194,30 @@ impl ExampleProcess {
 
 impl Drop for ExampleProcess {
     fn drop(&mut self) {
-        #[cfg(unix)]
-        {
-            // Mirrors the graceful-shutdown sequence the reddit-clone Tauri
-            // sidecar uses: SIGTERM first so autumn's on_shutdown hooks run
-            // (draining connections, stopping schedulers), then force-kill
-            // after a short grace period rather than blocking teardown
-            // indefinitely on a hung process.
-            let _ = Command::new("kill")
-                .args(["-TERM", &self.child.id().to_string()])
-                .status();
-            std::thread::sleep(Duration::from_millis(500));
-        }
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        // `ExampleProcess` is typically dropped at the end of an async
+        // smoke test, so the graceful-shutdown sequence (which includes a
+        // blocking sleep and a blocking `wait()`) runs on a background
+        // thread rather than blocking a Tokio worker thread.
+        let Some(mut child) = self.child.take() else {
+            return;
+        };
+        std::thread::spawn(move || {
+            #[cfg(unix)]
+            {
+                // Mirrors the graceful-shutdown sequence the reddit-clone
+                // Tauri sidecar uses: SIGTERM first so autumn's
+                // on_shutdown hooks run (draining connections, stopping
+                // schedulers), then force-kill after a short grace period
+                // rather than blocking teardown indefinitely on a hung
+                // process.
+                let _ = Command::new("kill")
+                    .args(["-TERM", &child.id().to_string()])
+                    .status();
+                std::thread::sleep(Duration::from_millis(500));
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+        });
     }
 }
 
@@ -281,7 +301,10 @@ pub async fn spawn_example(
         return Err(err);
     }
 
-    Ok(ExampleProcess { child, base_url })
+    Ok(ExampleProcess {
+        child: Some(child),
+        base_url,
+    })
 }
 
 /// Poll `{base_url}/health` until it returns a successful status.
@@ -304,7 +327,7 @@ async fn wait_until_healthy(
                 status,
             });
         }
-        if let Ok(response) = reqwest::get(&url).await
+        if let Ok(Ok(response)) = tokio::time::timeout(Duration::from_secs(1), reqwest::get(&url)).await
             && response.status().is_success()
         {
             return Ok(());

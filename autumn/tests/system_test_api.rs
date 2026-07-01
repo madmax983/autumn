@@ -349,7 +349,7 @@ async fn console_errors_returns_accumulated_messages() {
     // Give the CDP event a moment to be delivered and recorded.
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
-    let errors = page.console_errors().await;
+    let errors = page.console_errors();
     assert!(
         errors.iter().any(|e| e.contains("bad thing happened")),
         "expected captured console.error message; got: {errors:?}"

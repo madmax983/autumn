@@ -26,6 +26,14 @@
 # Override the Chromium binary the same way the smoke tests do:
 #
 #     AUTUMN_CHROMIUM=/path/to/chrome ./scripts/check-examples-e2e.sh
+#
+# In an environment that provisions Chromium and Docker specifically for
+# this gate (e.g. the publish-gate CI job), set REQUIRE_FULL_COVERAGE=1 so
+# any SKIP — which there would mean the provisioning silently broke, not
+# "no coverage available" — fails the gate instead of letting "all checks
+# passed" mask degraded coverage:
+#
+#     REQUIRE_FULL_COVERAGE=1 ./scripts/check-examples-e2e.sh
 
 set -uo pipefail
 # Deliberately NOT `-e`: a failing example must not abort the run — every
@@ -198,6 +206,16 @@ fi
 
 if [[ "$failures" -gt 0 ]]; then
   die "$failures example(s) failed — see per-example output above."
+fi
+
+# In an environment that provisions Chromium and Docker for exactly this
+# purpose (the publish-gate CI job), a skip means that provisioning silently
+# broke — not "no coverage available here" — so it must fail the release
+# gate rather than let "all checks passed" mask degraded coverage. Local/dev
+# runs without Docker or Chromium leave REQUIRE_FULL_COVERAGE unset and stay
+# lenient, matching AC6 ("visibly skip, don't silently pass").
+if [[ "${REQUIRE_FULL_COVERAGE:-0}" == "1" && "$skip_count" -gt 0 ]]; then
+  die "$skip_count example(s) skipped in an environment that requires full coverage (REQUIRE_FULL_COVERAGE=1) — see SKIP NOTICE(s) above."
 fi
 
 echo "Example e2e fleet gate: all checks passed."

@@ -70,7 +70,7 @@
 
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use chromiumoxide::cdp::js_protocol::runtime::{
@@ -78,7 +78,6 @@ use chromiumoxide::cdp::js_protocol::runtime::{
 };
 use chromiumoxide::{Browser, BrowserConfig};
 use futures::StreamExt as _;
-use tokio::sync::Mutex as AsyncMutex;
 
 use crate::config::AutumnConfig;
 use crate::route::Route;
@@ -540,12 +539,17 @@ impl Drop for SystemTestRunner {
         // is sent synchronously, but the OS reaping the process (and
         // releasing any file handles it held open under this directory) is
         // not instantaneous or guaranteed-ordered from Rust's perspective;
-        // a short synchronous grace period trades a little Drop latency for
-        // meaningfully higher odds the removal actually succeeds. Errors
-        // (including "still in use") are ignored — this is best-effort, not
-        // a correctness guarantee.
-        std::thread::sleep(Duration::from_millis(50));
-        let _ = std::fs::remove_dir_all(&self.user_data_dir);
+        // a short grace period trades a little latency for meaningfully
+        // higher odds the removal actually succeeds. Errors (including
+        // "still in use") are ignored — this is best-effort, not a
+        // correctness guarantee. Since `SystemTestRunner` is typically
+        // dropped at the end of an async test, the sleep and removal run on
+        // a background thread rather than blocking a Tokio worker thread.
+        let user_data_dir = self.user_data_dir.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            let _ = std::fs::remove_dir_all(user_data_dir);
+        });
     }
 }
 
@@ -570,7 +574,7 @@ impl SystemTestRunner {
         let cdp_page = browser.new_page("about:blank").await?;
         cdp_page.enable_runtime().await?;
 
-        let console_errors: Arc<AsyncMutex<Vec<String>>> = Arc::new(AsyncMutex::new(Vec::new()));
+        let console_errors: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         spawn_console_error_capture(&cdp_page, Arc::clone(&console_errors)).await?;
 
         Ok(Page {
@@ -594,7 +598,7 @@ impl SystemTestRunner {
 /// messages to `sink` as they arrive, for the lifetime of the page.
 async fn spawn_console_error_capture(
     page: &chromiumoxide::page::Page,
-    sink: Arc<AsyncMutex<Vec<String>>>,
+    sink: Arc<Mutex<Vec<String>>>,
 ) -> Result<(), SystemTestError> {
     let mut console_events = page.event_listener::<EventConsoleApiCalled>().await?;
     let mut exception_events = page.event_listener::<EventExceptionThrown>().await?;
@@ -619,7 +623,7 @@ async fn spawn_console_error_capture(
                                     .map(remote_object_to_string)
                                     .collect::<Vec<_>>()
                                     .join(" ");
-                                sink.lock().await.push(text);
+                                sink.lock().unwrap().push(text);
                             }
                         }
                         None => console_open = false,
@@ -628,7 +632,7 @@ async fn spawn_console_error_capture(
                 event = exception_events.next(), if exception_open => {
                     match event {
                         Some(event) => {
-                            sink.lock().await.push(event.exception_details.text.clone());
+                            sink.lock().unwrap().push(event.exception_details.text.clone());
                         }
                         None => exception_open = false,
                     }
@@ -665,7 +669,7 @@ pub struct Page {
     base_url: String,
     artifact_dir: PathBuf,
     hx_settle_timeout: Duration,
-    console_errors: Arc<AsyncMutex<Vec<String>>>,
+    console_errors: Arc<Mutex<Vec<String>>>,
 }
 
 impl Page {
@@ -935,8 +939,13 @@ impl Page {
     ///
     /// Useful for inspecting *why* [`Page::expect_no_console_errors`] failed,
     /// or for asserting on specific error text.
-    pub async fn console_errors(&self) -> Vec<String> {
-        self.console_errors.lock().await.clone()
+    ///
+    /// # Panics
+    /// If the internal lock is poisoned (i.e. the console-capture task
+    /// panicked while holding it).
+    #[must_use]
+    pub fn console_errors(&self) -> Vec<String> {
+        self.console_errors.lock().unwrap().clone()
     }
 
     /// Assert that the page has produced no `console.error(...)` calls and no
@@ -955,7 +964,7 @@ impl Page {
     pub async fn expect_no_console_errors(&self) -> Result<&Self, SystemTestError> {
         let deadline = tokio::time::Instant::now() + CONSOLE_ERROR_GRACE;
         loop {
-            let errors = self.console_errors().await;
+            let errors = self.console_errors();
             if !errors.is_empty() {
                 let artifact = self
                     .write_failure_artifacts("expect_no_console_errors")
