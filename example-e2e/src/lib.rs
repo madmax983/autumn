@@ -194,30 +194,31 @@ impl ExampleProcess {
 
 impl Drop for ExampleProcess {
     fn drop(&mut self) {
-        // `ExampleProcess` is typically dropped at the end of an async
-        // smoke test, so the graceful-shutdown sequence (which includes a
-        // blocking sleep and a blocking `wait()`) runs on a background
-        // thread rather than blocking a Tokio worker thread.
+        // Deliberately synchronous, unlike `SystemTestRunner`'s Drop: every
+        // example smoke is the sole `#[tokio::test]` in its own integration-
+        // test binary (see `tests/system/smoke.rs` in each example), so
+        // there is no sibling task on the runtime for a blocking sleep here
+        // to starve. Backgrounding this onto a detached thread would trade
+        // that non-issue for a real one — the test binary's `main` can
+        // return and the process exit before a detached thread ever runs,
+        // leaking the spawned example server across the e2e fan-out.
         let Some(mut child) = self.child.take() else {
             return;
         };
-        std::thread::spawn(move || {
-            #[cfg(unix)]
-            {
-                // Mirrors the graceful-shutdown sequence the reddit-clone
-                // Tauri sidecar uses: SIGTERM first so autumn's
-                // on_shutdown hooks run (draining connections, stopping
-                // schedulers), then force-kill after a short grace period
-                // rather than blocking teardown indefinitely on a hung
-                // process.
-                let _ = Command::new("kill")
-                    .args(["-TERM", &child.id().to_string()])
-                    .status();
-                std::thread::sleep(Duration::from_millis(500));
-            }
-            let _ = child.kill();
-            let _ = child.wait();
-        });
+        #[cfg(unix)]
+        {
+            // Mirrors the graceful-shutdown sequence the reddit-clone Tauri
+            // sidecar uses: SIGTERM first so autumn's on_shutdown hooks run
+            // (draining connections, stopping schedulers), then force-kill
+            // after a short grace period rather than blocking teardown
+            // indefinitely on a hung process.
+            let _ = Command::new("kill")
+                .args(["-TERM", &child.id().to_string()])
+                .status();
+            std::thread::sleep(Duration::from_millis(500));
+        }
+        let _ = child.kill();
+        let _ = child.wait();
     }
 }
 
