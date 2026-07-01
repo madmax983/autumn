@@ -298,6 +298,7 @@ mod tests {
         let clock = FixedClock::at(pinned);
         let secs = clock_unix_secs(&clock);
         assert_eq!(secs, pinned.timestamp().cast_unsigned());
+        assert!(secs > 1);
     }
 
     #[test]
@@ -306,5 +307,23 @@ mod tests {
         let pre_epoch = Utc.with_ymd_and_hms(1969, 12, 31, 23, 59, 59).unwrap();
         let clock = FixedClock::at(pre_epoch);
         assert_eq!(clock_unix_duration(&clock), std::time::Duration::ZERO);
+    }
+
+    #[test]
+    fn clock_unix_duration_positive_for_post_epoch() {
+        let post_epoch = Utc.with_ymd_and_hms(1970, 1, 1, 0, 1, 0).unwrap();
+        let clock = FixedClock::at(post_epoch);
+        assert_eq!(
+            clock_unix_duration(&clock),
+            std::time::Duration::from_secs(60)
+        );
+    }
+
+    #[test]
+    fn ticking_clock_advance_zero_is_noop() {
+        let start = Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
+        let clock = TickingClock::starting_at(start);
+        clock.advance(std::time::Duration::ZERO);
+        assert_eq!(clock.now(), start);
     }
 }
