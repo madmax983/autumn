@@ -1159,6 +1159,106 @@ pub fn ensure_autumn_web_feature_status(existing: &str, feature: &str) -> (Strin
     (existing.to_owned(), false)
 }
 
+/// Ensure `[dev-dependencies]` carries an `autumn-web` entry with the
+/// `test-support` feature, which enables `TestDb` (the shared Postgres
+/// testcontainer that generated `TestApp`-based integration tests use).
+///
+/// `autumn-web` is intentionally left out of `test-support` in
+/// `[dependencies]` — production builds must not pull in the
+/// `testcontainers`/`testcontainers-modules` dependency tree that the feature
+/// enables. Cargo unifies features across every declaration of the same
+/// dependency in the build graph, so a *dev*-only entry is enough to light up
+/// `TestDb` for `cargo test` while release builds stay lean.
+///
+/// Idempotent: a second call is a no-op once the feature is present.
+#[must_use]
+pub fn ensure_dev_dependency_test_support(existing: &str, autumn_version: &str) -> String {
+    let feature_quoted = "\"test-support\"";
+    let lines: Vec<&str> = existing.lines().collect();
+
+    let Some(header_idx) = lines
+        .iter()
+        .position(|l| is_dev_dependencies_header(l.trim()))
+    else {
+        // No [dev-dependencies] section yet -- append one. (Every project
+        // scaffolded by `autumn new` already has one for the `tokio` test
+        // dep, so this branch only guards hand-edited Cargo.toml files.)
+        let mut out = existing.to_owned();
+        if !out.is_empty() && !out.ends_with('\n') {
+            out.push('\n');
+        }
+        if !out.is_empty() && !out.ends_with("\n\n") {
+            out.push('\n');
+        }
+        out.push_str("[dev-dependencies]\n");
+        let _ = writeln!(
+            out,
+            "autumn-web = {{ version = \"{autumn_version}\", features = [{feature_quoted}] }}"
+        );
+        return out;
+    };
+
+    let section_end = lines[header_idx + 1..]
+        .iter()
+        .position(|l| {
+            let t = l.trim();
+            t.starts_with('[') && !t.starts_with("[dev-dependencies.")
+        })
+        .map_or(lines.len(), |offset| header_idx + 1 + offset);
+
+    for i in (header_idx + 1)..section_end {
+        let line = lines[i];
+        let trimmed = line.trim_start();
+        if trimmed.starts_with('#') {
+            continue;
+        }
+        let Some(rest) = trimmed.strip_prefix("autumn-web") else {
+            continue;
+        };
+        if rest.starts_with(|c: char| c != '=' && c != '.' && !c.is_whitespace()) {
+            continue;
+        }
+        // Idempotency check: strip any trailing TOML comment first.
+        let line_code = line.split_once('#').map_or(line, |(before, _)| before);
+        if line_code.contains(feature_quoted) {
+            return existing.to_owned();
+        }
+        let new_line = rewrite_dep_with_feature(line, "test-support");
+        let mut out = String::with_capacity(existing.len() + 32);
+        for (j, &l) in lines.iter().enumerate() {
+            out.push_str(if j == i { &new_line } else { l });
+            out.push('\n');
+        }
+        if !existing.ends_with('\n') {
+            out.pop();
+        }
+        return out;
+    }
+
+    // No existing `autumn-web` line in [dev-dependencies] -- insert one right
+    // after the section header.
+    let mut out = String::with_capacity(existing.len() + 96);
+    for (j, &l) in lines.iter().enumerate() {
+        out.push_str(l);
+        out.push('\n');
+        if j == header_idx {
+            let _ = writeln!(
+                out,
+                "autumn-web = {{ version = \"{autumn_version}\", features = [{feature_quoted}] }}"
+            );
+        }
+    }
+    if !existing.ends_with('\n') {
+        out.pop();
+    }
+    out
+}
+
+fn is_dev_dependencies_header(trimmed: &str) -> bool {
+    const HEADER: &str = "[dev-dependencies]";
+    trimmed == HEADER || (trimmed.starts_with(HEADER) && trimmed[HEADER.len()..].trim_start().starts_with('#'))
+}
+
 /// Scan `lines` for a section header matching `key` (after stripping inline TOML comments)
 /// whose body contains a `package = "autumn-web"` key.  Returns the index of the first body
 /// line when found, so the caller can pass it directly to `add_feature_to_deps_section`.
@@ -3878,6 +3978,55 @@ pub struct Comment {
             code_part.contains("\"inbound-mailgun\""),
             "feature must be present in the code portion of the dep line: {dep_line}"
         );
+    }
+
+    // ── ensure_dev_dependency_test_support (issue #1023) ───────────────────
+
+    #[test]
+    fn dev_dependency_test_support_inserts_into_existing_section() {
+        let cargo = "[package]\nname=\"x\"\n\n[dependencies]\nautumn-web = \"0.6\"\n\n[dev-dependencies]\ntokio = { version = \"1\", features = [\"rt\", \"macros\"] }\n";
+        let updated = ensure_dev_dependency_test_support(cargo, "0.6");
+        assert!(
+            updated.contains("autumn-web = { version = \"0.6\", features = [\"test-support\"] }"),
+            "must add a dev-dependency autumn-web entry with test-support: {updated}"
+        );
+        // The original tokio dev-dependency must survive untouched.
+        assert!(updated.contains("tokio = { version = \"1\""));
+        // The production dependency must be untouched (no test-support there).
+        let deps_section = updated.split("[dev-dependencies]").next().unwrap();
+        assert!(!deps_section.contains("test-support"));
+    }
+
+    #[test]
+    fn dev_dependency_test_support_is_idempotent() {
+        let cargo = "[package]\nname=\"x\"\n\n[dev-dependencies]\ntokio = \"1\"\n";
+        let once = ensure_dev_dependency_test_support(cargo, "0.6");
+        let twice = ensure_dev_dependency_test_support(&once, "0.6");
+        assert_eq!(once, twice, "a second call must be a no-op");
+    }
+
+    #[test]
+    fn dev_dependency_test_support_adds_feature_to_existing_dev_entry() {
+        let cargo = "[package]\nname=\"x\"\n\n[dev-dependencies]\nautumn-web = { version = \"0.6\" }\n";
+        let updated = ensure_dev_dependency_test_support(cargo, "0.6");
+        assert!(
+            updated.contains("\"test-support\""),
+            "must add test-support to the existing dev-dependency entry: {updated}"
+        );
+        // Must not duplicate the autumn-web line.
+        assert_eq!(
+            updated.matches("autumn-web").count(),
+            1,
+            "must not duplicate the autumn-web dev-dependency: {updated}"
+        );
+    }
+
+    #[test]
+    fn dev_dependency_test_support_creates_section_when_absent() {
+        let cargo = "[package]\nname=\"x\"\n\n[dependencies]\nautumn-web = \"0.6\"\n";
+        let updated = ensure_dev_dependency_test_support(cargo, "0.6");
+        assert!(updated.contains("[dev-dependencies]"));
+        assert!(updated.contains("\"test-support\""));
     }
 
     // ── IdType-aware variants (issue #1400) ────────────────────────────────

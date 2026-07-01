@@ -361,12 +361,21 @@ impl SystemTest {
         });
 
         // 5. Launch Chromium.
+        //
+        // `BrowserConfigBuilder::arg` takes a bare flag *name* (no leading
+        // `--`) and prefixes it itself -- passing `"--no-sandbox"` here would
+        // literally become `----no-sandbox` on the child's argv and Chrome
+        // would silently ignore it, defeating the whole point of this call
+        // (sandboxed containers/CI running as root then fail to launch with
+        // "Running as root without --no-sandbox is not supported"). Sandbox
+        // disabling has its own builder method for exactly this reason;
+        // headless is already the default `HeadlessMode`, so no extra arg is
+        // needed for it.
         let config = BrowserConfig::builder()
             .chrome_executable(browser_path)
-            .arg("--no-sandbox")
-            .arg("--disable-dev-shm-usage")
-            .arg("--disable-gpu")
-            .arg("--headless")
+            .no_sandbox()
+            .arg("disable-dev-shm-usage")
+            .arg("disable-gpu")
             // Forward the configured timeout into chromiumoxide's own launch
             // watchdog so the inner and outer timeouts are consistent and the
             // outer tokio::time::timeout always wins.

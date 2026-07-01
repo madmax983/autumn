@@ -8,7 +8,7 @@
 //! - A `tests/<snake>.rs` smoke test that asserts the index route returns 200.
 //! - Updates to `src/main.rs` registering all new routes in `routes![ … ]`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::path::Path;
 
@@ -18,7 +18,10 @@ use super::model::{
     ModelOptions, field_by_name, parse_model_metadata, plan_cargo_deps, plan_model_with_options,
 };
 use super::naming::{pascal, pluralize, snake};
-use super::schema_edit::{add_mod_declaration, ensure_autumn_web_feature, update_main_rs};
+use super::schema_edit::{
+    add_mod_declaration, create_table_sql_with_metadata_and_id, ensure_autumn_web_feature,
+    ensure_dev_dependency_test_support, update_main_rs,
+};
 use super::{Flags, GenerateError, ensure_project_root, read_or_empty, timestamp_now};
 
 /// Extra dependencies the *scaffold* generator's output requires on top of
@@ -191,6 +194,8 @@ pub fn plan_scaffold_with_options(
             options_with_key.api,
             &fields,
             options_with_key.model.id_type,
+            metadata.indexes(),
+            metadata.defaults(),
         ),
     );
 
@@ -263,6 +268,30 @@ pub fn plan_scaffold_with_options(
         for feat in feats {
             updated = ensure_autumn_web_feature(&updated, feat);
         }
+        if updated != base {
+            plan.actions.retain(|a| a.path() != cargo_path);
+            plan.modify(cargo_path, updated);
+        }
+    }
+
+    // The generated smoke test uses `autumn_web::test::TestDb` (a real,
+    // throwaway Postgres testcontainer) to back its in-process `TestApp`
+    // request. `TestDb` is compiled only when the `test-support` feature is
+    // enabled, and that feature must stay out of `[dependencies]` so release
+    // builds don't pull in `testcontainers` — so it goes in
+    // `[dev-dependencies]` instead.
+    {
+        let cargo_path = project_root.join("Cargo.toml");
+        let base = plan
+            .actions
+            .iter()
+            .rev()
+            .find_map(|a| match a {
+                Action::Modify { path, contents } if path == &cargo_path => Some(contents.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| read_or_empty(&cargo_path));
+        let updated = ensure_dev_dependency_test_support(&base, env!("CARGO_PKG_VERSION"));
         if updated != base {
             plan.actions.retain(|a| a.path() != cargo_path);
             plan.modify(cargo_path, updated);
@@ -1612,404 +1641,199 @@ fn render_update_columns(plural: &str, fields: &[Field]) -> String {
     out
 }
 
-const fn sample_scalar_value(kind: FieldKind) -> (&'static str, &'static str) {
-    // returns (json_value, url-encoded form value)
-    match kind {
-        FieldKind::String | FieldKind::Text => ("\\\"test\\\"", "test"),
-        FieldKind::Bool => ("true", "true"),
-        FieldKind::I32 | FieldKind::I64 => ("1", "1"),
-        FieldKind::F32 | FieldKind::F64 => ("1.0", "1.0"),
-        FieldKind::Uuid => (
-            "\\\"00000000-0000-0000-0000-000000000000\\\"",
-            "00000000-0000-0000-0000-000000000000",
-        ),
-        FieldKind::NaiveDateTime => ("\\\"2026-06-08T00:00:00\\\"", "2026-06-08T00%3A00%3A00"),
-        FieldKind::DateTime => ("\\\"2026-06-08T00:00:00Z\\\"", "2026-06-08T00%3A00%3A00Z"),
-        FieldKind::Bytea => ("[]", ""),
-        FieldKind::Attachment => ("null", ""),
-    }
-}
-
-fn build_sample_json(fields: &[Field]) -> String {
-    let parts: Vec<String> = fields
-        .iter()
-        .map(|f| {
-            let (json_val, _) = sample_scalar_value(f.kind);
-            format!("\\\"{}\\\": {}", f.name, json_val)
-        })
-        .collect();
-    format!("{{ {} }}", parts.join(", "))
-}
-
-fn build_sample_form(fields: &[Field]) -> String {
-    let parts: Vec<String> = fields
-        .iter()
-        .map(|f| {
-            let (_, form_val) = sample_scalar_value(f.kind);
-            format!("{}={}", f.name, form_val)
-        })
-        .collect();
-    parts.join("&")
-}
-
-fn build_id_capture_from_post(id_type: IdType) -> String {
-    match id_type {
-        IdType::BigSerial => {
-            "let id = json[\"id\"].as_i64().expect(\"expected id in POST response\");".to_owned()
+/// Split a `;`-terminated blob of SQL statements (as produced by
+/// [`create_table_sql_with_metadata_and_id`]) into individual statements,
+/// each still ending in `;`.
+///
+/// Postgres's extended query protocol -- which `diesel::sql_query` uses --
+/// rejects a single prepared statement that contains more than one SQL
+/// command, so a migration's `CREATE TABLE` followed by one or more
+/// `CREATE INDEX` statements must be executed one at a time.
+fn split_sql_statements(sql: &str) -> Vec<String> {
+    let mut statements = Vec::new();
+    let mut current = String::new();
+    for line in sql.lines() {
+        if !current.is_empty() {
+            current.push('\n');
         }
-        IdType::Uuid => {
-            "let id = json[\"id\"].as_str().expect(\"expected id in POST response\").to_owned();"
-                .to_owned()
+        current.push_str(line);
+        if line.trim_end().ends_with(';') {
+            statements.push(std::mem::take(&mut current));
         }
     }
+    if !current.trim().is_empty() {
+        statements.push(current);
+    }
+    statements
 }
 
-#[allow(clippy::too_many_lines)]
+/// Render one `db.execute_sql("...").await;` call per statement in `sql`,
+/// escaping the SQL text so it survives as a Rust string literal in the
+/// generated test.
+fn render_execute_sql_calls(sql: &str) -> String {
+    let mut out = String::new();
+    for statement in split_sql_statements(sql) {
+        let escaped = statement.replace('\\', "\\\\").replace('"', "\\\"");
+        let _ = writeln!(out, "db.execute_sql(\"{escaped}\").await;");
+    }
+    out
+}
+
+/// Render the `tests/<snake>.rs` smoke test's HTML (non-`--api`) shape: an
+/// in-process, real-database read of the scaffolded index route.
+///
+/// The handler under test is a stand-in for `routes::{plural}::index` rather
+/// than a literal re-export of it. A freshly scaffolded project is a binary
+/// crate (no `src/lib.rs`), so a `tests/*.rs` integration binary cannot import
+/// the project's own handler functions -- see
+/// `docs/guide/tutorial/11-testing.md`, which documents this exact
+/// constraint and the same "redeclare the handler under test" workaround.
+fn render_index_smoke_test(
+    pascal_name: &str,
+    plural: &str,
+    id_schema_type: &str,
+    setup_calls: &str,
+) -> String {
+    format!(
+        "//! Smoke test generated by `autumn generate scaffold`.\n\
+         //!\n\
+         //! Boots the scaffolded `GET /{plural}` route in-process via\n\
+         //! `autumn_web::test::{{TestApp, TestClient, TestDb}}` and asserts it\n\
+         //! against a real (throwaway) Postgres database -- no running server,\n\
+         //! no hard-coded server base URL env var, no silent skip.\n\
+         //!\n\
+         //! The handler below stands in for the generated `routes::{plural}::index`\n\
+         //! handler: a `tests/` integration binary cannot import from a project\n\
+         //! that has no `src/lib.rs` (see `docs/guide/tutorial/11-testing.md`), so\n\
+         //! -- exactly as that tutorial recommends -- this test redeclares a\n\
+         //! handler that runs the same kind of real query against the same table.\n\
+         //!\n\
+         //! `cargo test` reports this test as `ignored` (Docker is not assumed to\n\
+         //! be available in every environment); run it for real with:\n\
+         //!\n\
+         //!     cargo test -- --ignored\n\
+         \n\
+         use autumn_web::prelude::*;\n\
+         use autumn_web::test::{{TestApp, TestClient, TestDb}};\n\
+         use diesel::prelude::*;\n\
+         use diesel_async::RunQueryDsl;\n\
+         \n\
+         diesel::table! {{\n\
+         {plural} (id) {{\n\
+         id -> {id_schema_type},\n\
+         }}\n\
+         }}\n\
+         \n\
+         #[get(\"/{plural}\")]\n\
+         async fn index(mut db: Db) -> AutumnResult<Markup> {{\n\
+         let total: i64 = {plural}::table.count().get_result(&mut db).await?;\n\
+         Ok(html! {{\n\
+         h1 {{ \"{pascal_name}s\" }}\n\
+         p {{ (total) \" row(s)\" }}\n\
+         }})\n\
+         }}\n\
+         \n\
+         #[tokio::test]\n\
+         #[ignore = \"requires Docker (testcontainers) via TestDb; run `cargo test -- --ignored`\"]\n\
+         async fn {plural}_index_renders_scaffolded_rows() {{\n\
+         let db = TestDb::shared().await;\n\
+         {setup_calls}\
+         db.execute_sql(\"TRUNCATE {plural} RESTART IDENTITY\").await;\n\
+         \n\
+         let client: TestClient = TestApp::new().routes(routes![index]).with_db(db.pool()).build();\n\
+         \n\
+         client.get(\"/{plural}\").send().await\n\
+         .assert_ok()\n\
+         .assert_body_contains(\"{pascal_name}s\");\n\
+         }}\n"
+    )
+}
+
+/// Render the `tests/<snake>.rs` smoke test's `--api` shape: an in-process,
+/// real-database read of the scaffolded JSON list route.
+///
+/// See [`render_index_smoke_test`] for why the handler under test is a
+/// stand-in rather than a literal re-export of the generated
+/// `{snake}_api_list` repository handler.
+fn render_api_smoke_test(plural: &str, id_schema_type: &str, setup_calls: &str) -> String {
+    format!(
+        "//! Smoke test generated by `autumn generate scaffold --api`.\n\
+         //!\n\
+         //! Boots the scaffolded `GET /api/{plural}` route in-process via\n\
+         //! `autumn_web::test::{{TestApp, TestClient, TestDb}}` and asserts it\n\
+         //! against a real (throwaway) Postgres database -- no running server,\n\
+         //! no hard-coded server base URL env var, no silent skip.\n\
+         //!\n\
+         //! The handler below stands in for the generated repository's JSON list\n\
+         //! handler for the same reason documented in\n\
+         //! `docs/guide/tutorial/11-testing.md`: a `tests/` integration binary\n\
+         //! cannot import from a project with no `src/lib.rs`.\n\
+         //!\n\
+         //! `cargo test` reports this test as `ignored` (Docker is not assumed to\n\
+         //! be available in every environment); run it for real with:\n\
+         //!\n\
+         //!     cargo test -- --ignored\n\
+         \n\
+         use autumn_web::prelude::*;\n\
+         use autumn_web::test::{{TestApp, TestClient, TestDb}};\n\
+         use diesel::prelude::*;\n\
+         use diesel_async::RunQueryDsl;\n\
+         \n\
+         diesel::table! {{\n\
+         {plural} (id) {{\n\
+         id -> {id_schema_type},\n\
+         }}\n\
+         }}\n\
+         \n\
+         #[get(\"/api/{plural}\")]\n\
+         async fn api_list(mut db: Db) -> AutumnResult<Json<serde_json::Value>> {{\n\
+         let total: i64 = {plural}::table.count().get_result(&mut db).await?;\n\
+         Ok(Json(serde_json::json!({{ \"count\": total }})))\n\
+         }}\n\
+         \n\
+         #[tokio::test]\n\
+         #[ignore = \"requires Docker (testcontainers) via TestDb; run `cargo test -- --ignored`\"]\n\
+         async fn {plural}_api_list_returns_ok_against_a_real_database() {{\n\
+         let db = TestDb::shared().await;\n\
+         {setup_calls}\
+         db.execute_sql(\"TRUNCATE {plural} RESTART IDENTITY\").await;\n\
+         \n\
+         let client: TestClient = TestApp::new().routes(routes![api_list]).with_db(db.pool()).build();\n\
+         \n\
+         client.get(\"/api/{plural}\").send().await\n\
+         .assert_ok()\n\
+         .assert_json::<serde_json::Value, _>(|body| {{\n\
+         assert_eq!(body[\"count\"], 0);\n\
+         }});\n\
+         }}\n"
+    )
+}
+
+/// Render the `tests/<snake>.rs` smoke test.
+///
+/// Delegates to [`render_index_smoke_test`] or [`render_api_smoke_test`]
+/// depending on `api`, after computing the exact `CREATE TABLE`/`CREATE
+/// INDEX` SQL the generated migration also emits (see
+/// [`create_table_sql_with_metadata_and_id`]), so the throwaway table the
+/// test creates in `TestDb` matches the real schema.
 fn render_smoke_test(
     pascal_name: &str,
     plural: &str,
     api: bool,
     fields: &[Field],
     id_type: IdType,
+    indexes: &BTreeSet<String>,
+    defaults: &BTreeMap<String, String>,
 ) -> String {
-    if api {
-        let sample_json = build_sample_json(fields);
-        let id_capture = build_id_capture_from_post(id_type);
+    let create_table_sql =
+        create_table_sql_with_metadata_and_id(plural, fields, indexes, defaults, id_type);
+    let setup_calls = render_execute_sql_calls(&create_table_sql);
+    let id_schema_type = id_type.schema_type();
 
-        format!(
-            "//! Smoke test generated by `autumn generate scaffold --api`.\n\
-             //!\n\
-             //! Compiles against the project's stock dependency set (just\n\
-             //! `autumn-web`) so it lights up in CI immediately. Hits all five\n\
-             //! JSON CRUD endpoints via raw `std::net::TcpStream` in sequence.\n\
-             \n\
-             #[test]\n\
-             fn {plural}_api_json_crud_round_trip_when_server_is_running() {{\n\
-                 let Ok(base) = std::env::var(\"AUTUMN_TEST_BASE_URL\") else {{\n\
-                     eprintln!(\"skipping: AUTUMN_TEST_BASE_URL not set\");\n\
-                     return;\n\
-                 }};\n\
-                 let base = base.trim_end_matches('/');\n\
-                 if base.starts_with(\"https://\") {{\n\
-                     eprintln!(\"skipping: raw TcpStream helper does not support TLS; run against http://\");\n\
-                     return;\n\
-                 }}\n\
-                 let host_port = base\n\
-                     .trim_start_matches(\"http://\")\n\
-                     .trim_start_matches(\"https://\");\n\
-                 \n\
-                 fn request(host_port: &str, method: &str, path: &str, body: Option<&str>) -> (String, String) {{\n\
-                     use std::io::{{Read, Write}};\n\
-                     let mut stream = std::net::TcpStream::connect(host_port)\n\
-                         .unwrap_or_else(|_| panic!(\"could not connect to {{host_port}}\"));\n\
-                     let req = if let Some(b) = body {{\n\
-                         format!(\n\
-                             \"{{}} {{}} HTTP/1.1\\r\\n\\\n\
-                              Host: {{}}\\r\\n\\\n\
-                              Content-Type: application/json\\r\\n\\\n\
-                              Content-Length: {{}}\\r\\n\\\n\
-                              Connection: close\\r\\n\\r\\n\\\n\
-                              {{}}\",\n\
-                             method, path, host_port, b.len(), b\n\
-                         )\n\
-                     }} else {{\n\
-                         format!(\n\
-                             \"{{}} {{}} HTTP/1.1\\r\\n\\\n\
-                              Host: {{}}\\r\\n\\\n\
-                              Connection: close\\r\\n\\r\\n\",\n\
-                             method, path, host_port\n\
-                         )\n\
-                     }};\n\
-                     stream.write_all(req.as_bytes()).expect(\"write failed\");\n\
-                     let mut response = String::new();\n\
-                     stream.read_to_string(&mut response).expect(\"read failed\");\n\
-                     if let Some((headers, body)) = response.split_once(\"\\r\\n\\r\\n\") {{\n\
-                         (headers.to_string(), body.to_string())\n\
-                     }} else {{\n\
-                         (response, String::new())\n\
-                     }}\n\
-                 }}\n\
-                 \n\
-                 // 1. POST (Create)\n\
-                 let post_payload = \"{sample_json}\";\n\
-                 let (headers, body) = request(host_port, \"POST\", \"/api/{plural}\", Some(post_payload));\n\
-                 assert!(\n\
-                     headers.starts_with(\"HTTP/1.1 201\") || headers.starts_with(\"HTTP/1.0 201\"),\n\
-                     \"POST /api/{plural} did not return 201:\\n{{headers}}\\n{{body}}\"\n\
-                 );\n\
-                 \n\
-                 let json: autumn_web::reexports::serde_json::Value =\n\
-                     autumn_web::reexports::serde_json::from_str(&body)\n\
-                         .unwrap_or_else(|_| panic!(\"failed to parse POST response: {{body}}\"));\n\
-                 {id_capture}\n\
-                 let item_path = format!(\"/api/{plural}/{{id}}\");\n\
-                 \n\
-                 // 2. GET (Read single)\n\
-                 let (headers, body) = request(host_port, \"GET\", &item_path, None);\n\
-                 assert!(\n\
-                     headers.starts_with(\"HTTP/1.1 200\") || headers.starts_with(\"HTTP/1.0 200\"),\n\
-                     \"GET {{item_path}} did not return 200:\\n{{headers}}\\n{{body}}\"\n\
-                 );\n\
-                 \n\
-                 // 3. GET (Read list)\n\
-                 let (headers, body) = request(host_port, \"GET\", \"/api/{plural}\", None);\n\
-                 assert!(\n\
-                     headers.starts_with(\"HTTP/1.1 200\") || headers.starts_with(\"HTTP/1.0 200\"),\n\
-                     \"GET /api/{plural} did not return 200:\\n{{headers}}\\n{{body}}\"\n\
-                 );\n\
-                 \n\
-                 // 4. PUT (Update)\n\
-                 let (headers, body) = request(host_port, \"PUT\", &item_path, Some(post_payload));\n\
-                 assert!(\n\
-                     headers.starts_with(\"HTTP/1.1 200\") || headers.starts_with(\"HTTP/1.0 200\"),\n\
-                     \"PUT {{item_path}} did not return 200:\\n{{headers}}\\n{{body}}\"\n\
-                 );\n\
-                 \n\
-                 // 5. DELETE (Destroy)\n\
-                 let (headers, body) = request(host_port, \"DELETE\", &item_path, None);\n\
-                 assert!(\n\
-                     headers.starts_with(\"HTTP/1.1 204\") || headers.starts_with(\"HTTP/1.0 204\"),\n\
-                     \"DELETE {{item_path}} did not return 204:\\n{{headers}}\\n{{body}}\"\n\
-                 );\n\
-                 \n\
-                 // 6. GET (Verify deleted)\n\
-                 let (headers, body) = request(host_port, \"GET\", &item_path, None);\n\
-                 assert!(\n\
-                     headers.starts_with(\"HTTP/1.1 404\") || headers.starts_with(\"HTTP/1.0 404\"),\n\
-                     \"GET {{item_path}} after DELETE did not return 404:\\n{{headers}}\\n{{body}}\"\n\
-                 );\n\
-             }}\n"
-        )
+    if api {
+        render_api_smoke_test(plural, id_schema_type, &setup_calls)
     } else {
-        let sample_form = build_sample_form(fields);
-        let (id_hs_type, id_hs_collect, vid_extract) = match id_type {
-            IdType::BigSerial => (
-                "i64",
-                "filter_map(|v| v[\"id\"].as_i64()).collect()",
-                "let vid = v[\"id\"].as_i64()?;",
-            ),
-            IdType::Uuid => (
-                "String",
-                "filter_map(|v| v[\"id\"].as_str().map(|s| s.to_owned())).collect()",
-                "let vid = v[\"id\"].as_str().map(|s| s.to_owned())?;",
-            ),
-        };
-        let vid_guard = "if !before_ids.contains(&vid) { Some(vid) } else { None }";
-        let base = format!(
-            "//! Smoke test generated by `autumn generate scaffold`.\n\
-             //!\n\
-             //! Compiles against the project's stock dependency set (just\n\
-             //! `autumn-web`) so it lights up in CI immediately. Hit the route\n\
-             //! on a real server with the steps documented in the test body.\n\
-             \n\
-             #[test]\n\
-             fn {plural}_index_returns_200_when_server_is_running() {{\n\
-                 let Ok(base) = std::env::var(\"AUTUMN_TEST_BASE_URL\") else {{\n\
-                     eprintln!(\"skipping: AUTUMN_TEST_BASE_URL not set\");\n\
-                     return;\n\
-                 }};\n\
-                 // Hit the running app at $AUTUMN_TEST_BASE_URL -- we go via raw\n\
-                 // `std::net::TcpStream` to avoid forcing reqwest into the\n\
-                 // project's dependency graph. Once the user wires in their\n\
-                 // preferred HTTP client they should replace this body.\n\
-                 let base = base.trim_end_matches('/');\n\
-                 let url = format!(\"{{base}}/{plural}\");\n\
-                 if base.starts_with(\"https://\") {{\n\
-                     eprintln!(\"skipping: raw TcpStream helper does not support TLS; run against http://\");\n\
-                     return;\n\
-                 }}\n\
-                 let host_port = base\n\
-                     .trim_start_matches(\"http://\")\n\
-                     .trim_start_matches(\"https://\");\n\
-                 let mut stream = std::net::TcpStream::connect(host_port)\n\
-                     .unwrap_or_else(|_| panic!(\"could not connect to {{url}}\"));\n\
-                 use std::io::{{Read, Write}};\n\
-                 let req = format!(\n\
-                     \"GET /{plural} HTTP/1.1\\r\\nHost: {{host_port}}\\r\\nConnection: close\\r\\n\\r\\n\"\n\
-                 );\n\
-                 stream.write_all(req.as_bytes()).expect(\"write failed\");\n\
-                 let mut response = String::new();\n\
-                 stream.read_to_string(&mut response).expect(\"read failed\");\n\
-                 assert!(\n\
-                     response.starts_with(\"HTTP/1.1 200\")\n\
-                         || response.starts_with(\"HTTP/1.0 200\"),\n\
-                     \"{pascal_name} index did not return 200:\\n{{response}}\"\n\
-                 );\n\
-                 assert!(\n\
-                     response.contains(\"{pascal_name}s\"),\n\
-                     \"{pascal_name} index did not render the generated template:\\n{{response}}\"\n\
-                 );\n\
-             }}\n"
-        );
-        let delete_test = if fields
-            .iter()
-            .any(|f| matches!(f.kind, FieldKind::Bytea | FieldKind::Attachment))
-        {
-            format!(
-                "\n\
-                 #[test]\n\
-                 fn {plural}_delete_round_trip_when_server_is_running() {{\n\
-                     // Bytea/Attachment fields cannot be url-encoded in a plain form POST;\n\
-                     // write a multipart/form-data integration test for this scaffold.\n\
-                     eprintln!(\"skipping: scaffold has Bytea/Attachment fields that cannot be url-encoded\");\n\
-                 }}\n"
-            )
-        } else {
-            format!(
-                "\n\
-                 #[test]\n\
-                 fn {plural}_delete_round_trip_when_server_is_running() {{\n\
-                 let Ok(base) = std::env::var(\"AUTUMN_TEST_BASE_URL\") else {{\n\
-                     eprintln!(\"skipping: AUTUMN_TEST_BASE_URL not set\");\n\
-                     return;\n\
-                 }};\n\
-                 let base = base.trim_end_matches('/');\n\
-                 if base.starts_with(\"https://\") {{\n\
-                     eprintln!(\"skipping: raw TcpStream helper does not support TLS; run against http://\");\n\
-                     return;\n\
-                 }}\n\
-                 let host_port = base\n\
-                     .trim_start_matches(\"http://\")\n\
-                     .trim_start_matches(\"https://\");\n\
-                 \n\
-                 fn request(host_port: &str, method: &str, path: &str, body: Option<(&str, &str)>) -> (String, String) {{\n\
-                     use std::io::{{Read, Write}};\n\
-                     let mut stream = std::net::TcpStream::connect(host_port)\n\
-                         .unwrap_or_else(|_| panic!(\"could not connect to {{host_port}}\"));\n\
-                     let req = if let Some((content_type, b)) = body {{\n\
-                         format!(\n\
-                             \"{{}} {{}} HTTP/1.1\\r\\n\\\n\
-                              Host: {{}}\\r\\n\\\n\
-                              Content-Type: {{}}\\r\\n\\\n\
-                              Content-Length: {{}}\\r\\n\\\n\
-                              Connection: close\\r\\n\\r\\n\\\n\
-                              {{}}\",\n\
-                             method, path, host_port, content_type, b.len(), b\n\
-                         )\n\
-                     }} else {{\n\
-                         format!(\n\
-                             \"{{}} {{}} HTTP/1.1\\r\\n\\\n\
-                              Host: {{}}\\r\\n\\\n\
-                              Connection: close\\r\\n\\r\\n\",\n\
-                             method, path, host_port\n\
-                         )\n\
-                     }};\n\
-                     stream.write_all(req.as_bytes()).expect(\"write failed\");\n\
-                     let mut response = String::new();\n\
-                     stream.read_to_string(&mut response).expect(\"read failed\");\n\
-                     if let Some((headers, body)) = response.split_once(\"\\r\\n\\r\\n\") {{\n\
-                         (headers.to_string(), body.to_string())\n\
-                     }} else {{\n\
-                         (response, String::new())\n\
-                     }}\n\
-                 }}\n\
-                 \n\
-                 // 1. Snapshot existing IDs before creating.\n\
-                 // Note: calls find_all which fetches every row; on large tables this\n\
-                 // will be slow. This is a limitation of the smoke test; consider\n\
-                 // truncating the table or adding a filter before running it.\n\
-                 let (list_before_h, list_before_b) = request(host_port, \"GET\", \"/api/{plural}\", None);\n\
-                 assert!(\n\
-                     list_before_h.starts_with(\"HTTP/1.1 200\") || list_before_h.starts_with(\"HTTP/1.0 200\"),\n\
-                     \"GET /api/{plural} did not return 200:\\n{{list_before_h}}\\n{{list_before_b}}\"\n\
-                 );\n\
-                 let before_json: autumn_web::reexports::serde_json::Value =\n\
-                     autumn_web::reexports::serde_json::from_str(&list_before_b)\n\
-                         .unwrap_or_else(|_| panic!(\"failed to parse list: {{list_before_b}}\"));\n\
-                 assert!(\n\
-                     before_json.is_array(),\n\
-                     \"GET /api/{plural} did not return a JSON array:\\n{{list_before_b}}\"\n\
-                 );\n\
-                 let before_ids: std::collections::HashSet<{id_hs_type}> = before_json\n\
-                     .as_array()\n\
-                     .map(|arr| arr.iter().{id_hs_collect})\n\
-                     .unwrap_or_default();\n\
-                 \n\
-                 // 2. Create a row via the HTML form route.\n\
-                 // CSRF middleware returns 403 when a token is absent; skip in that case.\n\
-                 let form_body = \"{sample_form}\";\n\
-                 let (create_h, create_b) = request(\n\
-                     host_port, \"POST\", \"/{plural}\",\n\
-                     Some((\"application/x-www-form-urlencoded\", form_body)),\n\
-                 );\n\
-                 if create_h.starts_with(\"HTTP/1.1 403\") || create_h.starts_with(\"HTTP/1.0 403\") {{\n\
-                     eprintln!(\"skipping: CSRF enforced on create -- the delete route is also untested; disable CSRF in dev or run with a real session cookie\");\n\
-                     return;\n\
-                 }}\n\
-                 if create_h.starts_with(\"HTTP/1.1 401\") || create_h.starts_with(\"HTTP/1.0 401\") {{\n\
-                     eprintln!(\"skipping: create returned 401 (auth required); run with a valid session cookie\");\n\
-                     return;\n\
-                 }}\n\
-                 if create_h.starts_with(\"HTTP/1.1 302\") || create_h.starts_with(\"HTTP/1.0 302\")\n\
-                     || create_h.starts_with(\"HTTP/1.1 303\") || create_h.starts_with(\"HTTP/1.0 303\") {{\n\
-                     // redirect_to() returns 200 (meta-refresh), not 302/303; a redirect here\n\
-                     // means auth/tenant middleware intercepted the request -- no row was created.\n\
-                     eprintln!(\"skipping: POST /{plural} redirected (302/303); auth middleware may have intercepted -- no row was created\");\n\
-                     return;\n\
-                 }}\n\
-                 assert!(\n\
-                     create_h.starts_with(\"HTTP/1.1 200\") || create_h.starts_with(\"HTTP/1.0 200\"),\n\
-                     \"POST /{plural} did not return 200:\\n{{create_h}}\\n{{create_b}}\"\n\
-                 );\n\
-                 \n\
-                 // 3. Find the new row's ID by diffing the list.\n\
-                 let (list_after_h, list_after_b) = request(host_port, \"GET\", \"/api/{plural}\", None);\n\
-                 assert!(\n\
-                     list_after_h.starts_with(\"HTTP/1.1 200\") || list_after_h.starts_with(\"HTTP/1.0 200\"),\n\
-                     \"GET /api/{plural} after create did not return 200:\\n{{list_after_h}}\\n{{list_after_b}}\"\n\
-                 );\n\
-                 let after_json: autumn_web::reexports::serde_json::Value =\n\
-                     autumn_web::reexports::serde_json::from_str(&list_after_b)\n\
-                         .unwrap_or_else(|_| panic!(\"failed to parse list: {{list_after_b}}\"));\n\
-                 assert!(\n\
-                     after_json.is_array(),\n\
-                     \"GET /api/{plural} after create did not return a JSON array:\\n{{list_after_b}}\"\n\
-                 );\n\
-                 let new_ids: Vec<_> = after_json\n\
-                     .as_array()\n\
-                     .map(|arr| arr.iter().filter_map(|v| {{\n\
-                         {vid_extract}\n\
-                         {vid_guard}\n\
-                     }}).collect())\n\
-                     .unwrap_or_default();\n\
-                 if new_ids.len() > 1 {{\n\
-                     eprintln!(\"skipping: {{}} new rows appeared between snapshots; cannot isolate created row\", new_ids.len());\n\
-                     return;\n\
-                 }}\n\
-                 let id = new_ids.into_iter().next()\n\
-                     .expect(\"created item not found in list after POST /{plural}\");\n\
-                 \n\
-                 // 4. Delete via HTML route — POST /{plural}/{{id}}/delete.\n\
-                 // redirect_to() returns HTTP 200 (meta-refresh), not 302/303.\n\
-                 let delete_path = format!(\"/{plural}/{{id}}/delete\");\n\
-                 let (del_h, _del_b) = request(\n\
-                     host_port, \"POST\", &delete_path,\n\
-                     Some((\"application/x-www-form-urlencoded\", \"\")),\n\
-                 );\n\
-                 if del_h.starts_with(\"HTTP/1.1 403\") || del_h.starts_with(\"HTTP/1.0 403\") {{\n\
-                     eprintln!(\"skipping: CSRF enforced on delete; cannot verify deletion without a session token\");\n\
-                     return;\n\
-                 }}\n\
-                 if del_h.starts_with(\"HTTP/1.1 401\") || del_h.starts_with(\"HTTP/1.0 401\") {{\n\
-                     eprintln!(\"skipping: delete returned 401 (auth required); cannot verify deletion\");\n\
-                     return;\n\
-                 }}\n\
-                 assert!(\n\
-                     del_h.starts_with(\"HTTP/1.1 200\") || del_h.starts_with(\"HTTP/1.0 200\"),\n\
-                     \"POST {{delete_path}} did not return 200:\\n{{del_h}}\"\n\
-                 );\n\
-                 \n\
-                 // 5. Verify the row is gone via the JSON API.\n\
-                 let item_path = format!(\"/api/{plural}/{{id}}\");\n\
-                 let (get_h, get_b) = request(host_port, \"GET\", &item_path, None);\n\
-                 assert!(\n\
-                     get_h.starts_with(\"HTTP/1.1 404\") || get_h.starts_with(\"HTTP/1.0 404\"),\n\
-                     \"GET {{item_path}} after delete did not return 404:\\n{{get_h}}\\n{{get_b}}\"\n\
-                 );\n\
-             }}\n"
-            )
-        };
-        base + &delete_test
+        render_index_smoke_test(pascal_name, plural, id_schema_type, &setup_calls)
     }
 }
 
@@ -2391,15 +2215,95 @@ async fn main() {
         let plan = plan_scaffold(tmp.path(), "Post", &[], "20260427000000").unwrap();
         plan.execute(Flags::default()).unwrap();
         let test = fs::read_to_string(tmp.path().join("tests/post.rs")).unwrap();
-        assert!(test.contains("posts_index_returns_200_when_server_is_running"));
-        assert!(test.contains("AUTUMN_TEST_BASE_URL"));
+        assert!(test.contains("posts_index_renders_scaffolded_rows"));
         assert!(!test.contains("AUTUMN_TEST_SESSION_COOKIE"));
         assert!(!test.contains("Cookie: {session_cookie}"));
         assert!(test.contains("/posts"));
-        // The smoke test must also exercise the delete path (AC: create→delete round-trip).
+    }
+
+    // ── in-process TestApp/TestClient smoke test (issue #1023) ────────────
+
+    #[test]
+    fn smoke_test_uses_in_process_test_app_not_tcp_stream() {
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(tmp.path(), "Post", &[], "20260427000000").unwrap();
+        plan.execute(Flags::default()).unwrap();
+        let test = fs::read_to_string(tmp.path().join("tests/post.rs")).unwrap();
+
+        // Uses the real in-process harness -- no raw sockets, no env-var gate.
         assert!(
-            test.contains("posts_delete_round_trip_when_server_is_running"),
-            "smoke test must include delete round-trip function: {test}"
+            test.contains("autumn_web::test::{TestApp, TestClient, TestDb}"),
+            "smoke test must use the TestApp/TestClient/TestDb harness: {test}"
+        );
+        assert!(
+            !test.contains("TcpStream"),
+            "smoke test must not hand-roll a raw TCP request: {test}"
+        );
+        assert!(
+            !test.contains("AUTUMN_TEST_BASE_URL"),
+            "smoke test must not gate on a running server's base URL: {test}"
+        );
+        assert!(
+            !test.contains("eprintln!(\"skipping"),
+            "smoke test must not silently skip via an env-gated return: {test}"
+        );
+
+        // DB-backed handler: a Docker-backed test is a *visible* `ignored`,
+        // never a silent green pass, and carries an explicit reason.
+        assert!(
+            test.contains("#[ignore = \"requires Docker"),
+            "DB-backed smoke test must be explicitly #[ignore]d with a reason: {test}"
+        );
+
+        // Real assertions: 200 plus the rendered heading.
+        assert!(test.contains(".assert_ok()"));
+        assert!(test.contains(".assert_body_contains(\"Posts\")"));
+    }
+
+    #[test]
+    fn smoke_test_index_handler_returns_wrong_status_fails_the_assertion() {
+        // Red-phase spike: if the (re-declared) handler under test returned the
+        // wrong status or dropped the heading, `assert_ok`/`assert_body_contains`
+        // must be the thing that fails -- i.e. the test has real failure power,
+        // not just a status check that always trivially passes.
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(tmp.path(), "Post", &[], "20260427000000").unwrap();
+        plan.execute(Flags::default()).unwrap();
+        let test = fs::read_to_string(tmp.path().join("tests/post.rs")).unwrap();
+
+        assert!(
+            test.contains("Ok(html! {"),
+            "handler must actually render Markup that assert_body_contains can inspect: {test}"
+        );
+        assert!(
+            test.contains("h1 { \"Posts\" }"),
+            "handler must render the heading the test asserts on: {test}"
+        );
+        // The count query touches the real (throwaway) database -- a broken
+        // query or handler bubbles up as an Err via `?`, which axum turns into
+        // a non-200 response, which `assert_ok()` then catches.
+        assert!(test.contains(".get_result(&mut db).await?;"));
+    }
+
+    #[test]
+    fn smoke_test_wires_dev_dependency_test_support() {
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(tmp.path(), "Post", &[], "20260427000000").unwrap();
+        plan.execute(Flags::default()).unwrap();
+        let cargo = fs::read_to_string(tmp.path().join("Cargo.toml")).unwrap();
+        assert!(
+            cargo.contains("[dev-dependencies]"),
+            "Cargo.toml must have a [dev-dependencies] section: {cargo}"
+        );
+        assert!(
+            cargo.contains("test-support"),
+            "Cargo.toml must enable autumn-web's test-support feature for TestDb: {cargo}"
+        );
+        // Must not leak into the production dependency set.
+        let deps_section = cargo.split("[dev-dependencies]").next().unwrap();
+        assert!(
+            !deps_section.contains("test-support"),
+            "test-support must stay out of [dependencies]: {cargo}"
         );
     }
 
@@ -2424,7 +2328,13 @@ async fn main() {
     }
 
     #[test]
-    fn smoke_test_delete_round_trip_exercises_create_and_delete() {
+    fn smoke_test_no_longer_includes_write_path_round_trip() {
+        // The old create/delete round-trip test hit a *running server* over a
+        // raw TcpStream, gated on `AUTUMN_TEST_BASE_URL` -- the very
+        // false-positive-green pattern issue #1023 fixes. Write-path coverage
+        // (create -> redirect, update, delete) is deferred as a follow-up (see
+        // that issue's "Out of Scope"); the generator now emits exactly one
+        // real, in-process, DB-backed index/read smoke test.
         let tmp = project_with_main(default_main());
         let plan = plan_scaffold(
             tmp.path(),
@@ -2435,22 +2345,9 @@ async fn main() {
         .unwrap();
         plan.execute(Flags::default()).unwrap();
         let test = fs::read_to_string(tmp.path().join("tests/post.rs")).unwrap();
-        // Round-trip test: creates via HTML form route, deletes via HTML route, verifies 404 via JSON API.
         assert!(
-            test.contains("posts_delete_round_trip_when_server_is_running"),
-            "smoke test must include delete round-trip: {test}"
-        );
-        assert!(
-            test.contains("/posts/") && test.contains("/delete"),
-            "smoke test must reference the HTML delete path: {test}"
-        );
-        assert!(
-            test.contains("/api/posts"),
-            "smoke test must use JSON API to create a row for the delete test: {test}"
-        );
-        assert!(
-            test.contains("404"),
-            "smoke test must assert the row is gone (404) after delete: {test}"
+            !test.contains("delete_round_trip"),
+            "write-path round-trip coverage is deferred, not converted: {test}"
         );
     }
 
@@ -2883,9 +2780,17 @@ async fn main() {
         .unwrap();
         plan.execute(Flags::default()).unwrap();
         let test_file = fs::read_to_string(tmp.path().join("tests/post.rs")).unwrap();
-        assert!(test_file.contains("POST"));
         assert!(test_file.contains("/api/posts"));
-        assert!(test_file.contains("DELETE"));
+        assert!(
+            test_file.contains("autumn_web::test::{TestApp, TestClient, TestDb}"),
+            "api smoke test must use the in-process harness: {test_file}"
+        );
+        assert!(!test_file.contains("TcpStream"));
+        assert!(!test_file.contains("AUTUMN_TEST_BASE_URL"));
+        assert!(
+            test_file.contains("#[ignore = \"requires Docker"),
+            "DB-backed api smoke test must be explicitly ignored with a reason: {test_file}"
+        );
         assert!(!test_file.contains("contains(\"Posts\")"));
     }
 

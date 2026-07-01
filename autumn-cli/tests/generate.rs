@@ -367,12 +367,16 @@ fn generate_scaffold_full_e2e_post() {
         assert!(routes.contains(needle), "routes file missing: {needle}");
     }
 
-    // Smoke test.
+    // Smoke test: real, in-process, DB-backed index/read test (issue #1023) --
+    // no raw TcpStream, no AUTUMN_TEST_BASE_URL, no silent env-gated skip.
     let test = fs::read_to_string(project.join("tests/post.rs")).unwrap();
-    assert!(test.contains("posts_index_returns_200_when_server_is_running"));
-    assert!(test.contains("AUTUMN_TEST_BASE_URL"));
+    assert!(test.contains("posts_index_renders_scaffolded_rows"));
+    assert!(test.contains("autumn_web::test::{TestApp, TestClient, TestDb}"));
+    assert!(!test.contains("TcpStream"));
+    assert!(!test.contains("AUTUMN_TEST_BASE_URL"));
     assert!(!test.contains("AUTUMN_TEST_SESSION_COOKIE"));
     assert!(!test.contains("Cookie: {session_cookie}"));
+    assert!(test.contains("#[ignore = \"requires Docker"));
 
     // `routes![]` registration.
     let main = fs::read_to_string(project.join("src/main.rs")).unwrap();
@@ -438,12 +442,14 @@ fn generate_scaffold_api_only() {
     // No HTML routes file
     assert!(!project.join("src/routes/posts.rs").is_file());
 
-    // Smoke test.
+    // Smoke test: real, in-process, DB-backed read test (issue #1023).
     let test = fs::read_to_string(project.join("tests/post.rs")).unwrap();
-    assert!(test.contains("posts_api_json_crud_round_trip_when_server_is_running"));
-    assert!(test.contains("AUTUMN_TEST_BASE_URL"));
-    assert!(test.contains("POST"));
-    assert!(test.contains("DELETE"));
+    assert!(test.contains("posts_api_list_returns_ok_against_a_real_database"));
+    assert!(test.contains("autumn_web::test::{TestApp, TestClient, TestDb}"));
+    assert!(!test.contains("TcpStream"));
+    assert!(!test.contains("AUTUMN_TEST_BASE_URL"));
+    assert!(test.contains("#[ignore = \"requires Docker"));
+    assert!(test.contains("/api/posts"));
 
     // `routes![]` registration.
     let main = fs::read_to_string(project.join("src/main.rs")).unwrap();
