@@ -1841,9 +1841,10 @@ fn render_smoke_test(
                  );\n\
              }}\n"
         );
-        let delete_test = if fields.iter().any(|f| {
-            matches!(f.kind, FieldKind::Bytea | FieldKind::Attachment)
-        }) {
+        let delete_test = if fields
+            .iter()
+            .any(|f| matches!(f.kind, FieldKind::Bytea | FieldKind::Attachment))
+        {
             format!(
                 "\n\
                  #[test]\n\
