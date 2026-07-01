@@ -558,16 +558,14 @@ mod tests {
         use tower::ServiceExt;
 
         let metrics = crate::middleware::MetricsCollector::new();
-        let app = Router::new()
-            .route("/", get(|| async { "ok" }))
-            .layer(axum::middleware::from_fn(move |req, next| {
-                middleware(req, next, ReadYourWrites::Request, 5, None, metrics.clone())
-            }));
+        let app =
+            Router::new()
+                .route("/", get(|| async { "ok" }))
+                .layer(axum::middleware::from_fn(move |req, next| {
+                    middleware(req, next, ReadYourWrites::Request, 5, None, metrics.clone())
+                }));
 
-        let req = Request::builder()
-            .uri("/")
-            .body(Body::empty())
-            .unwrap();
+        let req = Request::builder().uri("/").body(Body::empty()).unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert!(
             !resp.headers().contains_key("set-cookie"),
@@ -602,10 +600,7 @@ mod tests {
                 )
             }));
 
-        let req = Request::builder()
-            .uri("/")
-            .body(Body::empty())
-            .unwrap();
+        let req = Request::builder().uri("/").body(Body::empty()).unwrap();
         let resp = app.oneshot(req).await.unwrap();
         let set_cookie = resp.headers().get("set-cookie");
         assert!(
@@ -627,23 +622,21 @@ mod tests {
         let keys = std::sync::Arc::new(test_keys());
         let metrics = crate::middleware::MetricsCollector::new();
         let keys_clone = keys.clone();
-        let app = Router::new()
-            .route("/", get(|| async { "ok" }))
-            .layer(axum::middleware::from_fn(move |req, next| {
-                middleware(
-                    req,
-                    next,
-                    ReadYourWrites::Session,
-                    5,
-                    Some(keys_clone.clone()),
-                    metrics.clone(),
-                )
-            }));
+        let app =
+            Router::new()
+                .route("/", get(|| async { "ok" }))
+                .layer(axum::middleware::from_fn(move |req, next| {
+                    middleware(
+                        req,
+                        next,
+                        ReadYourWrites::Session,
+                        5,
+                        Some(keys_clone.clone()),
+                        metrics.clone(),
+                    )
+                }));
 
-        let req = Request::builder()
-            .uri("/")
-            .body(Body::empty())
-            .unwrap();
+        let req = Request::builder().uri("/").body(Body::empty()).unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert!(
             !resp.headers().contains_key("set-cookie"),
