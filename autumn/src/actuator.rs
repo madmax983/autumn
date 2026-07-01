@@ -4291,6 +4291,10 @@ mod tests {
         assert!(text.contains("# HELP autumn_request_timeouts_total"));
         assert!(text.contains("# TYPE autumn_request_timeouts_total counter"));
         assert!(text.contains("autumn_request_timeouts_total{version=\"stable\"} 0"));
+
+        assert!(text.contains("# HELP autumn_read_your_writes_pins_total"));
+        assert!(text.contains("# TYPE autumn_read_your_writes_pins_total counter"));
+        assert!(text.contains("autumn_read_your_writes_pins_total{version=\"stable\"} 0"));
     }
 
     #[tokio::test]

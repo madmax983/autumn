@@ -491,4 +491,210 @@ mod tests {
             "produced cookie must be parseable as a fresh incoming_pin"
         );
     }
+
+    #[tokio::test]
+    async fn note_pin_redirect_increments_metric_via_new_with_metrics() {
+        let metrics = crate::middleware::MetricsCollector::new();
+        let pin = RequestPin::new_with_metrics(ReadYourWrites::Request, metrics.clone());
+        scope(pin, async {
+            mark_write();
+            note_pin_redirect();
+        })
+        .await;
+        assert_eq!(
+            metrics.snapshot().read_your_writes_pins_total,
+            1,
+            "note_pin_redirect must increment the metric counter"
+        );
+    }
+
+    #[tokio::test]
+    async fn note_pin_redirect_trace_fires_only_once_per_request() {
+        let metrics = crate::middleware::MetricsCollector::new();
+        let pin = RequestPin::new_with_metrics(ReadYourWrites::Request, metrics.clone());
+        scope(pin, async {
+            mark_write();
+            note_pin_redirect();
+            note_pin_redirect();
+            note_pin_redirect();
+        })
+        .await;
+        // Metric increments on every call; trace deduplicated (can't assert trace
+        // but we verify the counter reflects all three calls).
+        assert_eq!(metrics.snapshot().read_your_writes_pins_total, 3);
+    }
+
+    #[test]
+    fn with_session_cookie_and_metrics_fresh_sets_incoming_pin() {
+        let keys = test_keys();
+        let cookie = fresh_cookie(&keys);
+        let metrics = crate::middleware::MetricsCollector::new();
+        let pin = RequestPin::with_session_cookie_and_metrics(&cookie, &keys, 5, metrics);
+        assert!(
+            pin.incoming_pin(),
+            "with_session_cookie_and_metrics: fresh cookie must set incoming_pin"
+        );
+    }
+
+    #[test]
+    fn with_session_cookie_and_metrics_expired_does_not_set_incoming_pin() {
+        let keys = test_keys();
+        let ts = 1_000u64.to_string();
+        let sig = keys.sign(ts.as_bytes());
+        let cookie = format!("{ts}.{sig}");
+        let metrics = crate::middleware::MetricsCollector::new();
+        let pin = RequestPin::with_session_cookie_and_metrics(&cookie, &keys, 5, metrics);
+        assert!(
+            !pin.incoming_pin(),
+            "with_session_cookie_and_metrics: expired cookie must NOT set incoming_pin"
+        );
+    }
+
+    // ── middleware() integration tests ────────────────────────────────────────
+
+    #[tokio::test]
+    async fn middleware_request_mode_no_set_cookie() {
+        use axum::{Router, body::Body, http::Request, routing::get};
+        use tower::ServiceExt;
+
+        let metrics = crate::middleware::MetricsCollector::new();
+        let app = Router::new()
+            .route("/", get(|| async { "ok" }))
+            .layer(axum::middleware::from_fn(move |req, next| {
+                middleware(req, next, ReadYourWrites::Request, 5, None, metrics.clone())
+            }));
+
+        let req = Request::builder()
+            .uri("/")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert!(
+            !resp.headers().contains_key("set-cookie"),
+            "request mode must not set a cookie"
+        );
+    }
+
+    #[tokio::test]
+    async fn middleware_session_mode_write_sets_cookie() {
+        use axum::{Router, body::Body, http::Request, routing::get};
+        use tower::ServiceExt;
+
+        let keys = std::sync::Arc::new(test_keys());
+        let metrics = crate::middleware::MetricsCollector::new();
+        let keys_clone = keys.clone();
+        let app = Router::new()
+            .route(
+                "/",
+                get(|| async {
+                    mark_write();
+                    "ok"
+                }),
+            )
+            .layer(axum::middleware::from_fn(move |req, next| {
+                middleware(
+                    req,
+                    next,
+                    ReadYourWrites::Session,
+                    5,
+                    Some(keys_clone.clone()),
+                    metrics.clone(),
+                )
+            }));
+
+        let req = Request::builder()
+            .uri("/")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let set_cookie = resp.headers().get("set-cookie");
+        assert!(
+            set_cookie.is_some(),
+            "session mode + write must set the autumn.ryw cookie"
+        );
+        let cv = set_cookie.unwrap().to_str().unwrap();
+        assert!(
+            cv.starts_with("autumn.ryw="),
+            "Set-Cookie must be the autumn.ryw cookie, got: {cv}"
+        );
+    }
+
+    #[tokio::test]
+    async fn middleware_session_mode_no_write_no_set_cookie() {
+        use axum::{Router, body::Body, http::Request, routing::get};
+        use tower::ServiceExt;
+
+        let keys = std::sync::Arc::new(test_keys());
+        let metrics = crate::middleware::MetricsCollector::new();
+        let keys_clone = keys.clone();
+        let app = Router::new()
+            .route("/", get(|| async { "ok" }))
+            .layer(axum::middleware::from_fn(move |req, next| {
+                middleware(
+                    req,
+                    next,
+                    ReadYourWrites::Session,
+                    5,
+                    Some(keys_clone.clone()),
+                    metrics.clone(),
+                )
+            }));
+
+        let req = Request::builder()
+            .uri("/")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert!(
+            !resp.headers().contains_key("set-cookie"),
+            "session mode without write must NOT set a cookie"
+        );
+    }
+
+    #[tokio::test]
+    async fn middleware_session_mode_incoming_cookie_pins_read() {
+        use axum::{Router, body::Body, http::Request, routing::get};
+        use tower::ServiceExt;
+
+        let keys = std::sync::Arc::new(test_keys());
+        let cookie = fresh_cookie(&keys);
+        let metrics = crate::middleware::MetricsCollector::new();
+        let keys_clone = keys.clone();
+
+        // Track whether the handler saw a pin via a shared flag.
+        let saw_pin = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let saw_pin_clone = saw_pin.clone();
+        let app = Router::new()
+            .route(
+                "/",
+                get(move || {
+                    let flag = saw_pin_clone.clone();
+                    async move {
+                        flag.store(is_pinned(), Ordering::Relaxed);
+                        "ok"
+                    }
+                }),
+            )
+            .layer(axum::middleware::from_fn(move |req, next| {
+                middleware(
+                    req,
+                    next,
+                    ReadYourWrites::Session,
+                    5,
+                    Some(keys_clone.clone()),
+                    metrics.clone(),
+                )
+            }));
+
+        let req = Request::builder()
+            .uri("/")
+            .header("cookie", format!("autumn.ryw={cookie}"))
+            .body(Body::empty())
+            .unwrap();
+        app.oneshot(req).await.unwrap();
+        assert!(
+            saw_pin.load(Ordering::Relaxed),
+            "a valid incoming autumn.ryw cookie must activate the pin inside the handler"
+        );
+    }
 }

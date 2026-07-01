@@ -6894,6 +6894,30 @@ path = "/healthz"
     }
 
     #[test]
+    fn env_override_read_your_writes() {
+        let env = MockEnv::new().with("AUTUMN_DATABASE__READ_YOUR_WRITES", "request");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+        assert_eq!(config.database.read_your_writes, ReadYourWrites::Request);
+    }
+
+    #[test]
+    fn env_override_read_your_writes_session() {
+        let env = MockEnv::new().with("AUTUMN_DATABASE__READ_YOUR_WRITES", "session");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+        assert_eq!(config.database.read_your_writes, ReadYourWrites::Session);
+    }
+
+    #[test]
+    fn env_override_pin_after_write_secs() {
+        let env = MockEnv::new().with("AUTUMN_DATABASE__PIN_AFTER_WRITE_SECS", "10");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+        assert_eq!(config.database.pin_after_write_secs, 10);
+    }
+
+    #[test]
     fn env_override_invalid_pool_size_ignored() {
         let env = MockEnv::new().with("AUTUMN_DATABASE__POOL_SIZE", "not_a_number");
         let mut config = AutumnConfig::default();
