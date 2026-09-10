@@ -19813,7 +19813,9 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 // the `before_create` hook and the DB write, so validators and the
                 // database see the canonical value. Dispatches through the
                 // autoref-specialization probe: the `Yes` arm clones and canonicalizes
-                // only for models whose `New*` implements `Normalize`, and the `No`
+                // only for models whose `New*` implements `NeedsNormalization`
+                // (emitted by `#[model]` exactly when the model declares
+                // `#[normalize]` columns, per #2692), and the `No`
                 // arm hands back the caller's borrow unchanged, so a model with no
                 // `#[normalize]` columns pays no clone. `Borrow` unifies the owned and
                 // borrowed arms to `&#new_name`.
@@ -19858,9 +19860,10 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             async fn save_many(&self, new: &[#new_name]) -> ::autumn_web::AutumnResult<Vec<#model_name>> {
                 // #1379: normalize each `#[normalize]` column before the bulk
                 // insert path (mirrors `save`). The `Yes` arm clones+canonicalizes
-                // only for `Normalize` `New*` types; the `No` arm hands back the
-                // caller's slice unchanged (no clone) for everything else.
-                // `Borrow` unifies the owned `Vec`/borrowed slice arms.
+                // only for `NeedsNormalization` `New*` types (#2692); the `No`
+                // arm hands back the caller's slice unchanged (no clone) for
+                // everything else. `Borrow` unifies the owned `Vec`/borrowed
+                // slice arms.
                 #[allow(unused_imports)]
                 use ::autumn_web::normalize::{SpezNormalizeManyNo as _, SpezNormalizeManyYes as _};
                 #[allow(unused_imports)]
@@ -19875,11 +19878,12 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 // the body, so a skip-invalid import judges — and stores — the
                 // same canonical value `save_many` does.
                 //
-                // #2634: no clone when there is nothing to normalize. `#[model]`
-                // emits `impl Normalize` for the `New*` only when the model
-                // declares `#[normalize]` columns, so the probe's `Yes` arm wins
-                // exactly when normalization can change something; otherwise the
-                // borrowed `No` arm hands the caller's slice back untouched.
+                // #2692: no clone when there is nothing to normalize. `#[model]`
+                // emits `impl NeedsNormalization` for the `New*` only when the
+                // model declares `#[normalize]` columns, and the probe's `Yes`
+                // arm is gated on that marker, so it wins exactly when
+                // normalization can change something; otherwise the borrowed
+                // `No` arm hands the caller's slice back untouched.
                 #[allow(unused_imports)]
                 use ::autumn_web::normalize::{SpezNormalizeManyNo as _, SpezNormalizeManyYes as _};
                 #[allow(unused_imports)]

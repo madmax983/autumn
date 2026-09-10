@@ -100,12 +100,11 @@ pub fn strip_nul(s: &str) -> String {
 
 /// A type whose `#[normalize]` columns can be canonicalized in place.
 ///
-/// Implemented by `#[model]` for the model itself, and for every generated
-/// `New*` insert struct whose model declares `#[normalize]` columns (#2634:
-/// a `New*` with no normalized columns does not implement this, so the
-/// repository probe's no-clone fallback wins). `normalize` applies each
-/// field's normalizer chain; it is a no-op for models with no `#[normalize]`
-/// columns.
+/// Implemented by `#[model]` for the model itself **and for every generated
+/// `New*` insert struct** (#2692: removing it for unnormalized `New*`s in
+/// #2634 was a source-compat break, so the impl is unconditional again —
+/// see `NeedsNormalization`). `normalize` applies each field's normalizer
+/// chain; it is a no-op for models with no `#[normalize]` columns.
 pub trait Normalize {
     /// Canonicalize every `#[normalize]` field in place.
     fn normalize(&mut self);
@@ -146,21 +145,45 @@ pub fn normalize_lookup_value<M: NormalizedModel>(column: &str, value: &str) -> 
 // **not** work through a generic boundary, which is why the wrappers are
 // constructed in the generated code rather than behind a generic helper.
 
+/// Marker for types whose write-path normalization can change something
+/// (#2692).
+///
+/// `#[model]` implements this for the generated `New*` insert struct only
+/// when the model declares `#[normalize]` columns. The repository
+/// autoref-specialization probe (`SpezNormalizeYes` /
+/// `SpezNormalizeManyYes`) is gated on it, so `save`, `save_many`,
+/// `save_many_skip_invalid` and the create half of `find_or_create_by_*`
+/// clone their payload only when normalization can actually change a value.
+///
+/// The marker — not the presence of the `Normalize` impl — is what the probe
+/// consults. `Normalize` itself is implemented for *every* generated `New*`
+/// (a no-op when the model has no `#[normalize]` columns), which is the
+/// public API guarantee: downstream code calling `Normalize::normalize` on a
+/// generated `NewX`, or accepting all insert structs through a generic
+/// `T: Normalize` bound, keeps compiling (#2634 had removed the impl and
+/// #2692 restores it; the zero-clone behavior moves to this marker).
+///
+/// A hand-written `New*` that implements `Normalize + Clone` but not this
+/// marker now takes the probe's no-clone fallback in the generated write
+/// path; implement the marker explicitly if write-path normalization is
+/// wanted for it.
+pub trait NeedsNormalization {}
+
 /// Probe wrapper for write-path normalization.
 ///
 /// Holds an immutable borrow of the caller's input. The specialized `Yes` impl
-/// (selected only when the concrete type is `Normalize + Clone`) clones and
-/// canonicalizes, returning the owned value; the `No` fallback returns the
-/// borrow untouched, paying no clone.
+/// (selected only when the concrete type is `NeedsNormalization +
+/// Normalize + Clone`) clones and canonicalizes, returning the owned value;
+/// the `No` fallback returns the borrow untouched, paying no clone.
 ///
-/// In practice only a **hand-written** `New*` reaches that fallback — plus, as
-/// of #2634, a `#[model]`-generated `New*` whose model declares no
-/// `#[normalize]` columns: the macro no longer emits the empty-bodied `impl
-/// Normalize` for those, so the `Yes` arm cannot win and the `No` arm hands
-/// back the caller's borrow with no clone. The generated code unifies the two
-/// arms with `Borrow` (see
-/// `#[repository]` `save`, `save_many`, `save_many_skip_invalid` and
-/// `find_or_create_by_*`).
+/// In practice only a **hand-written** `New*` — or a `#[model]`-generated
+/// `New*` whose model declares no `#[normalize]` columns — reaches that
+/// fallback: the macro emits the `NeedsNormalization` marker only when the
+/// model declares `#[normalize]` columns (#2634's zero-clone behavior,
+/// re-expressed as #2692's marker so the unconditional `Normalize` impl can
+/// stay for source compatibility). The generated code unifies the two arms
+/// with `Borrow` (see `#[repository]` `save`, `save_many`,
+/// `save_many_skip_invalid` and `find_or_create_by_*`).
 #[doc(hidden)]
 pub struct SpezNormalize<'a, T: ?Sized>(pub &'a T);
 
@@ -168,7 +191,9 @@ pub struct SpezNormalize<'a, T: ?Sized>(pub &'a T);
 pub trait SpezNormalizeYes<'a, T> {
     fn spez_normalize(self) -> T;
 }
-impl<'a, T: Normalize + Clone> SpezNormalizeYes<'a, T> for SpezNormalize<'a, T> {
+impl<'a, T: NeedsNormalization + Normalize + Clone> SpezNormalizeYes<'a, T>
+    for SpezNormalize<'a, T>
+{
     #[inline]
     fn spez_normalize(self) -> T {
         let mut owned = self.0.clone();
@@ -192,7 +217,9 @@ impl<'a, T: ?Sized> SpezNormalizeNo<'a, T> for &SpezNormalize<'a, T> {
 pub trait SpezNormalizeManyYes<'a, T> {
     fn spez_normalize_many(self) -> Vec<T>;
 }
-impl<'a, T: Normalize + Clone> SpezNormalizeManyYes<'a, T> for SpezNormalize<'a, [T]> {
+impl<'a, T: NeedsNormalization + Normalize + Clone> SpezNormalizeManyYes<'a, T>
+    for SpezNormalize<'a, [T]>
+{
     #[inline]
     fn spez_normalize_many(self) -> Vec<T> {
         self.0
@@ -327,6 +354,19 @@ mod tests {
             self.0 = downcase(&trim(&self.0));
         }
     }
+    // #2692: `Norms` has real normalizer work to do, so it opts the
+    // repository write path back into clone+canonicalize via the marker.
+    impl NeedsNormalization for Norms {}
+    // A `Normalize + Clone` type WITHOUT the marker: #2692 keeps the
+    // unconditional `Normalize` impl on every generated `New*`, but the
+    // repository probe gates on the marker, so this takes the no-clone
+    // fallback — the unconditional `Normalize` impl no longer triggers a
+    // clone by itself.
+    #[derive(Clone)]
+    struct MarkedNoNormalize(String);
+    impl Normalize for MarkedNoNormalize {
+        fn normalize(&mut self) {}
+    }
     struct Plain(#[allow(dead_code)] String); // no Normalize impl
 
     #[test]
@@ -334,8 +374,8 @@ mod tests {
         use super::{SpezNormalizeNo as _, SpezNormalizeYes as _};
         use std::borrow::Borrow as _;
 
-        // A `Normalize + Clone` type is cloned and canonicalized; the borrow
-        // unifies both arms to `&T`.
+        // A `NeedsNormalization + Normalize + Clone` type is cloned and
+        // canonicalized; the borrow unifies both arms to `&T`.
         let n = Norms("  Foo ".into());
         let normalized = SpezNormalize(&n).spez_normalize();
         let n_ref: &Norms = normalized.borrow();
@@ -350,6 +390,34 @@ mod tests {
         let p = Plain("  Foo ".into());
         let p_ref: &Plain = SpezNormalize(&p).spez_normalize();
         assert_eq!(p_ref.0, "  Foo ", "non-Normalize type must be untouched");
+    }
+
+    #[test]
+    fn spez_normalize_marker_gates_the_clone_arm() {
+        // #2692: a `Normalize + Clone` type WITHOUT the `NeedsNormalization`
+        // marker (what `#[model]` now emits for a model with no `#[normalize]`
+        // columns) takes the no-clone fallback even though the unconditional
+        // `Normalize` impl is present — the impl alone must not pay for a
+        // clone the way it did before #2634.
+        use super::{SpezNormalizeManyNo as _, SpezNormalizeManyYes as _};
+        use super::{SpezNormalizeNo as _, SpezNormalizeYes as _};
+
+        let m = MarkedNoNormalize(" untouched ".into());
+        let m_ref: &MarkedNoNormalize = SpezNormalize(&m).spez_normalize();
+        assert!(
+            std::ptr::eq(m_ref, &m),
+            "unmarked type must come back by borrow, not by clone"
+        );
+        assert_eq!(m_ref.0, " untouched ", "value must be untouched");
+
+        // Same for the batch (`save_many`) arm. The generated call sites hand
+        // a slice `&[#new_name]` (not an array) to the probe.
+        let batch = [MarkedNoNormalize(" a ".into())];
+        let s: &[MarkedNoNormalize] = SpezNormalize(&batch[..]).spez_normalize_many();
+        assert!(
+            std::ptr::eq(s.as_ptr(), batch.as_ptr()),
+            "unmarked batch must come back by borrow, not by clone"
+        );
     }
 
     #[test]

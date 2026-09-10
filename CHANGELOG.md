@@ -232,6 +232,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   their payload — a full `Vec` copy of a bulk batch — to run a guaranteed
   no-op normalization. The no-clone fallback arm now wins for unnormalized
   models. The read-model `Normalize` impl and `NormalizedModel` are unchanged.
+  (Superseded by #2692 below: the `Normalize` impl is unconditional again, and
+  the zero-clone gate moved to a dedicated marker trait.)
+- **`#[model]`:** `impl Normalize` for every generated `New*` insert struct is
+  unconditional again, and the repository write-path probe gates its
+  clone+canonicalize arm on a new `autumn_web::normalize::NeedsNormalization`
+  marker trait instead of on the `Normalize` impl (issue #2692). #2634 had
+  removed the `Normalize` impl for `New*`s whose models declare no
+  `#[normalize]` columns — a source-compat break for downstream code calling
+  `Normalize::normalize` on a generated `NewX` or binding all insert structs
+  through a generic `T: Normalize` bound (the trait docs had always guaranteed
+  the impl). Now `#[model]` emits the unconditional no-op `Normalize` impl as
+  before and emits `impl NeedsNormalization` only when the model declares
+  `#[normalize]` columns, so the probe's `Yes` arm still wins exactly when
+  normalization can change something and the `No` arm still hands back the
+  caller's borrow/slice untouched — the zero-clone behavior #2634 introduced
+  is preserved. Hand-written `New*` types that implement `Normalize + Clone`
+  but not the marker now take the probe's no-clone fallback in the generated
+  write path; implement `NeedsNormalization` explicitly for such a type if
+  write-path normalization is wanted for it.
 - **build:** renamed colliding example binary targets so no two workspace
   members produce the same output filename — `todo-app`'s `seed` is now
   `todo-app-seed`, `bookmarks`' is `bookmarks-seed`, and the two auto-discovered

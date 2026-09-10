@@ -9550,30 +9550,38 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             quote! { #lookup_key => ::core::option::Option::Some(#expr), }
         })
         .collect();
-    // #2634: gate the `New*` `Normalize` impl on the insert struct actually
-    // having `#[normalize]` columns. With no columns the `Yes` arm of the
-    // repository autoref probe (`SpezNormalizeManyYes`) would win and clone
-    // the whole batch to run an empty `normalize()` — a guaranteed no-op.
-    // Omitting the impl lets the probe's `No` arm win, so `save` /
-    // `save_many` / `save_many_skip_invalid` / `find_or_create_by_*` pay no
-    // clone for unnormalized models. The read-model impl stays unconditional:
+    // #2692: the `Normalize` impl for `New*` is unconditional again (#2634's
+    // gating on `#[normalize]` columns was a source-compat break: downstream
+    // code calling `Normalize::normalize` on a generated `NewX`, or binding
+    // all insert structs through a generic `T: Normalize`, stopped
+    // compiling). With no `#[normalize]` columns the body is an empty
+    // no-op — harmless, because the repository write path no longer keys off
+    // this impl. The zero-clone behavior #2634 wanted lives on the separate
+    // `NeedsNormalization` marker now: the repository autoref probe's `Yes`
+    // arm is gated on it, so `save` / `save_many` / `save_many_skip_invalid`
+    // / `find_or_create_by_*` only clone the payload when normalization can
+    // actually change a value. The read-model impl stays unconditional too:
     // it is `&mut self` in place (no clone involved) and user code may call
-    // `.normalize()` on it directly, so removing it would be a compile break.
-    // `NormalizedModel` stays unconditional too: derived finders call
-    // `normalize_lookup` for every model and rely on the `None` arm.
-    let normalize_new_impl = if normalize_new_stmts.is_empty() {
+    // `.normalize()` on it directly. `NormalizedModel` stays unconditional:
+    // derived finders call `normalize_lookup` for every model and rely on
+    // the `None` arm.
+    let normalize_new_impl = quote! {
+        impl ::autumn_web::normalize::Normalize for #new_name {
+            fn normalize(&mut self) {
+                #(#normalize_new_stmts)*
+            }
+        }
+    };
+    let needs_normalization_impl = if normalize_new_stmts.is_empty() {
         quote! {}
     } else {
         quote! {
-            impl ::autumn_web::normalize::Normalize for #new_name {
-                fn normalize(&mut self) {
-                    #(#normalize_new_stmts)*
-                }
-            }
+            impl ::autumn_web::normalize::NeedsNormalization for #new_name {}
         }
     };
     let normalize_impls = quote! {
         #normalize_new_impl
+        #needs_normalization_impl
         impl ::autumn_web::normalize::Normalize for #name {
             fn normalize(&mut self) {
                 #(#normalize_model_stmts)*
@@ -15185,12 +15193,15 @@ mod tests {
     }
 
     #[test]
-    fn normalize_impl_for_new_is_gated_on_normalize_columns() {
-        // #2634: a model with no `#[normalize]` columns must not get
-        // `impl Normalize for New*` — otherwise the repository probe's `Yes`
-        // arm always wins and `save_many` clones a batch whose normalization
-        // is a guaranteed no-op. The read-model impl and `NormalizedModel`
-        // stay unconditional (public API surface and the finder `None` arm).
+    fn normalize_impl_for_new_is_unconditional_and_marker_is_gated() {
+        // #2692 (revises #2634): every generated `New*` gets the `Normalize`
+        // impl — removing it for unnormalized models broke downstream code
+        // calling `Normalize::normalize` on a `NewX` or binding insert
+        // structs through a generic `T: Normalize`. The zero-clone behavior
+        // moves to the `NeedsNormalization` marker, which the macro emits
+        // only when the model declares `#[normalize]` columns; the
+        // repository probe gates its clone arm on the marker, not on the
+        // `Normalize` impl.
         let output = model_macro(
             TokenStream::new(),
             quote! {
@@ -15203,8 +15214,12 @@ mod tests {
         );
         let generated = output.to_string();
         assert!(
-            !generated.contains("normalize :: Normalize for NewUser"),
-            "must NOT generate `impl Normalize for NewUser` with no normalize columns: {generated}"
+            generated.contains("normalize :: Normalize for NewUser"),
+            "must always generate `impl Normalize for NewUser`: {generated}"
+        );
+        assert!(
+            !generated.contains("normalize :: NeedsNormalization for NewUser"),
+            "must NOT generate the marker with no normalize columns: {generated}"
         );
         assert!(
             generated.contains("normalize :: Normalize for User"),
@@ -15213,6 +15228,27 @@ mod tests {
         assert!(
             generated.contains("normalize :: NormalizedModel for User"),
             "must keep `impl NormalizedModel for User`: {generated}"
+        );
+
+        let output = model_macro(
+            TokenStream::new(),
+            quote! {
+                pub struct User {
+                    #[id]
+                    pub id: i64,
+                    #[normalize(trim, downcase)]
+                    pub email: String,
+                }
+            },
+        );
+        let generated = output.to_string();
+        assert!(
+            generated.contains("normalize :: NeedsNormalization for NewUser"),
+            "must generate the marker when normalize columns exist: {generated}"
+        );
+        assert!(
+            generated.contains("normalize :: Normalize for NewUser"),
+            "must still generate `impl Normalize for NewUser`: {generated}"
         );
     }
 
