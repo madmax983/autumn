@@ -232,6 +232,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   their payload — a full `Vec` copy of a bulk batch — to run a guaranteed
   no-op normalization. The no-clone fallback arm now wins for unnormalized
   models. The read-model `Normalize` impl and `NormalizedModel` are unchanged.
+- **`error::unique_violation_field`:** now classifies SQLite unique violations
+  too (issue #2698). On SQLite diesel boxes a bare `String` as the error
+  information, so `constraint_name()` is `None` and the helper's friendly
+  branch was unreachable — every caller (`autumn generate teams`' pending
+  invitation index, scaffolded `--unique` columns, the CMS starters) fell
+  through to a blanket 500 while the constraint itself still failed closed.
+  When the constraint name is absent, the helper now parses the violated
+  columns out of SQLite's `UNIQUE constraint failed: table.col, ...` message
+  and returns the mapping entry whose field names one of those columns. An
+  unparseable message fails closed to `None`, exactly like the old absent-name
+  path, and the Postgres constraint-name path is unchanged (a present name is
+  still matched by name first).
 - **build:** renamed colliding example binary targets so no two workspace
   members produce the same output filename — `todo-app`'s `seed` is now
   `todo-app-seed`, `bookmarks`' is `bookmarks-seed`, and the two auto-discovered
