@@ -393,10 +393,21 @@ self.addEventListener('push', (event) => {
 
 self.addEventListener('notificationclick', (event) => {
   event.notification.close();
-  const target = new URL(
-    (event.notification.data && event.notification.data.url) || '/',
-    self.location.origin
-  );
+  let target;
+  try {
+    target = new URL(
+      (event.notification.data && event.notification.data.url) || '/',
+      self.location.origin
+    );
+  } catch {
+    // `PushMessage::url` is an arbitrary string carried verbatim into
+    // `data.url`, and a malformed *absolute* URL (e.g. `https://[`) makes
+    // `new URL()` throw *after* the notification already closed — the click
+    // would then silently do nothing. Fall back to the app root, the same
+    // fallback already used for cross-origin targets below, so a bad payload
+    // still navigates somewhere useful.
+    target = new URL('/', self.location.origin);
+  }
   // Cross-origin targets are dropped: the payload travels through a third-party
   // push service, so a notification must never be able to navigate this app's
   // users off-origin.
@@ -2218,6 +2229,33 @@ async fn main() {
         assert!(
             sw.contains("notification.close()"),
             "the notification must be dismissed on click:\n{sw}"
+        );
+    }
+
+    #[test]
+    fn notificationclick_survives_a_malformed_absolute_url() {
+        // `PushMessage::url` is `Option<String>` — an arbitrary string carried
+        // verbatim into `data.url`, travelling through a third-party push
+        // service. A malformed *absolute* URL (`https://[`) makes `new URL()`
+        // throw *after* `notification.close()` already ran, so the click would
+        // silently do nothing at all: no focus, no navigation, no fallback.
+        // The parse must be guarded and fall back to the app root — the same
+        // fallback the cross-origin check below already uses.
+        let sw = render_service_worker();
+        let handler = sw
+            .find("addEventListener('notificationclick'")
+            .map(|start| &sw[start..])
+            .expect("service worker must define a notificationclick handler");
+        let (head, _) = handler
+            .split_once("self.clients.matchAll")
+            .expect("notificationclick handler must route through clients.matchAll");
+        assert!(
+            head.contains("catch"),
+            "the notificationclick URL parse must be guarded:\\n{head}"
+        );
+        assert!(
+            head.contains("new URL('/', self.location.origin)"),
+            "a malformed URL must fall back to the app root:\\n{head}"
         );
     }
 

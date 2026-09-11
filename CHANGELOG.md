@@ -168,6 +168,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **PWA service worker: `notificationclick` survives a malformed
+  `PushMessage::url` (#2369):** the generated `notificationclick` handler
+  parsed `(event.notification.data && event.notification.data.url) || '/'`
+  with `new URL(...)` unguarded, but `PushMessage::url` is `Option<String>`
+  — an arbitrary string carried verbatim through the third-party push
+  service into `data.url`. A malformed *absolute* URL (e.g. `https://[`)
+  made the constructor throw *after* `notification.close()` had already run
+  and before `event.waitUntil(...)` was reached, so tapping the notification
+  dismissed it and did nothing at all. The parse is now wrapped in
+  try/catch and falls back to the app root — the same fallback the handler
+  already uses for cross-origin targets — so a bad payload still navigates
+  somewhere useful. Relative and cross-origin behaviour is unchanged.
 - **🧭 Wayfinder: redisplay the post editor on failure in `examples/blog`
   (error-path 0/2 → 2/2, draft preserved) [no-plugin]:** an error-path
   inventory of `blog`'s admin post editor — the create/edit HTML form behind
