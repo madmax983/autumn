@@ -7072,8 +7072,14 @@ impl AppBuilder {
                     // A dataset that failed is reported in its own row rather
                     // than aborting the run, but the command as a whole must
                     // still exit non-zero so a scripted purge doesn't look
-                    // successful.
-                    let exit_code = i32::from(reports.iter().any(|r| r.error.is_some()));
+                    // successful. An audit-write failure counts too: rows
+                    // were deleted with no compliance-trail record, which is
+                    // exactly the silent-failure shape #2396 closes.
+                    let exit_code = i32::from(
+                        reports
+                            .iter()
+                            .any(|r| r.error.is_some() || r.audit_error.is_some()),
+                    );
                     std::process::exit(exit_code);
                 }
                 Err(error) => {

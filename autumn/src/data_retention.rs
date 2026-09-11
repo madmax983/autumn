@@ -469,6 +469,13 @@ pub struct RetentionDatasetReport {
     /// The error this dataset's pass failed with, if it did. One dataset
     /// failing never aborts the others.
     pub error: Option<String>,
+    /// The audit-write failure for this dataset's sweep record, if the sweep
+    /// ran but its compliance-trail record could not be persisted. Kept
+    /// separate from `error` because the data situation is different: rows
+    /// were deleted and no durable record of the deletion exists, versus
+    /// rows never deleted at all (#2396).
+    #[serde(default)]
+    pub audit_error: Option<String>,
 }
 
 /// Options for one [`run_retention`] pass.
@@ -510,8 +517,8 @@ pub async fn run_retention(
     let config = state.config_arc();
     let mut reports = Vec::with_capacity(datasets.len());
     for dataset in datasets {
-        let report = run_one_dataset(state, &config, dataset, options.dry_run).await;
-        audit_sweep(state, &report).await;
+        let mut report = run_one_dataset(state, &config, dataset, options.dry_run).await;
+        audit_sweep(state, &mut report).await;
         reports.push(report);
     }
     Ok(reports)
@@ -571,6 +578,7 @@ async fn run_one_dataset(
         skipped: None,
         duration_ms: 0,
         error: None,
+        audit_error: None,
     };
 
     let (Some(window), Some(cutoff)) = (effective.window, cutoff) else {
@@ -1155,7 +1163,12 @@ struct SweptDataset {
 /// but a dataset held back by a **legal hold** *is* recorded even though
 /// nothing was deleted: "the policy wanted to delete this and did not" is
 /// exactly what a reviewer needs to see.
-async fn audit_sweep(state: &AppState, report: &RetentionDatasetReport) {
+///
+/// A sweep whose audit record could not be written is recorded on the report
+/// itself ([`RetentionDatasetReport::audit_error`]) rather than only logged:
+/// the record is the compliance trail for an irreversible deletion, so
+/// "rows deleted, no record" must never look like a clean sweep (#2396).
+async fn audit_sweep(state: &AppState, report: &mut RetentionDatasetReport) {
     let is_legal_hold = report
         .skipped
         .as_deref()
@@ -1209,10 +1222,55 @@ async fn audit_sweep(state: &AppState, report: &RetentionDatasetReport) {
             dataset = %report.dataset,
             "retention sweep audit record could not be written"
         );
+        // #2396: the audit record is the compliance trail for an irreversible
+        // deletion. A sweep that deleted rows but wrote no record must reach
+        // the report (and therefore the exit code and task health), not just
+        // a WARN line.
+        report.audit_error = Some(error.to_string());
     }
 }
 
 // ── Scheduled task (AC #2) ───────────────────────────────────────────────
+
+/// The scheduled task's return value for one finished sweep.
+///
+/// Per-dataset errors are deliberately captured into the reports rather than
+/// propagated, so one failing dataset never aborts the others — but the tick
+/// itself must not be recorded as successful when any dataset failed, or the
+/// scheduler calls `record_success`, `/actuator/tasks` shows the sweep as
+/// healthy, and failure alerts never fire (#2396).
+///
+/// A pure function so the "never aborts the others, but still fails the
+/// tick" contract is unit-tested without a database.
+fn retention_tick_result(reports: &[RetentionDatasetReport]) -> AutumnResult<()> {
+    let mut failures = Vec::new();
+    for report in reports {
+        if let Some(error) = report.error.as_deref() {
+            failures.push(format!("{}: {error}", report.dataset));
+        }
+        if let Some(audit_error) = report.audit_error.as_deref() {
+            failures.push(format!(
+                "{}: audit record not written: {audit_error}",
+                report.dataset
+            ));
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        // Count failed datasets, not failure messages: one dataset with both
+        // a sweep failure and an audit-write failure is still one dataset.
+        let failed_datasets = reports
+            .iter()
+            .filter(|r| r.error.is_some() || r.audit_error.is_some())
+            .count();
+        Err(crate::AutumnError::internal_server_error_msg(format!(
+            "retention sweep failed for {} dataset(s): {}",
+            failed_datasets,
+            failures.join("; ")
+        )))
+    }
+}
 
 /// The recurring in-process sweep, or `None` when no dataset declares a
 /// window.
@@ -1237,15 +1295,16 @@ pub fn framework_retention_task(config: &RetentionConfig) -> Option<TaskInfo> {
             Box::pin(async move {
                 let reports = run_retention(&state, &RetentionRunOptions::default()).await?;
                 for report in &reports {
-                    if let Some(error) = report.error.as_deref() {
+                    if report.error.is_some() || report.audit_error.is_some() {
                         tracing::warn!(
                             dataset = %report.dataset,
-                            error,
+                            error = report.error.as_deref().unwrap_or(""),
+                            audit_error = report.audit_error.as_deref().unwrap_or(""),
                             "framework retention sweep failed for one dataset"
                         );
                     }
                 }
-                Ok(())
+                retention_tick_result(&reports)
             })
         },
     })
@@ -1254,6 +1313,105 @@ pub fn framework_retention_task(config: &RetentionConfig) -> Option<TaskInfo> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
+    use crate::audit::{AuditError, AuditEvent, AuditLogger, AuditSink};
+
+    fn report(dataset: &str) -> RetentionDatasetReport {
+        RetentionDatasetReport {
+            dataset: dataset.to_owned(),
+            description: "a dataset".to_owned(),
+            enforcement: "sweep".to_owned(),
+            window_secs: Some(7_776_000),
+            source: "[retention]".to_owned(),
+            cutoff: Some("2026-06-01T00:00:00Z".to_owned()),
+            eligible_rows: Some(42),
+            rows_removed: 0,
+            truncated: false,
+            dry_run: true,
+            skipped: None,
+            duration_ms: 3,
+            error: None,
+            audit_error: None,
+        }
+    }
+
+    /// An [`AuditSink`] that always fails, so `audit_sweep`'s failure path is
+    /// exercised without a real sink.
+    struct FailingSink;
+
+    impl AuditSink for FailingSink {
+        fn write(
+            &self,
+            _event: AuditEvent,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), AuditError>> + Send + '_>>
+        {
+            Box::pin(async { Err(AuditError::new("sink on fire")) })
+        }
+    }
+
+    #[test]
+    fn retention_tick_result_is_ok_when_every_dataset_swept_clean() {
+        let reports = vec![report("job_history"), report("audit_archives")];
+        assert!(
+            retention_tick_result(&reports).is_ok(),
+            "a clean sweep must stay a successful tick"
+        );
+    }
+
+    #[test]
+    fn retention_tick_result_names_every_failed_dataset() {
+        // #2396: one failing dataset must never abort the others (the engine
+        // still sweeps them), but the tick itself must be recorded as failed
+        // so task health and failure alerts see it.
+        let mut sweep_failed = report("job_history");
+        sweep_failed.error = Some("statement timeout".to_owned());
+        let mut audit_failed = report("audit_archives");
+        audit_failed.audit_error = Some("sink on fire".to_owned());
+        let reports = vec![report("experiment_assignments"), sweep_failed, audit_failed];
+
+        let error =
+            retention_tick_result(&reports).expect_err("a tick with failed datasets must fail");
+        let message = error.to_string();
+        assert!(
+            message.contains("job_history") && message.contains("statement timeout"),
+            "the sweep failure must be named: {message}"
+        );
+        assert!(
+            message.contains("audit_archives") && message.contains("audit record not written"),
+            "the audit-write failure must be named: {message}"
+        );
+        assert!(
+            !message.contains("experiment_assignments"),
+            "a dataset that swept clean must not be implicated: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_audit_write_is_recorded_on_the_report() {
+        // #2396: the audit record is the compliance trail for an irreversible
+        // deletion. A sweep whose record could not be written must not look
+        // clean — the failure reaches `audit_error`, distinct from `error`
+        // (whose shape means "rows not deleted").
+        let state = AppState::for_test();
+        state.insert_extension(AuditLogger::new().with_sink(Arc::new(FailingSink)));
+
+        let mut swept = report("job_history");
+        swept.dry_run = false; // a dry run never writes an audit record
+        swept.eligible_rows = Some(10);
+        swept.rows_removed = 10;
+        audit_sweep(&state, &mut swept).await;
+
+        assert!(
+            swept.audit_error.as_deref()
+                == Some("audit sink write failed: 1 audit sink(s) failed: sink on fire"),
+            "the audit-write failure must be recorded: {swept:?}"
+        );
+        assert_eq!(
+            swept.error, None,
+            "the sweep itself did not fail — only its record did: {swept:?}"
+        );
+    }
 
     #[test]
     fn resolve_datasets_defaults_to_every_dataset() {

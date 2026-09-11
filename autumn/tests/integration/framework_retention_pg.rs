@@ -16,7 +16,7 @@ use std::sync::Arc;
 use autumn_web::AppState;
 use autumn_web::audit::{AuditError, AuditEvent, AuditLogger, AuditSink, AuditStatus};
 use autumn_web::config::AutumnConfig;
-use autumn_web::data_retention::{RetentionRunOptions, run_retention};
+use autumn_web::data_retention::{RetentionRunOptions, framework_retention_task, run_retention};
 use autumn_web::gdpr::{GdprRegistry, ModelRegistration};
 use diesel::Connection as _;
 use diesel::PgConnection;
@@ -76,6 +76,20 @@ impl AuditSink for RecordingAuditSink {
             events.lock().await.push(event);
             Ok(())
         })
+    }
+}
+
+/// An [`AuditSink`] that always fails, so a sweep whose compliance-trail
+/// record could not be written is exercised end to end (#2396).
+struct FailingSink;
+
+impl AuditSink for FailingSink {
+    fn write(
+        &self,
+        _event: AuditEvent,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), AuditError>> + Send + '_>>
+    {
+        Box::pin(async { Err(AuditError::new("sink on fire")) })
     }
 }
 
@@ -966,6 +980,64 @@ async fn a_failing_dataset_is_reported_without_aborting_the_run() {
         .expect("a failed sweep must still be audited");
     assert_eq!(failure.status, AuditStatus::Failure);
     assert!(failure.metadata.contains_key("error"), "{failure:?}");
+
+    // #2396: the sweep of the sibling datasets still ran to completion, but
+    // the tick itself must fail so the scheduler records it as a failure and
+    // task-health alerts fire.
+    let task = framework_retention_task(&config_with_windows()).expect("task registered");
+    let error = (task.handler)(state.clone())
+        .await
+        .expect_err("a tick with a failed dataset must fail");
+    assert!(
+        error.to_string().contains("job_history"),
+        "the aggregated error must name the failed dataset: {error}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_failed_audit_write_is_recorded_on_the_report_not_just_logged() {
+    // #2396: the audit record is the compliance trail for an irreversible
+    // deletion. A sweep whose record could not be written must reach the
+    // report — and through it the exit code and task health — not just a
+    // WARN line.
+    let (pool, _url, _container) = start_pg().await;
+    insert_job(&pool, "old", "completed", 90).await;
+
+    let state = state_with(&pool, config_with_windows());
+    state.insert_extension(AuditLogger::new().with_sink(Arc::new(FailingSink)));
+
+    let reports = run_retention(&state, &RetentionRunOptions::default())
+        .await
+        .expect("the run itself must not fail");
+
+    let job_history = reports
+        .iter()
+        .find(|r| r.dataset == "job_history")
+        .expect("reported");
+    assert_eq!(
+        job_history.error, None,
+        "the sweep itself succeeded: {job_history:?}"
+    );
+    assert!(
+        job_history.rows_removed > 0,
+        "rows were actually deleted, so the missing record matters: {job_history:?}"
+    );
+    assert_eq!(
+        job_history.audit_error.as_deref(),
+        Some("audit sink write failed: 1 audit sink(s) failed: sink on fire"),
+        "the audit-write failure must reach the report: {job_history:?}"
+    );
+
+    // The tick fails too: a silent audit-write failure must reach task health.
+    let task = framework_retention_task(&config_with_windows()).expect("task registered");
+    let error = (task.handler)(state)
+        .await
+        .expect_err("a tick with an unwritten audit record must fail");
+    assert!(
+        error.to_string().contains("audit record not written"),
+        "the aggregated error must name the audit failure: {error}"
+    );
 }
 
 #[tokio::test]

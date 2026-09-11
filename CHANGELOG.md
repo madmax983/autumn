@@ -168,6 +168,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Retention sweep failures now reach the report, the exit code, and task
+  health (#2396):** a sweep that failed still looked like a sweep that
+  succeeded, in two places. First, a failed audit write was only a WARN line:
+  `audit_sweep` now records the failure on a new
+  `RetentionDatasetReport::audit_error` field (kept distinct from `error`,
+  whose shape means "rows not deleted" — here rows *were* deleted with no
+  compliance-trail record), and `autumn db retention` exits non-zero for it.
+  The CLI's mirror struct and its human-readable table surface the new field
+  ("removed N, but the audit record failed"). Second, the scheduled
+  `framework_retention_task` handler returned `Ok(())` unconditionally, so
+  the scheduler recorded failed ticks as healthy and failure alerts never
+  fired: it now returns one aggregated error naming every failed dataset
+  (sweep failures and audit-write failures alike), after still running every
+  dataset to completion. New unit tests for the aggregation contract and for
+  `audit_sweep`'s failure path, plus Docker-gated integration coverage
+  asserting the handler's return value and a deliberately failing audit sink.
 - **🧭 Wayfinder: redisplay the post editor on failure in `examples/blog`
   (error-path 0/2 → 2/2, draft preserved) [no-plugin]:** an error-path
   inventory of `blog`'s admin post editor — the create/edit HTML form behind

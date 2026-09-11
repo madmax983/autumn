@@ -124,6 +124,12 @@ pub struct RetentionDatasetReport {
     pub skipped: Option<String>,
     pub duration_ms: u64,
     pub error: Option<String>,
+    /// The audit-write failure for this dataset's sweep record, if the sweep
+    /// ran but its compliance-trail record could not be persisted (#2396).
+    /// `default` so reports from an app binary that predates the field still
+    /// parse.
+    #[serde(default)]
+    pub audit_error: Option<String>,
 }
 
 /// Run `autumn db retention`.
@@ -320,6 +326,19 @@ fn format_rows(report: &RetentionDatasetReport, mode: RetentionMode) -> String {
         }
         return format!("error: {error}");
     }
+    if let Some(audit_error) = report.audit_error.as_deref() {
+        // #2396: the sweep ran but its compliance-trail record was not
+        // written — rows are gone with no durable record of the deletion.
+        // This is the one case where "the table looks clean" is the lie the
+        // operator most needs to see.
+        if report.rows_removed > 0 {
+            return format!(
+                "removed {n}, but the audit record failed: {audit_error}",
+                n = report.rows_removed
+            );
+        }
+        return format!("audit record failed: {audit_error}");
+    }
     if mode == RetentionMode::Purge && !report.dry_run {
         // A truncated run left rows behind; saying only "removed N" would read
         // as "the policy is now enforced", which it is not until a later tick
@@ -447,6 +466,7 @@ mod tests {
             skipped: None,
             duration_ms: 3,
             error: None,
+            audit_error: None,
         }
     }
 
@@ -650,6 +670,28 @@ mod tests {
         assert!(
             table.contains("more remain"),
             "a run that hit its batch cap must not read as fully enforced: {table}"
+        );
+    }
+
+    #[test]
+    fn format_report_surfaces_a_failed_audit_write() {
+        // #2396: the sweep ran and deleted rows, but its compliance-trail
+        // record was not written — the report must say so loudly, not read
+        // as a clean sweep.
+        let mut unwritten = report("job_history");
+        unwritten.dry_run = false;
+        unwritten.rows_removed = 4_812;
+        unwritten.audit_error = Some("disk full".to_owned());
+
+        let table = format_report(&[unwritten], RetentionMode::Purge);
+
+        assert!(
+            table.contains("4812"),
+            "the rows deleted without a record must be visible: {table}"
+        );
+        assert!(
+            table.contains("audit record failed: disk full"),
+            "the missing compliance trail must be named: {table}"
         );
     }
 
