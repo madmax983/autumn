@@ -168,6 +168,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Derivation registry checks compare the Postgres physical identifier
+  spelling (issue #2664):** Postgres truncates every identifier to
+  `NAMEDATALEN - 1` bytes (63 on a stock build), and quoting does not exempt
+  it — but the derivation/counter-cache collision guard compared full
+  spellings. Two maintained-column claims that agreed on their first 63 bytes
+  passed the boot check as distinct while the database saw one column, so
+  mutations would have double-applied deltas and backfills overwritten each
+  other. The Postgres registry key is now the spelling truncated to 63 bytes
+  on a char boundary (SQLite is unchanged: full spelling, ASCII-case-folded).
+  `docs/guide/derivations.md` documents the bound, and new tests cover the
+  truncation, the multi-byte char boundary, the rejection, and the SQLite
+  mirror case.
+
 - **🧭 Wayfinder: redisplay the post editor on failure in `examples/blog`
   (error-path 0/2 → 2/2, draft preserved) [no-plugin]:** an error-path
   inventory of `blog`'s admin post editor — the create/edit HTML form behind
