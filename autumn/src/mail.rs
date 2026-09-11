@@ -4578,14 +4578,37 @@ pub mod db_suppression {
 
     use super::{MailError, SuppressionStore};
 
-    diesel::table! {
-        mail_unsubscribes (id) {
-            id -> Int8,
-            subscriber -> Text,
-            list_id -> Text,
-            unsubscribed_at -> Timestamptz,
+    // The `mail_unsubscribes` table as scaffolded by `autumn generate mailer
+    // --list-unsubscribe`. Timestamps are TIMESTAMPTZ on Postgres and RFC 3339
+    // TEXT on SQLite (diesel's `TimestamptzSqlite`), matching the DDL the
+    // generator emits per backend. One `table!` used to cover both; the
+    // un-forked `Timestamptz` has no SQLite `FromSql`/`ToSql`, so any future
+    // `.select(unsubscribed_at)` or full-row `Queryable` would break the
+    // `sqlite` build (issue #2697).
+    #[cfg(not(feature = "sqlite"))]
+    mod schema {
+        diesel::table! {
+            mail_unsubscribes (id) {
+                id -> Int8,
+                subscriber -> Text,
+                list_id -> Text,
+                unsubscribed_at -> Timestamptz,
+            }
         }
     }
+    #[cfg(feature = "sqlite")]
+    mod schema {
+        diesel::table! {
+            mail_unsubscribes (id) {
+                id -> Int8,
+                subscriber -> Text,
+                list_id -> Text,
+                unsubscribed_at -> TimestamptzSqlite,
+            }
+        }
+    }
+
+    use schema::mail_unsubscribes;
 
     #[derive(Insertable)]
     #[diesel(table_name = mail_unsubscribes)]
@@ -4594,10 +4617,12 @@ pub mod db_suppression {
         list_id: &'a str,
     }
 
-    /// Postgres-backed suppression list keyed by `(subscriber, list_id)`.
+    /// Backend-aware suppression list keyed by `(subscriber, list_id)`.
     ///
     /// Backed by the `mail_unsubscribes` table provisioned by the migration that
-    /// `autumn generate mailer --list-unsubscribe` writes into the app.
+    /// `autumn generate mailer --list-unsubscribe` writes into the app; the
+    /// `unsubscribed_at` column type tracks the DDL the generator emits per
+    /// backend (`TIMESTAMPTZ` on Postgres, RFC 3339 `TEXT` on SQLite).
     #[derive(Clone)]
     pub struct DbSuppressionStore {
         pool: Pool<crate::db::RuntimeConnection>,

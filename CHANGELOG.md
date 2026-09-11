@@ -168,6 +168,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`DbSuppressionStore` forks its `table!` per backend (#2697):** the
+  `mail_unsubscribes` declaration in `autumn_web::mail::db_suppression` used to
+  pin the Postgres-only `Timestamptz` for `unsubscribed_at` on both backends,
+  disagreeing with the DDL `autumn generate mailer --list-unsubscribe` emits
+  for a SQLite app (`TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP`). No query in
+  the store touches the column — `is_suppressed` counts, `is_suppressed_many`
+  selects only `subscriber`, `suppress` inserts `(subscriber, list_id)` and
+  lets the DB default fill the timestamp — so it compiled and round-tripped by
+  luck, but any future `.select(unsubscribed_at)` or full-row `Queryable`
+  would have broken the `sqlite` build. The declaration now follows the same
+  per-backend fork the `notifications` and `push_subscriptions` stores already
+  use (`Timestamptz` on Postgres, diesel's `TimestamptzSqlite` on SQLite),
+  matching the DDL the generator emits per backend. A new `sqlite_*`
+  integration target (`sqlite_mail_suppression`, run in CI's sqlite mail-chaos
+  suite and measured in the sqlite+mail coverage lane) exercises
+  `suppress` → `is_suppressed` → `is_suppressed_many` against the generator's
+  own emitted SQLite DDL — including idempotent re-suppression over the
+  `(subscriber, list_id)` UNIQUE constraint — and reads the defaulted
+  `unsubscribed_at` back through the `TimestamptzSqlite` mapping to prove the
+  declared column type and the emitted DDL agree at runtime. The stale
+  `autumn-cli` comment calling `mail` a "genuine breaker" under the sqlite
+  flip is corrected: the store is `Pool<RuntimeConnection>` and compiles under
+  the flip today; it stays in the CLI's `postgres` bundle only so the sqlite
+  CLI mirrors autumn-web's own mail-free sqlite CI set.
+
 - **🧭 Wayfinder: redisplay the post editor on failure in `examples/blog`
   (error-path 0/2 → 2/2, draft preserved) [no-plugin]:** an error-path
   inventory of `blog`'s admin post editor — the create/edit HTML form behind

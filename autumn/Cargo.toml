@@ -678,6 +678,18 @@ path = "tests/version_history_alloc_gate.rs"
 name = "sqlite_boot_serve"
 path = "tests/sqlite_boot_serve.rs"
 
+# SQLite `DbSuppressionStore` proof (issue #2697). The store's `table!` used to
+# declare the Postgres-only `Timestamptz` for `unsubscribed_at`, disagreeing with
+# the DDL `autumn generate mailer --list-unsubscribe` emits for SQLite apps; it
+# is now forked per backend like `notifications`. Only meaningful under
+# `--features "sqlite,mail"`; the file is
+# `#![cfg(all(feature = "sqlite", feature = "mail"))]` so a default
+# `cargo test` compiles it to an empty (passing) binary. Run explicitly:
+# `cargo test -p autumn-web --features "sqlite,test-support,mail" --test sqlite_mail_suppression`.
+[[test]]
+name = "sqlite_mail_suppression"
+path = "tests/sqlite_mail_suppression.rs"
+
 # SQLite startup-migration proof (issue #1614, PR3). Only meaningful under
 # `--features sqlite`; the file is `#![cfg(feature = "sqlite")]` so a default
 # `cargo test` compiles it to an empty (passing) binary. Run explicitly:

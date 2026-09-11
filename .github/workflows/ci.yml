@@ -1599,8 +1599,12 @@ jobs:
           # `sqlite-runtime` job follows" — #1905 made the lib unit tests
           # backend-parametric, so that job now runs a bare `--lib`. Those
           # tests are executed there, just not measured for coverage here.
+          # `sqlite_mail_suppression` (#2697) joins the named list: its
+          # forked per-backend `table!` is sqlite+mail-only code and this
+          # lane is where it is measured.
           cargo llvm-cov --no-report -p autumn-web --features "sqlite,mail" \
-            --test sqlite_boot_serve
+            --test sqlite_boot_serve \
+            --test sqlite_mail_suppression
           # The #1907 durable job queue and lease scheduler are a large slice of
           # sqlite-only code; without this lane Codecov reports all of it
           # uncovered.
@@ -1775,9 +1779,12 @@ jobs:
         # `sim_chaos_mail` needs the `mail` feature for the mail
         # interceptor/transport surface, so it runs as its own invocation to
         # avoid widening the feature set of the other sqlite tests above.
+        # `sqlite_mail_suppression` (#2697) rides along: it needs `mail` too
+        # (for `DbSuppressionStore`) and is the same sqlite+mail union.
         run: |
           cargo test -p autumn-web --features "sqlite,test-support,mail" \
-            --test sim_chaos_mail
+            --test sim_chaos_mail \
+            --test sqlite_mail_suppression
       - name: Run the sim op-driver DoD suite (W6 PR2, issue #1797)
         # `sim_op_driver` needs the `sim-testing` feature (`proptest` as a
         # library dependency) — runs as its own invocation to avoid widening
