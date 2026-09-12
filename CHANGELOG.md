@@ -454,6 +454,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`deploy status`: a host answering its loopback `/ready` with anything but
+  200 no longer renders the green `✅` marker (issue #2273).** The marker now
+  degrades to `⚠️` when the readiness probe answered non-200, so the marker
+  column agrees with the load balancer — a 503 is the signal it uses to take
+  the host out of rotation — instead of disagreeing with the `ready 503` cell
+  in the same row. Deliberate: an *unanswered* probe (`ready ?`) does not
+  downgrade the marker, consistent with how `MaintenanceStatus::Unknown` never
+  does; and the readiness result is still not state drift, so
+  `deploy status --strict`'s exit code is unchanged.
 - **openapi:** a `Query<T>` whose `T` derives `OpenApiSchema` (directly, or via
   `#[model]`) now documents one OpenAPI parameter per field of `T`, instead of
   one opaque `style: form, explode: true` parameter for the whole struct

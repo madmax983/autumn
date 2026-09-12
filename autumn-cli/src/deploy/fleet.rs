@@ -1566,6 +1566,16 @@ pub(crate) fn fleet_status_lines(hosts: &[HostStatus], report: &DriftReport) -> 
         .iter()
         .zip(&cells)
         .map(|(status, cells)| {
+            // Readiness joins drift and maintenance in choosing the marker: a host
+            // that ANSWERED its loopback /ready with anything but 200 is, by the
+            // load balancer's contract, serving no traffic — so it must not render
+            // ✅ beside a "ready 503" cell (issue #2273). DELIBERATE: an unanswered
+            // probe (ready_code: None) does NOT downgrade the marker. A silent
+            // probe is "we could not tell", not a verdict — consistent with how
+            // MaintenanceStatus::Unknown and the "ready ?" cell never downgrade it
+            // either. Whether an unready host should also contribute a state-drift
+            // reason (making it --strict-alertable) is a separate decision: drift
+            // drives the exit code, the marker only the human reading.
             let marker = if !status.reachable {
                 "\u{274C}"
             } else if report
@@ -1573,6 +1583,7 @@ pub(crate) fn fleet_status_lines(hosts: &[HostStatus], report: &DriftReport) -> 
                 .iter()
                 .any(|(host, _)| *host == status.host)
                 || status.maintenance == exec::MaintenanceStatus::On
+                || status.ready_code.is_some_and(|code| code != 200)
             {
                 "\u{26A0}\u{FE0F} "
             } else {
@@ -3870,6 +3881,51 @@ mod tests {
         assert!(
             rendered.contains(MAINTENANCE_DOES_NOT_DRAIN_NOTE),
             "the table must state the orthogonality out loud:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn a_host_answering_ready_503_does_not_render_a_green_marker() {
+        // #2273: readiness was never among the marker's inputs, so a reachable
+        // host on the expected release — no drift, not in maintenance — rendered
+        // ✅ while its own cell read "ready 503". A /ready 503 is the signal the
+        // load balancer uses to drain a host from rotation, so the marker must
+        // agree with the balancer: the row degrades to ⚠️ instead.
+        let mut unready = status("web-a", Some("r1"));
+        unready.ready_code = Some(503);
+        let rendered = fleet_status_lines(&[unready.clone()], &fleet_drift(&[unready])).join("\n");
+        let row = rendered.lines().nth(1).expect("a status row");
+        assert!(
+            rendered.contains("ready 503"),
+            "the readiness cell still names the verdict:\n{rendered}"
+        );
+        assert!(
+            !row.contains('\u{2705}'),
+            "a host serving no traffic must not render green:\n{rendered}"
+        );
+        assert!(
+            row.contains('\u{26A0}'),
+            "the row degrades to the warning marker instead:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn an_unanswered_readiness_probe_keeps_the_old_marker() {
+        // #2273 (deliberate): ready_code None is "we could not tell", not a
+        // verdict — the cell already reads "ready ?", and downgrading on a
+        // probe failure would contradict the table's Unknown-handling convention
+        // (MaintenanceStatus::Unknown and ReleaseId::Unknown never downgrade it).
+        let mut silent = status("web-a", Some("r1"));
+        silent.ready_code = None;
+        let rendered = fleet_status_lines(&[silent.clone()], &fleet_drift(&[silent])).join("\n");
+        let row = rendered.lines().nth(1).expect("a status row");
+        assert!(
+            rendered.contains("ready ?"),
+            "the readiness cell admits what it could not tell:\n{rendered}"
+        );
+        assert!(
+            row.contains('\u{2705}'),
+            "no evidence, no downgrade:\n{rendered}"
         );
     }
 
