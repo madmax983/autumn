@@ -454,6 +454,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **ci:** confirmed the workspace and the SQLite-runtime lane pass
+  `cargo clippy -- -D warnings` clean on the runners' current stable
+  (rustc 1.98.1), on a cold cache (issue #2252). The four lint categories
+  the issue named were already fixed or grandfathered in earlier PRs, with
+  no link back to the issue — `unused_async_trait_impl` carries a scoped,
+  commented `[workspace.lints.clippy]` allow in the root `Cargo.toml`; the
+  other three carry local `#[allow(...)]` annotations with the same
+  rationale pattern. This closes the one open acceptance criterion: a
+  decision recorded on toolchain pinning. The lint lanes track `stable` on
+  purpose, to catch a new lint close to when it lands. The separate `msrv`
+  job keeps its own 1.88.0 pin for the compile floor.
 - **openapi:** a `Query<T>` whose `T` derives `OpenApiSchema` (directly, or via
   `#[model]`) now documents one OpenAPI parameter per field of `T`, instead of
   one opaque `style: form, explode: true` parameter for the whole struct
