@@ -124,16 +124,6 @@ fn substitute_params(pattern: &str, params: &StaticParams) -> String {
     result
 }
 
-/// The `Content-Type` values axum's blanket `IntoResponse` impls attach purely
-/// because of a handler's *Rust return type*, with no statement about the page.
-///
-/// `String`/`&str`/`Cow<str>` always yield `text/plain; charset=utf-8`, and
-/// `Vec<u8>`/`Bytes`/`Cow<[u8]>` always yield `application/octet-stream`. Both
-/// are defaults, not intent — unlike `Html`/`Markup` (`text/html`) or an
-/// explicit `[(CONTENT_TYPE, ...)]` tuple, where the handler said what it meant.
-const GENERIC_RETURN_TYPE_DEFAULTS: [&str; 2] =
-    ["text/plain; charset=utf-8", "application/octet-stream"];
-
 /// The `Content-Type` to record for `url`, given the rendered response's headers
 /// (#1832) — or `None` when there is no *intended* type worth storing.
 ///
@@ -145,49 +135,26 @@ const GENERIC_RETURN_TYPE_DEFAULTS: [&str; 2] =
 ///   nor a horizontal tab. The screen is
 ///   [`usable_recorded_content_type`](super::middleware::usable_recorded_content_type),
 ///   shared verbatim with the serve path so the manifest never stores a value
-///   that would be discarded at request time; or
-/// - the value is one of [`GENERIC_RETURN_TYPE_DEFAULTS`] *and* the route's own
-///   final segment carries a recognized asset extension that disagrees with it.
+///   that would be discarded at request time.
 ///
-/// That last rule is what keeps this change from regressing extensioned routes.
-/// `#[static_get("/theme.css")] async fn theme() -> String` declares
-/// `text/plain; charset=utf-8` only because it returns a `String`; recording
-/// that would serve a stylesheet as plain text, and `X-Content-Type-Options:
-/// nosniff` (on by default) would make the browser drop it entirely. The route
-/// named itself `.css`, which is the stronger signal, so nothing is recorded and
-/// the serve path derives `text/css` exactly as it did before #1832. Same shape
-/// for `/app.js`, for `/logo.png` returning `Vec<u8>`, and for `/sitemap.xml`
-/// returning `String`.
+/// A value that is a generic return-type default (axum's blanket `String` /
+/// `Vec<u8>` stamps) on a route whose own final segment carries a recognized
+/// asset extension that disagrees with it is recorded as the extension-derived
+/// type — `text/css; charset=utf-8` for
+/// `#[static_get("/theme.css")] async fn theme() -> String` (#2409). Recording
+/// the default would serve a stylesheet as plain text, and
+/// `X-Content-Type-Options: nosniff` (on by default) would make the browser
+/// drop it entirely; recording nothing (the pre-#2409 behaviour) left ISR
+/// unconstrained for exactly these routes. The derived type is what the serve
+/// path resolves to anyway, so the served type is identical to before — and
+/// ISR now has a real expectation to guard. The screening itself is
+/// [`resolve_generic_return_default`](super::middleware::resolve_generic_return_default),
+/// shared verbatim with the ISR guard, including the exact-match rule and the
+/// documented ambiguity around deliberate declarations of the same spellings.
 ///
 /// A handler that *explicitly* declares a type still wins, even against its own
 /// slug: `/notes.txt` declaring `application/json` is not a generic default, so
 /// it is recorded and served as JSON.
-///
-/// # The one ambiguity, and how to escape it
-///
-/// axum builds `String`'s response as
-/// `([(CONTENT_TYPE, "text/plain; charset=utf-8")], body)`, which is *byte-for-byte*
-/// the response a handler writing that tuple by hand produces. There is no
-/// provenance to read: at this layer "inferred default" and "deliberate
-/// declaration of the same type" are indistinguishable. So a route with a
-/// recognized extension that deliberately declares one of these two types —
-/// `/logo.png` declaring `application/octet-stream` to force a download — is
-/// treated as the inferred case and falls back to `image/png`.
-///
-/// The direction is chosen on which mistake is worse. Serving a stylesheet or a
-/// script as `text/plain` is *silently fatal* under `nosniff` (the browser drops
-/// it, with no console error about the type), and writing `-> String` is the
-/// obvious way to author such a route. Serving a deliberately-octet-stream
-/// `.png` as `image/png` is visible and mild — and forcing a download is
-/// properly expressed with `Content-Disposition: attachment`, which this does
-/// not touch.
-///
-/// The escape hatch is exact-match: only axum's own two spellings are treated as
-/// generic. A handler that really wants one of these types on an extensioned
-/// route declares it distinctly — bare `text/plain`, or
-/// `application/octet-stream` with a parameter — and it is recorded. Extensions
-/// outside the asset table (`.pdf`, `.zip`) are unaffected: there is nothing to
-/// prefer, so the declared type is always recorded.
 ///
 /// In every `None` case nothing is recorded and the serve path keeps deriving,
 /// rather than the manifest carrying a value that is wrong, unusable, or merely
@@ -208,14 +175,11 @@ fn recorded_content_type(headers: &axum::http::HeaderMap, url: &str) -> Option<S
     // to replace).
     let value = super::middleware::usable_recorded_content_type(Some(raw))?;
 
-    if GENERIC_RETURN_TYPE_DEFAULTS.contains(&value)
-        && let Some(from_extension) = crate::assets::content_type_for_opt(url)
-        && from_extension != value
-    {
-        return None;
-    }
-
-    Some(value.to_owned())
+    // #2409: when the declared type is a generic return-type default on a
+    // route whose extension disagrees, record the effective derived type —
+    // the serve path's own answer — instead of `None`. `None` then means only
+    // "pre-#1832 or hand-written manifest", never "we filtered this".
+    Some(super::middleware::resolve_generic_return_default(value, url).to_owned())
 }
 
 /// Render all static routes and write them to `dist_dir`.
@@ -908,16 +872,18 @@ mod tests {
         );
     }
 
-    // --- Generic return-type defaults must not clobber a route's extension ---
+    // --- Generic return-type defaults resolve to the route's extension ---
 
     /// The regression this guard exists for. `#[static_get("/theme.css")]`
     /// returning a `String` declares `text/plain; charset=utf-8` purely because
     /// of the return type. Recording it would serve a stylesheet as plain text,
     /// and `X-Content-Type-Options: nosniff` (on by default) makes the browser
-    /// drop it entirely. Nothing is recorded, so the serve path derives
-    /// `text/css` exactly as it did before #1832.
+    /// drop it entirely. The derived type is recorded instead (#2409) — it is
+    /// what the serve path resolves to anyway, so the served type is unchanged,
+    /// and ISR now has a real expectation for the route rather than running
+    /// unconstrained.
     #[tokio::test]
-    async fn does_not_record_generic_text_plain_over_a_recognized_extension() {
+    async fn records_derived_type_for_generic_default_over_a_recognized_extension() {
         let tmp = tempfile::tempdir().unwrap();
         let dist = tmp.path().join("dist");
         render_static_routes(echo_router(), &[test_meta("/theme.css", "theme")], &dist)
@@ -925,16 +891,18 @@ mod tests {
             .expect("render");
 
         let manifest = StaticManifest::load(&dist.join("manifest.json")).unwrap();
-        assert!(
-            manifest.routes["/theme.css"].content_type.is_none(),
-            "a String handler's generic text/plain must not override the .css route"
+        assert_eq!(
+            manifest.routes["/theme.css"].content_type.as_deref(),
+            Some("text/css; charset=utf-8"),
+            "a String handler's generic text/plain on a .css route must record \
+             the derived type, not the return-type default and not nothing"
         );
     }
 
     /// Same rule for the byte-slice default: `/logo.png` returning `Vec<u8>`
     /// declares `application/octet-stream`, which would block the image.
     #[tokio::test]
-    async fn does_not_record_generic_octet_stream_over_a_recognized_extension() {
+    async fn records_derived_type_for_generic_octet_stream_over_a_recognized_extension() {
         fn bytes_router() -> axum::Router {
             axum::Router::new().fallback(axum::routing::get(|| async {
                 b"\x89PNG\r\n\x1a\n".to_vec()
@@ -948,9 +916,11 @@ mod tests {
             .expect("render");
 
         let manifest = StaticManifest::load(&dist.join("manifest.json")).unwrap();
-        assert!(
-            manifest.routes["/logo.png"].content_type.is_none(),
-            "a Vec<u8> handler's generic octet-stream must not override the .png route"
+        assert_eq!(
+            manifest.routes["/logo.png"].content_type.as_deref(),
+            Some("image/png"),
+            "a Vec<u8> handler's generic octet-stream on a .png route must record \
+             the derived type, not the return-type default and not nothing"
         );
     }
 

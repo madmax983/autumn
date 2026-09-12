@@ -101,6 +101,79 @@ fn is_legal_content_type_byte(b: u8) -> bool {
     b == b'\t' || (0x20..0x7f).contains(&b)
 }
 
+/// The `Content-Type` values axum's blanket `IntoResponse` impls attach purely
+/// because of a handler's *Rust return type*, with no statement about the page.
+///
+/// `String`/`&str`/`Cow<str>` always yield `text/plain; charset=utf-8`, and
+/// `Vec<u8>`/`Bytes`/`Cow<[u8]>` always yield `application/octet-stream`. Both
+/// are defaults, not intent — unlike `Html`/`Markup` (`text/html`) or an
+/// explicit `[(CONTENT_TYPE, ...)]` tuple, where the handler said what it meant.
+const GENERIC_RETURN_TYPE_DEFAULTS: [&str; 2] =
+    ["text/plain; charset=utf-8", "application/octet-stream"];
+
+/// Map a response's `Content-Type` through the generic return-type-default
+/// screen (#2409), shared by generation
+/// ([`build::recorded_content_type`](super::build)) and the ISR guard
+/// ([`regenerate_page`]).
+///
+/// When the (trimmed) value is one of [`GENERIC_RETURN_TYPE_DEFAULTS`] *and*
+/// the route's own final segment carries a recognized asset extension that
+/// disagrees with it, the extension is the stronger signal — it is exactly
+/// what the serve path's derivation ([`resolved_content_type`]) would resolve
+/// to anyway — so the effective type is the derived one. Anything else is
+/// returned unchanged.
+///
+/// Generation records the effective type instead of nothing, which keeps the
+/// served type identical to today (the derivation steps the serve path takes
+/// are unchanged) while giving ISR a real expectation for these routes instead
+/// of letting them regenerate unconstrained. The ISR guard applies this same
+/// function to the *fresh* response before comparing: a manifest built by the
+/// new generation records `text/css; charset=utf-8` for
+/// `#[static_get("/theme.css")] async fn theme() -> String`, but the
+/// regeneration response still declares the raw `text/plain; charset=utf-8`
+/// — comparing raw would refuse every refresh of such a route, so both sides
+/// go through the same function and the guard compares what each side means.
+///
+/// The exact-match rule keeps this about *inferred* defaults only: only
+/// axum's own two spellings are treated as generic. A handler that deliberately
+/// declares one of these types on an extensioned route expresses it distinctly
+/// — bare `text/plain`, or `application/octet-stream` with a parameter — and
+/// that declaration is never screened.
+///
+/// # The one ambiguity
+///
+/// axum builds `String`'s response as
+/// `([(CONTENT_TYPE, "text/plain; charset=utf-8")], body)`, which is
+/// *byte-for-byte* the response a handler writing that tuple by hand produces.
+/// There is no provenance to read: at this layer "inferred default" and
+/// "deliberate declaration of the same type" are indistinguishable. So a route
+/// with a recognized extension that deliberately declares one of these two
+/// types — `/logo.png` declaring `application/octet-stream` to force a
+/// download — is treated as the inferred case and screened to `image/png`.
+///
+/// The direction is chosen on which mistake is worse. Serving a stylesheet or
+/// a script as `text/plain` is *silently fatal* under `nosniff` (the browser
+/// drops it, with no console error about the type), and writing `-> String`
+/// is the obvious way to author such a route. Serving a deliberately
+/// octet-stream `.png` as `image/png` is visible and mild — and forcing a
+/// download is properly expressed with `Content-Disposition: attachment`, which
+/// this does not touch.
+///
+/// `None` still means only what it meant before #2409 — a pre-#1832 or
+/// hand-written manifest with no recorded type — instead of doubling as "we
+/// filtered this".
+#[must_use]
+pub(super) fn resolve_generic_return_default<'a>(value: &'a str, url: &str) -> &'a str {
+    let value = value.trim();
+    if GENERIC_RETURN_TYPE_DEFAULTS.contains(&value)
+        && let Some(from_extension) = crate::assets::content_type_for_opt(url)
+        && from_extension != value
+    {
+        return from_extension;
+    }
+    value
+}
+
 /// The recorded `Content-Type` a manifest entry can actually be served with, or
 /// `None` when the stored value is unusable (#1832).
 ///
@@ -659,7 +732,17 @@ async fn regenerate_page(
             .headers()
             .get(axum::http::header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok());
-        if !actual.is_some_and(|actual| content_type_equivalent(actual, expected)) {
+        // #2409: normalize both sides through the generic return-type-default
+        // screen before comparing, rather than comparing raw. A manifest built
+        // by the new generation records the derived type for an extensioned
+        // route whose handler returns a bare `String`/`Vec<u8>` (e.g. `text/css`
+        // for `/theme.css`), while the regeneration response still carries the
+        // raw declaration (`text/plain; charset=utf-8`); comparing raw would
+        // refuse every refresh of such a route. Screening both sides through
+        // the same function makes the guard compare what each side means.
+        let comparable = actual.map(|actual| resolve_generic_return_default(actual, url));
+        let expected = resolve_generic_return_default(expected, url);
+        if !comparable.is_some_and(|actual| content_type_equivalent(actual, expected)) {
             // Logged here as well as by the caller: an ordinary regeneration
             // failure is transient, but this one repeats every cooldown until
             // someone rebuilds, so it needs to be greppable on its own.
@@ -1434,6 +1517,126 @@ mod tests {
                 "{unusable:?} must be treated as nothing recorded"
             );
         }
+    }
+
+    /// #2409: the generic return-type-default screen shared by generation and
+    /// the ISR guard. A generic default on a route whose recognized extension
+    /// disagrees resolves to the derived type; everything else passes through
+    /// unchanged.
+    #[test]
+    fn resolve_generic_return_default_screens_inferred_defaults_only() {
+        // The issue's case: a `String`-returning `/theme.css` handler declares
+        // the return-type default, so the effective type is the derivation.
+        assert_eq!(
+            resolve_generic_return_default("text/plain; charset=utf-8", "/theme.css"),
+            "text/css; charset=utf-8"
+        );
+        assert_eq!(
+            resolve_generic_return_default("application/octet-stream", "/logo.png"),
+            "image/png"
+        );
+        // The comparison is on the trimmed value, and the extension lookup is
+        // case-insensitive like the serve path's.
+        assert_eq!(
+            resolve_generic_return_default("  text/plain; charset=utf-8\t", "/THEME.CSS"),
+            "text/css; charset=utf-8"
+        );
+        // A generic default that agrees with the extension has nothing to
+        // screen: it is already the derived type.
+        assert_eq!(
+            resolve_generic_return_default("text/plain; charset=utf-8", "/notes.txt"),
+            "text/plain; charset=utf-8"
+        );
+        // The exact-match escape hatch: a distinctly-spelled declaration is
+        // intent, never an inferred default.
+        assert_eq!(
+            resolve_generic_return_default("text/plain", "/theme.css"),
+            "text/plain"
+        );
+        // Non-generic declarations pass through.
+        assert_eq!(
+            resolve_generic_return_default("application/json", "/notes.txt"),
+            "application/json"
+        );
+        // Unrecognized extensions and extensionless routes derive nothing, so
+        // there is nothing to prefer.
+        assert_eq!(
+            resolve_generic_return_default("application/octet-stream", "/data.bin"),
+            "application/octet-stream"
+        );
+        assert_eq!(
+            resolve_generic_return_default("text/plain; charset=utf-8", "/about"),
+            "text/plain; charset=utf-8"
+        );
+    }
+
+    /// #2409: the acceptance scenario. A manifest built by the new generation
+    /// records the derived type for `/theme.css` (`text/css; charset=utf-8`),
+    /// but the regeneration response still carries the handler's raw
+    /// return-type default (`text/plain; charset=utf-8`). Both sides are
+    /// screened through the same function, so the guard compares what each
+    /// side means and the refresh proceeds instead of freezing the route.
+    #[tokio::test]
+    async fn regenerate_page_accepts_a_generic_default_against_the_recorded_derived_type() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dest = dir.path().join("theme.css");
+        std::fs::write(&dest, "body { color: black; }").expect("write");
+
+        // A `String`-returning handler: axum stamps the generic default.
+        let router = axum::Router::new().fallback(axum::routing::get(|| async {
+            "body { color: red; }".to_owned()
+        }));
+
+        regenerate_page(
+            &router,
+            "/theme.css",
+            &dest,
+            Some("text/css; charset=utf-8"),
+        )
+        .await
+        .expect("a generic default screened to the recorded derived type must regenerate");
+
+        assert_eq!(
+            std::fs::read_to_string(&dest).unwrap(),
+            "body { color: red; }"
+        );
+    }
+
+    /// The screen must not launder a real type change: a handler that starts
+    /// declaring `application/json` on `/theme.css` is still refused, because
+    /// the recorded derived type is a real expectation now (#2409), not an
+    /// unconstrained gap.
+    #[tokio::test]
+    async fn regenerate_page_still_refuses_a_real_type_change_on_an_extensioned_route() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dest = dir.path().join("theme.css");
+        std::fs::write(&dest, "body { color: black; }").expect("write");
+
+        let router = axum::Router::new().fallback(axum::routing::get(|| async {
+            (
+                [(axum::http::header::CONTENT_TYPE, "application/json")],
+                r#"{"now":"json"}"#,
+            )
+        }));
+
+        let result = regenerate_page(
+            &router,
+            "/theme.css",
+            &dest,
+            Some("text/css; charset=utf-8"),
+        )
+        .await;
+
+        let err = result.expect_err("a changed Content-Type must fail regeneration");
+        assert!(
+            err.to_string().contains("Content-Type changed"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&dest).unwrap(),
+            "body { color: black; }",
+            "the stale-but-correctly-typed file must survive a refused regeneration"
+        );
     }
 
     /// A spelling difference must not freeze ISR: the regenerated response is

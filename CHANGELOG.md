@@ -454,6 +454,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **SSG/ISR: record the derived `Content-Type` for generic return-type defaults (#2409):**
+  when a handler returns a bare `String`/`Vec<u8>` on a route whose extension
+  disagrees (e.g. `#[static_get("/theme.css")] async fn theme() -> String`),
+  the manifest now records the extension-derived type (`text/css; charset=utf-8`)
+  instead of nothing. The served type is identical to before — the derivation
+  steps the serve path takes are unchanged — and ISR now has a real expectation
+  for these routes: previously they regenerated unconstrained, so a later
+  regeneration returning JSON would be written under a `text/css` header. The
+  ISR guard applies the same generic-default screen to the fresh response before
+  comparing, so a `String` handler's raw `text/plain; charset=utf-8` still
+  matches the recorded `text/css; charset=utf-8` instead of freezing the route;
+  a genuine type change is still refused. `None` in a manifest once again means
+  only "pre-#1832 or hand-written manifest".
+
 - **aws-ecs:** the generated ECS "migrate" task definition now carries the
   full app secret set (`AUTUMN_DATABASE__PRIMARY_URL`,
   `AUTUMN_SECURITY__SIGNING_SECRET`, and `AUTUMN_CACHE__REDIS__URL` when
