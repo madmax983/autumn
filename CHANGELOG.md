@@ -501,6 +501,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`autumn generate auth`:** the `--mail` flag's `Cargo.toml` patcher now
+  recognizes a `[dependencies.autumn_web]` subtable that renames the package
+  back with `package = "autumn-web"` (Cargo's underscore-normalized table key
+  plus the explicit rename it requires — Cargo does not treat `-`/`_` as
+  interchangeable in a dependency table key on its own). Before this fix, a
+  project declaring `autumn-web` this way silently kept the `mail` feature
+  unset after `autumn generate auth --mail`, with no error — the generated
+  mail routes would then fail to compile.
 - **query strings:** an append (`tags[]=`) after an out-of-range explicit
   index no longer sorts wrong or collides with it (#2253). `Segment::Index`
   saturates an absurd index to `usize::MAX` for ordering only; an append
