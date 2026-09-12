@@ -1434,9 +1434,31 @@ fn diff_csrf_exemptions(base: &PostureManifest, head: &PostureManifest, out: &mu
         let csrf = csrf_index(head);
         let bindings = authz_index(head);
         let mtls = mtls_index(head);
-        let mut guards: Vec<String> = routes
-            .keys()
-            .filter(|(path, _)| added.iter().any(|prefix| exempts_shape(prefix, path)))
+        // Only the routes that actually win an exempted URL go in. The prefix
+        // is matched against templates, but the router serves the request: a
+        // template that intersects the prefix can still be fully shadowed
+        // under it, the way `/users/{id}` is when `/users/me` is also
+        // mounted — every request the prefix exempts lands on the static
+        // node. So rank the intersecting templates per prefix the way
+        // `undominated` ranks takers, with the prefix itself and its
+        // catch-all form as the subjects; a template outranked and covered
+        // over its whole share never serves an exempted URL and drops out.
+        let mut winners: BTreeSet<&RouteKey> = BTreeSet::new();
+        for prefix in &added {
+            let subject = normalize_captures(prefix);
+            let candidates: Vec<&RouteKey> = routes
+                .keys()
+                .filter(|(path, _)| exempts_shape(prefix, path))
+                .collect();
+            let under = format!("{subject}/{CATCH_ALL}");
+            winners.extend(
+                undominated(&subject, &candidates)
+                    .into_iter()
+                    .chain(undominated(&under, &candidates)),
+            );
+        }
+        let mut guards: Vec<String> = winners
+            .iter()
             .filter_map(|key| {
                 effective_posture(key, &routes, &csrf, &bindings, &mtls)
                     .map(|posture| escape_list(&[key.1.clone(), key.0.clone(), posture]))
@@ -4751,6 +4773,69 @@ mod tests {
         };
 
         assert_ne!(exempting_with(&["mfa"]), exempting_with(&[]));
+    }
+
+    /// #2501: a prefix matched against templates is not what the router
+    /// serves. Exempting `/users/me` beside `POST /users/{id}` must fingerprint
+    /// only the static route — the dynamic template never sees an exempted
+    /// request, so narrowing it must not re-ask, while narrowing the static
+    /// one still must.
+    #[test]
+    fn an_exemption_acknowledgment_binds_only_the_routes_that_win_its_urls() {
+        let both_routes = format!(
+            "{},{}",
+            route("/users/me", "POST", "gated", &["admin"], &["mfa"], false),
+            route("/users/{id}", "POST", "gated", &["admin"], &["mfa"], false),
+        );
+        let csrf_entries = r#"{"path":"/users/me","method":"POST","csrf_enforced":true,"exempt":false},
+                              {"path":"/users/{id}","method":"POST","csrf_enforced":true,"exempt":false}"#;
+        let base = manifest_exempt(&both_routes, csrf_entries, &[]);
+        let exempting = |routes: &str| {
+            diff(
+                &base,
+                &manifest_exempt(routes, csrf_entries, &["/users/me"]),
+            )
+            .into_iter()
+            .find(|f| f.kind == "csrf_exemption_added")
+            .expect("a new exemption is a widening")
+            .canonical()
+        };
+
+        let both = exempting(&both_routes);
+        // The dynamic template is fully shadowed under the prefix, so the
+        // acknowledgment reads exactly as it does for the static route alone.
+        assert_eq!(
+            both,
+            exempting(&route(
+                "/users/me",
+                "POST",
+                "gated",
+                &["admin"],
+                &["mfa"],
+                false
+            )),
+            "the shadowed template must not enter the fingerprint"
+        );
+        // Narrowing only the shadowed route leaves the digest untouched.
+        assert_eq!(
+            both,
+            exempting(&format!(
+                "{},{}",
+                route("/users/me", "POST", "gated", &["admin"], &["mfa"], false),
+                route("/users/{id}", "POST", "gated", &["admin"], &[], false),
+            )),
+            "narrowing a route that serves no exempted URL must not re-ask"
+        );
+        // Narrowing the route that actually serves the URLs still re-asks.
+        assert_ne!(
+            both,
+            exempting(&format!(
+                "{},{}",
+                route("/users/me", "POST", "gated", &["admin"], &[], false),
+                route("/users/{id}", "POST", "gated", &["admin"], &["mfa"], false),
+            )),
+            "narrowing the winning route must move the digest"
+        );
     }
     /// The header findings were the last constant fingerprints, and I said two
     /// rounds ago that they were fine because a header is emitted or it is not

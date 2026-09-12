@@ -454,6 +454,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Posture diff:** a new CSRF exemption prefix now fingerprints only the
+  routes that actually win an exempted URL (#2501). The prefix used to be
+  matched against route templates, so exempting `/users/me` also bound
+  `POST /users/{id}` — a template the router never serves under the prefix,
+  because the static node wins every one of those requests. Narrowing that
+  shadowed route alone changed the acknowledgment digest and re-blocked the
+  pull request even though the approved exemption posture had not moved. The
+  intersecting templates are now ranked per prefix the way `undominated`
+  ranks takers, and a template outranked and covered over its whole share
+  drops out of the fingerprint. Where the prefix's URLs genuinely split
+  across several undominated templates, all of them are still bound.
 - **aws-ecs:** the generated ECS "migrate" task definition now carries the
   full app secret set (`AUTUMN_DATABASE__PRIMARY_URL`,
   `AUTUMN_SECURITY__SIGNING_SECRET`, and `AUTUMN_CACHE__REDIS__URL` when
