@@ -606,6 +606,107 @@ impl ColumnType {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Shared SQL builders
+// ---------------------------------------------------------------------------
+
+/// The `SQLite` `CHECK` that enforces `NUMERIC(precision, scale)` over a `TEXT`
+/// column (issue #1924).
+///
+/// `SQLite` has no fixed-precision numeric type and no regular expressions, so
+/// the constraint is spelled with string builtins over the stored text, which
+/// `db::sqlite_types::SqliteDecimal` always writes as a plain, normalized
+/// decimal literal. Six conditions, in order:
+///
+/// 1. only digits remain once the sign and the point are removed;
+/// 2. at most one decimal point;
+/// 3. a `-`, if present, is leading;
+/// 4. the fractional part is at most `scale` digits, and the integer part at
+///    most `precision - scale` digits once leading zeros are stripped;
+/// 5. the spelling is canonical — what `Decimal::normalize` would produce
+///    (issue #2636): the integer part is a lone `0` or starts `1`-`9` (no
+///    `007.5`, no `0019`, no missing integer part as in `.5`), a fractional
+///    part never ends in `0` (`19.90`, `0.10` rejected) and a bare trailing
+///    `.` is rejected (`19.00` normalizes to `19`, not `19.0`);
+/// 6. no negative zero (`-0`): `Decimal::normalize` converts -0 to 0, so the
+///    wrapper never writes it (`-0.0` is already caught by (5)).
+///
+/// (4) is the invariant `NUMERIC` enforces. It rejects rather than rounds,
+/// unlike Postgres, which rounds a value to `scale` — a loud failure beats
+/// silently storing what the schema says is out of range. (5)-(6) exist
+/// because SQLite compares `TEXT` byte for byte: without them, text written
+/// outside the wrapper (raw SQL, an import, a hand-written migration) passes
+/// the constraint while being a spelling the wrapper would never produce —
+/// and is then invisible to the equality lookups the generated `find_by_*`
+/// queries issue (`'19.90'` vs `'19.9'`), or admitted twice by a `:unique`
+/// index while Rust equality says they are the same value.
+/// `NULL` passes; the column's own `NOT NULL` decides that.
+///
+/// Shared with the declarative schema differ, which emits the identical inline
+/// `CHECK` for a `SQLite` [`Decimal`](ColumnType::Decimal) column (issue
+/// #2598): one builder, two emitters, so the two spellings cannot drift — a
+/// mismatch would make every table rebuild produce a spurious diff.
+#[must_use]
+pub fn sqlite_decimal_check(column: &str, precision: u32, scale: u32) -> String {
+    // The unsigned text. Repeated rather than named: a SQLite `CHECK` has no `let`.
+    let abs = format!("replace({column},'-','')");
+    let frac_len =
+        format!("CASE WHEN instr({abs},'.') = 0 THEN 0 ELSE length({abs}) - instr({abs},'.') END");
+    let int_part = format!(
+        "CASE WHEN instr({abs},'.') = 0 THEN {abs} ELSE substr({abs}, 1, instr({abs},'.') - 1) END"
+    );
+    let frac = format!(
+        "CASE WHEN instr({abs},'.') = 0 THEN '' ELSE substr({abs}, instr({abs},'.') + 1) END"
+    );
+    // The digits alone — sign and point removed. Condition 1 proves it is all
+    // digits, so its length is the digit count.
+    let digits = format!("replace(replace({column},'-',''),'.','')");
+    let conditions = [
+        // 0: actually stored as TEXT. `TEXT` affinity does NOT convert a BLOB,
+        // so `x'31392e3939'` keeps storage class blob while every string
+        // function below reads it as `19.99` and waves it through — and diesel's
+        // `FromSql<Text, Sqlite>` for `String` then refuses the blob before
+        // `Decimal` ever sees it. Same unloadable-row failure as conditions 1-5,
+        // one storage class further out.
+        format!("typeof({column}) = 'text'"),
+        // 1-5: a plain decimal literal. Without the digit count and the sign
+        // count, `''`, `'-'`, `'.'`, `'--1'` and `'-1-'` all pass — values a
+        // raw INSERT, an import or a hand-written migration can produce, which
+        // would satisfy the constraint and then fail `SqliteDecimal::from_sql`,
+        // leaving a row that cannot be loaded.
+        format!("ltrim({digits}, '0123456789') = ''"),
+        format!("length({digits}) >= 1"),
+        format!("length({column}) - length(replace({column},'.','')) <= 1"),
+        format!("length({column}) - length(replace({column},'-','')) <= 1"),
+        format!("(instr({column},'-') = 0 OR instr({column},'-') = 1)"),
+        // 6: scale.
+        format!("{frac_len} <= {scale}"),
+        // 7: precision, as the integer-digit budget NUMERIC(p, s) allows.
+        format!(
+            "length(ltrim({int_part}, '0')) <= {}",
+            precision.saturating_sub(scale)
+        ),
+        // 8: canonical integer part — the wrapper writes what
+        // `Decimal::normalize` produces: a lone `0`, or digits starting
+        // `1`-`9`. Rejects leading zeros (`007.5`, `0019`) and a missing
+        // integer part (`.5`); `Decimal` never prints either spelling.
+        format!(
+            "length({int_part}) >= 1 AND ({int_part} = '0' OR substr({int_part}, 1, 1) BETWEEN '1' AND '9')"
+        ),
+        // 9: canonical fractional part — `Decimal::normalize` strips trailing
+        // zeros and drops the point entirely when nothing remains (`19.00`
+        // becomes `19`, not `19.0`). Rejects `19.90`, `0.10` and a bare
+        // trailing `.`.
+        format!(
+            "(instr({abs},'.') = 0 OR (length({frac}) >= 1 AND substr({frac}, length({frac}), 1) != '0'))"
+        ),
+        // 10: no negative zero — `Decimal::normalize` converts -0 to 0, so
+        // the wrapper never writes `-0` (`-0.0` is already caught by 9).
+        format!("(instr({column},'-') = 0 OR ltrim({digits},'0') != '')"),
+    ];
+    format!("CHECK ({column} IS NULL OR ({}))", conditions.join(" AND "))
+}
+
 /// The primary-key strategy for a generated table.
 ///
 /// Mirrors `dsl::IdType`. Defaults conceptually to [`BigSerial`](Self::BigSerial)

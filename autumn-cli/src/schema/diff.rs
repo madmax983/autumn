@@ -157,7 +157,7 @@ use std::fmt::Write as _;
 
 use autumn_schema_core::{
     Backend, CheckConstraint, Column, ColumnDefault, ColumnType, IdKind, Index, SerialKind,
-    SqliteAffinity, Table,
+    SqliteAffinity, Table, sqlite_decimal_check,
 };
 
 use crate::schema::parse::ParsedSchema;
@@ -3413,6 +3413,22 @@ fn render_column_def(column: &Column, backend: Backend, render_unique: bool) -> 
     }
     if let Some(default) = &column.default {
         let _ = write!(def, " DEFAULT {}", default_sql(default, backend));
+    }
+    // `SQLite` `decimal{p,s}` is stored as `TEXT`, so without an explicit
+    // constraint the declared precision and scale bind nothing (issue #2598).
+    // The migration generator emits the identical inline `CHECK` through the
+    // shared [`sqlite_decimal_check`] builder — one spelling for both emitters,
+    // so a generator-written table and a declarative one agree byte-for-byte
+    // and a rebuild never produces a spurious diff. `Postgres` gets a real
+    // `NUMERIC(p, s)` and needs no `CHECK`.
+    if backend == Backend::Sqlite
+        && let ColumnType::Decimal { precision, scale } = &column.ty
+    {
+        let _ = write!(
+            def,
+            " {}",
+            sqlite_decimal_check(&column.name, u32::from(*precision), u32::from(*scale))
+        );
     }
     def
 }
@@ -7222,6 +7238,218 @@ PRAGMA foreign_keys=ON;
             up.contains("CHECK (length(status) > 0)"),
             "the parser-invisible baseline CHECK is preserved in the recreate: {up}"
         );
+    }
+
+    // -- issue #2598: the SQLite decimal CHECK on the declarative path --------
+
+    #[test]
+    fn sqlite_create_table_emits_shared_decimal_check() {
+        // A table created by `autumn schema diff` on `SQLite` carries the same
+        // decimal `CHECK` the migration generator emits — byte-identical, via
+        // the shared builder, not a second implementation.
+        let t = sqlite_table(
+            "prices",
+            vec![col(
+                "amount",
+                ColumnType::Decimal {
+                    precision: 10,
+                    scale: 2,
+                },
+            )],
+            vec![],
+        );
+        let body = render_create_table_body("prices", &t, Backend::Sqlite);
+        let expected = format!(
+            "    amount TEXT NOT NULL {}",
+            sqlite_decimal_check("amount", 10, 2)
+        );
+        assert!(
+            body.lines().any(|l| l == expected),
+            "declarative CREATE TABLE installs the generator's CHECK spelling: {body}"
+        );
+    }
+
+    #[test]
+    fn sqlite_add_column_emits_shared_decimal_check() {
+        // The `ADD COLUMN` path (a later migration adding a decimal column)
+        // carries the same `CHECK` the generator's add-column path emits.
+        // (`SQLite` rejects `ADD COLUMN ... NOT NULL` without a default, so
+        // the added column is nullable — pre-existing emitter behavior.)
+        let mut column = col(
+            "amount",
+            ColumnType::Decimal {
+                precision: 10,
+                scale: 2,
+            },
+        );
+        column.nullable = true;
+        let sql = emit_add_column("prices", &column, Backend::Sqlite).expect("add column renders");
+        assert!(
+            sql.contains(&sqlite_decimal_check("amount", 10, 2)),
+            "ADD COLUMN installs the shared decimal CHECK: {sql}"
+        );
+    }
+
+    #[test]
+    fn postgres_decimal_column_gets_no_check() {
+        // `Postgres` gets a real `NUMERIC(p, s)` — the `CHECK` is `SQLite`-only.
+        let t = posts_with(vec![col(
+            "amount",
+            ColumnType::Decimal {
+                precision: 10,
+                scale: 2,
+            },
+        )]);
+        let body = render_create_table_body("posts", &t, Backend::Postgres);
+        assert!(
+            body.contains("amount NUMERIC(10,2) NOT NULL"),
+            "Postgres decimal renders as NUMERIC: {body}"
+        );
+        assert!(
+            !body.contains("CHECK"),
+            "Postgres decimal gets no CHECK: {body}"
+        );
+    }
+
+    #[test]
+    fn sqlite_decimal_generator_table_round_trips_with_no_spurious_diff() {
+        // A table as the generator wrote it — pulled back by `SQLite`
+        // introspection, which leaves `checks` empty (CHECK extraction is
+        // deferred) and recovers the column as plain `TEXT` — must diff CLEAN
+        // against the declarative model. The inline decimal `CHECK` the
+        // differ now emits is not a modelled facet, so there is nothing to
+        // add and rule A never drops the baseline's.
+        let base = sqlite_table("prices", vec![col("amount", ColumnType::Text)], vec![]);
+        let want = parsed(
+            vec![sqlite_table(
+                "prices",
+                vec![col(
+                    "amount",
+                    ColumnType::Decimal {
+                        precision: 10,
+                        scale: 2,
+                    },
+                )],
+                vec![],
+            )],
+            vec![],
+        );
+        let plan = diff_schema(std::slice::from_ref(&base), &want, DEFAULT_OPTS);
+        assert!(
+            plan.is_empty(),
+            "generator-written table vs declarative model: no spurious diff: {plan:?}"
+        );
+    }
+
+    #[test]
+    fn sqlite_rebuild_preserves_decimal_check() {
+        // An unrelated change rebuilds the table (create new, copy, swap) —
+        // the staging `CREATE TABLE` must carry the decimal `CHECK`.
+        let decimal = col(
+            "amount",
+            ColumnType::Decimal {
+                precision: 10,
+                scale: 2,
+            },
+        );
+        let baseline = sqlite_table(
+            "prices",
+            vec![decimal.clone(), col("views", ColumnType::Int32)],
+            vec![],
+        );
+        let desired = sqlite_table(
+            "prices",
+            vec![decimal, col("views", ColumnType::Int64)],
+            vec![],
+        );
+        let plan = MigrationPlan {
+            backend: Backend::Sqlite,
+            changes: vec![SchemaChange::AlterColumnType {
+                table: "prices".to_owned(),
+                column: "views".to_owned(),
+                from: ColumnType::Int32,
+                to: ColumnType::Int64,
+            }],
+        };
+        let ctx = SchemaContext::from_tables(
+            std::slice::from_ref(&desired),
+            std::slice::from_ref(&baseline),
+        );
+        let up = emit_up_sql_with_context(&plan, &ctx).expect("emit up");
+        assert!(
+            up.contains(&sqlite_decimal_check("amount", 10, 2)),
+            "the decimal CHECK survives the table rebuild: {up}"
+        );
+    }
+
+    #[test]
+    fn sqlite_rebuilt_decimal_check_rejects_out_of_shape_values_on_real_sqlite() {
+        // The rebuilt table's `CHECK` is SQL, so it is tested by running it —
+        // against a real in-memory `SQLite`, like the existing rebuild tests —
+        // with the out-of-shape and non-`TEXT` values the generator's
+        // `sqlite_decimal_check_enforces_precision_scale_and_shape` covers.
+        use diesel::connection::SimpleConnection as _;
+        use diesel::prelude::*;
+
+        let t = sqlite_table(
+            "prices",
+            vec![col(
+                "amount",
+                ColumnType::Decimal {
+                    precision: 10,
+                    scale: 2,
+                },
+            )],
+            vec![],
+        );
+        // `render_create_table_body` is exactly what the rebuild path emits
+        // for the `{table}__autumn_new` staging table.
+        let ddl = render_create_table_body("prices", &t, Backend::Sqlite);
+        let mut conn = diesel::SqliteConnection::establish(":memory:").expect("in-memory sqlite");
+        conn.batch_execute(&ddl)
+            .expect("the rebuilt DDL must be valid SQLite SQL");
+
+        let accepts = |conn: &mut diesel::SqliteConnection, value: &str| {
+            diesel::sql_query(format!("INSERT INTO prices (amount) VALUES ('{value}')"))
+                .execute(conn)
+                .is_ok()
+        };
+        // `decimal{10,2}`: at most 8 integer digits and 2 fractional.
+        for value in ["0", "19.99", "-19.99", "12345678.99", "-0.01"] {
+            assert!(accepts(&mut conn, value), "`{value}` is in range");
+        }
+        for value in [
+            // Over budget.
+            "123456789.99",
+            "19.999",
+            "123456.789",
+            // Malformed: no digit, or a stray/duplicated sign.
+            "",
+            "-",
+            "--1",
+            "-1-",
+            "1.2.3",
+            "abc",
+            // Non-canonical spellings `Decimal::normalize` never writes.
+            "19.90",
+            "0.10",
+            "007.5",
+            "0019",
+            ".5",
+            "-0",
+        ] {
+            assert!(
+                !accepts(&mut conn, value),
+                "`{value}` must be rejected by the rebuilt CHECK"
+            );
+        }
+        // Storage class, not just text shape: a BLOB whose bytes spell a valid
+        // decimal keeps storage class blob (TEXT affinity does not convert it)
+        // and would be unloadable — the CHECK must reject it up front.
+        let blob_rejected = diesel::sql_query("INSERT INTO prices (amount) VALUES (x'31392e3939')")
+            .execute(&mut conn)
+            .is_err();
+        assert!(blob_rejected, "a blob amount must be rejected");
     }
 
     #[test]

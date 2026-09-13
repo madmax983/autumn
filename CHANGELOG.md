@@ -557,6 +557,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Declarative schema now emits the `SQLite` decimal `CHECK` (#2598):**
+  `decimal{p,s}` on `SQLite` is stored as `TEXT`, so the declared precision and
+  scale only bind through the generated `CHECK` built by `sqlite_decimal_check`
+  — which only the migration generator emitted. A table created by
+  `autumn schema diff` carried no constraint (accepting text
+  `SqliteDecimal::from_sql` cannot even load), and any `SQLite` table rebuild
+  silently dropped a generator-written `CHECK`. The declarative renderer now
+  emits the identical inline `CHECK` for a `SQLite` `decimal{p,s}` column
+  (`CREATE TABLE`, rebuild staging tables, and `ADD COLUMN`), via the same
+  shared builder moved to `autumn-schema-core` — one spelling for both
+  emitters, so a rebuild never produces a spurious diff. `Postgres` is
+  unaffected (it gets a real `NUMERIC(p, s)`).
 - **`autumn generate auth`:** the `--mail` flag's `Cargo.toml` patcher now
   recognizes a `[dependencies.autumn_web]` subtable that renames the package
   back with `package = "autumn-web"` (Cargo's underscore-normalized table key
