@@ -29,7 +29,11 @@ WHAT IT CHECKS
     file stem), and `src/bin/<name>/main.rs` (named after the directory).
 
   An explicit `[[bin]]` does NOT disable auto-discovery (autumn #2690): only
-  `autobins = false` does. Auto-discovered paths already claimed by an
+  `autobins = false` does — except in edition 2015 (also the default when
+  `edition` is omitted), where a manually specified target ([[bin]] or [lib])
+  applies the legacy opt-out and disables auto-discovery, but ONLY when
+  `[package] autobins` is left unspecified: an explicit `autobins = true`
+  honors the explicit choice and keeps auto-discovery (autumn #2745). Auto-discovered paths already claimed by an
   explicit entry — via its `path`, or the default `src/bin/<name>.rs` when no
   `path` is given — are excluded so one target is not counted twice.
 
@@ -220,9 +224,14 @@ def bin_target_names(member_dir: Path, workspace_edition: str | None = None) -> 
     # Auto-discovery is on unless `[package] autobins = false` — EXCEPT in
     # edition 2015 (also the default when `edition` is omitted), where any
     # manually specified target ([[bin]] or [lib]) disables auto-discovery
-    # entirely. (In edition 2018+ explicit [[bin]] entries do NOT disable it.)
-    # The edition itself may be inherited: `edition.workspace = true` resolves
-    # against the root's `[workspace.package] edition`.
+    # entirely (autumn #2746). That legacy opt-out applies ONLY when
+    # `autobins` is left unspecified: an explicit `autobins = true`
+    # overrides it (autumn #2745; cargo 1.95 metadata keeps the inferred
+    # bins), while an explicit `autobins = false` already disables
+    # discovery above. (In edition 2018+ explicit [[bin]] entries do NOT
+    # disable it.) The edition itself may be inherited:
+    # `edition.workspace = true` resolves against the root's
+    # `[workspace.package] edition`.
     edition_spec: object = package.get("edition", "2015")
     if (
         isinstance(edition_spec, dict)
@@ -230,8 +239,9 @@ def bin_target_names(member_dir: Path, workspace_edition: str | None = None) -> 
         and workspace_edition is not None
     ):
         edition_spec = workspace_edition
-    auto = package.get("autobins", True) is not False
-    if auto and str(edition_spec) == "2015":
+    autobins: object = package.get("autobins")
+    auto = autobins is not False
+    if auto and autobins is None and str(edition_spec) == "2015":
         auto = not ("bin" in manifest or "lib" in manifest)
     if auto:
         src = member_dir / "src"
@@ -813,12 +823,94 @@ def self_test() -> int:
             not collisions,
         )
 
+    # Case 22 (#2745): edition 2015 + EXPLICIT `autobins = true` + explicit
+    # [[bin]] — the explicit autobins wins over the legacy opt-out, so
+    # `src/bin/extra.rs` is still a target (cargo 1.95 metadata keeps it)
+    # and its cross-member collision is now reported.
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        root = _make_workspace(tmp, ["a", "b"])
+        _make_member(
+            tmp / "root", "a",
+            '[package]\nname = "a"\nversion = "0.1.0"\nedition = "2015"\n'
+            'autobins = true\n\n'
+            '[[bin]]\nname = "real"\npath = "src/bin/real.rs"\n',
+            {"src/bin/real.rs": "fn main() {}\n", "src/bin/extra.rs": "fn main() {}\n"},
+        )
+        _make_member(
+            tmp / "root", "b",
+            '[package]\nname = "b"\nversion = "0.1.0"\n',
+            {"src/bin/extra.rs": "fn main() {}\n"},
+        )
+        total, collisions = check(root)
+        expect(
+            "explicit autobins=true in 2015 keeps auto-discovery; collision caught",
+            "extra" in collisions and sorted(bin_target_names(root / "a")) == ["extra", "real"],
+        )
+
+    # Case 23 (#2745): edition 2015 + explicit `autobins = true` + [lib] only
+    # — the explicit autobins wins over the legacy opt-out, so the inferred
+    # bins are retained (cargo 1.95 metadata retains them too).
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        root = _make_workspace(tmp, ["app"])
+        _make_member(
+            tmp / "root", "app",
+            '[package]\nname = "app"\nversion = "0.1.0"\nedition = "2015"\n'
+            'autobins = true\n\n[lib]\nname = "app"\n',
+            {"src/lib.rs": "// lib\n", "src/bin/extra.rs": "fn main() {}\n"},
+        )
+        expect(
+            "explicit autobins=true + [lib] in 2015 retains auto-discovered bins",
+            bin_target_names(root / "app") == ["extra"],
+        )
+
+    # Case 24 (#2745): edition 2015 + `autobins` UNSPECIFIED + explicit [[bin]]
+    # — the legacy opt-out still applies, so no bins are invented and no
+    # false collision is reported.
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        root = _make_workspace(tmp, ["a", "b"])
+        _make_member(
+            tmp / "root", "a",
+            '[package]\nname = "a"\nversion = "0.1.0"\nedition = "2015"\n\n'
+            '[[bin]]\nname = "real"\npath = "src/bin/real.rs"\n',
+            {"src/bin/real.rs": "fn main() {}\n", "src/bin/extra.rs": "fn main() {}\n"},
+        )
+        _make_member(
+            tmp / "root", "b",
+            '[package]\nname = "b"\nversion = "0.1.0"\n',
+            {"src/bin/extra.rs": "fn main() {}\n"},
+        )
+        total, collisions = check(root)
+        expect(
+            "unspecified autobins in 2015 + explicit bin: legacy opt-out still applies",
+            not collisions and bin_target_names(root / "a") == ["real"],
+        )
+
+    # Case 25 (#2745): edition 2015 + explicit `autobins = false` — behavior
+    # unchanged: auto-discovery stays off.
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        root = _make_workspace(tmp, ["app"])
+        _make_member(
+            tmp / "root", "app",
+            '[package]\nname = "app"\nversion = "0.1.0"\nedition = "2015"\n'
+            'autobins = false\n\n'
+            '[[bin]]\nname = "app-seed"\npath = "src/bin/seed.rs"\n',
+            {"src/bin/seed.rs": "fn main() {}\n", "src/bin/helper.rs": "fn main() {}\n"},
+        )
+        expect(
+            "edition 2015 + explicit autobins=false: auto-discovery stays off",
+            bin_target_names(root / "app") == ["app-seed"],
+        )
+
     if failures:
         print(f"self-test: {len(failures)} case(s) FAILED", file=sys.stderr)
         for label in failures:
             print(f"  - {label}", file=sys.stderr)
         return 1
-    print("self-test: all 21 cases passed")
+    print("self-test: all 26 cases passed")
     return 0
 
 

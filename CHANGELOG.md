@@ -7188,6 +7188,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   marginal allocation blocks/query and bytes/query (dhat) are unchanged
   (8,583.28 / 530,252.6, both sides) — this change is instruction-bound, not
   allocation-bound, so only the instruction floor is claimed.
+- **duplicate-bin-names gate: honor explicit `autobins` in edition 2015
+  (#2745):** `scripts/check-example-bin-names.sh` applied the edition-2015
+  legacy auto-discovery opt-out whenever a manual target (`[[bin]]` or `[lib]`)
+  was present — even when the member explicitly set
+  `[package] autobins = true`. Cargo 1.95 metadata still includes the
+  auto-discovered bins in that case, so the checker under-enumerated targets
+  and could miss cross-member collisions. The legacy opt-out now applies only
+  when `autobins` is left unspecified AND a binary target is manually
+  declared, matching Cargo's own target auto-discovery rules; an explicit
+  `autobins = true` keeps auto-discovery even in edition 2015, and an explicit
+  `autobins = false` still disables it. Four new self-test cases pin the new
+  behavior (26/26 green; the two explicit-`autobins = true` cases fail on the
+  pre-fix logic), and the real scan of the workspace still reports 29 binary
+  targets, all names unique.
 
 ## [0.7.0] - 2026-08-23
 
