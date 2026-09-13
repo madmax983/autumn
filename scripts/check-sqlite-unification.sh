@@ -29,12 +29,20 @@
 #      `[dependencies.web]` + `package = "autumn-web"`, `web.package = "…"`) —
 #      a rename splits the crate name away from the `features` list, so the
 #      manifest is read twice and the aliases resolved before the rules run.
-#   2. No `[features]` entry forwards `autumn-web/sqlite` / `autumn-cli/sqlite`
-#      unless the entry is ITSELF named `sqlite` AND the manifest belongs to one
-#      of those two crates. That single exception is autumn-cli's own opt-in
-#      backend (`sqlite = ["autumn-web/sqlite", …]`), selected the same explicit
-#      way autumn-web's is; the same line in any other crate is an edge.
-#   3. No `default` feature list enables `sqlite`, bare or forwarded.
+#   2. No `[features]` entry enables `autumn-web/sqlite` / `autumn-cli/sqlite`,
+#      directly OR transitively through local feature aliases
+#      (`default = ["embedded"]`, `embedded = ["sqlite"]`): pass 1 builds the
+#      local feature graph, and pass 2 rejects any feature other than `sqlite`
+#      itself that reaches the flip, reporting the path that got there. The
+#      only exception is an entry ITSELF named `sqlite` in a manifest
+#      belonging to one of those two crates — autumn-cli's own opt-in backend
+#      (`sqlite = ["autumn-web/sqlite", …]`), selected the same explicit way
+#      autumn-web's is. The same line in any other crate is an edge wearing
+#      the exception as a name, and a `default` that reaches the flip through
+#      any number of hops is the one-hop `default = ["sqlite"]` case with the
+#      middlemen left in.
+#   3. (Folded into 2: `default` is one more node in the feature graph, so a
+#      bare, forwarded, or chained `default` is caught by the same rule.)
 #
 # It is a manifest gate, not a build: no toolchain, ~1 second, self-testing.
 #
@@ -68,44 +76,79 @@ FLIP_CRATES='autumn-web|autumn-cli'
 # scanner can fail to launch while the caller still reports "OK" is worse than
 # no gate.
 #
-# The file is read TWICE (awk's `NR == FNR` idiom). Pass 1 answers two
+# The file is read TWICE (awk's `NR == FNR` idiom). Pass 1 answers three
 # questions the per-line rules need up front — which crate this manifest
-# belongs to, and whether it defines a `sqlite` feature that forwards the flip
-# — because `default = ["sqlite"]` means the flip only in a manifest that does.
+# belongs to, whether it defines a `sqlite` feature that forwards the flip,
+# and what the LOCAL feature graph looks like (`default = ["embedded"]`,
+# `embedded = ["sqlite"]`) — because `default` reaches the flip through a
+# chain no single line exhibits.
 # ---------------------------------------------------------------------------
 scan_manifest() {
   local manifest="$1"
   awk -v flip="$FLIP_CRATES" '
     BEGIN {
       SQ = sprintf("%c", 39)   # a literal single quote, unwritable inline here
+      Q3 = "\"\"\""            # triple-quoted multiline strings: """ … """
+      SQ3 = SQ SQ SQ           # triple-single-quote delimiter
       pkg = ""
       defines_flip_sqlite = 0
+      ml = ""                  # open multiline-string delimiter, carried
+                               # ACROSS physical lines (#2571 item 2)
     }
 
     # ── TOML lexing ──────────────────────────────────────────────────────
     #
-    # All three helpers are STRING-AWARE and know both quote styles. A `#`
-    # inside a string is not a comment; a `[` inside one does not open an
-    # array. Getting either wrong desynchronizes the section tracker for the
-    # rest of the file, which fails OPEN.
-    # A backslash escapes the next character inside a BASIC string ("…") and
-    # is literal inside a literal string ('…'). Reading `\"` as the end of a
-    # string desynchronizes everything after it: a `[` in ordinary package
-    # metadata then reads as structural, the entry assembler swallows the
-    # following dependency, and the scan fails OPEN.
-    function strip_comment(s,   i, c, q, out) {
-      q = ""; out = ""
-      for (i = 1; i <= length(s); i++) {
+    # All helpers are STRING-AWARE and know both quote styles, INCLUDING
+    # triple-quoted multiline strings. A `#` inside a string is not a
+    # comment; a `[` inside one does not open a section or an array.
+    # Getting either wrong desynchronizes the section tracker for the rest
+    # of the file, which fails OPEN.
+    #
+    # `prep_line` prepares one physical line for the structural scan. It
+    # strips `#` comments and NEUTRALIZES the structural characters `[` `]`
+    # `{` `}` `#` inside a multiline string — replacing them with spaces —
+    # while leaving the string text intact: the rule matchers below need
+    # the quoted contents (`"sqlite"`, `"web/sqlite"`), only the characters
+    # the section tracker, the entry assembler, and the bracket counter read
+    # are hidden. The open delimiter lives in the global `ml` so a string
+    # spanning lines keeps the lexer synchronized across them.
+    #
+    # A backslash escapes the next character inside a BASIC string ("…",
+    # single- or triple-quoted) and is literal inside a literal string
+    # ('…', single- or triple-quoted). Reading `\"` as the end of a string
+    # desynchronizes everything after it: a `[` in ordinary package metadata
+    # then reads as structural, the entry assembler swallows the following
+    # dependency, and the scan fails OPEN.
+    function prep_line(s,   i, n, c, q, out) {
+      n = length(s); i = 1; out = ""
+      while (i <= n) {
         c = substr(s, i, 1)
-        if (q == "\"" && c == "\\" && i < length(s)) {
-          out = out c substr(s, i + 1, 1)
-          i++
-          continue
+        if (ml != "") {
+          # Inside a multiline string only its end matters; every
+          # structural character before it is blanked.
+          if (ml == Q3 && c == "\\" && i < n) {
+            out = out c substr(s, i + 1, 1); i += 2; continue
+          }
+          if (substr(s, i, 3) == ml) { out = out ml; ml = ""; i += 3; continue }
+          if (c == "[" || c == "]" || c == "{" || c == "}" || c == "#") c = " "
+          out = out c; i++; continue
         }
-        if (q != "") { if (c == q) q = "" }
-        else if (c == "\"" || c == SQ) q = c
-        else if (c == "#") break
-        out = out c
+        if (q != "") {
+          # Inside a single-line string: text (and any `#`) is preserved
+          # for the matchers; `balanced`, below, stays quote-aware so its
+          # brackets never count.
+          out = out c
+          if (q == "\"" && c == "\\" && i < n) {
+            out = out substr(s, i + 1, 1); i += 2; continue
+          }
+          if (c == q) q = ""
+          i++; continue
+        }
+        if (c == "#") break
+        if (substr(s, i, 3) == Q3) { ml = Q3; out = out Q3; i += 3; continue }
+        if (substr(s, i, 3) == SQ3) { ml = SQ3; out = out SQ3; i += 3; continue }
+        if (c == "\"" || c == SQ) q = c
+        out = out c; i++
       }
       return out
     }
@@ -132,7 +175,9 @@ scan_manifest() {
     # miss it entirely. Returns "" while an entry is still open.
     function feed(line,   entry) {
       sub(/\r$/, "", line)              # a CRLF checkout must not blind the gate
-      line = strip_comment(line)
+      line = prep_line(line)            # strip comments, neutralize multiline
+                                        # interiors; quote state in `ml`
+                                        # survives across physical lines
       if (pending != "") {
         pending = pending " " line
         if (!balanced(pending)) return ""
@@ -186,6 +231,30 @@ scan_manifest() {
       sub(/".*$/, "", value)
       return value
     }
+    # Does the local feature `key` transitively enable the backend flip?
+    # Returns the path ("default -> embedded -> sqlite") or "". A feature
+    # reaches the flip by forwarding it directly, or through another local
+    # feature that does; `visiting` guards against feature cycles.
+    function flip_path(key,   deps, n, arr, i, d, tail) {
+      if (key in visiting) return ""
+      visiting[key] = 1
+      if ((key in feat_forwards) && feat_forwards[key]) {
+        delete visiting[key]
+        return key
+      }
+      n = split((key in feat_deps ? feat_deps[key] : ""), arr, " ")
+      for (i = 1; i <= n; i++) {
+        d = arr[i]
+        if (d == "") continue
+        tail = flip_path(d)
+        if (tail != "") {
+          delete visiting[key]
+          return key " -> " tail
+        }
+      }
+      delete visiting[key]
+      return ""
+    }
 
     # ── Pass 1: whose manifest is this, and what does it define? ─────────
     NR == FNR {
@@ -197,8 +266,24 @@ scan_manifest() {
         sub(/^name[ \t]*=[ \t]*"/, "", pkg)
         sub(/".*$/, "", pkg)
       }
-      if (section == "[features]" && norm ~ /^sqlite[ \t]*=/ && forwards_flip(norm))
-        defines_flip_sqlite = 1
+      if (section == "[features]") {
+        key = norm
+        sub(/[ \t]*=.*$/, "", key)
+        feat_forwards[key] = forwards_flip(norm)
+        if (key == "sqlite" && feat_forwards[key]) defines_flip_sqlite = 1
+        # The LOCAL feature graph: every bare `"name"` in a feature value
+        # is a reference to another local feature. `dep:` inclusions and
+        # `dep/feature` paths name dependencies, not features, so the
+        # identifier-only pattern excludes them both. Pass 2 walks this to
+        # reject chains (`default -> embedded -> sqlite`) that no single
+        # line exhibits (#2571 item 3).
+        tail = norm
+        while (match(tail, /"[A-Za-z0-9_-]+"/)) {
+          dep = substr(tail, RSTART + 1, RLENGTH - 2)
+          feat_deps[key] = (key in feat_deps ? feat_deps[key] " " dep : dep)
+          tail = substr(tail, RSTART + RLENGTH)
+        }
+      }
 
       # A RENAMED dependency names its real crate in a `package` key that can
       # sit anywhere in the entry, so the rules cannot see it one line at a
@@ -235,7 +320,7 @@ scan_manifest() {
 
     # ── Pass 2: the rules ────────────────────────────────────────────────
     FNR == 1 {
-      pending = ""; section = ""
+      pending = ""; section = ""; ml = ""
       # autumn-web owns the flip, so a bare "sqlite" in ITS default list is the
       # flip itself, with nothing to forward to.
       if (pkg ~ ("^(" flip ")$")) defines_flip_sqlite = 1
@@ -275,19 +360,25 @@ scan_manifest() {
         next
       }
 
-      # ── 2 & 3. A feature that forwards or defaults into the flip ──────
+      # ── 2 & 3. A feature that enables the flip, directly or by chain ──
+      #
+      # Pass 1 built the local feature graph, so a chain like
+      # `default = ["embedded"]`, `embedded = ["sqlite"]` is rejected with
+      # the path that got there — not just a direct mention (#2571 item 3).
+      # The `sqlite` feature itself is the sanctioned opt-in, but ONLY in
+      # the two crates that own the flip.
       if (section == "[features]") {
         key = norm
         sub(/[ \t]*=.*$/, "", key)
-        if (key == "default" && (forwards || (mentions_sqlite && defines_flip_sqlite))) {
-          report("`default` enables the `sqlite` backend flip")
-        } else if (forwards && key != "sqlite") {
-          report("feature `" key "` forwards the `sqlite` backend flip")
-        } else if (forwards && !(pkg ~ ("^(" flip ")$"))) {
-          # A same-named `sqlite` feature is the sanctioned opt-in ONLY in the
-          # two crates that own the flip. Anywhere else it is an edge wearing
-          # the exception as a name.
-          report("feature `sqlite` forwards the backend flip from a crate that does not own it")
+        if (key == "sqlite") {
+          # A same-named `sqlite` feature is the sanctioned opt-in ONLY in
+          # the two crates that own the flip. Anywhere else it is an edge
+          # wearing the exception as a name.
+          if (forwards && !(pkg ~ ("^(" flip ")$"))) {
+            report("feature `sqlite` forwards the backend flip from a crate that does not own it")
+          }
+        } else if ((path = flip_path(key)) != "") {
+          report("feature `" key "` enables the `sqlite` backend flip (" path ")")
         }
       }
     }
@@ -568,6 +659,46 @@ sqlite = ["autumn-web/sqlite", "diesel_migrations/sqlite"]
 EOF
   check_fail "default enabling the crate's own flip feature" default_bare
 
+  # A multiline string containing an unmatched bracket must not desync the
+  # section tracker: the `[` below is string content, the real `[` on the
+  # next header is structural, and the dependency under it must be seen.
+  make_case multiline_desync <<'EOF'
+[package]
+name = "consumer"
+description = """
+an unmatched [ bracket
+"""
+
+[dependencies]
+autumn-web = { version = "0.7", features = ["sqlite"] }
+EOF
+  check_fail "a multiline string with an unmatched bracket does not desync the scan" multiline_desync
+
+  # The lexer's multiline handling must not BLIND the matchers either: a
+  # flip feature named inside a triple-quoted string is still the flip.
+  make_case multiline_value <<'EOF'
+[package]
+name = "autumn-cli"
+
+[features]
+default = ["""sqlite"""]
+sqlite = ["autumn-web/sqlite"]
+EOF
+  check_fail "a flip feature named inside a multiline string still counts" multiline_value
+
+  # A two-hop local alias chain enables the flip by default with no single
+  # line exhibiting it.
+  make_case transitive_alias <<'EOF'
+[package]
+name = "autumn-cli"
+
+[features]
+default = ["embedded"]
+embedded = ["sqlite"]
+sqlite = ["autumn-web/sqlite"]
+EOF
+  check_fail "a two-hop feature alias enabling the flip by default" transitive_alias
+
   make_case commented <<'EOF'
 [dependencies]
 # autumn-web = { version = "0.7", features = ["sqlite"] }
@@ -634,6 +765,45 @@ default = ["sqlite"]
 sqlite = ["rusqlite"]
 EOF
   check_pass "an unrelated crate's own sqlite feature in default" default_without_flip
+
+  # `sqlite` named inside a multiline string is documentation when no edge
+  # and no feature chain backs it — the neutralizer must hide structure,
+  # not text.
+  make_case multiline_docs <<'EOF'
+[package]
+name = "consumer"
+description = """
+documented: the flip is enabled with features = ["sqlite"]
+"""
+
+[dependencies]
+autumn-web = { version = "0.7", features = ["db"] }
+EOF
+  check_pass "sqlite named inside a multiline string is documentation, not an edge" multiline_docs
+
+  # A local alias chain that never reaches the flip is legitimate.
+  make_case chain_clean <<'EOF'
+[package]
+name = "consumer"
+
+[features]
+default = ["embedded"]
+embedded = ["tls"]
+EOF
+  check_pass "a feature chain that never reaches the flip" chain_clean
+
+  # A feature cycle with no flip anywhere must terminate, not hang the
+  # gate in `flip_path` recursion.
+  make_case cycle_clean <<'EOF'
+[package]
+name = "consumer"
+
+[features]
+default = ["a"]
+a = ["b"]
+b = ["a"]
+EOF
+  check_pass "a feature cycle with no flip terminates clean" cycle_clean
 
   # The scan must refuse to report OK when it scanned nothing.
   total+=1

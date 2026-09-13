@@ -99,15 +99,15 @@ pub fn is_bare_in_memory_sqlite(url: &str) -> bool {
 /// string). A bare filesystem path is exactly that, and is the case where
 /// naming the target is the whole value of the message.
 ///
-/// # Known gap
-///
-/// "The default is to mask" holds for everything `Url::parse` REJECTS. It does
-/// not yet hold for an OPAQUE url it accepts: `postgres:password=hunter2`
-/// parses, reports no password, query or fragment, and has no `@` in its path,
-/// so it returns verbatim and reaches the boot error. Tracked in #2571 — the
-/// fix is to treat a URL with no authority whose path carries key/value
-/// material as unclassified, rather than trusting that a successful parse
-/// means the parser understood every part of it.
+/// An OPAQUE url (`scheme:payload`, "cannot-be-a-base") is NOT the exception:
+/// it parses, so it used to return verbatim — #2571 closed that.
+/// `Url::parse("postgres:password=hunter2")` reports no password, no query,
+/// no fragment, and the parser understood nothing of the payload's structure;
+/// a successful parse is not proof it did. Anything opaque is unclassified
+/// and fails closed. This costs nothing legitimate: the verbatim exception
+/// above never produces an opaque URL — a bare path fails `Url::parse`
+/// outright — and every real database target this arm handles carries an
+/// authority.
 pub fn redact_target(url: &str) -> String {
     let backend = DatabaseBackend::detect(url);
     if backend == Some(DatabaseBackend::Sqlite) {
@@ -128,6 +128,21 @@ pub fn redact_target(url: &str) -> String {
                 .fragment()
                 .is_some_and(|fragment| fragment.contains('@'))
         {
+            return "****".to_owned();
+        }
+        // An OPAQUE url (`scheme:payload`) parses successfully but the parser
+        // understood none of its structure: no authority, no query, no
+        // fragment — the whole payload rides in one path string. `Url::parse`
+        // of `postgres:password=hunter2` reports no password, no query, no
+        // fragment and no `@` in the path, so every guard above passed and the
+        // string went back whole into the boot error (#2571 — the second leak
+        // of this shape, after the fragment case). A successful parse is not
+        // proof the parser understood the input, so an opaque URL is
+        // unclassified and fails closed. `Url::cannot_be_a_base()` is the
+        // cheap discriminator; the `@`-in-path check above stays as
+        // defense-in-depth for non-opaque spellings whose path still carries
+        // a stray `@`.
+        if parsed.cannot_be_a_base() {
             return "****".to_owned();
         }
         let has_password = parsed.password().is_some();
@@ -494,6 +509,36 @@ mod tests {
         assert_eq!(
             redact_target("postgres://app@db.internal/app"),
             "postgres://app@db.internal/app"
+        );
+    }
+
+    // An OPAQUE url (`scheme:payload`, "cannot-be-a-base") parses
+    // successfully, so the guards above all pass — and the parser understood
+    // nothing of its structure: no authority, no query, no fragment, the
+    // whole payload in one path string. #2571: all three of these went back
+    // verbatim into the boot error. Anything opaque is unclassified and fails
+    // closed — deliberately broader than "path carries key/value material",
+    // because the issue's own third repro (`mysql:secret`) carries none and
+    // the narrow verbatim exception (a bare filesystem path) never parses
+    // into an opaque URL anyway.
+    #[test]
+    fn opaque_urls_fail_closed() {
+        // The issue's exact repro inputs.
+        assert_eq!(redact_target("postgres:password=hunter2"), "****");
+        assert_eq!(redact_target("postgresql:host=db password=hunter2"), "****");
+        assert_eq!(redact_target("mysql:secret"), "****");
+        // Neighbors: other schemes, other key/value spellings, same shape.
+        assert_eq!(redact_target("postgresql:password=hunter2"), "****");
+        assert_eq!(redact_target("postgres:host=db"), "****");
+        assert_eq!(redact_target("mysql:user=root password=hunter2"), "****");
+        // A URL with an authority still goes through the normal guards.
+        assert_eq!(
+            redact_target("postgres://app@db.internal/app"),
+            "postgres://app@db.internal/app"
+        );
+        assert_eq!(
+            redact_target("mysql://user:secret@host/db"),
+            "mysql://user:****@host/db"
         );
     }
 

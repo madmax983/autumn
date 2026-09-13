@@ -557,6 +557,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Credential redaction (#2571):** `redact_target` no longer hands an opaque
+  (`scheme:payload`, "cannot-be-a-base") URL back verbatim.
+  `Url::parse("postgres:password=hunter2")` succeeds while reporting no
+  password, query, or fragment, so every guard passed and the string reached
+  the boot error unmasked. Any parsed URL with no authority is now treated as
+  unclassified and fails closed to `****` — a successful parse is not proof
+  the parser understood the input.
+- **`check-sqlite-unification.sh` (#2571):** the TOML lexer now carries
+  triple-quoted (`"""` / `'''`) string state across physical lines, so an
+  unmatched `[` inside a multiline string no longer desynchronizes the section
+  tracker and swallows the dependency under it; and the gate now builds the
+  local feature graph in pass 1 and rejects any feature other than `sqlite`
+  itself that *transitively* reaches the backend flip
+  (`default = ["embedded"]`, `embedded = ["sqlite"]`), reporting the path.
+  Six new self-test cases (35/35).
 - **`autumn generate auth`:** the `--mail` flag's `Cargo.toml` patcher now
   recognizes a `[dependencies.autumn_web]` subtable that renames the package
   back with `package = "autumn-web"` (Cargo's underscore-normalized table key
