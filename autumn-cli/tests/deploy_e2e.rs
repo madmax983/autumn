@@ -809,9 +809,9 @@ fn deploy_e2e_full_lifecycle() {
 /// the mismatch.
 ///
 /// Runs as part of the default Docker CI `--ignored` sweep (same as the sibling
-/// `deploy_e2e_full_lifecycle`): the "Run Docker-dependent tests" job executes
-/// `cargo test -p autumn-cli --test deploy_e2e -- --ignored`, which picks this up
-/// automatically. Run it locally the same way:
+/// `deploy_e2e_full_lifecycle`): the `Test (Docker)` job's `Run deploy_e2e` step
+/// executes `cargo test -p autumn-cli --test deploy_e2e -- --ignored`, which picks
+/// this up automatically. Run it locally the same way:
 /// ```text
 /// cargo test -p autumn-cli --test deploy_e2e -- --ignored --nocapture
 /// ```
@@ -908,7 +908,7 @@ fn deploy_e2e_pam_systemd_control_socket() {
 /// **Limitation, stated rather than hidden:** container bridge IPs are routable from
 /// the docker host only on Linux (and only when the runner IS the docker host rather
 /// than a sibling container). That is exactly the environment this test runs in —
-/// the Linux-only "Run Docker-dependent tests" CI step — and
+/// the Linux-only `Run deploy_e2e` CI step of the `Test (Docker)` job — and
 /// [`assert_bridge_reachable`] fails fast with an explicit message if it ever is not,
 /// instead of surfacing as an opaque ssh failure mid-rollout.
 ///

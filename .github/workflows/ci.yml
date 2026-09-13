@@ -1420,14 +1420,12 @@ jobs:
             --test-threads=1 \
             --skip per_request_overhead_is_under_50_microseconds_p99 \
             --skip capture_overhead_on_a_successful_query_request
-          # AC-7 deploy end-to-end (#1607, Slice 4): drives the real `autumn
-          # deploy up`/`rollback` over ssh/scp against a privileged systemd
-          # container (first deploy, zero-downtime redeploy, on-demand rollback,
-          # forced-failure auto-rollback). Isolated `--test deploy_e2e` binary; it
-          # builds its own fixture image (extracting kamal-proxy from the
-          # basecamp/kamal-proxy Docker Hub image) and needs the ssh client
-          # installed above.
-          cargo test -p autumn-cli --test deploy_e2e -- --ignored
+          # AC-7 deploy end-to-end (#1607, Slice 4) now runs in its own step at the
+          # end of this job (#2547): it builds its own fixture image
+          # (extracting kamal-proxy from the basecamp/kamal-proxy Docker Hub
+          # image), and by the time the sweep above finished pulling its
+          # container images the runner was out of disk twice on PR #2541. The
+          # sweep stays untouched here; see `Run deploy_e2e` below.
           # Example apps are NOT auto-swept the way autumn-web's consolidated
           # `integration_tests` binary is (Codex review finding on #2530):
           # `saas` and `teams` each have their own Docker-gated
@@ -1494,6 +1492,36 @@ jobs:
           # not even compile here).
           cargo test -p cms --test integration_test -- --ignored --test-threads=1
 
+      # #2547: free disk before the heaviest single item. The sweep above pulls
+      # a dozen container images (Postgres variants, Redis, Pebble, …) on top
+      # of the workspace build and the diesel_cli install, and on PR #2541 the
+      # runner hit "No space left on device" twice once deploy_e2e's fixture
+      # build started — once as a 45-minute timeout, once as three failing
+      # e2e tests. deploy_e2e is the last thing in this job and nothing after
+      # it needs any image the sweep pulled (the fixture build pulls
+      # basecamp/kamal-proxy itself), so the whole image store and the
+      # builder cache are reclaimable here.
+      - name: Free disk space before deploy_e2e
+        if: runner.os == 'Linux'
+        run: |
+          docker system prune --all --force
+          docker builder prune --all --force
+          df -h
+
+      # AC-7 deploy end-to-end (#1607, Slice 4): drives the real `autumn
+      # deploy up`/`rollback` over ssh/scp against a privileged systemd
+      # container (first deploy, zero-downtime redeploy, on-demand rollback,
+      # forced-failure auto-rollback). Isolated `--test deploy_e2e` binary; it
+      # builds its own fixture image (extracting kamal-proxy from the
+      # basecamp/kamal-proxy Docker Hub image) and needs the ssh client
+      # installed above. Its own step (rather than the tail of the sweep)
+      # so the prune above runs between the image-heavy sweep and the
+      # image-heavy fixture build (#2547).
+      - name: Run deploy_e2e
+        if: runner.os == 'Linux'
+        timeout-minutes: 45
+        run: |
+          cargo test -p autumn-cli --test deploy_e2e -- --ignored
 
   test-gate:
     name: Test suite

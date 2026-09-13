@@ -971,6 +971,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   changing `"a\b"` to `"ab"` or vice versa — made `regenerate_page` refuse
   every refresh for that route (with an `error!` each cooldown) even though
   the two spellings mean the same value (issue #2404).
+- **CI (`Test (Docker)`):** the deploy end-to-end suite moved out of the
+  `Run Docker-dependent tests` sweep into its own step (`Run deploy_e2e`),
+  with a `Free disk space before deploy_e2e` step between them that runs
+  `docker system prune --all --force` and `docker builder prune --all --force`.
+  The sweep pulls a dozen container images on top of the workspace build and
+  the `diesel_cli` install, and on PR #2541 the runner was out of disk twice
+  once the suite's fixture-image build started — once as a 45-minute timeout,
+  once as three failing e2e tests. The prune is placed last in the job (after
+  the example-app suites, which still need their Postgres images) and the
+  fixture build pulls its own `basecamp/kamal-proxy` image fresh, so nothing
+  later in the job needs a pruned image (issue #2547).
 
 ### Security
 
