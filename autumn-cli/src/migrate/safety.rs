@@ -303,6 +303,11 @@ pub fn split_statements(sql: &str) -> Vec<String> {
 ///
 /// Strips the `alter table <name>` prefix and splits the remaining text on
 /// commas that are not enclosed in parentheses, trimming each segment.
+///
+/// Single-quoted string literals are skipped whole — with the doubled-`''`
+/// escape, the same convention [`split_statements`] honors — so a comma
+/// inside a literal (`DEFAULT 'a,b'`) is not read as a second subcommand
+/// (#2580).
 fn alter_table_subcommands(normalized: &str) -> Vec<&str> {
     let after_prefix = normalized.strip_prefix("alter table ").unwrap_or("");
     let subcommands_start = after_prefix.find(' ').map_or(after_prefix.len(), |i| i + 1);
@@ -311,15 +316,45 @@ fn alter_table_subcommands(normalized: &str) -> Vec<&str> {
     let mut result = Vec::new();
     let mut depth: i32 = 0;
     let mut start = 0;
-    for (i, c) in subcommands.char_indices() {
-        match c {
-            '(' => depth += 1,
-            ')' => depth -= 1,
-            ',' if depth == 0 => {
+    let mut i = 0;
+    // Byte scan: every character this loop inspects (`(`, `)`, `,`, `'`) is
+    // ASCII, so `start` and `i` always land on UTF-8 boundaries.
+    let bytes = subcommands.as_bytes();
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\'' => {
+                // Skip the literal whole: a comma inside it is a value, not a
+                // subcommand separator.
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == b'\'' {
+                        if bytes.get(i + 1) == Some(&b'\'') {
+                            i += 2; // escaped quote — keep scanning
+                        } else {
+                            i += 1; // closing quote
+                            break;
+                        }
+                    } else {
+                        i += 1;
+                    }
+                }
+            }
+            b'(' => {
+                depth += 1;
+                i += 1;
+            }
+            b')' => {
+                depth -= 1;
+                i += 1;
+            }
+            b',' if depth == 0 => {
                 result.push(subcommands[start..i].trim());
                 start = i + 1;
+                i += 1;
             }
-            _ => {}
+            _ => {
+                i += 1;
+            }
         }
     }
     let last = subcommands[start..].trim();
@@ -356,6 +391,8 @@ fn is_known_alter_subcommand(backend: DatabaseBackend, subcommand: &str) -> bool
 /// canonical ones, so `ADD title TEXT` classifies exactly as
 /// `ADD COLUMN title TEXT`. `ADD CONSTRAINT` and `DROP CONSTRAINT` are left
 /// alone: they are Postgres-only, and the grammar rule must still reject them.
+/// `RENAME TO <new>` is the table rename and is likewise left alone; only a
+/// `RENAME` with a name on both sides of `TO` is a column rename.
 fn canonical_sqlite_alter(normalized: &str) -> String {
     if !normalized.starts_with("alter table ") {
         return normalized.to_owned();
@@ -377,6 +414,16 @@ fn canonical_sqlite_alter(normalized: &str) -> String {
                 {
                     return format!("{verb} column {rest}");
                 }
+            }
+            // `RENAME <col> TO <new>` omits `COLUMN` too. Without this a bare
+            // rename is recognized as a valid subcommand but matches no
+            // finding, so it sails through the gate (#2580).
+            if let Some(rest) = sub.strip_prefix("rename ")
+                && !rest.starts_with("column ")
+                && !rest.starts_with("to ")
+                && rest.contains(" to ")
+            {
+                return format!("rename column {rest}");
             }
             (*sub).to_owned()
         })
@@ -857,9 +904,10 @@ fn classify_statement(
         return vec![];
     }
     let sqlite = backend == DatabaseBackend::Sqlite;
-    // SQLite lets `ALTER TABLE … ADD <col>` and `DROP <col>` omit the `COLUMN`
-    // keyword. Every rule below matches the `COLUMN` spelling, so canonicalize
-    // first rather than duplicating each match.
+    // SQLite lets `ALTER TABLE … ADD <col>`, `DROP <col>` and
+    // `RENAME <col> TO <new>` omit the `COLUMN` keyword. Every rule below
+    // matches the `COLUMN` spelling, so canonicalize first rather than
+    // duplicating each match.
     let canonical;
     let normalized = if sqlite {
         canonical = canonical_sqlite_alter(normalized);
@@ -2958,6 +3006,59 @@ mod tests {
                 sqlite_ops(sql)
             );
         }
+    }
+
+    #[test]
+    fn sqlite_bare_rename_column_is_irreversible() {
+        // SQLite accepts `RENAME <col> TO <col>` with the `COLUMN` keyword
+        // omitted. It must classify exactly like the explicit spelling (#2580):
+        // a rename that breaks old replicas mid-rolling-deploy is irreversible,
+        // not silently safe.
+        let f = sqlite_finding(
+            "ALTER TABLE posts RENAME title TO headline;",
+            "RENAME COLUMN",
+        )
+        .expect("a bare RENAME must be flagged");
+        assert_eq!(f.risk, RiskLevel::Irreversible);
+
+        // The table rename keeps its own classification — the canonicalization
+        // must not rewrite `RENAME TO <new>` into a column rename.
+        let f = sqlite_finding("ALTER TABLE posts RENAME TO articles;", "RENAME TABLE")
+            .expect("a table rename must still be flagged");
+        assert_eq!(f.risk, RiskLevel::Irreversible);
+
+        // A `RENAME` with nothing after `TO` is not SQLite grammar at all.
+        assert!(
+            classify_sql_for(DatabaseBackend::Sqlite, "ALTER TABLE posts RENAME title;")
+                .iter()
+                .any(|f| f.risk == RiskLevel::Unsupported),
+            "malformed RENAME stays unsupported: {:?}",
+            sqlite_ops("ALTER TABLE posts RENAME title;")
+        );
+    }
+
+    #[test]
+    fn sqlite_comma_inside_a_string_literal_is_not_a_second_action() {
+        // A comma inside a quoted literal is a value, not a subcommand
+        // separator (#2580). SQLite applies this statement cleanly, so the
+        // multi-action rule must not fire.
+        let sql = "ALTER TABLE posts ADD COLUMN label TEXT DEFAULT 'a,b';";
+        assert!(
+            classify_sql_for(DatabaseBackend::Sqlite, sql).is_empty(),
+            "comma in a literal must not split the statement: {:?}",
+            sqlite_ops(sql)
+        );
+
+        // The splitter still counts a real second action, and a doubled-quote
+        // escape does not end the literal early.
+        let two = "ALTER TABLE posts ADD COLUMN label TEXT DEFAULT 'it''s,a', ADD COLUMN n INT;";
+        assert!(
+            classify_sql_for(DatabaseBackend::Sqlite, two)
+                .iter()
+                .any(|f| f.operation == "Multi-action ALTER TABLE (unsupported on SQLite)"),
+            "real multi-action must still be flagged: {:?}",
+            sqlite_ops(two)
+        );
     }
 
     #[test]

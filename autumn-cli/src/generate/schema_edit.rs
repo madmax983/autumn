@@ -1717,10 +1717,11 @@ pub fn remove_columns_down_sql_for(
 ) -> Result<String, GenerateError> {
     let collision_fields = fields_with_existing_schema_columns(fields, existing_schema, table);
     let mut out = String::new();
-    // Index names this function re-creates itself, below. A prior index that
-    // repeats one must not be re-created twice: SQLite fails the whole rollback
-    // with "index <name> already exists".
-    let mut own_indexes: Vec<String> = Vec::new();
+    // `(name key, unique, byte range of the emitted line in `out`)` for each
+    // index this function re-creates itself, below. A prior index that
+    // repeats one must not be re-created twice: SQLite fails the whole
+    // rollback with "index <name> already exists".
+    let mut own_indexes: Vec<(String, bool, std::ops::Range<usize>)> = Vec::new();
     for f in fields.iter().rev() {
         // SQLite rejects `ALTER TABLE … ADD COLUMN … NOT NULL` without a DEFAULT
         // (#1614 AC #4). The rollback re-adds the dropped column with the same `ADD
@@ -1758,36 +1759,59 @@ pub fn remove_columns_down_sql_for(
         // `references` field that is also `unique` must not get the plain
         // auto-index restored too.
         if f.kind.is_reference() && !f.unique {
-            let _ = writeln!(
-                out,
-                "CREATE INDEX idx_{table}_{} ON {table} ({});",
-                f.name, f.name
-            );
-            own_indexes.push(index_name_key(&format!("idx_{table}_{}", f.name)));
+            let index_name = format!("idx_{table}_{}", f.name);
+            let sql = format!("CREATE INDEX {index_name} ON {table} ({});", f.name);
+            let start = out.len();
+            let _ = writeln!(out, "{sql}");
+            own_indexes.push((index_name_key(&index_name), false, start..out.len()));
         }
         if f.unique {
-            out.push_str(&unique_index_sql(table, &f.name, &collision_fields));
-            own_indexes.push(index_name_key(&unique_index_name(
-                table,
-                &f.name,
-                &collision_fields,
-            )));
+            let name = unique_index_name(table, &f.name, &collision_fields);
+            let sql = unique_index_sql(table, &f.name, &collision_fields);
+            let start = out.len();
+            out.push_str(&sql);
+            own_indexes.push((index_name_key(&name), true, start..out.len()));
         }
     }
     // Re-create the prior indexes the up path dropped, after every column is
     // back. Skips a name this function already emitted, and dedupes the scan
     // itself: two removed columns can share one composite index.
     if backend == DatabaseBackend::Sqlite {
+        // `(own_indexes position, replacement SQL)`: a scanned index that is
+        // UNIQUE supersedes a regenerated plain index of the same name
+        // (#2580). Applied after the scan loop in descending position order,
+        // so each replacement keeps the recorded byte ranges of the entries
+        // before it valid.
+        let mut supersede: Vec<(usize, String)> = Vec::new();
         for index in prior_indexes
             .iter()
             .filter(|i| fields.iter().any(|f| i.covers(&f.name)))
         {
             let key = index_name_key(&index.name);
-            if own_indexes.contains(&key) {
+            if let Some(pos) = own_indexes.iter().position(|entry| entry.0 == key) {
+                // Same name as a regenerated index: emitting both fails the
+                // rollback with "index <name> already exists", so exactly one
+                // definition wins. When only the scanned one is UNIQUE it
+                // wins — a unique index still covers the lookup the plain
+                // regenerated index was created for, while the reverse
+                // silently drops a uniqueness constraint the history enforced
+                // (#2580). Identical-uniqueness collisions keep the
+                // regenerated definition.
+                if index.is_unique() && !own_indexes[pos].1 {
+                    own_indexes[pos].1 = true;
+                    supersede.push((pos, index.create_sql.clone()));
+                }
                 continue;
             }
-            own_indexes.push(key);
+            own_indexes.push((key, index.is_unique(), 0..0));
             let _ = writeln!(out, "{}", index.create_sql);
+        }
+        supersede.sort_by(|a, b| b.0.cmp(&a.0));
+        for (pos, sql) in supersede {
+            let range = own_indexes[pos].2.clone();
+            let mut replacement = sql;
+            replacement.push('\n');
+            out.replace_range(range, &replacement);
         }
     }
     Ok(out)
@@ -6496,6 +6520,65 @@ mod tests {
         .unwrap();
         assert_eq!(
             down.matches("idx_posts_author_id ON posts (author_id);")
+                .count(),
+            1,
+            "got:\n{down}"
+        );
+    }
+
+    #[test]
+    fn sqlite_remove_column_rollback_prefers_the_scanned_unique_definition() {
+        // Issue #2580: history holds a UNIQUE index under the conventional
+        // reference-index name. The regenerated plain index must not win the
+        // name dedupe — the rollback would silently stop enforcing
+        // uniqueness.
+        let indexes = prior(
+            "CREATE UNIQUE INDEX idx_posts_author_id ON posts (author_id);",
+            "posts",
+        );
+        let down = remove_columns_down_sql_for(
+            DatabaseBackend::Sqlite,
+            "posts",
+            &fields(&["author:references?"]),
+            "",
+            &indexes,
+        )
+        .unwrap();
+        assert!(
+            down.contains("CREATE UNIQUE INDEX idx_posts_author_id ON posts (author_id);"),
+            "the scanned UNIQUE definition must win:\n{down}"
+        );
+        assert_eq!(
+            down.matches("idx_posts_author_id ON posts (author_id);")
+                .count(),
+            1,
+            "the index must be emitted exactly once:\n{down}"
+        );
+    }
+
+    #[test]
+    fn sqlite_remove_column_rollback_keeps_the_regenerated_unique_definition() {
+        // The reverse collision — a scanned plain index against a regenerated
+        // unique one — keeps the regenerated unique definition: it already
+        // covers lookups, and the constraint must stay enforced.
+        let indexes = prior(
+            "CREATE INDEX idx_posts_slug_unique ON posts (slug);",
+            "posts",
+        );
+        let down = remove_columns_down_sql_for(
+            DatabaseBackend::Sqlite,
+            "posts",
+            &fields(&["slug:Option<String>:unique"]),
+            "",
+            &indexes,
+        )
+        .unwrap();
+        assert!(
+            down.contains("CREATE UNIQUE INDEX idx_posts_slug_unique ON posts (slug);"),
+            "the regenerated UNIQUE definition must win:\n{down}"
+        );
+        assert_eq!(
+            down.matches("idx_posts_slug_unique ON posts (slug);")
                 .count(),
             1,
             "got:\n{down}"

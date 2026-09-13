@@ -518,6 +518,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **SQLite `migrate check` / remove-column rollback:** three residual defects
+  from the #1906 SQLite dialect work (#2580). A bare
+  `ALTER TABLE … RENAME <col> TO <col>` (valid SQLite with `COLUMN` omitted)
+  passed the safety gate with no finding — the canonicalizer rewrote bare
+  `ADD`/`DROP` but not `RENAME`; it is now flagged irreversible like the
+  explicit spelling. A comma inside a string literal
+  (`ADD COLUMN label TEXT DEFAULT 'a,b'`) was read as a second `ALTER TABLE`
+  action, falsely tripping the multi-action rule — the subcommand splitter is
+  now quote-aware (same `''`-escape convention as `split_statements`). And a
+  remove-column rollback whose history held a `UNIQUE` index under the
+  conventional reference-index name silently re-created it as a plain index,
+  dropping the constraint — on a name collision the unique definition now
+  wins.
 - **`autumn generate auth`:** the `--mail` flag's `Cargo.toml` patcher now
   recognizes a `[dependencies.autumn_web]` subtable that renames the package
   back with `package = "autumn-web"` (Cargo's underscore-normalized table key

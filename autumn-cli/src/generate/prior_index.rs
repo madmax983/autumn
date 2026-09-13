@@ -37,6 +37,19 @@ impl PriorIndex {
         let needle = column.to_lowercase();
         self.tokens.contains(&needle)
     }
+
+    /// Whether the recorded definition enforces uniqueness.
+    ///
+    /// The rollback's name-based dedupe must not replace a scanned `UNIQUE`
+    /// index with a regenerated plain index of the same name (#2580): that
+    /// would silently drop the constraint.
+    #[must_use]
+    pub fn is_unique(&self) -> bool {
+        self.create_sql
+            .trim_start()
+            .to_lowercase()
+            .starts_with("create unique index")
+    }
 }
 
 /// Indexes live on `table` after replaying every migration in `migrations_dir`.
