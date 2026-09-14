@@ -1650,6 +1650,85 @@ async fn sqlite_tracking_store_swaps_on_a_version_not_a_timestamp() {
     );
 }
 
+/// (23b) The retry compare-and-swap is versioned, not timestamped (issue
+/// #2581).
+///
+/// The admin retry flow captures a token, then resets only if the record is
+/// unchanged. Under a frozen clock a `mark_running` write leaves
+/// `updated_at` identical, so a timestamp token would still match and the
+/// stale reset would overwrite the running attempt with `pending` — the
+/// exact failure from the issue. With the version token the stale reset is a
+/// no-op, while a fresh token still applies.
+#[tokio::test]
+async fn sqlite_reset_for_retry_is_a_no_op_on_a_frozen_clock_but_applies_fresh() {
+    use autumn_web::job_tracking::{
+        JobTrackingStore as _, SqliteJobTrackingStore, TrackedJobOwner,
+    };
+
+    let tmp = tempfile::TempDir::new().expect("temp dir");
+    let pool = build_sqlite_pool(&tmp);
+
+    // A clock frozen at one instant: `updated_at` is identical for every write.
+    let clock = std::sync::Arc::new(autumn_web::time::FixedClock::at(
+        chrono::DateTime::from_timestamp_millis(1_700_000_000_000).expect("valid instant"),
+    ));
+    let store = SqliteJobTrackingStore::new(pool.clone(), 3_600).with_clock(clock);
+
+    store
+        .create("k1", TrackedJobOwner::Anonymous)
+        .await
+        .expect("create");
+    store.fail("k1", "boom".to_string()).await.expect("fail");
+    let stale = store.get("k1").await.expect("get").expect("record");
+    assert!(matches!(
+        stale.status,
+        autumn_web::job_tracking::TrackedJobStatus::Failed
+    ));
+
+    // The retried attempt is claimed under the same frozen instant.
+    store.mark_running("k1").await.expect("mark running");
+    let moved = store.get("k1").await.expect("get").expect("record");
+    assert_eq!(
+        moved.updated_at, stale.updated_at,
+        "the frozen clock wrote the same updated_at both times"
+    );
+    assert_ne!(
+        moved.version, stale.version,
+        "every write must move the token even when the clock does not"
+    );
+
+    // The admin retry path's reset, still holding the pre-claim token, must
+    // not clobber the running attempt.
+    store
+        .reset_for_retry("k1", stale.owner.clone(), stale.version)
+        .await
+        .expect("stale reset runs");
+    let record = store.get("k1").await.expect("get").expect("record");
+    assert!(
+        matches!(
+            record.status,
+            autumn_web::job_tracking::TrackedJobStatus::Running
+        ),
+        "a stale reset must not overwrite a write that landed since, got {:?}",
+        record.status
+    );
+
+    // A reset holding the current token still applies.
+    store
+        .reset_for_retry("k1", stale.owner, record.version)
+        .await
+        .expect("fresh reset runs");
+    let record = store.get("k1").await.expect("get").expect("record");
+    assert!(
+        matches!(
+            record.status,
+            autumn_web::job_tracking::TrackedJobStatus::Pending
+        ),
+        "a reset against the current token must apply, got {:?}",
+        record.status
+    );
+}
+
 /// (24) A settled tracked record is final: a stale attempt of the same job
 /// cannot flip the authoritative attempt's result.
 ///

@@ -17014,7 +17014,12 @@ mod tests {
             let mut conn = pool.get().await.unwrap();
             let tracking_sql =
                 include_str!("../migrations/20260702000000_create_job_tracking/up.sql");
-            for stmt in tracking_sql.split(';') {
+            let tracking_version_sql =
+                include_str!("../migrations/20260914120000_add_job_tracking_version/up.sql");
+            for stmt in tracking_sql
+                .split(';')
+                .chain(tracking_version_sql.split(';'))
+            {
                 let stmt = stmt.trim();
                 if !stmt.is_empty() {
                     diesel::sql_query(stmt).execute(&mut *conn).await.unwrap();

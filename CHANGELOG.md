@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Tracked-job retry compare-and-swap moved off the timestamp onto a write
+  counter (#2581):** `JobTrackingStore::reset_for_retry` took the token to
+  compare against as a wall-clock instant, and both implementations turned it
+  into `WHERE ... AND updated_at = ?`. Two writes inside one millisecond — or
+  any write under a clock that does not advance, which is every `#[sim_test]`
+  using a fixed clock — leave `updated_at` unchanged, so a write that already
+  happened did not move the token: an operator retry's reset could overwrite a
+  worker's fresher `running` with a stale `pending`, and the status endpoint
+  would report a job as un-started while it was executing. The trait now takes
+  an opaque `TrackedJobVersion` the store hands out with each
+  `TrackedJobRecord` (new `version` field) and takes back; every store write
+  increments it, so the token never repeats. Postgres gained the same
+  `version` column the SQLite table already had (new framework migration
+  `20260914120000_add_job_tracking_version`), incremented on every write; the
+  Redis Lua guard compares `record.version`; the in-memory store bumps it on
+  every mutation. **Breaking:** the `reset_for_retry` signature changed from
+  `expected_updated_at: DateTime<Utc>` to
+  `expected_version: TrackedJobVersion`, and `TrackedJobRecord` gained a
+  `version` field (serde-defaulted, so previously stored payloads still
+  deserialize).
+
 - **`#[commentable]`'s write path (`add_comment`, `delete_comment`,
   `recompute_comment_count`) stopped honoring a parent's `deleted_at` column
   as audit-only data (#2263):** `#[commentable]` must hide a soft-deleted

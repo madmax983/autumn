@@ -116,6 +116,35 @@ pub struct TrackedJobRecord {
     pub error: Option<String>,
     pub owner: TrackedJobOwner,
     pub updated_at: DateTime<Utc>,
+    /// Monotonic write counter, incremented by every store write.
+    ///
+    /// This is the compare-and-swap token [`JobTrackingStore::reset_for_retry`]
+    /// takes back: unlike `updated_at`, it moves on every write — including
+    /// two writes inside one millisecond, or any write under a clock that does
+    /// not advance — so a stale retry can never match a record that moved on.
+    /// SQL-backed stores keep the authoritative counter in a `version` column
+    /// and stamp this field from it on every read; the JSON copy is a
+    /// convenience, not the source of truth.
+    #[serde(default)]
+    pub version: TrackedJobVersion,
+}
+
+/// The compare-and-swap token for [`JobTrackingStore::reset_for_retry`].
+///
+/// An opaque, monotonically increasing write counter handed out by the store
+/// with each [`TrackedJobRecord`] and taken back by `reset_for_retry`.
+/// Callers must treat it as opaque — compare it for equality only, never
+/// construct or interpret it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct TrackedJobVersion(pub i64);
+
+impl TrackedJobVersion {
+    /// The next version after this one, saturating rather than wrapping: a
+    /// wrapping counter would hand a stale writer a fresh-looking token.
+    #[must_use]
+    pub fn next(self) -> Self {
+        Self(self.0.saturating_add(1))
+    }
 }
 
 type BoxFut<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -183,17 +212,23 @@ pub trait JobTrackingStore: Send + Sync + 'static {
     fn get<'a>(&'a self, key: &'a str) -> BoxFut<'a, AutumnResult<Option<TrackedJobRecord>>>;
 
     /// Reset `key` back to a fresh `pending` record for a retried attempt —
-    /// but only if the stored record's `updated_at` still equals
-    /// `expected_updated_at` (the value read just before the retry decision
+    /// but only if the stored record's [`TrackedJobVersion`] still equals
+    /// `expected_version` (the token read just before the retry decision
     /// was made). If a worker has already re-executed and settled the
-    /// record in the meantime, `updated_at` will have moved on and this is a
+    /// record in the meantime, the version will have moved on and this is a
     /// no-op, so a fast retry can never clobber the fresher terminal write
     /// with a stale `pending` reset.
+    ///
+    /// The token is a write counter, not a timestamp: two writes inside one
+    /// millisecond — or any write under a clock that does not advance, which
+    /// is every `#[sim_test]` using a fixed clock — leave `updated_at`
+    /// unchanged, so a timestamp token would still match after a real write
+    /// and let the reset clobber it (issue #2581).
     fn reset_for_retry<'a>(
         &'a self,
         key: &'a str,
         owner: TrackedJobOwner,
-        expected_updated_at: DateTime<Utc>,
+        expected_version: TrackedJobVersion,
     ) -> BoxFut<'a, AutumnResult<()>>;
 }
 
@@ -623,9 +658,10 @@ impl SqliteJobTrackingStore {
         use diesel_async::RunQueryDsl as _;
 
         // One clock sample for both the record's `updated_at` and the column.
-        // `reset_for_retry` compares the column against the value it read out
-        // of the record, so two samples that straddle a millisecond make that
-        // compare-and-swap match nothing and leave an admin-retried job stuck.
+        // The reset-for-retry token is the `version` counter, not the
+        // timestamp: two writes inside one millisecond — or any write under
+        // a clock that does not advance — leave `updated_at` unchanged, so a
+        // stale writer's swap would still match (issue #2581).
         let now = self.clock.now();
         let now_ms = now.timestamp_millis();
         let mut conn = self.conn().await?;
@@ -664,6 +700,10 @@ impl SqliteJobTrackingStore {
         }
         f(&mut record);
         record.updated_at = now;
+        // Keep the JSON copy of the counter in step with the column: the
+        // column is authoritative, but a reader that deserializes the blob
+        // directly would otherwise see a stale token.
+        record.version = TrackedJobVersion(row.version).next();
         let payload = serde_json::to_string(&record).map_err(|error| {
             AutumnError::internal_server_error_msg(format!(
                 "job tracking serialize failed: {error}"
@@ -703,6 +743,9 @@ impl SqliteJobTrackingStore {
             error: None,
             owner,
             updated_at: now,
+            // The `version` column is the authoritative counter; `get`
+            // stamps the stored value over this on every read.
+            version: TrackedJobVersion::default(),
         };
         serde_json::to_string(&record).map_err(|error| {
             AutumnError::internal_server_error_msg(format!(
@@ -783,7 +826,7 @@ impl JobTrackingStore for SqliteJobTrackingStore {
         &'a self,
         key: &'a str,
         owner: TrackedJobOwner,
-        expected_updated_at: DateTime<Utc>,
+        expected_version: TrackedJobVersion,
     ) -> BoxFut<'a, AutumnResult<()>> {
         Box::pin(async move {
             use diesel_async::RunQueryDsl as _;
@@ -792,19 +835,22 @@ impl JobTrackingStore for SqliteJobTrackingStore {
             let now_ms = now.timestamp_millis();
             let payload = Self::pending_record(owner, now)?;
             let mut conn = self.conn().await?;
-            // Compare-and-swap: the reset applies only while nothing has
-            // written since `expected_updated_at` was read, so a retry that
-            // settles faster than this call returns is never clobbered.
+            // Compare-and-swap on the version counter: the reset applies
+            // only while nothing has written since the token was read, so a
+            // retry that settles faster than this call returns is never
+            // clobbered. A timestamp would not do here — two writes inside
+            // one millisecond, or any write under a frozen clock, leave it
+            // unchanged (issue #2581).
             diesel::sql_query(
                 "UPDATE autumn_job_tracking \
                  SET record = ?, updated_at = ?, expires_at = ?, version = version + 1 \
-                 WHERE key = ? AND updated_at = ?",
+                 WHERE key = ? AND version = ?",
             )
             .bind::<diesel::sql_types::Text, _>(&payload)
             .bind::<diesel::sql_types::BigInt, _>(now_ms)
             .bind::<diesel::sql_types::BigInt, _>(self.expires_at_ms(now_ms))
             .bind::<diesel::sql_types::Text, _>(key)
-            .bind::<diesel::sql_types::BigInt, _>(expected_updated_at.timestamp_millis())
+            .bind::<diesel::sql_types::BigInt, _>(expected_version.0)
             .execute(&mut *conn)
             .await
             .map_err(|error| {
@@ -839,11 +885,17 @@ impl JobTrackingStore for SqliteJobTrackingStore {
             })?;
 
             row.map(|row| {
-                serde_json::from_str::<TrackedJobRecord>(&row.record).map_err(|error| {
-                    AutumnError::internal_server_error_msg(format!(
-                        "job tracking deserialize failed: {error}"
-                    ))
-                })
+                // The `version` column is the authoritative counter; stamp it
+                // over whatever the JSON blob carries so a token read out of
+                // the record is always the one the writes actually used.
+                let mut record =
+                    serde_json::from_str::<TrackedJobRecord>(&row.record).map_err(|error| {
+                        AutumnError::internal_server_error_msg(format!(
+                            "job tracking deserialize failed: {error}"
+                        ))
+                    })?;
+                record.version = TrackedJobVersion(row.version);
+                Ok(record)
             })
             .transpose()
         })
@@ -1022,11 +1074,11 @@ async fn settle_tracked_payload_with_store(
     }
 }
 
-/// A tracking record's owner and `updated_at`, captured *before* an admin
-/// retry makes the job visible to workers again, so
+/// A tracking record's owner and write-counter token, captured *before* an
+/// admin retry makes the job visible to workers again, so
 /// [`apply_retry_reset`] can later detect whether anything wrote to the
 /// record in the meantime.
-pub(crate) type RetrySnapshot = (TrackedJobOwner, DateTime<Utc>);
+pub(crate) type RetrySnapshot = (TrackedJobOwner, TrackedJobVersion);
 
 /// If `payload` is a tracked-job envelope, read its current tracking record.
 ///
@@ -1043,7 +1095,7 @@ pub(crate) async fn capture_retry_snapshot(payload: &Value) -> Option<RetrySnaps
     let key = key?;
     let store = global_tracking_store()?;
     let record = store.get(key).await.ok().flatten()?;
-    Some((record.owner, record.updated_at))
+    Some((record.owner, record.version))
 }
 
 /// If `payload` is a tracked-job envelope and `snapshot` is `Some` (i.e.
@@ -1062,11 +1114,11 @@ pub(crate) async fn capture_retry_snapshot(payload: &Value) -> Option<RetrySnaps
 ///
 /// The reset only applies if the record is unchanged since `snapshot` was
 /// captured ([`JobTrackingStore::reset_for_retry`] is a compare-and-swap on
-/// `updated_at`), so a fast retry that already settled the record before
-/// this call runs is left alone rather than stomped back to a stale
-/// `pending`.
+/// the record's [`TrackedJobVersion`], which every store write increments),
+/// so a fast retry that already settled the record before this call runs is
+/// left alone rather than stomped back to a stale `pending`.
 pub(crate) async fn apply_retry_reset(payload: &Value, snapshot: Option<RetrySnapshot>) {
-    let Some((owner, expected_updated_at)) = snapshot else {
+    let Some((owner, expected_version)) = snapshot else {
         return;
     };
     let (key, _) = split_tracked_payload(payload);
@@ -1076,7 +1128,7 @@ pub(crate) async fn apply_retry_reset(payload: &Value, snapshot: Option<RetrySna
     let Some(store) = global_tracking_store() else {
         return;
     };
-    let _ = store.reset_for_retry(key, owner, expected_updated_at).await;
+    let _ = store.reset_for_retry(key, owner, expected_version).await;
 }
 
 // ── enqueue_tracked ────────────────────────────────────────────────────────────
@@ -1456,6 +1508,9 @@ impl InMemoryJobTrackingStore {
         {
             f(&mut entry.record);
             entry.record.updated_at = now;
+            // Every write moves the reset-for-retry token, even when the
+            // clock does not (issue #2581).
+            entry.record.version = entry.record.version.next();
             entry.expires_at = crate::time_math::saturating_dt_add(now, self.ttl);
         }
     }
@@ -1465,7 +1520,7 @@ impl InMemoryJobTrackingStore {
         &self,
         key: &str,
         owner: TrackedJobOwner,
-        expected_updated_at: DateTime<Utc>,
+        expected_version: TrackedJobVersion,
     ) {
         let now = self.clock.now();
         let mut guard = self
@@ -1474,8 +1529,9 @@ impl InMemoryJobTrackingStore {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(entry) = guard.get(key)
             && self.is_live(entry)
-            && entry.record.updated_at == expected_updated_at
+            && entry.record.version == expected_version
         {
+            let version = entry.record.version.next();
             guard.insert(
                 key.to_owned(),
                 MemoryEntry {
@@ -1487,6 +1543,7 @@ impl InMemoryJobTrackingStore {
                         error: None,
                         owner,
                         updated_at: now,
+                        version,
                     },
                     expires_at: crate::time_math::saturating_dt_add(now, self.ttl),
                 },
@@ -1507,6 +1564,7 @@ impl JobTrackingStore for InMemoryJobTrackingStore {
                 error: None,
                 owner,
                 updated_at: now,
+                version: TrackedJobVersion::default(),
             };
             self.insert_and_maybe_sweep(key, record, now);
             Ok(())
@@ -1551,10 +1609,10 @@ impl JobTrackingStore for InMemoryJobTrackingStore {
         &'a self,
         key: &'a str,
         owner: TrackedJobOwner,
-        expected_updated_at: DateTime<Utc>,
+        expected_version: TrackedJobVersion,
     ) -> BoxFut<'a, AutumnResult<()>> {
         Box::pin(async move {
-            self.reset_for_retry_if_unchanged(key, owner, expected_updated_at);
+            self.reset_for_retry_if_unchanged(key, owner, expected_version);
             Ok(())
         })
     }
@@ -1576,6 +1634,7 @@ impl JobTrackingStore for InMemoryJobTrackingStore {
                     error: entry.record.error.clone(),
                     owner: entry.record.owner.clone(),
                     updated_at: entry.record.updated_at,
+                    version: entry.record.version,
                 }))
         })
     }
@@ -1665,19 +1724,21 @@ impl RedisJobTrackingStore {
         };
         f(&mut record);
         record.updated_at = chrono::Utc::now();
+        record.version = record.version.next();
         self.write(key, &record).await
     }
 
     /// Atomically overwrite the record with `new_record`, but only if the
-    /// currently-stored record's `updated_at` still equals
-    /// `expected_updated_at` — a compare-and-swap guard evaluated inside a
+    /// currently-stored record's [`TrackedJobVersion`] still equals
+    /// `expected_version` — a compare-and-swap guard evaluated inside a
     /// single Lua script so the check-then-write cannot race against a
-    /// concurrent write landing in between.
+    /// concurrent write landing in between. The write lands with the next
+    /// version after the expected one.
     async fn write_if_unchanged(
         &self,
         key: &str,
-        expected_updated_at: DateTime<Utc>,
-        new_record: &TrackedJobRecord,
+        expected_version: TrackedJobVersion,
+        mut new_record: TrackedJobRecord,
     ) -> AutumnResult<()> {
         const SCRIPT: &str = r"
 local raw = redis.call('GET', KEYS[1])
@@ -1685,21 +1746,17 @@ if not raw then
   return 0
 end
 local record = cjson.decode(raw)
-if record.updated_at ~= ARGV[1] then
+if record.version ~= tonumber(ARGV[1]) then
   return 0
 end
 redis.call('SET', KEYS[1], ARGV[2], 'EX', ARGV[3])
 return 1
 ";
-        let expected = serde_json::to_string(&expected_updated_at).map_err(|error| {
-            AutumnError::internal_server_error_msg(format!(
-                "job tracking serialize failed: {error}"
-            ))
-        })?;
-        // cjson.decode(raw).updated_at yields the unquoted string value, so
-        // strip the JSON string quotes serde_json wraps it in above.
-        let expected = expected.trim_matches('"').to_owned();
-        let payload = serde_json::to_string(new_record).map_err(|error| {
+        // The version counter moves on every write, so it is the swap token:
+        // comparing `updated_at` instead would still match after a write that
+        // landed inside the same instant (issue #2581).
+        new_record.version = expected_version.next();
+        let payload = serde_json::to_string(&new_record).map_err(|error| {
             AutumnError::internal_server_error_msg(format!(
                 "job tracking serialize failed: {error}"
             ))
@@ -1708,7 +1765,7 @@ return 1
             .arg(SCRIPT)
             .arg(1)
             .arg(self.key_for(key))
-            .arg(expected)
+            .arg(expected_version.0)
             .arg(payload)
             .arg(self.ttl_secs.max(1))
             .query_async::<i64>(&mut self.connection.clone())
@@ -1734,6 +1791,7 @@ impl JobTrackingStore for RedisJobTrackingStore {
                 error: None,
                 owner,
                 updated_at: chrono::Utc::now(),
+                version: TrackedJobVersion::default(),
             };
             self.write(key, &record).await
         })
@@ -1776,7 +1834,7 @@ impl JobTrackingStore for RedisJobTrackingStore {
         &'a self,
         key: &'a str,
         owner: TrackedJobOwner,
-        expected_updated_at: DateTime<Utc>,
+        expected_version: TrackedJobVersion,
     ) -> BoxFut<'a, AutumnResult<()>> {
         Box::pin(async move {
             let record = TrackedJobRecord {
@@ -1787,9 +1845,9 @@ impl JobTrackingStore for RedisJobTrackingStore {
                 error: None,
                 owner,
                 updated_at: chrono::Utc::now(),
+                version: TrackedJobVersion::default(),
             };
-            self.write_if_unchanged(key, expected_updated_at, &record)
-                .await
+            self.write_if_unchanged(key, expected_version, record).await
         })
     }
 
@@ -1843,6 +1901,12 @@ pub struct PgJobTrackingStore {
 struct PgTrackingRow {
     #[diesel(sql_type = diesel::sql_types::Text)]
     record: String,
+    /// The compare-and-swap token for [`JobTrackingStore::reset_for_retry`].
+    /// A counter, not the timestamp: two writes inside one millisecond — or
+    /// any write under a clock that does not advance — leave `updated_at`
+    /// unchanged, so a stale writer's swap would still match (issue #2581).
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    version: i64,
 }
 
 #[cfg(feature = "db")]
@@ -1896,7 +1960,8 @@ impl PgJobTrackingStore {
         let now = self.clock.now();
         let mut conn = self.conn().await?;
         let row = diesel::sql_query(
-            "SELECT record::TEXT AS record FROM autumn_job_tracking WHERE key = $1 AND expires_at > $2",
+            "SELECT record::TEXT AS record, version FROM autumn_job_tracking \
+             WHERE key = $1 AND expires_at > $2",
         )
         .bind::<diesel::sql_types::Text, _>(key)
         .bind::<diesel::sql_types::Timestamptz, _>(now)
@@ -1918,6 +1983,9 @@ impl PgJobTrackingStore {
             })?;
         f(&mut record);
         record.updated_at = now;
+        // Keep the JSON copy of the counter in step with the column, which is
+        // what `reset_for_retry` actually swaps against.
+        record.version = TrackedJobVersion(row.version).next();
         let payload = serde_json::to_string(&record).map_err(|error| {
             AutumnError::internal_server_error_msg(format!(
                 "job tracking serialize failed: {error}"
@@ -1925,8 +1993,8 @@ impl PgJobTrackingStore {
         })?;
 
         diesel::sql_query(
-            "UPDATE autumn_job_tracking SET record = $2::JSONB, updated_at = $3, expires_at = $4 \
-             WHERE key = $1",
+            "UPDATE autumn_job_tracking SET record = $2::JSONB, updated_at = $3, expires_at = $4, \
+             version = version + 1 WHERE key = $1",
         )
         .bind::<diesel::sql_types::Text, _>(key)
         .bind::<diesel::sql_types::Text, _>(&payload)
@@ -1956,6 +2024,9 @@ impl JobTrackingStore for PgJobTrackingStore {
                 error: None,
                 owner,
                 updated_at: now,
+                // Fresh rows start at 0; the ON CONFLICT arm bumps the
+                // column, and `get` stamps the column value over the JSON.
+                version: TrackedJobVersion::default(),
             };
             let payload = serde_json::to_string(&record).map_err(|error| {
                 AutumnError::internal_server_error_msg(format!(
@@ -1964,12 +2035,13 @@ impl JobTrackingStore for PgJobTrackingStore {
             })?;
             let mut conn = self.conn().await?;
             diesel::sql_query(
-                "INSERT INTO autumn_job_tracking (key, record, updated_at, expires_at) \
-                 VALUES ($1, $2::JSONB, $3, $4) \
+                "INSERT INTO autumn_job_tracking (key, record, updated_at, expires_at, version) \
+                 VALUES ($1, $2::JSONB, $3, $4, 0) \
                  ON CONFLICT (key) DO UPDATE SET \
                      record = EXCLUDED.record, \
                      updated_at = EXCLUDED.updated_at, \
-                     expires_at = EXCLUDED.expires_at",
+                     expires_at = EXCLUDED.expires_at, \
+                     version = autumn_job_tracking.version + 1",
             )
             .bind::<diesel::sql_types::Text, _>(key)
             .bind::<diesel::sql_types::Text, _>(&payload)
@@ -2023,7 +2095,7 @@ impl JobTrackingStore for PgJobTrackingStore {
         &'a self,
         key: &'a str,
         owner: TrackedJobOwner,
-        expected_updated_at: DateTime<Utc>,
+        expected_version: TrackedJobVersion,
     ) -> BoxFut<'a, AutumnResult<()>> {
         Box::pin(async move {
             use diesel_async::RunQueryDsl as _;
@@ -2037,6 +2109,9 @@ impl JobTrackingStore for PgJobTrackingStore {
                 error: None,
                 owner,
                 updated_at: now,
+                // `get` stamps the column value over the JSON on the next
+                // read; the token that matters here is the column's.
+                version: expected_version.next(),
             };
             let payload = serde_json::to_string(&record).map_err(|error| {
                 AutumnError::internal_server_error_msg(format!(
@@ -2044,20 +2119,22 @@ impl JobTrackingStore for PgJobTrackingStore {
                 ))
             })?;
             let mut conn = self.conn().await?;
-            // The WHERE clause is a compare-and-swap guard: it only takes
-            // effect if nothing has written to this record (e.g. the
-            // retried attempt itself already settling) since
-            // `expected_updated_at` was read, so a fast retry can never
-            // clobber a fresher terminal write with a stale reset.
+            // The WHERE clause is a compare-and-swap guard on the version
+            // counter: it only takes effect if nothing has written to this
+            // record (e.g. the retried attempt itself already settling) since
+            // the token was read, so a fast retry can never clobber a fresher
+            // terminal write with a stale reset. A timestamp would not do —
+            // two writes inside one millisecond, or any write under a frozen
+            // clock, leave `updated_at` unchanged (issue #2581).
             diesel::sql_query(
                 "UPDATE autumn_job_tracking SET record = $2::JSONB, updated_at = $3, \
-                 expires_at = $4 WHERE key = $1 AND updated_at = $5",
+                 expires_at = $4, version = version + 1 WHERE key = $1 AND version = $5",
             )
             .bind::<diesel::sql_types::Text, _>(key)
             .bind::<diesel::sql_types::Text, _>(&payload)
             .bind::<diesel::sql_types::Timestamptz, _>(now)
             .bind::<diesel::sql_types::Timestamptz, _>(self.expires_at(now))
-            .bind::<diesel::sql_types::Timestamptz, _>(expected_updated_at)
+            .bind::<diesel::sql_types::BigInt, _>(expected_version.0)
             .execute(&mut *conn)
             .await
             .map_err(|error| {
@@ -2077,7 +2154,8 @@ impl JobTrackingStore for PgJobTrackingStore {
             let now = self.clock.now();
             let mut conn = self.conn().await?;
             let row = diesel::sql_query(
-                "SELECT record::TEXT AS record FROM autumn_job_tracking WHERE key = $1 AND expires_at > $2",
+                "SELECT record::TEXT AS record, version FROM autumn_job_tracking \
+                 WHERE key = $1 AND expires_at > $2",
             )
             .bind::<diesel::sql_types::Text, _>(key)
             .bind::<diesel::sql_types::Timestamptz, _>(now)
@@ -2091,11 +2169,17 @@ impl JobTrackingStore for PgJobTrackingStore {
             })?;
 
             row.map(|row| {
-                serde_json::from_str::<TrackedJobRecord>(&row.record).map_err(|error| {
-                    AutumnError::internal_server_error_msg(format!(
-                        "job tracking deserialize failed: {error}"
-                    ))
-                })
+                // The `version` column is the authoritative counter; stamp it
+                // over whatever the JSON blob carries so a token read out of
+                // the record is always the one the writes actually used.
+                let mut record =
+                    serde_json::from_str::<TrackedJobRecord>(&row.record).map_err(|error| {
+                        AutumnError::internal_server_error_msg(format!(
+                            "job tracking deserialize failed: {error}"
+                        ))
+                    })?;
+                record.version = TrackedJobVersion(row.version);
+                Ok(record)
             })
             .transpose()
         })
@@ -2194,7 +2278,7 @@ mod tests {
                 .unwrap();
             let record = store.get("k1").await.unwrap().expect("record");
             store
-                .reset_for_retry("k1", TrackedJobOwner::Anonymous, record.updated_at)
+                .reset_for_retry("k1", TrackedJobOwner::Anonymous, record.version)
                 .await
                 .unwrap();
             store
@@ -2250,7 +2334,7 @@ mod tests {
         assert_eq!(stale.status, TrackedJobStatus::Failed);
 
         store
-            .reset_for_retry("k1", stale.owner.clone(), stale.updated_at)
+            .reset_for_retry("k1", stale.owner.clone(), stale.version)
             .await
             .unwrap();
 
@@ -2283,7 +2367,7 @@ mod tests {
         // The admin retry path's reset, still holding the pre-retry
         // snapshot, must not clobber the fresher terminal result.
         store
-            .reset_for_retry("k1", stale.owner, stale.updated_at)
+            .reset_for_retry("k1", stale.owner, stale.version)
             .await
             .unwrap();
 
@@ -2294,6 +2378,84 @@ mod tests {
             "a reset computed from a stale read must not overwrite a write that landed since"
         );
         assert_eq!(record.result, Some(serde_json::json!({"already": "done"})));
+    }
+
+    #[tokio::test]
+    async fn reset_for_retry_is_a_no_op_when_a_write_landed_on_a_frozen_clock() {
+        // Issue #2581: the old timestamp token repeated under a clock that
+        // does not advance — every `#[sim_test]` — so a write that already
+        // happened did not move the token, and the admin retry path's
+        // compare-and-swap still matched and overwrote the worker's fresher
+        // `running` with a stale `pending`.
+        let start =
+            chrono::DateTime::from_timestamp_millis(1_700_000_000_000).expect("valid instant");
+        let store = InMemoryJobTrackingStore::new(86_400)
+            .with_clock(std::sync::Arc::new(FixedClock::at(start)));
+        store
+            .create("k1", TrackedJobOwner::Anonymous)
+            .await
+            .unwrap();
+        store.fail("k1", "boom".to_owned()).await.unwrap();
+        let stale = store.get("k1").await.unwrap().expect("record");
+        assert_eq!(stale.status, TrackedJobStatus::Failed);
+
+        // The retried attempt is claimed under the same frozen instant: the
+        // timestamp cannot move, but the version must.
+        store.mark_running("k1").await.unwrap();
+        let moved = store.get("k1").await.unwrap().expect("record");
+        assert_eq!(moved.updated_at, stale.updated_at);
+        assert_ne!(moved.version, stale.version);
+
+        // The admin retry path's reset, still holding the pre-retry token,
+        // must not clobber the running attempt.
+        store
+            .reset_for_retry("k1", stale.owner, stale.version)
+            .await
+            .unwrap();
+
+        let record = store.get("k1").await.unwrap().expect("record");
+        assert_eq!(
+            record.status,
+            TrackedJobStatus::Running,
+            "a write under a frozen clock must still move the CAS token, or a stale retry reset \
+             overwrites it"
+        );
+    }
+
+    #[tokio::test]
+    async fn reset_for_retry_matches_the_token_handed_out_by_get() {
+        // The version a store hands out with a record is exactly what a later
+        // `reset_for_retry` must take back; every write path moves it by one.
+        let store = store();
+        store
+            .create("k1", TrackedJobOwner::Anonymous)
+            .await
+            .unwrap();
+        let v0 = store.get("k1").await.unwrap().expect("record").version;
+
+        store.mark_running("k1").await.unwrap();
+        let v1 = store.get("k1").await.unwrap().expect("record").version;
+        assert_eq!(v1, v0.next());
+
+        store.set_progress("k1", 50, None).await.unwrap();
+        let v2 = store.get("k1").await.unwrap().expect("record").version;
+        assert_eq!(v2, v1.next());
+
+        store
+            .reset_for_retry("k1", TrackedJobOwner::Anonymous, v2)
+            .await
+            .unwrap();
+        let record = store.get("k1").await.unwrap().expect("record");
+        assert_eq!(record.status, TrackedJobStatus::Pending);
+        assert_eq!(record.version, v2.next());
+
+        // And the now-stale v2 no longer matches anything.
+        store
+            .reset_for_retry("k1", TrackedJobOwner::Anonymous, v2)
+            .await
+            .unwrap();
+        let record = store.get("k1").await.unwrap().expect("record");
+        assert_eq!(record.version, v2.next());
     }
 
     #[tokio::test]
@@ -2353,6 +2515,7 @@ mod tests {
             error: None,
             owner: TrackedJobOwner::Anonymous,
             updated_at: chrono::Utc::now(),
+            version: TrackedJobVersion::default(),
         };
 
         apply_mark_running(&mut record);
@@ -2799,9 +2962,9 @@ mod tests {
                 &'a self,
                 key: &'a str,
                 owner: TrackedJobOwner,
-                expected_updated_at: DateTime<Utc>,
+                expected_version: TrackedJobVersion,
             ) -> BoxFut<'a, AutumnResult<()>> {
-                self.inner.reset_for_retry(key, owner, expected_updated_at)
+                self.inner.reset_for_retry(key, owner, expected_version)
             }
             fn get<'a>(
                 &'a self,
