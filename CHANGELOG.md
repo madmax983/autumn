@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`autumn db scrub` now treats partition key columns as structural (#2366):**
+  the plan skips child partitions and rewrites their rows through the parent,
+  but nothing marked the parent's partition key as structural — so a PII
+  declaration on a date-ranged table's key (e.g. `occurred_at` scrubbed to
+  epoch) ran and Postgres re-routed every row into the one partition holding
+  that constant, silently collapsing the table (or aborting the `UPDATE` when
+  no such partition exists). `probe_database_facts` now reads
+  `pg_partitioned_table.partattrs` (gated on the catalog's presence for
+  pre-Postgres-10 servers), the columns join the structural set in
+  `is_key_column`, and declaring PII on one fails as `PiiOnKeyColumn` instead.
+  Added a regression test driving the plan against a hand-built
+  `DatabaseFacts`.
+
 - **`#[commentable]`'s write path (`add_comment`, `delete_comment`,
   `recompute_comment_count`) stopped honoring a parent's `deleted_at` column
   as audit-only data (#2263):** `#[commentable]` must hide a soft-deleted

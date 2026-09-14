@@ -98,7 +98,13 @@ Two sources need **no declaration at all**:
 Primary- and foreign-key columns are never claimed by the table-level
 inference: rewriting a key would break referential integrity. Neither are
 generated columns, which Postgres refuses to `UPDATE` and which a scrub of their
-source columns already covers.
+source columns already covers. The same goes for the **partition key columns
+of a declaratively partitioned table**: a partition's rows are rewritten
+through its parent, so rewriting the key re-routes every row — setting a
+date-ranged table's key to a constant collapses the whole table into the one
+partition holding that constant (or aborts the `UPDATE` when no such partition
+exists). Declaring PII on a partition key is a plan-time refusal, not a
+silent row migration.
 
 `[defaults] safe_columns` is a cross-table convenience, not a per-column review,
 so it does **not** narrow a GDPR anonymize registration — only an explicit

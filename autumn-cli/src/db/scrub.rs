@@ -1764,7 +1764,8 @@ fn unreachable_tables(facts: &DatabaseFacts, introspected: &[Table]) -> Vec<Stri
 }
 
 /// Whether a column is structural — a primary key, either side of any foreign
-/// key, or a generated column Postgres will not let an `UPDATE` touch.
+/// key, a generated column Postgres will not let an `UPDATE` touch, or a
+/// partition key column whose rewrite re-routes rows between partitions.
 ///
 /// The foreign-key half comes from [`DatabaseFacts`], not from the schema IR:
 /// the IR records only the *referencing* side and only a composite key's first
@@ -1779,6 +1780,7 @@ fn is_key_column(table: &Table, column: &Column, facts: &DatabaseFacts) -> bool 
         || column.references.is_some()
         || facts.foreign_key_columns.contains(&pair)
         || facts.generated_columns.contains(&pair)
+        || facts.partition_key_columns.contains(&pair)
 }
 
 /// Whether a rewrite of this column could violate a uniqueness constraint.
@@ -3892,6 +3894,14 @@ pub struct DatabaseFacts {
     /// them again double-updates — and the mapping also says whose role decides
     /// whether a key declared on a leaf can be ignored.
     pub partitions: BTreeMap<String, String>,
+    /// Partition key columns of every declaratively partitioned table, as
+    /// `(table, column)`. A partition's rows are rewritten through its parent,
+    /// so a rewrite of the KEY column re-routes the row: setting every
+    /// `occurred_at` to a constant collapses the whole table into one
+    /// partition (or aborts the `UPDATE` when no such partition exists). They
+    /// join the structural set in [`is_key_column`], so a PII declaration on
+    /// one fails as [`ScrubError::PiiOnKeyColumn`] instead of running.
+    pub partition_key_columns: BTreeSet<(String, String)>,
     /// Tables with row-level security enabled. A non-bypassing role silently
     /// updates only the rows its policies expose — a fail-open a scrub cannot
     /// tolerate.
@@ -4139,6 +4149,23 @@ fn has_catalog_column(
     Ok(!rows.is_empty())
 }
 
+/// Whether a system catalog relation exists on this server at all.
+///
+/// [`has_catalog_column`] cannot answer this question: its `::regclass` cast
+/// errors on a missing relation instead of returning false. `to_regclass`
+/// returns NULL instead, so this is the gate for whole-catalog facts like
+/// `pg_partitioned_table`, which arrived in Postgres 10 — an older server
+/// simply has no partitioned tables, which is the correct degraded answer.
+fn has_catalog_table(conn: &mut PgConnection, relation: &str) -> Result<bool, ScrubError> {
+    let rows: Vec<NameRow> = sql_query(format!(
+        "SELECT 'yes' AS name WHERE to_regclass({}) IS NOT NULL",
+        quote_literal(relation)
+    ))
+    .load(conn)
+    .map_err(|e| ScrubError::Sql(e.to_string()))?;
+    Ok(!rows.is_empty())
+}
+
 /// Gather every catalog fact the plan validation needs.
 // One catalog read per fact; splitting it would scatter closely-related SQL
 // across helpers that each need the same connection.
@@ -4378,6 +4405,38 @@ fn probe_database_facts(
         } else {
             BTreeMap::new()
         };
+
+    // ── Partition-key columns ─────────────────────────────────────────────
+    // A partition's rows are rewritten through its parent, so a rewrite of
+    // the partition KEY column re-routes the row: scrubbing a date-ranged
+    // table's `occurred_at` to a constant collapses every row into the one
+    // partition that holds that constant — or aborts the whole `UPDATE`
+    // when no such partition exists. The columns join the structural set
+    // in `is_key_column`, so a PII declaration on one fails as
+    // `PiiOnKeyColumn` instead of running.
+    //
+    // `pg_partitioned_table` arrived in Postgres 10, so its presence is
+    // probed with `has_catalog_table` rather than `has_catalog_column`
+    // (the `::regclass` cast there errors on a missing relation instead of
+    // returning false). `partattrs` is an `int2vector`, matched with
+    // `= ANY(...)` the same way `pg_index.indkey` is above.
+    let partition_key_columns = if has_catalog_table(&mut conn, "pg_partitioned_table")? {
+        pair_set(
+            sql_query(
+                "SELECT rel.relname AS tbl, att.attname AS col \
+                 FROM pg_partitioned_table pt \
+                 JOIN pg_class rel ON rel.oid = pt.partrelid \
+                 JOIN pg_namespace ns ON ns.oid = rel.relnamespace AND ns.nspname = 'public' \
+                 JOIN pg_attribute att ON att.attrelid = rel.oid \
+                 AND att.attnum = ANY(pt.partattrs) \
+                 WHERE att.attnum > 0 AND NOT att.attisdropped",
+            )
+            .load(&mut conn)
+            .map_err(|e| ScrubError::Sql(e.to_string()))?,
+        )
+    } else {
+        BTreeSet::new()
+    };
 
     // A declarative partition is also a `pg_inherits` child, so the partition
     // case is excluded explicitly — those the sample models through the parent
@@ -4708,6 +4767,7 @@ fn probe_database_facts(
         unique_columns,
         nulls_not_distinct_columns,
         partitions,
+        partition_key_columns,
         rls_tables,
         legacy_inheritance,
         triggered_tables,
@@ -6699,6 +6759,17 @@ mod tests {
         BTreeSet::new()
     }
 
+    fn events_table() -> Table {
+        let mut t = Table::new("events", Backend::Postgres);
+        t.primary_key = vec!["id".to_owned()];
+        t.columns = vec![
+            pk_col("id"),
+            Column::new("occurred_at", ColumnType::Timestamp),
+            text_col("payload"),
+        ];
+        t
+    }
+
     fn plan_for(
         tables: &[Table],
         config: &ScrubConfig,
@@ -7316,6 +7387,45 @@ mod tests {
         )
         .expect("a generated column needs no declaration");
         assert!(plan.column("users", "full_name").is_none());
+    }
+
+    #[test]
+    fn a_partition_key_column_is_structural_and_refuses_pii() {
+        // A partition's rows are rewritten through its parent, so a rewrite
+        // of the partition KEY re-routes every row — scrubbing a date-ranged
+        // table's `occurred_at` to a constant collapses the whole table into
+        // the one partition holding that constant. The key therefore joins
+        // the structural set in `is_key_column`, and a PII declaration on it
+        // is a plan-time `PiiOnKeyColumn` refusal rather than a silent
+        // row-migration.
+        let facts = DatabaseFacts {
+            partition_key_columns: BTreeSet::from([(
+                "events".to_owned(),
+                "occurred_at".to_owned(),
+            )]),
+            ..DatabaseFacts::default()
+        };
+        let config = parse_config_str(
+            r#"
+            [defaults]
+            safe_columns = ["id", "payload"]
+            [tables.events.pii]
+            occurred_at = "epoch"
+            "#,
+        )
+        .unwrap();
+        let err = plan_with_facts(
+            &[events_table()],
+            &config,
+            &empty_encrypted(),
+            &no_anonymize(),
+            &facts,
+        )
+        .expect_err("a partition key rewrite would collapse every row into one partition");
+        assert!(
+            matches!(err, ScrubError::PiiOnKeyColumn { ref columns } if columns == &vec!["events.occurred_at".to_owned()]),
+            "got {err:?}"
+        );
     }
 
     #[test]
