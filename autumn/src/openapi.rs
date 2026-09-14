@@ -346,7 +346,16 @@ pub enum SchemaKind {
     /// Refers to a named component schema.
     Ref,
     /// A primitive JSON type inlined at the reference site.
-    Primitive(&'static str),
+    ///
+    /// `format` carries the JSON-Schema `format` keyword for scalar
+    /// newtypes that serialize as a single scalar (`uuid::Uuid`,
+    /// `rust_decimal::Decimal`, chrono date/time types and the SQLite
+    /// TEXT-backed wrappers — issue #2582); plain primitives
+    /// (`String`, integers, …) leave it `None`.
+    Primitive {
+        json_type: &'static str,
+        format: Option<&'static str>,
+    },
     /// A JSON array whose items follow the referenced sub-schema. Used
     /// for handlers that return `Json<Vec<T>>` (or accept one as a
     /// request body) — emitting `Ref` for those would produce an
@@ -510,6 +519,99 @@ impl_primitive_schema!(u64, "integer", "integer");
 impl_primitive_schema!(f32, "number", "number");
 impl_primitive_schema!(f64, "number", "number");
 impl_primitive_schema!(serde_json::Value, "object", "object");
+
+/// Derive an [`OpenApiSchema`] impl for a type that serializes as a single
+/// JSON scalar but is not a language primitive (issue #2582): `uuid::Uuid`,
+/// `rust_decimal::Decimal`, the chrono date/time types, and the SQLite
+/// TEXT-backed wrappers (`db::sqlite_types`). Without these, every such
+/// model field fell through to the named-object `$ref` branch, so a
+/// generated client read the spec and built an object where the server
+/// sends a string.
+///
+/// `$format` is the JSON-Schema `format` keyword the type deserves, or
+/// `None` for a bare `string`. `NaiveDateTime` deliberately carries NO
+/// `format`: `date-time` is an RFC 3339 production that *requires* a UTC
+/// offset, but `NaiveDateTime` serializes without one — claiming it would
+/// make a strict validator reject the server's real payload (same rule as
+/// `scalar_json_schema` in `autumn-macros/src/schema.rs`).
+macro_rules! impl_scalar_schema {
+    ($ty:ty, $name:literal, $json:literal, $format:expr, $description:expr) => {
+        impl OpenApiSchema for $ty {
+            fn schema_name() -> &'static str {
+                $name
+            }
+            fn schema() -> serde_json::Value {
+                let mut schema = serde_json::Map::new();
+                schema.insert(
+                    "type".to_owned(),
+                    serde_json::Value::String($json.to_owned()),
+                );
+                let format: ::core::option::Option<&str> = $format;
+                if let Some(format) = format {
+                    schema.insert(
+                        "format".to_owned(),
+                        serde_json::Value::String(format.to_owned()),
+                    );
+                }
+                let description: ::core::option::Option<&str> = $description;
+                if let Some(description) = description {
+                    schema.insert(
+                        "description".to_owned(),
+                        serde_json::Value::String(description.to_owned()),
+                    );
+                }
+                serde_json::Value::Object(schema)
+            }
+        }
+    };
+}
+
+// `Decimal` serializes as a JSON **string** under this workspace's
+// `rust_decimal` feature set (`serde` only — verified against the
+// `Serialize` impl: without `serde-float`/`serde-arbitrary-precision` it
+// calls `serializer.serialize_str`). An app that unifies
+// `rust_decimal/serde-float` onto the build changes the wire shape to a
+// JSON number; the schema then describes the framework's own build, not
+// that app's (issue #2582).
+impl_scalar_schema!(uuid::Uuid, "Uuid", "string", Some("uuid"), None);
+impl_scalar_schema!(
+    rust_decimal::Decimal,
+    "Decimal",
+    "string",
+    Some("decimal"),
+    None
+);
+impl_scalar_schema!(
+    chrono::DateTime<chrono::Utc>,
+    "DateTime",
+    "string",
+    Some("date-time"),
+    None
+);
+impl_scalar_schema!(
+    chrono::NaiveDateTime,
+    "NaiveDateTime",
+    "string",
+    None,
+    Some("ISO 8601 date-time with no UTC offset, e.g. 2026-09-06T18:00:00")
+);
+impl_scalar_schema!(chrono::NaiveDate, "NaiveDate", "string", Some("date"), None);
+#[cfg(feature = "sqlite")]
+impl_scalar_schema!(
+    crate::db::sqlite_types::SqliteUuid,
+    "SqliteUuid",
+    "string",
+    Some("uuid"),
+    None
+);
+#[cfg(feature = "sqlite")]
+impl_scalar_schema!(
+    crate::db::sqlite_types::SqliteDecimal,
+    "SqliteDecimal",
+    "string",
+    Some("decimal"),
+    None
+);
 
 // ──────────────────────────────────────────────────────────────────
 // Compile-time inventory of `#[derive(OpenApiSchema)]` component schemas.
@@ -1109,7 +1211,7 @@ fn wrapper_is_impostor(entry: &SchemaEntry) -> bool {
     let prefixes: &[&str] = match entry.kind {
         SchemaKind::Array(_) => &VEC_TYPE_NAME_PREFIXES,
         SchemaKind::Nullable(_) => &OPTION_TYPE_NAME_PREFIXES,
-        SchemaKind::Ref | SchemaKind::Primitive(_) => return false,
+        SchemaKind::Ref | SchemaKind::Primitive { .. } => return false,
     };
     entry.identity.is_some_and(|resolve| {
         let identity = resolve();
@@ -1170,7 +1272,7 @@ fn flatten_ref_entries(entry: &SchemaEntry) -> Vec<&SchemaEntry> {
     match entry.kind {
         SchemaKind::Ref => vec![entry],
         SchemaKind::Array(inner) | SchemaKind::Nullable(inner) => flatten_ref_entries(inner),
-        SchemaKind::Primitive(_) => Vec::new(),
+        SchemaKind::Primitive { .. } => Vec::new(),
     }
 }
 
@@ -1672,7 +1774,20 @@ fn schema_value_for(entry: &SchemaEntry, index: &SchemaComponentIndex) -> serde_
         return arbitrary_json_schema();
     }
     match entry.kind {
-        SchemaKind::Primitive(json_type) => serde_json::json!({ "type": json_type }),
+        SchemaKind::Primitive { json_type, format } => {
+            let mut schema = serde_json::Map::new();
+            schema.insert(
+                "type".to_owned(),
+                serde_json::Value::String((*json_type).to_owned()),
+            );
+            if let Some(format) = format {
+                schema.insert(
+                    "format".to_owned(),
+                    serde_json::Value::String((*format).to_owned()),
+                );
+            }
+            serde_json::Value::Object(schema)
+        }
         SchemaKind::Ref => {
             serde_json::json!({ "$ref": format!("#/components/schemas/{}", index.display_key(entry)) })
         }
@@ -1704,8 +1819,19 @@ fn schema_value_for(entry: &SchemaEntry, index: &SchemaComponentIndex) -> serde_
                         ],
                     })
                 }
-                SchemaKind::Primitive(base_type) => {
-                    serde_json::json!({ "type": [base_type, "null"] })
+                SchemaKind::Primitive {
+                    json_type: base_type,
+                    format,
+                } => {
+                    let mut schema = serde_json::Map::new();
+                    schema.insert("type".to_owned(), serde_json::json!([base_type, "null"]));
+                    if let Some(format) = format {
+                        schema.insert(
+                            "format".to_owned(),
+                            serde_json::Value::String((*format).to_owned()),
+                        );
+                    }
+                    serde_json::Value::Object(schema)
                 }
             }
         }
@@ -2215,7 +2341,10 @@ mod tests {
         let mut doc = make_doc();
         doc.response = Some(SchemaEntry {
             name: "string",
-            kind: SchemaKind::Primitive("string"),
+            kind: SchemaKind::Primitive {
+                json_type: "string",
+                format: None,
+            },
             identity: None,
         });
         let config = OpenApiConfig::new("Demo", "1.0.0");
@@ -2401,7 +2530,10 @@ mod tests {
         // primitives instead of the 3.0 `nullable: true` flag.
         static INNER: SchemaEntry = SchemaEntry {
             name: "integer",
-            kind: SchemaKind::Primitive("integer"),
+            kind: SchemaKind::Primitive {
+                json_type: "integer",
+                format: None,
+            },
             identity: None,
         };
         let entry = SchemaEntry {
@@ -2512,6 +2644,105 @@ mod tests {
         assert_eq!(<i32 as OpenApiSchema>::schema_name(), "integer");
         assert_eq!(<bool as OpenApiSchema>::schema_name(), "boolean");
         assert_eq!(<f64 as OpenApiSchema>::schema_name(), "number");
+    }
+
+    /// Issue #2582: scalar newtypes serialize as a single scalar, so their
+    /// `OpenApiSchema` must be a scalar schema with the right `format` —
+    /// not the named-object `$ref` they fell through to before.
+    #[test]
+    fn scalar_impls_emit_scalar_schemas_with_format() {
+        assert_eq!(
+            <uuid::Uuid as OpenApiSchema>::schema(),
+            serde_json::json!({ "type": "string", "format": "uuid" })
+        );
+        assert_eq!(
+            <rust_decimal::Decimal as OpenApiSchema>::schema(),
+            serde_json::json!({ "type": "string", "format": "decimal" })
+        );
+        assert_eq!(
+            <chrono::DateTime<chrono::Utc> as OpenApiSchema>::schema(),
+            serde_json::json!({ "type": "string", "format": "date-time" })
+        );
+        assert_eq!(
+            <chrono::NaiveDate as OpenApiSchema>::schema(),
+            serde_json::json!({ "type": "string", "format": "date" })
+        );
+        // `NaiveDateTime` carries no `format` (its serialization has no UTC
+        // offset, so `date-time` would be a lie) — just the description the
+        // model-field path emits for it.
+        let naive = <chrono::NaiveDateTime as OpenApiSchema>::schema();
+        assert_eq!(naive.get("type"), Some(&serde_json::json!("string")));
+        assert!(naive.get("format").is_none());
+        assert!(naive.get("description").is_some());
+    }
+
+    /// The emitted `Decimal` contract matches its actual serde output under
+    /// this workspace's feature set: a JSON string, not a number (issue
+    /// #2582 — the shape is asserted by round-trip, not by default).
+    #[test]
+    fn decimal_schema_matches_decimal_serde_output() {
+        let value = rust_decimal::Decimal::new(123456, 4);
+        let json = serde_json::to_value(value).expect("Decimal serializes");
+        assert!(
+            json.is_string(),
+            "rust_decimal serializes as {json} under this workspace's features; \
+             the schema must say \"string\""
+        );
+        let schema = <rust_decimal::Decimal as OpenApiSchema>::schema();
+        assert_eq!(schema.get("type"), Some(&serde_json::json!("string")));
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn sqlite_wrapper_impls_match_their_inner_scalars() {
+        use crate::db::sqlite_types::{SqliteDecimal, SqliteUuid};
+        // Both wrappers are `#[serde(transparent)]`, so their schemas are
+        // their inner types' schemas.
+        assert_eq!(
+            <SqliteUuid as OpenApiSchema>::schema(),
+            <uuid::Uuid as OpenApiSchema>::schema()
+        );
+        assert_eq!(
+            <SqliteDecimal as OpenApiSchema>::schema(),
+            <rust_decimal::Decimal as OpenApiSchema>::schema()
+        );
+    }
+
+    /// A `Primitive` entry carrying a `format` renders it (issue #2582); a
+    /// nullable one keeps the OpenAPI 3.1 type-array form AND the format.
+    #[test]
+    fn primitive_entry_renders_its_format() {
+        let entry = SchemaEntry {
+            name: "Uuid",
+            kind: SchemaKind::Primitive {
+                json_type: "string",
+                format: Some("uuid"),
+            },
+            identity: None,
+        };
+        let index = SchemaComponentIndex::default();
+        assert_eq!(
+            schema_value_for(&entry, &index),
+            serde_json::json!({ "type": "string", "format": "uuid" })
+        );
+
+        static INNER: SchemaEntry = SchemaEntry {
+            name: "Uuid",
+            kind: SchemaKind::Primitive {
+                json_type: "string",
+                format: Some("uuid"),
+            },
+            identity: None,
+        };
+        let nullable = SchemaEntry {
+            name: "nullable",
+            kind: SchemaKind::Nullable(&INNER),
+            identity: None,
+        };
+        assert_eq!(
+            schema_value_for(&nullable, &index),
+            serde_json::json!({ "type": ["string", "null"], "format": "uuid" })
+        );
     }
 
     #[test]

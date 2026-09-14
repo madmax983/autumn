@@ -793,10 +793,22 @@ pub fn emit_json_schema_tokens(ty: &syn::Type) -> TokenStream {
 /// non-primitive type that nevertheless serializes as a single scalar.
 ///
 /// Deliberately narrow: only types whose serde output is unambiguous.
-/// Numeric-adjacent wrappers (`Decimal`, `BigDecimal`) are left out on purpose —
-/// whether they serialize as a JSON number or a string depends on which serde
-/// feature the app enabled, and an opaque placeholder beats a confidently wrong
-/// scalar.
+///
+/// `Decimal` is in the table as of issue #2582, which settled the old
+/// deliberate exclusion: this workspace enables only `rust_decimal`'s
+/// `serde` feature (no `serde-float`, no `serde-arbitrary-precision`), and
+/// the crate's `Serialize` impl without those calls
+/// `serializer.serialize_str` — the wire shape is a JSON string, verified
+/// by a round-trip test rather than assumed. Caveat, stated plainly: an
+/// app that unifies `rust_decimal/serde-float` onto its own build changes
+/// the wire shape to a JSON number, and this table then describes the
+/// framework's build, not that app's. (`BigDecimal` stays out: no
+/// workspace pin to verify against.)
+///
+/// The SQLite TEXT-backed wrappers (`SqliteUuid`, `SqliteDecimal`) are
+/// `#[serde(transparent)]`, so they serialize exactly as their inner
+/// types and take the same contract — keeping SQLite and Postgres apps in
+/// agreement (issue #2582).
 ///
 /// The **naive** chrono types deliberately carry NO `format`. `OpenAPI`'s
 /// `date-time` and `time` are RFC 3339 productions that *require* a UTC offset,
@@ -942,6 +954,9 @@ fn scalar_json_schema(
             Some("ISO 8601 time with no UTC offset, e.g. 18:00:00"),
         ),
         "Uuid" => ("string", Some("uuid"), None),
+        "Decimal" => ("string", Some("decimal"), None),
+        "SqliteUuid" => ("string", Some("uuid"), None),
+        "SqliteDecimal" => ("string", Some("decimal"), None),
         _ => return None,
     })
 }
@@ -962,7 +977,7 @@ fn scalar_json_schema(
 /// `DateTime<Tz>` is compared on the part before `<`, because the zone is a
 /// parameter: `DateTime<Utc>`, `DateTime<Local>` and `DateTime<Tz>` are all
 /// genuinely chrono's. Everything else is compared whole.
-fn scalar_identity_predicate(name: &str) -> Option<TokenStream> {
+pub(crate) fn scalar_identity_predicate(name: &str) -> Option<TokenStream> {
     let chrono = quote! { ::autumn_web::reexports::chrono };
     let real: TokenStream = match name {
         "DateTime" => {
@@ -978,6 +993,11 @@ fn scalar_identity_predicate(name: &str) -> Option<TokenStream> {
         "NaiveDateTime" => quote! { #chrono::NaiveDateTime },
         "NaiveTime" => quote! { #chrono::NaiveTime },
         "Uuid" => quote! { ::autumn_web::reexports::uuid::Uuid },
+        "Decimal" => quote! { ::autumn_web::reexports::rust_decimal::Decimal },
+        // The SQLite wrappers are `#[serde(transparent)]` newtypes, so their
+        // identity is their own path, not the inner type's.
+        "SqliteUuid" => quote! { ::autumn_web::db::sqlite_types::SqliteUuid },
+        "SqliteDecimal" => quote! { ::autumn_web::db::sqlite_types::SqliteDecimal },
         _ => return None,
     };
     Some(quote! { __identity == ::core::any::type_name::<#real>() })
@@ -1289,5 +1309,63 @@ mod tests {
         }
         // A rule serde itself rejects resolves to no rename here.
         assert_eq!(apply_serde_rename_all_rule("bogusCase", "word_count"), None);
+    }
+
+    /// Issue #2582: the scalar table must cover the whole family, and every
+    /// covered name must have an identity predicate (the `expect` at the
+    /// call site would panic at expansion time otherwise).
+    #[test]
+    fn scalar_table_covers_the_scalar_family_with_predicates() {
+        let cases = [
+            ("DateTime", "string", Some("date-time")),
+            ("NaiveDate", "string", Some("date")),
+            ("NaiveDateTime", "string", None),
+            ("NaiveTime", "string", None),
+            ("Uuid", "string", Some("uuid")),
+            ("Decimal", "string", Some("decimal")),
+            ("SqliteUuid", "string", Some("uuid")),
+            ("SqliteDecimal", "string", Some("decimal")),
+        ];
+        for (name, json_type, format) in cases {
+            let (ty, fmt, _) = scalar_json_schema(name).unwrap_or_else(|| panic!("{name} covered"));
+            assert_eq!(ty, json_type, "{name}");
+            assert_eq!(fmt, format, "{name}");
+            assert!(
+                scalar_identity_predicate(name).is_some(),
+                "{name} has an identity predicate"
+            );
+        }
+        for unknown in ["String", "Foo", "BigDecimal", "Date"] {
+            assert_eq!(scalar_json_schema(unknown), None, "{unknown}");
+            assert_eq!(scalar_identity_predicate(unknown), None, "{unknown}");
+        }
+    }
+
+    /// The identity predicates name the genuine types through
+    /// `autumn_web`'s re-exports — no hand-written path prefixes that a
+    /// downstream crate of the same name could satisfy (issue #802).
+    #[test]
+    fn scalar_identity_predicates_use_reexport_paths() {
+        let decimal = scalar_identity_predicate("Decimal")
+            .expect("Decimal predicate")
+            .to_string();
+        assert!(
+            decimal.contains("autumn_web :: reexports :: rust_decimal :: Decimal"),
+            "{decimal}"
+        );
+        let sqlite_uuid = scalar_identity_predicate("SqliteUuid")
+            .expect("SqliteUuid predicate")
+            .to_string();
+        assert!(
+            sqlite_uuid.contains("autumn_web :: db :: sqlite_types :: SqliteUuid"),
+            "{sqlite_uuid}"
+        );
+        let sqlite_decimal = scalar_identity_predicate("SqliteDecimal")
+            .expect("SqliteDecimal predicate")
+            .to_string();
+        assert!(
+            sqlite_decimal.contains("autumn_web :: db :: sqlite_types :: SqliteDecimal"),
+            "{sqlite_decimal}"
+        );
     }
 }

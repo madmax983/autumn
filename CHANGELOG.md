@@ -40,6 +40,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and generated-trait level), plus the corresponding rule in
   `docs/guide/commentable.md`.
 
+- **OpenAPI/MCP schemas document `Uuid`, `Decimal` and chrono date/time
+  fields as scalars instead of object `$ref`s (#2582):** `uuid::Uuid`,
+  `rust_decimal::Decimal`, `chrono::DateTime<Utc>`, `chrono::NaiveDateTime`,
+  `chrono::NaiveDate` — plus the SQLite wrappers `SqliteUuid` and
+  `SqliteDecimal` — previously rendered as opaque object references in
+  both the OpenAPI document and MCP `inputSchema`. They now emit their
+  true wire contracts (`type: string` with `format: uuid` / `decimal` /
+  `date-time` / `date`; `NaiveDateTime` takes a bare `string` plus a
+  description since it serializes with no UTC offset and must not claim
+  RFC 3339 `date-time`). The mapping is runtime identity-guarded exactly
+  like the model-field scalar table, so an application type that merely
+  shares one of these names keeps its honest `$ref`. Note for Postgres
+  apps: this changes existing OpenAPI output — fields that used to appear
+  as `{"$ref": "#/components/schemas/Uuid"}` now appear inline as
+  `{"type": "string", "format": "uuid"}`. `Decimal` is `type: string`
+  because this workspace enables only `rust_decimal`'s `serde` feature,
+  under which the crate serializes as a string (verified by a serde
+  round-trip test, not assumed).
+
 ### Added
 
 - **Build-checked typed contracts between two Autumn services (#1755):** the day

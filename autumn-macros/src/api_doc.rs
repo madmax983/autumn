@@ -626,11 +626,57 @@ fn schema_entry_for_type(ty: &syn::Type) -> TokenStream {
     let name_lit = LitStr::new(&name, Span::call_site());
     if let Some(json_type) = primitive_json_type(&name) {
         let json_lit = LitStr::new(json_type, Span::call_site());
-        quote! {
-            ::autumn_web::openapi::SchemaEntry {
-                name: #name_lit,
-                kind: ::autumn_web::openapi::SchemaKind::Primitive(#json_lit),
-                identity: ::core::option::Option::None,
+        // Scalar-family types (`Uuid`, `Decimal`, chrono date/times and the
+        // SQLite wrappers — issue #2582) carry a `format`, and unlike the
+        // language primitives they are plausible application type names — so
+        // the mapping is runtime-guarded on the type's real identity, exactly
+        // like the model-field scalar table: a genuine `uuid::Uuid` becomes
+        // an inline scalar, anything else keeps the honest `$ref` the
+        // fallback emits (issue #802).
+        if is_scalar_family_type(&name) {
+            let format = primitive_json_format(&name);
+            let format_tokens = match format {
+                Some(format) => {
+                    let format_lit = LitStr::new(format, Span::call_site());
+                    quote! { ::core::option::Option::Some(#format_lit) }
+                }
+                // `NaiveDateTime` serializes with no UTC offset, so it takes
+                // no `format` — a bare string, like the model-field table.
+                None => quote! { ::core::option::Option::None },
+            };
+            let predicate = crate::schema::scalar_identity_predicate(&name)
+                .expect("every scalar-family name has an identity predicate");
+            quote! {{
+                let __identity = ::core::any::type_name::<#ty>();
+                if #predicate {
+                    ::autumn_web::openapi::SchemaEntry {
+                        name: #name_lit,
+                        kind: ::autumn_web::openapi::SchemaKind::Primitive {
+                            json_type: #json_lit,
+                            format: #format_tokens,
+                        },
+                        identity: ::core::option::Option::None,
+                    }
+                } else {
+                    ::autumn_web::openapi::SchemaEntry {
+                        name: #name_lit,
+                        kind: ::autumn_web::openapi::SchemaKind::Ref,
+                        identity: ::core::option::Option::Some(
+                            ::autumn_web::openapi::type_name_of::<#ty>
+                        ),
+                    }
+                }
+            }}
+        } else {
+            quote! {
+                ::autumn_web::openapi::SchemaEntry {
+                    name: #name_lit,
+                    kind: ::autumn_web::openapi::SchemaKind::Primitive {
+                        json_type: #json_lit,
+                        format: ::core::option::Option::None,
+                    },
+                    identity: ::core::option::Option::None,
+                }
             }
         }
     } else {
@@ -650,6 +696,13 @@ fn schema_entry_for_type(ty: &syn::Type) -> TokenStream {
 }
 
 /// Map a short Rust primitive name to its JSON-schema `type` keyword.
+///
+/// Extended by issue #2582 with the scalar family (`Uuid`, `Decimal`, the
+/// chrono date/time types and the SQLite TEXT-backed wrappers): every one
+/// serializes as a JSON string, so they map to `"string"` here, with their
+/// `format` supplied by [`primitive_json_format`]. Like the primitives, this
+/// matches on the last path segment; the scalar family additionally gets a
+/// runtime identity guard at the emission site (see `schema_entry_for_type`).
 pub fn primitive_json_type(name: &str) -> Option<&'static str> {
     Some(match name {
         "String" | "str" => "string",
@@ -658,6 +711,47 @@ pub fn primitive_json_type(name: &str) -> Option<&'static str> {
             "integer"
         }
         "f32" | "f64" => "number",
+        // Issue #2582: scalar newtypes that serialize as a JSON string.
+        "Uuid" | "Decimal" | "DateTime" | "NaiveDateTime" | "NaiveDate" | "SqliteUuid"
+        | "SqliteDecimal" => "string",
+        _ => return None,
+    })
+}
+
+/// Whether `name` is one of the scalar-family types whose mapping
+/// [`primitive_json_type`] gained in issue #2582 (`Uuid`, `Decimal`, the
+/// chrono date/time types and the SQLite TEXT-backed wrappers).
+///
+/// These take the runtime identity guard at the emission site (unlike the
+/// language primitives): each is a plausible application type name, and an
+/// underived colliding type must keep its honest `$ref` (issue #802).
+/// Covers exactly the names `scalar_identity_predicate` (`crate::schema`)
+/// guards — `NaiveTime` is deliberately absent: the issue defines the
+/// family without it.
+pub fn is_scalar_family_type(name: &str) -> bool {
+    matches!(
+        name,
+        "Uuid"
+            | "Decimal"
+            | "DateTime"
+            | "NaiveDateTime"
+            | "NaiveDate"
+            | "SqliteUuid"
+            | "SqliteDecimal"
+    )
+}
+
+/// The JSON-Schema `format` keyword for the scalar-family names recognized
+/// by [`primitive_json_type`] (issue #2582), or `None` for the plain
+/// primitives — and for `NaiveDateTime`, which serializes with no UTC
+/// offset, so `date-time` would be a lie (same rule as the model-field
+/// scalar table).
+pub fn primitive_json_format(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "Uuid" | "SqliteUuid" => "uuid",
+        "Decimal" | "SqliteDecimal" => "decimal",
+        "DateTime" => "date-time",
+        "NaiveDate" => "date",
         _ => return None,
     })
 }
@@ -1262,6 +1356,69 @@ mod tests {
         assert_eq!(primitive_json_type("i64"), Some("integer"));
         assert_eq!(primitive_json_type("bool"), Some("boolean"));
         assert_eq!(primitive_json_type("Foo"), None);
+    }
+
+    /// Issue #2582: the scalar family maps to `"string"` with a `format`.
+    #[test]
+    fn primitive_json_type_maps_the_scalar_family_to_string() {
+        for name in [
+            "Uuid",
+            "Decimal",
+            "DateTime",
+            "NaiveDateTime",
+            "NaiveDate",
+            "SqliteUuid",
+            "SqliteDecimal",
+        ] {
+            assert_eq!(primitive_json_type(name), Some("string"), "{name}");
+            assert!(is_scalar_family_type(name), "{name}");
+        }
+        // `NaiveTime` is deliberately outside the issue's family.
+        assert_eq!(primitive_json_type("NaiveTime"), None);
+        assert!(!is_scalar_family_type("NaiveTime"));
+        // Plain primitives are not scalar-family members.
+        for name in ["String", "bool", "i64", "f64"] {
+            assert!(!is_scalar_family_type(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn primitive_json_format_covers_the_family() {
+        assert_eq!(primitive_json_format("Uuid"), Some("uuid"));
+        assert_eq!(primitive_json_format("SqliteUuid"), Some("uuid"));
+        assert_eq!(primitive_json_format("Decimal"), Some("decimal"));
+        assert_eq!(primitive_json_format("SqliteDecimal"), Some("decimal"));
+        assert_eq!(primitive_json_format("DateTime"), Some("date-time"));
+        assert_eq!(primitive_json_format("NaiveDate"), Some("date"));
+        // `NaiveDateTime` takes no format (no UTC offset in its wire shape).
+        assert_eq!(primitive_json_format("NaiveDateTime"), None);
+        assert_eq!(primitive_json_format("String"), None);
+        assert_eq!(primitive_json_format("i64"), None);
+        assert_eq!(primitive_json_format("Foo"), None);
+    }
+
+    /// The scalar-family branch of `schema_entry_for_type` emits a runtime
+    /// identity guard: the genuine type becomes an inline scalar, a colliding
+    /// application type keeps the `$ref` fallback (issue #802).
+    #[test]
+    fn schema_entry_for_scalar_family_is_identity_guarded() {
+        let ty: syn::Type = syn::parse_quote!(uuid::Uuid);
+        let tokens = schema_entry_for_type(&ty).to_string();
+        assert!(tokens.contains("Primitive"), "{tokens}");
+        assert!(tokens.contains("__identity"), "{tokens}");
+        // The guard's else-branch is the same `$ref` the general fallback
+        // emits, so a colliding application `Uuid` stays honest.
+        assert!(tokens.contains("Ref"), "{tokens}");
+        assert!(tokens.contains("type_name_of"), "{tokens}");
+    }
+
+    /// Plain primitives keep the old unguarded inline shape.
+    #[test]
+    fn schema_entry_for_plain_primitive_is_unguarded() {
+        let ty: syn::Type = syn::parse_quote!(String);
+        let tokens = schema_entry_for_type(&ty).to_string();
+        assert!(tokens.contains("Primitive"), "{tokens}");
+        assert!(!tokens.contains("__identity"), "{tokens}");
     }
 
     #[test]
