@@ -1164,6 +1164,20 @@ pub(crate) const DRIFT_PROXY_OPTIONS_UNREADABLE: &str =
 pub(crate) const DRIFT_PROXY_PORT_MISMATCH: &str =
     "the installed proxy unit binds a different public port than `[server] port` configures";
 
+/// State drift: this host's installed kamal-proxy unit exists, but its
+/// `--http-port` could not be read (issue #2278).
+///
+/// The redeploy path FAILS CLOSED on exactly this shape — a public-port move
+/// cannot be proven safe without knowing the installed port — so the host's NEXT
+/// deploy is guaranteed to refuse. That is "per-host marker damage that fails the
+/// NEXT deploy closed", the very category `state_drift` exists for.
+/// [`InstalledProxyPort::Absent`] is deliberately NOT drift: a host that has never
+/// been deployed has no unit file to read, and flagging that would make every
+/// pre-first-deploy fleet permanently "drifted". The same holds for `Unreadable`
+/// on a [`HostMode::First`] host, which by construction has no installed unit yet.
+pub(crate) const DRIFT_INSTALLED_PROXY_PORT_UNREADABLE: &str = "the installed kamal-proxy unit's --http-port is unreadable — the NEXT deploy of this host \
+     will refuse until the installed unit names a legible port";
+
 /// State drift: this host claims a promoted release its `current` symlink could
 /// not be resolved to (issue #1621, review round 2).
 ///
@@ -1442,12 +1456,28 @@ pub(crate) fn fleet_drift(hosts: &[HostStatus]) -> DriftReport {
         if matches!(status.proxy_options, exec::ProxyOptionsMarker::Unreadable) {
             state_drift.push((status.host.clone(), DRIFT_PROXY_OPTIONS_UNREADABLE));
         }
-        // Only a PROVEN different port is drift: `Absent` (no unit yet) and
-        // `Unreadable` are handled by the deploy path's own fail-closed guard, and
-        // reporting them here would flag every never-deployed host.
+        // Only a PROVEN different port is drift here: `Absent` (no unit yet) is
+        // handled by the deploy path's own fail-closed guard, and reporting it
+        // would flag every never-deployed host. `Unreadable` is reported by the
+        // mode-aware rule below, not here — same reasoning, narrower blast radius.
         if matches!(status.installed_proxy_port, exec::InstalledProxyPort::Port(port) if port != status.public_port)
         {
             state_drift.push((status.host.clone(), DRIFT_PROXY_PORT_MISMATCH));
+        }
+        // #2278: `Unreadable` on a `Redeploy` host is marker damage that fails the
+        // NEXT deploy closed (the redeploy path fails closed on an unprovable
+        // installed port), so it is state drift, judged against nothing like the
+        // `DRIFT_RELEASE_UNREADABLE` rule above. `Absent` stays silent — a host
+        // that has never been deployed has no unit to read — and so does
+        // `Unreadable` on a `First`-mode host, where no unit could have been
+        // installed yet.
+        if status.mode == Some(HostMode::Redeploy)
+            && matches!(
+                status.installed_proxy_port,
+                exec::InstalledProxyPort::Unreadable
+            )
+        {
+            state_drift.push((status.host.clone(), DRIFT_INSTALLED_PROXY_PORT_UNREADABLE));
         }
         // Review round 1: the maintenance column is only as good as the CLI's
         // knowledge of WHICH file the running unit polls. Both failure shapes are
@@ -3828,6 +3858,70 @@ mod tests {
                 .join("\n")
                 .contains("reported, not counted as drift"),
             "an unreachable host is still reported, not blamed",
+        );
+    }
+
+    #[test]
+    fn a_redeployed_host_with_an_unreadable_proxy_port_is_state_drift() {
+        // #2278. A reachable `Redeploy` host whose installed kamal-proxy unit
+        // exists but whose `--http-port` cannot be read used to render `proxy ?`
+        // and nothing else, so `deploy status --strict` exited 0 — while the
+        // host's NEXT deploy is guaranteed to refuse closed, because the redeploy
+        // path's concurrent-port-change guard refuses an unprovable installed
+        // port. That is precisely the "marker damage that fails the NEXT deploy
+        // closed" category state drift exists for.
+        let mut damaged = status("web-b", Some("r1"));
+        damaged.installed_proxy_port = exec::InstalledProxyPort::Unreadable;
+        let rows = [status("web-a", Some("r1")), damaged];
+        let report = fleet_drift(&rows);
+
+        assert!(
+            !report.version_drift,
+            "an unreadable proxy port is never VERSION drift: {:?}",
+            report.releases
+        );
+        assert_eq!(
+            report.state_drift,
+            vec![("web-b".to_owned(), DRIFT_INSTALLED_PROXY_PORT_UNREADABLE)],
+            "the damaged host is named with its own reason"
+        );
+        assert!(
+            report.drifted(),
+            "`deploy status --strict` must exit non-zero on it"
+        );
+
+        let rendered = fleet_status_lines(&rows, &report).join("\n");
+        assert!(
+            rendered.contains(DRIFT_INSTALLED_PROXY_PORT_UNREADABLE),
+            "the drift reason must be named on the row:\n{rendered}"
+        );
+
+        // `Absent` is the healthy pre-first-deploy shape — flagging it would make
+        // every never-deployed fleet permanently "drifted".
+        let mut never_deployed = status("web-c", Some("r1"));
+        never_deployed.installed_proxy_port = exec::InstalledProxyPort::Absent;
+        let absent_report = fleet_drift(&[status("web-a", Some("r1")), never_deployed]);
+        assert!(
+            absent_report.state_drift.is_empty(),
+            "an absent proxy port stays silent: {:?}",
+            absent_report.state_drift
+        );
+
+        // So does `Unreadable` on a `First`-mode host: no unit could have been
+        // installed yet, so there is nothing damaged. (The first-mode host still
+        // gets the usual peer-judged `DRIFT_HOST_NOT_DEPLOYED`, which is the
+        // point: the new rule must add nothing on top of it.)
+        let mut first_mode = status("web-d", None);
+        first_mode.mode = Some(HostMode::First);
+        first_mode.installed_proxy_port = exec::InstalledProxyPort::Unreadable;
+        let first_report = fleet_drift(&[status("web-a", Some("r1")), first_mode]);
+        assert!(
+            !first_report
+                .state_drift
+                .iter()
+                .any(|(_, reason)| *reason == DRIFT_INSTALLED_PROXY_PORT_UNREADABLE),
+            "an unreadable proxy port on a first-mode host adds no drift: {:?}",
+            first_report.state_drift
         );
     }
 
