@@ -125,9 +125,12 @@ fn this_modules_mutations() -> Vec<Mutation> {
 }
 
 fn read_named(id: &str) -> CachedRead {
+    // Since #2358 the identity is `module::<fn>@file:line:column`, so the
+    // name is matched as a `::<name>@` infix rather than a suffix.
+    let infix = format!("::{id}@");
     this_modules_reads()
         .into_iter()
-        .find(|r| r.id.ends_with(id))
+        .find(|r| r.id.contains(&infix))
         .unwrap_or_else(|| panic!("{id} was never registered"))
 }
 
@@ -292,7 +295,7 @@ fn the_gate_catches_the_seeded_bug_and_only_the_seeded_bug() {
             .iter()
             .next()
             .unwrap()
-            .ends_with("coherence_post_count"),
+            .contains("::coherence_post_count@"),
         "got {stale:?}"
     );
 
@@ -330,7 +333,7 @@ fn the_manifest_is_emitted_as_a_build_artifact() {
         .as_array()
         .unwrap()
         .iter()
-        .find(|v| v["id"].as_str().unwrap().ends_with("coherence_opaque"))
+        .find(|v| v["id"].as_str().unwrap().contains("::coherence_opaque@"))
         .expect("the underivable read must be reported");
     assert!(
         opaque["location"]

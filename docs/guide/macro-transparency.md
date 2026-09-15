@@ -1195,7 +1195,7 @@ async fn get_user(id: i64) -> AutumnResult<User> {
     // `const _` that an `impl` block cannot hold.
     inventory::submit! {
         CachedReadDescriptor {
-            id: concat!(module_path!(), "::", "get_user"),
+            id: concat!(module_path!(), "::", "get_user", "@", file!(), ":", line!(), ":", column!()),
             kind: ReadKind::Cached,
             reads: &[/* declared `reads(...)`, else what derivation found */],
             provenance: DependencyProvenance::Undetermined,
@@ -1208,13 +1208,13 @@ async fn get_user(id: i64) -> AutumnResult<User> {
     static __AUTUMN_CACHE: OnceLock<Arc<MokaCache>> = OnceLock::new();
     let __autumn_moka = __AUTUMN_CACHE.get_or_init(|| {
         let store = Arc::new(MokaCache::new(100, Some(::core::time::Duration::from_secs(300))));
-        coherence::register_namespace_store(concat!(module_path!(), "::", "get_user"), store.clone());
+        coherence::register_namespace_store(concat!(module_path!(), "::", "get_user", "@", file!(), ":", line!(), ":", column!()), store.clone());
         store
     });
     // Prefer a process-wide shared backend (e.g. Redis) when registered,
     // else fall back to the per-function Moka store.
     let __autumn_cache = global_cache().unwrap_or(&**__autumn_moka);
-    let __autumn_key = make_cache_key(concat!(module_path!(), "::", "get_user"), &(id.clone(),));
+    let __autumn_key = make_cache_key(concat!(module_path!(), "::", "get_user", "@", file!(), ":", line!(), ":", column!()), &(id.clone(),));
     if let Some(hit) = get_cached::<User>(__autumn_cache, &__autumn_key) {
         return Ok(hit); // `result` mode caches only Ok values
     }
@@ -1228,11 +1228,11 @@ async fn get_user(id: i64) -> AutumnResult<User> {
 // identity above is spliced rather than referenced through this constant.
 #[doc(hidden)]
 const __AUTUMN_CACHE_READ_ID__get_user: &'static str =
-    concat!(module_path!(), "::", "get_user");
+    concat!(module_path!(), "::", "get_user", "@", file!(), ":", line!(), ":", column!());
 
 #[doc(hidden)]
 fn __autumn_cache_invalidate__get_user() -> bool {
-    coherence::invalidate_namespace(concat!(module_path!(), "::", "get_user"))
+    coherence::invalidate_namespace(concat!(module_path!(), "::", "get_user", "@", file!(), ":", line!(), ":", column!()))
 }
 ```
 
@@ -1245,6 +1245,12 @@ and the cache-coherence pair `reads(Model, …)` / `acknowledge_stale = "…"`.
 **Gotcha:** `#[cached]` cannot be applied to methods with a `self` receiver.
 The `__AUTUMN_CACHE_READ_ID__…` constant inherits the function's visibility, so
 a private cached read cannot be named by an `invalidates(...)` in another module.
+
+**Identity:** the cache-key namespace is `module::<fn>@file:line:column`.
+The trailing source position means two same-named associated functions in one
+module (e.g. `Products::get` and `Reviews::get`) get distinct namespaces and
+can never poison each other's entries (#2358). Changing the identity changes
+every key, so this is a cold-cache-on-deploy change.
 See [Fragment Caching](./fragment-caching.md), [Cache Stampede](./cache-stampede.md)
 and [Cache Coherence](./cache-coherence.md).
 

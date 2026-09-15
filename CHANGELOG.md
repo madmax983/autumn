@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **same-named `#[cached]` associated functions no longer share a cache-key
+  namespace (#2358):** the read identity was `module_path!()::<fn name>`, so
+  two inherent impls in one module with same-named methods (e.g.
+  `Products::get` and `Reviews::get`) keyed every entry identically — with a
+  shared backend one method could be served the other's value, silently. An
+  attribute macro on a method never sees the enclosing `impl`, so the `Self`
+  type cannot be named; the identity now embeds the attribute's own source
+  position (`module::<fn>@file:line:column`), which is distinct for the two
+  methods with no user action. The identity stays a `&'static str` and stays
+  the exact prefix of every runtime key, so `invalidate_namespace`'s prefix
+  sweep is unaffected; the audit's `duplicate_read_ids` remains as the
+  backstop for hand-declared (`declare_cached_read!`) and macro-generated
+  collisions. This is a cold-cache-on-deploy change: keys minted before the
+  upgrade live under the old namespace and simply miss.
 - **🛣️ Onramp: a route-attribute typo (`#[get()]`) no longer cascades through
   `routes![]` into two extra "cannot find" errors, one of them naming an
   internal macro symbol (errors 3→1):** a fresh-context audit of the README

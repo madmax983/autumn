@@ -333,8 +333,22 @@ fn read_id_const_ident(fn_name: &syn::Ident) -> syn::Ident {
 /// the constant by path. In an `impl` block the constant is an ASSOCIATED
 /// const, which a bare path cannot reach; and `module_path!()` names the
 /// enclosing module either way, so every splice is the same string.
+///
+/// The identity is `module_path!()::<fn name>@<file>:<line>:<column>`, not
+/// just `module_path!()::<fn name>`. An attribute macro on a method never sees
+/// the enclosing `impl` block, so the impl's `Self` type cannot be named here
+/// — but two same-named associated functions in one module are still two
+/// different source positions, and `file!()`/`line!()`/`column!()` expand at
+/// the attribute's own span. That closes #2358: `Products::get` and
+/// `Reviews::get` in one module no longer share a cache-key namespace, with
+/// no user action and no new attribute. The identity stays a plain
+/// `&'static str` and stays the exact prefix of every runtime key, so
+/// `invalidate_namespace`'s prefix sweep is unaffected.
+///
+/// This is a cold-cache-on-deploy change: keys minted before the upgrade live
+/// under the old namespace and simply miss.
 fn read_id_expr(fn_name_str: &str) -> TokenStream {
-    quote! { concat!(module_path!(), "::", #fn_name_str) }
+    quote! { concat!(module_path!(), "::", #fn_name_str, "@", file!(), ":", line!(), ":", column!()) }
 }
 
 /// Name of the generated per-read invalidator.
@@ -1313,7 +1327,13 @@ mod tests {
         // it does not resolve. Splicing keeps the runtime key prefix, the
         // registered descriptor, the invalidator's namespace and the constant
         // `invalidates(...)` resolves to provably the same string.
-        let id = "concat ! (module_path ! () , \"::\" , \"recent\")";
+        //
+        // The identity carries the attribute's own source position
+        // (`@file:line:column`, #2358): an attribute macro on a method never
+        // sees the enclosing `impl`, so the `Self` type cannot be named, but
+        // two same-named methods in one module are still two different source
+        // positions and must not share a cache-key namespace.
+        let id = "concat ! (module_path ! () , \"::\" , \"recent\" , \"@\" , file ! () , \":\" , line ! () , \":\" , column ! ())";
         assert_eq!(
             out.matches(id).count(),
             5,
@@ -1333,6 +1353,38 @@ mod tests {
                 "const __AUTUMN_CACHE_READ_ID__recent : & 'static :: core :: primitive :: str = {id}"
             )),
             "{out}"
+        );
+    }
+
+    #[test]
+    fn the_identity_carries_the_source_position_so_same_named_methods_diverge() {
+        // #2358: two `#[cached]` associated functions with the same name in
+        // one module shared one cache-key namespace. The macro cannot name the
+        // enclosing `Self` type (an attribute on a method never sees the
+        // `impl`), so the identity embeds the attribute's own source position
+        // instead. At the token level every expansion renders the same
+        // expression — the divergence happens when rustc expands `file!()` /
+        // `line!()` / `column!()` at each attribute's span — so this pins the
+        // mechanism, and the integration test
+        // `cached_identity::same_named_associated_functions_do_not_share_a_namespace`
+        // proves the runtime divergence.
+        let out = cached_macro(
+            TokenStream::new(),
+            quote! { async fn get(id: i64) -> String { format!("{id}") } },
+        )
+        .to_string();
+        for fragment in ["\"@\"", "file ! ()", "\":\"", "line ! ()", "column ! ()"] {
+            assert!(
+                out.contains(fragment),
+                "the identity must embed the source position so same-named methods diverge; missing {fragment}: {out}"
+            );
+        }
+        // The position-qualified identity is still the exact prefix of the
+        // runtime key: `invalidate_namespace` sweeps Moka/Redis by the
+        // `"{namespace}:"` prefix.
+        assert!(
+            out.contains("make_cache_key (concat ! (module_path ! ()"),
+            "the cache key must still be prefixed with the identity: {out}"
         );
     }
 

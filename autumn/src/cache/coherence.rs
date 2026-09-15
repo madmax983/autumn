@@ -31,9 +31,16 @@
 //! # Identity
 //!
 //! A cached read is identified by its **cache-key namespace** —
-//! `concat!(module_path!(), "::", <fn name>)`, the exact prefix
+//! `concat!(module_path!(), "::", <fn name>, "@", file!(), ":", line!(), ":",
+//! column!())`, the exact prefix
 //! [`make_cache_key`](super::make_cache_key) already stamps on every entry. That
 //! keeps the manifest's identity and the runtime's key space the same string.
+//!
+//! The trailing source position is load-bearing (#2358): an attribute macro on
+//! a method never sees the enclosing `impl`, so the `Self` type cannot be
+//! named — but two same-named associated functions in one module are two
+//! different source positions, and each gets its own namespace (and therefore
+//! its own cache keys) with no user action.
 //!
 //! Models are matched on their **last path segment**, because the two sides
 //! learn the name differently: a `#[repository]` always has the model *type* in
@@ -124,7 +131,9 @@ impl DependencyProvenance {
 /// `'static` and const-constructible so it can be `inventory::submit!`ed from
 /// macro-generated code with no runtime cost.
 pub struct CachedReadDescriptor {
-    /// The cache-key namespace: `concat!(module_path!(), "::", <fn name>)`.
+    /// The cache-key namespace: `concat!(module_path!(), "::", <fn name>, "@",
+    /// `file!(), ":", line!(), ":", column!())` — every runtime key is
+    /// `"{this}:<hash>"`.
     pub id: &'static str,
     /// Which cache surface serves this read.
     pub kind: ReadKind,
@@ -338,13 +347,16 @@ pub fn check(reads: &[CachedRead], mutations: &[Mutation]) -> Vec<StalenessFindi
 
 /// Cache-read identities claimed by more than one registration.
 ///
-/// An identity is `module_path!()::<fn name>`, which two `#[cached]` associated
-/// functions with the same name in two `impl` blocks in one module both
-/// produce — as do a `declare_cached_read!` id chosen to collide with one. The
-/// consequences are real: `invalidates(...)` cannot say which read it means,
-/// and the two share a namespace at runtime. Invalidation clears every store
-/// registered under the identity, so nothing is silently left stale, but the
-/// ambiguity still deserves a name.
+/// Since #2358 the identity embeds the attribute's source position
+/// (`module_path!()::<fn name>@<file>:<line>:<column>`), so two hand-written
+/// `#[cached]` functions can no longer collide by accident. What can still
+/// collide: a `declare_cached_read!` id chosen (or copy-pasted) to match a
+/// generated one, and methods stamped out by a single `macro_rules!` arm,
+/// whose attributes share one definition-site span. The consequences are real:
+/// `invalidates(...)` cannot say which read it means, and the two share a
+/// namespace at runtime. Invalidation clears every store registered under the
+/// identity, so nothing is silently left stale, but the ambiguity still
+/// deserves a name.
 ///
 /// Returns the offending ids, sorted and deduplicated.
 #[must_use]
