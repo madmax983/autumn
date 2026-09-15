@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Single-host `deploy up` now warns when the schema is ahead of the binaries
+  after a failed deploy (#2276):** when a one-host deploy's `migrate` op
+  succeeded and a later op (a `readiness-gate` timeout is the ordinary shape)
+  failed, the candidate was torn down and the previous release kept serving
+  against the already-migrated schema — with nothing on screen saying so. The
+  single-host failure arm now prints the fleet path's schema-ahead warning
+  verbatim before returning the raw executor error. This is a deliberate,
+  documented one-line exception to the AC-1 byte-identity guarantee: it prints
+  only when the migration actually ran (a failure before `migrate`, or on a
+  host that skipped its migration, is silent as before), and never on
+  post-boundary failures that leave the new release serving. Covered by the
+  new `deploy.rs` unit test
+  `single_host_failure_after_migrate_warns_that_schema_is_ahead_of_binaries`.
+
 - **🧭 Wayfinder: redisplay `examples/cms`'s post/page editor on a rejected
   "Scheduled" submission (error-path 0/1 → 1/1, draft preserved):** an
   error-path inventory of `cms`'s content editor — `/admin/content/{type}`

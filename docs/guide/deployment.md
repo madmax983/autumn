@@ -908,30 +908,42 @@ single-host path prints byte-for-byte what it printed before.
 `autumn deploy --help` was also rewritten, and `up`/`rollback` gained `--only`
 and `--no-rollback`; no existing flag changed meaning.
 
-> **Known limitation — a single-host deploy that fails after its migration ran
-> says nothing about the schema (#2276).** On one host, a failure at any point is
-> reported as the plain per-host error and the command returns right there: the
-> single-host path deliberately keeps its pre-fleet output byte-for-byte, so it
-> renders no `Fleet state:` summary and therefore none of
-> [the three schema notes](#the-three-schema-notes-on-the-fleet-state-summary).
-> If the failure landed *after* `migrate` but before the cutover — a
-> `readiness-gate` timeout is the ordinary shape — the candidate is torn down and
-> your previous release keeps serving, **against the already-migrated schema**,
-> with nothing on screen saying so. The fleet path does warn in exactly this
-> situation; the single-host path does not yet. This is tracked as
-> [#2276](https://github.com/autumn-foundation/autumn/issues/2276) and is not fixed. Until
-> it is: after any failed single-host `deploy up`, check `autumn migrate status`
-> before assuming the failure left nothing behind — and write expand/contract
-> migrations so the still-serving release fits the migrated schema either way.
+> **One deliberate exception to the byte-identity rule — a single-host deploy
+> that fails after its migration ran says so out loud (#2276).** On one host, a
+> failure at any point is reported as the plain per-host error and the command
+> returns right there: the single-host path deliberately keeps its pre-fleet
+> output byte-for-byte, so it renders no `Fleet state:` summary and therefore
+> none of
+> [the three schema notes](#the-three-schema-notes-on-the-fleet-state-summary)
+> — with exactly one exception. If the failure landed *after* `migrate` but
+> before the cutover — a `readiness-gate` timeout is the ordinary shape — the
+> candidate is torn down and your previous release keeps serving, **against the
+> already-migrated schema**. Staying silent there is dangerous rather than
+> merely terse, so the deploy now prints the same schema-ahead warning the
+> fleet path prints, immediately before the raw error:
+>
+> ```
+> ⚠️  no host is serving the new release, but the migration that already ran was
+> NOT rolled back — the binaries went back and the schema did not; confirm the
+> release now serving still fits the migrated schema
+> ```
+>
+> This is the single exception the AC-1 byte-identity guarantee now carries; it
+> prints only when the migration actually ran (a failure at a step *before*
+> `migrate`, or on a host that skipped its migration, changes nothing). The
+> warning names the hazard — it does not fix it. Confirm the release now
+> serving still fits the migrated schema before deploying again: `autumn
+> migrate status` is how you find out, and writing expand/contract migrations
+> so the still-serving release fits the migrated schema either way is how you
+> stop needing to ask.
 >
 > Since a **first** deploy migrates too
-> ([Migration ordering](#migration-ordering-first-deploy-included)), this now has a
+> ([Migration ordering](#migration-ordering-first-deploy-included)), this has a
 > second shape: a single-host *first* deploy that migrates and then fails its
 > readiness gate tears the release down and leaves **nothing serving at all**
-> against a schema that has already moved. The same advice applies, and more
-> sharply — `autumn migrate status` is how you find out, and the fix for the next
-> attempt is usually just re-running `autumn deploy up`, which is idempotent about
-> an already-applied migration.
+> against a schema that has already moved. The same warning prints, and the
+> same advice applies — the fix for the next attempt is usually just re-running
+> `autumn deploy up`, which is idempotent about an already-applied migration.
 
 ### Rollback
 

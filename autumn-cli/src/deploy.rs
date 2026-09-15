@@ -4014,6 +4014,42 @@ where
     }
 }
 
+/// The schema-ahead warning a FAILED single-host deploy prints (issue #2276).
+///
+/// Pure, so it is pinned by a unit test rather than by reading stderr — the same
+/// reason `fleet::fleet_summary_lines` is pure. Returns `Some(note)` exactly when
+/// the migration already ran and the executor tore the candidate down itself: the
+/// previous release (or nothing, on a first deploy) keeps serving against the
+/// migrated schema, and the raw executor error says nothing about it.
+///
+/// This is a deliberate, documented one-line exception to the AC-1 byte-identity
+/// guarantee (#1621): every other single-host failure path prints nothing extra.
+/// The note is the fleet path's `FLEET_SCHEMA_AHEAD_OF_BINARIES_NOTE` verbatim,
+/// so the two paths cannot phrase the same hazard differently.
+fn single_host_schema_ahead_note(
+    host_plan: &fleet::HostPlan,
+    err: &exec::DeployExecError,
+) -> Option<&'static str> {
+    // The executor only puts the binaries back by itself on its two clean-failure
+    // shapes (its own pre-boundary teardown ran). A post-boundary failure leaves
+    // the host forward or in doubt, and the schema note for that state belongs to
+    // the fleet vocabulary — printing the "binaries went back" sentence there
+    // would be false.
+    if !fleet::classify_host_outcome(err).went_back() {
+        return None;
+    }
+    // The migration must have been scheduled on this host AND the failure must
+    // not prove the host never reached it — the same conservative gate
+    // `fleet::schema_moved` applies to the fleet summary.
+    if host_plan.migrate == exec::MigrateStep::Run
+        && !exec::failed_before_migrating(fleet::failed_step_label(err))
+    {
+        Some(fleet::FLEET_SCHEMA_AHEAD_OF_BINARIES_NOTE)
+    } else {
+        None
+    }
+}
+
 /// Drive the rollout: probe every host, plan, then replace the hosts ONE AT A TIME
 /// (issue #1621, AC-2/AC-3/AC-4).
 ///
@@ -4042,11 +4078,14 @@ where
 ///   table — rolling a whole fleet back because an `rm -rf` of old release dirs
 ///   failed would be a self-inflicted outage.
 ///
-/// **N = 1 is exempt from all of it.** A single-host config takes the pre-#1621
-/// path verbatim: the raw executor error, no fleet vocabulary, no state table, no
-/// compensation (there is no other host to converge with, and its own boundary
-/// teardown already ran). That is AC-1, and it is why the `single` branches below
-/// are not cosmetic.
+/// **N = 1 is exempt from all of it, with one deliberate exception.** A
+/// single-host config takes the pre-#1621 path verbatim: the raw executor error,
+/// no fleet vocabulary, no state table, no compensation (there is no other host
+/// to converge with, and its own boundary teardown already ran). That is AC-1,
+/// and it is why the `single` branches below are not cosmetic. The single
+/// exception is the schema-ahead warning (#2276): when the migration already
+/// ran, the deploy says so out loud before returning the raw error, because
+/// silence there is dangerous rather than merely terse.
 #[allow(clippy::too_many_lines)]
 fn run_up_with<E, P, F>(input: &FleetUpInput<'_, P>, make_executor: F) -> Result<(), DeployError>
 where
@@ -4352,10 +4391,18 @@ where
                 // A one-host fleet keeps today's error verbatim: the per-host
                 // executor already told the whole story, and inventing a fleet
                 // vocabulary for one host would change pre-#1621 output. This
-                // returns BEFORE any classification, degrade-and-continue or
-                // compensation, so N = 1 is byte-identical on every failure shape,
-                // post-boundary ones included.
+                // returns BEFORE any degrade-and-continue or compensation, so N = 1
+                // is byte-identical on every failure shape, post-boundary ones
+                // included — with one deliberate, documented exception (#2276):
+                // when the migration already ran, the executor tore the candidate
+                // down itself and the previous release keeps serving against the
+                // migrated schema, so the deploy prints the schema-ahead warning
+                // before returning the raw error. Every other single-host failure
+                // prints nothing extra.
                 if single {
+                    if let Some(note) = single_host_schema_ahead_note(host_plan, &err) {
+                        eprintln!("\n\u{26A0}\u{FE0F}  {note}\n");
+                    }
                     return Err(DeployError::Exec(err.to_string()));
                 }
                 let failed_step = fleet::failed_step_label(&err);
@@ -10350,6 +10397,93 @@ mod tests {
                 .collect::<Vec<_>>(),
             "the one host runs today's exact sequence and nothing more — no \
              compensation, no extra probe"
+        );
+    }
+
+    #[test]
+    fn single_host_failure_after_migrate_warns_that_schema_is_ahead_of_binaries() {
+        // #2276. The single-host failure arm returns the raw executor error with
+        // one deliberate exception: when the migration already ran and the
+        // executor tore the candidate down itself, the previous release keeps
+        // serving against the migrated schema — and saying only the raw error
+        // leaves that unsaid. `single_host_schema_ahead_note` is the pure gate
+        // the driver prints; this test pins its every shape.
+        let plan = |mode: fleet::HostMode, migrate: exec::MigrateStep| fleet::HostPlan {
+            host: "203.0.113.10".to_owned(),
+            mode,
+            migrate,
+        };
+        let rolled_back_at = |step: &'static str| exec::DeployExecError::CandidateRolledBack {
+            failed_step: step,
+            source: Box::new(exec::DeployExecError::CommandFailed {
+                label: step,
+                message: "scripted failure".to_owned(),
+            }),
+        };
+        let torn_down_at = |step: &'static str| exec::DeployExecError::FirstDeployTornDown {
+            failed_step: step,
+            source: Box::new(exec::DeployExecError::CommandFailed {
+                label: step,
+                message: "scripted failure".to_owned(),
+            }),
+        };
+
+        // The reproduction shape: a migration ran, then `readiness-gate` failed
+        // and the executor auto-rolled the candidate back. The warning must
+        // print — the fleet's note verbatim, so both paths phrase the same
+        // hazard identically.
+        assert_eq!(
+            single_host_schema_ahead_note(
+                &plan(fleet::HostMode::Redeploy, exec::MigrateStep::Run),
+                &rolled_back_at("readiness-gate"),
+            ),
+            Some(fleet::FLEET_SCHEMA_AHEAD_OF_BINARIES_NOTE),
+            "a redeploy that tore its candidate down after migrating must warn"
+        );
+        // A first deploy migrates too: nothing is serving at all against the
+        // moved schema, so the silence is worse, not better.
+        assert_eq!(
+            single_host_schema_ahead_note(
+                &plan(fleet::HostMode::First, exec::MigrateStep::Run),
+                &torn_down_at("readiness-gate"),
+            ),
+            Some(fleet::FLEET_SCHEMA_AHEAD_OF_BINARIES_NOTE),
+            "a torn-down first deploy left nothing serving against a moved schema"
+        );
+
+        // A failure the step labels prove landed BEFORE the migration: the
+        // schema never moved, so silence stays silence.
+        assert_eq!(
+            single_host_schema_ahead_note(
+                &plan(fleet::HostMode::Redeploy, exec::MigrateStep::Run),
+                &rolled_back_at("upload"),
+            ),
+            None,
+            "a failure before the migration must not claim the schema moved"
+        );
+        // No migration scheduled on this host: nothing to warn about.
+        assert_eq!(
+            single_host_schema_ahead_note(
+                &plan(fleet::HostMode::Redeploy, exec::MigrateStep::Skip),
+                &rolled_back_at("readiness-gate"),
+            ),
+            None,
+            "a host that skipped its migration cannot be schema-ahead"
+        );
+        // Post-boundary failures leave the host ON the new release: printing
+        // the "binaries went back" sentence there would be false.
+        let post_boundary = exec::DeployExecError::CommandFailed {
+            label: "prune",
+            message: "scripted failure".to_owned(),
+        };
+        assert_eq!(
+            single_host_schema_ahead_note(
+                &plan(fleet::HostMode::Redeploy, exec::MigrateStep::Run),
+                &post_boundary,
+            ),
+            None,
+            "a post-boundary failure left the new release serving — this note \
+             would be a lie there"
         );
     }
 
