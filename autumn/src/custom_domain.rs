@@ -479,12 +479,31 @@ impl CustomDomain {
 /// Records must survive a restart: a lost registry silently stops routing
 /// every tenant's domain and re-orders every certificate.
 pub trait CustomDomainStore: Send + Sync + std::fmt::Debug {
-    /// Every stored record. Called once at boot to hydrate the index.
-    fn load_all(&self) -> StoreFuture<'_, io::Result<Vec<CustomDomain>>>;
+    /// Every stored record, plus the record files that could not be read.
+    /// Called once at boot to hydrate the index.
+    ///
+    /// A store must report every file it skipped rather than discarding it:
+    /// the registry refuses new registrations until every record loads (or
+    /// is deleted) and the server restarts, so a corrupt record can never
+    /// open a takeover window.
+    fn load_all(&self) -> StoreFuture<'_, io::Result<CustomDomainLoad>>;
     /// Insert or replace one record.
     fn save<'a>(&'a self, domain: &'a CustomDomain) -> StoreFuture<'a, io::Result<()>>;
     /// Delete one record. Deleting an absent record succeeds.
     fn delete<'a>(&'a self, hostname: &'a str) -> StoreFuture<'a, io::Result<()>>;
+}
+
+/// What [`CustomDomainStore::load_all`] found on disk.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct CustomDomainLoad {
+    /// Records that decoded cleanly, in no particular order.
+    pub records: Vec<CustomDomain>,
+    /// Record files that could not be read or decoded, in scan order.
+    ///
+    /// Only names paths; the registry's `load` decides what the skip means,
+    /// and names the files again in the refusal error and the log so the
+    /// operator can restore or delete them.
+    pub skipped: Vec<std::path::PathBuf>,
 }
 
 /// In-memory [`CustomDomainStore`], for tests and for a deployment that
@@ -510,8 +529,13 @@ impl MemoryCustomDomainStore {
 }
 
 impl CustomDomainStore for MemoryCustomDomainStore {
-    fn load_all(&self) -> StoreFuture<'_, io::Result<Vec<CustomDomain>>> {
-        Box::pin(async move { Ok(read_lock(&self.records).values().cloned().collect()) })
+    fn load_all(&self) -> StoreFuture<'_, io::Result<CustomDomainLoad>> {
+        Box::pin(async move {
+            Ok(CustomDomainLoad {
+                records: read_lock(&self.records).values().cloned().collect(),
+                skipped: Vec::new(),
+            })
+        })
     }
 
     fn save<'a>(&'a self, domain: &'a CustomDomain) -> StoreFuture<'a, io::Result<()>> {
@@ -569,29 +593,50 @@ fn file_stem(hostname: &str) -> String {
 }
 
 impl CustomDomainStore for FsCustomDomainStore {
-    fn load_all(&self) -> StoreFuture<'_, io::Result<Vec<CustomDomain>>> {
+    fn load_all(&self) -> StoreFuture<'_, io::Result<CustomDomainLoad>> {
         Box::pin(async move {
             let mut entries = match tokio::fs::read_dir(&self.dir).await {
                 Ok(entries) => entries,
-                Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                    return Ok(CustomDomainLoad::default());
+                }
                 Err(e) => return Err(e),
             };
-            let mut out = Vec::new();
+            let mut out = CustomDomainLoad::default();
             while let Some(entry) = entries.next_entry().await? {
                 let path = entry.path();
                 if path.extension().is_none_or(|ext| ext != "json") {
                     continue;
                 }
-                let bytes = tokio::fs::read(&path).await?;
+                let bytes = match tokio::fs::read(&path).await {
+                    Ok(bytes) => bytes,
+                    // A file that cannot even be read (permissions, vanished
+                    // mid-scan, ...) is the same condition `autumn doctor`
+                    // warns about: skip it and REPORT it, not discard it, the
+                    // same way as a corrupt one.
+                    Err(e) => {
+                        tracing::warn!(
+                            path = %path.display(),
+                            "skipping unreadable custom-domain record: {e}"
+                        );
+                        out.skipped.push(path);
+                        continue;
+                    }
+                };
                 match serde_json::from_slice::<CustomDomain>(&bytes) {
-                    Ok(domain) => out.push(domain),
+                    Ok(domain) => out.records.push(domain),
                     // A corrupt record must not stop the other 999 domains from
-                    // being served; it is logged and skipped, and the app can
-                    // re-register the hostname to repair it.
-                    Err(e) => tracing::warn!(
-                        path = %path.display(),
-                        "skipping unreadable custom-domain record: {e}"
-                    ),
+                    // being served; it is skipped and REPORTED, not discarded:
+                    // the registry refuses new registrations until every
+                    // record loads (or is deleted), so a hostname missing from
+                    // the index can never be handed to another tenant.
+                    Err(e) => {
+                        tracing::warn!(
+                            path = %path.display(),
+                            "skipping unreadable custom-domain record: {e}"
+                        );
+                        out.skipped.push(path);
+                    }
                 }
             }
             Ok(out)
@@ -650,6 +695,18 @@ pub enum RegisterError {
     /// The registry has not hydrated from its store, so it cannot tell whether
     /// another tenant already owns the hostname.
     NotReady,
+    /// The registry hydrated, but one or more record files could not be read,
+    /// so a hostname may be missing from the index.
+    ///
+    /// Serving and renewal keep working for the records that did load, but
+    /// no new registration is accepted: registering a hostname the index
+    /// cannot see would overwrite the durable record of whoever owns it (the
+    /// store keys files by a hash of the hostname), handing their domain to
+    /// another tenant at the next restart.
+    HydrationIncomplete {
+        /// The unreadable record files, in the store's scan order.
+        files: Vec<std::path::PathBuf>,
+    },
 }
 
 impl std::fmt::Display for RegisterError {
@@ -675,6 +732,23 @@ impl std::fmt::Display for RegisterError {
                 "the custom-domain registry has not loaded, so a hostname cannot be connected \
                  without risking another tenant's record; check the server log for the load error"
             ),
+            Self::HydrationIncomplete { files } => {
+                let names = files
+                    .iter()
+                    .map(|p| p.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                write!(
+                    f,
+                    "the custom-domain registry skipped {} unreadable record file{} ({}); a \
+                     hostname missing from the index cannot be distinguished from a free one, \
+                     so no hostname can be connected until the files are restored or deleted \
+                     and the server restarts",
+                    files.len(),
+                    if files.len() == 1 { "" } else { "s" },
+                    names,
+                )
+            }
         }
     }
 }
@@ -712,7 +786,21 @@ pub struct CustomDomainRegistry {
     /// does not know, so it must never run over an index that failed to
     /// hydrate: that index knows nothing, and every tenant certificate would
     /// read as an orphan.
+    ///
+    /// This is set only by a load with NO skipped records. A load that
+    /// skipped even one record keeps serving and renewing the records that
+    /// did load, but new registrations and the retention prune stay refused
+    /// until every record loads (or is deleted) and the server restarts — a
+    /// hostname missing from the index cannot be distinguished from a free
+    /// one. Serving and renewal keep working: the index holds every record
+    /// that did load, so loaded domains stay live.
     hydrated: std::sync::atomic::AtomicBool,
+    /// Record files the last [`load`](Self::load) skipped because they could
+    /// not be read or decoded, in the store's scan order.
+    ///
+    /// Kept so [`register`](Self::register) can name them in its refusal,
+    /// next to the same filenames `autumn doctor` reports as a warning.
+    hydration_skips: RwLock<Vec<std::path::PathBuf>>,
 }
 
 impl CustomDomainRegistry {
@@ -726,6 +814,7 @@ impl CustomDomainRegistry {
             max_domains,
             reserved: Vec::new(),
             hydrated: std::sync::atomic::AtomicBool::new(false),
+            hydration_skips: RwLock::new(Vec::new()),
         }
     }
 
@@ -791,21 +880,49 @@ impl CustomDomainRegistry {
     }
 
     /// Whether the index has been hydrated from the store.
+    ///
+    /// True only after a [`load`](Self::load) that skipped no records: the
+    /// same gate that refuses `register` when the load never ran also refuses
+    /// it (and the retention prune) when the load was incomplete, so a
+    /// hostname missing from the index can never read as free or orphaned.
     #[must_use]
     pub fn is_hydrated(&self) -> bool {
         self.hydrated.load(std::sync::atomic::Ordering::Acquire)
     }
 
+    /// Record files the last [`load`](Self::load) skipped because they could
+    /// not be read or decoded, in the store's scan order.
+    ///
+    /// Empty on a clean load; non-empty exactly when [`register`](Self::register)
+    /// refuses with [`RegisterError::HydrationIncomplete`].
+    #[must_use]
+    pub fn hydration_skips(&self) -> Vec<std::path::PathBuf> {
+        read_lock(&self.hydration_skips).clone()
+    }
+
     /// Hydrate the index from the store. Returns how many records loaded.
+    ///
+    /// A load that skipped any record still fills the index with what did
+    /// load (so serving and renewal keep working), but leaves
+    /// [`is_hydrated`](Self::is_hydrated) false and records the skipped
+    /// files: new registrations and the retention prune stay refused until
+    /// every record loads or is deleted and the server restarts.
     ///
     /// # Errors
     ///
     /// Propagates the store's read error.
     pub async fn load(&self) -> io::Result<usize> {
-        let records = self.store.load_all().await?;
+        // Fail closed BEFORE the store is touched: a reload must never leave
+        // the registry claiming a fully-hydrated index it no longer has.
+        // A clean load below sets `hydrated` true again; anything else leaves
+        // it false with the new skip list installed.
+        self.hydrated
+            .store(false, std::sync::atomic::Ordering::Release);
+        *write_lock(&self.hydration_skips) = Vec::new();
+        let outcome = self.store.load_all().await?;
         let mut index = write_lock(&self.index);
         index.clear();
-        for record in records {
+        for record in outcome.records {
             // A reservation can appear AFTER a domain was connected: the
             // operator adds a tenancy base domain, another name to the
             // deployment certificate, or an ingress hostname. `register`
@@ -831,8 +948,27 @@ impl CustomDomainRegistry {
             }
             index.insert(record.hostname.clone(), record);
         }
-        self.hydrated
-            .store(true, std::sync::atomic::Ordering::Release);
+        let skipped = outcome.skipped;
+        if skipped.is_empty() {
+            self.hydrated
+                .store(true, std::sync::atomic::Ordering::Release);
+        } else {
+            // error, not warn: this load opens a takeover window for every
+            // new registration, and the operator is the only one who can
+            // close it — by restoring or deleting the files and restarting.
+            tracing::error!(
+                count = skipped.len(),
+                files = %skipped
+                    .iter()
+                    .map(|p| p.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                "custom-domain registry loaded with unreadable record files; \
+                 new registrations are refused until the files are restored or \
+                 deleted and the server restarts"
+            );
+        }
+        *write_lock(&self.hydration_skips) = skipped;
         Ok(index.len())
     }
 
@@ -846,7 +982,9 @@ impl CustomDomainRegistry {
     /// # Errors
     ///
     /// [`RegisterError`] for an unusable hostname, a full registry, a hostname
-    /// another tenant owns, or a store write failure.
+    /// another tenant owns, a store write failure, or — when the boot-time
+    /// load skipped one or more unreadable records —
+    /// [`RegisterError::HydrationIncomplete`] naming the skipped files.
     pub async fn register(
         &self,
         hostname: &str,
@@ -866,10 +1004,23 @@ impl CustomDomainRegistry {
         // files by a hash of the hostname: registering here would report
         // success, overwrite the record of whoever durably owns the hostname,
         // and hand it to this tenant at the next restart. A transient read
-        // error at boot must not cost a tenant their domain, so mutations wait
-        // for a load that succeeded.
+        // error at boot must not cost a tenant their domain, so registrations
+        // wait for a load that succeeded.
+        //
+        // The same holds for a load that SKIPPED records: a corrupt file's
+        // hostname cannot be decoded, so the index cannot tell whether a
+        // requested hostname is free or is the corrupt record's. Serving and
+        // renewal keep working for the records that did load — those tenants
+        // are innocent — but every registration is refused, naming the
+        // skipped files so the operator can restore or delete them.
         if !self.is_hydrated() {
-            return Err(RegisterError::NotReady);
+            let skips = read_lock(&self.hydration_skips);
+            if skips.is_empty() {
+                return Err(RegisterError::NotReady);
+            }
+            return Err(RegisterError::HydrationIncomplete {
+                files: skips.clone(),
+            });
         }
 
         // Refuse a full registry BEFORE creating this hostname's write gate.
@@ -2178,12 +2329,158 @@ mod tests {
         store.save(&domain).await.unwrap();
 
         let loaded = store.load_all().await.unwrap();
-        assert_eq!(loaded, vec![domain.clone()]);
+        assert_eq!(loaded.records, vec![domain.clone()]);
+        assert!(loaded.skipped.is_empty());
 
         store.delete("app.clientco.com").await.unwrap();
-        assert!(store.load_all().await.unwrap().is_empty());
+        let reloaded = store.load_all().await.unwrap();
+        assert!(reloaded.records.is_empty());
+        assert!(reloaded.skipped.is_empty());
         // Deleting again is not an error.
         store.delete("app.clientco.com").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_filesystem_store_reports_skipped_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FsCustomDomainStore::new(dir.path());
+        let domain = CustomDomain::new("app.clientco.com".to_owned(), "t1".to_owned(), 100);
+        store.save(&domain).await.unwrap();
+        // A truncated record file: present on disk, undecodable.
+        let corrupt = dir.path().join("deadbeef.json");
+        std::fs::write(&corrupt, b"{not json").unwrap();
+        // A non-record file is ignored, not reported.
+        std::fs::write(dir.path().join("notes.txt"), b"hello").unwrap();
+
+        let outcome = store.load_all().await.unwrap();
+        assert_eq!(outcome.records, vec![domain]);
+        assert_eq!(outcome.skipped, vec![corrupt]);
+    }
+
+    #[tokio::test]
+    async fn the_filesystem_store_reports_unreadable_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FsCustomDomainStore::new(dir.path());
+        let domain = CustomDomain::new("app.clientco.com".to_owned(), "t1".to_owned(), 100);
+        store.save(&domain).await.unwrap();
+        // A path that matches the record glob but cannot be read at all (a
+        // directory with a .json name): the whole load must not fail — the
+        // path is reported as skipped, the same condition `autumn doctor`
+        // warns about, so runtime and doctor describe one condition.
+        let unreadable = dir.path().join("cafef00d.json");
+        std::fs::create_dir(&unreadable).unwrap();
+
+        let outcome = store.load_all().await.unwrap();
+        assert_eq!(outcome.records, vec![domain]);
+        assert_eq!(outcome.skipped, vec![unreadable]);
+    }
+
+    /// A reload can demote a hydrated registry: a clean first load followed
+    /// by a partial reload must not keep claiming a complete index, or the
+    /// takeover window re-opens without anyone noticing.
+    #[tokio::test]
+    async fn a_partial_reload_demotes_a_hydrated_registry() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(FsCustomDomainStore::new(dir.path()));
+        let good = CustomDomain::new("app.clientco.com".to_owned(), "t1".to_owned(), 100);
+        store.save(&good).await.unwrap();
+
+        let registry = CustomDomainRegistry::new(store.clone(), 10);
+        registry.load().await.unwrap();
+        assert!(registry.is_hydrated());
+        registry
+            .register("new.clientco.com", "t2", 100)
+            .await
+            .unwrap();
+
+        // A record corrupts on disk after the clean load.
+        let corrupt = dir.path().join("deadbeef.json");
+        std::fs::write(&corrupt, b"{not json").unwrap();
+        assert_eq!(registry.load().await.unwrap(), 2);
+        assert!(!registry.is_hydrated());
+        assert_eq!(registry.hydration_skips(), vec![corrupt]);
+        assert!(matches!(
+            registry.register("another.clientco.com", "t3", 100).await,
+            Err(RegisterError::HydrationIncomplete { .. })
+        ));
+    }
+
+    /// The issue #2654 acceptance shape: one corrupt record file must not
+    /// open a takeover window. The registry serves and renews the records
+    /// that did load, but every `register` is refused, naming the file.
+    #[tokio::test]
+    async fn a_partial_hydration_refuses_registrations_but_keeps_serving() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(FsCustomDomainStore::new(dir.path()));
+        let good = CustomDomain::new("app.clientco.com".to_owned(), "t1".to_owned(), 100);
+        store.save(&good).await.unwrap();
+        // Simulate a corrupt record: a file that was someone's domain.
+        let corrupt = dir.path().join("deadbeef.json");
+        std::fs::write(&corrupt, b"{not json").unwrap();
+
+        let registry = CustomDomainRegistry::new(store.clone(), 10);
+        assert_eq!(registry.load().await.unwrap(), 1);
+        assert!(!registry.is_hydrated());
+        assert_eq!(registry.hydration_skips(), vec![corrupt.clone()]);
+
+        // The loaded record is still served and due-for-renewal logic sees it.
+        registry
+            .record_active("app.clientco.com", 100, 101)
+            .await
+            .unwrap();
+        assert_eq!(
+            registry.tenant_for_host("app.clientco.com"),
+            Some("t1".to_owned())
+        );
+        assert_eq!(registry.due_for_renewal(200, 30).len(), 1);
+
+        // A fresh hostname: refused, and the refusal names the skipped file —
+        // the same filename `autumn doctor` reports as a warning.
+        let err = registry
+            .register("app.victim.com", "tenant-evil", 100)
+            .await
+            .expect_err("a partially-hydrated registry must refuse to connect a hostname");
+        match &err {
+            RegisterError::HydrationIncomplete { files } => {
+                assert_eq!(files, &vec![corrupt.clone()]);
+            }
+            other => panic!("expected HydrationIncomplete, got {other:?}"),
+        }
+        let message = err.to_string();
+        assert!(
+            message.contains(&corrupt.display().to_string()),
+            "the refusal must name the skipped file: {message}"
+        );
+
+        // Re-registering the LOADED hostname is refused too: registrations
+        // stop, not just claims on unknown names — even an idempotent
+        // re-registration is a registration, and the store keys its files by
+        // a hash of the hostname.
+        let err = registry
+            .register("app.clientco.com", "t1", 100)
+            .await
+            .expect_err("even an idempotent re-registration is a registration");
+        assert!(matches!(err, RegisterError::HydrationIncomplete { .. }));
+
+        // Nothing reached the store: the victim's record was not created.
+        let outcome = store.load_all().await.unwrap();
+        assert_eq!(outcome.records.len(), 1);
+        assert_eq!(outcome.skipped, vec![corrupt]);
+    }
+
+    /// A clean load hydrates fully and registers as before.
+    #[tokio::test]
+    async fn a_clean_load_still_hydrates_and_registers() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(FsCustomDomainStore::new(dir.path()));
+        let registry = CustomDomainRegistry::new(store, 10);
+        registry.load().await.unwrap();
+        assert!(registry.is_hydrated());
+        assert!(registry.hydration_skips().is_empty());
+        registry
+            .register("app.clientco.com", "t1", 100)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

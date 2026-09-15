@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **custom domains: a partial hydration no longer opens a takeover window
+  (#2654):** `FsCustomDomainStore::load_all` used to skip record files it
+  could not decode and return `Ok`, so a registry that skipped even one
+  record still reported hydrated and `register` stayed open. A hostname
+  missing from the index cannot be distinguished from a free one, so
+  registering it would overwrite the durable record of whoever owns it —
+  the store keys files by a hash of the hostname — and hand their domain to
+  another tenant at the next restart. Now `load_all` reports every skipped
+  file (`CustomDomainStore::load_all` returns `CustomDomainLoad { records,
+  skipped }` — a breaking change for hand-written store impls, noted here),
+  and the registry treats a load that skipped any record as incomplete: the
+  records that did load keep routing and renewing, but `register` refuses
+  every hostname with `RegisterError::HydrationIncomplete`, naming the
+  skipped files (the same filenames `autumn doctor` reports as a warning),
+  and the retention prune refuses to run over the incomplete index, since
+  every certificate would read as an orphan. Logged at `error` with the file
+  paths at boot; restore or delete the files and restart to reopen
+  registrations.
 - **the Cold-Start Onboarding Gate stops failing every scheduled run (#2309):**
   the gate (issue #977) checks the no-DB `hello` app against a p95 60s / max
   90s budget. It failed all 9+ scheduled runs since it was created.

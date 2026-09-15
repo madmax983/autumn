@@ -472,7 +472,7 @@ async fn removing_a_domain_stops_routing_serving_and_renewal() {
     assert!(registry.tenant_for_host("app.clientco.com").is_none());
     assert!(registry.due_for_renewal(NOW + 86_400, 30).is_empty());
     assert!(
-        store.load_all().await.unwrap().is_empty(),
+        store.load_all().await.unwrap().records.is_empty(),
         "the record must be deleted, not orphaned"
     );
 
@@ -850,7 +850,7 @@ impl autumn_web::custom_domain::CustomDomainStore for PausingDeleteStore {
         &self,
     ) -> autumn_web::custom_domain::StoreFuture<
         '_,
-        std::io::Result<Vec<autumn_web::custom_domain::CustomDomain>>,
+        std::io::Result<autumn_web::custom_domain::CustomDomainLoad>,
     > {
         self.inner.load_all()
     }
@@ -1063,7 +1063,7 @@ impl autumn_web::custom_domain::CustomDomainStore for FailingSaveStore {
         &self,
     ) -> autumn_web::custom_domain::StoreFuture<
         '_,
-        std::io::Result<Vec<autumn_web::custom_domain::CustomDomain>>,
+        std::io::Result<autumn_web::custom_domain::CustomDomainLoad>,
     > {
         self.inner.load_all()
     }
@@ -1207,7 +1207,7 @@ impl autumn_web::custom_domain::CustomDomainStore for UnreadableStore {
         &self,
     ) -> autumn_web::custom_domain::StoreFuture<
         '_,
-        std::io::Result<Vec<autumn_web::custom_domain::CustomDomain>>,
+        std::io::Result<autumn_web::custom_domain::CustomDomainLoad>,
     > {
         Box::pin(async move {
             Err(std::io::Error::other(
@@ -1253,7 +1253,7 @@ async fn a_registry_that_did_not_hydrate_refuses_to_connect_anything() {
         .expect_err("a registry that never loaded must refuse to connect a hostname");
     assert!(matches!(err, RegisterError::NotReady), "{err:?}");
     // Nothing reached the store, so the durable owner's record is untouched.
-    assert!(store.inner.load_all().await.unwrap().is_empty());
+    assert!(store.inner.load_all().await.unwrap().records.is_empty());
     assert!(registry.get("app.clientco.com").is_none());
 
     // A registry that DID load takes registrations as before.

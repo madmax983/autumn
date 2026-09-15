@@ -1366,7 +1366,7 @@ impl autumn_web::custom_domain::CustomDomainStore for FailingSaveStore {
         &self,
     ) -> autumn_web::custom_domain::StoreFuture<
         '_,
-        std::io::Result<Vec<autumn_web::custom_domain::CustomDomain>>,
+        std::io::Result<autumn_web::custom_domain::CustomDomainLoad>,
     > {
         self.inner.load_all()
     }
@@ -1723,7 +1723,7 @@ impl autumn_web::custom_domain::CustomDomainStore for PausingDeleteStore {
         &self,
     ) -> autumn_web::custom_domain::StoreFuture<
         '_,
-        std::io::Result<Vec<autumn_web::custom_domain::CustomDomain>>,
+        std::io::Result<autumn_web::custom_domain::CustomDomainLoad>,
     > {
         self.inner.load_all()
     }
@@ -1991,7 +1991,7 @@ async fn a_restart_serves_every_connected_domain_without_reordering() {
     // Second boot: fresh registry and cache over the SAME directories.
     let store = Arc::new(FsCustomDomainStore::new(&registry_dir));
     assert_eq!(
-        store.load_all().await.unwrap().len(),
+        store.load_all().await.unwrap().records.len(),
         2,
         "records must survive"
     );

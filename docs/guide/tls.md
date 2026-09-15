@@ -870,6 +870,17 @@ custom-domain registry has not loaded" rather than overwriting the durable
 record of whoever owns it. The deployment's own certificate keeps serving; fix
 the store and restart.
 
+A registry that could read only *some* of its records refuses connections the
+same way: the records that did load keep routing and renewing, but `register`
+refuses every hostname — naming the skipped record files, the same names
+`autumn doctor` reports as a warning — until the files are restored or deleted
+and the server restarts. With a hostname missing from the index the registry
+cannot tell a free hostname from one whose record is corrupt, and connecting
+it would overwrite the durable record of whoever owns it and hand their domain
+to another tenant at the next restart. The retention prune refuses to run over
+the incomplete index for the same reason: every certificate would read as an
+orphan.
+
 ### What doctor checks
 
 | Check | What it catches |
