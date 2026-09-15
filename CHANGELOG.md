@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **reddit-clone's Docker-gated integration tests now run in CI (#2558):** the
+  ten testcontainer-backed suites (`avatar_s3_integration`,
+  `commentable_pg_integration`, `jobs_pg_integration`, `m2m_pg_integration`,
+  `post_dependent_delete_pg_integration`, `post_slug_race_e2e`,
+  `preload_pg_integration`, `seo_pg_integration`, `votable_pg_integration`,
+  `webhook_outbound_integration`) — including the `post_slug_race_e2e`
+  slug-race regressions, the only automated proof of #2544's
+  retry-on-conflict fix — were never named in any workflow, so they ran
+  nowhere. They are now invoked explicitly in ci.yml's Docker job
+  (`--test-threads=1`; the Chromium `smoke` target stays out — it is
+  `system-tests`-gated and needs a browser this runner does not provide),
+  and a new `repo_hygiene` gate
+  (`reddit_clone_docker_test_targets_are_ci_named`) fails if a future
+  Docker-gated reddit-clone target is not named in CI.
+
 - **🧭 Wayfinder: redisplay `examples/cms`'s post/page editor on a rejected
   "Scheduled" submission (error-path 0/1 → 1/1, draft preserved):** an
   error-path inventory of `cms`'s content editor — `/admin/content/{type}`

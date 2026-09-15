@@ -1555,6 +1555,37 @@ jobs:
           # this job does not provide (it is `system-tests`-gated and so does
           # not even compile here).
           cargo test -p cms --test integration_test -- --ignored --test-threads=1
+          # `examples/reddit-clone` — the canonical feature-showcase example.
+          # Same story as `saas`/`teams`/`cms` above: example apps are not
+          # auto-swept, so without these lines its ten Docker-gated test
+          # targets (incl. #2544's `post_slug_race_e2e` slug-race regressions —
+          # the only automated proof the retry-on-conflict logic keeps
+          # working) run nowhere in CI. Each target is named explicitly rather
+          # than swept as a bare package invocation: the crate's other
+          # `#[ignore]`d target, `tests/system/smoke.rs`, needs Chromium this
+          # job does not provide (it is `system-tests`-gated and so does not
+          # even compile here), and an explicit list cannot silently absorb a
+          # future non-Docker ignored target. `--test-threads=1` because the
+          # suites share process-global testcontainers (several files' own
+          # doc comments prescribe it).
+          #
+          # Unlike `cms` above, these suites have never run green as a whole
+          # before — #2558 wires them so the first real run happens in CI; if
+          # that surfaces pre-existing ordering sensitivities the way the
+          # `saas`/`teams` lines above did, narrow with `--skip` (never
+          # delete). `repo_hygiene.rs::reddit_clone_docker_test_targets_are_ci_named`
+          # pins this list: a newly-added Docker-gated reddit-clone target
+          # fails the gate until it is named here.
+          cargo test -p reddit-clone --test avatar_s3_integration -- --ignored --test-threads=1
+          cargo test -p reddit-clone --test commentable_pg_integration -- --ignored --test-threads=1
+          cargo test -p reddit-clone --test jobs_pg_integration -- --ignored --test-threads=1
+          cargo test -p reddit-clone --test m2m_pg_integration -- --ignored --test-threads=1
+          cargo test -p reddit-clone --test post_dependent_delete_pg_integration -- --ignored --test-threads=1
+          cargo test -p reddit-clone --test post_slug_race_e2e -- --ignored --test-threads=1
+          cargo test -p reddit-clone --test preload_pg_integration -- --ignored --test-threads=1
+          cargo test -p reddit-clone --test seo_pg_integration -- --ignored --test-threads=1
+          cargo test -p reddit-clone --test votable_pg_integration -- --ignored --test-threads=1
+          cargo test -p reddit-clone --test webhook_outbound_integration -- --ignored --test-threads=1
 
 
   test-gate:

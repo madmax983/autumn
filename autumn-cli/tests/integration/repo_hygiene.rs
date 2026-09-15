@@ -1149,6 +1149,108 @@ fn sqlite_test_targets_are_ci_named() {
     }
 }
 
+/// Every Docker-gated integration-test target in `examples/reddit-clone` must
+/// be named in the CI Docker job (issue #2558).
+///
+/// Example packages are not auto-swept the way the `autumn` and `autumn-cli`
+/// consolidated `integration_tests`/`cli_tests` binaries are, so a
+/// Docker-gated `#[ignore]`d target that is not named in
+/// `.github/workflows/ci.yml`'s test-docker step never runs anywhere — which
+/// is how `post_slug_race_e2e` (the only automated proof of #2544's
+/// slug-race fix) shipped dark. Targets are discovered from their own source:
+/// a file counts as Docker-gated when it carries an `#[ignore]` whose reason
+/// names Docker/testcontainers/Postgres. The Chromium smoke is deliberately
+/// excluded — it is `#![cfg(feature = "system-tests")]`, never compiles into
+/// the default build, and needs a browser this job does not provide. A
+/// newly-added Docker-gated target fails this gate until ci.yml names it with
+/// an explicit `--test <target>` invocation.
+#[test]
+fn reddit_clone_docker_test_targets_are_ci_named() {
+    let root = workspace_root();
+    let tests_dir = root.join("examples/reddit-clone/tests");
+    let mut docker_targets = Vec::new();
+    for entry in std::fs::read_dir(&tests_dir)
+        .unwrap_or_else(|err| panic!("failed to read {}: {err}", tests_dir.display()))
+        .flatten()
+    {
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("rs") {
+            continue;
+        }
+        let source = std::fs::read_to_string(&path)
+            .unwrap_or_else(|err| panic!("failed to read {}: {err}", path.display()));
+        if source.contains("#![cfg(feature = \"system-tests\")]") {
+            continue;
+        }
+        let docker_gated = source.lines().any(|line| {
+            let trimmed = line.trim_start();
+            trimmed.starts_with("#[ignore")
+                && (trimmed.contains("Docker")
+                    || trimmed.contains("testcontainers")
+                    || trimmed.contains("PostgreSQL")
+                    || trimmed.contains("Postgres"))
+        });
+        if docker_gated {
+            docker_targets.push(
+                path.file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .unwrap_or_else(|| {
+                        panic!("non-UTF8 test file name: {}", path.display())
+                    })
+                    .to_owned(),
+            );
+        }
+    }
+    assert!(
+        docker_targets.len() >= 10,
+        "expected the reddit-clone Docker-gated test targets to be discovered, found {docker_targets:?}",
+    );
+
+    let ci_path = root.join(".github/workflows/ci.yml");
+    let ci_yml = std::fs::read_to_string(&ci_path)
+        .unwrap_or_else(|err| panic!("failed to read {}: {err}", ci_path.display()));
+
+    // Collect the cargo commands the workflow actually runs, the same way the
+    // sqlite gate does: strip comments (prose mentions do not count), join
+    // `\`-continued lines so one wrapped invocation is one command.
+    let mut commands: Vec<String> = Vec::new();
+    let mut pending = String::new();
+    for line in strip_yaml_comments(&ci_yml).lines() {
+        let trimmed = line.trim_end();
+        if let Some(head) = trimmed.strip_suffix('\\') {
+            pending.push_str(head);
+            pending.push(' ');
+        } else {
+            pending.push_str(trimmed);
+            commands.push(std::mem::take(&mut pending));
+        }
+    }
+    if !pending.is_empty() {
+        commands.push(pending);
+    }
+
+    let reddit_invocations: Vec<Vec<&str>> = commands
+        .iter()
+        .map(|command| command.split_whitespace().collect::<Vec<_>>())
+        .filter(|tokens| {
+            tokens.contains(&"cargo")
+                && tokens.contains(&"test")
+                && flag_values(tokens, "-p").contains(&"reddit-clone")
+        })
+        .collect();
+
+    for target in docker_targets {
+        assert!(
+            reddit_invocations
+                .iter()
+                .any(|tokens| flag_values(tokens, "--test").contains(&target.as_str())),
+            "a CI workflow must run `cargo test -p reddit-clone --test {target} -- --ignored`; \
+             a Docker-gated reddit-clone target missing from the Docker job never runs — \
+             see issue #2558",
+        );
+    }
+}
+
 #[test]
 fn contributing_documents_ignored_generator_tests() {
     let root = workspace_root();
