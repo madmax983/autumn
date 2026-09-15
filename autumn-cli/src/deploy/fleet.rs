@@ -1169,7 +1169,9 @@ pub(crate) const DRIFT_PROXY_PORT_MISMATCH: &str =
 ///
 /// The probe shell tests `[ -L current ]`, which succeeds for a symlink whose
 /// target cannot be canonicalized, so such a host reports `HostMode::Redeploy`
-/// while `readlink -f` yields nothing and the release reads back
+/// while the existence-checking `readlink -e` yields nothing — a dangling link
+/// used to print its missing target's path under `readlink -f` and read back as
+/// [`ReleaseId::Known`] (issue #2277) — and the release reads back
 /// [`ReleaseId::Unknown`]. That combination is not "we have not looked" — it is a
 /// host that says it is serving a release nobody can name, which is exactly the
 /// unprovable state this feature fails closed on.
@@ -3828,6 +3830,70 @@ mod tests {
                 .join("\n")
                 .contains("reported, not counted as drift"),
             "an unreachable host is still reported, not blamed",
+        );
+    }
+
+    #[test]
+    fn fleet_drift_flags_a_dangling_current_symlink_end_to_end() {
+        // #2277: a dangling `current` used to report as a KNOWN release — GNU
+        // `readlink -f` requires only all but the LAST path component to exist,
+        // so a missing release dir (e.g. pruned) still printed its path and
+        // `release_id_from_dir` named it — which meant the DRIFT_RELEASE_UNREADABLE
+        // check never fired and `deploy status --strict` exited 0 on a broken
+        // host. The probe now uses the existence-checking `readlink -e`, which
+        // prints nothing for a dangling link. This pins the WHOLE chain: the
+        // scripted capture below is exactly the `-e` shape for a dangling link
+        // (`redeploy` mode from `[ -L current ]`, empty current section) →
+        // `ReleaseId::Unknown` → DRIFT_RELEASE_UNREADABLE → `drifted()`.
+        let cfg = ResolvedDeployConfig::resolve(
+            &DeployConfig {
+                host: Some("203.0.113.10".to_owned()),
+                ..DeployConfig::default()
+            },
+            "myapp",
+        )
+        .expect("deploy config resolves");
+        let capture = exec::test_support::RecordingExecutor::new().with_stdout(
+            "detect-current",
+            "redeploy:blue\t3001\n---autumn-kamal-proxy-list---\n\
+             ---autumn-kamal-proxy-unit---\n---autumn-no-proxy-unit---\n\
+             ---autumn-kamal-proxy-options---\n\n---autumn-current-release---\n",
+        );
+        let deploy_probe = exec::probe_deploy_state(&cfg, &capture).expect("scripted probe parses");
+        assert!(
+            deploy_probe.current_release_dir.is_none(),
+            "a dangling `current` must not resolve to a release dir"
+        );
+        // Everything-but-the-release is healthy, so the ONLY drift in the report
+        // can be the unreadable release.
+        let probe = exec::HostStatusProbe {
+            deploy: deploy_probe,
+            ready_code: Some(200),
+            shared_maintenance_flag: false,
+            maintenance: exec::MaintenanceStatus::Off,
+            maintenance_flag_source: exec::MaintenanceFlagSource::Shared,
+            last_deploy: None,
+        };
+        let damaged = HostStatus::from_probe(&cfg, 3000, &probe);
+        assert_eq!(
+            damaged.release,
+            ReleaseId::Unknown,
+            "a dangling `current` must read back as ReleaseId::Unknown"
+        );
+        let report = fleet_drift(&[damaged]);
+        assert!(
+            !report.version_drift,
+            "an unknown release still names no version: {:?}",
+            report.releases
+        );
+        assert_eq!(
+            report.state_drift,
+            vec![("203.0.113.10".to_owned(), DRIFT_RELEASE_UNREADABLE)],
+            "the dangling link is state drift"
+        );
+        assert!(
+            report.drifted(),
+            "`deploy status --strict` must exit non-zero on a dangling `current`"
         );
     }
 

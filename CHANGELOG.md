@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`deploy status` no longer reports a known release for a dangling `current`
+  symlink (#2277):** the deploy-start probe resolved `{app_dir}/current` with
+  `readlink -f`, which only requires all but the LAST path component to exist —
+  so a dangling `current` whose `releases/` parent still exists (e.g. a pruned
+  release dir) printed the missing target's path, and `release_id_from_dir`
+  reported it as `ReleaseId::Known`: the status table confidently named a release
+  that is not installed, the `DRIFT_RELEASE_UNREADABLE` state-drift check never
+  fired, and `deploy status --strict` exited 0 on a broken host. The probe now
+  uses the existence-checking `readlink -e`, so a dangling link resolves to
+  nothing and correctly parses as `ReleaseId::Unknown`, which the existing drift
+  check turns into state drift (non-zero `--strict`). `DeployMode` detection is
+  unchanged — it keys off `[ -L current ]`, which is still true for a dangling
+  link, not off the resolved value. Deliberately out of scope: validating that
+  the resolved path sits under the host's `releases_dir` — a `current` pointing
+  outside the release tree is left as a follow-up.
+
 - **🧭 Wayfinder: redisplay `examples/cms`'s post/page editor on a rejected
   "Scheduled" submission (error-path 0/1 → 1/1, draft preserved):** an
   error-path inventory of `cms`'s content editor — `/admin/content/{type}`

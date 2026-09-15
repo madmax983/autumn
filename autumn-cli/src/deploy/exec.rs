@@ -2333,9 +2333,12 @@ const NO_PROXY_UNIT_SENTINEL: &str = "---autumn-no-proxy-unit---";
 const PROXY_OPTIONS_DELIM: &str = "---autumn-kamal-proxy-options---";
 
 /// Delimiter appended after the `shared/proxy-options` marker, before
-/// `readlink -f {app_dir}/current` (issue #1621, AC-6), so all five sections ride
-/// in ONE round-trip. Its ABSENCE (a host deployed before this feature, older
-/// recorded output, or a scripted test) leaves an empty section →
+/// `readlink -e {app_dir}/current` (issue #1621, AC-6), so all five sections ride
+/// in ONE round-trip. The `-e` (not `-f`) is deliberate (issue #2277):
+/// existence-checking `readlink` prints nothing for a dangling `current`, where
+/// `-f` would print the missing target's path and the status table would name a
+/// release that is not installed. Its ABSENCE (a host deployed before this
+/// feature, older recorded output, or a scripted test) leaves an empty section →
 /// [`DeployProbe::current_release_dir`] `None` — "unknown", never a guessed id.
 const CURRENT_RELEASE_DELIM: &str = "---autumn-current-release---";
 
@@ -2376,8 +2379,9 @@ pub struct DeployProbe {
     /// The release dir the host's `current` symlink resolves to (#1621, AC-6); its
     /// basename is the deployed release id ([`release_id_from_dir`]).
     ///
-    /// `None` when the symlink is absent, dangling, or the probe output predates
-    /// this section — reported as "unknown", never guessed. `deploy status` and the
+    /// `None` when the symlink is absent, DANGLING (the probe's `readlink -e`
+    /// prints nothing for one — issue #2277), or the probe output predates this
+    /// section — reported as "unknown", never guessed. `deploy status` and the
     /// fleet `maintenance` fan-out read it; the rollout path ignores it.
     pub current_release_dir: Option<String>,
 }
@@ -2476,7 +2480,7 @@ pub fn probe_deploy_state(
          printf '\\n{opts_delim}\\n'; \
          cat {opts_marker} 2>/dev/null || true; \
          printf '\\n{current_delim}\\n'; \
-         readlink -f {current} 2>/dev/null || true",
+         readlink -e {current} 2>/dev/null || true",
         current = shell_quote(&cfg.current_symlink()),
         marker = shell_quote(&live_slot_marker(cfg)),
         blue = SLOT_BLUE,
@@ -2505,7 +2509,7 @@ pub fn probe_deploy_state(
                     .split_once(PROXY_OPTIONS_DELIM)
                     .unwrap_or((after_unit, ""));
                 // …and the options section further splits into the marker `cat` and the
-                // `readlink -f current` result (#1621). A missing delimiter (a host
+                // `readlink -e current` result (#1621, #2277). A missing delimiter (a host
                 // deployed before this feature, or a scripted test) leaves an empty
                 // current section → `None` = "release unknown", never a guessed id.
                 let (opts_section, current_section) = after_opts
@@ -2549,9 +2553,11 @@ pub fn probe_deploy_state(
     })
 }
 
-/// Parse the probe's `readlink -f {app_dir}/current` section (#1621, AC-6).
+/// Parse the probe's `readlink -e {app_dir}/current` section (#1621, AC-6).
 ///
-/// Empty (absent/dangling symlink, or a probe capture predating this section) →
+/// Empty (absent symlink, DANGLING symlink — the probe's existence-checking
+/// `readlink -e` prints nothing for one, unlike `-f` which prints the missing
+/// target's path (#2277) — or a probe capture predating this section) →
 /// `None`. Anything else is the resolved release DIR, trimmed of surrounding
 /// whitespace/newlines. Deliberately NOT fail-closed: this section is read-only
 /// reporting, and refusing to report a status because a symlink is unreadable would
@@ -6755,11 +6761,14 @@ mod tests {
         );
         assert_eq!(probe.installed_proxy_port, InstalledProxyPort::Port(80));
 
-        // The probe shell resolves the symlink behind its own delimiter, best-effort.
+        // The probe shell resolves the symlink behind its own delimiter, best-effort,
+        // with the EXISTENCE-checking `readlink -e` (#2277): a dangling `current`
+        // prints nothing (→ unknown release → DRIFT_RELEASE_UNREADABLE) instead of
+        // the missing target's path (→ a confidently named, uninstalled release).
         let shell = exec.shell_for("detect-current").expect("probe ran");
         assert!(
             shell.contains("---autumn-current-release---")
-                && shell.contains("readlink -f '/srv/autumn/myapp/current'"),
+                && shell.contains("readlink -e '/srv/autumn/myapp/current'"),
             "probe resolves the current symlink behind its delimiter: {shell}"
         );
         // The LABEL is unchanged: it is load-bearing for every exact-vector test and
@@ -6804,6 +6813,46 @@ mod tests {
         assert!(
             probe.current_release_dir.is_none(),
             "an empty current section is unknown, not an empty release id"
+        );
+    }
+
+    #[test]
+    fn probe_deploy_state_reports_unknown_for_a_dangling_current_symlink() {
+        // #2277: GNU `readlink -f` requires only all but the LAST path component
+        // to exist, so a dangling `current` (symlink target deleted, `releases/`
+        // still there) printed the missing target's path and the status table
+        // confidently named a release that is not installed. The probe now uses
+        // the existence-checking `readlink -e`, which prints nothing for a
+        // dangling link — this scripts THAT capture shape: `redeploy` (the probe
+        // shell keys first-vs-redeploy off `[ -L current ]`, which is true for a
+        // dangling link, so the mode is unaffected) with an EMPTY current
+        // section.
+        let cfg = resolved();
+        let stdout = "redeploy:blue\t3001\n---autumn-kamal-proxy-list---\n\
+             ---autumn-kamal-proxy-unit---\n---autumn-no-proxy-unit---\n\
+             ---autumn-kamal-proxy-options---\n\n---autumn-current-release---\n";
+        let exec = RecordingExecutor::new().with_stdout("detect-current", stdout);
+        let probe = probe_deploy_state(&cfg, &exec).unwrap();
+        assert_eq!(
+            probe.mode,
+            DeployMode::Redeploy {
+                live_slot: SLOT_BLUE
+            },
+            "`[ -L current ]` still reports redeploy for a dangling link — \
+             DeployMode detection keys off the symlink, not its resolved value"
+        );
+        assert!(
+            probe.current_release_dir.is_none(),
+            "a dangling `current` must parse to an unknown release"
+        );
+        assert!(
+            probe
+                .current_release_dir
+                .as_deref()
+                .and_then(release_id_from_dir)
+                .is_none(),
+            "an unknown release dir must map to ReleaseId::Unknown downstream, \
+             never to a named-but-uninstalled release"
         );
     }
 
