@@ -4035,12 +4035,19 @@ where
 ///   Hosts after the failing one are never touched, and the hosts that already cut
 ///   over are rolled back in reverse order so the fleet converges on ONE version —
 ///   binaries only; a migration that already ran is never undone. The one exception
-///   is a post-boundary HOUSEKEEPING failure (`record-proxy-options`, `drain-old`,
-///   `prune`): the host is live and healthy on the new release, so the rollout
+///   is a post-boundary HOUSEKEEPING failure (`record-proxy-options`, `prune`):
+///   the host is live and healthy on the new release, so the rollout
 ///   warns, marks it degraded, and CONTINUES. A rollout whose only failures are
 ///   housekeeping therefore succeeds (`Ok`) with degraded hosts named in the state
 ///   table — rolling a whole fleet back because an `rm -rf` of old release dirs
 ///   failed would be a self-inflicted outage.
+///
+///   `drain-old` is deliberately NOT in that list (issue #2279): a failed
+///   `systemctl disable --now` can leave the old slot's process running — job
+///   workers and the in-process scheduler included — so the driver verifies the
+///   old unit actually stopped (`systemctl is-active`) before waving it through
+///   as degraded. A still-active (or unprovable) old slot escalates to a
+///   functional failure instead: the rollout halts and compensates.
 ///
 /// **N = 1 is exempt from all of it.** A single-host config takes the pre-#1621
 /// path verbatim: the raw executor error, no fleet vocabulary, no state table, no
@@ -4359,6 +4366,71 @@ where
                     return Err(DeployError::Exec(err.to_string()));
                 }
                 let failed_step = fleet::failed_step_label(&err);
+                // #2279: a failed `drain-old` is not provable housekeeping. A failed
+                // `systemctl disable --now` can leave the old slot's process running
+                // — and deployed apps run job workers and the in-process scheduler
+                // in that same process (`ProcessRole::Combined` is the default) —
+                // so two live processes would mean every scheduled task fires twice
+                // and queued jobs run twice. VERIFY rather than assume: the
+                // follow-up `systemctl is-active` probe proves whether the old unit
+                // actually stopped. Only a proven-stopped old unit keeps the
+                // housekeeping treatment; a still-active (or unprovable) one
+                // escalates to Functional — halt and compensate.
+                if failed_step == exec::DRAIN_OLD_LABEL {
+                    let verify = executor.run(&exec::drain_old_verify_op(cfg, &state.slots));
+                    let still_active = verify.is_ok();
+                    outcomes[index] = fleet::classify_drain_old_failure(&verify);
+                    if let fleet::HostOutcome::Degraded { label } = outcomes[index] {
+                        // The old unit is verified STOPPED: the running-process
+                        // danger is gone, and only boot-persistence bookkeeping
+                        // (`disable`) failed. Same warn-and-continue as other
+                        // housekeeping — but the message says what was verified,
+                        // not just what failed.
+                        degraded.push((host_plan.host.clone(), label));
+                        eprintln!(
+                            "\u{26A0}\u{FE0F}  [{}/{total} {}] serving {} \u{2014} but \
+                             `{label}` failed AFTER the cutover. The old slot's unit is \
+                             verified STOPPED — no duplicate workers or schedulers — so \
+                             only boot-persistence bookkeeping failed; traffic is \
+                             healthy and the rollout continues. Repair this host (a \
+                             redeploy does) before the next deploy, which will refuse \
+                             it.\n",
+                            index + 1,
+                            host_plan.host,
+                            input.release_id,
+                        );
+                        continue;
+                    }
+                    // Escalated: the old slot is (or may be) still running. Name the
+                    // actual risk — duplicate scheduled work and jobs — not just
+                    // the failed step, then halt and compensate like any other
+                    // functional post-boundary failure.
+                    if still_active {
+                        eprintln!(
+                            "\n\u{274C} rollout halted at {} (`drain-old`) \u{2014} the old \
+                             slot is STILL RUNNING: its job workers and in-process \
+                             scheduler keep running alongside the new release, so every \
+                             scheduled task fires twice and queued jobs run twice until \
+                             the old unit is stopped by hand. The remaining hosts were \
+                             not touched.\n",
+                            host_plan.host,
+                        );
+                    } else {
+                        eprintln!(
+                            "\n\u{274C} rollout halted at {} (`drain-old`) \u{2014} the \
+                             follow-up check could not prove the old slot stopped, so \
+                             the rollout assumes it is still running (fail closed): its \
+                             job workers and in-process scheduler may be running \
+                             alongside the new release, firing every scheduled task \
+                             twice and running queued jobs twice until the old unit is \
+                             checked and stopped by hand. The remaining hosts were not \
+                             touched.\n",
+                            host_plan.host,
+                        );
+                    }
+                    halt = Some((host_plan.host.clone(), exec::DRAIN_OLD_LABEL));
+                    break;
+                }
                 outcomes[index] = fleet::classify_host_outcome(&err);
                 // Post-boundary housekeeping: the proxy is already serving the new
                 // release on this host and only bookkeeping failed. Warn, record the
@@ -10258,6 +10330,155 @@ mod tests {
             web_b.contains(&"prune")
                 && !web_b.contains(&"teardown-candidate-unit")
                 && !web_b.contains(&"restart-previous"),
+            "a degraded host is live and healthy: nothing may be torn down or rolled \
+             back on it: {web_b:?}"
+        );
+        assert!(
+            recorder.positions_of("resolve-previous").is_empty(),
+            "a rollout that only degraded must compensate NOTHING anywhere"
+        );
+    }
+
+    #[test]
+    fn a_drain_old_failure_with_the_old_unit_still_active_halts_and_compensates() {
+        // #2279. `drain-old` is NOT generic housekeeping: a failed
+        // `systemctl disable --now` can leave the old slot's process running —
+        // job workers and the in-process scheduler included — so two live
+        // processes would fire every scheduled task twice and run queued jobs
+        // twice. The driver follows a failed `drain-old` with a
+        // `systemctl is-active` probe; here the probe SUCCEEDS (exit 0), so the
+        // old unit is still active and the failure escalates to Functional: the
+        // rollout HALTS and compensates, and the deploy FAILS rather than
+        // reporting a green success with a merely-degraded host.
+        let hosts = ["web-a", "web-b", "web-c"];
+        let fleet = fleet_of(&hosts);
+        let mut recorder = fleet::test_support::FleetRecorder::new();
+        for host in hosts {
+            recorder = script_redeploy(recorder, host);
+        }
+        // web-b's `drain-old` fails as a remote non-zero exit; the follow-up
+        // `verify-drain-old` probe is left at its default (success — exit 0),
+        // which is the old unit still being ACTIVE.
+        recorder = recorder.fail("web-b", "drain-old");
+        // Both cut-over hosts get the compensating rollback scripted.
+        recorder = script_compensation(recorder, "web-a", "present");
+        recorder = script_compensation(recorder, "web-b", "present");
+        let fixture = FleetFixture::new();
+
+        let err = run_up_with(&fixture.input(&fleet), |cfg| Ok(recorder.executor(cfg))).expect_err(
+            "a drain-old failure with the old unit still active must NOT end in a \
+             green rollout",
+        );
+
+        // The rollout halted at web-b's `drain-old`, and web-c was never touched.
+        let halt = fleet_halt_of(&err);
+        assert_eq!(halt.failed_host, "web-b");
+        assert_eq!(halt.failed_step, "drain-old");
+        assert_eq!(
+            recorder.run_labels_for("web-c"),
+            READ_ONLY_PROBES.to_vec(),
+            "a halt must leave every later host untouched"
+        );
+        // The verification probe ran IMMEDIATELY after the failed drain, against
+        // the OLD slot's unit — verify, not assume.
+        let web_b = recorder.run_labels_for("web-b");
+        let drain = web_b
+            .iter()
+            .position(|l| *l == "drain-old")
+            .expect("the cutover drains the old release");
+        assert_eq!(
+            web_b[drain + 1],
+            "verify-drain-old",
+            "a failed `drain-old` must be followed by the verification probe: {web_b:?}"
+        );
+        let probe_shell = recorder
+            .calls_for("web-b")
+            .iter()
+            .find_map(|call| match call {
+                exec::test_support::RecordedCall::Run {
+                    label: "verify-drain-old",
+                    shell,
+                } => Some(shell.clone()),
+                _ => None,
+            })
+            .expect("the verification probe ran on web-b");
+        assert_eq!(
+            probe_shell, "systemctl is-active myapp-blue.service",
+            "the probe must ask systemd about the OLD slot's unit, got: {probe_shell}"
+        );
+        // Halt + compensate: both cut-over hosts came back (plan order), nothing
+        // is left on the new release, and nothing was waved through as degraded.
+        assert_eq!(
+            halt.rolled_back,
+            vec!["web-a".to_owned(), "web-b".to_owned()],
+            "both cut-over hosts must be compensated, newest first"
+        );
+        assert!(
+            halt.still_on_new.is_empty(),
+            "no host may be left on the new release: {halt:?}"
+        );
+        assert!(
+            halt.degraded.is_empty(),
+            "a still-active old slot must never render as merely degraded: {halt:?}"
+        );
+        assert!(
+            err.to_string().contains("drain-old"),
+            "the halt must name the failing step: {err}"
+        );
+    }
+
+    #[test]
+    fn a_drain_old_failure_with_the_old_unit_verified_stopped_degrades_and_continues() {
+        // #2279, the sibling case. web-b's `drain-old` fails as a remote non-zero
+        // exit, but the follow-up `systemctl is-active` probe ALSO exits non-zero
+        // (scripted failure) — the old unit is provably STOPPED, so only
+        // boot-persistence bookkeeping (`disable`) failed. The housekeeping
+        // treatment stays honest: warn, mark the host degraded, and CONTINUE the
+        // rollout to a green deploy.
+        let hosts = ["web-a", "web-b", "web-c"];
+        let fleet = fleet_of(&hosts);
+        let mut recorder = fleet::test_support::FleetRecorder::new();
+        for host in hosts {
+            recorder = script_redeploy(recorder, host);
+        }
+        recorder = recorder.fail("web-b", "drain-old");
+        // The verification probe fails as a remote non-zero exit: `is-active`
+        // reports inactive/failed/unknown as non-zero, so the old process is
+        // provably gone.
+        recorder = recorder.fail("web-b", "verify-drain-old");
+        let fixture = FleetFixture::new();
+
+        run_up_with(&fixture.input(&fleet), |cfg| Ok(recorder.executor(cfg))).expect(
+            "a drain-old failure with the old unit verified stopped must not fail the rollout",
+        );
+
+        // The rollout continued past the degraded host onto web-c.
+        assert_eq!(
+            recorder.run_labels_for("web-c"),
+            READ_ONLY_PROBES
+                .iter()
+                .copied()
+                .chain(
+                    REDEPLOY_RUN_LABELS
+                        .iter()
+                        .copied()
+                        .filter(|label| *label != "migrate")
+                )
+                .collect::<Vec<_>>(),
+            "the rollout must CONTINUE past a verified-stopped drain-old failure"
+        );
+        let web_b = recorder.run_labels_for("web-b");
+        let drain = web_b
+            .iter()
+            .position(|l| *l == "drain-old")
+            .expect("the cutover drains the old release");
+        assert_eq!(
+            web_b[drain + 1],
+            "verify-drain-old",
+            "a failed `drain-old` must be followed by the verification probe: {web_b:?}"
+        );
+        assert!(
+            !web_b.contains(&"teardown-candidate-unit") && !web_b.contains(&"restart-previous"),
             "a degraded host is live and healthy: nothing may be torn down or rolled \
              back on it: {web_b:?}"
         );

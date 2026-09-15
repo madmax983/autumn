@@ -540,6 +540,48 @@ pub fn slot_unit_name(service: &str, slot: &str) -> String {
     format!("{service}-{slot}")
 }
 
+/// Label of the post-cutover op that stops and disables the old slot's unit
+/// (issue #2279). `drain-old` is deliberately NOT one of
+/// [`super::fleet::HOUSEKEEPING_LABELS`]: a failed `systemctl disable --now`
+/// can leave the old slot's process running — and deployed apps run job
+/// workers and the in-process scheduler in that same process — so a failed
+/// drain must be VERIFIED before it may be waved through as housekeeping (see
+/// [`drain_old_verify_op`] and `fleet::classify_drain_old_failure`).
+pub(crate) const DRAIN_OLD_LABEL: &str = "drain-old";
+
+/// Label of the follow-up probe the fleet driver runs after a failed
+/// `drain-old` (issue #2279). It is built on demand by [`drain_old_verify_op`],
+/// never part of the op vector, so a healthy deploy never runs it.
+pub(crate) const VERIFY_DRAIN_OLD_LABEL: &str = "verify-drain-old";
+
+/// Build the verification probe for a failed `drain-old` (issue #2279):
+/// `systemctl is-active {old-unit}`.
+///
+/// `drain-old` is `systemctl disable --now {old-unit}`, and either half can
+/// fail independently — the process may be stopped while the `disable` fails
+/// (a read-only `/etc`, say), or the whole command may fail and leave the old
+/// slot running. `systemctl is-active` exits 0 ONLY while the unit is active,
+/// so this probe's own outcome decides the classification: exit 0 (the probe
+/// SUCCEEDS) means the old slot's workers and in-process scheduler are still
+/// running alongside the new release — duplicate scheduled work, duplicate
+/// outbound email, duplicate job side effects — and the failure escalates to
+/// Functional (halt + compensate). A non-zero exit (inactive/failed/unknown)
+/// PROVES the process is gone, so only boot-persistence bookkeeping failed and
+/// the housekeeping treatment (warn, degrade, continue) stays honest.
+///
+/// Deliberately a `RemoteCommand` and not a `DeployOp`: the driver runs it by
+/// hand against the host's executor after the failure, so it never joins the
+/// pinned `REDEPLOY_RUN_LABELS` sequence and no exact-sequence test has to
+/// account for it.
+#[must_use]
+pub(crate) fn drain_old_verify_op(cfg: &ResolvedDeployConfig, plan: &SlotPlan) -> RemoteCommand {
+    let live_unit = slot_unit_name(&cfg.service_name, plan.live_slot);
+    RemoteCommand::new(
+        VERIFY_DRAIN_OLD_LABEL,
+        format!("systemctl is-active {live_unit}.service"),
+    )
+}
+
 /// Remote marker file recording which slot currently serves live traffic, so the
 /// next redeploy can pick the OTHER slot for the candidate.
 fn live_slot_marker(cfg: &ResolvedDeployConfig) -> String {
@@ -1124,7 +1166,7 @@ pub fn cutover_ops(
         // has landed), atomically via mktemp + `mv`.
         DeployOp::Run(record_proxy_options(cfg, &proxy.proxy_service_options())),
         DeployOp::Run(RemoteCommand::new(
-            "drain-old",
+            DRAIN_OLD_LABEL,
             format!("systemctl disable --now {live_unit}.service"),
         )),
         DeployOp::Run(RemoteCommand::new(

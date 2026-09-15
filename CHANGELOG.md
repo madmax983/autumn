@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A failed `drain-old` no longer reports a green fleet rollout while the old
+  slot keeps running its workers and scheduler (#2279):** `drain-old`
+  (`systemctl disable --now {old-unit}`) used to sit in the generic
+  post-cutover housekeeping bucket, so a failure warned, marked the host
+  degraded, and continued to a successful exit — even though the old slot's
+  process (job workers and the in-process scheduler run in the same process
+  under the default `ProcessRole::Combined`) could still be alive, firing
+  every scheduled task twice and running queued jobs twice alongside the new
+  release. `drain-old` is now carved out of `HOUSEKEEPING_LABELS` (a bare
+  drain-old failure fails closed to Functional), and the fleet driver follows
+  a failed `drain-old` with a `systemctl is-active {old-unit}` verification
+  probe before classifying: the host keeps the warn-and-continue housekeeping
+  treatment only when the probe proves the old unit stopped (the message says
+  so), and escalates to halt + compensate when the old unit is still active —
+  or when the probe itself cannot prove it stopped — with an operator message
+  naming the actual risk (duplicate scheduled work and jobs), not just the
+  failed step. New unit test pins the probe-outcome classification
+  (`fleet.rs`), and two driver-level regression tests cover both branches: a
+  still-active old unit halts the rollout and compensates every cut-over host
+  (never a green rollout), while a verified-stopped old unit degrades and the
+  rollout continues.
 - **🧭 Wayfinder: redisplay `examples/cms`'s post/page editor on a rejected
   "Scheduled" submission (error-path 0/1 → 1/1, draft preserved):** an
   error-path inventory of `cms`'s content editor — `/admin/content/{type}`

@@ -727,7 +727,8 @@ failure landed relative to the **go-live step** — `proxy-flip` on a redeploy,
 |---|---|---|
 | At or before go-live, on a redeploy | Previous release still serving (the candidate was torn down) | Already clean — nothing to undo |
 | At or before go-live, on a first deploy | Nothing serving (the candidate was torn down) | Already clean — nothing to undo |
-| After go-live, in housekeeping (`record-proxy-options`, `drain-old`, `prune`) | **Live and healthy on the new release** | **Warn and keep rolling** — the host is fine; only bookkeeping failed |
+| After go-live, in housekeeping (`record-proxy-options`, `prune`) | **Live and healthy on the new release** | **Warn and keep rolling** — the host is fine; only bookkeeping failed |
+| After go-live, at `drain-old` | Live on the new release | **Verify, then decide**: a follow-up `systemctl is-active` probe checks the old slot actually stopped. Proven stopped → warn and keep rolling (only boot-persistence bookkeeping failed). Still active, or unprovable → **halt and compensate** — the old slot's workers and in-process scheduler would otherwise keep running alongside the new release, firing every scheduled task twice (#2279) |
 | After go-live, at `commit-markers` | Live on the new release, markers mid-transaction | Halt, and **never** auto-roll this host back — the rollback target cannot be trusted |
 | After go-live, anything else | Live on the new release | Halt and compensate, this host included |
 

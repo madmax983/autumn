@@ -465,17 +465,28 @@ pub(crate) enum PostBoundaryClass {
 
 /// Post-boundary labels that do not affect traffic (issue #1621, §4.6).
 ///
-/// All three run strictly AFTER `proxy-flip`, so the proxy is already serving the
+/// Both run strictly AFTER `proxy-flip`, so the proxy is already serving the
 /// new release when they run:
 ///
 /// - `record-proxy-options` — writes the `shared/proxy-options` marker. Its failure
 ///   is invisible today and fails the NEXT deploy closed
 ///   (`refuse_unprovable_proxy_options`), which is exactly why it must be surfaced
 ///   rather than swallowed.
-/// - `drain-old` — disables the now-idle old slot unit. Two slots running is
-///   untidy, not an outage.
 /// - `prune` — removes old release dirs. Disk hygiene.
-pub(crate) const HOUSEKEEPING_LABELS: [&str; 3] = ["record-proxy-options", "drain-old", "prune"];
+///
+/// `drain-old` used to be a third member and was REMOVED (issue #2279): a failed
+/// `systemctl disable --now` can leave the old slot's process running, and that
+/// process is not an idle listener — deployed apps run job workers and the
+/// in-process scheduler in the same process (`ProcessRole::Combined` is the
+/// default, and `autumn deploy` never sets a role). Two live processes means
+/// every scheduled task fires twice and queued jobs run twice, while a generic
+/// housekeeping classification would report the host merely degraded and exit 0.
+/// A bare `drain-old` failure now falls through to
+/// [`PostBoundaryClass::Functional`] — fail closed — and the fleet driver refines
+/// it with a follow-up `systemctl is-active` probe
+/// ([`exec::drain_old_verify_op`]): only a PROVEN-stopped old unit keeps the
+/// housekeeping treatment (see [`classify_drain_old_failure`]).
+pub(crate) const HOUSEKEEPING_LABELS: [&str; 2] = ["record-proxy-options", "prune"];
 
 /// The one post-boundary label whose failure makes a host's rollback target
 /// unprovable: `commit-markers` writes previous-release + `current` + live-slot as
@@ -724,6 +735,13 @@ pub(crate) fn classify_failure(err: &exec::DeployExecError) -> HostOutcome {
 /// (see [`post_boundary_class`] for how the failing op is attributed). A
 /// pre-boundary outcome passes through untouched: the executor already tore that
 /// candidate down, so there is nothing left to classify.
+///
+/// `drain-old` never reaches this function: the driver carves it out BEFORE
+/// classifying and verifies the old unit's actual state with
+/// [`exec::drain_old_verify_op`], then calls [`classify_drain_old_failure`] —
+/// a bare `drain-old` failure falls through to [`PostBoundaryClass::Functional`]
+/// here (see [`HOUSEKEEPING_LABELS`]), which is the fail-closed direction only
+/// because the verify step refines it first.
 pub(crate) fn classify_host_outcome(err: &exec::DeployExecError) -> HostOutcome {
     match classify_failure(err) {
         HostOutcome::LiveOnNew { failed_step } => match post_boundary_class(err, failed_step) {
@@ -732,6 +750,49 @@ pub(crate) fn classify_host_outcome(err: &exec::DeployExecError) -> HostOutcome 
             PostBoundaryClass::Functional => HostOutcome::LiveOnNew { failed_step },
         },
         clean => clean,
+    }
+}
+
+/// Classify a failed `drain-old` AFTER the driver's verification probe (issue
+/// #2279) — pure, so the policy is pinned by unit test rather than by reading
+/// stderr.
+///
+/// `drain-old` left the generic housekeeping bucket because a failed
+/// `systemctl disable --now` can leave the old slot's process RUNNING — and
+/// that process keeps running job workers and the in-process scheduler
+/// (`ProcessRole::Combined` is the default), so two live processes means every
+/// scheduled task fires twice and queued jobs run twice. The `verify` argument
+/// is the driver's follow-up `systemctl is-active {old-unit}` probe
+/// ([`exec::drain_old_verify_op`]), whose own outcome decides:
+///
+/// * **`Ok(_)`** — `is-active` exited 0, so the old unit is STILL ACTIVE. This
+///   is a [`PostBoundaryClass::Functional`] failure in everything but name: the
+///   driver halts and compensates, and the operator is told the actual risk
+///   (duplicate scheduled work and jobs), not just "drain-old failed".
+/// * **`Err(CommandFailed)`** — `is-active` exited non-zero (inactive, failed,
+///   or unknown are all non-zero), which PROVES the old process is gone. Only
+///   boot-persistence bookkeeping (`disable`) failed, so the housekeeping
+///   treatment stays honest: warn, mark the host degraded, continue.
+/// * **any other `Err`** — the probe itself is unprovable (a dropped transport,
+///   …). Fail closed to Functional: a host whose old slot MAY still be running
+///   must not render as a green success.
+///
+/// The probe failing as [`exec::DeployExecError::CommandFailed`] is the ONLY
+/// shape that degrades — matching [`post_boundary_class`]'s rule that a
+/// label-less failure never downgrades to housekeeping.
+pub(crate) fn classify_drain_old_failure(
+    verify: &Result<exec::CommandOutput, exec::DeployExecError>,
+) -> HostOutcome {
+    match verify {
+        Ok(_) => HostOutcome::LiveOnNew {
+            failed_step: exec::DRAIN_OLD_LABEL,
+        },
+        Err(exec::DeployExecError::CommandFailed { .. }) => HostOutcome::Degraded {
+            label: exec::DRAIN_OLD_LABEL,
+        },
+        Err(_) => HostOutcome::LiveOnNew {
+            failed_step: exec::DRAIN_OLD_LABEL,
+        },
     }
 }
 
@@ -2839,7 +2900,7 @@ mod tests {
         // direction is an outage — roll a fleet back because `prune` failed and you
         // caused one; auto-roll-back on mid-transaction markers and you may restore
         // the WRONG release.
-        for label in ["record-proxy-options", "drain-old", "prune"] {
+        for label in ["record-proxy-options", "prune"] {
             assert_eq!(
                 classify_post_boundary(label),
                 PostBoundaryClass::Housekeeping,
@@ -2855,7 +2916,14 @@ mod tests {
         );
         // Fail closed on anything unknown: a NEW op added after the boundary is
         // treated as mattering until someone deliberately lists it as housekeeping.
-        for label in ["proxy-flip", "some-future-post-flip-op", ""] {
+        //
+        // #2279: `drain-old` belongs in this group now, not the one above. A
+        // failed `systemctl disable --now` can leave the old slot's workers and
+        // in-process scheduler running, so a BARE drain-old failure fails closed
+        // to Functional here — only the driver's follow-up `systemctl is-active`
+        // probe (`exec::drain_old_verify_op`) proving the old unit stopped may
+        // keep the housekeeping treatment (see `classify_drain_old_failure`).
+        for label in ["proxy-flip", "drain-old", "some-future-post-flip-op", ""] {
             assert_eq!(
                 classify_post_boundary(label),
                 PostBoundaryClass::Functional,
@@ -2972,6 +3040,63 @@ mod tests {
             }),
             HostOutcome::AmbiguousMarkers,
             "an unattributable post-boundary failure must decline the automatic rollback"
+        );
+    }
+
+    #[test]
+    fn a_failed_drain_old_is_classified_by_the_verification_probe() {
+        // #2279. `drain-old` left the generic housekeeping bucket: a failed
+        // `systemctl disable --now` can leave the old slot's process running,
+        // and that process keeps running job workers and the in-process
+        // scheduler — two live processes means every scheduled task fires twice
+        // and queued jobs run twice. The driver's follow-up `systemctl is-active`
+        // probe decides, and only a PROVEN-stopped old unit keeps the
+        // housekeeping treatment.
+        let stopped = || {
+            Err::<exec::CommandOutput, exec::DeployExecError>(
+                exec::DeployExecError::CommandFailed {
+                    label: exec::VERIFY_DRAIN_OLD_LABEL,
+                    message: "scripted".to_owned(),
+                },
+            )
+        };
+        // `is-active` exited 0: the old unit is STILL ACTIVE — escalate to
+        // Functional (halt + compensate), exactly like any other failure that
+        // leaves the host in a state a redeploy cannot silently paper over.
+        assert_eq!(
+            classify_drain_old_failure(&Ok(exec::CommandOutput {
+                stdout: "active\n".to_owned(),
+                stderr: String::new(),
+            })),
+            HostOutcome::LiveOnNew {
+                failed_step: exec::DRAIN_OLD_LABEL
+            },
+            "an old slot that is still active after a failed `drain-old` must halt \
+             the rollout — it must never render as a green success"
+        );
+        // `is-active` exited non-zero (inactive/failed/unknown are all non-zero):
+        // the old process is provably gone, so only boot-persistence bookkeeping
+        // failed — the housekeeping treatment stays honest.
+        assert_eq!(
+            classify_drain_old_failure(&stopped()),
+            HostOutcome::Degraded {
+                label: exec::DRAIN_OLD_LABEL
+            },
+            "an old slot proven stopped after a failed `drain-old` degrades the \
+             host and the rollout continues"
+        );
+        // The probe itself is unprovable (a dropped transport, …): fail closed.
+        // A host whose old slot MAY still be running must not render as a green
+        // success.
+        assert_eq!(
+            classify_drain_old_failure(&Err(exec::DeployExecError::Spawn {
+                program: "ssh".to_owned(),
+                source: std::io::Error::other("scripted"),
+            })),
+            HostOutcome::LiveOnNew {
+                failed_step: exec::DRAIN_OLD_LABEL
+            },
+            "an unprovable verification probe must fail closed to halt + compensate"
         );
     }
 
