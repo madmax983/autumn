@@ -7093,12 +7093,33 @@ pub fn check_tls_mode_impl(
 /// The resolved `[server.tls.acme]` inputs the doctor needs (issue #1608).
 #[derive(Debug, Clone)]
 pub struct AcmeDoctorConfig {
+    /// The rendered `[server.tls] acme` value when the key is PRESENT but is not
+    /// a TOML table (e.g. `acme = "yes"`). The runtime deserializes
+    /// `TlsConfig::acme` as `Option<AcmeConfig>` and fails to boot on any
+    /// non-table shape, so doctor records it for an `acme_config` FAIL instead
+    /// of skipping every ACME check (#2413). `None` when the section is a table
+    /// (normal) or absent (ACME not configured — the resolver returns `None`).
+    pub section_error: Option<String>,
     /// Configured domains (first is used for active probes).
     pub domains: Vec<String>,
+    /// The rendered `acme.domains` value when the key is PRESENT but is not a
+    /// TOML array (e.g. `domains = "app.example.com"`). The runtime
+    /// deserializes `domains` as `Vec<String>` and fails to boot on a
+    /// non-array, so doctor records the shape for an `acme_config` FAIL naming
+    /// the type error instead of the misleading "must list at least one domain"
+    /// (#2413). `None` when `domains` is an array or absent.
+    pub domains_shape_error: Option<String>,
     /// Contact email registered with the ACME account. Empty when unset; the
     /// runtime `AcmeConfig::validate()` rejects a missing/blank value at boot, so
     /// doctor mirrors that as a FAIL.
     pub contact_email: String,
+    /// The rendered `acme.contact_email` value when the key is PRESENT but is
+    /// not a TOML string (e.g. `contact_email = 42`). The runtime deserializes
+    /// `contact_email` as `String` and fails to boot on a non-string, so doctor
+    /// records it for an `acme_config` FAIL naming the type error instead of the
+    /// misleading "contact_email must be set" (#2413). `None` when the value is
+    /// a string or the key is absent.
+    pub contact_email_error: Option<String>,
     /// Port to serve the HTTP-01 challenge on. Defaults to 80 when unset. The
     /// runtime `AcmeConfig::validate()` rejects `0` (it binds an ephemeral OS port
     /// the HTTP-01 validator can never reach), so doctor mirrors that as a FAIL.
@@ -7111,6 +7132,16 @@ pub struct AcmeDoctorConfig {
     pub renew_before_days: u32,
     /// Directory holding the stored account + certificates.
     pub cache_dir: std::path::PathBuf,
+    /// The rendered invalid `acme.cache_dir` value when the key is PRESENT but
+    /// does not deserialize as a `PathBuf` the way the runtime's typed
+    /// `AcmeConfig` does (a non-string like `42`, `true`, or `["config/acme"]`).
+    /// The runtime fails to boot on such a value, so doctor surfaces it as an
+    /// `acme_config` FAIL instead of silently defaulting to `config/acme`
+    /// (which would also grade a directory the operator never configured,
+    /// #2413). Mirrors the [`port_error`](Self::port_error) treatment. `None`
+    /// when the value is a string or the key is absent (absent uses the runtime
+    /// default, `config/acme`).
+    pub cache_dir_error: Option<String>,
     /// The per-directory subdirectory label the runtime store namespaces
     /// certificates under (`{cache_dir}/{directory_label}/`). Derived from the
     /// configured `acme.directory`, matching `FsAcmeStore`. Falls back to the
@@ -7191,6 +7222,39 @@ pub struct AcmeDoctorConfig {
     /// rather than reporting "custom domains are off" for a config the server
     /// refuses to boot on. `None` when the section is valid or absent.
     pub custom_domains_error: Option<String>,
+}
+
+impl AcmeDoctorConfig {
+    /// Build the config for a `[server.tls] acme` key that is present but not a
+    /// table (issue #2413, item 2): every parsed field takes its absent-key
+    /// default and only [`section_error`](Self::section_error) is set, so the
+    /// grader FAILs on the shape instead of the resolver skipping every ACME
+    /// check. The runtime cannot deserialize the section at all here, so no
+    /// per-key value is meaningful.
+    fn section_not_a_table(value: &toml::Value) -> Self {
+        Self {
+            section_error: Some(value.to_string().trim().to_owned()),
+            domains: Vec::new(),
+            domains_shape_error: None,
+            contact_email: String::new(),
+            contact_email_error: None,
+            http_challenge_port: 80,
+            renew_before_days: 30,
+            cache_dir: std::path::PathBuf::from("config/acme"),
+            cache_dir_error: None,
+            directory_label: "staging".to_owned(),
+            directory_error: None,
+            port_error: None,
+            ca_root_path: None,
+            ca_root_error: None,
+            domains_error: None,
+            renew_before_days_error: None,
+            dns: None,
+            dns_error: None,
+            custom_domains: None,
+            custom_domains_error: None,
+        }
+    }
 }
 
 /// Deserialize `[server.tls.acme] directory` exactly as the runtime does.
@@ -7299,40 +7363,68 @@ fn acme_short_hash(input: &str) -> String {
 }
 
 /// Resolve `[server.tls.acme]` from the parsed `autumn.toml`, if configured.
+///
+/// Returns `None` when no `[server.tls.acme]` section is configured at all
+/// (ACME not in play — no checks to run). A PRESENT-but-not-a-table `acme` key
+/// (e.g. `acme = "yes"`) is not `None`: the runtime's typed `Option<AcmeConfig>`
+/// deserialization fails to boot on that shape, so the resolver returns a
+/// config carrying only [`AcmeDoctorConfig::section_error`] and the grader
+/// FAILs instead of skipping every ACME check (#2413).
 fn resolve_acme_doctor_config(toml_table: Option<&toml::Table>) -> Option<AcmeDoctorConfig> {
-    let acme = toml_table?
+    let tls = toml_table?
         .get("server")
         .and_then(toml::Value::as_table)?
         .get("tls")
-        .and_then(toml::Value::as_table)?
-        .get("acme")
         .and_then(toml::Value::as_table)?;
+    let acme = match tls.get("acme") {
+        None => return None,
+        Some(toml::Value::Table(table)) => table,
+        Some(other) => return Some(AcmeDoctorConfig::section_not_a_table(other)),
+    };
 
     // Collect the domains as the runtime's typed `Vec<String>` deserialization
     // does — and, unlike a lenient `filter_map`, RECORD any non-string entry
     // (e.g. `domains = ["app.example.com", 123]`) instead of silently dropping it.
     // The runtime fails to deserialize such an array and won't boot, so the grader
-    // must FAIL rather than pass on the surviving string names.
+    // must FAIL rather than pass on the surviving string names. A `domains` key
+    // that is not an array at all (e.g. `domains = "app.example.com"`) is the
+    // same boot failure one level up: record the shape (#2413).
     let mut domains = Vec::new();
     let mut domains_error = None;
-    if let Some(array) = acme.get("domains").and_then(toml::Value::as_array) {
-        for (index, entry) in array.iter().enumerate() {
-            let Some(domain) = entry.as_str() else {
-                domains_error = Some(format!(
-                    "entry at index {index} ({}) is not a string",
-                    entry.to_string().trim()
+    let mut domains_shape_error = None;
+    if let Some(value) = acme.get("domains") {
+        match value.as_array() {
+            Some(array) => {
+                for (index, entry) in array.iter().enumerate() {
+                    let Some(domain) = entry.as_str() else {
+                        domains_error = Some(format!(
+                            "entry at index {index} ({}) is not a string",
+                            entry.to_string().trim()
+                        ));
+                        break;
+                    };
+                    domains.push(domain.to_owned());
+                }
+            }
+            None => {
+                domains_shape_error = Some(format!(
+                    "expected an array of string hostnames, found {}",
+                    value.to_string().trim()
                 ));
-                break;
-            };
-            domains.push(domain.to_owned());
+            }
         }
     }
 
-    let contact_email = acme
-        .get("contact_email")
-        .and_then(toml::Value::as_str)
-        .unwrap_or_default()
-        .to_owned();
+    // Deserialize `contact_email` the way the runtime's typed `AcmeConfig` does:
+    // an absent key stays empty (the validate tier FAILs "must be set"), a
+    // string is the address, and a non-string is a value the runtime rejects
+    // pre-boot — recorded so the grader FAILs naming the type error instead of
+    // the misleading "contact_email must be set" (#2413).
+    let (contact_email, contact_email_error) =
+        match parse_acme_scalar(acme, "contact_email", String::new()) {
+            Ok(email) => (email, None),
+            Err(bad_value) => (String::new(), Some(bad_value)),
+        };
 
     // Deserialize `http_challenge_port` the way the runtime's typed `AcmeConfig`
     // does: an absent key defaults to 80, an explicit valid `u16` is preserved
@@ -7357,10 +7449,17 @@ fn resolve_acme_doctor_config(toml_table: Option<&toml::Table>) -> Option<AcmeDo
         Err(bad_value) => (30, Some(bad_value)),
     };
 
-    let cache_dir = acme
-        .get("cache_dir")
-        .and_then(toml::Value::as_str)
-        .map_or_else(|| std::path::PathBuf::from("config/acme"), Into::into);
+    // Deserialize `cache_dir` the way the runtime's typed `AcmeConfig` does: an
+    // absent key defaults to `config/acme`, a string is the directory, and a
+    // non-string (e.g. `cache_dir = 42`) is a value the runtime rejects pre-boot
+    // — recorded so the grader FAILs naming the type error instead of silently
+    // substituting `config/acme` and grading a directory the operator never
+    // configured (#2413).
+    let (cache_dir, cache_dir_error) =
+        match parse_acme_scalar(acme, "cache_dir", std::path::PathBuf::from("config/acme")) {
+            Ok(dir) => (dir, None),
+            Err(bad_value) => (std::path::PathBuf::from("config/acme"), Some(bad_value)),
+        };
 
     // Deserialize `directory` the way the runtime does; on error, record the bad
     // value so the acme-config grader FAILs (the runtime won't boot on it) rather
@@ -7408,11 +7507,15 @@ fn resolve_acme_doctor_config(toml_table: Option<&toml::Table>) -> Option<AcmeDo
         });
 
     Some(AcmeDoctorConfig {
+        section_error: None,
         domains,
+        domains_shape_error,
         contact_email,
+        contact_email_error,
         http_challenge_port,
         renew_before_days,
         cache_dir,
+        cache_dir_error,
         directory_label,
         directory_error,
         port_error,
@@ -7454,13 +7557,49 @@ const fn acme_config_fail(detail: String, hint: &'static str) -> CheckResult {
 /// parse this" tier reads as one unit.
 fn check_acme_deserialize_errors(config: &AcmeDoctorConfig) -> Option<CheckResult> {
     let AcmeDoctorConfig {
+        section_error,
+        domains_shape_error,
+        domains_error,
+        contact_email_error,
         directory_error,
         port_error,
-        domains_error,
         renew_before_days_error,
+        cache_dir_error,
         ..
     } = config;
 
+    // The section shape gates everything: a non-table `acme` means no per-key
+    // value was parseable at all.
+    if let Some(bad_value) = section_error {
+        return Some(acme_config_fail(
+            format!(
+                "[server.tls] acme value {bad_value} is not a table: the runtime deserializes \
+                 [server.tls.acme] as a table of ACME settings and fails to boot on any other \
+                 shape"
+            ),
+            "Write [server.tls.acme] as a table (a [server.tls.acme] header with domains and \
+             contact_email keys), not a bare value",
+        ));
+    }
+    if let Some(bad_value) = domains_shape_error {
+        return Some(acme_config_fail(
+            format!(
+                "[server.tls.acme] domains {bad_value}: the runtime deserializes domains as a \
+                 list of string hostnames and fails to boot on a non-array value"
+            ),
+            "List string hostnames in [server.tls.acme] domains (e.g. domains = \
+             [\"app.example.com\"])",
+        ));
+    }
+    if let Some(bad_value) = contact_email_error {
+        return Some(acme_config_fail(
+            format!(
+                "[server.tls.acme] contact_email value {bad_value} is not a string: the runtime \
+                 deserializes contact_email as a string and fails to boot on any other type"
+            ),
+            "Set [server.tls.acme] contact_email to a string email address",
+        ));
+    }
     if let Some(bad_value) = domains_error {
         return Some(acme_config_fail(
             format!(
@@ -7505,6 +7644,15 @@ fn check_acme_deserialize_errors(config: &AcmeDoctorConfig) -> Option<CheckResul
              30), unquoted",
         ));
     }
+    if let Some(bad_value) = cache_dir_error {
+        return Some(acme_config_fail(
+            format!(
+                "[server.tls.acme] cache_dir value {bad_value} is not a valid directory path: it \
+                 must be a string (the runtime fails to boot on a non-string value)"
+            ),
+            "Set [server.tls.acme] cache_dir to a string path (default \"config/acme\")",
+        ));
+    }
     None
 }
 
@@ -7539,9 +7687,13 @@ fn check_acme_deserialize_errors(config: &AcmeDoctorConfig) -> Option<CheckResul
 /// FAIL can name it.
 ///
 /// [`domains_error`]: AcmeDoctorConfig::domains_error
+/// [`domains_shape_error`]: AcmeDoctorConfig::domains_shape_error
 /// [`directory_error`]: AcmeDoctorConfig::directory_error
 /// [`port_error`]: AcmeDoctorConfig::port_error
 /// [`renew_before_days_error`]: AcmeDoctorConfig::renew_before_days_error
+/// [`cache_dir_error`]: AcmeDoctorConfig::cache_dir_error
+/// [`contact_email_error`]: AcmeDoctorConfig::contact_email_error
+/// [`section_error`]: AcmeDoctorConfig::section_error
 #[must_use]
 pub fn check_acme_config_impl(config: &AcmeDoctorConfig) -> Option<CheckResult> {
     let AcmeDoctorConfig {
@@ -13798,11 +13950,15 @@ pub struct Vault {
     /// `config/acme`, staging) with no recorded deserialize errors.
     fn acme_doctor_cfg(domains: &[&str], contact_email: &str) -> AcmeDoctorConfig {
         AcmeDoctorConfig {
+            section_error: None,
             domains: domains.iter().map(|d| (*d).to_owned()).collect(),
+            domains_shape_error: None,
             contact_email: contact_email.to_owned(),
+            contact_email_error: None,
             http_challenge_port: 80,
             renew_before_days: 30,
             cache_dir: std::path::PathBuf::from("config/acme"),
+            cache_dir_error: None,
             directory_label: "staging".to_owned(),
             directory_error: None,
             port_error: None,
@@ -14765,6 +14921,200 @@ contact_email = \"ops@example.com\"
             "absent key uses the runtime default"
         );
         assert!(check_acme_config_impl(&acme).is_none());
+    }
+
+    // Regression (#2413, item 1): a `cache_dir` the runtime's typed `AcmeConfig`
+    // cannot deserialize as a `PathBuf` — an integer, a bool, an array — must
+    // FAIL, not silently default to `config/acme`. Doctor's old
+    // `as_str().map_or(default, ...)` chain treated a non-string as ABSENT, so
+    // `cache_dir = 42` graded Pass (and the stored-cert check graded a directory
+    // the operator never configured) while the server exits at boot on the same
+    // file.
+    #[test]
+    fn acme_config_fail_when_cache_dir_not_a_string() {
+        for (bad_line, needle) in [
+            ("cache_dir = 42", "42"),
+            ("cache_dir = true", "true"),
+            ("cache_dir = [\"config/acme\"]", "config/acme"),
+        ] {
+            let raw: toml::Table = toml::from_str(&format!(
+                "\
+[server.tls.acme]
+domains = [\"app.example.com\"]
+contact_email = \"ops@example.com\"
+{bad_line}
+"
+            ))
+            .unwrap();
+            let acme = resolve_acme_doctor_config(Some(&raw)).expect("[server.tls.acme] present");
+            assert!(
+                acme.cache_dir_error.is_some(),
+                "`{bad_line}` must be recorded, not silently defaulted to config/acme"
+            );
+            // The default is still substituted so downstream path joins don't
+            // blow up on a non-path value; the FAIL carries the diagnosis.
+            assert_eq!(
+                acme.cache_dir,
+                std::path::PathBuf::from("config/acme"),
+                "`{bad_line}` keeps the runtime default as the inert placeholder"
+            );
+            let r = check_acme_config_impl(&acme)
+                .unwrap_or_else(|| panic!("`{bad_line}` must be an acme_config FAIL"));
+            assert!(matches!(r.status, CheckStatus::Fail));
+            assert_eq!(r.name, "acme_config");
+            let detail = r.detail.as_deref().unwrap_or_default();
+            assert!(
+                detail.contains("cache_dir")
+                    && detail.contains(needle)
+                    && detail.contains("is not a valid directory path"),
+                "detail must name the bad cache_dir value as a type error: {detail}"
+            );
+        }
+    }
+
+    // Companion: a valid explicit `cache_dir` records no error and is preserved,
+    // and an absent key still falls back to the runtime default with no FAIL.
+    #[test]
+    fn acme_config_ok_when_cache_dir_valid_or_absent() {
+        let raw: toml::Table = toml::from_str(
+            "\
+[server.tls.acme]
+domains = [\"app.example.com\"]
+contact_email = \"ops@example.com\"
+cache_dir = \"var/acme\"
+",
+        )
+        .unwrap();
+        let acme = resolve_acme_doctor_config(Some(&raw)).expect("[server.tls.acme] present");
+        assert!(acme.cache_dir_error.is_none());
+        assert_eq!(acme.cache_dir, std::path::PathBuf::from("var/acme"));
+        assert!(check_acme_config_impl(&acme).is_none());
+
+        let raw: toml::Table = toml::from_str(
+            "\
+[server.tls.acme]
+domains = [\"app.example.com\"]
+contact_email = \"ops@example.com\"
+",
+        )
+        .unwrap();
+        let acme = resolve_acme_doctor_config(Some(&raw)).expect("[server.tls.acme] present");
+        assert!(acme.cache_dir_error.is_none());
+        assert_eq!(
+            acme.cache_dir,
+            std::path::PathBuf::from("config/acme"),
+            "absent key uses the runtime default"
+        );
+        assert!(check_acme_config_impl(&acme).is_none());
+    }
+
+    // Regression (#2413, item 2): a `[server.tls] acme` key that is present but
+    // not a table must FAIL, not skip every ACME check. The runtime
+    // deserializes `TlsConfig::acme` as `Option<AcmeConfig>` and fails to boot
+    // on a non-table shape; doctor's old `.and_then(as_table)?` chain returned
+    // `None`, so `doctor --strict` passed a file the server refuses to start on.
+    #[test]
+    fn acme_config_fail_when_acme_section_not_a_table() {
+        for acme_line in ["acme = \"yes\"", "acme = 42", "acme = [\"x\"]"] {
+            let raw: toml::Table = toml::from_str(&format!(
+                "\
+[server.tls]
+{acme_line}
+"
+            ))
+            .unwrap();
+            let acme = resolve_acme_doctor_config(Some(&raw)).unwrap_or_else(|| {
+                panic!("a non-table `{acme_line}` must resolve to a config carrying the section error, not None")
+            });
+            assert!(
+                acme.section_error.is_some(),
+                "a non-table `{acme_line}` must be recorded"
+            );
+            let r = check_acme_config_impl(&acme)
+                .unwrap_or_else(|| panic!("a non-table `{acme_line}` must be an acme_config FAIL"));
+            assert!(matches!(r.status, CheckStatus::Fail));
+            assert_eq!(r.name, "acme_config");
+            let detail = r.detail.as_deref().unwrap_or_default();
+            assert!(
+                detail.contains("[server.tls] acme") && detail.contains("is not a table"),
+                "detail must name the malformed section shape: {detail}"
+            );
+        }
+
+        // The absent section still resolves to `None` (no ACME checks to run) —
+        // only a PRESENT non-table key becomes a FAIL.
+        let raw: toml::Table = toml::from_str(
+            "\
+[server.tls]
+",
+        )
+        .unwrap();
+        assert!(
+            resolve_acme_doctor_config(Some(&raw)).is_none(),
+            "an absent [server.tls.acme] section must still resolve to None"
+        );
+    }
+
+    // Regression (#2413, item 3): a non-string `contact_email` must FAIL naming
+    // the type error, not the misleading "contact_email must be set". The
+    // verdict was already Fail (the old `as_str()` chain collapsed the value to
+    // `""`, tripping the blank-email rule); only the diagnosis was wrong.
+    #[test]
+    fn acme_config_fail_names_the_type_error_when_contact_email_not_a_string() {
+        let raw: toml::Table = toml::from_str(
+            "\
+[server.tls.acme]
+domains = [\"app.example.com\"]
+contact_email = 42
+",
+        )
+        .unwrap();
+        let acme = resolve_acme_doctor_config(Some(&raw)).expect("[server.tls.acme] present");
+        assert!(
+            acme.contact_email_error.is_some(),
+            "a non-string contact_email must be recorded"
+        );
+        let r = check_acme_config_impl(&acme)
+            .expect("a non-string contact_email must be an acme_config FAIL");
+        assert!(matches!(r.status, CheckStatus::Fail));
+        assert_eq!(r.name, "acme_config");
+        let detail = r.detail.as_deref().unwrap_or_default();
+        assert!(
+            detail.contains("contact_email")
+                && detail.contains("42")
+                && detail.contains("is not a string"),
+            "detail must name the type error, not \"must be set\": {detail}"
+        );
+    }
+
+    // Regression (#2413, item 3): a `domains` value that is not an array must
+    // FAIL naming the shape error, not the misleading "must list at least one
+    // domain". The verdict was already Fail (no array meant no domains); only
+    // the diagnosis was wrong.
+    #[test]
+    fn acme_config_fail_names_the_shape_error_when_domains_not_an_array() {
+        let raw: toml::Table = toml::from_str(
+            "\
+[server.tls.acme]
+domains = \"app.example.com\"
+contact_email = \"ops@example.com\"
+",
+        )
+        .unwrap();
+        let acme = resolve_acme_doctor_config(Some(&raw)).expect("[server.tls.acme] present");
+        assert!(
+            acme.domains_shape_error.is_some(),
+            "a non-array domains must be recorded"
+        );
+        let r =
+            check_acme_config_impl(&acme).expect("a non-array domains must be an acme_config FAIL");
+        assert!(matches!(r.status, CheckStatus::Fail));
+        assert_eq!(r.name, "acme_config");
+        let detail = r.detail.as_deref().unwrap_or_default();
+        assert!(
+            detail.contains("domains") && detail.contains("expected an array"),
+            "detail must name the shape error, not \"must list at least one domain\": {detail}"
+        );
     }
 
     // Regression (#1874, item 2): doctor must mirror `AcmeConfig::validate()`'s

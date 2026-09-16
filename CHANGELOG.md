@@ -186,6 +186,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   audit-`deleted_at` shape and the denormalized-`tenant_id` shape (router
   and generated-trait level), plus the corresponding rule in
   `docs/guide/commentable.md`.
+- **`autumn doctor` ACME deserialize-tier parity: non-string `cache_dir`,
+  non-table `acme` section, and misdiagnosed `contact_email`/`domains`
+  (#2413):** `resolve_acme_doctor_config` silently substituted the
+  `config/acme` default for a non-string `cache_dir` (e.g. `cache_dir = 42`),
+  so `doctor --strict` passed a file the runtime refuses to boot on — and
+  the stored-cert check then graded a directory the operator never
+  configured. `cache_dir` now goes through the `parse_acme_scalar` helper
+  (#2412) like `http_challenge_port`/`renew_before_days`, recording a
+  `cache_dir_error` the grader surfaces as an `acme_config` FAIL naming the
+  type error. A `[server.tls] acme` key that is present but not a table
+  (e.g. `acme = "yes"`) no longer resolves to `None` (which skipped every
+  ACME check); it resolves to a config carrying only `section_error`, so the
+  grader FAILs on the shape instead. Two message-only fixes in the same
+  tier: a non-string `contact_email` now FAILs naming the type error instead
+  of the misleading "contact_email must be set", and a non-array `domains`
+  FAILs naming the expected shape instead of "must list at least one
+  domain" — both verdicts were already Fail, only the diagnosis was wrong.
+  Regression tests pin all four items plus the valid/absent companions.
 
 ### Added
 
