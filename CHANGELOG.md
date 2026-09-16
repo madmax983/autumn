@@ -24,6 +24,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Prune stale autumn-web features on scaffold re-render (issue #2328):**
+  regenerating a scaffold with `--force` while dropping a feature-enabling
+  flag (`--searchable` → `htmx`, `--import` → `multipart`, attachment fields
+  → `storage` + `multipart`) used to leave the explicit feature pinned in
+  `Cargo.toml` even though the generated surface was gone. The scaffold plan
+  now declares its flag-gated features unneeded when the flag is off, and a
+  generate-path prune removes each one whose usage markers survive nowhere
+  in the post-write tree — pending re-renders count as the new content, so
+  the re-rendered module no longer pins its own feature, while a sibling
+  scaffold or hand-written code still using it keeps the feature. Backend-
+  pinned features (`sqlite`) are never touched, `maud` is excluded (its
+  markers would false-positive on stock boilerplate), and `--i18n` keeps
+  `i18n` because the re-render leaves the `.i18n_auto()` wiring in `main.rs`.
 - **Frame-forge the SQLite fork for the framework control-plane migrations
   (issue #2699):** `autumn/migrations` — `FRAMEWORK_MIGRATIONS`, backing
   api_tokens, the job queue, feature flags, experiments, the shard

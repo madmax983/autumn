@@ -591,6 +591,14 @@ pub struct Plan {
     /// [`Plan::revert`] (`autumn destroy`, issue #1048) can remove exactly
     /// what this plan would have inserted into a shared file.
     pub reverts: Vec<Revert>,
+    /// autumn-web features this generate run's flags no longer enable
+    /// (issue #2328) — candidates for removal from the staged `Cargo.toml`
+    /// once [`Plan::prune_unneeded_autumn_web_features`] confirms no usage
+    /// marker survives in the post-write tree. Lives on [`Plan`] rather than
+    /// as per-action metadata for the same reason [`Revert`] does: the
+    /// `Cargo.toml` actions get collapsed and re-pushed while the plan is
+    /// built, which would silently drop per-action metadata.
+    unneeded_autumn_web_features: Vec<String>,
 }
 
 impl Plan {
@@ -604,6 +612,7 @@ impl Plan {
             actions: Vec::new(),
             warnings: Vec::new(),
             reverts: Vec::new(),
+            unneeded_autumn_web_features: Vec::new(),
         }
     }
 
@@ -618,6 +627,102 @@ impl Plan {
     /// (issue #1048) — irrelevant to a normal `generate` run.
     pub fn push_revert(&mut self, revert: Revert) {
         self.reverts.push(revert);
+    }
+
+    /// Declare that this generate run no longer needs autumn-web's `feature`
+    /// (issue #2328): the flag (or field shape) that used to enable it is off
+    /// in this invocation, so the surface it gated is not emitted. Recorded,
+    /// not acted on, until [`Plan::prune_unneeded_autumn_web_features`] runs —
+    /// a feature a sibling scaffold or hand-written code still uses survives
+    /// the marker check there. Generate-path only: [`Plan::revert`] (`autumn
+    /// destroy`) never consults this list.
+    pub fn declare_autumn_web_feature_unneeded(&mut self, feature: &str) {
+        if !self
+            .unneeded_autumn_web_features
+            .iter()
+            .any(|f| f == feature)
+        {
+            self.unneeded_autumn_web_features.push(feature.to_owned());
+        }
+    }
+
+    /// Drop every declared-unneeded autumn-web feature whose usage markers
+    /// survive nowhere in the post-write tree (issue #2328).
+    ///
+    /// Runs at the end of plan construction, before [`Plan::execute`] writes
+    /// anything: the marker scan sees each pending [`Action::Create`]/
+    /// [`Action::Modify`] as an override over the on-disk tree, so a routes
+    /// module this run re-renders *without* the flag-gated surface counts as
+    /// not using the feature, while a sibling scaffold's untouched files on
+    /// disk still count. [`Action::CreateIfAbsent`] targets are excluded from
+    /// the scan — like [`Plan::revert`]'s destroy path, their post-write
+    /// content is uncertain (the write is skipped when the file exists).
+    ///
+    /// A feature absent from the staged `Cargo.toml`, or pinned by the app's
+    /// database backend ([`autumn_web_feature_pinned_by_backend`]), is left
+    /// alone. Removal itself goes through
+    /// [`remove_autumn_web_feature`](super::schema_edit::remove_autumn_web_feature),
+    /// the inverse of the
+    /// [`ensure_autumn_web_feature`](super::schema_edit::ensure_autumn_web_feature)
+    /// the flag blocks used to add it.
+    pub fn prune_unneeded_autumn_web_features(&mut self) {
+        use super::read_or_empty;
+        use super::schema_edit::remove_autumn_web_feature;
+
+        if self.unneeded_autumn_web_features.is_empty() {
+            return;
+        }
+        // Post-write view of the tree: pending writes win over disk, and
+        // create-if-absent targets (whose write may not happen) are hidden —
+        // mirroring the destroy path's `scan_overrides`/`excluding` split.
+        let mut overrides: HashMap<PathBuf, String> = HashMap::new();
+        let mut excluding: Vec<PathBuf> = Vec::new();
+        for action in &self.actions {
+            match action {
+                Action::Create { path, contents } | Action::Modify { path, contents } => {
+                    overrides.insert(path.clone(), contents.clone());
+                }
+                Action::CreateIfAbsent { path, .. } => excluding.push(path.clone()),
+                Action::CreateBytes { .. } => {}
+            }
+        }
+        let cargo_path = self.project_root.join("Cargo.toml");
+        let base = self
+            .actions
+            .iter()
+            .rev()
+            .find_map(|a| match a {
+                Action::Modify { path, contents } if path == &cargo_path => Some(contents.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| read_or_empty(&cargo_path));
+        let mut updated = base.clone();
+        for feature in &self.unneeded_autumn_web_features {
+            // Cheap pure-string gate first: only a feature actually listed
+            // pays for the whole-tree marker scan.
+            let candidate = remove_autumn_web_feature(&updated, feature);
+            if candidate == updated {
+                continue;
+            }
+            if autumn_web_feature_pinned_by_backend(feature, &self.project_root)
+                || autumn_web_feature_still_needed_elsewhere(
+                    feature,
+                    &self.project_root,
+                    &excluding,
+                    &overrides,
+                )
+            {
+                continue;
+            }
+            updated = candidate;
+        }
+        if updated != base {
+            self.actions.retain(|a| a.path() != cargo_path);
+            self.actions.push(Action::Modify {
+                path: cargo_path,
+                contents: updated,
+            });
+        }
     }
 
     /// Push a [`Action::Create`] action.
@@ -1440,6 +1545,28 @@ fn autumn_web_feature_markers(feature: &str) -> &'static [&'static str] {
         // scaffold of one transport must not strip a feature the other
         // transport, generated separately, still needs).
         "ws" => &["#[ws]", "autumn_web::sse::stream("],
+        // A searchable index (`--searchable`) inlines an htmx `<script>` and
+        // its results handler extracts `HxRequest`; `--live` scaffolds swap
+        // regions through `OobSwap`/`HtmxFragments` — all gated behind
+        // autumn-web's `htmx` feature (issue #2328). Bare type/constant names,
+        // not `autumn_web::htmx::`-qualified paths, so a hand-written route
+        // that pulls them in through `use autumn_web::prelude::*;` is still
+        // caught (the prelude re-exports every one of these). Deliberately NOT
+        // the `autumn_web::htmx::` prefix itself: the stock `main.rs` layout
+        // every `autumn new` project ships references
+        // `autumn_web::htmx::AUTUMN_WIDGETS_JS_PATH`, which would pin the
+        // feature in every project forever — the same trap the `maud` comment
+        // above describes for `maud::html!`.
+        "htmx" => &[
+            "HxRequest",
+            "HxResponseExt",
+            "HTMX_JS_PATH",
+            "HTMX_CSRF_JS_PATH",
+            "HTMX_SSE_JS_PATH",
+            "IDIOMORPH_JS_PATH",
+            "OobSwap",
+            "HtmxFragments",
+        ],
         // `TestDb::` (not bare `TestDb`) so a doc comment merely mentioning
         // the type (e.g. the template-shipped `tests/integration_test.rs`'s
         // "Add DB-backed tests with `TestDb`...") doesn't count as usage.
@@ -3735,5 +3862,138 @@ mod tests {
         // under-retaining strips a dependency out from under code that still
         // compiles against it. The tie goes to the build.
         assert!(matches("use autumn_admin_plugin_extras::Thing;"));
+    }
+
+    // ── `Plan::prune_unneeded_autumn_web_features` (issue #2328) ──────────
+
+    fn prune_fixture(features: &[&str]) -> (tempfile::TempDir, Plan) {
+        let (tmp, plan) = fixture();
+        let features = features
+            .iter()
+            .map(|f| format!("\"{f}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        std::fs::write(
+            tmp.path().join("Cargo.toml"),
+            format!(
+                "[package]\nname = \"x\"\n\n[dependencies]\nautumn-web = {{ version = \"1\", features = [{features}] }}\n"
+            ),
+        )
+        .unwrap();
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        std::fs::write(tmp.path().join("src/main.rs"), "fn main() {}\n").unwrap();
+        (tmp, plan)
+    }
+
+    fn staged_cargo_toml(plan: &Plan) -> Option<String> {
+        let cargo_path = plan.project_root.join("Cargo.toml");
+        plan.actions.iter().find_map(|a| match a {
+            Action::Modify { path, contents } if path == &cargo_path => Some(contents.clone()),
+            _ => None,
+        })
+    }
+
+    /// A declared feature with no surviving usage marker is stripped from the
+    /// staged `Cargo.toml`.
+    #[test]
+    fn prune_drops_a_declared_feature_with_no_surviving_markers() {
+        let (_tmp, mut plan) = prune_fixture(&["htmx", "serde"]);
+        plan.declare_autumn_web_feature_unneeded("htmx");
+        plan.prune_unneeded_autumn_web_features();
+        let staged = staged_cargo_toml(&plan).expect("prune must stage a Cargo.toml rewrite");
+        assert!(!staged.contains("\"htmx\""), "htmx must be gone:\n{staged}");
+        assert!(
+            staged.contains("\"serde\""),
+            "unrelated features must survive:\n{staged}"
+        );
+    }
+
+    /// A sibling scaffold's untouched on-disk file still counts as usage: the
+    /// feature survives the prune.
+    #[test]
+    fn prune_keeps_a_declared_feature_a_sibling_still_uses() {
+        let (tmp, mut plan) = prune_fixture(&["htmx", "serde"]);
+        std::fs::write(
+            tmp.path().join("src/comments.rs"),
+            "async fn search(hx: autumn_web::htmx::HxRequest) {}\n",
+        )
+        .unwrap();
+        plan.declare_autumn_web_feature_unneeded("htmx");
+        plan.prune_unneeded_autumn_web_features();
+        assert!(
+            staged_cargo_toml(&plan).is_none(),
+            "htmx is still used by the sibling — no rewrite may be staged"
+        );
+    }
+
+    /// The marker scan sees the plan's pending (post-write) contents, not the
+    /// stale disk: the issue's `--force` re-render drops the feature even
+    /// though the on-disk routes file still carries the old marker.
+    #[test]
+    fn prune_scans_pending_writes_not_stale_disk() {
+        let (tmp, mut plan) = prune_fixture(&["htmx", "serde"]);
+        let routes = tmp.path().join("src/posts.rs");
+        std::fs::write(
+            &routes,
+            "async fn search(hx: autumn_web::htmx::HxRequest) {}\n",
+        )
+        .unwrap();
+        // This run re-renders the module WITHOUT the search surface.
+        plan.actions.push(Action::Modify {
+            path: routes,
+            contents: "async fn index() {}\n".to_owned(),
+        });
+        plan.declare_autumn_web_feature_unneeded("htmx");
+        plan.prune_unneeded_autumn_web_features();
+        let staged = staged_cargo_toml(&plan).expect("prune must stage a Cargo.toml rewrite");
+        assert!(
+            !staged.contains("\"htmx\""),
+            "the pending re-render removed the only usage:\n{staged}"
+        );
+    }
+
+    /// A declared feature absent from the staged `Cargo.toml` is left alone —
+    /// in particular no `Cargo.toml` rewrite is staged.
+    #[test]
+    fn prune_leaves_an_unlisted_feature_alone() {
+        let (_tmp, mut plan) = prune_fixture(&["serde"]);
+        plan.declare_autumn_web_feature_unneeded("htmx");
+        plan.prune_unneeded_autumn_web_features();
+        assert!(
+            staged_cargo_toml(&plan).is_none(),
+            "nothing to remove — no Cargo.toml action may be staged"
+        );
+    }
+
+    /// Declaring the same feature twice records it once.
+    #[test]
+    fn declare_dedups_features() {
+        let (_tmp, mut plan) = fixture();
+        plan.declare_autumn_web_feature_unneeded("htmx");
+        plan.declare_autumn_web_feature_unneeded("htmx");
+        assert_eq!(plan.unneeded_autumn_web_features, vec!["htmx"]);
+    }
+
+    /// The new `htmx` markers catch the shapes the scaffold actually emits —
+    /// and, critically, do NOT match the stock `main.rs` layout's
+    /// `AUTUMN_WIDGETS_JS_PATH` reference, which would pin the feature in
+    /// every project forever.
+    #[test]
+    fn htmx_markers_catch_generated_usage_but_not_the_stock_layout() {
+        let markers = autumn_web_feature_markers("htmx");
+        let matches = |src: &str| markers.iter().any(|m| src.contains(m));
+        // What the scaffold emits (search results handler, live regions).
+        assert!(matches("hx: autumn_web::htmx::HxRequest,"));
+        assert!(matches("script src=(autumn_web::htmx::HTMX_JS_PATH) {};"));
+        assert!(matches("fn swap() -> autumn_web::htmx::OobSwap {"));
+        // What a hand-written route pulls in through the prelude.
+        assert!(matches(
+            "use autumn_web::prelude::*;\nasync fn h(HxRequest) {}"
+        ));
+        // The stock layout every `autumn new` project ships — must NOT pin.
+        assert!(!matches(
+            "script src=(autumn_web::htmx::AUTUMN_WIDGETS_JS_PATH) {};"
+        ));
+        assert!(!matches("fn main() {}"));
     }
 }

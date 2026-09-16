@@ -396,7 +396,23 @@ pub fn plan_scaffold_with_options(
     // `autumn destroy scaffold` recomputes the identical plan before reverting
     // it, and must bypass that generate-only preflight (issue #1834); it reaches
     // the builder through `plan_scaffold_with_options_for_revert` instead.
-    plan_scaffold_with_options_impl(project_root, name, field_tokens, timestamp, options, false)
+    let mut plan = plan_scaffold_with_options_impl(
+        project_root,
+        name,
+        field_tokens,
+        timestamp,
+        options,
+        false,
+    );
+    // Issue #2328: a `--force` re-render that drops a feature-enabling flag
+    // must give the feature back when nothing else still uses it. Each flag
+    // block below declares its feature unneeded when the flag is off; this
+    // runs the marker-aware check against the plan's pending (post-write)
+    // contents and strips the unused survivors from the staged Cargo.toml.
+    // The destroy path never reaches this: it builds through
+    // `plan_scaffold_with_options_for_revert` and calls `Plan::revert`.
+    plan.prune_unneeded_autumn_web_features();
+    Ok(plan)
 }
 
 /// Compute the file actions for `autumn destroy scaffold …`.
@@ -2401,6 +2417,11 @@ fn plan_scaffold_with_options_impl(
             feature: "csv".to_owned(),
             owner_dir: None,
         });
+    } else if !for_revert {
+        // Issue #2328: a re-render whose shape no longer emits the export
+        // surface (`--api`, `--live`, `--sharded`) gives the `csv` feature
+        // back when no other generated or hand-written code still uses it.
+        plan.declare_autumn_web_feature_unneeded("csv");
     }
 
     // #1393: the emitted import handler takes an `autumn_web::extract::Multipart` body,
@@ -2451,6 +2472,12 @@ fn plan_scaffold_with_options_impl(
             feature: "multipart".to_owned(),
             owner_dir: None,
         });
+    } else {
+        // Issue #2328: the `if` above already covers the destroy path
+        // (`for_revert`), so this `else` is generate-only — a re-render
+        // without `--import` gives the `multipart` feature back when no other
+        // generated or hand-written code still uses it.
+        plan.declare_autumn_web_feature_unneeded("multipart");
     }
 
     // Issue #1319: a searchable (non-live) index inlines an htmx `<script>` and
@@ -2478,6 +2505,11 @@ fn plan_scaffold_with_options_impl(
             feature: "htmx".to_owned(),
             owner_dir: Some(project_root.join("src").join("routes")),
         });
+    } else if !for_revert {
+        // Issue #2328: a re-render without `--searchable` (or as `--api`, which
+        // has no HTML index) gives the `htmx` feature back when no other
+        // generated or hand-written code still uses it.
+        plan.declare_autumn_web_feature_unneeded("htmx");
     }
 
     // #1236: a scaffold with attachment fields needs autumn-web's `storage` feature — the
@@ -2554,6 +2586,12 @@ fn plan_scaffold_with_options_impl(
                     .to_owned(),
             );
         }
+    } else if !for_revert {
+        // Issue #2328: a re-render whose fields no longer include an
+        // attachment gives the `storage` and `multipart` features back when no
+        // other generated or hand-written code still uses them.
+        plan.declare_autumn_web_feature_unneeded("storage");
+        plan.declare_autumn_web_feature_unneeded("multipart");
     }
 
     // #1255: a scaffold with `richtext` columns needs autumn-web's `markdown` feature. The
@@ -2591,6 +2629,11 @@ fn plan_scaffold_with_options_impl(
             feature: "markdown".to_owned(),
             owner_dir: Some(project_root.join("src").join("routes")),
         });
+    } else if !for_revert {
+        // Issue #2328: a re-render whose fields no longer include a richtext
+        // column (or that switched to `--api`) gives the `markdown` feature
+        // back when no other generated or hand-written code still uses it.
+        plan.declare_autumn_web_feature_unneeded("markdown");
     }
 
     // --live requires `ws` (sse::stream), `maud` (LiveFragment/Markup), and `htmx`.
@@ -2629,6 +2672,15 @@ fn plan_scaffold_with_options_impl(
                 owner_dir: Some(routes_dir.clone()),
             });
         }
+    } else if !for_revert {
+        // Issue #2328: a re-render without `--live`/`--live-validation` gives
+        // the `ws` (SSE transport) and `htmx` features back when no other
+        // generated or hand-written code still uses them. `maud` is
+        // deliberately not declared: it has no usage markers (see
+        // `emit::autumn_web_feature_markers`), and it stays enabled through
+        // autumn-web's own default features regardless.
+        plan.declare_autumn_web_feature_unneeded("htmx");
+        plan.declare_autumn_web_feature_unneeded("ws");
     }
 
     // The generated smoke test uses `autumn_web::test::TestDb` (a real,
@@ -26771,6 +26823,256 @@ exempt_paths = [
         assert!(
             routes.matches("\"post.field.author_name\"").count() >= 3,
             "the field key must serve index, show, and form:\n{routes}"
+        );
+    }
+
+    /// Issue #2328: regenerating a scaffold WITHOUT a feature-enabling flag
+    /// leaves the now-stale explicit autumn-web feature pinned in Cargo.toml.
+    /// A `--force` re-render that drops `--searchable` must give `htmx` back
+    /// when nothing else still uses it.
+    #[test]
+    fn rerender_without_searchable_drops_the_stale_htmx_feature() {
+        let tmp = project_with_main(default_main());
+        let fields = ["title:String".to_string()];
+        let searchable = ScaffoldOptions {
+            model: ModelOptions {
+                searchable: vec!["title".to_string()],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        plan_scaffold_with_options(tmp.path(), "Post", &fields, "20260427000000", &searchable)
+            .unwrap()
+            .execute(Flags::default())
+            .unwrap();
+        let cargo = fs::read_to_string(tmp.path().join("Cargo.toml")).unwrap();
+        assert!(
+            cargo.contains("\"htmx\""),
+            "the --searchable render must pin the htmx feature:\n{cargo}"
+        );
+
+        // The issue's repro: `--force` re-render with the flag gone.
+        plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &fields,
+            "20260427000000",
+            &ScaffoldOptions::default(),
+        )
+        .unwrap()
+        .execute(Flags {
+            force: true,
+            ..Default::default()
+        })
+        .unwrap();
+        let cargo = fs::read_to_string(tmp.path().join("Cargo.toml")).unwrap();
+        assert!(
+            !cargo.contains("\"htmx\""),
+            "the re-render must drop the now-stale htmx feature:\n{cargo}"
+        );
+    }
+
+    /// Issue #2328: the same re-render must NOT drop the feature while a
+    /// sibling scaffold still renders its flag-gated surface.
+    #[test]
+    fn rerender_without_searchable_keeps_htmx_for_a_searchable_sibling() {
+        let tmp = project_with_main(default_main());
+        let fields = ["title:String".to_string()];
+        let searchable = ScaffoldOptions {
+            model: ModelOptions {
+                searchable: vec!["title".to_string()],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        for name in ["Post", "Comment"] {
+            plan_scaffold_with_options(tmp.path(), name, &fields, "20260427000000", &searchable)
+                .unwrap()
+                .execute(Flags::default())
+                .unwrap();
+        }
+        plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &fields,
+            "20260427000000",
+            &ScaffoldOptions::default(),
+        )
+        .unwrap()
+        .execute(Flags {
+            force: true,
+            ..Default::default()
+        })
+        .unwrap();
+        let cargo = fs::read_to_string(tmp.path().join("Cargo.toml")).unwrap();
+        assert!(
+            cargo.contains("\"htmx\""),
+            "Comment's search surface still needs htmx:\n{cargo}"
+        );
+    }
+
+    /// Issue #2328, `--import` → `multipart`: the re-render gives the feature
+    /// back when the import surface is gone and nothing else uses it.
+    #[test]
+    fn rerender_without_import_drops_the_stale_multipart_feature() {
+        let tmp = project_with_main(default_main());
+        let fields = ["title:String".to_string()];
+        let with_import = ScaffoldOptions {
+            import: true,
+            ..Default::default()
+        };
+        plan_scaffold_with_options(tmp.path(), "Post", &fields, "20260427000000", &with_import)
+            .unwrap()
+            .execute(Flags::default())
+            .unwrap();
+        let cargo = fs::read_to_string(tmp.path().join("Cargo.toml")).unwrap();
+        assert!(
+            cargo.contains("\"multipart\""),
+            "the --import render must pin the multipart feature:\n{cargo}"
+        );
+
+        plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &fields,
+            "20260427000000",
+            &ScaffoldOptions::default(),
+        )
+        .unwrap()
+        .execute(Flags {
+            force: true,
+            ..Default::default()
+        })
+        .unwrap();
+        let cargo = fs::read_to_string(tmp.path().join("Cargo.toml")).unwrap();
+        assert!(
+            !cargo.contains("\"multipart\""),
+            "the re-render must drop the now-stale multipart feature:\n{cargo}"
+        );
+    }
+
+    /// Issue #2328: hand-written code using the feature pins it just like a
+    /// sibling scaffold does — here a hand-written `Multipart` extractor in
+    /// `src/handlers.rs` survives the importless re-render.
+    #[test]
+    fn hand_written_multipart_usage_survives_an_importless_rerender() {
+        let tmp = project_with_main(default_main());
+        fs::write(
+            tmp.path().join("src/handlers.rs"),
+            "use autumn_web::extract::Multipart;\n\npub async fn upload(mut m: Multipart) {}\n",
+        )
+        .unwrap();
+        let fields = ["title:String".to_string()];
+        let with_import = ScaffoldOptions {
+            import: true,
+            ..Default::default()
+        };
+        plan_scaffold_with_options(tmp.path(), "Post", &fields, "20260427000000", &with_import)
+            .unwrap()
+            .execute(Flags::default())
+            .unwrap();
+        plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &fields,
+            "20260427000000",
+            &ScaffoldOptions::default(),
+        )
+        .unwrap()
+        .execute(Flags {
+            force: true,
+            ..Default::default()
+        })
+        .unwrap();
+        let cargo = fs::read_to_string(tmp.path().join("Cargo.toml")).unwrap();
+        assert!(
+            cargo.contains("\"multipart\""),
+            "hand-written Multipart code still needs the feature:\n{cargo}"
+        );
+    }
+
+    /// Issue #2328, attachment fields → `storage` + `multipart`: dropping the
+    /// attachment field from the re-render gives both features back.
+    #[test]
+    fn rerender_without_attachments_drops_storage_and_multipart() {
+        let tmp = project_with_main(default_main());
+        plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "cover:attachment".into()],
+            "20260427000000",
+            &ScaffoldOptions::default(),
+        )
+        .unwrap()
+        .execute(Flags::default())
+        .unwrap();
+        let cargo = fs::read_to_string(tmp.path().join("Cargo.toml")).unwrap();
+        assert!(
+            cargo.contains("\"storage\"") && cargo.contains("\"multipart\""),
+            "the attachment render must pin storage and multipart:\n{cargo}"
+        );
+
+        plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &["title:String".into()],
+            "20260427000000",
+            &ScaffoldOptions::default(),
+        )
+        .unwrap()
+        .execute(Flags {
+            force: true,
+            ..Default::default()
+        })
+        .unwrap();
+        let cargo = fs::read_to_string(tmp.path().join("Cargo.toml")).unwrap();
+        assert!(
+            !cargo.contains("\"storage\"") && !cargo.contains("\"multipart\""),
+            "the re-render must drop storage and multipart:\n{cargo}"
+        );
+    }
+
+    /// Issue #2328, `--i18n` → `i18n`: deliberately NOT pruned. The re-render
+    /// keeps the `.i18n_auto()` wiring in `main.rs` (the i18n block has no
+    /// matching revert for exactly this reason), so the feature is still
+    /// needed — dropping it would break the build.
+    #[test]
+    fn rerender_without_i18n_keeps_the_i18n_feature() {
+        let tmp = project_with_main(default_main());
+        let fields = ["title:String".to_string()];
+        plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &fields,
+            "20260427000000",
+            &i18n_options(),
+        )
+        .unwrap()
+        .execute(Flags::default())
+        .unwrap();
+        let cargo = fs::read_to_string(tmp.path().join("Cargo.toml")).unwrap();
+        assert!(
+            cargo.contains("\"i18n\""),
+            "the --i18n render must pin the i18n feature:\n{cargo}"
+        );
+
+        plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &fields,
+            "20260427000000",
+            &ScaffoldOptions::default(),
+        )
+        .unwrap()
+        .execute(Flags {
+            force: true,
+            ..Default::default()
+        })
+        .unwrap();
+        let cargo = fs::read_to_string(tmp.path().join("Cargo.toml")).unwrap();
+        assert!(
+            cargo.contains("\"i18n\""),
+            "the .i18n_auto() wiring persists, so the feature must stay:\n{cargo}"
         );
     }
 }
