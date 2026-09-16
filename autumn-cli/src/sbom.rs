@@ -72,6 +72,12 @@ pub enum SbomError {
     Json(#[from] serde_json::Error),
     #[error("unsupported object file format")]
     UnsupportedObjectFormat,
+    #[error(
+        "byte-swapped fat Mach-O magic {magic:#010x}: the fat header is always big-endian on disk, \
+         so no Apple toolchain produces this spelling. If you have a binary that really reads this \
+         way, please open an issue"
+    )]
+    ByteSwappedFatMagic { magic: u32 },
     #[error("truncated or malformed object file")]
     MalformedObject,
     #[error(
@@ -740,7 +746,8 @@ pub fn bom_from_audit_data(json: &str, tool_version: &str) -> Result<Bom, SbomEr
 ///
 /// # Errors
 ///
-/// Propagates [`SbomError::UnsupportedObjectFormat`], [`SbomError::NoAuditData`]
+/// Propagates [`SbomError::UnsupportedObjectFormat`],
+/// [`SbomError::ByteSwappedFatMagic`], [`SbomError::NoAuditData`]
 /// and JSON/decompression failures.
 pub fn bom_from_binary(bytes: &[u8], tool_version: &str) -> Result<Bom, SbomError> {
     let section = extract_dep_section(bytes)?;
@@ -1062,9 +1069,18 @@ fn extract_from_pe(bytes: &[u8]) -> Result<&[u8], SbomError> {
 /// Handles ELF (32/64-bit, either endianness), Mach-O (thin and fat/universal)
 /// and PE — i.e. every target the CLI itself ships binaries for.
 ///
+/// Fat/universal Mach-O is recognised by the two big-endian fat magics
+/// (`FAT_MAGIC`, `FAT_MAGIC_64`) only. The byte-swapped spellings (`FAT_CIGAM`,
+/// `FAT_CIGAM_64`) are rejected with [`SbomError::ByteSwappedFatMagic`] rather
+/// than parsed: per `<mach-o/fat.h>` the fat header is always big-endian on
+/// disk regardless of the endianness of the slices inside, so no Apple toolchain
+/// produces them, and parsing a layout nothing emits would trade a clear
+/// rejection for unexercised code.
+///
 /// # Errors
 ///
 /// * [`SbomError::UnsupportedObjectFormat`] — not a recognized object file.
+/// * [`SbomError::ByteSwappedFatMagic`] — byte-swapped fat Mach-O magic; deliberate, see above.
 /// * [`SbomError::NoAuditData`] — a valid object file with no embedded list.
 /// * [`SbomError::MalformedObject`] — truncated or self-inconsistent headers.
 pub fn extract_dep_section(bytes: &[u8]) -> Result<&[u8], SbomError> {
@@ -1075,6 +1091,18 @@ pub fn extract_dep_section(bytes: &[u8]) -> Result<&[u8], SbomError> {
         }
         Some([0xca, 0xfe, 0xba, 0xbe]) => extract_from_macho_fat(bytes, false),
         Some([0xca, 0xfe, 0xba, 0xbf]) => extract_from_macho_fat(bytes, true),
+        // FAT_CIGAM / FAT_CIGAM_64: the byte-swapped spellings of the two fat
+        // magics. Per <mach-o/fat.h> the fat header is always big-endian on
+        // disk regardless of the slices inside, so no conforming producer
+        // (lipo, clang, cargo) emits them; matching them explicitly keeps the
+        // rejection deliberate and explanatory instead of a generic
+        // unknown-format. (#2394)
+        Some([0xbe, 0xba, 0xfe, 0xca]) => {
+            Err(SbomError::ByteSwappedFatMagic { magic: 0xbeba_feca })
+        }
+        Some([0xbf, 0xba, 0xfe, 0xca]) => {
+            Err(SbomError::ByteSwappedFatMagic { magic: 0xbfba_feca })
+        }
         Some([b'M', b'Z', ..]) => extract_from_pe(bytes),
         _ => Err(SbomError::UnsupportedObjectFormat),
     }
@@ -2222,6 +2250,44 @@ mod tests {
     fn rejects_a_file_that_is_not_an_object_file() {
         assert!(matches!(
             extract_dep_section(b"#!/bin/sh\necho hi\n"),
+            Err(SbomError::UnsupportedObjectFormat)
+        ));
+    }
+
+    #[test]
+    fn byte_swapped_fat_magics_are_rejected_with_a_named_error() {
+        // FAT_CIGAM / FAT_CIGAM_64: the fat header is always big-endian on
+        // disk per <mach-o/fat.h>, so no conforming producer emits these
+        // spellings. The rejection names the magic and says why instead of
+        // falling through to the generic unsupported-format error. (#2394)
+        for (magic_bytes, magic) in [
+            ([0xbe, 0xba, 0xfe, 0xca], 0xbeba_feca_u32),
+            ([0xbf, 0xba, 0xfe, 0xca], 0xbfba_feca_u32),
+        ] {
+            let mut input = magic_bytes.to_vec();
+            // Header bytes the dispatch never reads; the rejection is keyed
+            // on the magic alone.
+            input.extend_from_slice(&[0u8; 64]);
+            let err = extract_dep_section(&input).unwrap_err();
+            assert!(
+                matches!(err, SbomError::ByteSwappedFatMagic { magic: m } if m == magic),
+                "expected a named byte-swapped-fat rejection, got: {err}"
+            );
+            let message = err.to_string();
+            assert!(message.contains("byte-swapped"), "{message}");
+            assert!(message.contains("big-endian"), "{message}");
+            assert!(message.contains("open an issue"), "{message}");
+        }
+    }
+
+    #[test]
+    fn a_nearby_unrecognized_magic_stays_a_generic_rejection() {
+        // Only the two documented FAT_CIGAM spellings get the named error; a
+        // one-off neighbor is still an unrecognized format. (#2394)
+        let mut input = [0xca, 0xfe, 0xba, 0xbd].to_vec();
+        input.extend_from_slice(&[0u8; 64]);
+        assert!(matches!(
+            extract_dep_section(&input),
             Err(SbomError::UnsupportedObjectFormat)
         ));
     }

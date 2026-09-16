@@ -186,6 +186,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   audit-`deleted_at` shape and the denormalized-`tenant_id` shape (router
   and generated-trait level), plus the corresponding rule in
   `docs/guide/commentable.md`.
+- **`autumn sbom --binary` names the byte-swapped fat Mach-O magics when it
+  rejects them (#2394):** the object-format dispatch now matches `FAT_CIGAM`
+  / `FAT_CIGAM_64` explicitly and reports `SbomError::ByteSwappedFatMagic`
+  — the fat header is always big-endian on disk per `<mach-o/fat.h>`, so no
+  Apple toolchain produces these spellings — instead of the generic
+  "unsupported object file format". Deliberately not parsed: a code path
+  for a layout no conforming producer emits would be worse than the honest
+  rejection. The accepted fat spellings and the reasoning are documented
+  on `extract_dep_section`.
 
 ### Added
 
