@@ -659,19 +659,33 @@ struct AuditData {
 
 fn component_from_audit(pkg: &AuditPackage) -> Component {
     // cargo-auditable records a vocabulary of its own ("crates.io", "registry",
-    // "git", "local", …) rather than a cargo source URL, so translate it to the
-    // same "only claim a crates.io identity when it IS one" rule.
-    let (purl, bom_ref) = package_url(
-        &pkg.name,
-        &pkg.version,
-        match pkg.source.as_deref() {
-            Some("crates.io" | "registry") => Some(CRATES_IO_SOURCE),
-            // No URL is recorded, so there is nothing to qualify with; say it
-            // is not a registry package rather than claiming it is.
-            Some("git") => Some("git+"),
-            _ => None,
-        },
-    );
+    // "git", "local", …) rather than a cargo source URL, so decide the purl
+    // and bom-ref directly from that vocabulary instead of round-tripping
+    // through `package_url` (#2386): the audit data never carries a source URL,
+    // so translating "git" into the synthetic `git+` made `package_url` emit a
+    // purl with an empty `vcs_url=` qualifier — the comment on that arm said
+    // there was nothing to qualify with, and the code qualified with nothing —
+    // and translating "registry" into crates.io's source pinned an
+    // alternate-registry package to a crates.io identity it may not share.
+    //
+    // Only "crates.io" can claim the canonical `pkg:cargo/<name>@<version>`
+    // identity. Every other origin gets a bom-ref whose scheme says what it
+    // is, and no purl — claiming nothing beats claiming the wrong registry.
+    let name = pkg.name.as_str();
+    let version = pkg.version.as_str();
+    let (purl, bom_ref) = match pkg.source.as_deref() {
+        Some("crates.io") => {
+            let bare = format!("pkg:cargo/{name}@{version}");
+            (Some(bare.clone()), bare)
+        }
+        Some("registry") => (None, format!("registry:{name}@{version}")),
+        Some("git") => (None, format!("git:{name}@{version}")),
+        // An audit entry with no recorded source is most plausibly a local or
+        // path build — the old `_ => None` mapping into `package_url`'s
+        // unpublished arm produced this same `path:` bom-ref, so keep it.
+        Some("local") | None => (None, format!("path:{name}@{version}")),
+        Some(_) => (None, format!("other:{name}@{version}")),
+    };
     let kind = pkg.kind.as_deref().unwrap_or("runtime");
     let mut properties = Vec::new();
     // Only annotate the non-default kind, so a runtime-only BOM stays clean.
@@ -1626,6 +1640,84 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&render(&bom).unwrap()).unwrap();
         assert!(v["components"][0].get("purl").is_none());
         assert_eq!(v["components"][0]["bom-ref"], "path:vendored@2.0.0");
+    }
+
+    #[test]
+    fn audit_data_source_vocabulary_never_invents_a_registry_identity() {
+        // #2386: translating cargo-auditable's source vocabulary through
+        // synthetic cargo source strings pinned an alternate-registry package
+        // to a crates.io purl and a git package to a purl with an empty
+        // `vcs_url=` qualifier. Only "crates.io" may claim the canonical
+        // identity now; every other origin gets a scheme-prefixed bom-ref and
+        // no purl. The same name@version across all five categories also pins
+        // bom-ref uniqueness.
+        let bom = bom_from_audit_data(
+            r#"{"packages":[
+                {"name":"same","version":"1.0.0","source":"crates.io"},
+                {"name":"same","version":"1.0.0","source":"registry"},
+                {"name":"same","version":"1.0.0","source":"git"},
+                {"name":"same","version":"1.0.0","source":"local"},
+                {"name":"same","version":"1.0.0","source":"mercurial"},
+                {"name":"unsourced","version":"1.0.0"}
+            ]}"#,
+            "0.7.0",
+        )
+        .unwrap();
+        let rendered = render(&bom).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+        let components = v["components"].as_array().unwrap();
+        assert_eq!(components.len(), 6);
+        let by_ref = |r: &str| {
+            components
+                .iter()
+                .find(|c| c["bom-ref"] == r)
+                .unwrap_or_else(|| panic!("no component with bom-ref {r}"))
+        };
+
+        // "crates.io" keeps the canonical purl — and only it does.
+        let crates_io = by_ref("pkg:cargo/same@1.0.0");
+        assert_eq!(crates_io["purl"], "pkg:cargo/same@1.0.0");
+
+        for (bom_ref, origin) in [
+            ("registry:same@1.0.0", "registry"),
+            ("git:same@1.0.0", "git"),
+            ("path:same@1.0.0", "local"),
+            ("other:same@1.0.0", "mercurial"),
+        ] {
+            let c = by_ref(bom_ref);
+            assert!(c.get("purl").is_none(), "{bom_ref} must not claim a purl");
+            let sources: Vec<&str> = c["properties"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|p| p["name"] == "cargo:source")
+                .map(|p| p["value"].as_str().unwrap())
+                .collect();
+            assert_eq!(sources, vec![origin], "{bom_ref} keeps its cargo:source");
+        }
+
+        // The old "git" spelling emitted `pkg:cargo/same@1.0.0?vcs_url=` with
+        // an empty value — `get("purl").is_none()` alone would not catch a
+        // purl-shaped bom-ref, so pin the rendered document too.
+        assert!(
+            !rendered.contains("vcs_url="),
+            "no component may carry an empty vcs_url qualifier"
+        );
+
+        // A source-less audit entry is most plausibly a local/path build and
+        // keeps the old `path:` spelling (with no origin category to record).
+        let unsourced = by_ref("path:unsourced@1.0.0");
+        assert!(unsourced.get("purl").is_none());
+        assert!(unsourced.get("properties").is_none());
+
+        // Five categories sharing one name@version: every bom-ref is unique.
+        let mut refs: Vec<&str> = components
+            .iter()
+            .map(|c| c["bom-ref"].as_str().unwrap())
+            .collect();
+        refs.sort_unstable();
+        refs.dedup();
+        assert_eq!(refs.len(), 6);
     }
 
     #[test]

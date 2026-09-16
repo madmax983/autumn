@@ -49,6 +49,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   see the note in the PR: a correct one has to reuse
   `check-docs-cli.sh`'s `resolve()` rather than re-implement it, and that is
   its own change.
+
+- **`autumn sbom --binary` no longer invents provenance for non-crates.io
+  packages (#2386):** `component_from_audit` translated cargo-auditable's
+  source vocabulary through synthetic cargo source strings before deriving
+  each component's purl. That pinned an alternate-registry (`"registry"`)
+  package to the canonical `pkg:cargo/<name>@<version>` — a crates.io
+  identity it may not share — and gave a `"git"` package a purl with an
+  empty `vcs_url=` qualifier (the comment on that arm said there was
+  nothing to qualify with, and the code qualified with nothing). The purl
+  and bom-ref are now decided directly from the audit vocabulary: only
+  `"crates.io"` claims the canonical purl; `"registry"`, `"git"`,
+  `"local"`, and anything else get a scheme-prefixed bom-ref
+  (`registry:`/`git:`/`path:`/`other:`) and no purl, while the existing
+  `cargo:source` property keeps recording the origin category. Regression
+  test covers all five categories over a synthetic audit payload, including
+  bom-ref uniqueness for one name@version shared across them. The
+  `cargo metadata` path is untouched — it receives real source URLs and was
+  already correct.
+
 - **🧭 Wayfinder: redisplay the "create account to accept" form on a
   rejected password in examples/teams (error-path 0/3 → 3/3, email
   preserved):** `POST /invite/{token}/accept` — the join step of the
