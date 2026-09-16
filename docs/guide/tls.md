@@ -744,7 +744,11 @@ ingress_ipv4     = ["203.0.113.10"]      # A records, for tenant APEX domains
 
 `ingress_hostname` is what tenants CNAME at. An **apex** domain
 (`clientco.com`) cannot carry a CNAME, so it needs `ingress_ipv4` /
-`ingress_ipv6` instead; set both kinds if you accept both.
+`ingress_ipv6` instead; set both kinds if you accept both. A three-label name
+is ambiguous without a public-suffix list — `clientco.co.uk` is an apex under
+a multi-label suffix, `app.clientco.com` a subdomain — so the instructions
+offer both record shapes there and the tenant publishes the one their zone
+allows.
 
 ### The tenant journey
 
@@ -772,8 +776,13 @@ let ingress = config.server.tls.as_ref()
 let domain = registry.register("app.clientco.com", &tenant_id, now_unix).await?;
 
 // 2. Show the tenant exactly what to publish. Fields are tab-separated.
+//    A three-label name is ambiguous (apex or subdomain), so it gets both
+//    shapes; the tenant publishes the one their zone allows.
 let instructions = DnsInstructions::for_hostname(&domain.hostname, &ingress)?;
-println!("{}", instructions.render());   // app.clientco.com\tCNAME\tingress.myapp.com
+println!("{}", instructions.render());
+// app.clientco.com\tCNAME\tingress.myapp.com
+// # If app.clientco.com is an apex domain (it has three labels, ...), ...
+// app.clientco.com\tA\t203.0.113.10
 
 // 3. Render status, including why it is stuck.
 for d in registry.list_for_tenant(&tenant_id) {

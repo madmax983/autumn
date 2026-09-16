@@ -107,20 +107,37 @@ fn hostnames_are_normalised_and_validated() {
 }
 
 #[test]
-fn dns_instructions_are_cname_for_subdomains_and_addresses_for_apex() {
-    let sub = DnsInstructions::for_hostname("app.clientco.com", &ingress()).unwrap();
-    match &sub {
-        DnsInstructions::Cname { name, value } => {
+fn dns_instructions_are_both_shapes_for_ambiguous_names_and_single_shapes_otherwise() {
+    // A three-label name is ambiguous without a public-suffix list: it may be
+    // an apex (clientco.co.uk) or a subdomain (app.clientco.com), so the
+    // tenant is offered both record shapes (#2643).
+    let both = DnsInstructions::for_hostname("app.clientco.com", &ingress()).unwrap();
+    match &both {
+        DnsInstructions::Both {
+            name,
+            cname_value,
+            ipv4,
+            ipv6,
+        } => {
             assert_eq!(name, "app.clientco.com");
-            assert_eq!(value, "ingress.myapp.com");
+            assert_eq!(cname_value, "ingress.myapp.com");
+            assert_eq!(ipv4, &["203.0.113.10".to_owned()]);
+            assert!(ipv6.is_empty());
         }
-        other @ DnsInstructions::Address { .. } => {
-            panic!("expected a CNAME instruction, got {other:?}")
-        }
+        other => panic!("expected both shapes for a three-label name, got {other:?}"),
     }
-    assert!(sub.render().contains("CNAME"));
+    let rendered = both.render();
+    assert!(rendered.contains("CNAME"));
+    assert!(rendered.contains("\tA\t"));
 
-    // An apex domain cannot carry a CNAME, so it gets A/AAAA records.
+    // The issue's case: clientco.co.uk must no longer be handed a lone CNAME.
+    let apex_like = DnsInstructions::for_hostname("clientco.co.uk", &ingress()).unwrap();
+    assert!(
+        matches!(apex_like, DnsInstructions::Both { .. }),
+        "expected both shapes, got {apex_like:?}"
+    );
+
+    // An unambiguous apex still gets address records only.
     let apex = DnsInstructions::for_hostname("clientco.com", &ingress()).unwrap();
     match &apex {
         DnsInstructions::Address { name, ipv4, ipv6 } => {
@@ -128,11 +145,18 @@ fn dns_instructions_are_cname_for_subdomains_and_addresses_for_apex() {
             assert_eq!(ipv4, &["203.0.113.10".to_owned()]);
             assert!(ipv6.is_empty());
         }
-        other @ DnsInstructions::Cname { .. } => {
+        other @ DnsInstructions::Cname { .. } | other @ DnsInstructions::Both { .. } => {
             panic!("expected address records, got {other:?}")
         }
     }
     assert!(apex.render().contains('A'));
+
+    // A four-label name is unambiguously a subdomain: CNAME only.
+    let deep = DnsInstructions::for_hostname("a.b.clientco.com", &ingress()).unwrap();
+    assert!(
+        matches!(deep, DnsInstructions::Cname { .. }),
+        "expected a CNAME instruction, got {deep:?}"
+    );
 }
 
 #[tokio::test]

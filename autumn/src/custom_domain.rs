@@ -7,7 +7,9 @@
 //! - the hostname → tenant [registry](CustomDomainRegistry) and its persistence
 //!   ([`CustomDomainStore`]),
 //! - the tenant-facing [DNS instructions](DnsInstructions) — CNAME for a
-//!   subdomain, A/AAAA for an apex, which cannot carry a CNAME,
+//!   subdomain, A/AAAA for an apex, which cannot carry a CNAME, and both
+//!   shapes for an ambiguous three-label name (an apex under a multi-label
+//!   public suffix, or a subdomain, is undecidable from the label count),
 //! - the **verification gate** ([`grade_dns_verification`]): no ACME order is
 //!   created until the hostname is independently observed to point at this
 //!   deployment,
@@ -122,14 +124,41 @@ pub fn normalize_hostname(raw: &str) -> Result<String, String> {
 
 /// Is `hostname` an apex (registrable) name, which cannot carry a CNAME?
 ///
-/// Approximated as "exactly two labels". A public-suffix list would be exact
-/// (`co.uk` needs three), but the cost of being wrong is only which record type
-/// the instructions suggest — and [`grade_dns_verification`] accepts either
-/// shape, so a tenant who follows a CNAME suggestion on a three-label apex and
-/// gets a DNS-provider error can still use A/AAAA and verify.
+/// Approximated as "at most two labels". That is exact for single-label public
+/// suffixes (`clientco.com`) but cannot be exact for multi-label ones: a
+/// three-label name may be an apex (`clientco.co.uk`) or a subdomain
+/// (`app.clientco.com`), and the label count alone cannot tell (see
+/// [`apex_verdict`]). [`DnsInstructions::for_hostname`] no longer trusts this
+/// guess alone for the ambiguous class — it offers both record shapes there.
 #[must_use]
 pub fn is_apex(hostname: &str) -> bool {
     hostname.split('.').filter(|l| !l.is_empty()).count() <= 2
+}
+
+/// What the label-count heuristic can say about a hostname, without a
+/// public-suffix list.
+///
+/// - [`ApexVerdict::Apex`]: at most two labels — an apex for every public
+///   suffix the list could plausibly contain.
+/// - [`ApexVerdict::Subdomain`]: four or more labels — a subdomain under any
+///   public suffix of at most two labels (the residual is the rare three-label
+///   suffix, e.g. `city.kobe.jp`).
+/// - [`ApexVerdict::Ambiguous`]: exactly three labels — an apex under a
+///   two-label suffix (`clientco.co.uk`) or a subdomain of a two-label
+///   registrable name (`app.clientco.com`); undecidable without the list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ApexVerdict {
+    Apex,
+    Subdomain,
+    Ambiguous,
+}
+
+fn apex_verdict(hostname: &str) -> ApexVerdict {
+    match hostname.split('.').filter(|l| !l.is_empty()).count() {
+        0..=2 => ApexVerdict::Apex,
+        3 => ApexVerdict::Ambiguous,
+        _ => ApexVerdict::Subdomain,
+    }
 }
 
 // ── Tenant-facing DNS instructions ───────────────────────────────────────
@@ -182,57 +211,135 @@ pub enum DnsInstructions {
         /// AAAA-record values.
         ipv6: Vec<String>,
     },
+    /// An ambiguous three-label name (`clientco.co.uk` may be an apex under a
+    /// multi-label public suffix, `app.clientco.com` a subdomain): both record
+    /// shapes, so the tenant publishes the one their zone allows. A subdomain
+    /// may carry either shape; an apex may only carry the address shape.
+    Both {
+        /// The record name the tenant creates.
+        name: String,
+        /// The CNAME target, for the subdomain interpretation.
+        cname_value: String,
+        /// A-record values, for the apex interpretation.
+        ipv4: Vec<String>,
+        /// AAAA-record values, for the apex interpretation.
+        ipv6: Vec<String>,
+    },
 }
 
 impl DnsInstructions {
     /// Build the instructions for `hostname` against this deployment's ingress.
     ///
+    /// An unambiguous apex (at most two labels) gets the address shape; an
+    /// unambiguous subdomain (four or more labels) gets the CNAME shape. An
+    /// ambiguous three-label name gets [`DnsInstructions::Both`] when the
+    /// ingress carries a CNAME target and addresses, and the best available
+    /// single shape otherwise.
+    ///
     /// # Errors
     ///
     /// Returns a message when the hostname is invalid, or when the ingress
     /// carries nothing of the kind this hostname needs (no CNAME target for a
-    /// subdomain, no addresses for an apex).
+    /// subdomain, no addresses for an apex, neither for an ambiguous name).
     pub fn for_hostname(hostname: &str, ingress: &ExpectedIngress) -> Result<Self, String> {
         let host = normalize_hostname(hostname)?;
-        if is_apex(&host) {
-            if ingress.ipv4.is_empty() && ingress.ipv6.is_empty() {
-                return Err(format!(
-                    "{host} is an apex domain, which cannot carry a CNAME, but no ingress \
-                     addresses are configured; set [server.tls.acme.custom_domains] ingress_ipv4 \
-                     / ingress_ipv6"
-                ));
+        match apex_verdict(&host) {
+            ApexVerdict::Apex => Self::address_instructions(&host, ingress),
+            ApexVerdict::Subdomain => Self::cname_instructions(&host, ingress),
+            ApexVerdict::Ambiguous => {
+                let cname = ingress.cname_target();
+                let has_addresses = !ingress.ipv4.is_empty() || !ingress.ipv6.is_empty();
+                match (cname, has_addresses) {
+                    (Some(cname_value), true) => Ok(Self::Both {
+                        name: host,
+                        cname_value,
+                        ipv4: ingress.ipv4.iter().map(ToString::to_string).collect(),
+                        ipv6: ingress.ipv6.iter().map(ToString::to_string).collect(),
+                    }),
+                    (Some(value), false) => Ok(Self::Cname { name: host, value }),
+                    (None, true) => Self::address_instructions(&host, ingress),
+                    (None, false) => Err(format!(
+                        "{host} needs a CNAME target or ingress addresses, but the ingress \
+                         configures neither; set [server.tls.acme.custom_domains] \
+                         ingress_hostname and/or ingress_ipv4 / ingress_ipv6"
+                    )),
+                }
             }
-            return Ok(Self::Address {
-                name: host,
-                ipv4: ingress.ipv4.iter().map(ToString::to_string).collect(),
-                ipv6: ingress.ipv6.iter().map(ToString::to_string).collect(),
-            });
         }
+    }
+
+    /// The address-shape instructions, for an apex (or an ambiguous name whose
+    /// ingress has no CNAME target).
+    fn address_instructions(host: &str, ingress: &ExpectedIngress) -> Result<Self, String> {
+        if ingress.ipv4.is_empty() && ingress.ipv6.is_empty() {
+            return Err(format!(
+                "{host} is an apex domain, which cannot carry a CNAME, but no ingress \
+                 addresses are configured; set [server.tls.acme.custom_domains] ingress_ipv4 \
+                 / ingress_ipv6"
+            ));
+        }
+        Ok(Self::Address {
+            name: host.to_owned(),
+            ipv4: ingress.ipv4.iter().map(ToString::to_string).collect(),
+            ipv6: ingress.ipv6.iter().map(ToString::to_string).collect(),
+        })
+    }
+
+    /// The CNAME-shape instructions, for an unambiguous subdomain.
+    fn cname_instructions(host: &str, ingress: &ExpectedIngress) -> Result<Self, String> {
         let value = ingress.cname_target().ok_or_else(|| {
             format!(
                 "{host} needs a CNAME target, but no ingress hostname is configured; set \
                  [server.tls.acme.custom_domains] ingress_hostname"
             )
         })?;
-        Ok(Self::Cname { name: host, value })
+        Ok(Self::Cname {
+            name: host.to_owned(),
+            value,
+        })
     }
 
-    /// The instructions as a line a tenant-facing screen can print verbatim.
+    /// The instructions as text a tenant-facing screen can print verbatim.
+    ///
+    /// The [`DnsInstructions::Both`] shape prints the CNAME records first and
+    /// the address records after, with a note explaining which to publish:
+    /// a name that is a subdomain may carry either, an apex only the address
+    /// records.
     #[must_use]
     pub fn render(&self) -> String {
         match self {
             Self::Cname { name, value } => format!("{name}\tCNAME\t{value}"),
-            Self::Address { name, ipv4, ipv6 } => {
+            Self::Address { name, ipv4, ipv6 } => Self::render_addresses(name, ipv4, ipv6),
+            Self::Both {
+                name,
+                cname_value,
+                ipv4,
+                ipv6,
+            } => {
                 use std::fmt::Write as _;
-                let mut out = String::new();
-                for (kind, addrs) in [("A", ipv4), ("AAAA", ipv6)] {
-                    for addr in addrs {
-                        let _ = writeln!(out, "{name}\t{kind}\t{addr}");
-                    }
-                }
-                out.trim_end().to_owned()
+                let mut out = format!("{name}\tCNAME\t{cname_value}\n");
+                let _ = write!(
+                    out,
+                    "# If {name} is an apex domain (it has three labels, e.g. clientco.co.uk \
+                     under a multi-label public suffix), a CNAME cannot be published there — \
+                     publish these instead:\n"
+                );
+                out.push_str(&Self::render_addresses(name, ipv4, ipv6));
+                out
             }
         }
+    }
+
+    /// The address-shape records, one tab-separated line per address.
+    fn render_addresses(name: &str, ipv4: &[String], ipv6: &[String]) -> String {
+        use std::fmt::Write as _;
+        let mut out = String::new();
+        for (kind, addrs) in [("A", ipv4), ("AAAA", ipv6)] {
+            for addr in addrs {
+                let _ = writeln!(out, "{name}\t{kind}\t{addr}");
+            }
+        }
+        out.trim_end().to_owned()
     }
 }
 
@@ -2125,6 +2232,111 @@ mod tests {
         assert!(is_apex("clientco.com"));
         assert!(!is_apex("app.clientco.com"));
         assert!(!is_apex("a.b.clientco.com"));
+    }
+
+    fn full_ingress() -> ExpectedIngress {
+        ExpectedIngress {
+            hostname: Some("ingress.myapp.com".to_owned()),
+            ipv4: vec!["203.0.113.10".parse().unwrap()],
+            ipv6: vec![],
+        }
+    }
+
+    #[test]
+    fn apex_verdict_classifies_label_counts() {
+        assert_eq!(apex_verdict("clientco.com"), ApexVerdict::Apex);
+        assert_eq!(apex_verdict("co.uk"), ApexVerdict::Apex);
+        // Three labels are undecidable without a public-suffix list:
+        // apex under a multi-label suffix, or a subdomain.
+        assert_eq!(apex_verdict("clientco.co.uk"), ApexVerdict::Ambiguous);
+        assert_eq!(apex_verdict("app.clientco.com"), ApexVerdict::Ambiguous);
+        assert_eq!(apex_verdict("a.b.clientco.com"), ApexVerdict::Subdomain);
+    }
+
+    #[test]
+    fn an_ambiguous_name_gets_both_shapes_when_the_ingress_serves_both() {
+        // The issue's case: clientco.co.uk is an apex the old guess called a
+        // subdomain. It must no longer be handed a lone CNAME.
+        let both = DnsInstructions::for_hostname("clientco.co.uk", &full_ingress()).unwrap();
+        match &both {
+            DnsInstructions::Both {
+                name,
+                cname_value,
+                ipv4,
+                ipv6,
+            } => {
+                assert_eq!(name, "clientco.co.uk");
+                assert_eq!(cname_value, "ingress.myapp.com");
+                assert_eq!(ipv4, &["203.0.113.10".to_owned()]);
+                assert!(ipv6.is_empty());
+            }
+            other => panic!("expected both shapes, got {other:?}"),
+        }
+        let rendered = both.render();
+        assert!(rendered.contains("clientco.co.uk\tCNAME\tingress.myapp.com"));
+        assert!(rendered.contains("clientco.co.uk\tA\t203.0.113.10"));
+        assert!(rendered.contains("apex"));
+
+        // A genuine three-label subdomain gets the same honest answer: the
+        // guess cannot tell it apart from the apex above.
+        let sub = DnsInstructions::for_hostname("app.clientco.com", &full_ingress()).unwrap();
+        assert!(matches!(sub, DnsInstructions::Both { .. }));
+    }
+
+    #[test]
+    fn an_ambiguous_name_falls_back_to_the_single_shape_available() {
+        let hostname_only = ExpectedIngress {
+            hostname: Some("ingress.myapp.com".to_owned()),
+            ..ExpectedIngress::default()
+        };
+        let addrs_only = ExpectedIngress {
+            ipv4: vec!["203.0.113.10".parse().unwrap()],
+            ..ExpectedIngress::default()
+        };
+
+        let cname = DnsInstructions::for_hostname("clientco.co.uk", &hostname_only).unwrap();
+        assert!(
+            matches!(cname, DnsInstructions::Cname { .. }),
+            "no addresses configured: the CNAME shape is all that can be offered, got {cname:?}"
+        );
+
+        let addrs = DnsInstructions::for_hostname("clientco.co.uk", &addrs_only).unwrap();
+        assert!(
+            matches!(addrs, DnsInstructions::Address { .. }),
+            "no CNAME target configured: the address shape is all that can be offered, got {addrs:?}"
+        );
+
+        let err = DnsInstructions::for_hostname("clientco.co.uk", &ExpectedIngress::default())
+            .unwrap_err();
+        assert!(
+            err.contains("ingress_hostname") && err.contains("ingress_ipv4"),
+            "the error must name both knobs, got: {err}"
+        );
+    }
+
+    #[test]
+    fn unambiguous_names_keep_their_single_shape() {
+        let apex = DnsInstructions::for_hostname("clientco.com", &full_ingress()).unwrap();
+        assert!(matches!(apex, DnsInstructions::Address { .. }));
+
+        let sub = DnsInstructions::for_hostname("a.b.clientco.com", &full_ingress()).unwrap();
+        assert!(matches!(sub, DnsInstructions::Cname { .. }));
+
+        // An apex with no addresses configured is still an error.
+        let hostname_only = ExpectedIngress {
+            hostname: Some("ingress.myapp.com".to_owned()),
+            ..ExpectedIngress::default()
+        };
+        assert!(DnsInstructions::for_hostname("clientco.com", &hostname_only).is_err());
+    }
+
+    #[test]
+    fn both_shapes_round_trip_through_serde() {
+        let both = DnsInstructions::for_hostname("clientco.co.uk", &full_ingress()).unwrap();
+        let json = serde_json::to_string(&both).expect("serialize");
+        assert!(json.contains("\"type\":\"both\""));
+        let back: DnsInstructions = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(both, back);
     }
 
     #[test]

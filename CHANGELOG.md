@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Custom domains: an ambiguous three-label hostname no longer gets a lone
+  CNAME instruction (#2643):** `DnsInstructions::for_hostname` guessed apex
+  vs subdomain from the label count alone, so `clientco.co.uk` — an apex
+  under a multi-label public suffix — was handed a CNAME it can never publish
+  (RFC 1034 forbids a CNAME at an apex). Three-label names are undecidable
+  without a public-suffix list, so they now get a new `DnsInstructions::Both`
+  shape when the ingress configures both a CNAME target and addresses, and the
+  best available single shape otherwise; `render()` prints both record sets
+  with a note telling the tenant which to publish. Unambiguous names are
+  unchanged (≤2 labels → addresses, ≥4 → CNAME). Deliberately not done: a
+  public-suffix-list dependency — the exact fix — stays a dependency decision
+  for review; the residual is a four-label name under a rare three-label
+  suffix being read as a subdomain.
+
 - **📖 Folio: make the `autumn token` lifecycle findable (retrieval "revoke
   api token" 0 hits → 1):** the guide taught readers to *gate* a route on a
   token scope — `#[secured(scopes = ["posts:write"])]`, on three pages — and
