@@ -810,19 +810,30 @@ pub fn evaluate_within(root: &Path, budget: Duration) -> Evaluation {
 /// The directory holding the app's policy file, searching upward from `start`.
 ///
 /// The CI gate runs at the repository root. A developer inside a workspace
-/// member must get that same graph, not "no policy".
+/// member must get that same graph, not "no policy" — and when both the
+/// member and the root carry a policy, the root's wins, because that is the
+/// file the generated CI workflow reads.
+///
+/// This is a deliberate asymmetry with a bare `cargo deny` run inside the
+/// member directory, which would read the member's file: the framework's
+/// contract is local/CI parity, not directory-local auditor parity. The
+/// choice is deterministic either way, so doctor and CI can never silently
+/// audit two different policies for the same tree.
 pub fn find_policy_root(start: &Path) -> Option<PathBuf> {
     let start = start.canonicalize().ok()?;
+    // Track the outermost policy seen, not the first: the generated CI
+    // workflow always reads the repository root's policy.
+    let mut found = None;
     for dir in start.ancestors() {
         if dir.join(POLICY_FILE).is_file() {
-            return Some(dir.to_path_buf());
+            found = Some(dir.to_path_buf());
         }
         // The repository root bounds the search.
         if dir.join(".git").exists() {
             break;
         }
     }
-    None
+    found
 }
 
 /// Evaluate the dependency policy for the app rooted at `root`.
@@ -1688,6 +1699,38 @@ mod tests {
         let repo = outer.path().join("repo");
         std::fs::create_dir_all(repo.join(".git")).expect("git");
         assert_eq!(find_policy_root(&repo), None);
+    }
+
+    #[test]
+    fn a_member_level_policy_defers_to_the_repository_root_policy() {
+        // The generated CI workflow reads the repository root's policy. When
+        // a member carries its own as well, doctor/dev must still audit the
+        // root's graph, so the local verdict predicts the gate.
+        let root = tempfile::tempdir().expect("tempdir");
+        std::fs::write(root.path().join(POLICY_FILE), "[advisories]\n").expect("policy");
+        let member = root.path().join("crates").join("app");
+        std::fs::create_dir_all(&member).expect("member");
+        std::fs::write(member.join(POLICY_FILE), "[advisories]\n").expect("member policy");
+        assert_eq!(
+            find_policy_root(&member).map(|found| found.canonicalize().expect("canonical")),
+            Some(root.path().canonicalize().expect("canonical"))
+        );
+    }
+
+    #[test]
+    fn a_member_policy_still_applies_when_the_root_has_none() {
+        // The #2562 case the other way round: no policy at the repository
+        // root, so the member's own file must be found rather than reporting
+        // "no policy".
+        let root = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(root.path().join(".git")).expect("git");
+        let member = root.path().join("crates").join("app");
+        std::fs::create_dir_all(&member).expect("member");
+        std::fs::write(member.join(POLICY_FILE), "[advisories]\n").expect("policy");
+        assert_eq!(
+            find_policy_root(&member).map(|found| found.canonicalize().expect("canonical")),
+            Some(member.canonicalize().expect("canonical"))
+        );
     }
 
     #[test]

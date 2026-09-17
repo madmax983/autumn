@@ -24,6 +24,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Prefer the repository-root dependency policy when both levels carry one
+  (issue #2570):** `find_policy_root` now returns the outermost `deny.toml`
+  up to the `.git` boundary, not the first one found walking up. A workspace
+  member with its own `deny.toml` used to make `autumn doctor`/`autumn dev`
+  audit the member's policy while the generated CI gate reads the
+  repository root's — different waivers, bans, and license rules. The root's
+  now wins deliberately: the framework's contract is local/CI parity, not
+  directory-local `cargo deny` parity (a bare `cargo deny` in the member
+  directory still reads the member's file).
+
 - **Frame-forge the SQLite fork for the framework control-plane migrations
   (issue #2699):** `autumn/migrations` — `FRAMEWORK_MIGRATIONS`, backing
   api_tokens, the job queue, feature flags, experiments, the shard
