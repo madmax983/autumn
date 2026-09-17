@@ -73,6 +73,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`/_stories` gallery now loads htmx (#2353):** the story gallery shell
+  loaded `autumn-widgets.js` but never `htmx.min.js`, so the live previews
+  of the htmx-driven built-in stories (`active-search`, `autocomplete`,
+  `comment-thread`, `reaction-controls`, `infinite-feed`) were inert
+  markup — typing in the active-search box did nothing, the infinite feed
+  never paged. The shell now emits `htmx.min.js` ahead of
+  `autumn-widgets.js` (both same-origin `defer` scripts, covered by the
+  default `script-src 'self'` policy with no nonce), under the same
+  `htmx` feature gate, on the index and every detail page.
+
 - **🪝 Snag: `autumn_web::pdf` now warns when the 512-level nesting cap
   drops content (#2801):** `Pdf::render`'s layout walker silently dropped
   any HTML past 512 levels of tag nesting — no error, no log line —

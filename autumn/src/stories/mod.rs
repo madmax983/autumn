@@ -430,16 +430,19 @@ body { margin: 0; font-family: system-ui, sans-serif; color: #1f2933; }
 .story-empty { padding: 2rem; border: 1px dashed #cbd2d9; border-radius: 6px; }
 ";
 
-/// Full HTML document shell: framework widget stylesheet + widget runtime
-/// script + gallery chrome.
+/// Full HTML document shell: framework widget stylesheet + htmx and widget
+/// runtime scripts + gallery chrome.
 ///
 /// Interactive widgets (`modal_trigger`, `confirm_action`, `nav_bar`, …) emit
 /// `data-*` hooks wired by the framework's `autumn-widgets.js` runtime, so the
 /// shell loads that same-origin script (always mounted under the `htmx`
 /// feature) alongside the stylesheet — otherwise the live previews of those
-/// stories would be inert in browsers that need the JS fallback. The script
-/// needs no CSP nonce: the framework's default policy keeps `'self'` in
-/// `script-src` in both plain and nonce modes.
+/// stories would be inert in browsers that need the JS fallback. Several
+/// built-in stories (`active-search`, `infinite-feed`, …) are driven by
+/// `hx-*` attributes, so the shell loads `htmx.min.js` ahead of the widget
+/// runtime for the same reason. The scripts need no CSP nonce: the
+/// framework's default policy keeps `'self'` in `script-src` in both plain
+/// and nonce modes.
 ///
 /// When the security layer's per-request CSP nonce is active
 /// (`security.headers.csp_nonce.enabled = true`, which drops
@@ -452,9 +455,12 @@ fn story_page(
     nonce: Option<&crate::security::CspNonce>,
 ) -> maud::Markup {
     #[cfg(feature = "htmx")]
-    let widgets_js: Option<&str> = Some(crate::htmx::AUTUMN_WIDGETS_JS_PATH);
+    let gallery_scripts: &[&str] = &[
+        crate::htmx::HTMX_JS_PATH,
+        crate::htmx::AUTUMN_WIDGETS_JS_PATH,
+    ];
     #[cfg(not(feature = "htmx"))]
-    let widgets_js: Option<&str> = None;
+    let gallery_scripts: &[&str] = &[];
     maud::html! {
         (maud::DOCTYPE)
         html lang="en" {
@@ -463,7 +469,7 @@ fn story_page(
                 meta name="viewport" content="width=device-width, initial-scale=1";
                 title { (title) " — Autumn stories" }
                 link rel="stylesheet" href=(crate::ui::WIDGETS_CSS_PATH);
-                @if let Some(src) = widgets_js {
+                @for src in gallery_scripts {
                     script src=(src) defer {}
                 }
                 style nonce=[nonce.map(crate::security::CspNonce::value)] {
@@ -802,6 +808,49 @@ mod tests {
             page.contains("&lt;p"),
             "Rendered HTML tab must show the escaped markup: {page}"
         );
+    }
+
+    // U7b (#2353): the gallery shell loads htmx.min.js ahead of the widget
+    // runtime, on both the index and the detail pages — several built-in
+    // stories are driven by hx-* attributes, and without htmx their live
+    // previews are inert markup.
+    #[cfg(feature = "htmx")]
+    #[test]
+    fn gallery_shell_loads_htmx_before_the_widget_runtime() {
+        let htmx_tag = format!("src=\"{}\"", crate::htmx::HTMX_JS_PATH);
+        let widgets_tag = format!("src=\"{}\"", crate::htmx::AUTUMN_WIDGETS_JS_PATH);
+
+        let story = crate::stories::story! {
+            "Forms",
+            "Proof",
+            {
+                maud::html! { p class="proof-marker" { "live proof" } }
+            }
+        };
+        let rendered = story.render().expect("proof story renders");
+        let registry = StoryRegistry::new(vec![demo_story("Forms", "Active search")]);
+        let pages = [
+            ("index", render_story_index(&registry, None).into_string()),
+            (
+                "detail",
+                render_story_detail(&story, &rendered, None).into_string(),
+            ),
+        ];
+        for (which, page) in pages {
+            let htmx_pos = page.find(&htmx_tag).unwrap_or_else(|| {
+                panic!(
+                    "{which} page must load htmx.min.js so htmx-driven \
+                     story previews are live: {page}"
+                )
+            });
+            let widgets_pos = page.find(&widgets_tag).unwrap_or_else(|| {
+                panic!("{which} page must keep loading the widget runtime: {page}")
+            });
+            assert!(
+                htmx_pos < widgets_pos,
+                "{which} page must load htmx before the widget runtime: {page}"
+            );
+        }
     }
 
     // U8 (AC4/AC5, R12): enabled-but-unregistered renders a helpful empty
