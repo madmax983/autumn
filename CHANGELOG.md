@@ -73,6 +73,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Compression carve-outs are now matched ASCII-case-insensitively
+  (#2416):** `CompressionPredicate::should_compress` compared the response
+  `Content-Type` against `COMPRESSION_EXCLUDED_CONTENT_TYPES` with a
+  case-sensitive `starts_with`, so a handler declaring `Audio/MPEG`,
+  `Application/Zip`, or `Font/WOFF2` missed its carve-out and had
+  already-compressed bytes re-compressed (wasted CPU on both ends, and for
+  some formats a slightly larger body). Media type tokens are
+  case-insensitive per RFC 9110 §8.3.1, so the comparison is now an
+  ASCII-case-insensitive prefix match — matching only; the served
+  `Content-Type` keeps the handler's own spelling. The deliberately narrow
+  `font/` gap is preserved: `font/ttf` / `font/otf` are still compressed in
+  any casing, since raw SFNT data genuinely benefits from transfer
+  compression.
+
 - **🪝 Snag: `autumn_web::pdf` now warns when the 512-level nesting cap
   drops content (#2801):** `Pdf::render`'s layout walker silently dropped
   any HTML past 512 levels of tag nesting — no error, no log line —

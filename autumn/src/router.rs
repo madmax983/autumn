@@ -3445,9 +3445,23 @@ impl tower_http::compression::predicate::Predicate for CompressionPredicate {
                 .is_none_or(|content_type| {
                     !COMPRESSION_EXCLUDED_CONTENT_TYPES
                         .iter()
-                        .any(|excluded| content_type.starts_with(excluded))
+                        .any(|excluded| compression_carve_out_matches(content_type, excluded))
                 })
     }
+}
+
+/// ASCII-case-insensitive prefix match against one
+/// [`COMPRESSION_EXCLUDED_CONTENT_TYPES`] entry (#2416).
+///
+/// Media type tokens are case-insensitive (RFC 9110 §8.3.1), so a handler
+/// declaring `Audio/MPEG` must hit the `audio/` carve-out exactly like the
+/// lowercase spelling. Only the *matching* is case-blind — the served
+/// `Content-Type` keeps the handler's own spelling. The length guard keeps
+/// the slice in bounds; every entry is ASCII, so the prefix slice is always
+/// a char boundary.
+fn compression_carve_out_matches(content_type: &str, excluded: &str) -> bool {
+    content_type.len() >= excluded.len()
+        && content_type[..excluded.len()].eq_ignore_ascii_case(excluded)
 }
 
 fn compression_predicate() -> CompressionPredicate {
@@ -11698,6 +11712,139 @@ enabled = true
                 Some("gzip"),
                 "{route}: raw SFNT fonts are uncompressed data and must still be \
                  gzipped — only WOFF/WOFF2 embed their own compression"
+            );
+        }
+    }
+
+    /// The compression carve-out comparison is ASCII-case-insensitive
+    /// (#2416): media type tokens are case-insensitive per RFC 9110 §8.3.1,
+    /// so `Audio/MPEG` must hit the `audio/` carve-out exactly like the
+    /// lowercase spelling — while the deliberately narrow `font/` gap
+    /// (`font/ttf` / `font/otf` stay compressible, pinned by
+    /// `ssg_raw_sfnt_fonts_stay_compressible`) survives any casing.
+    #[test]
+    fn compression_carve_out_matching_is_ascii_case_insensitive() {
+        let excluded = |content_type: &str| {
+            COMPRESSION_EXCLUDED_CONTENT_TYPES
+                .iter()
+                .any(|excluded| compression_carve_out_matches(content_type, excluded))
+        };
+        // The issue's repros: mixed-case spellings hit the carve-out.
+        for content_type in ["Audio/MPEG", "Application/Zip", "Font/WOFF2"] {
+            assert!(excluded(content_type), "{content_type} must be carved out");
+        }
+        // No regression on the lowercase spellings.
+        for content_type in ["audio/mpeg", "application/zip", "font/woff2"] {
+            assert!(excluded(content_type), "{content_type} must be carved out");
+        }
+        // The deliberate gap stays open in every casing: raw SFNT fonts are
+        // uncompressed data that genuinely benefits from transfer
+        // compression, so they must never match `font/woff` / `font/woff2`.
+        for content_type in ["font/ttf", "Font/TTF", "font/otf", "Font/OTF"] {
+            assert!(
+                !excluded(content_type),
+                "{content_type} must stay compressible"
+            );
+        }
+        // Compressible types stay compressible however they are cased.
+        for content_type in ["text/html", "Text/HTML", "application/json"] {
+            assert!(
+                !excluded(content_type),
+                "{content_type} must stay compressible"
+            );
+        }
+        // Parameters ride along with the prefix, and short inputs never
+        // panic or match.
+        assert!(excluded("audio/mpeg; charset=binary"));
+        assert!(excluded("VIDEO/MP4"));
+        for content_type in ["", "a", "audio", "font/wof"] {
+            assert!(!excluded(content_type), "{content_type:?} must not match");
+        }
+    }
+
+    /// End-to-end shape of #2416: a manifest that recorded the handler's
+    /// declared type verbatim in mixed case hits the same carve-out as the
+    /// lowercase spelling, and the served `Content-Type` keeps the handler's
+    /// own casing — while a mixed-case `Font/TTF` stays compressible (the
+    /// narrow SFNT gap from `ssg_raw_sfnt_fonts_stay_compressible` is
+    /// case-blind too).
+    #[tokio::test]
+    async fn ssg_mixed_case_content_types_hit_the_same_carve_outs() {
+        // Body well past DefaultPredicate's size floor; compressibility is
+        // irrelevant for the carved-out entries, which never reach the
+        // encoder.
+        let mut bytes = b"AUdio".to_vec();
+        bytes.extend(std::iter::repeat_n(0xA5u8, 8192));
+        // Highly compressible padding for the entry that must stay gzipped.
+        let mut raw_font = vec![0u8, 1, 0, 0];
+        raw_font.extend(std::iter::repeat_n(b'A', 4096));
+
+        for (route, file, body, declared, expected_encoding) in [
+            (
+                "/theme",
+                "audio/theme.mp3",
+                bytes.as_slice(),
+                "Audio/MPEG",
+                None,
+            ),
+            (
+                "/archive",
+                "files/archive.zip",
+                bytes.as_slice(),
+                "Application/Zip",
+                None,
+            ),
+            (
+                "/font",
+                "fonts/inter.woff2",
+                bytes.as_slice(),
+                "Font/WOFF2",
+                None,
+            ),
+            (
+                "/rawfont",
+                "fonts/inter.ttf",
+                raw_font.as_slice(),
+                "Font/TTF",
+                Some("gzip"),
+            ),
+        ] {
+            let tmp = create_ssg_dist_with_types(&[(route, file, body, Some(declared))]);
+            let dist = tmp.path().join("dist");
+            let router = try_build_router_with_static(
+                Vec::new(),
+                &compression_enabled_config(),
+                test_state(),
+                Some(&dist),
+            )
+            .expect("router builds");
+            let response = router
+                .oneshot(
+                    Request::builder()
+                        .uri(route)
+                        .header("accept-encoding", "gzip")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(response.status(), StatusCode::OK, "{route}");
+            assert_eq!(
+                response
+                    .headers()
+                    .get(http::header::CONTENT_TYPE)
+                    .and_then(|v| v.to_str().ok()),
+                Some(declared),
+                "{route} must keep the handler's own Content-Type spelling"
+            );
+            assert_eq!(
+                response
+                    .headers()
+                    .get(http::header::CONTENT_ENCODING)
+                    .and_then(|v| v.to_str().ok()),
+                expected_encoding,
+                "{route}"
             );
         }
     }
