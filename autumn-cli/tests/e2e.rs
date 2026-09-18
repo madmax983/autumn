@@ -42,6 +42,55 @@ fn patch_generated_cargo_toml(project_dir: &std::path::Path) {
     std::fs::write(&cargo_toml_path, content).expect("failed to patch Cargo.toml");
 }
 
+/// Scaffold a project with the source-built CLI and return the temp dir and
+/// project dir (#2840).
+///
+/// This is the `autumn new` half of the local-development drift gate:
+/// `cargo install --path autumn-cli` → `autumn new`, exactly the way a
+/// local-development user gets it (README.md / docs/guide/getting-started.md
+/// "Local development"). `autumn new` writes no version pin that can drift —
+/// it scaffolds from the CLI's own templates — so a failure here is always a
+/// real CLI regression, never the known, permanent
+/// trunk-dev-vs-published-`autumn-web` drift that makes the `cargo build`
+/// half go red until the next release. Both drift-gate tests share this
+/// helper so the scaffold invocation is a single variable.
+fn run_autumn_new_against_published() -> (tempfile::TempDir, std::path::PathBuf) {
+    let temp_dir = tempfile::tempdir().expect("failed to create temp dir");
+    let autumn_bin = env!("CARGO_BIN_EXE_autumn");
+
+    let new_output = Command::new(autumn_bin)
+        .args(["new", "test-app"])
+        .current_dir(temp_dir.path())
+        .output()
+        .expect("failed to run `autumn new`");
+
+    assert!(
+        new_output.status.success(),
+        "autumn new failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&new_output.stdout),
+        String::from_utf8_lossy(&new_output.stderr),
+    );
+
+    let project_dir = temp_dir.path().join("test-app");
+    assert!(project_dir.join("Cargo.toml").is_file());
+    (temp_dir, project_dir)
+}
+
+/// The hard gate of the local-development drift pair (#2840): `autumn new`
+/// from the source-built CLI must succeed on its own.
+///
+/// Fast — it never runs `cargo build` — and hard-gated in CI, because a
+/// failure here cannot be the known trunk-dev-vs-published-`autumn-web`
+/// drift (there is no version pin in `autumn new` to drift against); it is
+/// always a real CLI regression. The `cargo build` half lives in
+/// [`generated_project_compiles_against_published_autumn_web`], which runs
+/// with `continue-on-error` in the quickstart workflow.
+#[test]
+#[ignore = "local-dev drift gate: run explicitly via .github/workflows/quickstart-gate.yml"]
+fn autumn_new_succeeds_against_published_autumn_web() {
+    let _ = run_autumn_new_against_published();
+}
+
 #[test]
 #[ignore = "slow: compiles a fresh Rust project — run with `cargo test -p autumn-cli -- --ignored`"]
 fn generated_project_compiles_runs_and_serves() {
@@ -215,24 +264,7 @@ fn generated_project_compiles_runs_and_serves() {
 #[test]
 #[ignore = "slow: compiles a fresh Rust project — run with `cargo test -p autumn-cli -- --ignored`"]
 fn generated_project_compiles_against_published_autumn_web() {
-    let temp_dir = tempfile::tempdir().expect("failed to create temp dir");
-    let autumn_bin = env!("CARGO_BIN_EXE_autumn");
-
-    let new_output = Command::new(autumn_bin)
-        .args(["new", "test-app"])
-        .current_dir(temp_dir.path())
-        .output()
-        .expect("failed to run `autumn new`");
-
-    assert!(
-        new_output.status.success(),
-        "autumn new failed:\nstdout: {}\nstderr: {}",
-        String::from_utf8_lossy(&new_output.stdout),
-        String::from_utf8_lossy(&new_output.stderr),
-    );
-
-    let project_dir = temp_dir.path().join("test-app");
-    assert!(project_dir.join("Cargo.toml").is_file());
+    let (_temp_dir, project_dir) = run_autumn_new_against_published();
 
     // No [patch.crates-io] here, deliberately: this project must build
     // exactly as `autumn new` left it, against the real crates.io

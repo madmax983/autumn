@@ -73,6 +73,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`local-dev-quickstart` no longer fails CI on the permanent
+  trunk-dev-vs-published drift (#2840):** the `local-dev-quickstart` job in
+  `.github/workflows/quickstart-gate.yml` ran `autumn new` and `cargo build`
+  as one step, so it failed on every run — trunk-dev is *expected* to drift
+  ahead of the published `autumn-web` between releases (this repo never
+  bumps the version outside a deliberate release), a permanent by-design
+  condition, not a regression. The step is now split: `autumn new` runs as a
+  new, fast, hard-gated test
+  (`autumn_new_succeeds_against_published_autumn_web` — `autumn new` writes
+  no version pin that can drift, so a failure there is always a real CLI
+  regression), and the `cargo build` half
+  (`generated_project_compiles_against_published_autumn_web`, unchanged
+  assertions, now sharing a `run_autumn_new_against_published` helper)
+  carries `continue-on-error: true`. The build still runs on every
+  push/schedule and prints the exact drifted call site in its log — it just
+  shows neutral instead of red when only the known drift fires. Reapplies
+  #2755, which reached the same design but went stale on a fast-moving
+  trunk-dev.
+
 - **🪝 Snag: `autumn_web::pdf` now warns when the 512-level nesting cap
   drops content (#2801):** `Pdf::render`'s layout walker silently dropped
   any HTML past 512 levels of tag nesting — no error, no log line —

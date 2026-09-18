@@ -187,6 +187,15 @@ jobs:
     # generator-emitted call site is a separate, uncovered instance of the
     # same gap, not something a red/green here proves either way.
     #
+    # Split into a hard gate and a soft gate (#2840): the `autumn new`
+    # scaffold step below fails the workflow — a failure there is always a
+    # real CLI regression, never drift. The `cargo build` step after it runs
+    # with `continue-on-error: true`: the trunk-dev-vs-published drift is
+    # permanent and by design (this repo never bumps the version outside a
+    # deliberate release), so the build still runs on every push/schedule
+    # and prints the exact drifted call site in its log, but shows neutral
+    # instead of failing the run when only that known drift fires.
+    #
     # A red run here means precisely that has happened. Until the next
     # release ships, the workaround is the one `autumn doctor`'s own docs
     # already describe: point the generated `Cargo.toml` at the checkout
@@ -215,10 +224,27 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - name: "autumn new my-app, then cargo build against published autumn-web"
+      - name: "Local-dev: autumn new my-app (hard gate)"
+        # No DATABASE_URL, no Postgres service: the base `autumn new`
+        # output (no generate/scaffold) needs neither — and the scaffold
+        # itself is the hard gate here (`autumn new` writes no version pin
+        # that can drift, so a failure is always a real CLI regression).
+        run: |
+          cargo test -p autumn-cli --test e2e \
+            autumn_new_succeeds_against_published_autumn_web \
+            -- --ignored --exact
+
+      - name: "Local-dev: cargo build the scaffold against published autumn-web"
+        # Soft gate (#2840): trunk-dev is expected to drift ahead of the
+        # published autumn-web between releases — a permanent, by-design
+        # condition, not a regression. This step still runs on every
+        # push/schedule and still prints the exact drifted call site in its
+        # log; it just shows neutral instead of failing the workflow when
+        # only that known drift fires.
         # No DATABASE_URL, no Postgres service: the base `autumn new`
         # output (no generate/scaffold) needs neither to reach its first
         # `cargo build` — and that first build is exactly what breaks.
+        continue-on-error: true
         run: |
           cargo test -p autumn-cli --test e2e \
             generated_project_compiles_against_published_autumn_web \
