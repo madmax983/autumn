@@ -144,19 +144,101 @@ pub fn policy_checks(policy: &str) -> Vec<String> {
 /// Doctor parses TOML; the workflow greps, because a shell cannot parse TOML.
 /// The two agree on every spelling a person writes by hand, but a basic key
 /// carrying an escape (`["ban\u0073"]`) decodes to `bans` for one and not the
-/// other. Rather than let that diverge silently, it is reported.
+/// other. Rather than let that diverge silently, it is reported. This is one
+/// direction of the disagreement; [`checks_phantom_to_ci`] covers the other,
+/// and [`derivations_disagree`] covers both.
 pub fn checks_invisible_to_ci(policy: &str) -> Vec<String> {
     let parsed = declared_sections(policy);
     OPTIONAL_CHECKS
         .iter()
         .filter(|section| {
-            parsed.iter().any(|key| key == *section)
-                && !policy
-                    .lines()
-                    .any(|line| line_declares(code_of(line), section))
+            parsed.iter().any(|key| key == *section) && !scan_declares(policy, section)
         })
         .map(|section| (*section).to_owned())
         .collect()
+}
+
+/// Optional checks the scaffolded workflow's grep can see that the TOML parse
+/// does not declare.
+///
+/// The mirror image of [`checks_invisible_to_ci`]: a line that *looks* like a
+/// section header but lives inside a multiline string is invisible to the
+/// parser and visible to the grep — a waiver whose `reason` quotes `[bans]`
+/// as prose makes CI enforce `bans` while doctor's verdict never considered
+/// it. This is the dangerous direction: CI enforcing a check the local run
+/// never saw, the exact "green locally, red in CI" outcome #1633 exists to
+/// eliminate. Rather than let that diverge silently, it is reported.
+pub fn checks_phantom_to_ci(policy: &str) -> Vec<String> {
+    let parsed = declared_sections(policy);
+    OPTIONAL_CHECKS
+        .iter()
+        .filter(|section| {
+            !parsed.iter().any(|key| key == *section) && scan_declares(policy, section)
+        })
+        .map(|section| (*section).to_owned())
+        .collect()
+}
+
+/// Optional checks on which the two check-list derivations disagree, in either
+/// direction.
+///
+/// Doctor parses TOML; the scaffolded workflow greps, because a shell cannot
+/// parse TOML. [`checks_invisible_to_ci`] covers the parse-visible/grep-blind
+/// spellings and [`checks_phantom_to_ci`] the grep-visible/parse-blind ones.
+/// A check on either side means the local check list and the CI check list
+/// differ, so no verdict here predicts that gate.
+pub fn derivations_disagree(policy: &str) -> Vec<String> {
+    let parsed = declared_sections(policy);
+    OPTIONAL_CHECKS
+        .iter()
+        .filter(|section| {
+            let by_parse = parsed.iter().any(|key| key == *section);
+            let by_scan = scan_declares(policy, section);
+            by_parse != by_scan
+        })
+        .map(|section| (*section).to_owned())
+        .collect()
+}
+
+/// True when the scaffolded workflow's grep would read one policy line as
+/// declaring `section`.
+///
+/// `code_of` strips the comment and trims the line the same way the
+/// workflow's `grep -qE "^[[:space:]]*(\[\[?[[:space:]]*)?..."` anchors its
+/// pattern at the line start; `line_declares` is the spelling rule the
+/// workflow mirrors in shell.
+fn scan_declares(policy: &str, section: &str) -> bool {
+    policy
+        .lines()
+        .any(|line| line_declares(code_of(line), section))
+}
+
+/// Why doctor refuses to predict the CI gate when the two check-list
+/// derivations disagree.
+///
+/// The two directions need different advice: an invisible spelling is fixed by
+/// writing the section plainly, while a phantom line must be removed or
+/// reworded so the workflow's grep stops seeing it.
+fn derivation_mismatch_reason(invisible: &[String], phantom: &[String]) -> String {
+    let mut parts = Vec::new();
+    if !invisible.is_empty() {
+        parts.push(format!(
+            "{POLICY_FILE} declares {} in a spelling the CI workflow's check-list derivation cannot detect; write it as [{}]",
+            invisible.join(", "),
+            invisible.join("], [")
+        ));
+    }
+    if !phantom.is_empty() {
+        let sections = phantom
+            .iter()
+            .map(|section| format!("[{section}]"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        parts.push(format!(
+            "{POLICY_FILE} contains text the CI workflow's check-list derivation reads as {sections} that the TOML parse does not declare (for example a section-like line inside a string); remove or reword the phantom line so doctor and CI derive the same check list"
+        ));
+    }
+    parts.join(" ")
 }
 
 /// The top-level table keys the policy declares.
@@ -174,11 +256,7 @@ fn declared_sections(policy: &str) -> Vec<String> {
     }
     OPTIONAL_CHECKS
         .iter()
-        .filter(|section| {
-            policy
-                .lines()
-                .any(|line| line_declares(code_of(line), section))
-        })
+        .filter(|section| scan_declares(policy, section))
         .map(|section| (*section).to_owned())
         .collect()
 }
@@ -851,14 +929,16 @@ pub fn evaluate(root: &Path) -> Evaluation {
         };
     }
     // A section only one of the two derivations can see means the local check
-    // list and the CI check list differ, so no verdict here predicts that gate.
-    let invisible = checks_invisible_to_ci(&policy);
-    if !invisible.is_empty() {
+    // list and the CI check list differ, so no verdict here predicts that
+    // gate. The guard is symmetric: a spelling the parser decodes that the
+    // workflow's grep misses is as divergent as a phantom section the grep
+    // reads out of a string the parser never declares.
+    let divergent = derivations_disagree(&policy);
+    if !divergent.is_empty() {
         return Evaluation::Unavailable {
-            reason: format!(
-                "{POLICY_FILE} declares {} in a spelling the CI workflow's check-list derivation cannot detect; write it as [{}]",
-                invisible.join(", "),
-                invisible.join("], [")
+            reason: derivation_mismatch_reason(
+                &checks_invisible_to_ci(&policy),
+                &checks_phantom_to_ci(&policy),
             ),
             checks,
         };
@@ -878,8 +958,8 @@ pub fn evaluate(root: &Path) -> Evaluation {
     // A policy that names its own database is cargo-deny's to resolve: this
     // pre-check only guards the default location, so an unreadable custom path
     // reports whatever the auditor says rather than a database that is missing.
-    let custom_db = policy_db_path(&policy);
-    let mtime = newest_db_mtime(&custom_db.map_or_else(default_db_dir, PathBuf::from));
+    let custom_db = policy_db_path(&policy).map(|path| resolve_db_dir(&path, &root));
+    let mtime = newest_db_mtime(&custom_db.unwrap_or_else(default_db_dir));
     if mtime.is_none() && !policy_declares_db_path(&policy) {
         return Evaluation::DatabaseMissing { checks };
     }
@@ -935,6 +1015,28 @@ pub fn evaluate(root: &Path) -> Evaluation {
 /// True when the policy names its own advisory database location.
 fn policy_declares_db_path(policy: &str) -> bool {
     policy_db_path(policy).is_some()
+}
+
+/// cargo-deny resolves a relative `db-path` against the policy's own
+/// directory; age the database in the same place the audit reads it from.
+///
+/// `evaluate` runs cargo-deny with `current_dir(&root)` — the directory
+/// holding the policy — but aged the advisory database at the path *as
+/// written*, resolved against the process's own directory. Run from a
+/// workspace member, a repository-level policy carrying a relative path
+/// (e.g. `db-path = "advisory-dbs"`) audited fine while the age probe looked
+/// under the member directory, found nothing, and — because a custom
+/// `db-path` deliberately suppresses `DatabaseMissing` — reported neither the
+/// data age nor a staleness warning, the two signals that make an air-gapped
+/// mirror trustworthy. `expand_path` already ran on `path`, so only a bare
+/// relative spelling still needs joining.
+fn resolve_db_dir(path: &str, policy_root: &Path) -> PathBuf {
+    let path = PathBuf::from(path);
+    if path.is_absolute() {
+        path
+    } else {
+        policy_root.join(path)
+    }
 }
 
 /// The auditor binary, invoked directly rather than as `cargo deny`.
@@ -1425,6 +1527,98 @@ mod tests {
                 "wrongly reported as invisible: {policy:?}"
             );
         }
+    }
+
+    #[test]
+    fn every_hand_written_spelling_agrees_in_both_directions() {
+        // The symmetric guard must not invent disagreements where none exist:
+        // every spelling the two derivations already agreed on stays quiet.
+        for policy in [
+            "[bans]\n",
+            "[ bans ]\n",
+            "[bans] # note\n",
+            "[bans.build]\n",
+            "[[bans.deny]]\n",
+            "bans.deny = []\n",
+            "[\"bans\"]\n",
+            "['bans']\n",
+            "[advisories]\n",
+        ] {
+            assert!(
+                derivations_disagree(policy).is_empty(),
+                "wrongly reported as divergent: {policy:?}"
+            );
+            assert!(checks_phantom_to_ci(policy).is_empty());
+        }
+    }
+
+    #[test]
+    fn a_section_like_line_inside_a_string_is_a_phantom_ci_section() {
+        // Issue #2572's repro: the workflow's grep reads `[bans]` out of a
+        // waiver's multiline `reason` string, while the TOML parse correctly
+        // declares only advisories. That is the dangerous direction — CI
+        // enforcing a check the local verdict never considered.
+        let phantom = "[advisories]\nignore = [\n    { id = \"RUSTSEC-2020-0071\", reason = \"\"\"\nno fix; the section header below is prose, not policy:\n[bans]\nreview-by 2026-12-01\"\"\" },\n]\n";
+        assert_eq!(policy_checks(phantom), vec!["advisories".to_owned()]);
+        assert!(checks_invisible_to_ci(phantom).is_empty());
+        assert_eq!(checks_phantom_to_ci(phantom), vec!["bans".to_owned()]);
+        assert_eq!(derivations_disagree(phantom), vec!["bans".to_owned()]);
+
+        let root = tempfile::tempdir().expect("tempdir");
+        std::fs::write(root.path().join(POLICY_FILE), phantom).expect("policy");
+        match evaluate(root.path()) {
+            Evaluation::Unavailable { reason, .. } => {
+                assert!(reason.contains("bans"), "{reason}");
+                assert!(reason.contains("phantom"), "{reason}");
+            }
+            other => panic!("a phantom section must not read as evaluable: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn both_derivation_directions_are_detected_together() {
+        // An escape-decoded key the grep cannot see, plus a string-quoted
+        // section line the parser does not declare.
+        let policy = "[advisories]\n[\"ban\\u0073\"]\nignore = [\n    { id = \"RUSTSEC-2020-0071\", reason = \"\"\"\nprose:\n[sources]\n\"\"\" },\n]\n";
+        assert_eq!(checks_invisible_to_ci(policy), vec!["bans".to_owned()]);
+        assert_eq!(checks_phantom_to_ci(policy), vec!["sources".to_owned()]);
+        assert_eq!(
+            derivations_disagree(policy),
+            vec!["bans".to_owned(), "sources".to_owned()]
+        );
+
+        let root = tempfile::tempdir().expect("tempdir");
+        std::fs::write(root.path().join(POLICY_FILE), policy).expect("policy");
+        match evaluate(root.path()) {
+            Evaluation::Unavailable { reason, .. } => {
+                assert!(reason.contains("bans"), "{reason}");
+                assert!(reason.contains("sources"), "{reason}");
+                assert!(reason.contains("phantom"), "{reason}");
+            }
+            other => panic!("divergent derivations must not read as evaluable: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_relative_db_path_is_resolved_against_the_policy_root() {
+        // cargo-deny resolves a relative `db-path` against the policy's own
+        // directory (it runs with `current_dir` set there); the age probe
+        // must look in the same place.
+        let root = Path::new("/repo");
+        assert_eq!(
+            resolve_db_dir("advisory-dbs", root),
+            PathBuf::from("/repo/advisory-dbs")
+        );
+        assert_eq!(
+            resolve_db_dir("../shared/dbs", root),
+            PathBuf::from("/repo/../shared/dbs")
+        );
+        // Absolute spellings (including `~`/`$CARGO_HOME` after expansion) are
+        // cargo-deny's to resolve; doctor must not re-root them.
+        assert_eq!(
+            resolve_db_dir("/srv/advisory-db", root),
+            PathBuf::from("/srv/advisory-db")
+        );
     }
 
     #[test]

@@ -73,6 +73,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Dependency policy: `autumn doctor` now catches check-list drift in both
+  directions, and ages a relative `db-path` against the policy root (#2572):**
+  doctor derives the cargo-deny check list by parsing `deny.toml` as TOML
+  while the scaffolded workflow greps it, and the guard that refused to
+  predict the CI gate on a disagreement only covered one direction — a key
+  the parser decodes but the grep cannot see (e.g. `["ban\u0073"]`). The
+  other direction was open: a section-like line inside a multiline string
+  (e.g. a waiver `reason` quoting `[bans]` as prose) is invisible to the
+  parser but visible to the grep, so CI could enforce a check the local
+  verdict never considered — the exact "green locally, red in CI" outcome
+  #1633 exists to eliminate. `derivations_disagree` now reports both
+  directions and `autumn doctor` refuses to predict the gate on either, with
+  direction-specific advice. Separately, a relative advisory `db-path` was
+  aged against the process's own directory while cargo-deny resolves it
+  against the policy's directory: run from a workspace member, a
+  repository-level policy with `db-path = "advisory-dbs"` audited fine while
+  the age probe found nothing and suppressed the data-age/staleness signals.
+  The probe now joins a relative `db-path` to the policy root before aging.
 - **🪝 Snag: `autumn_web::pdf` now warns when the 512-level nesting cap
   drops content (#2801):** `Pdf::render`'s layout walker silently dropped
   any HTML past 512 levels of tag nesting — no error, no log line —
