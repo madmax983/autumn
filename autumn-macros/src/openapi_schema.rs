@@ -19,13 +19,168 @@
 //! `DerivedSchemaDescriptor` inventory that the spec/MCP back-fill loops
 //! consult, so a referenced type resolves to its real schema with no manual
 //! registration.
+//!
+//! Dual-version override (issue #2565): a crate that depends on two
+//! differently-keyed copies of `autumn-web` at once can pin the generated
+//! code to one of them with the registered `#[openapi_schema]` helper
+//! attribute — `#[derive(web_new::OpenApiSchema)]` plus
+//! `#[openapi_schema(crate = "web_new")]` — the derive analog of the
+//! attribute macros' `crate = "..."` argument, which a derive macro cannot
+//! take directly. The attribute is parsed and stripped before expansion; the
+//! override reaches `crate_path::set_target` via the `lib.rs` entry point.
 
 use proc_macro::TokenStream;
+use proc_macro2::TokenTree;
 use quote::quote;
-use syn::{Data, DeriveInput, Fields, parse_macro_input};
+use syn::{Data, DeriveInput, Fields};
 
-pub fn derive_openapi_schema(input: TokenStream) -> TokenStream {
-    let input = parse_macro_input!(input as DeriveInput);
+/// Parse the `#[openapi_schema(...)]` helper attribute's arguments, returning
+/// the `crate = "..."` override (if any) — issue #2565.
+///
+/// A `#[proc_macro_derive]` receives only the annotated item's own tokens, so
+/// unlike the attribute macros — which take the override from their separate
+/// `attr` argument via `crate_path::extract_crate_override` — this derive's
+/// dual-version escape hatch has to ride on a registered helper attribute:
+/// `#[derive(web_new::OpenApiSchema)]` together with
+/// `#[openapi_schema(crate = "web_new")]`. The value grammar mirrors
+/// `extract_crate_override`'s exactly (a string literal naming a valid Rust
+/// identifier); anything else is a compile error rather than a silent
+/// ignore, and so is an argument that is not `crate = ...`.
+fn parse_openapi_schema_args(attr: &syn::Attribute) -> syn::Result<Option<String>> {
+    let list = match &attr.meta {
+        // A bare `#[openapi_schema]` carries no override.
+        syn::Meta::Path(_) => return Ok(None),
+        syn::Meta::List(list) => list,
+        syn::Meta::NameValue(_) => {
+            return Err(syn::Error::new_spanned(
+                attr,
+                "expected `#[openapi_schema]` or \
+                 `#[openapi_schema(crate = \"...\")]`",
+            ));
+        }
+    };
+    if !matches!(list.delimiter, syn::MacroDelimiter::Paren(_)) {
+        return Err(syn::Error::new_spanned(
+            attr,
+            "expected `#[openapi_schema]` or \
+             `#[openapi_schema(crate = \"...\")]`",
+        ));
+    }
+    parse_openapi_schema_arg_list(&list.tokens)
+}
+
+/// Parse the comma-separated `crate = "..."` argument list of
+/// `#[openapi_schema(...)]`. Kept as a `TokenTree` walk rather than a
+/// `syn`-keyed parser because `crate` is a reserved keyword — the same
+/// reason `crate_path::extract_crate_override` does not use one.
+fn parse_openapi_schema_arg_list(tokens: &proc_macro2::TokenStream) -> syn::Result<Option<String>> {
+    let inner: Vec<TokenTree> = tokens.clone().into_iter().collect();
+
+    let mut found: Option<String> = None;
+    let mut index = 0;
+    while index < inner.len() {
+        // Commas only separate arguments; a trailing comma is fine.
+        if matches!(&inner[index], TokenTree::Punct(sep) if sep.as_char() == ',') {
+            index += 1;
+            continue;
+        }
+        let is_crate_key = matches!(&inner[index], TokenTree::Ident(key) if *key == "crate");
+        let is_equals =
+            matches!(inner.get(index + 1), Some(TokenTree::Punct(eq)) if eq.as_char() == '=');
+        if !is_crate_key || !is_equals {
+            return Err(syn::Error::new_spanned(
+                &inner[index],
+                "unknown `#[openapi_schema]` argument: the only supported key is \
+                 `crate = \"...\"` (e.g. `#[openapi_schema(crate = \"web_new\")]`)",
+            ));
+        }
+        if found.is_some() {
+            return Err(syn::Error::new_spanned(
+                &inner[index],
+                "duplicate `crate = ...` in `#[openapi_schema]`",
+            ));
+        }
+        let Some(TokenTree::Literal(literal)) = inner.get(index + 2) else {
+            let span_source = inner
+                .get(index + 2)
+                .map_or_else(|| inner[index + 1].clone(), TokenTree::clone);
+            return Err(syn::Error::new_spanned(
+                span_source,
+                "`crate = ...` must be a string literal naming the crate, e.g. \
+                 `crate = \"web_new\"`",
+            ));
+        };
+        let value = syn::parse_str::<syn::LitStr>(&literal.to_string())
+            .map(|lit| lit.value())
+            .map_err(|_| {
+                syn::Error::new_spanned(
+                    literal,
+                    "`crate = ...` must be a string literal naming the crate, e.g. \
+                     `crate = \"web_new\"`",
+                )
+            })?;
+        if syn::parse_str::<syn::Ident>(&value).is_err() {
+            return Err(syn::Error::new_spanned(
+                literal,
+                format!("`crate = {value:?}` is not a valid Rust identifier"),
+            ));
+        }
+        found = Some(value);
+        index += 3;
+    }
+    Ok(found)
+}
+
+/// Find the `#[openapi_schema(...)]` helper attribute on the derive input,
+/// parse its `crate = "..."` override, and strip the attribute so the rest of
+/// the pipeline never sees it — this derive's analog of the way `#[model]`
+/// strips the attributes it consumes (e.g. `#[votable]`) before re-emitting.
+fn take_openapi_schema_override(input: &mut DeriveInput) -> syn::Result<Option<String>> {
+    let mut found: Option<String> = None;
+    let mut seen = false;
+    let mut kept: Vec<syn::Attribute> = Vec::with_capacity(input.attrs.len());
+    for attr in input.attrs.drain(..) {
+        if !attr.path().is_ident("openapi_schema") {
+            kept.push(attr);
+            continue;
+        }
+        if seen {
+            return Err(syn::Error::new_spanned(
+                &attr,
+                "duplicate `#[openapi_schema]` attribute",
+            ));
+        }
+        seen = true;
+        found = parse_openapi_schema_args(&attr)?;
+    }
+    input.attrs = kept;
+    Ok(found)
+}
+
+pub fn derive_openapi_schema(input: TokenStream) -> (Option<String>, TokenStream) {
+    // `parse_macro_input!` cannot be used here: its parse-failure arm returns
+    // a bare `TokenStream`, not this function's `(Option<String>,
+    // TokenStream)` pair.
+    let mut input: DeriveInput = match syn::parse(input) {
+        Ok(input) => input,
+        Err(error) => return (None, error.to_compile_error().into()),
+    };
+    // A derive macro gets no separate `attr` argument, so the dual-version
+    // `crate = "..."` override rides on the registered `#[openapi_schema]`
+    // helper attribute instead (issue #2565). Parse it out and strip it
+    // before the rest of the pipeline sees the input; the `lib.rs` entry
+    // point passes the override to `crate_path::set_target`.
+    let crate_override = match take_openapi_schema_override(&mut input) {
+        Ok(found) => found,
+        Err(error) => return (None, error.to_compile_error().into()),
+    };
+    let expanded = expand_openapi_schema(&input);
+    (crate_override, expanded)
+}
+
+/// The expansion itself, unchanged by #2565: the schema body plus the
+/// `OpenApiSchema` impl and the inventory submission.
+fn expand_openapi_schema(input: &DeriveInput) -> TokenStream {
     let name = &input.ident;
 
     // The emitted impl uses the bare type name for both `schema_name()` and the
@@ -898,5 +1053,135 @@ mod tests {
             }
         })
         .expect("`default = \"with_default\"` is not an adapter");
+    }
+
+    /// Issue #2565: `#[derive(OpenApiSchema)]` accepts its dual-version
+    /// `crate = "..."` override through the registered `#[openapi_schema]`
+    /// helper attribute, since a derive macro gets no attribute argument of
+    /// its own.
+    fn take_override(input: &mut DeriveInput) -> Result<Option<String>, String> {
+        take_openapi_schema_override(input).map_err(|e| e.to_string())
+    }
+
+    #[test]
+    fn openapi_schema_helper_attr_parses_a_crate_override_and_strips_the_attribute() {
+        let mut input: DeriveInput = parse_quote! {
+            #[openapi_schema(crate = "web_new")]
+            struct SearchParams {
+                q: String,
+            }
+        };
+        let found = take_override(&mut input).expect("the helper attribute must parse");
+        assert_eq!(found.as_deref(), Some("web_new"));
+        assert!(
+            input.attrs.is_empty(),
+            "the helper attribute must be stripped before expansion"
+        );
+    }
+
+    #[test]
+    fn openapi_schema_helper_attr_absent_leaves_attrs_untouched() {
+        let mut input: DeriveInput = parse_quote! {
+            #[serde(rename_all = "camelCase")]
+            struct SearchParams {
+                q: String,
+            }
+        };
+        let found = take_override(&mut input).expect("no attribute must be fine");
+        assert!(found.is_none());
+        assert_eq!(input.attrs.len(), 1);
+        assert!(input.attrs[0].path().is_ident("serde"));
+    }
+
+    #[test]
+    fn a_bare_openapi_schema_attribute_is_a_no_op_override() {
+        let mut input: DeriveInput = parse_quote! {
+            #[openapi_schema]
+            struct SearchParams {
+                q: String,
+            }
+        };
+        let found = take_override(&mut input).expect("a bare attribute must be fine");
+        assert!(found.is_none());
+        assert!(
+            input.attrs.is_empty(),
+            "a bare attribute must still be stripped"
+        );
+    }
+
+    #[test]
+    fn an_unknown_openapi_schema_argument_is_rejected() {
+        let mut input: DeriveInput = parse_quote! {
+            #[openapi_schema(version = "2")]
+            struct SearchParams {
+                q: String,
+            }
+        };
+        let err = take_override(&mut input).expect_err("an unknown key must be rejected");
+        assert!(
+            err.contains("unknown") && err.contains("crate"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn a_duplicate_openapi_schema_attribute_is_rejected() {
+        let mut input: DeriveInput = parse_quote! {
+            #[openapi_schema(crate = "a")]
+            #[openapi_schema(crate = "b")]
+            struct SearchParams {
+                q: String,
+            }
+        };
+        let err = take_override(&mut input).expect_err("a duplicate attribute must be rejected");
+        assert!(err.contains("duplicate"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn a_duplicate_crate_key_is_rejected() {
+        let mut input: DeriveInput = parse_quote! {
+            #[openapi_schema(crate = "a", crate = "b")]
+            struct SearchParams {
+                q: String,
+            }
+        };
+        let err = take_override(&mut input).expect_err("a duplicate key must be rejected");
+        assert!(err.contains("duplicate"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn a_non_string_crate_override_is_rejected() {
+        let mut input: DeriveInput = parse_quote! {
+            #[openapi_schema(crate = 42)]
+            struct SearchParams {
+                q: String,
+            }
+        };
+        let err = take_override(&mut input).expect_err("a non-string value must be rejected");
+        assert!(err.contains("string literal"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn a_non_identifier_crate_override_is_rejected() {
+        let mut input: DeriveInput = parse_quote! {
+            #[openapi_schema(crate = "not an ident")]
+            struct SearchParams {
+                q: String,
+            }
+        };
+        let err = take_override(&mut input).expect_err("a non-identifier value must be rejected");
+        assert!(err.contains("identifier"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn an_equals_form_openapi_schema_attribute_is_rejected() {
+        let mut input: DeriveInput = parse_quote! {
+            #[openapi_schema = "web_new"]
+            struct SearchParams {
+                q: String,
+            }
+        };
+        let err = take_override(&mut input).expect_err("the equals form must be rejected");
+        assert!(err.contains("openapi_schema"), "unexpected error: {err}");
     }
 }

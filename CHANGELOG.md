@@ -73,6 +73,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **🔌 `#[derive(OpenApiSchema)]` gains the dual-version `crate = "..."`
+  override (#2565):** every attribute macro (`#[get]`, `#[model]`, …) already
+  accepted an explicit `crate = "..."` for crates that depend on two
+  differently-keyed copies of `autumn-web` at once, but the derive had no
+  spelling for it — it always called `set_target(None)`. The derive now
+  registers an `#[openapi_schema]` helper attribute, so
+  `#[derive(web_new::OpenApiSchema)]` together with
+  `#[openapi_schema(crate = "web_new")]` pins the generated code to the
+  named copy. The attribute is parsed and stripped before expansion; unknown
+  keys, duplicate attributes/keys, non-string values, and non-identifier
+  values are compile errors. Without the helper attribute the derive
+  resolves the crate name automatically, exactly as before.
+
 - **🪝 Snag: `autumn_web::pdf` now warns when the 512-level nesting cap
   drops content (#2801):** `Pdf::render`'s layout walker silently dropped
   any HTML past 512 levels of tag nesting — no error, no log line —

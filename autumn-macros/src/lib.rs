@@ -26,7 +26,9 @@
 //! automatic detection. Every attribute macro (`#[get]`, `#[model]`,
 //! `#[repository]`, …) therefore also accepts an explicit `crate = "..."`
 //! argument naming the extern-prelude identifier to use instead, e.g.
-//! `#[get("/x", crate = "autumn_web_05")]`.
+//! `#[get("/x", crate = "autumn_web_05")]`; `#[derive(OpenApiSchema)]` takes
+//! the same override through a `#[openapi_schema(crate = "...")]` helper
+//! attribute, since a derive macro has no attribute argument of its own.
 
 mod agent_authority;
 mod api_doc;
@@ -813,10 +815,28 @@ pub fn model(attr: TokenStream, item: TokenStream) -> TokenStream {
 ///     InProgress,
 /// }
 /// ```
-#[proc_macro_derive(OpenApiSchema)]
+/// # Dual-version override (#2565)
+///
+/// Like the attribute macros' `crate = "..."` argument, but spelled as a
+/// helper attribute — a derive macro receives no separate attribute argument
+/// to parse one out of. A crate that depends on two differently-keyed copies
+/// of `autumn-web` at once can disambiguate with:
+///
+/// ```ignore
+/// #[derive(web_new::OpenApiSchema)]
+/// #[openapi_schema(crate = "web_new")]
+/// struct SearchParams {
+///     q: String,
+/// }
+/// ```
+///
+/// Without the helper attribute the derive resolves the crate name
+/// automatically, exactly as before.
+#[proc_macro_derive(OpenApiSchema, attributes(openapi_schema))]
 pub fn derive_openapi_schema(input: TokenStream) -> TokenStream {
-    let _guard = crate_path::set_target(None);
-    crate_path::finalize(openapi_schema::derive_openapi_schema(input).into()).into()
+    let (crate_override, expanded) = openapi_schema::derive_openapi_schema(input);
+    let _guard = crate_path::set_target(crate_override.as_deref());
+    crate_path::finalize(expanded.into()).into()
 }
 
 /// Derive a repository with CRUD operations and derived queries.
