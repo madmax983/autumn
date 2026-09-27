@@ -79,7 +79,7 @@ impl autumn_web::data::csv::CsvSchema for Todo {
 /// When the form requires extra fields, different validation rules, or
 /// UI-specific concerns (e.g. a `confirm_password` field), define a
 /// dedicated form struct instead and convert it to `NewTodo` on success.
-#[derive(Insertable, Deserialize, Serialize, Validate)]
+#[derive(Insertable, Deserialize, Serialize, Validate, Debug)]
 #[diesel(table_name = todos)]
 pub struct NewTodo {
     #[validate(
@@ -100,12 +100,98 @@ pub(crate) fn title_not_blank(s: &str) -> Result<(), validator::ValidationError>
 }
 
 impl NewTodo {
-    /// Validate and normalize the title. Returns 422 if the title is empty.
+    /// Validate and normalize the title.
+    ///
+    /// Runs the model's own derived [`validator`] rules first — the same
+    /// rules the HTML form path enforces through `ChangesetForm<NewTodo>` —
+    /// then trims the title. Returns 422 on any violation.
     pub fn validated(self) -> AutumnResult<Self> {
+        // The derived rules (length, custom) run against the submitted
+        // value, mirroring `ChangesetForm::into_valid`, which validates
+        // before the handler trims for storage. Without this the JSON API
+        // silently accepted titles past `length(max = 255)` (#2972).
+        if let Err(errors) = self.validate() {
+            let details = errors
+                .field_errors()
+                .into_iter()
+                .map(|(field, errs)| {
+                    let messages = errs
+                        .iter()
+                        .map(|e| {
+                            e.message.as_ref().map_or_else(
+                                || format!("validation failed: {}", e.code),
+                                ToString::to_string,
+                            )
+                        })
+                        .collect();
+                    (field.to_string(), messages)
+                })
+                .collect();
+            return Err(AutumnError::validation(details));
+        }
         let title = self.title.trim().to_owned();
         if title.is_empty() {
             return Err(AutumnError::unprocessable_msg("Title must not be empty"));
         }
         Ok(Self { title })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use autumn_web::prelude::StatusCode;
+
+    #[test]
+    fn validated_accepts_a_255_char_title() {
+        let todo = NewTodo {
+            title: "x".repeat(255),
+        }
+        .validated()
+        .unwrap();
+        assert_eq!(todo.title.len(), 255);
+    }
+
+    #[test]
+    fn validated_rejects_a_256_char_title_with_422() {
+        // Issue #2972: the JSON API silently accepted titles past the
+        // model's declared `length(max = 255)` because the hand-rolled
+        // `validated()` never ran the derived rules.
+        let err = NewTodo {
+            title: "x".repeat(256),
+        }
+        .validated()
+        .unwrap_err();
+        assert_eq!(err.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[test]
+    fn validated_rejects_an_empty_title_with_422() {
+        let err = NewTodo {
+            title: String::new(),
+        }
+        .validated()
+        .unwrap_err();
+        assert_eq!(err.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[test]
+    fn validated_rejects_a_whitespace_only_title_with_422() {
+        let err = NewTodo {
+            title: "   ".to_owned(),
+        }
+        .validated()
+        .unwrap_err();
+        assert_eq!(err.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[test]
+    fn validated_trims_a_valid_title() {
+        let todo = NewTodo {
+            title: "  Buy milk  ".to_owned(),
+        }
+        .validated()
+        .unwrap();
+        assert_eq!(todo.title, "Buy milk");
     }
 }
