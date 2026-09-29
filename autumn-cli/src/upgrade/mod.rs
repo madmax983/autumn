@@ -1421,9 +1421,16 @@ mod write_guard_tests {
 /// the run it is previewing: a bare `autumn upgrade` would offer `build.rs` as
 /// a writable `update` that `--apply` then refuses. A preview that does not
 /// predict its own apply is worse than no preview, and this is the one file
-/// that can be in both halves at once.
+/// that can be in both halves at once. The plan carries the *contents* the
+/// codemods mean to write, not just the paths, so a migrated file's diff is
+/// rendered against the bytes `--apply` will produce rather than the
+/// pre-codemod bytes a preview still finds on disk.
 fn plan_scaffold(root: &Path, target: &str, report: &Report) -> Option<scaffold::ScaffoldReport> {
-    let migrated: BTreeSet<String> = report.files.iter().map(|file| file.path.clone()).collect();
+    let migrated: BTreeMap<String, String> = report
+        .files
+        .iter()
+        .map(|file| (file.path.clone(), file.updated.clone()))
+        .collect();
     scaffold::is_project(root).then(|| scaffold::plan_after(root, target, &migrated))
 }
 

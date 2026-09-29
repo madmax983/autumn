@@ -318,7 +318,9 @@ pub enum ConflictReason {
     /// the tool itself makes four lines earlier would be simply false.
     ///
     /// Set from the codemods' *plan*, so a preview says the same thing the
-    /// apply it is previewing will.
+    /// apply it is previewing will. The rendered diff is against the planned
+    /// contents too — the bytes `--apply` writes — not the pre-codemod bytes
+    /// a preview still finds on disk.
     MigratedThisRun,
 }
 
@@ -651,7 +653,7 @@ pub fn classify(
     root: &Path,
     files: &BTreeMap<&'static str, String>,
     manifest: Option<&Manifest>,
-    migrated: &BTreeSet<String>,
+    migrated: &BTreeMap<String, String>,
 ) -> Vec<Entry> {
     let recorded = |path: &str| manifest.and_then(|manifest| manifest.digests.get(path));
     let pinned = |path: &str| manifest.is_some_and(|manifest| manifest.pinned.contains(path));
@@ -692,16 +694,25 @@ pub fn classify(
                         .unwrap_or_default(),
                 ),
                 OnDisk::Text(text) => {
-                    let status = if migrated.contains(*path) {
-                        Status::Conflict(ConflictReason::MigratedThisRun)
-                    } else {
-                        match recorded(path) {
-                            Some(baseline) if *baseline == digest(text) => Status::Update,
-                            Some(_) => Status::Conflict(ConflictReason::Edited),
-                            None => Status::Conflict(ConflictReason::NoBaseline),
+                    let (status, diff) = match migrated.get(*path) {
+                        // This run's app-code migrations cover the file. The
+                        // diff is rendered against the codemods' *planned*
+                        // contents — what `--apply` will have on disk — not
+                        // the pre-codemod bytes a preview still finds there.
+                        Some(updated) => (
+                            Status::Conflict(ConflictReason::MigratedThisRun),
+                            differs(&normalize(updated)).1,
+                        ),
+                        None => {
+                            let status = match recorded(path) {
+                                Some(baseline) if *baseline == digest(text) => Status::Update,
+                                Some(_) => Status::Conflict(ConflictReason::Edited),
+                                None => Status::Conflict(ConflictReason::NoBaseline),
+                            };
+                            (status, differs(text).1)
                         }
                     };
-                    (status, differs(text).1)
+                    (status, diff)
                 }
             };
             Entry {
@@ -922,18 +933,25 @@ pub struct WriteFailure {
 /// 0.6.0 while rendering 0.7.0's files would simply be false.
 #[must_use]
 pub fn plan(root: &Path, target: &str) -> ScaffoldReport {
-    plan_after(root, target, &BTreeSet::new())
+    plan_after(root, target, &BTreeMap::new())
 }
 
-/// Plan a reconciliation, knowing which paths this run's app-code migrations
-/// have already rewritten.
+/// Plan a reconciliation, knowing what this run's app-code migrations have
+/// already rewritten.
 ///
+/// `migrated` maps each rewritten path to the codemods' *planned* contents —
+/// the bytes `--apply` writes, which a preview still finds absent from disk.
 /// `build.rs` is both a framework-owned file and a `.rs` file the codemods
-/// scan, so one `--apply` can land on it twice. Told which files the first half
-/// touched, the second half reports them honestly instead of accusing the
-/// developer of an edit this command made moments earlier.
+/// scan, so one `--apply` can land on it twice. Told what the first half will
+/// write, the second half reports those files honestly instead of accusing the
+/// developer of an edit this command made moments earlier — and renders their
+/// diffs against the planned bytes, the same bytes `--apply` will produce.
 #[must_use]
-pub fn plan_after(root: &Path, _target: &str, migrated: &BTreeSet<String>) -> ScaffoldReport {
+pub fn plan_after(
+    root: &Path,
+    _target: &str,
+    migrated: &BTreeMap<String, String>,
+) -> ScaffoldReport {
     let target = env!("CARGO_PKG_VERSION").to_owned();
     let manifest = Manifest::load(root);
     let options = resolve_options(root, manifest.as_ref());
@@ -2669,7 +2687,11 @@ mod tests {
             &Status::Update
         );
 
-        let migrated: BTreeSet<String> = std::iter::once("build.rs".to_owned()).collect();
+        let migrated: BTreeMap<String, String> = std::iter::once((
+            "build.rs".to_owned(),
+            "fn main() { /* an older release's build.rs, migrated */ }\n".to_owned(),
+        ))
+        .collect();
         let previewed = plan_after(tmp.path(), "0.7.0", &migrated);
         assert_eq!(
             status_of(&previewed.entries, "build.rs"),
@@ -2681,6 +2703,54 @@ mod tests {
                 .iter()
                 .any(|entry| entry.path == "build.rs"),
             "a file the codemods rewrite is never a writable scaffold update"
+        );
+    }
+
+    #[test]
+    fn a_preview_renders_a_migrated_build_rs_diff_against_the_codemod_plan() {
+        // `build.rs` is both framework-owned and codemod-scanned: in preview
+        // mode the disk still holds the pre-codemod bytes, while `--apply`
+        // rewrites them before the scaffold half plans. The preview's diff
+        // must be the diff `--apply` will show — rendered against the
+        // codemods' planned contents, not the bytes still on disk.
+        let tmp = scaffolded(GenerateOptions::default());
+        let stale = "fn main() { /* an older release's build.rs */ }\n";
+        write(tmp.path(), "build.rs", stale);
+        let rewritten = "fn main() { /* an older release's build.rs, migrated */ }\n";
+        let migrated: BTreeMap<String, String> =
+            std::iter::once(("build.rs".to_owned(), rewritten.to_owned())).collect();
+
+        let preview = plan_after(tmp.path(), "0.7.0", &migrated);
+        let previewed = preview
+            .entries
+            .iter()
+            .find(|entry| entry.path == "build.rs")
+            .expect("build.rs is framework-owned");
+        assert_eq!(
+            previewed.status,
+            Status::Conflict(ConflictReason::MigratedThisRun)
+        );
+
+        // Now run the apply half first: the codemods' bytes land on disk, and
+        // the scaffold half plans against them.
+        write(tmp.path(), "build.rs", rewritten);
+        let applied = plan_after(tmp.path(), "0.7.0", &migrated);
+        let after_apply = applied
+            .entries
+            .iter()
+            .find(|entry| entry.path == "build.rs")
+            .expect("build.rs is framework-owned");
+        assert_eq!(
+            after_apply.status,
+            Status::Conflict(ConflictReason::MigratedThisRun)
+        );
+        assert_eq!(
+            previewed.diff, after_apply.diff,
+            "the preview diffs the migrated file against the codemod plan, like --apply does"
+        );
+        assert!(
+            !previewed.diff.is_empty(),
+            "the diff shows the template drift, not an empty render"
         );
     }
 
