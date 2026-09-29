@@ -37,6 +37,7 @@ use chrono::{DateTime, Duration, SubsecRound, Utc};
 use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
 use diesel_async::pooled_connection::deadpool::Pool;
+use scoped_futures::ScopedFutureExt as _;
 use uuid::Uuid;
 
 use autumn_web::RuntimeConnection;
@@ -146,6 +147,17 @@ fn map_db_err<E: std::fmt::Display>(err: E) -> RoomError {
     RoomError::Store
 }
 
+impl From<diesel::result::Error> for RoomError {
+    /// Map transaction begin/commit/rollback failures the same way as any
+    /// other store failure: log the real cause, surface a generic `503`. This
+    /// is what lets [`join_room_serialized`] run inside
+    /// `scoped_immediate_transaction`, whose error type must convert from
+    /// `diesel::result::Error`.
+    fn from(err: diesel::result::Error) -> Self {
+        map_db_err(err)
+    }
+}
+
 /// Build a token-free [`RoomSnapshot`] from a room row and its participant rows,
 /// with the same deterministic roster ordering (`joined_at`, then `id`) as the
 /// in-memory store.
@@ -238,76 +250,7 @@ impl RoomStore for DbRoomStore {
     ) -> RoomStoreFuture<'a, JoinRecord> {
         Box::pin(async move {
             let mut conn = self.pool.get().await.map_err(map_db_err)?;
-
-            // The room must exist (fail-closed on a namespace mismatch — the
-            // filter keys on both columns).
-            let room: RoomRow = media_rooms::table
-                .filter(
-                    media_rooms::namespace
-                        .eq(namespace)
-                        .and(media_rooms::room_id.eq(room_id)),
-                )
-                .select(RoomRow::as_select())
-                .first(&mut conn)
-                .await
-                .optional()
-                .map_err(map_db_err)?
-                .ok_or(RoomError::RoomNotFound)?;
-            let max = usize::try_from(room.max_participants).unwrap_or(0);
-
-            // Capacity check (non-transactional backstop, as above).
-            let seats: i64 = media_room_participants::table
-                .filter(
-                    media_room_participants::namespace
-                        .eq(namespace)
-                        .and(media_room_participants::room_id.eq(room_id)),
-                )
-                .count()
-                .get_result(&mut conn)
-                .await
-                .map_err(map_db_err)?;
-            if usize::try_from(seats).unwrap_or(usize::MAX) >= max {
-                return Err(RoomError::RoomFull { max });
-            }
-
-            let now = Utc::now();
-            let participant_id = Uuid::new_v4().to_string();
-            let token = SessionToken::generate();
-            let token_expires_at = now + token_ttl;
-            let new = ParticipantRow {
-                namespace: namespace.to_owned(),
-                room_id: room_id.to_owned(),
-                participant_id: participant_id.clone(),
-                display_name,
-                token: token.expose().to_owned(),
-                joined_at: now.naive_utc(),
-                token_expires_at: token_expires_at.naive_utc(),
-                last_seen_at: now.naive_utc(),
-            };
-            diesel::insert_into(media_room_participants::table)
-                .values(&new)
-                .execute(&mut conn)
-                .await
-                .map_err(map_db_err)?;
-
-            // Snapshot the room *after* the join (includes the new participant).
-            let rows: Vec<ParticipantRow> = media_room_participants::table
-                .filter(
-                    media_room_participants::namespace
-                        .eq(namespace)
-                        .and(media_room_participants::room_id.eq(room_id)),
-                )
-                .select(ParticipantRow::as_select())
-                .load(&mut conn)
-                .await
-                .map_err(map_db_err)?;
-
-            Ok(JoinRecord {
-                participant_id,
-                token,
-                token_expires_at,
-                room: snapshot_from(&room, &rows),
-            })
+            join_room_serialized(&mut conn, namespace, room_id, display_name, token_ttl).await
         })
     }
 
@@ -588,4 +531,144 @@ impl RoomStore for DbRoomStore {
             stats
         })
     }
+}
+
+/// Run one [`DbRoomStore::join_room`] seat claim with the check-then-insert
+/// window closed (issue #2864).
+///
+/// The whole claim — lock the room row, re-read the participant count against
+/// ground truth, enforce the cap, insert the seat, reload the roster — runs in
+/// one `::autumn_web::__private::scoped_immediate_transaction`, mirroring the
+/// `#[votable]` S1–S5 shape (issue #1362):
+///
+/// * **Postgres:** the room row is taken `FOR NO KEY UPDATE` first, so
+///   concurrent joins on one room serialize on the row lock; each joiner then
+///   counts the previous joiner's committed row. `FOR NO KEY UPDATE` — rather
+///   than `FOR UPDATE` — is deliberate: a participant `INSERT`'s foreign-key
+///   check takes `FOR KEY SHARE` on the room row, which does not conflict, so
+///   FK validation never blocks against an in-flight join.
+/// * **SQLite:** the helper's `BEGIN IMMEDIATE` takes the database write lock
+///   up front, so a second joiner queues on the busy timeout and then reads
+///   the first joiner's committed count. The row fetch itself stays lock-free
+///   — `FOR NO KEY UPDATE` is a parse error on SQLite, which is why the lock
+///   clause lives only in the `pg` arm of `backend_select!`.
+///
+/// Lock ordering: joins only ever take the room row lock and then insert a
+/// fresh participant row; `reap_stale`'s room sweep deletes room rows without
+/// holding participant locks first, and `leave_room` never takes the room row
+/// lock. Every wait edge points at the room row, so no lock cycle (and hence
+/// no `40P01` deadlock) can form between these paths.
+async fn join_room_serialized(
+    conn: &mut RuntimeConnection,
+    namespace: &str,
+    room_id: &str,
+    display_name: Option<String>,
+    token_ttl: Duration,
+) -> Result<JoinRecord, RoomError> {
+    ::autumn_web::__private::scoped_immediate_transaction::<JoinRecord, RoomError, _>(
+        conn,
+        |conn| {
+            async move {
+                // S1 — lock the room row on Postgres so concurrent joins on
+                // one room serialize; on SQLite the `BEGIN IMMEDIATE` above is
+                // the serialization point and the fetch stays a plain read.
+                // The room must exist (fail-closed on a namespace mismatch —
+                // the filter keys on both columns).
+                let room: RoomRow = ::autumn_web::backend_select! {
+                    pg => {{
+                        media_rooms::table
+                            .filter(
+                                media_rooms::namespace
+                                    .eq(namespace)
+                                    .and(media_rooms::room_id.eq(room_id)),
+                            )
+                            .select(RoomRow::as_select())
+                            .for_no_key_update()
+                            .first(&mut *conn)
+                            .await
+                            .optional()
+                            .map_err(map_db_err)?
+                            .ok_or(RoomError::RoomNotFound)?
+                    }},
+                    sqlite => {{
+                        media_rooms::table
+                            .filter(
+                                media_rooms::namespace
+                                    .eq(namespace)
+                                    .and(media_rooms::room_id.eq(room_id)),
+                            )
+                            .select(RoomRow::as_select())
+                            .first(&mut *conn)
+                            .await
+                            .optional()
+                            .map_err(map_db_err)?
+                            .ok_or(RoomError::RoomNotFound)?
+                    }},
+                };
+                let max = usize::try_from(room.max_participants).unwrap_or(0);
+
+                // S2 — count seats against ground truth. No other join can
+                // slip an insert between this count and the S4 insert: on
+                // Postgres it must take the S1 row lock first, on SQLite it
+                // cannot begin writing until this transaction commits.
+                let seats: i64 = media_room_participants::table
+                    .filter(
+                        media_room_participants::namespace
+                            .eq(namespace)
+                            .and(media_room_participants::room_id.eq(room_id)),
+                    )
+                    .count()
+                    .get_result(&mut *conn)
+                    .await
+                    .map_err(map_db_err)?;
+                // S3 — enforce the cap.
+                if usize::try_from(seats).unwrap_or(usize::MAX) >= max {
+                    return Err(RoomError::RoomFull { max });
+                }
+
+                // S4 — claim the seat.
+                let now = Utc::now();
+                let participant_id = Uuid::new_v4().to_string();
+                let token = SessionToken::generate();
+                let token_expires_at = now + token_ttl;
+                let new = ParticipantRow {
+                    namespace: namespace.to_owned(),
+                    room_id: room_id.to_owned(),
+                    participant_id: participant_id.clone(),
+                    display_name,
+                    token: token.expose().to_owned(),
+                    joined_at: now.naive_utc(),
+                    token_expires_at: token_expires_at.naive_utc(),
+                    last_seen_at: now.naive_utc(),
+                };
+                diesel::insert_into(media_room_participants::table)
+                    .values(&new)
+                    .execute(&mut *conn)
+                    .await
+                    .map_err(map_db_err)?;
+
+                // S5 — snapshot the room *after* the join (includes the new
+                // participant), inside the same transaction.
+                let rows: Vec<ParticipantRow> = media_room_participants::table
+                    .filter(
+                        media_room_participants::namespace
+                            .eq(namespace)
+                            .and(media_room_participants::room_id.eq(room_id)),
+                    )
+                    .select(ParticipantRow::as_select())
+                    .load(&mut *conn)
+                    .await
+                    .map_err(map_db_err)?;
+
+                Ok(JoinRecord {
+                    participant_id,
+                    token,
+                    token_expires_at,
+                    room: snapshot_from(&room, &rows),
+                })
+            }
+            .scope_boxed()
+        },
+    )
+    .await
 }

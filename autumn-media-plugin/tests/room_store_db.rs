@@ -534,3 +534,84 @@ async fn heartbeat_on_a_seat_reaped_concurrently_reports_it_gone() {
         Err(RoomError::RoomNotFound)
     ));
 }
+
+/// Regression test for #2864: N concurrent `join_room` calls against a room
+/// with cap C must admit exactly C participants — never more.
+///
+/// Before the fix, the seat-cap check ran outside any transaction (room read →
+/// count → compare → insert as separate statements), so joins racing in the
+/// check-then-insert window could all read the same pre-join count and every
+/// one insert, overshooting the documented cap. The fix serializes the whole
+/// claim in one transaction (`FOR NO KEY UPDATE` on the room row on Postgres),
+/// so each joiner counts the previous joiner's committed row.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn concurrent_joins_never_exceed_seat_cap() {
+    const CAP: usize = 4;
+    const RACERS: usize = 16;
+
+    let (pool, _container) = setup_pool().await;
+    let store = Arc::new(DbRoomStore::new(pool, 6));
+    let room = store.create_room("race", CAP).await.expect("create");
+
+    // A barrier releases every racer at once so all 16 land in the
+    // check-then-insert window together; without the fix, several slip past
+    // the cap before any insert commits.
+    let barrier = Arc::new(tokio::sync::Barrier::new(RACERS));
+    let mut handles = Vec::with_capacity(RACERS);
+    for i in 0..RACERS {
+        let store = Arc::clone(&store);
+        let barrier = Arc::clone(&barrier);
+        let room_id = room.id.clone();
+        handles.push(tokio::spawn(async move {
+            barrier.wait().await;
+            store
+                .join_room(
+                    "race",
+                    &room_id,
+                    Some(format!("racer-{i}")),
+                    Duration::seconds(300),
+                )
+                .await
+        }));
+    }
+
+    let mut admitted = 0usize;
+    let mut rejected = 0usize;
+    let mut first_token: Option<String> = None;
+    for handle in handles {
+        match handle.await.expect("join task panicked") {
+            Ok(joined) => {
+                admitted += 1;
+                if first_token.is_none() {
+                    first_token = Some(joined.token.expose().to_owned());
+                }
+            }
+            Err(RoomError::RoomFull { max }) => {
+                assert_eq!(max, CAP);
+                rejected += 1;
+            }
+            Err(other) => panic!("unexpected join error: {other:?}"),
+        }
+    }
+    assert_eq!(
+        admitted, CAP,
+        "exactly the cap's worth of joins must succeed"
+    );
+    assert_eq!(
+        rejected,
+        RACERS - CAP,
+        "every join past the cap is turned away"
+    );
+
+    // Ground truth: the table itself holds exactly `CAP` rows.
+    let roster = store
+        .roster(
+            "race",
+            &room.id,
+            &first_token.expect("someone was admitted"),
+        )
+        .await
+        .expect("roster");
+    assert_eq!(roster.participants.len(), CAP);
+}
