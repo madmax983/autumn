@@ -2063,6 +2063,9 @@ struct RedisWorkerConfig {
     default_attempts: u32,
     default_backoff: u64,
     retry_promotion_interval: std::time::Duration,
+    /// Maximum dead-lettered jobs retained in the `{prefix}:dead` list
+    /// (issue #3055). From `jobs.redis.dead_letter_limit`; `0` = unbounded.
+    dead_letter_limit: usize,
     /// The app's injected clock. Redis job records carry absolute
     /// millisecond timestamps (`enqueued_at_ms`, due-at scores, visibility
     /// deadlines), so they must be minted from the same clock the rest of the
@@ -7548,6 +7551,10 @@ fn expected_claim_args(record: &RedisJobRecord) -> Option<(&str, u64)> {
 #[cfg(feature = "redis")]
 const CLAIMED_REDIS_TRANSITION_SCRIPT: &str = r"
 local function trim_dead_history(dead_key, dead_record_prefix, limit)
+  -- A zero limit means unbounded (issue #3055): skip the trim entirely.
+  if limit == 0 then
+    return 0
+  end
   local trimmed_records = redis.call('LRANGE', dead_key, limit, -1)
   for _, encoded in ipairs(trimmed_records) do
     local trimmed_ok, trimmed = pcall(cjson.decode, encoded)
@@ -7556,6 +7563,9 @@ local function trim_dead_history(dead_key, dead_record_prefix, limit)
     end
   end
   redis.call('LTRIM', dead_key, 0, limit - 1)
+  -- Report how many entries were dropped so the worker can warn and count
+  -- them (issue #3055); previously this trim was completely silent.
+  return #trimmed_records
 end
 local key = KEYS[2] .. ARGV[1]
 local body = redis.call('GET', key)
@@ -7603,8 +7613,11 @@ elseif ARGV[4] == 'retry' then
 elseif ARGV[4] == 'dead' then
   redis.call('LPUSH', KEYS[4], ARGV[5])
   redis.call('SET', KEYS[6] .. ARGV[1], ARGV[5])
-  trim_dead_history(KEYS[4], KEYS[6], tonumber(ARGV[7]))
+  local trimmed = trim_dead_history(KEYS[4], KEYS[6], tonumber(ARGV[12]))
   redis.call('DEL', key)
+  -- Pack the trim count into the high 32 bits (issue #3055); the low 32 bits
+  -- keep the applied code (1 = settled) so existing checks keep working.
+  return 1 + trimmed * 4294967296
 else
   return 0
 end
@@ -7663,6 +7676,10 @@ async fn apply_claimed_redis_transition(
             ""
         })
         .arg(REDIS_UNIQUE_LOCK_TTL_BACKSTOP_MS)
+        // ARGV[12]: the dead-letter retention limit (issue #3055). The
+        // completed-list trim above keeps using ARGV[7] =
+        // DEFAULT_JOB_ADMIN_HISTORY_LIMIT.
+        .arg(worker_config.dead_letter_limit)
         .query_async(connection)
         .await?;
 
@@ -7740,6 +7757,45 @@ async fn schedule_redis_retry(
     })
 }
 
+/// Bit layout of a dead-letter settle script's packed `EVAL` return
+/// (issue #3055): the low 32 bits carry the applied code (`0` = the claim no
+/// longer matched, `1` = settled, `2` = retry contention on a duplicate
+/// unique lock), and the high 32 bits carry how many dead-letter entries that
+/// settle trimmed off the `{prefix}:dead` list. Non-dead settles never trim,
+/// so their high bits are always zero and the existing `== 1` / `== 2` checks
+/// on the raw value keep working untouched.
+#[cfg(feature = "redis")]
+const REDIS_SETTLE_TRIMMED_SHIFT: u32 = 32;
+
+/// Split a dead-letter settle script's packed `EVAL` return into
+/// `(settled, trimmed)`: whether the transition applied, and how many
+/// dead-letter entries it trimmed off the retention-limited dead list.
+#[cfg(feature = "redis")]
+const fn decode_redis_dead_letter_settle(raw: i64) -> (bool, usize) {
+    let unsigned = raw.cast_unsigned();
+    (
+        (unsigned & 0xFFFF_FFFF) == 1,
+        (unsigned >> REDIS_SETTLE_TRIMMED_SHIFT) as usize,
+    )
+}
+
+/// Make a dead-letter-list trim observable (issue #3055).
+///
+/// The trim itself happens atomically inside the settle script, where no
+/// logging or metrics are available — so the first thing the worker does with
+/// the script's trim count is emit both. A trim means forensic data was just
+/// destroyed; that must never be silent again.
+#[cfg(feature = "redis")]
+fn report_dead_letter_trim(job_id: &str, trimmed: usize, dead_letter_limit: usize) {
+    tracing::warn!(
+        job_id = %job_id,
+        trimmed,
+        dead_letter_limit,
+        "redis dead-letter list hit its retention limit; trimmed {trimmed} oldest entries and deleted their metadata. Raise `jobs.redis.dead_letter_limit` (0 = unbounded) to keep more history."
+    );
+    crate::metrics::counter("autumn_jobs_dead_letter_trimmed_total").increment(trimmed as u64);
+}
+
 #[cfg(feature = "redis")]
 async fn dead_letter_redis_job(
     connection: &mut redis::aio::ConnectionManager,
@@ -7751,7 +7807,7 @@ async fn dead_letter_redis_job(
         tracing::warn!(job_id = %record.id, "failed to serialize redis dead-letter record");
         return Ok(false);
     };
-    let applied = apply_claimed_redis_transition(
+    let raw = apply_claimed_redis_transition(
         connection,
         worker_config,
         expected,
@@ -7760,12 +7816,20 @@ async fn dead_letter_redis_job(
         None,
     )
     .await?;
-    Ok(applied == 1)
+    let (applied, trimmed) = decode_redis_dead_letter_settle(raw);
+    if applied && trimmed > 0 {
+        report_dead_letter_trim(&record.id, trimmed, worker_config.dead_letter_limit);
+    }
+    Ok(applied)
 }
 
 #[cfg(feature = "redis")]
 const STALE_REDIS_RECOVERY_SCRIPT: &str = r"
 local function trim_dead_history(dead_key, dead_record_prefix, limit)
+  -- A zero limit means unbounded (issue #3055): skip the trim entirely.
+  if limit == 0 then
+    return 0
+  end
   local trimmed_records = redis.call('LRANGE', dead_key, limit, -1)
   for _, encoded in ipairs(trimmed_records) do
     local trimmed_ok, trimmed = pcall(cjson.decode, encoded)
@@ -7774,6 +7838,9 @@ local function trim_dead_history(dead_key, dead_record_prefix, limit)
     end
   end
   redis.call('LTRIM', dead_key, 0, limit - 1)
+  -- Report how many entries were dropped so the worker can warn and count
+  -- them (issue #3055); previously this trim was completely silent.
+  return #trimmed_records
 end
 local key = KEYS[2] .. ARGV[1]
 local body = redis.call('GET', key)
@@ -7819,8 +7886,11 @@ if ARGV[4] == 'requeue' then
 elseif ARGV[4] == 'dead' then
   redis.call('LPUSH', KEYS[4], ARGV[5])
   redis.call('SET', KEYS[5] .. ARGV[1], ARGV[5])
-  trim_dead_history(KEYS[4], KEYS[5], tonumber(ARGV[6]))
+  local trimmed = trim_dead_history(KEYS[4], KEYS[5], tonumber(ARGV[6]))
   redis.call('DEL', key)
+  -- Pack the trim count into the high 32 bits (issue #3055); the low 32 bits
+  -- keep the applied code (1 = settled) so existing checks keep working.
+  return 1 + trimmed * 4294967296
 else
   return 0
 end
@@ -7861,7 +7931,7 @@ async fn apply_stale_redis_recovery(
     };
     // A requeued stale job returns to its own named queue, not the default one.
     let requeue_key = redis_queue_key(&worker_config.key_prefix, &record.queue);
-    let applied: usize = redis::cmd("EVAL")
+    let raw: i64 = redis::cmd("EVAL")
         .arg(STALE_REDIS_RECOVERY_SCRIPT)
         .arg(7)
         .arg(&worker_config.processing_key)
@@ -7876,7 +7946,9 @@ async fn apply_stale_redis_recovery(
         .arg(claimed_at_ms)
         .arg(mode)
         .arg(encoded)
-        .arg(DEFAULT_JOB_ADMIN_HISTORY_LIMIT)
+        // ARGV[6]: the dead-letter retention limit (issue #3055), replacing the
+        // old shared history-limit constant for this trim.
+        .arg(worker_config.dead_letter_limit)
         .arg(release_unique)
         .arg(decrement_slot)
         .arg(if mode == "requeue" {
@@ -7888,7 +7960,11 @@ async fn apply_stale_redis_recovery(
         .query_async(connection)
         .await?;
 
-    Ok(applied == 1)
+    let (applied, trimmed) = decode_redis_dead_letter_settle(raw);
+    if applied && trimmed > 0 && let RedisStaleRecovery::DeadLetter(dead) = action {
+        report_dead_letter_trim(&dead.id, trimmed, worker_config.dead_letter_limit);
+    }
+    Ok(applied)
 }
 
 #[cfg(feature = "redis")]
@@ -8646,6 +8722,7 @@ fn start_redis_runtime(
                 default_attempts: config.max_attempts,
                 default_backoff: config.initial_backoff_ms,
                 retry_promotion_interval,
+                dead_letter_limit: config.redis.dead_letter_limit,
                 clock: state.clock_arc(),
             },
         )?;
@@ -13307,13 +13384,20 @@ mod tests {
     fn redis_dead_letter_scripts_delete_trimmed_dead_record_metadata() {
         assert!(
             CLAIMED_REDIS_TRANSITION_SCRIPT
-                .contains("trim_dead_history(KEYS[4], KEYS[6], tonumber(ARGV[7]))"),
-            "claimed-job dead-letter trim should delete metadata for records beyond the history limit"
+                .contains("trim_dead_history(KEYS[4], KEYS[6], tonumber(ARGV[12]))"),
+            "claimed-job dead-letter trim should delete metadata for records beyond the dead-letter limit (ARGV[12])"
+        );
+        // The completed-list trim keeps the shared history limit on ARGV[7];
+        // only the dead-letter trim moved to the configurable limit.
+        assert!(
+            CLAIMED_REDIS_TRANSITION_SCRIPT
+                .contains("redis.call('LTRIM', KEYS[5], 0, tonumber(ARGV[7]) - 1)"),
+            "claimed-job completed-list trim should keep the shared history limit (ARGV[7])"
         );
         assert!(
             STALE_REDIS_RECOVERY_SCRIPT
                 .contains("trim_dead_history(KEYS[4], KEYS[5], tonumber(ARGV[6]))"),
-            "stale-recovery dead-letter trim should delete metadata for records beyond the history limit"
+            "stale-recovery dead-letter trim should delete metadata for records beyond the dead-letter limit (ARGV[6])"
         );
         assert!(
             CLAIMED_REDIS_TRANSITION_SCRIPT
@@ -13329,6 +13413,27 @@ mod tests {
                 >= 1,
             "stale-recovery dead-letter script should remove trimmed per-id metadata"
         );
+    }
+
+    #[cfg(feature = "redis")]
+    #[test]
+    fn redis_dead_letter_settle_decode_splits_applied_code_and_trim_count() {
+        // Plain (non-packing) returns: nothing trimmed.
+        assert_eq!(decode_redis_dead_letter_settle(1), (true, 0));
+        assert_eq!(decode_redis_dead_letter_settle(0), (false, 0));
+        assert_eq!(decode_redis_dead_letter_settle(2), (false, 0));
+        // Packed: applied with 3 trimmed.
+        let packed = 1 + 3 * 4_294_967_296i64;
+        assert_eq!(decode_redis_dead_letter_settle(packed), (true, 3));
+        // Packed: applied with nothing trimmed (list under the limit).
+        assert_eq!(
+            decode_redis_dead_letter_settle(1 + 0 * 4_294_967_296i64),
+            (true, 0)
+        );
+        // A large trim count still decodes exactly (Lua doubles are exact
+        // here; the pack/unpack round-trips through i64).
+        let packed = 1 + 1_500_000 * 4_294_967_296i64;
+        assert_eq!(decode_redis_dead_letter_settle(packed), (true, 1_500_000));
     }
 
     #[cfg(feature = "redis")]
@@ -13356,6 +13461,9 @@ mod tests {
             default_attempts: 3,
             default_backoff: 1,
             retry_promotion_interval: Duration::from_millis(1),
+            // Tests that need a different retention limit set the field after
+            // construction; the default matches production's default.
+            dead_letter_limit: DEFAULT_JOB_ADMIN_HISTORY_LIMIT,
             clock: std::sync::Arc::new(crate::time::SystemClock),
         }
     }

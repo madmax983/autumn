@@ -370,6 +370,35 @@ as every other durable backend.
 - Redis retries are scheduled in Redis before the worker moves on, so a crash
   during the backoff window does not drop the job.
 
+### Dead-letter retention
+
+Dead jobs are forensic evidence, so know how long each backend keeps them:
+
+- **Redis:** the `{key_prefix}:dead` list is capped at
+  `jobs.redis.dead_letter_limit` (default `1000`; `0` = unbounded, also via
+  `AUTUMN_JOBS__REDIS__DEAD_LETTER_LIMIT`). When a new dead-letter arrives past
+  the limit, the oldest entries are trimmed **and their per-job metadata keys
+  are deleted** — before this was configurable the trim was also completely
+  silent. Now every trim emits a `warn!` log and increments the
+  `autumn_jobs_dead_letter_trimmed_total` counter (visible in
+  `/actuator/prometheus`), so retention loss is an observable event instead of
+  a mystery. If you investigate dead jobs regularly, raise the limit or set it
+  to `0`; Redis memory is the only cost of keeping more.
+- **Postgres / SQLite:** dead jobs stay as terminal rows in `autumn_jobs` until
+  the opt-in `retention.job_history` window sweeps them (time-based, not
+  count-based). With no window configured, history is kept forever. The sweep
+  respects data-retention legal holds.
+- **Local (in-memory):** the admin history ring holds the most recent
+  `1000` finished entries; it is a view convenience, not durable storage.
+
+```toml
+[jobs.redis]
+# Keep the last 5,000 dead-lettered jobs instead of 1,000.
+dead_letter_limit = 5000
+# …or keep them all (watch Redis memory):
+# dead_letter_limit = 0
+```
+
 ## Job priorities
 
 By default every job drains from a single FIFO queue, so a flood of low-value

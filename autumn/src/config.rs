@@ -127,6 +127,7 @@
 //! | `AUTUMN_JOBS__REDIS__URL` | `jobs.redis.url` | `String` |
 //! | `AUTUMN_JOBS__REDIS__KEY_PREFIX` | `jobs.redis.key_prefix` | `String` |
 //! | `AUTUMN_JOBS__REDIS__VISIBILITY_TIMEOUT_MS` | `jobs.redis.visibility_timeout_ms` | `u64` |
+//! | `AUTUMN_JOBS__REDIS__DEAD_LETTER_LIMIT` | `jobs.redis.dead_letter_limit` | `usize` (`0` = unbounded) |
 //! | `AUTUMN_JOBS__POSTGRES__VISIBILITY_TIMEOUT_MS` | `jobs.postgres.visibility_timeout_ms` | `u64` |
 //! | `AUTUMN_JOBS__TRACKING__TTL_SECS` | `jobs.tracking.ttl_secs` | `u64` |
 //! | `AUTUMN_JOBS__TRACKING__ROUTE_ENABLED` | `jobs.tracking.route_enabled` | `bool` |
@@ -503,113 +504,83 @@ fn profile_section_from_base_toml(base: &toml::Value, profile: &str) -> Option<t
 /// (staging, test, etc.) get no smart defaults — they rely on
 /// their profile TOML file and env overrides.
 fn profile_defaults_as_toml(profile: &str) -> toml::Value {
-    let mut table = toml::map::Map::new();
-
     match profile {
-        "dev" => {
-            let mut log = toml::map::Map::new();
-            log.insert("level".into(), "debug".into());
-            log.insert("format".into(), "Pretty".into());
-            table.insert("log".into(), toml::Value::Table(log));
+        "dev" => toml::from_str(
+            r#"
+[log]
+level = "debug"
+format = "Pretty"
 
-            let mut telemetry = toml::map::Map::new();
-            telemetry.insert("environment".into(), "development".into());
-            table.insert("telemetry".into(), toml::Value::Table(telemetry));
+[telemetry]
+environment = "development"
 
-            let mut server = toml::map::Map::new();
-            server.insert("host".into(), "127.0.0.1".into());
-            server.insert("shutdown_timeout_secs".into(), toml::Value::Integer(1));
-            // Zero-out the prestop grace in dev: there is no load balancer to
-            // deregister, so the 5-second default would add unnecessary latency
-            // on every Ctrl-C.
-            server.insert("prestop_grace_secs".into(), toml::Value::Integer(0));
-            table.insert("server".into(), toml::Value::Table(server));
+[server]
+host = "127.0.0.1"
+shutdown_timeout_secs = 1
+# Zero-out the prestop grace in dev: there is no load balancer to
+# deregister, so the 5-second default would add unnecessary latency
+# on every Ctrl-C.
+prestop_grace_secs = 0
 
-            let mut health = toml::map::Map::new();
-            health.insert("detailed".into(), toml::Value::Boolean(true));
-            table.insert("health".into(), toml::Value::Table(health));
+[health]
+detailed = true
 
-            let mut actuator = toml::map::Map::new();
-            actuator.insert("sensitive".into(), toml::Value::Boolean(true));
-            table.insert("actuator".into(), toml::Value::Table(actuator));
+[actuator]
+sensitive = true
 
-            let mut cors = toml::map::Map::new();
-            cors.insert(
-                "allowed_origins".into(),
-                toml::Value::Array(vec![toml::Value::String("*".to_owned())]),
-            );
-            table.insert("cors".into(), toml::Value::Table(cors));
+[cors]
+allowed_origins = ["*"]
 
-            // Dev: enable the local-disk blob store rooted at
-            // `target/blobs/` automatically when the `storage` feature
-            // is on. `prod` deliberately leaves `backend = "disabled"`
-            // so the operator has to opt into either `local` (with
-            // `allow_local_in_production = true`) or `s3`.
-            let mut storage = toml::map::Map::new();
-            storage.insert("backend".into(), "local".into());
-            table.insert("storage".into(), toml::Value::Table(storage));
-            // Dev: trust X-Forwarded-* from loopback only so local reverse
-            // proxies (nginx, caddy, etc. on 127.0.0.1/::1) work out of the box.
-            let mut trusted_proxies = toml::map::Map::new();
-            trusted_proxies.insert("trust_forwarded_headers".into(), toml::Value::Boolean(true));
-            trusted_proxies.insert(
-                "ranges".into(),
-                toml::Value::Array(vec![
-                    toml::Value::String("127.0.0.0/8".to_owned()),
-                    toml::Value::String("::1/128".to_owned()),
-                ]),
-            );
-            let mut security = toml::map::Map::new();
-            security.insert(
-                "trusted_proxies".into(),
-                toml::Value::Table(trusted_proxies),
-            );
-            table.insert("security".into(), toml::Value::Table(security));
-            // Dev: CSRF disabled (default), HSTS off (default)
-        }
-        "prod" => {
-            let mut log = toml::map::Map::new();
-            log.insert("level".into(), "info".into());
-            log.insert("format".into(), "Json".into());
-            table.insert("log".into(), toml::Value::Table(log));
+# Dev: enable the local-disk blob store rooted at
+# `target/blobs/` automatically when the `storage` feature
+# is on. `prod` deliberately leaves `backend = "disabled"`
+# so the operator has to opt into either `local` (with
+# `allow_local_in_production = true`) or `s3`.
+[storage]
+backend = "local"
 
-            let mut telemetry = toml::map::Map::new();
-            telemetry.insert("environment".into(), "production".into());
-            table.insert("telemetry".into(), toml::Value::Table(telemetry));
+[security.trusted_proxies]
+# Dev: trust X-Forwarded-* from loopback only so local reverse
+# proxies (nginx, caddy, etc. on 127.0.0.1/::1) work out of the box.
+trust_forwarded_headers = true
+ranges = ["127.0.0.0/8", "::1/128"]
+# Dev: CSRF disabled (default), HSTS off (default)
+"#,
+        )
+        .expect("valid dev toml"),
+        "prod" => toml::from_str(
+            r#"
+[log]
+level = "info"
+format = "Json"
 
-            let mut server = toml::map::Map::new();
-            server.insert("host".into(), "0.0.0.0".into());
-            server.insert("shutdown_timeout_secs".into(), toml::Value::Integer(30));
-            let mut timeouts = toml::map::Map::new();
-            timeouts.insert("request_timeout_ms".into(), toml::Value::Integer(30_000));
-            server.insert("timeouts".into(), toml::Value::Table(timeouts));
-            table.insert("server".into(), toml::Value::Table(server));
+[telemetry]
+environment = "production"
 
-            let mut health = toml::map::Map::new();
-            health.insert("detailed".into(), toml::Value::Boolean(false));
-            table.insert("health".into(), toml::Value::Table(health));
+[server]
+host = "0.0.0.0"
+shutdown_timeout_secs = 30
 
-            // Prod: strict security -- HSTS on, CSRF enabled, secure cookies
-            let mut security = toml::map::Map::new();
-            let mut headers = toml::map::Map::new();
-            headers.insert(
-                "strict_transport_security".into(),
-                toml::Value::Boolean(true),
-            );
-            security.insert("headers".into(), toml::Value::Table(headers));
-            let mut csrf = toml::map::Map::new();
-            csrf.insert("enabled".into(), toml::Value::Boolean(true));
-            security.insert("csrf".into(), toml::Value::Table(csrf));
-            table.insert("security".into(), toml::Value::Table(security));
+[server.timeouts]
+request_timeout_ms = 30_000
 
-            let mut session = toml::map::Map::new();
-            session.insert("secure".into(), toml::Value::Boolean(true));
-            table.insert("session".into(), toml::Value::Table(session));
-        }
-        _ => {} // Custom profiles get no smart defaults
+[health]
+detailed = false
+
+# Prod: strict security -- HSTS on, CSRF enabled, secure cookies
+[security.headers]
+strict_transport_security = true
+
+[security.csrf]
+enabled = true
+
+[session]
+secure = true
+"#,
+        )
+        .expect("valid prod toml"),
+        _ => toml::Value::Table(toml::map::Map::new()), // Custom profiles get no smart defaults
     }
-
-    toml::Value::Table(table)
 }
 
 #[cfg(feature = "mail")]
@@ -3896,6 +3867,18 @@ pub struct JobRedisConfig {
     /// Duration before an in-flight job claim is considered stale.
     #[serde(default = "default_jobs_redis_visibility_timeout_ms")]
     pub visibility_timeout_ms: u64,
+    /// Maximum number of dead-lettered jobs retained in the Redis
+    /// `{key_prefix}:dead` list (issue #3055).
+    ///
+    /// When a new dead-letter arrives past this limit, the oldest entries are
+    /// trimmed and their per-job metadata keys deleted. `0` means unbounded
+    /// (no trim). Default: `1_000` (today's behavior).
+    ///
+    /// Every trim emits a `warn!` log and increments the
+    /// `autumn_jobs_dead_letter_trimmed_total` counter, so silent forensic
+    /// loss becomes an observable event.
+    #[serde(default = "default_jobs_redis_dead_letter_limit")]
+    pub dead_letter_limit: usize,
 }
 
 impl Default for JobRedisConfig {
@@ -3904,6 +3887,7 @@ impl Default for JobRedisConfig {
             url: None,
             key_prefix: default_jobs_redis_prefix(),
             visibility_timeout_ms: default_jobs_redis_visibility_timeout_ms(),
+            dead_letter_limit: default_jobs_redis_dead_letter_limit(),
         }
     }
 }
@@ -4018,6 +4002,12 @@ fn default_jobs_redis_prefix() -> String {
 
 const fn default_jobs_redis_visibility_timeout_ms() -> u64 {
     30_000
+}
+
+/// Default Redis dead-letter retention: matches the pre-#3055 hard-coded trim
+/// so existing deployments behave exactly as before.
+const fn default_jobs_redis_dead_letter_limit() -> usize {
+    1_000
 }
 
 /// Parent config paths whose child keys were already covered by strict
@@ -5215,6 +5205,7 @@ impl AutumnConfig {
     /// - `AUTUMN_JOBS__REDIS__URL` → `jobs.redis.url` (`String`)
     /// - `AUTUMN_JOBS__REDIS__KEY_PREFIX` → `jobs.redis.key_prefix` (`String`)
     /// - `AUTUMN_JOBS__REDIS__VISIBILITY_TIMEOUT_MS` → `jobs.redis.visibility_timeout_ms` (`u64`)
+    /// - `AUTUMN_JOBS__REDIS__DEAD_LETTER_LIMIT` → `jobs.redis.dead_letter_limit` (`usize`, `0` = unbounded)
     /// - `AUTUMN_JOBS__TRACKING__TTL_SECS` → `jobs.tracking.ttl_secs` (`u64`)
     /// - `AUTUMN_JOBS__TRACKING__ROUTE_ENABLED` → `jobs.tracking.route_enabled` (`bool`)
     ///
@@ -6160,6 +6151,11 @@ impl AutumnConfig {
             env,
             "AUTUMN_JOBS__REDIS__VISIBILITY_TIMEOUT_MS",
             &mut self.jobs.redis.visibility_timeout_ms,
+        );
+        parse_env(
+            env,
+            "AUTUMN_JOBS__REDIS__DEAD_LETTER_LIMIT",
+            &mut self.jobs.redis.dead_letter_limit,
         );
         parse_env(
             env,
@@ -14562,7 +14558,8 @@ path = "/healthz"
             .with("AUTUMN_JOBS__INITIAL_BACKOFF_MS", "750")
             .with("AUTUMN_JOBS__REDIS__URL", "redis://jobs:6379/2")
             .with("AUTUMN_JOBS__REDIS__KEY_PREFIX", "myapp:jobs")
-            .with("AUTUMN_JOBS__REDIS__VISIBILITY_TIMEOUT_MS", "45000");
+            .with("AUTUMN_JOBS__REDIS__VISIBILITY_TIMEOUT_MS", "45000")
+            .with("AUTUMN_JOBS__REDIS__DEAD_LETTER_LIMIT", "250");
         let mut config = AutumnConfig::default();
         config.apply_env_overrides_with_env(&env);
 
@@ -14576,6 +14573,19 @@ path = "/healthz"
         );
         assert_eq!(config.jobs.redis.key_prefix, "myapp:jobs");
         assert_eq!(config.jobs.redis.visibility_timeout_ms, 45_000);
+        assert_eq!(config.jobs.redis.dead_letter_limit, 250);
+    }
+
+    #[test]
+    fn jobs_redis_dead_letter_limit_defaults_to_previous_hard_coded_trim() {
+        // Issue #3055: the default must preserve today's behavior exactly —
+        // the trim previously hard-coded DEFAULT_JOB_ADMIN_HISTORY_LIMIT.
+        let config = AutumnConfig::default();
+        assert_eq!(config.jobs.redis.dead_letter_limit, 1_000);
+
+        let toml_config: AutumnConfig = toml::from_str("[jobs.redis]\ndead_letter_limit = 0\n")
+            .expect("dead_letter_limit = 0 must parse (unbounded)");
+        assert_eq!(toml_config.jobs.redis.dead_letter_limit, 0);
     }
 
     // ── [retention] unified framework-owned data retention (issue #1605) ──
