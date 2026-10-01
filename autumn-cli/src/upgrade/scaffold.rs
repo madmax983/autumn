@@ -42,6 +42,15 @@ use crate::new::{GenerateOptions, TemplateVars, framework_owned_files};
 /// *later* checkout compares against.
 pub const MANIFEST_PATH: &str = ".autumn/scaffold.toml";
 
+/// How many times [`Manifest::save`] re-reads, re-merges, and retries after
+/// losing the manifest to a concurrent writer before giving up.
+///
+/// Each attempt is one small read and one atomic rename; contention between
+/// two `autumn upgrade` processes resolves in the first retry. Past this
+/// many consecutive losses something is pathological — a tight writer loop —
+/// and failing loudly beats spinning forever.
+const MANIFEST_SAVE_ATTEMPTS: u32 = 8;
+
 /// Line endings normalised, so a CRLF checkout is not mistaken for an edit.
 ///
 /// `git config core.autocrlf true` rewrites every text file on checkout. Hashing
@@ -274,6 +283,21 @@ impl Manifest {
 
     /// Write the manifest under `root`, creating `.autumn/` if needed.
     ///
+    /// A compare-and-swap, not a blind overwrite. `self` was computed from
+    /// the manifest as it read some time ago, and another `autumn upgrade`
+    /// may have published since — two concurrent `--accept` runs each pin a
+    /// different file, both load the same manifest, and the later publish
+    /// must not lose the earlier pin. So the manifest is re-read immediately
+    /// before publishing, merged with what this run computed, and published
+    /// only if it still holds what the re-read saw; a lost race re-reads
+    /// and retries, a bounded number of times.
+    ///
+    /// `previous` is the manifest `self` was computed from — the base of the
+    /// three-way merge. Without it the merge cannot tell a key this run
+    /// deliberately dropped (a release that no longer owns the file, a digest
+    /// explicitly removed) from a key it never knew (a concurrent writer's
+    /// addition), and it would resurrect the former.
+    ///
     /// # Errors
     ///
     /// Fails if the path cannot be written — including when `.autumn` or the
@@ -281,18 +305,108 @@ impl Manifest {
     /// different code path than the scaffold files and would otherwise have had
     /// none of their protection: following the link would truncate a file
     /// outside the project, invisibly to that project's own `git diff`.
-    pub fn save(&self, root: &Path) -> std::io::Result<()> {
-        if matches!(read_current(root, MANIFEST_PATH), OnDisk::Linked(_)) {
-            return Err(std::io::Error::other(format!(
-                "{MANIFEST_PATH} (or a directory on the way to it) is a symlink; \
-                 writing through it could write outside the project"
-            )));
-        }
+    pub fn save(&self, root: &Path, previous: Option<&Self>) -> std::io::Result<()> {
         let path = root.join(MANIFEST_PATH);
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        publish(&path, &self.render(), Publish::Replace).map_err(std::io::Error::other)
+        for _ in 0..MANIFEST_SAVE_ATTEMPTS {
+            // Re-read under the same rules `load` uses: a manifest reachable
+            // only through a link is no manifest at all.
+            let observed = read_current(root, MANIFEST_PATH);
+            if matches!(observed, OnDisk::Linked(_)) {
+                return Err(std::io::Error::other(format!(
+                    "{MANIFEST_PATH} (or a directory on the way to it) is a symlink; \
+                     writing through it could write outside the project"
+                )));
+            }
+            let disk = match &observed {
+                OnDisk::Text(text) => Self::parse(text),
+                _ => None,
+            };
+            let merged = self.merged_with(disk.as_ref(), previous, root);
+            match publish(
+                &path,
+                &merged.render(),
+                Publish::Replace { expected: observed },
+            ) {
+                Ok(()) => return Ok(()),
+                // Lost the race to another writer: re-read, re-merge, and try
+                // again. Anything else is a real failure, not contention.
+                Err(PublishError::Changed(_)) => {}
+                Err(PublishError::Failed(error)) => return Err(std::io::Error::other(error)),
+            }
+        }
+        Err(std::io::Error::other(format!(
+            "{MANIFEST_PATH} changed under this run {MANIFEST_SAVE_ATTEMPTS} times \
+             in a row; another `autumn upgrade` appears to be writing it \
+             concurrently. Re-run to record the baseline."
+        )))
+    }
+
+    /// Merge a freshly re-read manifest into `self` before publishing.
+    ///
+    /// The merge is last-writer-wins per key, resolved against the bytes on
+    /// disk rather than against either snapshot's age:
+    ///
+    /// - `pinned` is a set union: accepting a file only ever adds.
+    /// - For each digest, the side whose value matches the file as it sits
+    ///   now is the side that wrote it last, and wins the key. A digest
+    ///   neither side matches means something else changed the file after
+    ///   both writes; the fresher claim stands, and the next `--check`
+    ///   reports the file as edited either way.
+    /// - `version` and `options` are this run's own: the merge only ever runs
+    ///   while publishing this run's outcome. `written_by` is the exception —
+    ///   it is a high-water mark, so it never moves backwards.
+    /// - A key the disk has and `self` does not is kept only when the base
+    ///   never knew it — a concurrent writer's addition. When the base had
+    ///   the key and `self` dropped it, that was deliberate (a release that
+    ///   no longer owns the file, a digest explicitly removed) and the merge
+    ///   does not resurrect it.
+    fn merged_with(
+        &self,
+        disk: Option<&Self>,
+        previous: Option<&Self>,
+        root: &Path,
+    ) -> Self {
+        let Some(disk) = disk else {
+            return self.clone();
+        };
+        let mut digests = disk.digests.clone();
+        for (path, ours) in &self.digests {
+            if disk.digests.get(path) == Some(ours) {
+                continue;
+            }
+            let actual = match read_current(root, path) {
+                OnDisk::Text(text) => Some(digest(&text)),
+                _ => None,
+            };
+            let ours_current = actual.as_deref() == Some(ours.as_str());
+            let theirs_current = disk
+                .digests
+                .get(path)
+                .is_some_and(|theirs| actual.as_deref() == Some(theirs.as_str()));
+            if ours_current || (!theirs_current && !disk.digests.contains_key(path)) {
+                digests.insert(path.clone(), ours.clone());
+            }
+        }
+        digests.retain(|path, _| {
+            self.digests.contains_key(path)
+                || !previous.is_some_and(|base| base.digests.contains_key(path))
+        });
+        let mut pinned = disk.pinned.clone();
+        pinned.extend(self.pinned.iter().cloned());
+        Self {
+            version: self.version.clone(),
+            written_by: match (&self.written_by, &disk.written_by) {
+                (Some(ours), Some(theirs)) => Some(newest(Some(ours), theirs)),
+                (Some(ours), None) => Some(ours.clone()),
+                (None, theirs) => theirs.clone(),
+            },
+            options: self.options,
+            digests,
+            pinned,
+        }
     }
 }
 
@@ -622,19 +736,29 @@ fn read_current(root: &Path, relative: &str) -> OnDisk {
     }
 
     let absolute = root.join(relative);
+    read_leaf(&absolute)
+}
+
+/// Read a single path by absolute location, refusing to resolve through a link.
+///
+/// The leaf half of [`read_current`], for callers that already hold the
+/// absolute path — notably `publish`'s swap-time re-verification, which must
+/// apply the same "a link is never a plain file" rule the plan used. The
+/// parent chain is the plan's business; this checks only the leaf itself.
+fn read_leaf(absolute: &Path) -> OnDisk {
     // `symlink_metadata` does not follow, which is the point: a link's own
     // metadata is what says it is a link. `metadata` would report the target,
     // and a dangling link would read as absent — the exact combination that
     // lets `--apply` create a file outside the project.
-    match std::fs::symlink_metadata(&absolute) {
+    match std::fs::symlink_metadata(absolute) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => OnDisk::Absent,
         Err(_) => OnDisk::Opaque(ConflictReason::Unreadable),
-        Ok(metadata) if metadata.file_type().is_symlink() => OnDisk::Linked(read_text(&absolute)),
+        Ok(metadata) if metadata.file_type().is_symlink() => OnDisk::Linked(read_text(absolute)),
         // It exists. Reading it can still fail — a directory, a device,
         // non-UTF-8 bytes, a permission the process does not have — and every
         // one of those is untouchable rather than absent.
         Ok(_) => {
-            read_text(&absolute).map_or(OnDisk::Opaque(ConflictReason::Unreadable), OnDisk::Text)
+            read_text(absolute).map_or(OnDisk::Opaque(ConflictReason::Unreadable), OnDisk::Text)
         }
     }
 }
@@ -1077,8 +1201,8 @@ fn prerelease_precedence(left: &str, right: &str) -> std::cmp::Ordering {
 /// changes nothing. Accepting a path is a promise that reconciliation will skip
 /// it, and a promise about a file this command never touches is meaningless.
 pub fn accept(root: &Path, paths: &[String]) -> Result<Manifest, String> {
-    let manifest = Manifest::load(root);
-    let options = resolve_options(root, manifest.as_ref());
+    let previous = Manifest::load(root);
+    let options = resolve_options(root, previous.as_ref());
     let owned = current_files(root, options).ok_or_else(|| {
         "this project's `Cargo.toml` gives no usable `[package] name`, so the scaffold \
          cannot be rendered and there is nothing to accept against"
@@ -1096,7 +1220,7 @@ pub fn accept(root: &Path, paths: &[String]) -> Result<Manifest, String> {
         ));
     }
 
-    let mut manifest = manifest.unwrap_or_else(|| Manifest {
+    let mut manifest = previous.clone().unwrap_or_else(|| Manifest {
         version: None,
         written_by: None,
         options,
@@ -1106,7 +1230,7 @@ pub fn accept(root: &Path, paths: &[String]) -> Result<Manifest, String> {
     manifest.options = options;
     manifest.pinned.extend(paths.iter().cloned());
     manifest
-        .save(root)
+        .save(root, previous.as_ref())
         .map_err(|error| format!("could not write {MANIFEST_PATH}: {error}"))?;
     Ok(manifest)
 }
@@ -1184,7 +1308,7 @@ fn record_baseline(report: &ScaffoldReport) -> Result<(), String> {
     if std::fs::read_to_string(&path).is_ok_and(|current| current == rendered) {
         return Ok(());
     }
-    next.save(&report.root).map_err(|error| {
+    next.save(&report.root, previous.as_ref()).map_err(|error| {
         format!(
             "the scaffold files were written, but the baseline could not be recorded: \
              {error}. Until it is, every file this run updated will be reported as a \
@@ -1199,6 +1323,11 @@ fn record_baseline(report: &ScaffoldReport) -> Result<(), String> {
 /// read earlier, and between then and now a formatter, a code generator, an
 /// editor autosave, or a second `autumn upgrade` can have replaced them. Writing
 /// anyway would silently revert whatever landed in that window.
+///
+/// The same re-read is carried into the publish as the swap's expectation, so
+/// a file that moves *while* the replacement is being staged — after this
+/// check, before the rename — is refused with the same error rather than
+/// silently reverted.
 ///
 /// Written through a temporary file in the same directory and renamed into
 /// place, the way the app-code half of this command writes: a truncate-in-place
@@ -1239,9 +1368,10 @@ fn write_one(entry: &Entry) -> Result<(), String> {
         if entry.current == OnDisk::Absent {
             Publish::Create
         } else {
-            Publish::Replace
+            Publish::Replace { expected: on_disk }
         },
     )
+    .map_err(PublishError::message)
 }
 
 /// Whether a publish may take a destination that already exists.
@@ -1249,12 +1379,35 @@ fn write_one(entry: &Entry) -> Result<(), String> {
 /// A statement about what the caller has *established*, not about what is on
 /// disk right now — the gap between those two is the race this exists to catch.
 /// Permissions are decided separately, from the destination itself.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum Publish {
     /// The path was empty when the plan was made and must still be empty.
     Create,
-    /// The caller may take whatever is there.
-    Replace,
+    /// The destination is taken only if it still holds what the caller
+    /// established. The re-read at swap time compares against this, which is
+    /// what makes the publish a compare-and-swap rather than a blind rename.
+    Replace { expected: OnDisk },
+}
+
+/// How a publish can fail.
+#[derive(Debug)]
+enum PublishError {
+    /// The destination no longer holds what the caller established — someone
+    /// else won the race to it. The destination is untouched, and the bytes
+    /// staged for it were discarded; retrying the whole read-modify-write is
+    /// the correct response.
+    Changed(String),
+    /// The write itself failed: permissions, a missing directory, a full
+    /// disk. Retrying without fixing the cause fails the same way.
+    Failed(String),
+}
+
+impl PublishError {
+    fn message(self) -> String {
+        match self {
+            Self::Changed(message) | Self::Failed(message) => message,
+        }
+    }
 }
 
 /// Publish `contents` at `absolute`, atomically.
@@ -1278,17 +1431,20 @@ enum Publish {
 /// are written and synced, so a file another process creates inside that window
 /// would be silently clobbered by the very step that advertises it will not.
 ///
-/// [`Publish::Replace`] does replace, since that is the point there. Its window
-/// is narrowed by the re-read, not closed: a writer that replaces the file
-/// between the re-read and the publish loses. Closing that needs an exchange
-/// primitive no portable API offers, and it is the same window every
-/// rename-based updater lives with.
-fn publish(absolute: &Path, contents: &str, mode: Publish) -> Result<(), String> {
+/// [`Publish::Replace`] re-verifies the destination at the moment of the swap:
+/// after staging and syncing, the destination is re-read and compared against
+/// what the caller established, and the rename happens only on a match. A
+/// writer that lands inside the staging window — the sync alone is
+/// milliseconds — is refused with the existing partial-apply error instead of
+/// being silently reverted. The residual window, this re-read to the rename,
+/// is microseconds; closing it needs an exchange primitive no portable API
+/// offers, and it is the same window every rename-based updater lives with.
+fn publish(absolute: &Path, contents: &str, mode: Publish) -> Result<(), PublishError> {
     use std::io::Write as _;
 
     let directory = absolute
         .parent()
-        .ok_or_else(|| "no parent directory".to_owned())?;
+        .ok_or_else(|| PublishError::Failed("no parent directory".to_owned()))?;
     // Created through ordinary `0o666` open semantics so the process umask
     // applies, exactly as it does to the `fs::write` that `autumn new` uses.
     // `tempfile`'s own constructor deliberately creates `0600`, and deriving a
@@ -1306,7 +1462,7 @@ fn publish(absolute: &Path, contents: &str, mode: Publish) -> Result<(), String>
                 .create_new(true)
                 .open(path)
         })
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| PublishError::Failed(error.to_string()))?;
 
     // A file that is really there keeps the mode it already has; anything else
     // is genuinely new and keeps the umask-derived mode it was just created
@@ -1319,28 +1475,46 @@ fn publish(absolute: &Path, contents: &str, mode: Publish) -> Result<(), String>
     }
 
     temp.write_all(contents.as_bytes())
-        .map_err(|error| error.to_string())?;
-    temp.flush().map_err(|error| error.to_string())?;
+        .map_err(|error| PublishError::Failed(error.to_string()))?;
+    temp.flush()
+        .map_err(|error| PublishError::Failed(error.to_string()))?;
     // The publish is atomic, but only against a crash if the bytes reached the
     // disk first: otherwise it can land before the data and publish an empty
     // file.
     temp.as_file()
         .sync_all()
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| PublishError::Failed(error.to_string()))?;
 
     match mode {
         Publish::Create => temp.persist_noclobber(absolute).map_err(|error| {
             if error.error.kind() == std::io::ErrorKind::AlreadyExists {
-                "something appeared at this path while it was being written; \
-                 it was left exactly as it is"
-                    .to_owned()
+                PublishError::Changed(
+                    "something appeared at this path while it was being written; \
+                     it was left exactly as it is"
+                        .to_owned(),
+                )
             } else {
-                error.error.to_string()
+                PublishError::Failed(error.error.to_string())
             }
         })?,
-        Publish::Replace => temp
-            .persist(absolute)
-            .map_err(|error| error.error.to_string())?,
+        Publish::Replace { expected } => {
+            // The compare in compare-and-swap, as close to the swap as a
+            // portable API gets: the destination is re-read *after* staging,
+            // and the rename happens only if it still holds what the caller
+            // established. A writer that landed inside the staging window is
+            // refused with the existing partial-apply error, not silently
+            // reverted. Dropping `temp` here deletes the staged file, so a
+            // refused publish leaves no scratch behind.
+            if read_leaf(absolute) != expected {
+                return Err(PublishError::Changed(
+                    "this file changed after the preview was computed; \
+                     it was left exactly as it is"
+                        .to_owned(),
+                ));
+            }
+            temp.persist(absolute)
+                .map_err(|error| PublishError::Failed(error.error.to_string()))?
+        }
     };
     Ok(())
 }
@@ -1688,7 +1862,7 @@ mod tests {
             digests,
             pinned: BTreeSet::new(),
         };
-        manifest.save(tmp.path()).unwrap();
+        manifest.save(tmp.path(), None).unwrap();
         let loaded = Manifest::load(tmp.path()).expect("written manifest loads");
         assert_eq!(loaded.digests, manifest.digests);
         assert_eq!(loaded.version.as_deref(), Some("0.7.0"));
@@ -1709,7 +1883,7 @@ mod tests {
             write(tmp.path(), path, contents);
         }
         Manifest::for_files(env!("CARGO_PKG_VERSION"), opts, &files)
-            .save(tmp.path())
+            .save(tmp.path(), None)
             .unwrap();
         tmp
     }
@@ -1749,9 +1923,10 @@ mod tests {
         fs::remove_file(tmp.path().join("rust-toolchain.toml")).unwrap();
         // The manifest is the *old* release's: it never knew this file.
         let mut manifest = Manifest::load(tmp.path()).unwrap();
+        let previous = manifest.clone();
         manifest.digests.remove("rust-toolchain.toml");
         manifest.version = Some("0.5.0".to_owned());
-        manifest.save(tmp.path()).unwrap();
+        manifest.save(tmp.path(), Some(&previous)).unwrap();
 
         let entries = plan_in(tmp.path()).entries;
         assert_eq!(status_of(&entries, "rust-toolchain.toml"), &Status::Add);
@@ -1770,7 +1945,7 @@ mod tests {
         manifest
             .digests
             .insert("clippy.toml".to_owned(), digest(old));
-        manifest.save(tmp.path()).unwrap();
+        manifest.save(tmp.path(), None).unwrap();
 
         let entries = plan_in(tmp.path()).entries;
         assert_eq!(status_of(&entries, "clippy.toml"), &Status::Update);
@@ -1896,7 +2071,7 @@ mod tests {
         let tmp = scaffolded(GenerateOptions::default());
         let mut manifest = Manifest::load(tmp.path()).unwrap();
         manifest.version = Some("0.5.0".to_owned());
-        manifest.save(tmp.path()).unwrap();
+        manifest.save(tmp.path(), None).unwrap();
 
         let report = plan_in(tmp.path());
         assert_eq!(report.baseline.as_deref(), Some("0.5.0"));
@@ -1936,8 +2111,9 @@ mod tests {
         let tmp = scaffolded(GenerateOptions::default());
         fs::remove_file(tmp.path().join("rustfmt.toml")).unwrap();
         let mut manifest = Manifest::load(tmp.path()).unwrap();
+        let previous = manifest.clone();
         manifest.digests.remove("rustfmt.toml");
-        manifest.save(tmp.path()).unwrap();
+        manifest.save(tmp.path(), Some(&previous)).unwrap();
 
         let report = plan_in(tmp.path());
         assert_eq!(report.outcome, Outcome::Preview);
@@ -1959,11 +2135,12 @@ mod tests {
         write(tmp.path(), "Dockerfile", mine);
 
         let mut manifest = Manifest::load(tmp.path()).unwrap();
+        let previous = manifest.clone();
         manifest.digests.remove("rustfmt.toml");
         manifest
             .digests
             .insert("clippy.toml".to_owned(), digest(stale));
-        manifest.save(tmp.path()).unwrap();
+        manifest.save(tmp.path(), Some(&previous)).unwrap();
 
         let mut report = plan_in(tmp.path());
         apply(&mut report).expect("apply");
@@ -1990,8 +2167,9 @@ mod tests {
         let tmp = scaffolded(GenerateOptions::default());
         fs::remove_dir_all(tmp.path().join(".github")).unwrap();
         let mut manifest = Manifest::load(tmp.path()).unwrap();
+        let previous = manifest.clone();
         manifest.digests.remove(".github/workflows/ci.yml");
-        manifest.save(tmp.path()).unwrap();
+        manifest.save(tmp.path(), Some(&previous)).unwrap();
 
         let mut report = plan_in(tmp.path());
         apply(&mut report).expect("apply");
@@ -2003,9 +2181,10 @@ mod tests {
         let tmp = scaffolded(GenerateOptions::default());
         fs::remove_file(tmp.path().join("rustfmt.toml")).unwrap();
         let mut manifest = Manifest::load(tmp.path()).unwrap();
+        let previous = manifest.clone();
         manifest.digests.remove("rustfmt.toml");
         manifest.version = Some("0.5.0".to_owned());
-        manifest.save(tmp.path()).unwrap();
+        manifest.save(tmp.path(), Some(&previous)).unwrap();
 
         let mut report = plan_in(tmp.path());
         apply(&mut report).expect("apply");
@@ -2023,7 +2202,7 @@ mod tests {
         write(tmp.path(), "Dockerfile", "FROM scratch\n");
         let mut manifest = Manifest::load(tmp.path()).unwrap();
         manifest.version = Some("0.5.0".to_owned());
-        manifest.save(tmp.path()).unwrap();
+        manifest.save(tmp.path(), None).unwrap();
 
         let mut report = plan_in(tmp.path());
         apply(&mut report).expect("apply");
@@ -2042,7 +2221,7 @@ mod tests {
         manifest
             .digests
             .insert("clippy.toml".to_owned(), digest(stale));
-        manifest.save(tmp.path()).unwrap();
+        manifest.save(tmp.path(), None).unwrap();
 
         let mut report = plan_in(tmp.path());
         // Something else (a formatter, an editor) writes between plan and apply.
@@ -2062,8 +2241,9 @@ mod tests {
         let tmp = scaffolded(GenerateOptions::default());
         fs::remove_file(tmp.path().join("rustfmt.toml")).unwrap();
         let mut manifest = Manifest::load(tmp.path()).unwrap();
+        let previous = manifest.clone();
         manifest.digests.remove("rustfmt.toml");
-        manifest.save(tmp.path()).unwrap();
+        manifest.save(tmp.path(), Some(&previous)).unwrap();
 
         let mut report = plan_in(tmp.path());
         write(tmp.path(), "rustfmt.toml", "# mine, written just now\n");
@@ -2082,8 +2262,9 @@ mod tests {
         fs::remove_file(tmp.path().join("rustfmt.toml")).unwrap();
         write(tmp.path(), "Dockerfile", "FROM scratch\n");
         let mut manifest = Manifest::load(tmp.path()).unwrap();
+        let previous = manifest.clone();
         manifest.digests.remove("rustfmt.toml");
-        manifest.save(tmp.path()).unwrap();
+        manifest.save(tmp.path(), Some(&previous)).unwrap();
 
         let text = render_text(&plan_in(tmp.path()));
         assert!(text.contains("rustfmt.toml"), "{text}");
@@ -2108,8 +2289,9 @@ mod tests {
         let tmp = scaffolded(GenerateOptions::default());
         fs::remove_file(tmp.path().join("rustfmt.toml")).unwrap();
         let mut manifest = Manifest::load(tmp.path()).unwrap();
+        let previous = manifest.clone();
         manifest.digests.remove("rustfmt.toml");
-        manifest.save(tmp.path()).unwrap();
+        manifest.save(tmp.path(), Some(&previous)).unwrap();
 
         let value = json(&plan_in(tmp.path()));
         assert_eq!(value["target"], env!("CARGO_PKG_VERSION"));
@@ -2355,8 +2537,9 @@ mod tests {
         let tmp = scaffolded(GenerateOptions::default());
         fs::remove_file(tmp.path().join("rustfmt.toml")).unwrap();
         let mut manifest = Manifest::load(tmp.path()).unwrap();
+        let previous = manifest.clone();
         manifest.digests.remove("rustfmt.toml");
-        manifest.save(tmp.path()).unwrap();
+        manifest.save(tmp.path(), Some(&previous)).unwrap();
 
         let mut report = plan_in(tmp.path());
         apply(&mut report).expect("apply");
@@ -2482,11 +2665,12 @@ mod tests {
         let stale = "# older\n";
         write(tmp.path(), "clippy.toml", stale);
         let mut manifest = Manifest::load(tmp.path()).unwrap();
+        let previous = manifest.clone();
         manifest.digests.remove("rustfmt.toml");
         manifest
             .digests
             .insert("clippy.toml".to_owned(), digest(stale));
-        manifest.save(tmp.path()).unwrap();
+        manifest.save(tmp.path(), Some(&previous)).unwrap();
 
         let mut report = plan_in(tmp.path());
         apply(&mut report).expect("apply");
@@ -2509,8 +2693,9 @@ mod tests {
         let tmp = scaffolded(GenerateOptions::default());
         fs::remove_file(tmp.path().join("rustfmt.toml")).unwrap();
         let mut manifest = Manifest::load(tmp.path()).unwrap();
+        let previous = manifest.clone();
         manifest.digests.remove("rustfmt.toml");
-        manifest.save(tmp.path()).unwrap();
+        manifest.save(tmp.path(), Some(&previous)).unwrap();
         let lookalike = tmp.path().join(".autumn-upgrade-rustfmt.toml.tmp");
         fs::write(&lookalike, "not this command's to delete\n").unwrap();
 
@@ -2617,7 +2802,9 @@ mod tests {
         let path = tmp.path().join("arrived.toml");
         fs::write(&path, "someone else got here first\n").unwrap();
 
-        let error = publish(&path, "ours\n", Publish::Create).expect_err("must refuse");
+        let error = publish(&path, "ours\n", Publish::Create)
+            .expect_err("must refuse")
+            .message();
         assert!(error.contains("appeared"), "{error}");
         assert_eq!(
             fs::read_to_string(&path).unwrap(),
@@ -2632,9 +2819,135 @@ mod tests {
         let path = tmp.path().join("existing.toml");
         fs::write(&path, "old\n").unwrap();
 
-        publish(&path, "new\n", Publish::Replace).expect("replace");
+        publish(
+            &path,
+            "new\n",
+            Publish::Replace {
+                expected: OnDisk::Text("old\n".to_owned()),
+            },
+        )
+        .expect("replace");
         assert_eq!(fs::read_to_string(&path).unwrap(), "new\n");
         assert!(no_scratch_beside(&path), "no scratch left behind");
+    }
+
+    #[test]
+    fn publishing_a_replacement_refuses_a_destination_that_moved_during_staging() {
+        // The swap-time re-verification (issue #2342): the caller established
+        // "old", but by the time the staged bytes are ready the destination
+        // holds something else. The publish is refused with the existing
+        // partial-apply error rather than silently reverting the newer bytes.
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("racy.toml");
+        fs::write(&path, "newer\n").unwrap();
+
+        let error = publish(
+            &path,
+            "ours\n",
+            Publish::Replace {
+                expected: OnDisk::Text("old\n".to_owned()),
+            },
+        )
+        .expect_err("must refuse")
+        .message();
+        assert!(
+            error.contains("changed after the preview was computed"),
+            "{error}"
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), "newer\n");
+        assert!(no_scratch_beside(&path), "no scratch left behind");
+    }
+
+    #[test]
+    fn publishing_a_replacement_refuses_a_destination_that_vanished() {
+        // Deleted between the plan's re-read and the swap: the rename must
+        // not recreate it from a stale decision.
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("gone.toml");
+
+        let error = publish(
+            &path,
+            "ours\n",
+            Publish::Replace {
+                expected: OnDisk::Text("old\n".to_owned()),
+            },
+        )
+        .expect_err("must refuse")
+        .message();
+        assert!(
+            error.contains("changed after the preview was computed"),
+            "{error}"
+        );
+        assert!(!path.exists(), "nothing recreated");
+        assert!(no_scratch_beside(&path), "no scratch left behind");
+    }
+
+    #[test]
+    fn two_accepts_against_one_project_keep_both_pins() {
+        // Issue #2342: two concurrent runs load the same manifest, each pins
+        // a different file, and the later publish must not lose the earlier
+        // pin. Both runs report success, so both pins must survive.
+        let tmp = scaffolded(GenerateOptions::default());
+        let mut stale = Manifest::load(tmp.path()).expect("manifest");
+        let base = stale.clone();
+        accept(tmp.path(), &["Dockerfile".to_owned()]).expect("accept");
+        stale.pinned.insert("build.rs".to_owned());
+        stale.save(tmp.path(), Some(&base)).expect("save");
+
+        let merged = Manifest::load(tmp.path()).expect("manifest");
+        assert!(merged.pinned.contains("Dockerfile"), "first pin survived");
+        assert!(merged.pinned.contains("build.rs"), "second pin survived");
+    }
+
+    #[test]
+    fn manifest_save_keeps_a_concurrent_writers_digests() {
+        // Each of two concurrent runs updates a different file; the merged
+        // manifest records both digests, resolved against the bytes on disk,
+        // and the `written_by` high-water mark never moves backwards.
+        let tmp = TempDir::new().unwrap();
+        let base = Manifest {
+            version: Some("0.7.0".to_owned()),
+            written_by: Some("0.7.0".to_owned()),
+            options: GenerateOptions::default(),
+            digests: BTreeMap::from([
+                ("a.toml".to_owned(), digest("old-a\n")),
+                ("b.toml".to_owned(), digest("old-b\n")),
+            ]),
+            pinned: BTreeSet::new(),
+        };
+        base.save(tmp.path(), None).unwrap();
+
+        // The concurrent run wrote b.toml and saved first, from the same base.
+        write(tmp.path(), "b.toml", "new-b\n");
+        let mut concurrent = Manifest::load(tmp.path()).expect("manifest");
+        concurrent.written_by = Some("0.8.0".to_owned());
+        concurrent
+            .digests
+            .insert("b.toml".to_owned(), digest("new-b\n"));
+        concurrent.save(tmp.path(), Some(&base)).unwrap();
+
+        // Our run wrote a.toml, still holding the stale base.
+        write(tmp.path(), "a.toml", "new-a\n");
+        let mut ours = base.clone();
+        ours.digests.insert("a.toml".to_owned(), digest("new-a\n"));
+        ours.save(tmp.path(), Some(&base)).unwrap();
+
+        let merged = Manifest::load(tmp.path()).expect("manifest");
+        assert_eq!(
+            merged.digests.get("a.toml"),
+            Some(&digest("new-a\n")),
+            "our write recorded"
+        );
+        assert_eq!(
+            merged.digests.get("b.toml"),
+            Some(&digest("new-b\n")),
+            "concurrent write not clobbered"
+        );
+        assert_eq!(
+            merged.written_by.as_deref(),
+            Some("0.8.0"),
+            "high-water mark kept"
+        );
     }
 
     /// Whether the directory holding `path` is free of staging files.
@@ -2665,7 +2978,7 @@ mod tests {
         manifest
             .digests
             .insert("build.rs".to_owned(), digest(stale));
-        manifest.save(tmp.path()).unwrap();
+        manifest.save(tmp.path(), None).unwrap();
         assert_eq!(
             status_of(&plan_in(tmp.path()).entries, "build.rs"),
             &Status::Update
@@ -2819,7 +3132,7 @@ mod tests {
         let tmp = scaffolded(GenerateOptions::default());
         let mut manifest = Manifest::load(tmp.path()).unwrap();
         manifest.version = Some("99.0.0".to_owned());
-        manifest.save(tmp.path()).unwrap();
+        manifest.save(tmp.path(), None).unwrap();
         // An older template on disk, matching its recorded digest exactly as a
         // newer CLI's output would.
         let newer = "# written by a newer release\n";
@@ -2828,7 +3141,7 @@ mod tests {
         manifest
             .digests
             .insert("clippy.toml".to_owned(), digest(newer));
-        manifest.save(tmp.path()).unwrap();
+        manifest.save(tmp.path(), None).unwrap();
 
         let report = plan_in(tmp.path());
         assert!(report.entries.is_empty(), "nothing may be reconciled");
@@ -2884,7 +3197,7 @@ mod tests {
         let tmp = scaffolded(GenerateOptions::default());
         let mut manifest = Manifest::load(tmp.path()).unwrap();
         manifest.version = Some("99.0.0".to_owned());
-        manifest.save(tmp.path()).unwrap();
+        manifest.save(tmp.path(), None).unwrap();
         let before = fs::read_to_string(tmp.path().join(MANIFEST_PATH)).unwrap();
 
         let mut report = plan_in(tmp.path());
@@ -2912,8 +3225,9 @@ mod tests {
         fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o775)).unwrap();
         fs::remove_file(tmp.path().join("rustfmt.toml")).unwrap();
         let mut manifest = Manifest::load(tmp.path()).unwrap();
+        let previous = manifest.clone();
         manifest.digests.remove("rustfmt.toml");
-        manifest.save(tmp.path()).unwrap();
+        manifest.save(tmp.path(), Some(&previous)).unwrap();
 
         // What an ordinary write produces in this very directory, whatever the
         // umask happens to be.
@@ -2952,7 +3266,7 @@ mod tests {
         manifest
             .digests
             .insert("clippy.toml".to_owned(), digest(newer));
-        manifest.save(tmp.path()).unwrap();
+        manifest.save(tmp.path(), None).unwrap();
 
         let report = plan_in(tmp.path());
         assert_eq!(report.scaffolded_by_newer.as_deref(), Some("99.0.0"));
@@ -2982,7 +3296,7 @@ mod tests {
         manifest
             .digests
             .insert("clippy.toml".to_owned(), digest(stale));
-        manifest.save(tmp.path()).unwrap();
+        manifest.save(tmp.path(), None).unwrap();
 
         let mut report = plan_in(tmp.path());
         apply(&mut report).expect("apply");
@@ -3062,7 +3376,7 @@ mod tests {
         let tmp = scaffolded(GenerateOptions::default());
         let mut manifest = Manifest::load(tmp.path()).unwrap();
         manifest.version = None;
-        manifest.save(tmp.path()).unwrap();
+        manifest.save(tmp.path(), None).unwrap();
 
         let loaded = Manifest::load(tmp.path()).expect("still a baseline");
         assert!(loaded.version.is_none());

@@ -311,7 +311,7 @@ fn generate_inner(
     // failing a scaffold over bookkeeping would be a worse trade than losing
     // conflict precision.
     let _ = crate::upgrade::scaffold::Manifest::for_files(autumn_version, opts, &owned)
-        .save(&project_dir);
+        .save(&project_dir, None);
     fs::write(project_dir.join("migrations/.gitkeep"), "")?;
 
     // The API flavor serves no HTML, so it needs no vendored htmx/SSE JS or the
