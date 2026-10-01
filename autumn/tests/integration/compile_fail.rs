@@ -688,6 +688,10 @@ fn compile_pass_tests_a() {
     // #2662: the `parent_pk` override reaches the preload loader.
     #[cfg(feature = "db")]
     t.pass("tests/compile-pass/model_counter_cache_parent_pk.rs");
+    // #3033: a `#[model]` keyed on a non-`id` primary key compiles, both
+    // spellings, with association preloads and a standalone `parent_pk`.
+    #[cfg(feature = "db")]
+    t.pass("tests/compile-pass/model_non_id_pk.rs");
 
     // Model draft accessors (requires db feature)
     #[cfg(feature = "db")]

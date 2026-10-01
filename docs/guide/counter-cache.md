@@ -375,11 +375,18 @@ see the parent's fields — the same visibility limit that makes
 before. `#[derivation]` takes the same `parent_pk = "<column>"` key with the
 same default.
 
-The key also drives the `belongs_to` preload: the loader filters on and
-selects `parent_pk` instead of `<parent>::id`. Note that a `#[model]` parent
-still needs an `id` column today (#3033), so for a counter cache the override
-currently serves counting through an alternate unique key; derivations onto a
-parent that is not a `#[model]` are unaffected by that limit.
+On `#[belongs_to]` the key also stands alone, without `counter_cache`
+(#3033): it then drives just the preload — the loader filters on and
+selects `parent_pk` instead of `<parent>::id`, so a `belongs_to` to a parent
+keyed on a non-`id` column compiles:
+
+```rust,ignore
+#[belongs_to(Post, parent_pk = "post_uuid")]
+```
+
+On `#[has_many]` / `#[has_one]` / `through` a standalone `parent_pk` is
+still rejected: there it only feeds the counter-cache maintenance, so
+without `counter_cache` there is nothing to address.
 
 ## Filtered and weighted counts
 

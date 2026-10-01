@@ -1,9 +1,9 @@
 //! #2662 compile-pass: a counter-cached `belongs_to` that names the parent key
 //! column with `parent_pk`. The generated preload loader then filters on and
 //! selects that column instead of `posts::id`, so this pins that the override
-//! branch type-checks. (The parent keeps an `id` column because `#[model]`
-//! itself still requires one; the child counts through the unique
-//! `post_uuid` key.)
+//! branch type-checks. (The parent keeps an `id` column here only to pin the
+//! historical default alongside the override; #3033 covers a parent keyed on
+//! a non-`id` column outright.)
 use autumn_web::model;
 
 diesel::table! {
