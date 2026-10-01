@@ -32,7 +32,9 @@ use crate::error::BillingError;
 use crate::event::{
     BillingEvent, BillingEventKind, CheckoutSnapshot, InvoiceSnapshot, SubscriptionSnapshot,
 };
-use crate::model::{Customer, DunningAttempt, DunningState, Invoice, SubscriptionStatus};
+use crate::model::{
+    Customer, DunningAttempt, DunningState, Invoice, Subscription, SubscriptionStatus,
+};
 use crate::notify;
 use crate::store::{
     CustomerUpsert, EventClaim, InvoiceUpsert, SubscriptionUpsert, Write as StoreWrite,
@@ -231,11 +233,21 @@ impl Ctx<'_> {
             upsert = upsert.with_period_end(end);
         }
         let subscription = match store.upsert_subscription(upsert).await? {
-            StoreWrite::Applied(subscription) => subscription,
+            StoreWrite::Applied(subscription) => {
+                // #3081: failures that arrived before this subscription was
+                // mirrored stored the provider id without a local link;
+                // back-fill those pending invoices and their open dunning
+                // rows now.
+                self.link_pending_invoices(snapshot, &subscription).await?;
+                subscription
+            }
             // A redelivery after a failure past the write: repeat the
-            // idempotent step only. Notifications and hooks ran, or never
+            // idempotent steps only. Notifications and hooks ran, or never
             // will, with the first delivery.
             StoreWrite::Unchanged(subscription) => {
+                // The link is idempotent, so a redelivery also heals a link
+                // that failed after the first write succeeded.
+                self.link_pending_invoices(snapshot, &subscription).await?;
                 if subscription.status == SubscriptionStatus::Canceled {
                     self.close_dunning_for(&subscription.id).await?;
                 }
@@ -264,6 +276,26 @@ impl Ctx<'_> {
             .hooks()
             .on_subscription_changed(&subscription, previous.as_ref())
             .await;
+        Ok(())
+    }
+
+    /// Back-fill the local subscription link on pending invoices and open
+    /// dunning rows that carry `snapshot.provider_subscription_id` but were
+    /// stored before the subscription was mirrored (#3081). Idempotent:
+    /// invoices already linked are skipped by the store.
+    async fn link_pending_invoices(
+        &self,
+        snapshot: &SubscriptionSnapshot,
+        subscription: &Subscription,
+    ) -> Result<(), BillingError> {
+        self.service
+            .store()
+            .link_invoices_to_subscription(
+                &snapshot.provider_subscription_id,
+                &subscription.id,
+                self.now,
+            )
+            .await?;
         Ok(())
     }
 
@@ -313,6 +345,12 @@ impl Ctx<'_> {
         .with_attempt_count(snapshot.attempt_count);
         if let Some(subscription) = subscription {
             upsert = upsert.with_subscription(subscription.id);
+        }
+        // #3081: keep the provider subscription id even when the local
+        // subscription is not mirrored yet, so `subscription()` can
+        // back-fill the link when it arrives.
+        if let Some(provider_subscription_id) = &snapshot.provider_subscription_id {
+            upsert = upsert.with_provider_subscription(provider_subscription_id.clone());
         }
         if let Some(next) = snapshot.next_payment_attempt {
             upsert = upsert.with_next_payment_attempt(next);

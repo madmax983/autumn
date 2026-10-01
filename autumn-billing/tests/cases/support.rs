@@ -686,6 +686,21 @@ impl BillingStore for FailingStore {
         delegate!(self, upsert_invoice, upsert)
     }
 
+    fn link_invoices_to_subscription<'a>(
+        &'a self,
+        provider_subscription_id: &'a autumn_billing::ProviderId,
+        subscription_id: &'a str,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> autumn_billing::store::StoreFuture<'a, usize> {
+        delegate!(
+            self,
+            link_invoices_to_subscription,
+            provider_subscription_id,
+            subscription_id,
+            now
+        )
+    }
+
     fn invoice_by_id<'a>(
         &'a self,
         id: &'a str,
@@ -898,4 +913,122 @@ impl BillingHooks for RecordingHooks {
         self.record(format!("dunning_exhausted:{}", dunning.attempt));
         Box::pin(async {})
     }
+}
+
+// ── #3081 acceptance scenario ───────────────────────────────────────────
+
+/// #3081: `invoice.payment_failed` arrives before the subscription event.
+/// The invoice keeps the provider subscription id with no local link; the
+/// subscription event back-fills the pending invoice and its open dunning
+/// row; every retry is declined and no further failure webhook arrives.
+/// The subscription must still end `Unpaid` and the provider must still
+/// receive `cancel_subscription`.
+///
+/// Runs on any store, so the memory suite (`tests/cases/dunning.rs`) and
+/// the Postgres suite (`tests/mirror_db.rs`) share this one scenario.
+pub async fn late_subscription_exhaustion_scenario(store: Arc<dyn BillingStore>) {
+    use autumn_billing::{
+        BillingEventKind, DunningState, InvoiceSnapshot, InvoiceStatus, SubscriptionSnapshot,
+        SubscriptionStatus,
+    };
+    use autumn_web::time::TickingClock;
+
+    let provider = FakeProvider::with_parser(FakeParser::BillingEventJson);
+    let h = harness_dyn(config(), store.clone(), provider.clone(), |app| {
+        app.with_clock(TickingClock::starting_at(base_time()))
+            .routes(notification_routes())
+    });
+
+    // 1. The failure arrives first: there is no local subscription yet.
+    let failed = BillingEventKind::InvoicePaymentFailed(
+        InvoiceSnapshot::new(
+            "in_late",
+            "cus_late",
+            InvoiceStatus::Open,
+            Money::from_minor(1999, Currency::USD),
+        )
+        .with_subscription("sub_late")
+        .with_attempt_count(1),
+    );
+    apply_event(&h.client, event("evt_late_fail", at(-200), failed))
+        .await
+        .unwrap();
+
+    let invoice = store
+        .invoice_by_provider_id(&ProviderId::new("in_late"))
+        .await
+        .unwrap()
+        .expect("invoice mirrored");
+    assert_eq!(invoice.subscription_id, None);
+    assert_eq!(
+        invoice.provider_subscription_id,
+        Some(ProviderId::new("sub_late")),
+        "the invoice keeps the provider subscription id until the mirror links it"
+    );
+    let row = store
+        .dunning_by_invoice(&invoice.id)
+        .await
+        .unwrap()
+        .expect("dunning row opened");
+    assert_eq!(row.subscription_id, None);
+
+    // 2. The subscription event arrives afterwards: the mirror back-fills
+    // the dangling links.
+    let sub = BillingEventKind::SubscriptionChanged(
+        SubscriptionSnapshot::new("sub_late", "cus_late", SubscriptionStatus::Active)
+            .with_price(PRO_PRICE),
+    );
+    apply_event(&h.client, event("evt_late_sub", at(-100), sub))
+        .await
+        .unwrap();
+
+    let invoice = store.invoice_by_id(&invoice.id).await.unwrap().unwrap();
+    let subscription = store
+        .subscription_by_provider_id(&ProviderId::new("sub_late"))
+        .await
+        .unwrap()
+        .expect("subscription mirrored");
+    assert_eq!(
+        invoice.subscription_id.as_deref(),
+        Some(subscription.id.as_str())
+    );
+    let row = store
+        .dunning_by_invoice(&invoice.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        row.subscription_id.as_deref(),
+        Some(subscription.id.as_str())
+    );
+
+    // 3. Every retry is declined; no further failure webhook arrives.
+    for delay in [3601, 7200, 10_800] {
+        h.client
+            .advance_clock(std::time::Duration::from_secs(delay));
+        h.client
+            .perform_enqueued_jobs()
+            .await
+            .assert_all_succeeded();
+    }
+
+    assert_eq!(provider.retry_calls(), 3);
+    let row = store
+        .dunning_by_invoice(&invoice.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.state, DunningState::Exhausted);
+    let subscription = store
+        .subscription_by_id(&subscription.id)
+        .await
+        .unwrap()
+        .expect("subscription");
+    assert_eq!(subscription.status, SubscriptionStatus::Unpaid);
+    assert_eq!(provider.cancel_calls(), 1);
+    assert!(
+        provider
+            .calls()
+            .contains(&FakeCall::CancelSubscription(ProviderId::new("sub_late")))
+    );
 }

@@ -377,6 +377,10 @@ async fn recovered(
     if let Some(subscription_id) = &invoice.subscription_id {
         paid = paid.with_subscription(subscription_id.clone());
     }
+    // Keep the provider link so a later event never loses the trace (#3081).
+    if let Some(provider_subscription_id) = &invoice.provider_subscription_id {
+        paid = paid.with_provider_subscription(provider_subscription_id.clone());
+    }
     let invoice = store.upsert_invoice(paid).await?.into_inner();
     tracing::info!(invoice_id = %invoice.id, "🍂 Autumn Billing: payment recovered");
     if let Some(customer) = store.customer_by_id(&invoice.customer_id).await? {
@@ -466,11 +470,22 @@ async fn exhausted(
     let customer = store.customer_by_id(&invoice.customer_id).await?;
     let action = service.config().dunning.on_exhausted;
     // The row was opened before the subscription was mirrored when the
-    // failure arrived first; the invoice carries the link by now.
-    let subscription_id = exhausted
+    // failure arrived first; the invoice carries the link by now. When even
+    // the back-fill never ran (the subscription event landed after the last
+    // retry), the invoice's provider subscription id still resolves the
+    // subscription (#3081).
+    let mut subscription_id = exhausted
         .subscription_id
         .clone()
         .or_else(|| invoice.subscription_id.clone());
+    if subscription_id.is_none()
+        && let Some(provider_subscription_id) = &invoice.provider_subscription_id
+    {
+        subscription_id = store
+            .subscription_by_provider_id(provider_subscription_id)
+            .await?
+            .map(|subscription| subscription.id);
+    }
     if let Some(subscription_id) = &subscription_id {
         let subscription = store
             .set_subscription_status(subscription_id, SubscriptionStatus::Unpaid, now)

@@ -69,6 +69,7 @@ diesel::table! {
         id -> Text,
         customer_id -> Text,
         subscription_id -> Nullable<Text>,
+        provider_subscription_id -> Nullable<Text>,
         provider_invoice_id -> Text,
         status -> Text,
         amount_due_minor -> BigInt,
@@ -143,6 +144,7 @@ struct InvoiceRow {
     id: String,
     customer_id: String,
     subscription_id: Option<String>,
+    provider_subscription_id: Option<String>,
     provider_invoice_id: String,
     status: String,
     amount_due_minor: i64,
@@ -253,6 +255,7 @@ impl InvoiceRow {
         id: String,
         created_at: DateTime<Utc>,
         subscription_id: Option<String>,
+        provider_subscription_id: Option<String>,
         upsert: InvoiceUpsert,
     ) -> Result<Self, BillingError> {
         let currency = upsert.amount_due.currency();
@@ -265,6 +268,7 @@ impl InvoiceRow {
             id,
             customer_id: upsert.customer_id,
             subscription_id,
+            provider_subscription_id,
             provider_invoice_id: upsert.provider_invoice_id.as_str().to_owned(),
             status: upsert.status.as_str().to_owned(),
             amount_due_minor: upsert.amount_due.minor(),
@@ -286,6 +290,7 @@ impl InvoiceRow {
             id: self.id,
             customer_id: self.customer_id,
             subscription_id: self.subscription_id,
+            provider_subscription_id: self.provider_subscription_id.map(ProviderId::new),
             provider_invoice_id: ProviderId::new(self.provider_invoice_id),
             status,
             amount_due: Money::from_minor(self.amount_due_minor, currency),
@@ -904,6 +909,10 @@ impl BillingStore for DbBillingStore {
                             upsert.new_id.clone(),
                             upsert.now,
                             upsert.subscription_id.clone(),
+                            upsert
+                                .provider_subscription_id
+                                .clone()
+                                .map(|id| id.as_str().to_owned()),
                             upsert,
                         )?;
                         diesel::insert_into(billing_invoices::table)
@@ -925,13 +934,20 @@ impl BillingStore for DbBillingStore {
                         Guard::Unchanged => return Ok(Write::Unchanged(current)),
                         Guard::Stale => return Ok(Write::Stale(current)),
                     }
-                    // `None` keeps the stored link.
+                    // `None` keeps the stored ids: a later event that omits them
+                    // does not unlink the invoice.
                     let subscription_id =
                         upsert.subscription_id.clone().or(current.subscription_id);
+                    let provider_subscription_id = upsert
+                        .provider_subscription_id
+                        .clone()
+                        .map(|id| id.as_str().to_owned())
+                        .or(current.provider_subscription_id);
                     let row = InvoiceRow::from_upsert(
                         current.id.clone(),
                         to_utc(current.created_at),
                         subscription_id,
+                        provider_subscription_id,
                         upsert,
                     )?;
                     diesel::update(billing_invoices::table.find(&row.id))
@@ -943,6 +959,62 @@ impl BillingStore for DbBillingStore {
                 .await
                 .map_err(|err| err.into_billing("upsert_invoice"))?;
             write.try_map(InvoiceRow::into_model)
+        })
+    }
+
+    fn link_invoices_to_subscription<'a>(
+        &'a self,
+        provider_subscription_id: &'a ProviderId,
+        subscription_id: &'a str,
+        now: DateTime<Utc>,
+    ) -> StoreFuture<'a, usize> {
+        Box::pin(async move {
+            let mut conn = self.conn().await?;
+            let provider_id = provider_subscription_id.as_str().to_owned();
+            let local_id = subscription_id.to_owned();
+            let naive_now = to_naive(now);
+            // #3081: repair the links left dangling when the failure arrived
+            // before the subscription was mirrored. Both updates run in one
+            // transaction so a crash cannot link the invoices while their
+            // open dunning rows still dangle.
+            let linked = conn
+                .transaction(async move |conn| -> Result<usize, TxError> {
+                    let linked = diesel::update(
+                        billing_invoices::table
+                            .filter(billing_invoices::provider_subscription_id.eq(&provider_id))
+                            .filter(billing_invoices::subscription_id.is_null()),
+                    )
+                    .set((
+                        billing_invoices::subscription_id.eq(&local_id),
+                        billing_invoices::updated_at.eq(naive_now),
+                    ))
+                    .execute(conn)
+                    .await?;
+                    let invoice_ids: Vec<String> = billing_invoices::table
+                        .filter(billing_invoices::provider_subscription_id.eq(&provider_id))
+                        .select(billing_invoices::id)
+                        .load(conn)
+                        .await?;
+                    diesel::update(
+                        billing_dunning::table
+                            .filter(billing_dunning::invoice_id.eq_any(&invoice_ids))
+                            .filter(billing_dunning::subscription_id.is_null())
+                            .filter(billing_dunning::state.eq_any([
+                                DunningState::Pending.as_str(),
+                                DunningState::Running.as_str(),
+                            ])),
+                    )
+                    .set((
+                        billing_dunning::subscription_id.eq(&local_id),
+                        billing_dunning::updated_at.eq(naive_now),
+                    ))
+                    .execute(conn)
+                    .await?;
+                    Ok(linked)
+                })
+                .await
+                .map_err(|err| err.into_billing("link_invoices_to_subscription"))?;
+            Ok(linked)
         })
     }
 

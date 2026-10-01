@@ -353,6 +353,10 @@ pub struct Invoice {
     pub customer_id: String,
     /// Local subscription id, when the invoice belongs to one.
     pub subscription_id: Option<String>,
+    /// Provider subscription id, kept even when the local subscription is
+    /// not mirrored yet (#3081: the failure can arrive before the
+    /// subscription event, and the link is back-filled on mirror).
+    pub provider_subscription_id: Option<ProviderId>,
     /// Provider invoice id.
     pub provider_invoice_id: ProviderId,
     /// Status.
@@ -395,6 +399,7 @@ impl Invoice {
             id: id.into(),
             customer_id: customer_id.into(),
             subscription_id: None,
+            provider_subscription_id: None,
             provider_invoice_id: provider_invoice_id.into(),
             status,
             amount_due,

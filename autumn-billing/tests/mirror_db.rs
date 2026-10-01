@@ -13,6 +13,11 @@
 #[path = "cases/store_contract.rs"]
 mod store_contract;
 
+#[path = "cases/support.rs"]
+mod support;
+
+use std::sync::Arc;
+
 use autumn_billing::{BillingError, BillingStore, DbBillingStore, ProviderId};
 use autumn_web::reexports::diesel_migrations::MigrationHarness;
 use diesel::Connection;
@@ -130,4 +135,17 @@ async fn unparseable_stored_status_is_a_store_error() {
         .expect_err("a status that does not parse is an error");
     assert!(matches!(err, BillingError::Store(_)), "{err:?}");
     assert!(err.to_string().contains("bogus"), "{err}");
+}
+
+/// The #3081 acceptance flow against Postgres: `payment_failed` arrives
+/// before the subscription event, the mirror back-fills the dangling links,
+/// and when every retry is declined the subscription still ends `Unpaid`
+/// with the provider cancel reaching Stripe. Shares the scenario with the
+/// memory lane in `tests/cases/dunning.rs`.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires Docker (testcontainers)"]
+async fn exhaustion_links_a_subscription_mirrored_after_payment_failed_on_postgres() {
+    let (pool, _container) = setup().await;
+    let store: Arc<dyn BillingStore> = Arc::new(DbBillingStore::new(pool));
+    support::late_subscription_exhaustion_scenario(store).await;
 }

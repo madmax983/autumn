@@ -374,6 +374,9 @@ impl BillingStore for MemoryBillingStore {
                     id: current.id.clone(),
                     customer_id: upsert.customer_id,
                     subscription_id: upsert.subscription_id.or(current.subscription_id),
+                    provider_subscription_id: upsert
+                        .provider_subscription_id
+                        .or(current.provider_subscription_id),
                     provider_invoice_id: upsert.provider_invoice_id,
                     status: upsert.status,
                     amount_due: upsert.amount_due,
@@ -391,6 +394,7 @@ impl BillingStore for MemoryBillingStore {
                 id: upsert.new_id,
                 customer_id: upsert.customer_id,
                 subscription_id: upsert.subscription_id,
+                provider_subscription_id: upsert.provider_subscription_id,
                 provider_invoice_id: upsert.provider_invoice_id,
                 status: upsert.status,
                 amount_due: upsert.amount_due,
@@ -403,6 +407,39 @@ impl BillingStore for MemoryBillingStore {
             };
             inner.invoices.insert(row.id.clone(), row.clone());
             Write::Applied(row)
+        }))
+    }
+
+    /// #3081: repair the links left dangling when the failure arrived
+    /// before the subscription was mirrored.
+    fn link_invoices_to_subscription<'a>(
+        &'a self,
+        provider_subscription_id: &'a ProviderId,
+        subscription_id: &'a str,
+        now: DateTime<Utc>,
+    ) -> StoreFuture<'a, usize> {
+        ready(self.lock().map(|mut inner| {
+            let mut linked = 0;
+            let mut linked_invoices: Vec<String> = Vec::new();
+            for row in inner.invoices.values_mut() {
+                if row.provider_subscription_id.as_ref() == Some(provider_subscription_id)
+                    && row.subscription_id.is_none()
+                {
+                    row.subscription_id = Some(subscription_id.to_owned());
+                    row.updated_at = now;
+                    linked += 1;
+                    linked_invoices.push(row.id.clone());
+                }
+            }
+            for attempt in inner.dunning.values_mut() {
+                if linked_invoices.contains(&attempt.invoice_id)
+                    && attempt.subscription_id.is_none()
+                    && matches!(attempt.state, DunningState::Pending | DunningState::Running)
+                {
+                    attempt.subscription_id = Some(subscription_id.to_owned());
+                }
+            }
+            linked
         }))
     }
 

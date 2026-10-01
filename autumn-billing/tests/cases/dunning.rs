@@ -677,3 +677,15 @@ async fn second_process_does_not_double_retry() {
     perform_ok(&app_b).await;
     assert_eq!(provider.retry_calls(), 1);
 }
+
+// ── #3081: failure before the subscription event ────────────────────────
+
+/// The #3081 acceptance flow against the memory store: `payment_failed`
+/// arrives before the subscription event, the mirror back-fills the
+/// dangling links, and when every retry is declined the subscription still
+/// ends `Unpaid` with the provider cancel reaching Stripe. The Postgres
+/// lane runs the same scenario in `tests/mirror_db.rs`.
+#[tokio::test]
+async fn exhaustion_links_a_subscription_mirrored_after_payment_failed() {
+    support::late_subscription_exhaustion_scenario(MemoryBillingStore::shared()).await;
+}

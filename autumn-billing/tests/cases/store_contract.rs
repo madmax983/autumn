@@ -686,6 +686,97 @@ pub async fn invoice_money_round_trip(store: &dyn BillingStore) {
 
 // ── Dunning ─────────────────────────────────────────────────────────────
 
+/// #3081: the provider subscription id is persisted even when the local
+/// subscription is not mirrored yet, and `link_invoices_to_subscription`
+/// back-fills the local link on the pending invoices and their open
+/// dunning rows — idempotently, without touching already-linked rows,
+/// settled rows, or other subscriptions.
+pub async fn invoice_link_back_fills_dangling_subscription_links(store: &dyn BillingStore) {
+    let customer = seed_customer(store, "link-a", None).await;
+    let provider = ProviderId::new("sub_link_a");
+    let local = "link-a-local-sub";
+
+    // The failure arrived before the subscription: invoices + open dunning
+    // rows with the provider id but no local link.
+    let mut open_rows = Vec::new();
+    for (key, state) in [
+        ("early", DunningState::Pending),
+        ("mid", DunningState::Running),
+    ] {
+        let upsert = invoice_upsert("link-a", &customer, key, InvoiceStatus::Open, 100)
+            .with_provider_subscription(provider.clone());
+        let invoice = store.upsert_invoice(upsert).await.unwrap().into_inner();
+        assert_eq!(invoice.subscription_id, None);
+        assert_eq!(invoice.provider_subscription_id, Some(provider.clone()));
+        let mut row = dunning("link-a", key, 1, 3600, state);
+        row.invoice_id = invoice.id.clone();
+        row.subscription_id = None;
+        store.upsert_dunning(row).await.unwrap();
+        open_rows.push(invoice.id);
+    }
+
+    // An invoice that already has a local link keeps it (counted as not linked).
+    let upsert = invoice_upsert("link-a", &customer, "has-link", InvoiceStatus::Open, 100)
+        .with_provider_subscription(provider.clone())
+        .with_subscription(local);
+    let linked = store.upsert_invoice(upsert).await.unwrap().into_inner();
+
+    // A settled row is not an open row: the invoice still gets its truthful
+    // link, but the finished dunning row keeps dangling.
+    let upsert = invoice_upsert("link-a", &customer, "settled", InvoiceStatus::Open, 100)
+        .with_provider_subscription(provider.clone());
+    let settled = store.upsert_invoice(upsert).await.unwrap().into_inner();
+    let mut settled_row = dunning("link-a", "settled", 3, 10_800, DunningState::Exhausted);
+    settled_row.invoice_id = settled.id.clone();
+    store.upsert_dunning(settled_row).await.unwrap();
+
+    // An invoice of another subscription is untouched.
+    let upsert = invoice_upsert("link-a", &customer, "other", InvoiceStatus::Open, 100)
+        .with_provider_subscription(ProviderId::new("sub_other"));
+    let other = store.upsert_invoice(upsert).await.unwrap().into_inner();
+
+    let n = store
+        .link_invoices_to_subscription(&provider, local, at(2000))
+        .await
+        .unwrap();
+    assert_eq!(n, 3, "only the three unlinked invoices are linked");
+
+    for invoice_id in &open_rows {
+        let invoice = store.invoice_by_id(invoice_id).await.unwrap().unwrap();
+        assert_eq!(invoice.subscription_id.as_deref(), Some(local));
+        assert_eq!(invoice.provider_subscription_id, Some(provider.clone()));
+        let row = store.dunning_by_invoice(invoice_id).await.unwrap().unwrap();
+        assert_eq!(row.subscription_id.as_deref(), Some(local));
+    }
+
+    let linked = store.invoice_by_id(&linked.id).await.unwrap().unwrap();
+    assert_eq!(linked.subscription_id.as_deref(), Some(local));
+
+    let settled = store.invoice_by_id(&settled.id).await.unwrap().unwrap();
+    assert_eq!(settled.subscription_id.as_deref(), Some(local));
+    let settled_row = store
+        .dunning_by_invoice(&settled.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        settled_row.subscription_id, None,
+        "a finished row keeps dangling"
+    );
+
+    let other = store.invoice_by_id(&other.id).await.unwrap().unwrap();
+    assert_eq!(other.subscription_id, None);
+
+    // Idempotent: a second call links nothing.
+    let n = store
+        .link_invoices_to_subscription(&provider, local, at(2001))
+        .await
+        .unwrap();
+    assert_eq!(n, 0);
+}
+
+// ── Dunning ─────────────────────────────────────────────────────────────
+
 /// Upsert inserts, then replaces the whole row.
 pub async fn dunning_upsert_replaces(store: &dyn BillingStore) {
     store
@@ -1310,6 +1401,7 @@ pub async fn run_contract(store: &dyn BillingStore) {
     subscription_set_status(store).await;
     invoice_guarded_upsert_keeps_subscription_id(store).await;
     invoice_money_round_trip(store).await;
+    invoice_link_back_fills_dangling_subscription_links(store).await;
     dunning_upsert_replaces(store).await;
     dunning_claim_is_compare_and_set(store).await;
     open_dunning_ordered_and_filtered(store).await;
@@ -1354,6 +1446,7 @@ mod memory {
         subscription_set_status,
         invoice_guarded_upsert_keeps_subscription_id,
         invoice_money_round_trip,
+        invoice_link_back_fills_dangling_subscription_links,
         dunning_upsert_replaces,
         dunning_claim_is_compare_and_set,
         open_dunning_ordered_and_filtered,
