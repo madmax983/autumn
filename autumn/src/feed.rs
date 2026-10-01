@@ -423,12 +423,13 @@ fn rfc2822(dt: DateTime<Utc>) -> String {
 /// sequence so untrusted titles/bodies cannot break out of the document.
 ///
 /// Real titles/bodies are overwhelmingly plain ASCII text containing none of
-/// the five special characters, but the byte-by-byte `chars()` loop below
-/// pays a full UTF-8 decode + 5-way match per character even for that common
-/// case. `needs_escaping` does one cheap byte scan to detect it and returns
-/// the input unchanged (one allocation, one memcpy) instead of rebuilding it
-/// one `char` at a time. Any non-ASCII byte falls straight through to the
-/// per-`char` path unconditionally, so `is_xml_char`'s
+/// the five special characters, but the slow path below still pays a UTF-8
+/// decode + 5-way match per character for that common case. `needs_escaping`
+/// does one cheap byte scan to detect it and returns the input unchanged (one
+/// allocation, one memcpy) instead of rebuilding it. When the slow path does
+/// run, it copies maximal clean runs with one `push_str` each, flushing only
+/// around an escaped or dropped character. Any non-ASCII byte falls straight
+/// through to the slow path unconditionally, so `is_xml_char`'s
 /// `U+FFFE`/`U+FFFF`-filtering — which only matters for non-ASCII code
 /// points — is never bypassed.
 fn escape(s: &str) -> String {
@@ -436,19 +437,31 @@ fn escape(s: &str) -> String {
         return s.to_owned();
     }
     let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        if !is_xml_char(c) {
-            continue;
-        }
-        match c {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            '"' => out.push_str("&quot;"),
-            '\'' => out.push_str("&apos;"),
-            _ => out.push(c),
+    // Copy maximal clean runs with one `push_str` each instead of pushing one
+    // `char` at a time: most escaped text is long ASCII stretches broken only
+    // by the occasional entity or dropped control byte.
+    let mut run_start = 0;
+    for (i, c) in s.char_indices() {
+        let replacement = if !is_xml_char(c) {
+            // Not a valid XML 1.0 char: dropped, like the per-char loop did.
+            Some("")
+        } else {
+            match c {
+                '&' => Some("&amp;"),
+                '<' => Some("&lt;"),
+                '>' => Some("&gt;"),
+                '"' => Some("&quot;"),
+                '\'' => Some("&apos;"),
+                _ => None,
+            }
+        };
+        if let Some(entity) = replacement {
+            out.push_str(&s[run_start..i]);
+            out.push_str(entity);
+            run_start = i + c.len_utf8();
         }
     }
+    out.push_str(&s[run_start..]);
     out
 }
 
