@@ -642,6 +642,15 @@ delete actions remain last-write-wins.
 - `Db::tx_with(opts: TxOptions, f) -> Result<T, AutumnError>`
   (**0.6.0**) — closure gets `&mut AsyncPgConnection`; auto-retries
   SQLSTATE 40001 with capped exponential backoff.
+- `Db::tx_immediate(f)` (unreleased, #2885) — same semantics as `Db::tx`
+  (closure gets `&mut RuntimeConnection`); on SQLite it begins
+  `BEGIN IMMEDIATE`, so a concurrent writer on a file database queues on
+  `busy_timeout` instead of failing its read→write upgrade with
+  `SQLITE_BUSY_SNAPSHOT`. Use it for write-heavy closures; keep pure reads on
+  `Db::tx`. On a `cache=shared` target it only stops writers from all
+  reading before they upgrade; any writer can still get `SQLITE_LOCKED`
+  immediately (no queueing, no guaranteed winner), so pair it with a backoff
+  retry there. `ShardedDb::tx_immediate` delegates.
 - `autumn_web::db::IsolationLevel` {`ReadCommitted` (default),
   `RepeatableRead`, `Serializable`}; `TxOptions` builders
   `::read_committed()` / `::repeatable_read()` / `::serializable()` +

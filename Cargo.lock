@@ -728,6 +728,7 @@ dependencies = [
  "time",
  "tokio",
  "toml 1.1.6+spec-1.1.0",
+ "tower",
  "tracing",
  "uuid",
 ]
@@ -870,7 +871,7 @@ dependencies = [
  "serde_path_to_error",
  "serde_urlencoded",
  "serde_yaml",
- "sha1 0.10.7",
+ "sha1 0.11.0",
  "sha2 0.10.9",
  "socket2",
  "subtle",
@@ -903,7 +904,7 @@ dependencies = [
  "wat",
  "webauthn-rs",
  "webpki-roots 1.0.9",
- "x509-parser 0.16.0",
+ "x509-parser 0.18.1",
  "zeroize",
 ]
 
@@ -1637,6 +1638,8 @@ dependencies = [
  "pq-sys",
  "serde",
  "serde_json",
+ "testcontainers",
+ "testcontainers-modules",
  "tokio",
 ]
 
@@ -1898,6 +1901,16 @@ checksum = "7dafe3a8757b027e2be6e4e5601ed563c55989fcf1546e933c66c8eb3a058d35"
 dependencies = [
  "bytes",
  "either",
+]
+
+[[package]]
+name = "card-validate"
+version = "2.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "655fa70596e2a38372c0c0c4449ec0166ad9cc43d91558bbecc1a6f38bf9eb91"
+dependencies = [
+ "lazy_static",
+ "regex",
 ]
 
 [[package]]
@@ -9863,7 +9876,7 @@ dependencies = [
  "log",
  "rand 0.10.2",
  "sha1 0.11.0",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -10085,6 +10098,7 @@ version = "0.21.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3d68c6633c483df6780cc5277a417c7c2d1bceee2649d06c8ab6b0fd2dd3c81"
 dependencies = [
+ "card-validate",
  "idna",
  "regex",
  "serde",
@@ -10647,6 +10661,7 @@ checksum = "72069c3113ab32ab29e5584db3c6ec55d416895e60715417b5b883a357c3e471"
 name = "wiki"
 version = "0.7.0"
 dependencies = [
+ "autumn-search",
  "autumn-web",
  "chrono",
  "diesel",

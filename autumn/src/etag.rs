@@ -153,12 +153,20 @@ impl ETag {
     ///
     /// `*` matches any `ETag`. Both strong and weak `ETag`s are compared by
     /// their opaque tag string.
+    ///
+    /// The list is split on commas that sit *outside* quoted entity-tags
+    /// (RFC 9110 §13.1.2: `If-None-Match = "*" / 1#entity-tag`, and `etagc`
+    /// per §8.8.3 permits commas inside the quotes, so a bare `split(',')`
+    /// would corrupt tags like `"a,b"` — the server's own tag never matches
+    /// its echo, or worse, a different tag matches as a false prefix).
+    /// Unquoted candidates stay accepted leniently (trimmed and compared
+    /// as-is), as before; only the quote handling changed.
     fn matches_if_none_match(&self, if_none_match: &str) -> bool {
         let if_none_match = if_none_match.trim();
         if if_none_match == "*" {
             return true;
         }
-        for candidate in if_none_match.split(',') {
+        for candidate in split_entity_tag_list(if_none_match) {
             let candidate = candidate.trim();
             // Strip W/ prefix then quotes for weak comparison.
             let tag = candidate
@@ -171,6 +179,32 @@ impl ETag {
         }
         false
     }
+}
+
+/// Split an `If-None-Match` header value into entity-tag candidates.
+///
+/// Commas *inside* a quoted entity-tag are part of the tag, not list
+/// separators (RFC 9110 §8.8.3 — `etagc` excludes `"` but permits `,`, and
+/// §13.1.2 splits the list on commas *outside* the quoted strings). There is
+/// no escape mechanism in `etagc`, so a `"` toggles quoting exactly.
+/// An unterminated quote runs to the end of the value — the same lenient
+/// read the old bare `split(',')` gave unquoted input.
+fn split_entity_tag_list(value: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut start = 0usize;
+    let mut in_quotes = false;
+    for (i, ch) in value.char_indices() {
+        match ch {
+            '"' => in_quotes = !in_quotes,
+            ',' if !in_quotes => {
+                parts.push(&value[start..i]);
+                start = i + 1; // ',' is one byte
+            }
+            _ => {}
+        }
+    }
+    parts.push(&value[start..]);
+    parts
 }
 
 // ── IntoETag trait ────────────────────────────────────────────────────────────
@@ -1235,6 +1269,62 @@ mod tests {
     fn etag_matches_one_of_many_in_list() {
         let etag = ETag::strong("abc");
         assert!(etag.matches_if_none_match(r#""xyz", "abc", "foo""#));
+    }
+
+    // ── #3080: commas inside quoted entity-tags are not list separators ─────
+
+    #[test]
+    fn etag_matches_its_own_header_value_when_the_tag_contains_a_comma() {
+        // The issue's never-304 repro: the server's own ETag never matched
+        // its echo because the bare split(',') cut the tag in half.
+        let etag = ETag::strong("a,b");
+        let header = etag.header_value().to_str().unwrap().to_owned();
+        assert_eq!(header, r#""a,b""#);
+        assert!(etag.matches_if_none_match(&header));
+    }
+
+    #[test]
+    fn etag_does_not_false_match_the_prefix_before_a_comma() {
+        // The issue's false-304 repro: the old split(',') turned `"a,b"`
+        // into candidates `"a` and `b"`, and trimming the quotes made tag
+        // `a` match — serving a 304 for a changed resource.
+        let etag = ETag::strong("a");
+        assert!(!etag.matches_if_none_match(r#""a,b""#));
+    }
+
+    #[test]
+    fn etag_matches_a_comma_tag_buried_in_a_longer_list() {
+        let etag = ETag::strong("a,b");
+        assert!(etag.matches_if_none_match(r#""xyz", "a,b", "foo""#));
+    }
+
+    #[test]
+    fn etag_matches_a_weak_comma_tag() {
+        let etag = ETag::strong("a,b");
+        assert!(etag.matches_if_none_match(r#"W/"a,b""#));
+    }
+
+    #[test]
+    fn etag_still_matches_unquoted_candidates_leniently() {
+        // #3080's design call: the old code accepted unquoted candidates via
+        // trim_matches('"'); the fix keeps that leniency, only the comma
+        // splitting became quote-aware.
+        let etag = ETag::strong("abc");
+        assert!(etag.matches_if_none_match("abc"));
+        assert!(etag.matches_if_none_match(r#""abc", def"#));
+    }
+
+    #[test]
+    fn split_entity_tag_list_respects_quotes() {
+        assert_eq!(split_entity_tag_list(r#""a,b""#), vec![r#""a,b""#]);
+        assert_eq!(
+            split_entity_tag_list(r#""x", "a,b", W/"c,d""#),
+            vec![r#""x""#, r#" "a,b""#, r#" W/"c,d""#]
+        );
+        // Unterminated quote runs to the end, like the old split.
+        assert_eq!(split_entity_tag_list(r#""abc"#), vec![r#""abc"#]);
+        // No quotes at all behaves exactly like the old split(',').
+        assert_eq!(split_entity_tag_list("a,b,c"), vec!["a", "b", "c"]);
     }
 
     // ── RED: fresh_when core behaviour ───────────────────────────────────────
