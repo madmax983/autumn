@@ -46,6 +46,22 @@ ignore = [
     # wasm output is rebuilt — that rebuild is the natural point to check
     # whether bincode-referencing symbols actually survive into the binary.
     { id = "RUSTSEC-2025-0141", reason = "bincode unmaintained (governance, not a CVE); arrives via yew's own prokio/gloo-worker plumbing, not island-flock's source; reachability in the shipped wasm undetermined (not confirmed dead-code-eliminated); no safe upgrade; review-by 2026-10-01" },
+    # RUSTSEC-2026-0319 — anymap2 0.13.0 is unmaintained (`anymap3` is the
+    # advisory's suggested replacement; no CVE, no known exploit). The
+    # dependency is gloo-worker's own plumbing: `cargo tree -i anymap2`
+    # roots at `gloo-worker` 0.2.1, which island-flock's own source never
+    # references directly — it arrives solely through yew's internal
+    # `prokio`/`gloo` runtime plumbing, the same chain RUSTSEC-2025-0141's
+    # `bincode` arrived through, one link further down. REACHABILITY
+    # UNDETERMINED, not confirmed unreachable: whether that plumbing is
+    # dead-code-eliminated from the actual compiled
+    # `autumn_island_flock_bg.wasm` was not verified this pass (would need a
+    # symbol-table inspection of the built artifact) — same caveat as the
+    # bincode entry above. No safe upgrade exists per the advisory.
+    # Review-by: 2026-10-01, or the next time this crate's wasm output is
+    # rebuilt — that rebuild is the natural point to check whether
+    # anymap2-referencing symbols actually survive into the binary.
+    { id = "RUSTSEC-2026-0319", reason = "anymap2 unmaintained (anymap3 is the suggested replacement, no CVE); arrives via yew's own prokio/gloo-worker plumbing, not island-flock's source; reachability in the shipped wasm undetermined (not confirmed dead-code-eliminated); no safe upgrade; review-by 2026-10-01" },
 ]
 
 [sources]
