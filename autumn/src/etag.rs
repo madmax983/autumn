@@ -153,12 +153,22 @@ impl ETag {
     ///
     /// `*` matches any `ETag`. Both strong and weak `ETag`s are compared by
     /// their opaque tag string.
+    ///
+    /// The header is a comma-separated list, but a comma is legal *inside* a
+    /// quoted entity-tag (RFC 9110 §8.8.3), so the list is split on commas
+    /// outside quoted strings rather than on every comma — otherwise a
+    /// server-issued `ETag` like `"a,b"` would never match its own echo
+    /// (never-304), and `"a"` would falsely match `"a,b"` (false 304).
+    ///
+    /// Candidates are still accepted leniently: an unquoted tag (e.g. `abc`
+    /// instead of `"abc"`) matches, as does a tag with unbalanced quotes;
+    /// only the *splitting* is quote-aware.
     fn matches_if_none_match(&self, if_none_match: &str) -> bool {
         let if_none_match = if_none_match.trim();
         if if_none_match == "*" {
             return true;
         }
-        for candidate in if_none_match.split(',') {
+        for candidate in split_entity_tag_list(if_none_match) {
             let candidate = candidate.trim();
             // Strip W/ prefix then quotes for weak comparison.
             let tag = candidate
@@ -171,6 +181,32 @@ impl ETag {
         }
         false
     }
+}
+
+/// Split an `If-None-Match` header value into candidate entity-tags on
+/// commas *outside* quoted strings.
+///
+/// RFC 9110 §13.1.2 defines `If-None-Match = 1#entity-tag`: the `#` list
+/// separator is the comma that is not part of any quoted string. RFC 9110
+/// §8.8.3's `etagc` permits any visible character except `"` inside an
+/// opaque tag, so a comma is legal there and any `"` toggles quoted state —
+/// no escape handling is needed (an opaque tag cannot contain `DQUOTE`).
+fn split_entity_tag_list(header_value: &str) -> impl Iterator<Item = &str> {
+    let mut in_quotes = false;
+    let mut start = 0;
+    let mut spans = Vec::new();
+    for (i, c) in header_value.char_indices() {
+        match c {
+            '"' => in_quotes = !in_quotes,
+            ',' if !in_quotes => {
+                spans.push(&header_value[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    spans.push(&header_value[start..]);
+    spans.into_iter()
 }
 
 // ── IntoETag trait ────────────────────────────────────────────────────────────
@@ -1235,6 +1271,49 @@ mod tests {
     fn etag_matches_one_of_many_in_list() {
         let etag = ETag::strong("abc");
         assert!(etag.matches_if_none_match(r#""xyz", "abc", "foo""#));
+    }
+
+    // ── RED: If-None-Match is split quote-aware (issue #3080) ───────────────
+
+    #[test]
+    fn etag_with_comma_in_tag_matches_its_own_header_value() {
+        // Repro from the issue: the server's own ETag echoed back.
+        let etag = ETag::strong("a,b");
+        let hv = etag.header_value();
+        assert!(etag.matches_if_none_match(hv.to_str().unwrap()));
+        assert!(etag.matches_if_none_match(r#""a,b""#));
+    }
+
+    #[test]
+    fn etag_does_not_false_match_a_prefix_before_a_comma() {
+        // The stale-304 half of the issue: "a" must not match "a,b".
+        let etag = ETag::strong("a");
+        assert!(!etag.matches_if_none_match(r#""a,b""#));
+    }
+
+    #[test]
+    fn etag_matches_comma_tag_later_in_a_list() {
+        let etag = ETag::strong("b");
+        assert!(etag.matches_if_none_match(r#""a,x", "b", "c,y""#));
+    }
+
+    #[test]
+    fn etag_matches_weak_variant_with_comma_in_tag() {
+        let etag = ETag::strong("a,b");
+        assert!(etag.matches_if_none_match(r#"W/"a,b""#));
+    }
+
+    #[test]
+    fn split_entity_tag_list_keeps_quoted_commas_inside_candidates() {
+        let parts: Vec<&str> = split_entity_tag_list(r#""a", "b,c" ,W/"d,e""#).collect();
+        assert_eq!(parts, vec![r#""a""#, r#" "b,c" "#, r#"W/"d,e""#]);
+    }
+
+    #[test]
+    fn etag_still_matches_lenient_unquoted_candidate() {
+        // The unquoted leniency predates this fix; only the splitting changed.
+        let etag = ETag::strong("abc");
+        assert!(etag.matches_if_none_match("abc"));
     }
 
     // ── RED: fresh_when core behaviour ───────────────────────────────────────
