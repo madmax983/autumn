@@ -385,7 +385,11 @@ pub fn read_project_name(dir: &Path) -> Result<String, ReleaseError> {
 /// directory, so this checks existence generally rather than requiring a
 /// directory. Returns `None` if no ancestor up to the filesystem root has
 /// one (`dir` isn't inside a git repository at all).
-fn find_git_root(dir: &Path) -> Option<PathBuf> {
+///
+/// `pub(crate)` for `upgrade::scaffold`, which answers workflow-file
+/// ownership from the git root rather than from Cargo ancestry (#2344).
+#[allow(clippy::redundant_pub_crate)] // `mod release` is private; `pub` would read as more public than it is
+pub(crate) fn find_git_root(dir: &Path) -> Option<PathBuf> {
     let mut current = dir;
     loop {
         if current.join(".git").exists() {

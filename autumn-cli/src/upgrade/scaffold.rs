@@ -505,14 +505,20 @@ pub fn resolve_options(root: &Path, manifest: Option<&Manifest>) -> GenerateOpti
 /// `clippy.toml`, `rustfmt.toml` and `rust-toolchain.toml` are all resolved
 /// from the *nearest ancestor* of the crate being built, so a crate-local copy
 /// does not add to the workspace's — it **shadows** it, silently dropping its
-/// lints and its MSRV pin with no diagnostic. GitHub only runs workflows from
-/// the repository root, so a member's `.github/workflows/ci.yml` never runs at
-/// all. Seeding any of them into a workspace member is not an upgrade; it is a
-/// regression that looks like one.
-const WORKSPACE_ROOT_OWNED: &[&str] = &[
-    "clippy.toml",
-    "rustfmt.toml",
-    "rust-toolchain.toml",
+/// lints and its MSRV pin with no diagnostic. Seeding any of them into a
+/// workspace member is not an upgrade; it is a regression that looks like one.
+const CARGO_ROOT_OWNED: &[&str] = &["clippy.toml", "rustfmt.toml", "rust-toolchain.toml"];
+
+/// Files that GitHub Actions discovers from the repository root, never from
+/// an arbitrary subdirectory.
+///
+/// Workflow ownership follows the **git root**, not Cargo ancestry: a crate
+/// that is its own git repository (a nested repo or submodule beneath an
+/// enclosing Cargo workspace) owns its workflows even though the workspace
+/// owns its Cargo-resolved config above. A crate that merely sits inside the
+/// enclosing repository does not — its `.github/workflows/ci.yml` would never
+/// run. (Issue #2344.)
+const GIT_ROOT_OWNED: &[&str] = &[
     ".github/workflows/ci.yml",
     ".github/workflows/posture-gate.yml",
 ];
@@ -549,6 +555,22 @@ fn declares_workspace(directory: &Path) -> bool {
         .is_some_and(|table| table.contains_key("workspace"))
 }
 
+/// Whether the project at `root` owns its GitHub workflow files.
+///
+/// GitHub Actions discovers workflows from the repository root, never from an
+/// arbitrary subdirectory — so this is answered from the git root, not Cargo
+/// ancestry. A crate that is its own git repository (a nested repo or
+/// submodule beneath an enclosing Cargo workspace) owns its workflows even
+/// though the workspace owns its Cargo-resolved config; a crate that merely
+/// sits inside the enclosing repository does not, and neither does a project
+/// with no git root at all (a workflow there could never run).
+fn owns_workflows(root: &Path) -> bool {
+    let canonical_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    crate::release::find_git_root(root)
+        .and_then(|git_root| git_root.canonicalize().ok())
+        .is_some_and(|git_root| git_root == canonical_root)
+}
+
 /// The current release's framework-owned files, rendered for the project at
 /// `root`, or `None` when the project's name cannot be established.
 #[must_use]
@@ -566,7 +588,18 @@ pub fn current_files(
     };
     let mut files = framework_owned_files(&vars, options);
     if workspace_root_above(root).is_some() {
-        for path in WORKSPACE_ROOT_OWNED {
+        for path in CARGO_ROOT_OWNED {
+            files.remove(path);
+        }
+    }
+    // GitHub Actions discovers workflows from the repository root, never from
+    // an arbitrary subdirectory — so workflow ownership follows the git root,
+    // not Cargo ancestry. A workspace member that is its own git repository
+    // (a nested repo or submodule) owns its workflows; a member that merely
+    // sits inside the enclosing repository does not, and neither does a
+    // project with no git root to be (its workflow could never run).
+    if !owns_workflows(root) {
+        for path in GIT_ROOT_OWNED {
             files.remove(path);
         }
     }
@@ -755,6 +788,7 @@ pub fn release_guide(target: &str) -> String {
 
 /// Everything one scaffold reconciliation found.
 #[derive(Debug, Clone)]
+#[allow(clippy::struct_excessive_bools)] // independent report flags, not a state machine
 pub struct ScaffoldReport {
     /// The project this report is about.
     pub root: PathBuf,
@@ -783,6 +817,10 @@ pub struct ScaffoldReport {
     /// Whether this project is a crate inside an enclosing Cargo workspace, in
     /// which case the files that workspace owns at its root are out of scope.
     pub workspace_member: bool,
+    /// Whether the CI workflow files were left out of this run because the
+    /// project is not the git root (see [`owns_workflows`]). The "out of
+    /// scope" note names exactly the files that are out of scope.
+    pub workflows_out_of_scope: bool,
     /// Every framework-owned file, up-to-date ones included.
     pub entries: Vec<Entry>,
     /// What the apply step actually did.
@@ -965,6 +1003,7 @@ pub fn plan_after(root: &Path, _target: &str, migrated: &BTreeSet<String>) -> Sc
         named: scaffolded_by_newer.is_some() || files.is_some(),
         scaffolded_by_newer,
         workspace_member: workspace_root_above(root).is_some(),
+        workflows_out_of_scope: !owns_workflows(root),
         entries: files
             .map(|files| classify(root, &files, manifest.as_ref(), migrated))
             .unwrap_or_default(),
@@ -1422,13 +1461,28 @@ fn render(report: &ScaffoldReport, diffs: bool) -> String {
         );
     }
     if report.workspace_member {
-        let _ = writeln!(
-            out,
-            "  This crate sits inside a Cargo workspace, so the files that workspace owns\n  \
-             at its root — clippy.toml, rustfmt.toml, rust-toolchain.toml and the CI\n  \
-             workflow — are out of scope here: a crate-local copy would shadow the\n  \
-             workspace's, not add to it. Reconcile those at the workspace root."
-        );
+        // The note names exactly the files this run left out: a member that
+        // is its own git repository (nested repo, submodule) still owns its
+        // CI workflow — GitHub discovers workflows from the repository root,
+        // not from the Cargo workspace root.
+        if report.workflows_out_of_scope {
+            let _ = writeln!(
+                out,
+                "  This crate sits inside a Cargo workspace, so the files that workspace owns\n  \
+                 at its root — clippy.toml, rustfmt.toml, rust-toolchain.toml and the CI\n  \
+                 workflow — are out of scope here: a crate-local copy would shadow the\n  \
+                 workspace's, not add to it. Reconcile those at the workspace root."
+            );
+        } else {
+            let _ = writeln!(
+                out,
+                "  This crate sits inside a Cargo workspace, so clippy.toml, rustfmt.toml\n  \
+                 and rust-toolchain.toml are out of scope here: a crate-local copy would\n  \
+                 shadow the workspace's, not add to it. Reconcile those at the workspace\n  \
+                 root. The CI workflow stays in scope — this crate is its own git\n  \
+                 repository, and GitHub discovers workflows from the repository root."
+            );
+        }
     }
 
     let changed = report.changed();
@@ -1560,6 +1614,7 @@ pub fn json(report: &ScaffoldReport) -> serde_json::Value {
         "outcome": report.outcome.label(),
         "drift": report.drifted(),
         "workspace_member": report.workspace_member,
+        "workflows_out_of_scope": report.workflows_out_of_scope,
         // The plan, and the part of it that reached disk — the same split the
         // app-code report draws, for the same reason: "what would this do" and
         // "what is on disk now" are different questions, and a gate that reads
@@ -1698,7 +1753,17 @@ mod tests {
 
     /// A project whose framework-owned files are exactly the current scaffold.
     fn scaffolded(opts: GenerateOptions) -> TempDir {
+        scaffolded_with_git(opts, false)
+    }
+
+    /// Like [`scaffolded`], but inside a git repository, so the project owns
+    /// its workflow files (see [`owns_workflows`]). Tests that manipulate
+    /// `.github/` itself need the workflows in the plan at all.
+    fn scaffolded_with_git(opts: GenerateOptions, git: bool) -> TempDir {
         let tmp = TempDir::new().unwrap();
+        if git {
+            fs::create_dir_all(tmp.path().join(".git")).unwrap();
+        }
         write(
             tmp.path(),
             "Cargo.toml",
@@ -1987,7 +2052,7 @@ mod tests {
 
     #[test]
     fn apply_creates_missing_parent_directories() {
-        let tmp = scaffolded(GenerateOptions::default());
+        let tmp = scaffolded_with_git(GenerateOptions::default(), true);
         fs::remove_dir_all(tmp.path().join(".github")).unwrap();
         let mut manifest = Manifest::load(tmp.path()).unwrap();
         manifest.digests.remove(".github/workflows/ci.yml");
@@ -2306,7 +2371,7 @@ mod tests {
         // Checking only the leaf is not enough: `.github` symlinked to a shared
         // workflows tree lets `--apply` create a file outside the project
         // entirely, which the project's own `git status` would never show.
-        let tmp = scaffolded(GenerateOptions::default());
+        let tmp = scaffolded_with_git(GenerateOptions::default(), true);
         let outside = tmp.path().join("outside-workflows");
         fs::create_dir_all(&outside).unwrap();
         fs::remove_dir_all(tmp.path().join(".github")).unwrap();
@@ -2434,6 +2499,110 @@ mod tests {
         assert!(offered.contains(&"build.rs"), "{offered:?}");
         assert!(
             render_text(&report).contains("workspace"),
+            "{}",
+            render_text(&report)
+        );
+    }
+
+    /// Issue #2344: workflow ownership follows the git root, not Cargo
+    /// ancestry. A member that is its own git repository (nested repo,
+    /// submodule) owns its workflows even though the workspace owns its
+    /// Cargo-resolved config.
+    #[test]
+    fn a_nested_git_repo_inside_a_workspace_owns_its_workflows() {
+        let outer = TempDir::new().unwrap();
+        // The enclosing repository: a Cargo workspace that is also a git repo.
+        fs::create_dir_all(outer.path().join(".git")).unwrap();
+        fs::write(
+            outer.path().join("Cargo.toml"),
+            "[workspace]\nmembers = [\"app\"]\nresolver = \"3\"\n",
+        )
+        .unwrap();
+        // The member is its own git repository (nested repo / submodule).
+        let root = outer.path().join("app");
+        fs::create_dir_all(root.join(".git")).unwrap();
+        write(
+            &root,
+            "Cargo.toml",
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n",
+        );
+        write(&root, "autumn.toml", "[server]\n");
+
+        let report = plan(&root, "0.7.0");
+        assert!(report.workspace_member, "still a Cargo workspace member");
+        assert!(
+            !report.workflows_out_of_scope,
+            "its own git root owns its workflows"
+        );
+        let offered: Vec<&str> = report.entries.iter().map(|e| e.path.as_str()).collect();
+        // The Cargo-resolved config still belongs to the workspace root.
+        for cargo_owned in ["clippy.toml", "rustfmt.toml", "rust-toolchain.toml"] {
+            assert!(
+                !offered.contains(&cargo_owned),
+                "{cargo_owned} in {offered:?}"
+            );
+        }
+        // ...but the workflows are live: GitHub discovers them from this
+        // crate's own repository root.
+        for workflow in [
+            ".github/workflows/ci.yml",
+            ".github/workflows/posture-gate.yml",
+        ] {
+            assert!(
+                offered.contains(&workflow),
+                "{workflow} missing from {offered:?}"
+            );
+        }
+        assert!(
+            render_text(&report).contains("stays in scope"),
+            "{}",
+            render_text(&report)
+        );
+    }
+
+    /// Issue #2344: a plain member of the enclosing repository owns neither
+    /// the Cargo-resolved config nor the workflows.
+    #[test]
+    fn a_plain_member_of_the_enclosing_repo_owns_no_root_files() {
+        let outer = TempDir::new().unwrap();
+        // The enclosing repository owns both the workspace and the git root.
+        fs::create_dir_all(outer.path().join(".git")).unwrap();
+        fs::write(
+            outer.path().join("Cargo.toml"),
+            "[workspace]\nmembers = [\"app\"]\nresolver = \"3\"\n",
+        )
+        .unwrap();
+        // The member has no `.git` of its own.
+        let root = outer.path().join("app");
+        fs::create_dir_all(&root).unwrap();
+        write(
+            &root,
+            "Cargo.toml",
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n",
+        );
+        write(&root, "autumn.toml", "[server]\n");
+
+        let report = plan(&root, "0.7.0");
+        assert!(report.workspace_member, "a Cargo workspace member");
+        assert!(
+            report.workflows_out_of_scope,
+            "the enclosing repository owns the workflows"
+        );
+        let offered: Vec<&str> = report.entries.iter().map(|e| e.path.as_str()).collect();
+        for root_owned in [
+            "clippy.toml",
+            "rustfmt.toml",
+            "rust-toolchain.toml",
+            ".github/workflows/ci.yml",
+            ".github/workflows/posture-gate.yml",
+        ] {
+            assert!(
+                !offered.contains(&root_owned),
+                "{root_owned} in {offered:?}"
+            );
+        }
+        assert!(
+            render_text(&report).contains("are out of scope here"),
             "{}",
             render_text(&report)
         );
