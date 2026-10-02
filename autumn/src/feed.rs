@@ -38,7 +38,7 @@
 use std::fmt::Write as _;
 
 use axum::response::{IntoResponse, Response};
-use chrono::{DateTime, SecondsFormat, Utc};
+use chrono::{DateTime, Datelike, SecondsFormat, TimeZone, Utc};
 use http::header::CONTENT_TYPE;
 
 use crate::etag::{ETag, fresh_when, hash_etag};
@@ -409,11 +409,35 @@ const fn fallback_timestamp() -> DateTime<Utc> {
 }
 
 fn rfc3339(dt: DateTime<Utc>) -> String {
-    dt.to_rfc3339_opts(SecondsFormat::Secs, true)
+    clamp_feed_year(dt).to_rfc3339_opts(SecondsFormat::Secs, true)
 }
 
 fn rfc2822(dt: DateTime<Utc>) -> String {
-    dt.to_rfc2822()
+    clamp_feed_year(dt).to_rfc2822()
+}
+
+/// Saturate a timestamp into the year range both feed date formats can
+/// represent. RFC 2822's `pubDate` and RFC 3339's `date-construct` (Atom
+/// `<updated>`/`<published>`) both describe a 4-digit `full-year`, so a
+/// `DateTime` outside years 0..=9999 — reachable whenever an app feeds
+/// DB-editable timestamps into `FeedEntry::published`/`updated` or
+/// `Feed::updated` (HTML date inputs accept years up to 275760) — cannot be
+/// rendered validly: chrono's `to_rfc2822` panics and `to_rfc3339` emits the
+/// non-conforming expanded form (`+10000-…`). Saturating at the representable
+/// bound keeps every date present (Atom requires `<updated>` on every entry)
+/// and the whole feed rendering instead of one bad entry taking the endpoint
+/// down with a panic or strict readers rejecting an invalid document.
+fn clamp_feed_year(dt: DateTime<Utc>) -> DateTime<Utc> {
+    match dt.year() {
+        y if y < 0 => dt
+            .with_year(0)
+            .expect("year 0 is within chrono's representable range"),
+        y if y > 9999 => Utc
+            .with_ymd_and_hms(9999, 12, 31, 23, 59, 59)
+            .single()
+            .expect("9999-12-31T23:59:59Z is a valid timestamp"),
+        _ => dt,
+    }
 }
 
 /// XML-escape a text value: `&`, `<`, `>`, `"`, `'`. Characters outside the
@@ -528,6 +552,81 @@ mod proptests {
         // U+FFFE is dropped by `is_xml_char`; the fast path must route any
         // non-ASCII input to the full per-char path so this still happens.
         assert_eq!(escape("café\u{FFFE}!"), "café!");
+    }
+
+    #[test]
+    fn feed_year_clamp_saturates_years_below_zero() {
+        // Year -1 (reachable from an HTML date input or a DB edit) clamps to
+        // the earliest representable date instead of panicking `to_rfc2822`
+        // or emitting the non-RFC-3339 `-0001-…` form.
+        let d = Utc.with_ymd_and_hms(-1, 1, 1, 0, 0, 0).unwrap();
+        let clamped = clamp_feed_year(d);
+        assert_eq!(
+            clamped.to_rfc3339_opts(SecondsFormat::Secs, true),
+            "0000-01-01T00:00:00Z"
+        );
+        assert_eq!(rfc3339(d), "0000-01-01T00:00:00Z");
+        assert_eq!(rfc2822(d), "Sat, 1 Jan 0000 00:00:00 +0000");
+    }
+
+    #[test]
+    fn feed_year_clamp_saturates_years_above_9999() {
+        // Year 10000 (and the chrono extreme) clamps to the latest
+        // representable date instead of panicking or emitting `+10000-…`.
+        for year in [10000, 262000] {
+            let d = Utc.with_ymd_and_hms(year, 1, 1, 0, 0, 0).unwrap();
+            assert_eq!(rfc3339(d), "9999-12-31T23:59:59Z");
+            assert_eq!(rfc2822(d), "Fri, 31 Dec 9999 23:59:59 +0000");
+        }
+    }
+
+    #[test]
+    fn feed_year_clamp_leaves_in_range_dates_alone() {
+        // Boundary years and ordinary dates render byte-identically to chrono.
+        for (y, m, day) in [(0, 1, 1), (999, 6, 15), (2026, 5, 31), (9999, 12, 31)] {
+            let d = Utc.with_ymd_and_hms(y, m, day, 12, 0, 0).unwrap();
+            assert_eq!(clamp_feed_year(d), d);
+            assert_eq!(rfc3339(d), d.to_rfc3339_opts(SecondsFormat::Secs, true));
+            assert_eq!(rfc2822(d), d.to_rfc2822());
+        }
+    }
+
+    #[test]
+    fn rss_render_saturates_an_out_of_range_entry_date() {
+        // The issue's repro: this panicked at `to_rfc2822` before the fix.
+        // One bad entry must not take the whole feed endpoint down.
+        let d = Utc.with_ymd_and_hms(10000, 1, 1, 0, 0, 0).unwrap();
+        let out = Feed::rss("t", "https://example.com/", "https://example.com/feed.xml")
+            .entry(FeedEntry::new("i", "t", "https://example.com/1").published(d))
+            .render();
+        assert!(out.contains("<pubDate>Fri, 31 Dec 9999 23:59:59 +0000</pubDate>"));
+        assert!(!out.contains("10000"));
+
+        let neg = Utc.with_ymd_and_hms(-1, 1, 1, 0, 0, 0).unwrap();
+        let out = Feed::rss("t", "https://example.com/", "https://example.com/feed.xml")
+            .updated(neg)
+            .render();
+        assert!(out.contains("<lastBuildDate>Sat, 1 Jan 0000 00:00:00 +0000</lastBuildDate>"));
+    }
+
+    #[test]
+    fn atom_render_emits_strict_rfc3339_for_out_of_range_entry_date() {
+        // Before the fix this emitted `+10000-01-01T00:00:00Z`, which RFC 3339
+        // §5.6 forbids (`full-year` is exactly 4 digits) — strict Atom parsers
+        // reject the whole feed.
+        let d = Utc.with_ymd_and_hms(10000, 1, 1, 0, 0, 0).unwrap();
+        let out = Feed::atom("t", "https://example.com/", "https://example.com/feed.xml")
+            .entry(FeedEntry::new("i", "t", "https://example.com/1").published(d))
+            .render();
+        assert!(out.contains("<published>9999-12-31T23:59:59Z</published>"));
+        assert!(!out.contains("+10000"));
+
+        let neg = Utc.with_ymd_and_hms(-1, 1, 1, 0, 0, 0).unwrap();
+        let out = Feed::atom("t", "https://example.com/", "https://example.com/feed.xml")
+            .updated(neg)
+            .render();
+        assert!(out.contains("<updated>0000-01-01T00:00:00Z</updated>"));
+        assert!(!out.contains("-0001"));
     }
 
     proptest! {
