@@ -122,7 +122,7 @@ pub const FIRST_PARTY: &[CatalogEntry] = &[
             "billing_customers",
         ],
         config_keys: &[
-            "[[security.webhooks.endpoints]]\nname = \"billing\"\npath = \"/billing/webhook\"\nprovider = \"stripe\"\nsecret_env = \"STRIPE_WEBHOOK_SECRET\"",
+            "[[security.webhooks.endpoints]]\nname = \"billing\"\npath = \"/billing/webhook\"\nprovider = \"stripe\"\nsecret_env = \"STRIPE_WEBHOOK_SECRET\"\nmax_body_bytes = 4194304",
             "[billing]\nsuccess_url = \"/billing/success\"\ncancel_url = \"/billing/cancel\"",
         ],
         post_install: &[
@@ -570,5 +570,48 @@ mod tests {
             "{snippet}"
         );
         assert!(community_mount_snippet("autumn-plugin-").is_none());
+    }
+
+    /// The `autumn plugin add autumn-billing` catalog entry writes the webhook
+    /// declaration into the app's `autumn.toml`. It must carry the billing
+    /// body minimum (issue #3100): the pasted entry would otherwise boot at
+    /// the 1 MiB default and boot would refuse it.
+    #[test]
+    fn billing_catalog_entry_meets_the_webhook_body_minimum() {
+        use autumn_web::webhook::WebhookEndpointConfig;
+        use serde::Deserialize;
+
+        #[derive(Deserialize)]
+        struct SecurityWebhooksDoc {
+            security: SecurityDoc,
+        }
+        #[derive(Deserialize)]
+        struct SecurityDoc {
+            webhooks: WebhooksDoc,
+        }
+        #[derive(Deserialize)]
+        struct WebhooksDoc {
+            endpoints: Vec<WebhookEndpointConfig>,
+        }
+
+        let entry = lookup("autumn-billing").expect("billing catalog entry");
+        let snippet = entry
+            .config_keys
+            .iter()
+            .find(|key| key.contains("[[security.webhooks.endpoints]]"))
+            .expect("the billing entry declares the webhook endpoint");
+        let doc: SecurityWebhooksDoc =
+            toml::from_str(snippet).expect("the catalog snippet parses as TOML");
+        let endpoint = doc
+            .security
+            .webhooks
+            .endpoints
+            .first()
+            .expect("the snippet declares an endpoint");
+        assert!(
+            endpoint.max_body_bytes >= 4 * 1024 * 1024,
+            "catalog snippet allows {} bytes, below the billing minimum",
+            endpoint.max_body_bytes
+        );
     }
 }

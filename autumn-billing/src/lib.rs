@@ -99,7 +99,10 @@ use std::sync::Arc;
 use autumn_web::app::AppBuilder;
 use autumn_web::plugin::Plugin;
 use autumn_web::plugin_contract::PluginContract;
+use autumn_web::webhook::WebhookEndpointConfig;
 use autumn_web::{AppState, AutumnError};
+
+use crate::config::WEBHOOK_MAX_BODY_BYTES;
 
 /// How long a ledger claim in `processing` blocks redelivery before it is
 /// treated as abandoned.
@@ -383,8 +386,9 @@ fn check_memory_store(is_production: bool, config: &BillingConfig) -> Result<(),
     Ok(())
 }
 
-/// Fail boot when the app did not declare the webhook receiver, or declared
-/// it with another verification preset than `provider` needs.
+/// Fail boot when the app did not declare the webhook receiver, declared it
+/// with another verification preset than `provider` needs, or capped its body
+/// below the billing minimum (issue #3100).
 fn verify_webhook_endpoint(
     state: &AppState,
     config: &BillingConfig,
@@ -394,7 +398,6 @@ fn verify_webhook_endpoint(
     let expected = provider
         .webhook_endpoint(&config.endpoint_name, &path)
         .map_err(BillingError::into_autumn)?;
-    let preset = expected.provider.as_str();
     let config_arc = state.config_arc();
     let declared = config_arc
         .security
@@ -402,24 +405,51 @@ fn verify_webhook_endpoint(
         .endpoints
         .iter()
         .find(|endpoint| endpoint.path == path);
+    check_declared_webhook_endpoint(declared, &expected, &config.endpoint_name, provider.name())
+}
+
+/// The `[[security.webhooks.endpoints]]` declaration check, factored out of
+/// the `AppState` plumbing so boot's verdict is unit-testable.
+fn check_declared_webhook_endpoint(
+    declared: Option<&WebhookEndpointConfig>,
+    expected: &WebhookEndpointConfig,
+    endpoint_name: &str,
+    provider_name: &str,
+) -> Result<(), AutumnError> {
+    let path = &expected.path;
+    let preset = expected.provider.as_str();
     match declared {
-        Some(endpoint) if endpoint.provider == expected.provider => Ok(()),
+        Some(endpoint) if endpoint.provider == expected.provider => {
+            if endpoint.max_body_bytes < WEBHOOK_MAX_BODY_BYTES {
+                return Err(AutumnError::internal_server_error_msg(format!(
+                    "autumn-billing: the signed webhook endpoint at {path} declares \
+                     max_body_bytes = {}, but the {provider_name} billing webhook needs \
+                     at least max_body_bytes = {WEBHOOK_MAX_BODY_BYTES} (invoices with \
+                     many lines exceed the 1 MiB default; a body over the limit becomes \
+                     a 400 the provider retries unchanged, so the event never reaches \
+                     reconciliation). Add `max_body_bytes = {WEBHOOK_MAX_BODY_BYTES}` \
+                     to the [[security.webhooks.endpoints]] entry in autumn.toml.",
+                    endpoint.max_body_bytes
+                )));
+            }
+            Ok(())
+        }
         Some(endpoint) => Err(AutumnError::internal_server_error_msg(format!(
             "autumn-billing: the signed webhook endpoint at {path} declares provider = \"{}\", \
              but the {} billing provider needs provider = \"{preset}\". Fix the \
              [[security.webhooks.endpoints]] entry in autumn.toml.",
             endpoint.provider.as_str(),
-            provider.name()
+            provider_name
         ))),
         None => Err(AutumnError::internal_server_error_msg(format!(
             "autumn-billing: no signed webhook endpoint is declared at {path}. Add to autumn.toml:\n\
              [[security.webhooks.endpoints]]\n\
-             name = \"{}\"\n\
+             name = \"{endpoint_name}\"\n\
              path = \"{path}\"\n\
              provider = \"{preset}\"\n\
-             secret_env = \"{}_WEBHOOK_SECRET\"",
-            config.endpoint_name,
-            provider.name().to_uppercase()
+             secret_env = \"{}_WEBHOOK_SECRET\"\n\
+             max_body_bytes = {WEBHOOK_MAX_BODY_BYTES}",
+            provider_name.to_uppercase()
         ))),
     }
 }
@@ -607,5 +637,112 @@ mod contract_tests {
             Some(autumn_web::plugin_contract::lockstep_range(env!("CARGO_PKG_VERSION")).as_str())
         );
         assert!(contract.experimental_surfaces.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod webhook_endpoint_verification_tests {
+    use serde::Deserialize;
+    use std::path::PathBuf;
+
+    use super::{WEBHOOK_MAX_BODY_BYTES, WebhookEndpointConfig, check_declared_webhook_endpoint};
+
+    /// A declared entry whose body cap sits below the billing minimum must
+    /// fail boot, and the error must name both the declared and the required
+    /// byte counts (issue #3100: it previously booted and 400'd every large
+    /// invoice event).
+    #[test]
+    fn boot_fails_for_a_declared_limit_below_the_minimum() {
+        let expected = WebhookEndpointConfig::stripe("billing", "/billing/webhook", "whsec_x");
+        let mut declared = expected.clone();
+        declared.max_body_bytes = 1024 * 1024;
+        let err = check_declared_webhook_endpoint(Some(&declared), &expected, "billing", "stripe")
+            .expect_err("a 1 MiB declared limit must fail boot");
+        let message = err.to_string();
+        assert!(
+            message.contains("1048576"),
+            "error names the declared limit: {message}"
+        );
+        assert!(
+            message.contains("4194304"),
+            "error names the required limit: {message}"
+        );
+    }
+
+    /// A larger limit is the app's call; boot must not refuse it.
+    #[test]
+    fn boot_accepts_a_larger_declared_limit() {
+        let expected = WebhookEndpointConfig::stripe("billing", "/billing/webhook", "whsec_x");
+        let mut declared = expected.clone();
+        declared.max_body_bytes = 16 * 1024 * 1024;
+        check_declared_webhook_endpoint(Some(&declared), &expected, "billing", "stripe")
+            .expect("a larger limit is accepted");
+    }
+
+    /// The "no endpoint declared" error prints a snippet to paste; it must
+    /// carry the body limit, or the pasted entry boots at the 1 MiB default.
+    #[test]
+    fn undeclared_endpoint_snippet_carries_the_body_limit() {
+        let expected = WebhookEndpointConfig::stripe("billing", "/billing/webhook", "whsec_x");
+        let err = check_declared_webhook_endpoint(None, &expected, "billing", "stripe")
+            .expect_err("a missing endpoint must fail boot");
+        let message = err.to_string();
+        assert!(
+            message.contains("max_body_bytes = 4194304"),
+            "the printed snippet carries the limit: {message}"
+        );
+    }
+
+    /// The `[[security.webhooks.endpoints]]` table the billing guide shows,
+    /// parsed exactly as an app's `autumn.toml` would parse it.
+    #[derive(Deserialize)]
+    struct SecurityWebhooksDoc {
+        security: SecurityDoc,
+    }
+    #[derive(Deserialize)]
+    struct SecurityDoc {
+        webhooks: WebhooksDoc,
+    }
+    #[derive(Deserialize)]
+    struct WebhooksDoc {
+        endpoints: Vec<WebhookEndpointConfig>,
+    }
+
+    /// The billing guide's webhook snippet must meet the minimum when parsed
+    /// as TOML; the 1 MiB `#[serde(default)]` would read `1048576` otherwise.
+    #[test]
+    fn guide_snippet_meets_the_body_minimum() {
+        let guide = workspace_guide("docs/guide/billing.md");
+        let snippet = toml_code_block(&guide, "[[security.webhooks.endpoints]]")
+            .expect("the guide shows a [[security.webhooks.endpoints]] snippet");
+        let doc: SecurityWebhooksDoc =
+            toml::from_str(&snippet).expect("the guide snippet parses as TOML");
+        let endpoint = doc
+            .security
+            .webhooks
+            .endpoints
+            .first()
+            .expect("the snippet declares an endpoint");
+        assert!(
+            endpoint.max_body_bytes >= WEBHOOK_MAX_BODY_BYTES,
+            "guide snippet allows {} bytes, below the {WEBHOOK_MAX_BODY_BYTES} minimum",
+            endpoint.max_body_bytes
+        );
+    }
+
+    fn workspace_guide(relative: &str) -> String {
+        let path: PathBuf = [env!("CARGO_MANIFEST_DIR"), "..", relative]
+            .iter()
+            .collect();
+        std::fs::read_to_string(&path).unwrap_or_else(|_| panic!("read {}", path.display()))
+    }
+
+    /// The first ```toml block in `text` containing `marker`.
+    fn toml_code_block(text: &str, marker: &str) -> Option<String> {
+        let mut blocks = text.split("```toml").skip(1);
+        blocks
+            .by_ref()
+            .map(|block| block.split("```").next().unwrap_or("").to_owned())
+            .find(|block| block.contains(marker))
     }
 }

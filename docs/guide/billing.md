@@ -35,7 +35,13 @@ name = "billing"
 path = "/billing/webhook"
 provider = "stripe"
 secret_env = "STRIPE_WEBHOOK_SECRET"
+max_body_bytes = 4194304
 ```
+
+The 4 MiB limit is not optional: invoices with many lines exceed the 1 MiB
+framework default, and a body over the declared limit becomes a 400 that
+Stripe retries unchanged, so the event never reaches reconciliation. Boot
+fails if the declared endpoint allows less.
 
 Boot fails with this exact snippet when the endpoint is missing.
 

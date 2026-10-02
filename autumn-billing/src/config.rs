@@ -32,6 +32,14 @@ pub const DEFAULT_STRIPE_API_BASE: &str = "https://api.stripe.com";
 pub const STRIPE_API_BASE_ENV: &str = "AUTUMN_BILLING__STRIPE__API_BASE";
 /// Env var that overrides `billing.route_prefix`.
 pub const ROUTE_PREFIX_ENV: &str = "AUTUMN_BILLING__ROUTE_PREFIX";
+/// Minimum `max_body_bytes` the declared `security.webhooks.endpoints` entry
+/// must allow (4 MiB).
+///
+/// Invoices with many lines exceed the 1 MiB framework default, and the
+/// webhook extractor turns an oversized body into a 400 — which the provider
+/// treats as a failure and retries unchanged, so the event never reaches
+/// reconciliation. Boot refuses a smaller declared limit (issue #3100).
+pub(crate) const WEBHOOK_MAX_BODY_BYTES: usize = 4 * 1024 * 1024;
 
 /// A secret that never prints.
 #[derive(Clone, PartialEq, Eq, Deserialize)]
@@ -365,8 +373,8 @@ impl BillingConfig {
             self.webhook_path(),
             secret.expose(),
         );
-        // Invoices with many lines exceed the 1 MiB default.
-        endpoint.max_body_bytes = 4 * 1024 * 1024;
+        // Invoices with many lines exceed the 1 MiB framework default.
+        endpoint.max_body_bytes = WEBHOOK_MAX_BODY_BYTES;
         Ok(endpoint)
     }
 
@@ -936,7 +944,7 @@ interval = "year"
         assert_eq!(endpoint.path, "/billing/webhook");
         assert_eq!(endpoint.provider, WebhookProvider::Stripe);
         assert_eq!(endpoint.secret.as_deref(), Some("whsec_abc"));
-        assert_eq!(endpoint.max_body_bytes, 4 * 1024 * 1024);
+        assert_eq!(endpoint.max_body_bytes, WEBHOOK_MAX_BODY_BYTES);
     }
 
     #[test]
