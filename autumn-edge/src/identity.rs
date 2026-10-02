@@ -98,3 +98,81 @@ impl<S: Send + Sync> FromRequestParts<S> for EdgeIdentity {
             .ok_or(EdgeIdentityRequired)
     }
 }
+
+/// Origin-side gate for `#[edge(needs(identity))]` routes (#3086).
+///
+/// The capsule declines an unauthenticated request *before* dispatch
+/// (fallthrough on [`FallthroughReason::MissingCapability`]), so without this
+/// the native mount answers requests the edge lane would never serve: a
+/// declaration-only identity route stays reachable through the origin
+/// fallback. The route macro applies this to the native mount of every
+/// handler that declares `needs(identity)`; a request whose extensions carry
+/// a host-resolved [`EdgeIdentity`] runs on, anything else gets the same 401
+/// plus [`FALLTHROUGH_SENTINEL`] rejection the extractor returns, so edge and
+/// origin agree on the outcome.
+///
+/// Use with `axum::middleware::from_fn`. Route-local by construction, like
+/// [`crate::strip_request_credentials`]: the app's own middleware wraps the
+/// router above this layer and still sees the original request.
+pub async fn require_edge_identity(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    if request.extensions().get::<EdgeIdentity>().is_some() {
+        next.run(request).await
+    } else {
+        EdgeIdentityRequired.into_response()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::routing::get;
+    use tower::ServiceExt as _;
+
+    fn gated_app() -> axum::Router {
+        axum::Router::new()
+            .route("/", get(|| async { "served" }))
+            .layer(axum::middleware::from_fn(require_edge_identity))
+    }
+
+    fn get_request() -> axum::extract::Request {
+        http::Request::builder()
+            .uri("/")
+            .body(Body::from(""))
+            .expect("a bare GET request builds")
+    }
+
+    #[test]
+    fn anonymous_requests_are_rejected_with_the_fallthrough_sentinel() {
+        let response = futures::executor::block_on(gated_app().oneshot(get_request()))
+            .expect("the service responds");
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let sentinel = response
+            .headers()
+            .get(FALLTHROUGH_SENTINEL)
+            .expect("the rejection carries the fallthrough sentinel");
+        assert_eq!(
+            sentinel.as_bytes(),
+            FallthroughReason::MissingCapability.as_str().as_bytes(),
+            "the sentinel names the missing capability, like the extractor's rejection"
+        );
+    }
+
+    #[test]
+    fn requests_carrying_a_host_resolved_identity_are_forwarded() {
+        let mut request = get_request();
+        request.extensions_mut().insert(EdgeIdentity::new(
+            EdgeUserId::new("user-1"),
+            vec![EdgeRole::new("reader")],
+        ));
+
+        let response = futures::executor::block_on(gated_app().oneshot(request))
+            .expect("the service responds");
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+}

@@ -209,6 +209,20 @@ pub fn route_macro(
             ))
         };
     }
+    if edge.is_some_and(|marking| marking.needs_identity) {
+        // The capsule declines an unauthenticated request before dispatch
+        // (fallthrough on `MissingCapability`); without a gate the native
+        // mount answers it anyway, so a declaration-only identity route is
+        // reachable through the origin fallback (#3086). The gate is the
+        // same 401 + fallthrough-sentinel rejection the `EdgeIdentity`
+        // extractor returns, so both lanes agree. Applied outside the
+        // credential strip: a rejected request never reaches the handler.
+        handler_expr = quote! {
+            #handler_expr.layer(::autumn_edge::reexports::axum::middleware::from_fn(
+                ::autumn_edge::require_edge_identity,
+            ))
+        };
+    }
     let route_idempotency = if intercepted_route {
         quote! { ::autumn_web::RouteIdempotency::Direct }
     } else {
@@ -2510,6 +2524,70 @@ mod tests {
         assert!(
             !plain.contains("strip_request_credentials"),
             "a non-edge route must not be rewritten: {plain}"
+        );
+    }
+
+    #[test]
+    fn route_macro_edge_needs_identity_gates_the_native_mount() {
+        // The capsule declines an unauthenticated request before dispatch;
+        // the native mount must enforce the same requirement or the origin
+        // fallback serves what the edge lane would never serve (#3086).
+        let generated = route_macro(
+            "GET",
+            "get",
+            quote! { "/me" },
+            quote! {
+                #[edge(needs(identity))]
+                async fn me(identity: EdgeIdentity) -> String { identity.user_id().as_str().to_owned() }
+            },
+        )
+        .to_string();
+
+        assert!(
+            generated.contains("require_edge_identity"),
+            "needs(identity) must gate the native mount: {generated}"
+        );
+        assert!(!generated.contains("compile_error"), "{generated}");
+    }
+
+    #[test]
+    fn route_macro_edge_needs_identity_gate_is_read_from_an_expanded_marker_too() {
+        // `#[edge]` below `#[get]` expands first; the route macro must read
+        // the declaration back out of the marker const, not just the live
+        // attribute.
+        let edged = crate::edge::edge_macro(
+            quote! { needs(identity) },
+            quote! { async fn me(identity: EdgeIdentity) -> String { identity.user_id().as_str().to_owned() } },
+        );
+        let generated = route_macro("GET", "get", quote! { "/me" }, edged).to_string();
+
+        assert!(
+            generated.contains("require_edge_identity"),
+            "an expanded needs(identity) marker must gate the native mount: {generated}"
+        );
+        assert!(!generated.contains("compile_error"), "{generated}");
+    }
+
+    #[test]
+    fn route_macro_edge_without_needs_identity_omits_the_gate() {
+        let generated = route_macro(
+            "GET",
+            "get",
+            quote! { "/greet" },
+            quote! {
+                #[edge]
+                async fn greet() -> &'static str { "hi" }
+            },
+        )
+        .to_string();
+
+        assert!(
+            !generated.contains("require_edge_identity"),
+            "a route without needs(identity) must not be gated: {generated}"
+        );
+        assert!(
+            generated.contains("strip_request_credentials"),
+            "the credential strip applies to every edge route, independent of the identity gate: {generated}"
         );
     }
 
