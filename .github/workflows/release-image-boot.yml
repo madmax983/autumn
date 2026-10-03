@@ -5,7 +5,7 @@ name: Release Image Build-and-Boot Gate
 #
 # `autumn release init` scaffolds a production Dockerfile and docs/guide/deployment.md
 # promises "a fresh `autumn new` project to a running container in under 10
-# minutes", with `/health` wired as the container HEALTHCHECK. Until this gate,
+# minutes", with `/live` wired as the container HEALTHCHECK. Until this gate,
 # nothing in CI ever ran `docker build` on the generated image and booted it —
 # the existing tests only string-assert Dockerfile contents and the publish-gate
 # smoke job only checks that a downstream project *compiles*. A base-image bump,
@@ -15,7 +15,7 @@ name: Release Image Build-and-Boot Gate
 #
 # This workflow scaffolds a fresh project, runs `autumn release init`,
 # `docker build`s the image, runs the documented one-shot `autumn migrate`, boots
-# the container against a throwaway Postgres, and asserts /health and
+# the container against a throwaway Postgres, and asserts /ready and
 # /actuator/health return 200 within the documented startup budget. It covers
 # both the bare `release init` target and the `--target docker-compose` variant,
 # plus a direct-TLS variant (issue #1603): the same image booted with

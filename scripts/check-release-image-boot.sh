@@ -3,13 +3,13 @@
 #
 # `autumn release init` scaffolds a production Dockerfile and docs/guide/deployment.md
 # makes a falsifiable promise: "from a fresh `autumn new` project to a
-# production-shaped container running... under 10 minutes", with `/health` wired
+# production-shaped container running... under 10 minutes", with `/live` wired
 # as the container HEALTHCHECK. The existing tests only string-assert Dockerfile
 # *contents*; nothing ever runs `docker build` on the generated image and boots
 # it. This harness closes that loop: it scaffolds a fresh project, runs
 # `autumn release init --force`, builds the generated image, runs the documented
 # one-shot `autumn migrate` job against a throwaway Postgres, boots the web
-# container, and asserts GET /health and /actuator/health both return 200 within
+# container, and asserts GET /ready and /actuator/health both return 200 within
 # a bounded startup window. It also covers the `--target docker-compose` path,
 # bringing the stack up and tearing it down cleanly.
 #
@@ -331,7 +331,7 @@ run_default_target() {
   # --network host lets the container reach the Postgres service on localhost
   # and bind :3000 on the runner. Minimal AUTUMN_* env: the primary URL, the
   # required production signing secret, and a trusted-host allowlist so the
-  # prod profile binds and /health is reachable.
+  # prod profile binds and /ready is reachable.
   docker run -d --name "${CONTAINER_NAME}" --network host \
     -e AUTUMN_DATABASE__PRIMARY_URL="${DB_URL}" \
     -e AUTUMN_SECURITY__SIGNING_SECRET="${SIGNING_SECRET}" \
@@ -339,7 +339,7 @@ run_default_target() {
     "${IMAGE_TAG}"
 
   if ! probe_until_healthy "${STARTUP_BUDGET_SECS}" \
-       "http://localhost:3000/health" \
+       "http://localhost:3000/ready" \
        "http://localhost:3000/actuator/health"; then
     fail "container did not reach a healthy state — boot logs follow"
     docker logs "${CONTAINER_NAME}" || true
@@ -347,7 +347,7 @@ run_default_target() {
     exit 1
   fi
 
-  log "default target: image builds and boots, /health + /actuator/health = 200"
+  log "default target: image builds and boots, /ready + /actuator/health = 200"
 }
 
 # ── docker-compose target ───────────────────────────────────────────────────
@@ -378,7 +378,7 @@ YAML
   fi
 
   if ! probe_until_healthy "${STARTUP_BUDGET_SECS}" \
-       "http://localhost:3000/health" \
+       "http://localhost:3000/ready" \
        "http://localhost:3000/actuator/health"; then
     fail "compose stack did not reach a healthy state — compose logs follow"
     ( cd "${PROJECT_DIR}" && docker compose logs ) || true
@@ -386,7 +386,7 @@ YAML
     exit 1
   fi
 
-  log "compose target: stack builds, migrates, and serves /health + /actuator/health = 200"
+  log "compose target: stack builds, migrates, and serves /ready + /actuator/health = 200"
   # Teardown is handled by the EXIT trap (docker compose down -v).
 }
 
@@ -523,7 +523,7 @@ run_https_target() {
     -e AUTUMN_SECURITY__TRUSTED_HOSTS__HOSTS="*" \
     -e AUTUMN_SERVER__TLS__CERT_PATH=/etc/autumn/tls/cert.pem \
     -e AUTUMN_SERVER__TLS__KEY_PATH=/etc/autumn/tls/key.pem \
-    -e AUTUMN_HEALTHCHECK_URL=https://localhost:3000/health \
+    -e AUTUMN_HEALTHCHECK_URL=https://localhost:3000/live \
     -e AUTUMN_HEALTHCHECK_INSECURE=1 \
     "${IMAGE_TAG}"
 
@@ -534,7 +534,7 @@ run_https_target() {
   # this function can be left holding a stale `--cacert`.
   local -a PROBE_CURL_OPTS=(--cacert "${TLS_DIR}/cert.pem")
   if ! probe_until_healthy "${STARTUP_BUDGET_SECS}" \
-       "https://localhost:3000/health" \
+       "https://localhost:3000/ready" \
        "https://localhost:3000/actuator/health"; then
     fail "the HTTPS container did not reach a healthy state — boot logs follow"
     docker logs "${CONTAINER_NAME}" || true
@@ -550,17 +550,17 @@ run_https_target() {
   # (and a real `200` on a request curl also errored on would read `200000`,
   # sliding past the equality check this assertion depends on).
   local plain_code=""
-  plain_code="$(curl -o /dev/null -s -m 5 -w '%{http_code}' http://localhost:3000/health 2>/dev/null)" \
+  plain_code="$(curl -o /dev/null -s -m 5 -w '%{http_code}' http://localhost:3000/ready 2>/dev/null)" \
     || plain_code="${plain_code:-000}"
   if [[ "${plain_code}" == "200" ]]; then
-    fail "http://localhost:3000/health returned 200 — the app is serving cleartext on the TLS port"
+    fail "http://localhost:3000/ready returned 200 — the app is serving cleartext on the TLS port"
     exit 1
   fi
   log "OK: plain HTTP on :3000 does not answer (code: ${plain_code})"
 
   wait_until_container_healthy "${HEALTHY_BUDGET_SECS}" || exit 1
 
-  log "https target: image builds and boots over TLS, HTTPS /health + /actuator/health = 200"
+  log "https target: image builds and boots over TLS, HTTPS /ready + /actuator/health = 200"
 }
 
 case "${TARGET}" in

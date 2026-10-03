@@ -12,9 +12,13 @@ level = "info"
 format = "Json"
 
 [health]
+# The framework mounts explicit liveness/readiness/startup probe contracts at
+# /live, /ready and /startup. `path` is the transitional compatibility alias
+# for readiness (default "/health"); new deployments should point their
+# platform probes at the explicit paths and leave the alias at its default.
 path = "/health"
-# live_path = "/live"
-# ready_path = "/ready"
+live_path = "/live"
+ready_path = "/ready"
 
 # Database topology:
 # - primary_url is the write role used by Db, transactions, advisory locks, and migrations.

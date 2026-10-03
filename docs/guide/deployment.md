@@ -11,7 +11,7 @@ internet connection.
 > [`release-image-boot`](../../.github/workflows/release-image-boot.yml) CI gate
 > scaffolds a fresh project, runs every command on this page (`autumn new` →
 > `autumn release init --force` → `docker build` → one-shot `autumn migrate` →
-> boot), and fails the build unless the container answers `GET /health` **and**
+> boot), and fails the build unless the container answers `GET /ready` **and**
 > `GET /actuator/health` with `200` within the documented startup budget. It
 > covers both the bare `release init` image and the `--target docker-compose`
 > stack, so the deployment scaffold can never silently rot — a base-image bump,
@@ -514,8 +514,8 @@ On success it prints:
 Verify it is serving (the public port is your configured `server.port`):
 
 ```bash
-curl http://203.0.113.10:3000/health   # -> {"status":"ok", ...}
-curl http://203.0.113.10:3000/ready    # readiness probe used during cutover
+curl http://203.0.113.10:3000/live    # -> {"status":"ok", ...} (liveness)
+curl http://203.0.113.10:3000/ready   # readiness probe used during cutover
 ```
 
 ### Migration ordering (first deploy included)
@@ -1670,7 +1670,7 @@ The command emits three files at the project root:
 > The production Dockerfile adds cargo-chef dependency caching (so rebuilds only
 > recompile what changed), installs `libpq`, `tini`, and `ca-certificates` in the
 > slim runtime, copies compiled Tailwind assets from `static/`, leaves
-> migrations to an explicit primary-role job, and wires the `/health` endpoint as the container
+> migrations to an explicit primary-role job, and wires the `/live` endpoint as the container
 > `HEALTHCHECK`.
 
 ---
@@ -2395,12 +2395,12 @@ APP_URL="$(terraform output -raw app_url)"   # known only after the FIRST apply 
 # merges it — RuntimeEnvironmentSecrets must be re-supplied here alongside
 # the real image, or the cutover silently drops
 # AUTUMN_DATABASE__PRIMARY_URL/AUTUMN_SECURITY__SIGNING_SECRET and the real
-# app can't boot. HealthCheckConfiguration restores the real "/health" path
+# app can't boot. HealthCheckConfiguration restores the real "/ready" path
 # — main.tf's bootstrap revision used "/" (nginx's own default response)
-# since the bootstrap placeholder doesn't serve /health.
+# since the bootstrap placeholder doesn't serve /ready.
 OPERATION_ID=$(aws apprunner update-service --service-arn "$SERVICE_ARN" \
   --instance-configuration "{\"InstanceRoleArn\": \"$INSTANCE_ROLE\"}" \
-  --health-check-configuration "{\"Protocol\": \"HTTP\", \"Path\": \"/health\"}" \
+  --health-check-configuration "{\"Protocol\": \"HTTP\", \"Path\": \"/ready\"}" \
   --source-configuration "{
   \"ImageRepository\": {
     \"ImageIdentifier\": \"$ECR:$TAG\",

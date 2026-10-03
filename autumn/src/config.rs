@@ -7002,7 +7002,9 @@ impl AutumnConfig {
 /// Per-request timeout configuration.
 ///
 /// Controls how long the server waits for a complete request-response cycle
-/// before returning `408 Request Timeout`. A value of `None` or `0` disables
+/// before returning `503 Service Unavailable` (a server-side deadline has
+/// expired; `408 Request Timeout` instead means the *client* was too slow
+/// sending the request). A value of `None` or `0` disables
 /// the timeout (the default, so existing applications are unaffected).
 ///
 /// # `autumn.toml` example

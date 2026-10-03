@@ -10940,14 +10940,14 @@ async fn pg_enqueued_and_scheduled_pages(
 
 /// `SQLite` stub for the Postgres job runtime.
 ///
-/// The durable Postgres job backend uses `LISTEN`/`NOTIFY`, `FOR UPDATE SKIP
-/// LOCKED` claiming, and advisory locks — none of which `SQLite` provides — so
-/// under the `sqlite` feature the runtime pool (`RuntimeConnection`) is a
-/// `SQLite` pool that cannot drive the Postgres worker loops. Refuse a
-/// `jobs.backend = "postgres"` configuration with a clear message instead of
-/// mis-typing. `SQLite` deployments use `jobs.backend = "sqlite"` for a durable
-/// queue in their own database file, or the in-process `local` backend (the
-/// default) when durability is not needed.
+/// The durable Postgres job backend claims rows with `FOR UPDATE SKIP LOCKED`
+/// (plus advisory locks for serialized claiming) on a 200 ms poll interval —
+/// none of which a SQLite-only `RuntimeConnection` can drive — so under the
+/// `sqlite` feature the runtime pool cannot run the Postgres worker loops.
+/// Refuse a `jobs.backend = "postgres"` configuration with a clear message
+/// instead of mis-typing. `SQLite` deployments use `jobs.backend = "sqlite"`
+/// for a durable queue in their own database file, or the in-process `local`
+/// backend (the default) when durability is not needed.
 #[cfg(all(feature = "db", feature = "sqlite"))]
 fn start_postgres_runtime(
     jobs: Vec<JobInfo>,
@@ -10958,8 +10958,9 @@ fn start_postgres_runtime(
 ) -> AutumnResult<()> {
     let _ = (jobs, state, shutdown, config, run_workers);
     Err(AutumnError::internal_server_error(std::io::Error::other(
-        "jobs.backend=postgres is unsupported under the sqlite feature; SQLite has no \
-         LISTEN/NOTIFY or advisory-lock queue. Use jobs.backend=sqlite for a durable queue \
+        "jobs.backend=postgres is unsupported under the sqlite feature; this build has no \
+         Postgres runtime connection, so the Postgres worker loop (FOR UPDATE SKIP LOCKED \
+         claiming plus advisory locks) cannot run. Use jobs.backend=sqlite for a durable queue \
          in your own SQLite file, or jobs.backend=local (the default) for the in-process \
          queue.",
     )))
@@ -17394,9 +17395,10 @@ mod tests {
         }
 
         // The sqlite arm of the same call. `start_postgres_runtime` is a stub
-        // under the backend flip — SQLite has no LISTEN/NOTIFY and no
-        // advisory-lock queue — so it refuses regardless of what is configured,
-        // and this is the only coverage of that refusal.
+        // under the backend flip — the build has no Postgres runtime
+        // connection, so the Postgres worker loop cannot run — and it refuses
+        // regardless of what is configured; this is the only coverage of that
+        // refusal.
         #[cfg(feature = "sqlite")]
         #[tokio::test]
         async fn sqlite_build_refuses_the_postgres_job_backend() {

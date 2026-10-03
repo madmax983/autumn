@@ -1412,7 +1412,7 @@ mod tests {
     }
 
     /// Issue #1603 AC6: an image whose app terminates TLS itself
-    /// (`[server.tls]`) answers `/health` over **HTTPS**, so a HEALTHCHECK
+    /// (`[server.tls]`) answers `/live` over **HTTPS**, so a HEALTHCHECK
     /// hardcoded to `http://` marks that container permanently unhealthy —
     /// and in compose, `depends_on: condition: service_healthy` never
     /// releases. The probe URL must therefore be overridable at runtime.
@@ -1429,7 +1429,7 @@ mod tests {
              image can be probed over https://, got: {healthcheck}"
         );
         assert!(
-            healthcheck.contains("http://localhost:3000/health"),
+            healthcheck.contains("http://localhost:3000/live"),
             "the default probe URL must stay today's plain-HTTP one, got: {healthcheck}"
         );
         assert!(
@@ -1465,13 +1465,13 @@ mod tests {
             // Default: today's plain-HTTP probe, verification on.
             (None, None, false),
             // An https URL alone is NOT enough — fail safe, not fail open.
-            (Some("https://localhost:3000/health"), None, false),
+            (Some("https://localhost:3000/live"), None, false),
             // The documented direct-TLS pairing.
-            (Some("https://localhost:3000/health"), Some("1"), true),
+            (Some("https://localhost:3000/live"), Some("1"), true),
             // Any non-empty value opts in; the value itself is not parsed.
-            (Some("https://localhost:3000/health"), Some("true"), true),
+            (Some("https://localhost:3000/live"), Some("true"), true),
             // An empty value is not an opt-in.
-            (Some("https://localhost:3000/health"), Some(""), false),
+            (Some("https://localhost:3000/live"), Some(""), false),
             // URLs that a parser would have mistaken for loopback stay verified
             // unless the operator opted in — curl resolves both remotely.
             (
@@ -1512,7 +1512,7 @@ mod tests {
                 if expect_insecure { "" } else { "NOT" }
             );
             // The probe must hit the URL it was given, verbatim.
-            let expected_url = url.unwrap_or("http://localhost:3000/health");
+            let expected_url = url.unwrap_or("http://localhost:3000/live");
             assert!(
                 invocation.contains(expected_url),
                 "the probe must request {expected_url}; curl was called as: {invocation}"

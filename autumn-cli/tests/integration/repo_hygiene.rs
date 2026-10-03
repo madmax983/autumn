@@ -9360,3 +9360,83 @@ fn capacity_contract_scheduled_probe_uses_declared_defaults() {
         }
     }
 }
+
+/// Release templates must use the explicit probe contracts (#3066): `/ready`
+/// for readiness/traffic checks (so the drain-time 503 flip reaches the load
+/// balancer) and `/live` for liveness/restart decisions (which never fails on
+/// a missing dependency). The transitional `/health` alias must not be the
+/// target of any platform probe.
+#[test]
+fn release_templates_use_explicit_probe_contracts() {
+    let root = workspace_root();
+    let release = root.join("autumn-cli/src/templates/release");
+    let read_template = |name: &str| {
+        let path = release.join(name);
+        std::fs::read_to_string(&path)
+            .unwrap_or_else(|err| panic!("failed to read {}: {err}", path.display()))
+    };
+
+    // ECS: the ALB target group gates traffic, so it must see the readiness
+    // flip. The bootstrap nginx placeholder answers the same path so the
+    // permanent target group passes before the real image exists.
+    let ecs = read_template("aws-ecs-main.tf.tmpl");
+    assert!(
+        ecs.contains("path                = \"/ready\""),
+        "aws-ecs-main.tf.tmpl: the ALB target group health check must probe /ready"
+    );
+    assert!(
+        ecs.contains("location /ready { return 200; }"),
+        "aws-ecs-main.tf.tmpl: the bootstrap nginx must also answer /ready"
+    );
+
+    // Fly: service-level checks gate proxy routing, top-level checks decide
+    // machine restarts.
+    let fly = read_template("fly.toml.tmpl");
+    assert!(
+        fly.contains("path         = \"/ready\""),
+        "fly.toml.tmpl: http_service checks must probe /ready"
+    );
+    assert!(
+        fly.contains("path         = \"/live\""),
+        "fly.toml.tmpl: machine checks must probe /live"
+    );
+
+    // Docker: HEALTHCHECK decides container restarts — liveness, not readiness.
+    let dockerfile = read_template("Dockerfile.tmpl");
+    assert!(
+        dockerfile.contains("${AUTUMN_HEALTHCHECK_URL:-http://localhost:3000/live}"),
+        "Dockerfile.tmpl: the container HEALTHCHECK must default to /live"
+    );
+
+    // App Runner: the bootstrap revision serves "/" (nginx's own default) and
+    // the cutover call in docs/guide/deployment.md switches the mutable,
+    // service-level health check to the real app's /ready.
+    let apprunner = read_template("aws-app-runner-main.tf.tmpl");
+    assert!(
+        apprunner.contains("path     = \"/\""),
+        "aws-app-runner-main.tf.tmpl: the bootstrap health check must stay on nginx's \"/\""
+    );
+    assert!(
+        apprunner.contains("to the real app's \"/ready\""),
+        "aws-app-runner-main.tf.tmpl: the cutover must restore /ready"
+    );
+    let guide = std::fs::read_to_string(root.join("docs/guide/deployment.md"))
+        .expect("docs/guide/deployment.md must be readable");
+    assert!(
+        guide.contains(r#"\"Path\": \"/ready\""#),
+        "docs/guide/deployment.md: the App Runner cutover must restore the /ready path"
+    );
+
+    // The transitional alias must not be the target of any platform probe.
+    for (name, content) in [
+        ("aws-ecs-main.tf.tmpl", ecs.as_str()),
+        ("fly.toml.tmpl", fly.as_str()),
+        ("Dockerfile.tmpl", dockerfile.as_str()),
+        ("aws-app-runner-main.tf.tmpl", apprunner.as_str()),
+    ] {
+        assert!(
+            !content.contains("\"/health\""),
+            "{name}: no platform probe may target the transitional /health alias"
+        );
+    }
+}
