@@ -476,7 +476,7 @@ fn waived_id(fields: &serde_json::Value) -> Option<String> {
             label.get("message").and_then(serde_json::Value::as_str)
                 == Some("advisory ignored here")
         })
-        .and_then(&span_of)
+        .and_then(span_of)
         .or_else(|| {
             labels
                 .iter()
@@ -957,7 +957,7 @@ const AUDITOR: &str = "cargo-deny";
 /// toolchain — least of all halfway, which is what leaves the next `cargo
 /// build` broken. With this set, rustup errors instead, and the audit reports
 /// no verdict (issue #1633).
-fn no_toolchain_installs(command: &mut Command) {
+pub fn no_toolchain_installs(command: &mut Command) {
     command.env("RUSTUP_AUTO_INSTALL", "0");
 }
 

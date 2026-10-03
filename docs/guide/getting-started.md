@@ -11,7 +11,7 @@ endpoints, profile-aware configuration, and a project CLI behind a Spring
 Boot-style developer experience.
 
 > **Version note:** This guide tracks the published `autumn-web` and
-> `autumn-cli` **0.7.x** release line. If you are working from a source
+> `autumn-cli` **0.8.x** release line. If you are working from a source
 > checkout of the Autumn repository, the workspace may be ahead of the
 > published crates — see [local development](#local-development) below.
 
@@ -85,7 +85,7 @@ directory.
 To build it from crates.io instead:
 
 ```bash
-cargo install autumn-cli --version 0.7.0
+cargo install autumn-cli --version 0.8.0
 ```
 
 ### Local development
@@ -103,8 +103,8 @@ work, only for a release. So `autumn new` pins whatever `autumn-web` version
 your source-built CLI was compiled with, and that number is normally already
 on crates.io; it is the *code* behind it that has moved on. That means
 `autumn doctor`'s `version_compat` check, which compares version strings, will
-print a reassuring `✅ version_compat — autumn-cli 0.7.0 matches autumn-web
-0.7.0` even when your checkout and the published crate have diverged — it has
+print a reassuring `✅ version_compat — autumn-cli 0.8.0 matches autumn-web
+0.8.0` even when your checkout and the published crate have diverged — it has
 no way to see API drift that the version number doesn't carry.
 
 The real symptom is a `cargo build` failure right after `autumn new`, usually
@@ -220,15 +220,15 @@ On a fresh project, before `autumn setup`, you will see something like:
 🍂 autumn doctor
 
 ✅ rust_toolchain — rustc 1.88.0 ≥ MSRV 1.88.0
-✅ version_compat — autumn-cli 0.7.0 matches autumn-web 0.7.0
+✅ version_compat — autumn-cli 0.8.0 matches autumn-web 0.8.0
 ✅ autumn_toml — autumn.toml and profile configurations are valid
 ✅ database_topology — database not configured
 ✅ port_bindable — port 3000 is available
 ❌ tailwind_binary — target/autumn/tailwindcss not found
    hint: Run `autumn setup` to download the Tailwind CSS binary
-⚠️  signing_secret — using an ephemeral per-process signing secret (dev/test
-    only; sessions and signed URLs will not survive restarts or be shared
-    across replicas)
+⚠️  signing_secret — no signing secret configured (dev/test only): sessions and
+    CSRF tokens ride unsigned; local-storage signed URLs use an ephemeral
+    per-process key instead
    hint: Set AUTUMN_SECURITY__SIGNING_SECRET before deploying to production
 ⚠️  dotenv — `.env.example` is present but no `.env` exists
    hint: Copy `.env.example` to `.env` and fill in local values
@@ -302,7 +302,7 @@ routes are live immediately:
 `/health` responds with:
 
 ```json
-{ "status": "ok", "version": "0.7.0" }
+{ "status": "ok", "version": "0.8.0" }
 ```
 
 Press **Ctrl+C** to stop the server. Shutdown is graceful, draining in-flight
@@ -758,7 +758,7 @@ your code referred to Diesel's traits:
 
 ```toml
 [dependencies]
-autumn-web = "0.7"
+autumn-web = "0.8"
 chrono = { version = "0.4", features = ["serde"] }
 diesel = { version = "2", features = ["postgres", "chrono"] }
 diesel-async = { version = "0.9", features = ["postgres"] }
@@ -1298,11 +1298,14 @@ so a `.env` file can never switch the active profile.
 
 ### Log format behavior
 
-| Format   | Behavior                                                 |
-|----------|----------------------------------------------------------|
-| `Auto`   | Pretty in development, JSON when the profile is production |
-| `Pretty` | Always human-readable, colorized                         |
-| `Json`   | Always structured JSON                                   |
+`Auto` renders pretty lines unless the profile is production, then JSON.
+`Pretty` and `Json` pin it either way. The profile usually decides this before
+`Auto` ever does: `dev` defaults to `Pretty` and `prod` to `Json` outright,
+which is why the same binary reads well on a laptop and parses in production
+without the config changing. The same goes for the level — `dev` defaults to
+`debug`, `prod` to `info`. [Logging](logging-pii.md#choose-the-log-format-pretty-or-json)
+is where the log settings are documented in full, including how to change a log
+level on a running process.
 
 ### Running without a database
 
@@ -1505,8 +1508,10 @@ See the [testing guide](testing.md) for `TestDb`, fixtures, and
 ## Before you deploy
 
 The generated app starts with local-safe defaults: in-memory sessions,
-in-process `#[scheduled]` tasks, an ephemeral signing secret, and a generic
-container Dockerfile. Before running multiple replicas you usually want to:
+in-process `#[scheduled]` tasks, no configured signing secret (see
+[signing secrets](signing-secrets.md) for what that does and does not sign),
+and a generic container Dockerfile. Before running multiple replicas you
+usually want to:
 
 1. Set `AUTUMN_ENV=prod`
 2. Set a durable `AUTUMN_SECURITY__SIGNING_SECRET` and a trusted-hosts list

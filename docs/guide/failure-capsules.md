@@ -195,7 +195,7 @@ has one, which is how a capsule on disk is tied back to a log line.
   "format_version": 3,
   "id": "01JB2K7Q8N4W",
   "captured_at": "2026-08-12T10:14:13.882104Z",
-  "autumn_version": "0.7.0",
+  "autumn_version": "0.8.0",
   "app": { "name": "invoices", "profile": "production" },
   "request": {
     "method": "GET",
@@ -945,7 +945,7 @@ is not.
 
 - [Error Reporting](./error-reporting.md) — the pipeline that decides a request
   failed, and the `ErrorEvent` a capsule attaches to.
-- [Logging & PII](./logging-pii.md) — `[log] filter_parameters`, the one list
+- [Logging: levels, format & PII](./logging-pii.md) — `[log] filter_parameters`, the one list
   that governs redaction here too.
 - [Cloud-Native Guide](./cloud-native.md) — running Autumn where the disk a
   capsule lands on may not outlive the pod.

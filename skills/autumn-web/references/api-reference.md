@@ -1,18 +1,21 @@
-# autumn-web API Reference (0.7.0)
+# autumn-web API Reference (0.8.0)
 
 Use this file as a quick map for public names, features, dependency versions,
 and config keys. Verify against current source when exact code matters.
 
-Version identity: this reference tracks **0.7.0**, the current release line,
+Version identity: this reference tracks **0.8.0**, the current release line,
 which is also the version `trunk-dev` carries. Entries carry the release they
-arrived in: **(0.6.0)** is absent from 0.5.x, and **(0.7.0)** is absent from
-0.6.x and earlier. Unmarked entries predate 0.6.0.
+arrived in: **(0.6.0)** is absent from 0.5.x, **(0.7.0)** is absent from 0.6.x and
+earlier, and **(0.8.0)** is absent from 0.7.x and earlier. Unmarked entries predate 0.6.0.
 
 ## Published crates
 
 | Crate | Directory | Notes |
 |---|---|---|
-| `autumn-macros` | `autumn-macros/` | Proc macros; publish first |
+| `autumn-macros-support` | `autumn-macros-support/` | Shared codegen helpers; no Autumn runtime deps, every macro crate pins it, so publish first |
+| `autumn-macros` | `autumn-macros/` | Core proc macros (routes, handlers, edge); depends on `autumn-macros-support` |
+| `autumn-macros-model` | `autumn-macros-model/` | `#[model]` / `#[commentable]` codegen; `autumn-web` pins it (optionally) so it publishes before `autumn-web` |
+| `autumn-macros-repository` | `autumn-macros-repository/` | `#[repository]` / `#[service]` codegen; `autumn-web` pins it (optionally) so it publishes before `autumn-web` |
 | `autumn-schema-core` | `autumn-schema-core/` | Schema primitives shared by the CLI; no Autumn runtime deps |
 | `autumn-edge` | `autumn-edge/` | Edge/WASM capsule runtime; `autumn-web` pins it (optionally) so it publishes before `autumn-web` |
 | `autumn-web` | `autumn/` | Main framework crate; import path `autumn_web` |
@@ -25,7 +28,7 @@ arrived in: **(0.6.0)** is absent from 0.5.x, and **(0.7.0)** is absent from
 | `autumn-billing` | `autumn-billing/` | Stripe subscription billing plugin |
 
 All publishable crates share the `[workspace.package]` version and release
-together at `0.7.0`. This table lists the same crates, in the same order, as
+together at `0.8.0`. This table lists the same crates, in the same order, as
 `CRATES` in `scripts/check-publish-dry-run.sh` — that script is the executable
 copy of the publish order.
 
@@ -37,7 +40,7 @@ copy of the publish order.
 - `autumn_web::slugify(&str) -> String` — URL-safe slug. **Never returns
   `""`**: input with nothing to slugify (empty, all punctuation, un-folded
   non-Latin) gets a stable, deterministic hash fallback token instead.
-- `autumn_web::contains_letter_or_number(&str) -> bool` (unreleased, #2424) —
+- `autumn_web::contains_letter_or_number(&str) -> bool` (0.8.0, #2424) —
   the input check `slugify` cannot answer. Reach for it to reject content-free
   user input (`"***"`, `"🎉🔥💯"`); **never** `slugify(x).is_empty()`, which is
   always `false` and so is dead code. Deliberately broader than "`slugify`
@@ -117,10 +120,10 @@ copy of the publish order.
 |---|---|
 | `#[get]`, `#[post]`, `#[put]`, `#[patch]`, `#[delete]` | HTTP route handlers; optional args `name`, `api_version`, `sunset_opt_out`, `timeout_ms`, `timeout = "off"`, and `seo(...)` |
 | `routes![...]` | Collect route handlers |
-| `#[autumn_web::main]` | Tokio runtime + Autumn profile bootstrap; optional runtime args `flavor` (`"multi_thread"` default / `"current_thread"`), `worker_threads`, `max_blocking_threads`, `thread_name`, `thread_stack_size`, `thread_keep_alive = "30s"`, and `configure = path::to::fn` — a `fn(&mut tokio::runtime::Builder)` run last, the escape hatch for `Builder` methods the args don't name (unreleased). Numeric args take expressions, not only literals. No args = tokio defaults; an unknown/duplicate/zero arg, or `worker_threads` under `current_thread`, is a compile error |
-| `#[static_get]`, `static_routes![...]` | Static pre-render routes for `autumn build`; also accepts `params`, `revalidate`, and `seo(...)`. The `Content-Type` the handler declares is recorded per route in `dist/manifest.json` and served verbatim (unreleased, #1832) — set it explicitly for non-HTML routes (`application/xml`, `application/rss+xml`) since the serve path no longer infers it from the route slug |
-| `static_gen::ManifestEntry` | One `dist/manifest.json` route entry: `file`, `revalidate`, `content_type`. `#[non_exhaustive]` — build with `ManifestEntry::new(file).with_revalidate(..).with_content_type(..)` (unreleased, #1832) |
-| `static_gen::StaticFileLayer::resolve_entry` → `ResolvedStatic` | Manifest lookup returning the file path **and** the ready-to-serve `Content-Type`; `resolve` is the file-path-only shorthand. `static_gen::resolved_content_type` is the decision function: recorded type → recognized route extension → served file name → `application/octet-stream` (unreleased, #1832) |
+| `#[autumn_web::main]` | Tokio runtime + Autumn profile bootstrap; optional runtime args `flavor` (`"multi_thread"` default / `"current_thread"`), `worker_threads`, `max_blocking_threads`, `thread_name`, `thread_stack_size`, `thread_keep_alive = "30s"`, and `configure = path::to::fn` — a `fn(&mut tokio::runtime::Builder)` run last, the escape hatch for `Builder` methods the args don't name (0.8.0). Numeric args take expressions, not only literals. No args = tokio defaults; an unknown/duplicate/zero arg, or `worker_threads` under `current_thread`, is a compile error |
+| `#[static_get]`, `static_routes![...]` | Static pre-render routes for `autumn build`; also accepts `params`, `revalidate`, and `seo(...)`. The `Content-Type` the handler declares is recorded per route in `dist/manifest.json` and served verbatim (0.8.0, #1832) — set it explicitly for non-HTML routes (`application/xml`, `application/rss+xml`) since the serve path no longer infers it from the route slug |
+| `static_gen::ManifestEntry` | One `dist/manifest.json` route entry: `file`, `revalidate`, `content_type`. `#[non_exhaustive]` — build with `ManifestEntry::new(file).with_revalidate(..).with_content_type(..)` (0.8.0, #1832) |
+| `static_gen::StaticFileLayer::resolve_entry` → `ResolvedStatic` | Manifest lookup returning the file path **and** the ready-to-serve `Content-Type`; `resolve` is the file-path-only shorthand. `static_gen::resolved_content_type` is the decision function: recorded type → recognized route extension → served file name → `application/octet-stream` (0.8.0, #1832) |
 | `#[ws]` | WebSocket route handler (`ws`) |
 | `#[model]` | Diesel model derives (`db`) |
 | `#[repository]` | CRUD repository and generated API (`db`); `mcp` / `mcp = "read"` expose the generated routes as MCP tools; `invalidates(path::to::cached_fn)` declares a cache-coherence invalidation edge proven by `autumn cache audit` (#1716) |
@@ -259,7 +262,56 @@ from -> to: "guard", ...))]` field attribute on `String` fields, generating
   be declared `#[translatable]` with **no data migration**; keys are never gated
   on locale-tag shape, so every key an app can write round-trips through the
   column.
-- **(0.7.0)** `#[classified]` / `#[classified(personal_data)]` (issue #1654) — marks a
+- **(0.8.0)** `#[collaborative]` (issue #1806, needs the `collab` feature) — the column
+  stores a **text CRDT** instead of a plain string, so two people editing the
+  same field merge character by character rather than overwriting each other.
+  The field type becomes `autumn_web::collab::CollabText`, a Replicated
+  Growable Array persisted as JSON in the field's own `TEXT` column (portable
+  Postgres + `SQLite`, the same storage shape `#[translatable]` uses). Give the
+  column `DEFAULT '{"elems":[]}'` (`collab::EMPTY_DOCUMENT`); a bare `'{}'`
+  reads as prose, not as an empty document. Guarantees: replicas holding the
+  same operations render the same text **in any delivery order**; an operation
+  arriving before the character it refers to waits in a buffer rather than
+  being dropped; applying one twice is a no-op, so a reconnect is safe; and an
+  edit anchors to a neighbouring character rather than an index, so it lands
+  where the author meant even when the document changed in flight.
+  Generated: per-field `<f>_text()` / `<f>_insert(actor, index, text)` /
+  `<f>_remove(index, count)` / `<f>_set_text(actor, text)` /
+  `<f>_merge(&other)`, plus field-name-keyed `collaborative(field)` /
+  `collaborative_mut(field)` / `Model::collaborative_fields()`, and a
+  `collab::CollaborativeColumnDescriptor` inventory registration.
+  **Write semantics matter**: use `<f>_set_text` for a whole-field form post —
+  it emits the smallest edit, so a concurrent edit outside the changed span
+  survives. Assigning a fresh `CollabText::from(str)` throws the merge history
+  away. `Serialize` is lossless; `Deserialize` refuses a bare string, so
+  `PUT {"body": "hi"}` is a 422 rather than a silent wipe of everyone else's
+  characters. Refused in combination with `#[encrypted]`, `#[classified]`,
+  `#[searchable]`, `#[translatable]`, `#[normalize]`, `unique`/`indexed`,
+  `#[id]`, `#[lock_version]`, `#[position]`, `#[state_machine]`,
+  `#[serde(rename)]` and `#[diesel(column_name)]`. `Option<CollabText>` is a
+  compile error — an empty document already means "no text". A pre-existing
+  plain-text column can be declared `#[collaborative]` with **no data
+  migration** (it must be `NOT NULL`; back-fill `''` first).
+  **Live sessions** (needs `presence` too): `state.collab()` is a
+  `collab::CollabHub` holding one live document per field instance.
+  `hub.open_with(&doc_key("notes", id, "body"), || note.body.clone())?` seeds it
+  from the row once, and `collab::hub::serve_socket(&doc, actor, label, socket)`
+  is the whole client protocol from a `#[ws]` handler — operations fan out over
+  a `Channels` topic, membership comes from `Presence`, cursors ride a message
+  merged into the participant list. Authorize the **record** before opening the
+  document: the hub applies no ownership check. The last editor to leave evicts
+  the document; `hub.close(key)` hands back a `CollabClose` whose `text()` is
+  the final state to persist. The document stays discoverable until
+  `finalize()`, so a reconnect during the write joins it instead of seeding a
+  second authority from the stale row.
+  **Offline**: `collab::CollabResolver::for_table("notes")` replaces
+  last-write-wins for the marked columns of that collection in the
+  offline-sync engine (`sync::server::router`), leaving every other column and
+  every row-level delete to the wrapped resolver. Cost: the merge scans the
+  character list, so it suits note-sized and comment-sized fields. See
+  [collaboration](../../../docs/guide/collaboration.md) and
+  `examples/collab-notes`.
+- **(0.8.0)** `#[classified]` / `#[classified(personal_data)]` (issue #1654) — marks a
   non-null `String` column as **personal data** and carries that classification
   on the *type*, not in a name denylist. The generated field becomes
   `autumn_web::classify::Classified<String, {Model}{Column}Classified>` — a
@@ -300,6 +352,40 @@ from -> to: "guard", ...))]` field attribute on `String` fields, generating
   `classify::manifest::ClassifiedFieldDescriptor` inventory registration, and
   `Model::__AUTUMN_CLASSIFIED_COLUMNS`. `autumn data-flow` emits the manifest.
   See `docs/guide/data-classification.md`.
+- **(0.8.0)** `#[confidential]` / `#[confidential(blind_index)]` (issue #1771) —
+  marks a column **operator-blind**: the value is sealed on the client under a
+  key the server never receives, so the server holds only ciphertext. Unlike
+  `#[encrypted]` (operator-held keys, `String` field, transparent plaintext in
+  Rust), the field is declared as `autumn_web::confidential::Sealed` — an opaque
+  envelope with no `Display`, no `Deref` and no accessor that yields plaintext.
+  Every generated struct (`NewX`/`UpdateX`/`Changeset`/`XFactory`/JSON view)
+  therefore carries ciphertext, and the database, `autumn db backup` output, the
+  access and error log, replay capsules, record version history, the admin UI and
+  its CSV export hold only that.
+  Client side: `RootKey::generate()` / `::from_hex` / `::from_bytes` (no
+  `Serialize`, no `Display`, no byte accessor, zeroizes on drop, never built from
+  config or the credentials store),
+  `FieldContext::for_record(table, column, owner, record)` (or `::new` without
+  the record, which leaves rows interchangeable), then
+  `key.seal(&ctx, plaintext)? -> Sealed` and `key.unseal(&ctx, &sealed)?`.
+  Equality: `#[confidential(blind_index)]` requires a companion
+  `<field>_bidx: autumn_web::confidential::BlindIndex` column; the client sends
+  `key.blind_index(&ctx, plaintext)` and the server compares the token
+  (constant-time `PartialEq`, fixed 32 hex characters, so no length leak).
+  Refused at **build time**: `#[encrypted]`, `#[classified]`, `#[searchable]`,
+  `#[unique]`, `#[indexed]`, `#[references]`, `#[normalize]`, `#[translatable]`,
+  `#[id]`, `#[lock_version]`, `#[position]`, `#[state_machine]`, `#[default]`, a
+  `tenant_id` column, `#[serde(rename)]` / `rename_all`,
+  `#[diesel(column_name)]`, the model's shard key, a non-`Sealed` field type —
+  and, through the `Model::__AUTUMN_CONFIDENTIAL_COLUMNS` list `#[model]`
+  publishes, a `#[repository]` `find_by_<field>` / `count_by_` / `delete_by_` /
+  `exists_by_`, `find_or_create_by_<field>`, `cursor_key = <field>` or grouped
+  aggregate. Query the `_bidx` companion instead. Generated: a type assertion
+  proving the field really is `Sealed`, a
+  `confidential::ConfidentialColumnDescriptor` inventory registration, and
+  `Model::__AUTUMN_CONFIDENTIAL_COLUMNS`. See
+  `docs/guide/confidential-fields.md` for the threat model, including what
+  sealing does not hide.
 - `#[normalize(trim, downcase, upcase, squish, strip_nul, with = path::to::fn)]` (issue
   #1379) — canonicalizes a `String` column, composing normalizers
   left-to-right. Built-ins live in `autumn_web::normalize`
@@ -413,7 +499,9 @@ enforces `max_depth` (default 5) and same-record `reply_to`, and moves
 `comment_count` with the #1325 counter-cache primitive in the same transaction.
 `comment_thread` is one query at any depth; `delete_comment` cascades to the
 descendant subtree and is idempotent, and takes `parent_id` so a comment id
-alone is never authority over a comment on another record.
+alone is never authority over a comment on another record. With
+`soft_delete = false` it refuses (`422`) a subtree that has a reply on another
+record, because the `parent_id` cascade would delete that reply too.
 `recompute_comment_count` is the drift repair (`counter_cache_recompute` would
 be WRONG here — it keys on the fk column alone, which is shared across models).
 Like `react()`, all four take their own pooled connection — never hold a `Db`
@@ -557,12 +645,106 @@ delete actions remain last-write-wins.
 - `Db::tx_with(opts: TxOptions, f) -> Result<T, AutumnError>`
   (**0.6.0**) — closure gets `&mut AsyncPgConnection`; auto-retries
   SQLSTATE 40001 with capped exponential backoff.
+- `Db::tx_immediate(f)` (0.8.0, #2885) — same semantics as `Db::tx`
+  (closure gets `&mut RuntimeConnection`); on SQLite it begins
+  `BEGIN IMMEDIATE`, so a concurrent writer on a file database queues on
+  `busy_timeout` instead of failing its read→write upgrade with
+  `SQLITE_BUSY_SNAPSHOT`. Use it for write-heavy closures; keep pure reads on
+  `Db::tx`. On a `cache=shared` target it only stops writers from all
+  reading before they upgrade; any writer can still get `SQLITE_LOCKED`
+  immediately (no queueing, no guaranteed winner), so pair it with a backoff
+  retry there. `ShardedDb::tx_immediate` delegates.
 - `autumn_web::db::IsolationLevel` {`ReadCommitted` (default),
   `RepeatableRead`, `Serializable`}; `TxOptions` builders
   `::read_committed()` / `::repeatable_read()` / `::serializable()` +
   `.read_only()` / `.deferrable()` / `.max_attempts(n)` /
   `.initial_backoff(d)` / `.max_backoff(d)`; retrying constructors default
   to 5 attempts.
+
+## Money and the ledger (`autumn_web::money`, 0.8.0, #1837)
+
+Not `autumn_web::ledger`, which is the bitemporal *record* ledger.
+
+- `Money<C>` — an amount in currency `C`, as an `i64` count of minor units.
+  No `f64`, and no `Add`/`Sub` impls (an operator cannot report an overflow).
+  `from_minor` / `from_major` / `minor` / `currency` / `to_decimal` /
+  `checked_add` / `checked_sub` / `checked_neg` / `checked_abs` /
+  `checked_mul` / `try_sum` / `is_zero` / `is_positive` / `is_negative` /
+  `to_any`; `ZERO`.
+- `Money::from_decimal(d, Rounding)` and `from_decimal_exact(d)` (refuses to
+  round). `Rounding` {`HalfUp`, `HalfEven`, `HalfDown`, `TowardZero`,
+  `AwayFromZero`, `Floor`, `Ceiling`} — no default, every call names one.
+- `Money::allocate(&[i64])` / `split(n)` — largest-remainder; the parts always
+  sum back to the whole. `split` is bounded by `money::MAX_PARTS`.
+- `Currency` (sealed) with markers `Usd`, `Eur`, `Gbp`, `Jpy`, … (34 ISO 4217
+  codes, exponents 0/2/3). `Usd::currency()` gives the runtime `CurrencyCode`;
+  `CurrencyCode::parse(code)` / `::known()`.
+- `AnyMoney` — runtime-tagged amount for a stored row: `new` / `zero` /
+  `minor` / `currency` / `to_decimal` / `checked_add` / `checked_sub` /
+  `checked_neg` / `try_sum` / `try_into_typed::<C>()`.
+- `MoneyError` {`Overflow`, `CurrencyMismatch`, `UnknownCurrency`, `Inexact`,
+  `InvalidWeights`} → 422, except `Overflow` → 500.
+- `money::ledger::{ensure_account, set_allow_negative, account, post, balance,
+  transaction_by_key, trial_balance}` — all take `&mut RuntimeConnection`, so
+  they nest inside `Db::tx`. `post` **requires** a transaction.
+- `Account::new(id, currency)` / `.disallow_negative()`; `Posting::debit(...)` /
+  `::credit(...)`; `Transaction::new(key, postings).memo(...)` /
+  `.validate()`; `IdempotencyKey::new(s)` / `::derive(namespace, &postings)`;
+  `PostOutcome::{Posted, Replayed}` with `is_posted` / `is_replayed` /
+  `transaction`; `PostedTransaction`, `CurrencyTotal`, `Side`.
+- `LedgerError` {`Money`, `Unbalanced`, `PostingCount`, `OneSided`,
+  `ZeroPosting`, `MixedCurrencies`, `NegativeAmount`, `UnknownAccount`,
+  `AccountCurrency`, `KeyReuse`, `InvalidText`, `NegativeBalance`,
+  `NotInTransaction`, `Conflict`, `EmptyTransaction`, `Database`} — 409 for
+  `KeyReuse` / `NegativeBalance` / `Conflict`, 500 for `NotInTransaction` /
+  `EmptyTransaction` / `Database`, 422 for the rest.
+- Tables `ACCOUNTS_TABLE` / `TRANSACTIONS_TABLE` / `POSTINGS_TABLE`
+  (`_autumn_money_*`), append-only by trigger on both backends, shipped in the
+  framework migration set.
+
+## SLA obligations (`autumn_web::sla`, 0.8.0, #1826)
+
+Needs the `sla` feature. Deadlines in business time. The clock runs only in working hours and reads
+only the injected `Clock`.
+
+- `BusinessCalendar::new()` / `::weekdays(hours)` + `.hours(Weekday, hours)` /
+  `.holiday(NaiveDate)` / `.annual_holiday(month, day)` / `.zone(Tz)` /
+  `.business_day(Duration)`; reads: `working_time(from, to, tz)`,
+  `deadline(from, budget, tz)`, `is_working`, `next_working_instant`,
+  `day_length`, `is_holiday`, `home_zone`.
+- `WorkingHours` — `"09:00-17:00".parse()`, `::new(open, close)`, `ALL_DAY`.
+- `BusinessDuration` — `"2 business days".parse()`, `::days` / `::hours` /
+  `::minutes` / `::from_parts(days, secs)`, `resolve(&calendar)`.
+- `Obligation::new(name, subject)` + `.within(d)` / `.calendar(name)` /
+  `.zone(tz)` / `.zone_from(&value)` / `.starting_at(t)` / `.met_at(t)`;
+  `key()` is `"<name>/<subject>"` (`/` and `%` in the name percent-encoded); `status_with(&cal, tz, now)` is pure.
+- `#[obligation(name = ident, within = "...", starts = field, calendar = "...",
+  met = field, zone = field, subject = field)]` on a struct adds
+  `<name>_obligation(&self)`. A bad `within` is a compile error.
+- `SlaPlugin::new().calendar(name, cal).store(s).on_breach(name, |state,
+  breach| async { .. }).on_any_breach(..)`; registers jobs `CHECK_JOB`
+  (`autumn_sla_check`) and `ESCALATE_JOB` (`autumn_sla_escalate`).
+- `Sla` extractor (or `Sla::from_state`): `status(&ob)`, `track(&ob)`,
+  `meet(key)`, `get(key)`, `statuses()`, `forget(key)`, `reconcile()` (after a
+  calendar change), `calendar(name)`,
+  `now()`.
+- `ObligationStatus` {`key`, `state`, `zone`, `started_at`, `due_at`,
+  `met_at`, `escalated_at`, `resumes_at`, `budget`, `elapsed`, `remaining`};
+  `ObligationState` {`Running`, `Paused`, `Met`, `Breached`}.
+- `SlaBreach` (serde) {`key`, `obligation`, `subject`, `calendar`, `zone`,
+  `generation`, `started_at`, `due_at`, `escalated_at`, `token`} — the typed
+  escalation.
+- `ObligationStore` trait (`insert` → `(record, created)`, `get`, `list`,
+  `remove`, and the generation-bound writes `mark_met`, `set_due`,
+  `begin_dispatch`, `claim_escalation`, `release_escalation`);
+  `ObligationRecord { obligation, generation, escalated_at, due_at,
+  dispatch_token }` (the stored deadline decides the claim; `reconcile`
+  rewrites it after a calendar change; the first escalate job's token wins
+  the dispatch, so the handler runs once); `track` is idempotent and safe to retry;
+  `MemoryObligationStore` is the per-process default; replicas need one
+  shared store. A breach met late still escalates.
+- `SlaError` {`InvalidHours`, `InvalidDuration`, `UnknownCalendar`,
+  `NotInstalled`, `NoJobRuntime`, `Job`, `Store`} → 500 through `?`.
 
 ## Form helpers (`autumn_web::form`)
 
@@ -1005,7 +1187,7 @@ to a downloadable PDF `IntoResponse` built on `Download`.
   `issue_scoped_api_token`, `#[secured(scopes = [...])]`,
   `PolicyContext::has_scope/has_any_scope/has_all_scopes`, `autumn token
   issue --name/--scope/--expires-at | list | rotate`, admin `TokenAdminModel`.
-- **(unreleased, #1394)**: admin impersonation —
+- **(0.8.0, #1394)**: admin impersonation —
   `autumn_web::auth::impersonation::{begin_impersonation, end_impersonation,
   impersonator_id, is_impersonating, impersonation_state, audit_actor_id, clear,
   Impersonation, ImpersonationGate, ImpersonationPolicy, ImpersonationTarget,
@@ -1060,7 +1242,10 @@ double-submits and replays.
   feature enabled).
   **Note**: `#[model]` and `#[repository]` are NOT in the prelude — use
   `#[autumn_web::model]` and `#[autumn_web::repository]` (qualified paths).
-- Rendering: `asset_url`, `Markup`, `PreEscaped`, `html!`.
+- Rendering: `asset_url`, `Markup`, `PreEscaped`, `html!`. `asset_url` also
+  returns content-hashed URLs for files compiled into a crate:
+  `asset_url("js/htmx.min.js")` (the framework's own scripts) and
+  `asset_url("_plugins/<ns>/<file>")` (an installed `PluginAssets` bundle).
 - Accessibility primitives (`maud` feature, 0.6.0):
   `Button`, `ButtonType`, `Img`, `Link`, `MenuItem`, `TextField`.
 - Extractors: `Db`, `LazyDb`, `Form`, `Json`, `Path`, `Query`, `State`, `Session`,
@@ -1093,6 +1278,7 @@ double-submits and replays.
 | `layer(...)`, `has_layer<T>()`, `get_layer_types()` | Tower middleware |
 | `merge(router)`, `nest(path, router)` | Raw Axum composition |
 | `declare_plugin_routes(...)` | Plugin route declarations |
+| `plugin_assets(&'static PluginAssets)` | Serve a plugin's compiled-in assets under `/static/_plugins/<ns>/`: hashed URL `immutable`, plain URL `must-revalidate`, ETag/304/Range, routes declared public. Build the bundle with `plugin_assets!("ns")` (embeds `assets/`, `embed-assets`) or `PluginAssets::from_files(ns, &[(path, bytes)])`; emit tags with `ASSETS.script_tag(path)` / `deferred_script_tag` / `stylesheet_tag` (hashed URL + `integrity`). A second, different bundle with the same namespace panics. Guide: `docs/guide/plugin-assets.md` |
 | `on_startup(...)`, `on_shutdown(...)` | Lifecycle hooks |
 | `with_extension(value)`, `update_extension(...)`, `extension<T>()` | Typed state extensions |
 | `i18n(bundle)`, `i18n_auto()` | I18n bundle setup |
@@ -1128,6 +1314,7 @@ to a wall-clock jump in production.
 | `MonotonicInstant::saturating_duration_since(earlier)` | Elapsed duration; never negative, never panics (**0.7.0**) |
 | `MonotonicInstant::saturating_add(dur)` | Deadline arithmetic without `Instant + Duration`'s panic (**0.7.0**) |
 | `time::monotonic_now()` | Real monotonic clock, for code with no `ClockSource` in scope (**0.7.0**) |
+| `time::ambient_now()` / `ambient_monotonic()` / `ambient_instant()` / `ambient_system_time()` / `AmbientClock` | For code with no clock in scope: the running `Sim`'s virtual clock on this thread, else the system clock. Measure with `ambient_instant().saturating_duration_since(start)`, never `start.elapsed()` (#2967) |
 | `time::clock_unix_secs(clock)` / `clock_unix_duration(clock)` | Unix time from the injected clock |
 | `ClockSource::now` / `ClockSource::monotonic` | The trait; `monotonic` is defaulted to real time, so a **virtual** clock must override it (**0.7.0**) |
 | `Rng` extractor -> `.uuid_v4()` / `.uuid_v7(ms)` / `.next_u64()` | Ids and randomness from the injected `Entropy` source |
@@ -1138,6 +1325,16 @@ to a wall-clock jump in production.
 `std::time::Instant` — a raw `std::time::Instant` reads the real machine clock
 even inside a `#[sim_test]`. For a deadline whose counterparty is
 `tokio::time::sleep`, use `tokio::time::Instant`.
+
+## Simulation Phase 2 (`autumn_web::sim`, #2967)
+
+| API | Purpose |
+|---|---|
+| `Sim::net(SimNet)` | Route outbound `http_client::Client` calls through a seeded virtual network. `SimNet::new().host("payments", router).latency(min, max).drop_rate(p)`; `net.partition("payments")` / `net.heal(..)`; `net.events()` logs each attempt (`NetFault::{None, Dropped, Partitioned, TimedOut}`). No call reaches the real network; a host with no router falls back to `http_mock`s (`http-client` feature) |
+| `Sim::interleave(Vec<F>)` / `Sim::spawn(fut)` | Seeded poll order for futures / seeded yields for a spawned task, so a sweep explores task interleavings. The same seed replays the same order |
+| `sim::crash_at(index, op)` → `CrashOutcome` | Drop `op` at its `index`-th suspension. Pair with `CrashPoint::await_index` and `Sim::kill` / `Sim::restart` |
+| `Sim::try_run_to_idle()` → `Result<(), SimStall>` | `run_to_idle` panics with the seed when the drain never settles (a job that re-enqueues itself); this returns the `SimStall` instead |
+| `http_client::ClientError::SimNetwork` | A sim drop, partition, timeout or unknown host. `ClientError` is `#[non_exhaustive]` |
 
 ## Authored fault scenarios (`autumn_web::sim::FaultPlan`, #1680)
 
@@ -1244,7 +1441,7 @@ csv = ["dep:csv"]
 system-tests = ["dep:chromiumoxide"]
 ```
 
-`storage-s3` is not an `autumn-web` feature. Use `autumn-storage-s3 = "0.7"`.
+`storage-s3` is not an `autumn-web` feature. Use `autumn-storage-s3 = "0.8"`.
 
 ## Generated UI (`autumn_web::constela`, feature `constela`)
 
@@ -1326,7 +1523,7 @@ opentelemetry-otlp = { version = "0.31.0", default-features = false, features = 
 redis = { version = "1.2.0", default-features = false, features = ["aio", "tokio-comp", "connection-manager", "script", "tokio-rustls-comp"] }
 tokio-cron-scheduler = { version = "0.15", features = ["signal"] }
 chrono-tz = "0.10"
-validator = { version = "0.20", features = ["derive"] }
+validator = { version = "0.21", features = ["derive"] }
 bcrypt = "0.19"
 futures = "0.3"
 indexmap = "2"
@@ -1604,7 +1801,7 @@ In-process HTTPS termination on the same host:port (off by default).
   probes its own loopback listener over TLS instead of failing forever. See
   `docs/guide/tls.md`.
 
-### `[server.tls.client_auth]` (feature `tls`, unreleased, #1640)
+### `[server.tls.client_auth]` (feature `tls`, 0.8.0, #1640)
 
 Mutual TLS: verify the *caller's* certificate, not just prove the server's.
 Absent, the handshake is byte-for-byte the server-only TLS above.
@@ -1663,7 +1860,7 @@ default. Mutually exclusive with static `cert_path` / `key_path`.
   accept from the site.
 - Automatic HTTP-01 provisioning + hourly leader-elected renewal.
 
-### `[server.tls.acme.dns]` (feature `acme`, unreleased — trunk-dev, #1620)
+### `[server.tls.acme.dns]` (feature `acme`; ACME since 0.6.0, DNS-01 since 0.8.0, #1620)
 
 Answers every authorization over **DNS-01** instead of HTTP-01, which is what a
 **wildcard** certificate requires — so one `*.myapp.com` covers every tenant
@@ -1714,7 +1911,7 @@ provider = "cloudflare"
 
 See `docs/guide/tls.md`.
 
-### `[server.tls.acme.custom_domains]` (feature `acme`, unreleased — trunk-dev, #1635)
+### `[server.tls.acme.custom_domains]` (feature `acme`, 0.8.0, #1635)
 
 Lets a **tenant connect its own hostname** (`app.clientco.com`), each getting its
 own verified, auto-renewing certificate served by SNI. Config-only: no per-domain
@@ -1742,9 +1939,13 @@ ingress_ipv4     = ["203.0.113.10"]      # A records, for tenant APEX domains
 
 The app drives the journey through
 `autumn_web::custom_domain::CustomDomainRegistry` (published in `AppState`):
-`register(hostname, tenant, now)` connects one, `DnsInstructions::for_hostname`
-renders the exact record to show the tenant, and `list_for_tenant` renders
-status. States are `pending_dns` → `verified` → `issuing` → `active`; a stuck
+`register(hostname, tenant, now)` connects one, `DnsInstructions::for_domain`
+renders the exact records to show the tenant, and `list_for_tenant` renders
+status. A domain verifies only when it points at the ingress AND its
+`_autumn-challenge.<hostname>` TXT record carries the registration's
+`verification_token`; each registration mints a new token, so DNS a previous
+tenant left behind proves nothing. `active` domains from before the token are
+grandfathered. States are `pending_dns` → `verified` → `issuing` → `active`; a stuck
 domain carries `failure_reason`, and an `active` domain that fails renewal STAYS
 active and serving.
 

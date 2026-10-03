@@ -3,8 +3,8 @@
 Autumn relies on procedural macros to eliminate boilerplate. This guide shows
 you exactly what those macros generate so there are no surprises at runtime.
 
-Examples in this guide track the Autumn 0.7.x line and Rust 1.88.0+ as of
-2026-07-10.
+Examples in this guide track the Autumn 0.8.x line and Rust 1.88.0+ as of
+2026-10-01.
 
 The code snippets are **illustrative**, not compiled doctests: the "what it
 expands to" blocks are hand-written conceptual expansions (the real output has
@@ -38,7 +38,7 @@ When your application starts, Autumn logs every decision it makes. A typical
 startup sequence looks like this:
 
 ```
-  INFO autumn: Autumn starting version="0.7.0" profile="dev"
+  INFO autumn: Autumn starting version="0.8.0" profile="dev"
   INFO autumn: Database pool configured max_connections=10
   INFO autumn: Registered task name="db_cleanup" schedule="every 5m"
   INFO autumn: Listening addr=127.0.0.1:3000
@@ -47,7 +47,7 @@ startup sequence looks like this:
 If you omit the database:
 
 ```
-  INFO autumn: Autumn starting version="0.7.0" profile="dev"
+  INFO autumn: Autumn starting version="0.8.0" profile="dev"
   INFO autumn: Database not configured
   INFO autumn: Listening addr=127.0.0.1:3000
 ```
@@ -74,7 +74,7 @@ AUTUMN_SHOW_CONFIG=1 cargo run
 This produces output like:
 
 ```
-  INFO autumn: Autumn starting version="0.7.0" profile="dev"
+  INFO autumn: Autumn starting version="0.8.0" profile="dev"
   INFO autumn: Registered routes:
     /            GET      -> index
     /todos       GET      -> list_todos
@@ -288,6 +288,11 @@ Collect the static metadata with `static_routes![about, ...]`, which calls the
 A WebSocket upgrade route built on a **two-function** pattern: your outer
 function runs at upgrade time (with normal extractors) and returns a value
 implementing `WsHandler` that owns the live socket.
+
+Behind the non-default `ws` Cargo feature — `autumn-web = { version = "0.8",
+features = ["ws"] }`. Without it the attribute does not exist, and the block
+below fails to compile against your own file. See
+[WebSockets](./websockets.md).
 
 **You write:**
 
@@ -1633,6 +1638,16 @@ See [The Agent Authority Envelope](./agent-authority.md).
 
 ## Mail
 
+Every macro in this section is behind a non-default Cargo feature:
+`#[mailer]`, `#[mailer_preview]` and `mail_previews![]` need `mail`,
+and `#[inbound_mail]` needs `inbound-mail`.
+
+```toml
+autumn-web = { version = "0.8", features = ["mail", "inbound-mail"] }
+```
+
+See [Mail](./mail.md) for the subsystem itself.
+
 ### `#[mailer]`
 
 Applied to an `impl` block. For each method that returns
@@ -1693,9 +1708,15 @@ InboundMailRouter::new().handler(handle_support_handler_info())
 
 Recipient matching: `to = "address@example.com"` (exact),
 `to = "replies+{token}@app.example"` (plus-address; token via
-`InboundEmail::plus_token()`), or `to = "prefix+*"` (local-part prefix).
-`processing = "sync" | "background"` (default `"background"`). See
-[Mail](./mail.md).
+`InboundEmail::plus_token()`), or `to = "prefix*"` (local-part prefix).
+`processing = "sync" | "background"` (default `"background"`).
+
+This page shows what the macro expands to. For the subsystem it plugs into —
+the provider endpoints, the router, and what `background` costs you when a
+handler fails — see
+[Receiving Mail](./mail.md#receiving-mail-inbound-email), and
+[the recipient pattern table](./mail.md#routing-a-message-to-a-handler) for the
+full matching rules.
 
 ---
 
@@ -1704,7 +1725,9 @@ Recipient matching: `to = "address@example.com"` (exact),
 ### `t!` (i18n translate)
 
 Translates an i18n key, with **compile-time validation** that the key exists in
-the default locale's `.ftl` file.
+the default locale's `.ftl` file. Behind the non-default `i18n` feature —
+`autumn-web = { version = "0.8", features = ["i18n"] }`; see
+[Internationalization](./i18n.md).
 
 **You write:**
 

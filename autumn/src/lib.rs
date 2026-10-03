@@ -148,7 +148,11 @@ mod fs_atomic;
 // not in scope (`-D rustdoc::broken_intra_doc_links` in `scripts/check-docs.sh`).
 // The module documents itself.
 pub mod classify;
+// A plain comment, not a doc comment: the module carries its own `//!` docs
+// and an outer `///` here would be merged with them.
 pub mod cluster;
+#[cfg(feature = "collab")]
+pub mod collab;
 pub mod config;
 pub mod consent;
 // Parse, validate and server-render Constela documents: the constrained JSON UI
@@ -159,6 +163,7 @@ pub mod consent;
 // `classify` carry one: an outer `///` here is merged with the module's own
 // `//!` docs, and the whole block then resolves its intra-doc links in *this*
 // scope — where `policy`, `eval` and `Document` do not exist.
+pub mod confidential;
 #[cfg(feature = "constela")]
 pub mod constela;
 pub mod credentials;
@@ -223,6 +228,7 @@ pub mod seo;
 /// `autumn_web::t!(locale, "key")` usage.
 #[cfg(feature = "i18n")]
 pub use crate::i18n::t;
+pub(crate) mod accept_drain;
 #[cfg(feature = "inbound-mail")]
 pub mod inbound_mail;
 pub mod inspector;
@@ -293,6 +299,47 @@ macro_rules! embed_static {
         #[allow(unused_imports)]
         use $crate::include_dir;
         $crate::include_dir::include_dir!("$CARGO_MANIFEST_DIR/static")
+    }};
+}
+
+/// Embed a plugin crate's asset directory as a fingerprinted
+/// [`PluginAssets`](crate::assets::PluginAssets) bundle.
+///
+/// The first argument is the bundle's namespace, which becomes the URL
+/// segment under `/static/_plugins/`. The second is the directory, resolved
+/// like `include_dir!` (so `$CARGO_MANIFEST_DIR` means the **calling**
+/// crate); it defaults to `"$CARGO_MANIFEST_DIR/assets"`.
+///
+/// ```rust,ignore
+/// use autumn_web::assets::PluginAssets;
+///
+/// pub static ASSETS: PluginAssets = autumn_web::plugin_assets!("motion");
+/// // or a custom directory:
+/// pub static ASSETS: PluginAssets =
+///     autumn_web::plugin_assets!("motion", "$CARGO_MANIFEST_DIR/vendor");
+/// ```
+///
+/// Install the bundle with
+/// [`AppBuilder::plugin_assets`](crate::app::AppBuilder::plugin_assets).
+/// Without the `embed-assets` feature, list the files with
+/// [`PluginAssets::from_files`](crate::assets::PluginAssets::from_files)
+/// instead.
+#[cfg(feature = "embed-assets")]
+#[macro_export]
+macro_rules! plugin_assets {
+    ($namespace:literal) => {
+        $crate::plugin_assets!($namespace, "$CARGO_MANIFEST_DIR/assets")
+    };
+    // `$dir` is a `tt`, not a `literal`: a captured `literal` fragment is
+    // forwarded as an opaque group, and `include_dir!`'s parser only accepts a
+    // bare string token.
+    ($namespace:literal, $dir:tt) => {{
+        // `include_dir!` emits `include_dir::…` paths resolved at the call
+        // site; see `embed_static!`.
+        #[allow(unused_imports)]
+        use $crate::include_dir;
+        static DIR: $crate::include_dir::Dir<'static> = $crate::include_dir::include_dir!($dir);
+        $crate::assets::PluginAssets::from_dir($namespace, &DIR)
     }};
 }
 
@@ -417,9 +464,22 @@ pub mod read_your_writes;
 #[cfg(feature = "offline-sync")]
 pub mod sync;
 
+// Typed money and an append-only, double-entry money ledger (issue #1837).
+// Not to be confused with `ledger` below, which records the history of a
+// `#[repository]` row.
+//
+// A `//` comment, not `///`: an outer doc attribute here merges into the
+// module's own `//!` header and makes its unqualified intra-doc links resolve
+// in `lib.rs`'s scope instead of the module's. `Money`, `AnyMoney` and
+// `MoneyError` are deliberately not re-exported at the crate root — `Money` is
+// too plausible an application type name to take — so every one of those links
+// would break. Same reason as `data_retention` above.
+pub mod money;
+
 /// Bitemporal, tamper-evident record ledger for `#[repository]` writes.
 ///
-/// See [`ledger`] module documentation for the full API (issue #1699).
+/// See [`ledger`] module documentation for the full API (issue #1699). This
+/// records the history of a row. For money, see [`money`].
 pub mod ledger;
 // The data types a caller handles. The two *evidence* enums the verification
 // entry point takes — `LedgerLiveState` and `LedgerHighWaterState` — are
@@ -630,6 +690,10 @@ pub mod slug;
 pub use slug::{contains_letter_or_number, slugify};
 #[cfg(feature = "redis")]
 pub(crate) mod session_redis;
+// Calendar-aware SLA obligations (issue #1826). A plain comment, not `///`:
+// the module header has intra-doc links that must resolve in the module.
+#[cfg(feature = "sla")]
+pub mod sla;
 pub mod sse;
 /// Static site generation support.
 pub mod static_gen;
@@ -862,7 +926,10 @@ pub use db::RuntimeBackend;
 /// See the [`error`] module for details.
 pub use error::{AutumnError, AutumnResult};
 
-pub use tenant_cell::{QuotaExceeded, TenantCell, TenantCellHandle, TenantCellRegistry};
+pub use tenant_cell::{
+    QuotaExceeded, TenantAllocationError, TenantArena, TenantBytes, TenantCell, TenantCellHandle,
+    TenantCellRegistry, TenantString,
+};
 
 /// Paginated list response wrapper with navigation metadata.
 ///
@@ -1083,6 +1150,10 @@ pub use autumn_macros::sim_test;
 #[cfg(feature = "maud")]
 pub use autumn_macros::story;
 
+/// Annotate an OAuth2/OIDC callback handler.
+///
+/// Convenience alias for `#[get(...)]` with callback-focused naming.
+pub use autumn_macros::oauth2_callback;
 /// Derive Diesel and Serde traits for a database model struct.
 ///
 /// Applies `Queryable`, `Selectable`, `Insertable`, `Serialize`, and
@@ -1153,17 +1224,13 @@ pub use autumn_macros::story;
 /// registry, backfill and status API, `GET /actuator/derivations` for state and
 /// drift, and `docs/guide/derivations.md` for the guide.
 #[cfg(feature = "db")]
-pub use autumn_macros::model;
-/// Annotate an OAuth2/OIDC callback handler.
-///
-/// Convenience alias for `#[get(...)]` with callback-focused naming.
-pub use autumn_macros::oauth2_callback;
+pub use autumn_macros_model::model;
 
 /// Derive a repository with CRUD operations and derived queries.
 ///
 /// See [`macro@repository`] for details.
 #[cfg(feature = "db")]
-pub use autumn_macros::repository;
+pub use autumn_macros_repository::repository;
 
 /// Define a service for cross-model orchestration and non-DB side effects.
 ///
@@ -1190,7 +1257,7 @@ pub use autumn_macros::repository;
 /// }
 /// ```
 #[cfg(feature = "db")]
-pub use autumn_macros::service;
+pub use autumn_macros_model::service;
 
 /// Mark a typed handler as a service endpoint (issue #1755).
 ///
@@ -1768,6 +1835,34 @@ pub use autumn_macros::edge_routes;
 /// ```
 pub use autumn_macros::lifecycle;
 
+/// Declare a business-time obligation on a struct (issue #1826).
+///
+/// It adds a `<name>_obligation(&self)` method that returns an
+/// [`sla::Obligation`]. See the [`sla`] module.
+///
+/// ```rust,ignore
+/// use autumn_web::obligation;
+///
+/// #[obligation(
+///     name = first_response,
+///     within = "2 business days",
+///     calendar = "support",
+///     starts = opened_at,
+///     met = responded_at,
+///     zone = customer_zone,
+/// )]
+/// pub struct Ticket {
+///     pub id: i64,
+///     pub opened_at: chrono::DateTime<chrono::Utc>,
+///     pub responded_at: Option<chrono::DateTime<chrono::Utc>>,
+///     pub customer_zone: String,
+/// }
+///
+/// let obligation = ticket.first_response_obligation();
+/// ```
+#[cfg(feature = "sla")]
+pub use autumn_macros::obligation;
+
 /// Marker trait implemented by every `#[lifecycle]` enum, exposing that
 /// lifecycle's transition edges as a string-keyed table.
 ///
@@ -1974,6 +2069,16 @@ pub use maud::html;
 /// }
 /// ```
 pub use crate::extract::Json;
+
+/// CSV request body extractor and response type.
+///
+/// When used as a handler parameter, deserializes the request body as a CSV list of records.
+/// When returned from a handler, serializes the value as CSV with
+/// `Content-Type: text/csv; charset=utf-8`.
+///
+/// Requires the `csv` feature.
+#[cfg(feature = "csv")]
+pub use crate::extract::Csv;
 
 /// Path extractor.
 ///

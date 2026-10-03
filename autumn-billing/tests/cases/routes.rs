@@ -6,6 +6,7 @@ use autumn_billing::prelude::*;
 use autumn_billing::routes::route_infos;
 use autumn_billing::store::{CustomerUpsert, SubscriptionUpsert};
 use autumn_billing::{PortalRequest, ProviderId, SubscriptionStatus};
+use autumn_web::tenancy::with_tenant;
 use autumn_web::test::TestApp;
 use autumn_web::time::FixedClock;
 use chrono::{DateTime, TimeZone, Utc};
@@ -633,6 +634,149 @@ async fn boot_fails_when_declared_endpoint_preset_differs_from_provider() {
     );
 }
 
+/// What `autumn.toml` gives an app that follows the guide: an endpoint entry
+/// without `max_body_bytes`, so the webhook default (1 MiB). `BillingConfig::
+/// webhook_endpoint()` raises it to 4 MiB, but only the test helpers call that.
+const WEBHOOK_DEFAULT_BODY_LIMIT: usize = 1024 * 1024;
+/// The least the billing receiver needs: provider events carrying many invoice
+/// lines outgrow the default, and an oversized body is a 400 the provider
+/// retries forever without the event ever reaching reconciliation.
+const BILLING_MIN_BODY_LIMIT: usize = 4 * 1024 * 1024;
+
+#[tokio::test]
+async fn boot_fails_when_declared_endpoint_body_limit_is_below_the_billing_minimum() {
+    let billing = support::config();
+    let mut autumn = support::autumn_config(&billing);
+    autumn
+        .security
+        .webhooks
+        .endpoints
+        .first_mut()
+        .expect("declared endpoint")
+        .max_body_bytes = WEBHOOK_DEFAULT_BODY_LIMIT;
+    let message = boot_panic_message(|| {
+        support::harness_with(
+            billing,
+            autumn,
+            MemoryBillingStore::shared(),
+            FakeProvider::new(),
+            pinned,
+        )
+    });
+    assert!(message.contains("max_body_bytes"), "{message}");
+    // Both what the entry declares and what is needed, so the fix is obvious.
+    assert!(
+        message.contains(&WEBHOOK_DEFAULT_BODY_LIMIT.to_string()),
+        "{message}"
+    );
+    assert!(
+        message.contains(&format!("max_body_bytes = {BILLING_MIN_BODY_LIMIT}")),
+        "{message}"
+    );
+}
+
+#[tokio::test]
+async fn boot_accepts_a_declared_endpoint_with_a_larger_body_limit() {
+    let billing = support::config();
+    let mut autumn = support::autumn_config(&billing);
+    autumn
+        .security
+        .webhooks
+        .endpoints
+        .first_mut()
+        .expect("declared endpoint")
+        .max_body_bytes = BILLING_MIN_BODY_LIMIT * 2;
+    // A larger limit is the app's call; only a smaller one fails boot.
+    let _harness = support::harness_with(
+        billing,
+        autumn,
+        MemoryBillingStore::shared(),
+        FakeProvider::new(),
+        pinned,
+    );
+}
+
+#[tokio::test]
+async fn boot_honors_a_provider_that_expects_a_smaller_body_limit() {
+    let billing = support::config();
+    let mut autumn = support::autumn_config(&billing);
+    autumn
+        .security
+        .webhooks
+        .endpoints
+        .first_mut()
+        .expect("declared endpoint")
+        .max_body_bytes = WEBHOOK_DEFAULT_BODY_LIMIT;
+    // The minimum is the provider's call, not Stripe's: a provider whose
+    // expected endpoint allows 1 MiB must not be forced to buffer 4 MiB.
+    let _harness = support::harness_with(
+        billing,
+        autumn,
+        MemoryBillingStore::shared(),
+        FakeProvider::with_webhook_body_limit(WEBHOOK_DEFAULT_BODY_LIMIT),
+        pinned,
+    );
+}
+
+/// Every `toml` code fence in `text` that declares the billing webhook endpoint,
+/// parsed as the entry an app would paste into `autumn.toml`. `//!` doc-comment
+/// markers are stripped first, so the crate's rustdoc quick start is read the
+/// same way as the markdown files.
+fn documented_billing_endpoints(text: &str) -> Vec<autumn_web::webhook::WebhookEndpointConfig> {
+    let unwrapped = text
+        .lines()
+        .map(|line| {
+            line.strip_prefix("//!")
+                .map_or(line, |rest| rest.strip_prefix(' ').unwrap_or(rest))
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    unwrapped
+        .split("```toml")
+        .skip(1)
+        .filter_map(|rest| rest.split("```").next())
+        .filter(|block| {
+            block.contains("[[security.webhooks.endpoints]]") && block.contains("/billing/webhook")
+        })
+        .map(|block| {
+            let value: toml::Value = toml::from_str(block).expect("the snippet is valid TOML");
+            value["security"]["webhooks"]["endpoints"][0]
+                .clone()
+                .try_into()
+                .expect("the snippet is a webhook endpoint")
+        })
+        .collect()
+}
+
+/// A snippet is what an app copies into `autumn.toml`, so every one the crate
+/// shows must itself pass the boot check, not just the test helper's entry. The
+/// guide, the crate README and the rustdoc quick start each show it.
+#[test]
+fn every_documented_endpoint_snippet_declares_a_sufficient_body_limit() {
+    for (what, path) in [
+        ("the billing guide", "/../docs/guide/billing.md"),
+        ("the crate README", "/README.md"),
+        ("the crate rustdoc quick start", "/src/lib.rs"),
+    ] {
+        let text = std::fs::read_to_string(format!("{}{path}", env!("CARGO_MANIFEST_DIR")))
+            .unwrap_or_else(|err| panic!("read {what}: {err}"));
+        let endpoints = documented_billing_endpoints(&text);
+        // A file that stops showing the entry must not make this pass vacuously.
+        assert!(
+            !endpoints.is_empty(),
+            "{what} shows no billing endpoint entry to check"
+        );
+        for endpoint in endpoints {
+            assert!(
+                endpoint.max_body_bytes >= BILLING_MIN_BODY_LIMIT,
+                "{what} declares max_body_bytes = {}, below the {BILLING_MIN_BODY_LIMIT} the \
+                 billing receiver needs",
+                endpoint.max_body_bytes
+            );
+        }
+    }
+}
+
 #[tokio::test]
 async fn boot_fails_when_webhook_endpoint_is_undeclared() {
     let billing = support::config();
@@ -665,6 +809,11 @@ async fn boot_fails_when_webhook_endpoint_is_undeclared() {
         "{message}"
     );
     assert!(message.contains("_WEBHOOK_SECRET"), "{message}");
+    // The entry it prints is what an app pastes in, so it carries the limit.
+    assert!(
+        message.contains(&format!("max_body_bytes = {BILLING_MIN_BODY_LIMIT}")),
+        "{message}"
+    );
 }
 
 #[tokio::test]
@@ -739,4 +888,145 @@ async fn store_resolution_falls_back_to_memory() {
     );
     let service = autumn_billing::BillingService::require(client.state()).expect("plugin started");
     assert_eq!(service.store().applied_event_count().await.unwrap(), 1);
+}
+
+// ── Warden 2026-09-23: cross-tenant identity collision ────────────────────
+//
+// `SessionUser`/`Entitled<R>` key every billing lookup on the bare session
+// `user_id` string (`autumn_billing::gate::session_user_id`), with no tenant
+// component. That string is only guaranteed unique WITHIN one tenant:
+// `docs/guide/sharding.md` documents that a sharded deployment's shard-local
+// `BIGSERIAL` id "is not copied" between shards and starts over on each one,
+// so a `#[repository(tenant_scoped)]` `User` model on two different tenants'
+// shards routinely hands out the identical numeric id. `BillingPlugin`'s
+// store always resolves `DbState::pool(state)` — the app's one primary/
+// control pool (`autumn_billing::lib::BillingPlugin::resolve_store`), never a
+// per-shard one — so every tenant's billing mirror lives in the same
+// `billing_customers` table regardless. Two unrelated tenants' users sharing
+// a `user_id` are therefore treated as one and the same billing customer.
+
+#[tokio::test]
+async fn subscription_does_not_leak_across_tenants_sharing_a_shard_local_user_id() {
+    let store = MemoryBillingStore::shared();
+
+    // Tenant "acme": its user "7" completes a real checkout and the
+    // provider's webhook confirms an active Pro subscription — the ordinary
+    // flow `docs/guide/billing.md` documents, run entirely through the real
+    // HTTP entry points (never a hand-built store row) so the customer this
+    // creates is keyed exactly the way production checkout keys it.
+    let acme = support::harness(store.clone(), FakeProvider::new(), pinned);
+    acme.client.acting_as("7").await;
+    with_tenant("acme".to_owned(), async {
+        acme.client
+            .post("/billing/checkout")
+            .form("plan=pro")
+            .send()
+            .await
+            .assert_status(303);
+    })
+    .await;
+    let body = fixture_with("customer_subscription_created", |json| {
+        json["data"]["object"]["customer"] = Value::from("cus_fake_1");
+    });
+    // The provider webhook is tenant-agnostic (Stripe has no notion of
+    // Autumn tenants): it links by `provider_customer_id`, not by session,
+    // so it needs no tenant scope of its own.
+    let resp = support::post_webhook(&acme.client, &body).await;
+    resp.assert_status(200);
+    assert_eq!(resp.json::<Value>()["outcome"], "applied");
+    with_tenant("acme".to_owned(), async {
+        let resp = acme.client.get("/billing/subscription").send().await;
+        resp.assert_status(200);
+        assert_eq!(
+            resp.json::<Value>()["entitled"],
+            true,
+            "acme's own paying user must see their own subscription"
+        );
+    })
+    .await;
+
+    // Tenant "widgets": an entirely separate app/tenant sharing the same
+    // control-plane billing store, whose own independent shard-local
+    // sequence separately handed out "7" to a brand-new user who has never
+    // paid for anything.
+    let widgets = support::harness(store.clone(), FakeProvider::new(), pinned);
+    widgets.client.acting_as("7").await;
+    with_tenant("widgets".to_owned(), async {
+        let resp = widgets.client.get("/billing/subscription").send().await;
+        resp.assert_status(200);
+        let body: Value = resp.json();
+        assert_eq!(
+            body["entitled"], false,
+            "tenant widgets' own unrelated user must not inherit tenant acme's paid \
+             subscription just because their shard-local user ids happen to collide as \
+             \"7\": {body}"
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn portal_does_not_hand_a_hosted_session_to_another_tenants_customer() {
+    let store = MemoryBillingStore::shared();
+
+    // Tenant "acme" links its "7" to a real Stripe customer.
+    let acme = support::harness(store.clone(), FakeProvider::new(), pinned);
+    seed_customer(&store, "7").await;
+    acme.client.acting_as("7").await;
+
+    // Tenant "widgets" never linked its own "7" to any customer — its user
+    // has never even started a checkout.
+    let widgets = support::harness(store.clone(), FakeProvider::new(), pinned);
+    widgets.client.acting_as("7").await;
+    with_tenant("widgets".to_owned(), async {
+        let resp = widgets.client.post("/billing/portal").send().await;
+        // Without tenant scoping this wrongly resolves acme's customer row
+        // and redirects tenant widgets' user into acme's Stripe billing
+        // portal (payment methods, invoices, and the ability to cancel
+        // acme's subscription).
+        assert_ne!(
+            resp.status.as_u16(),
+            303,
+            "tenant widgets must not be handed a hosted portal session for tenant acme's \
+             Stripe customer just because their shard-local user ids collide as \"7\" \
+             (got a redirect to {:?})",
+            resp.header("location")
+        );
+        resp.assert_status(404);
+    })
+    .await;
+}
+
+/// A custom `BillingProvider` (Stripe or otherwise) receives the raw session
+/// user id, never the tenant-scoped store key — the provider is outside
+/// Autumn's own tenant boundary and has no stake in the collision that
+/// scoping exists to prevent, and a custom provider's own metadata-based
+/// lookups should not silently break on a framework upgrade.
+#[tokio::test]
+async fn provider_create_customer_receives_the_raw_user_id_not_the_tenant_scoped_one() {
+    let harness = support::harness(MemoryBillingStore::shared(), FakeProvider::new(), pinned);
+    harness.client.acting_as("7").await;
+    with_tenant("acme".to_owned(), async {
+        harness
+            .client
+            .post("/billing/checkout")
+            .form("plan=pro")
+            .send()
+            .await
+            .assert_status(303);
+    })
+    .await;
+
+    let calls = harness.provider.calls();
+    let create_customer = calls
+        .iter()
+        .find_map(|call| match call {
+            FakeCall::CreateCustomer(request) => Some(request),
+            _ => None,
+        })
+        .expect("checkout creates a provider customer");
+    assert_eq!(
+        create_customer.user_id, "7",
+        "the provider must see the raw session id, not \"acme\\u{{1}}...\"-scoped one"
+    );
 }

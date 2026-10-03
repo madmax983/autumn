@@ -122,7 +122,7 @@ const DEFAULT_BCRYPT_COST: u32 = 12;
 /// ```
 pub async fn hash_password(password: &str) -> crate::AutumnResult<String> {
     let password = password.to_string();
-    tokio::task::spawn_blocking(move || {
+    crate::time::spawn_blocking(move || {
         bcrypt::hash(password, DEFAULT_BCRYPT_COST)
             .map_err(|e| crate::AutumnError::from(std::io::Error::other(e.to_string())))
     })
@@ -163,7 +163,7 @@ pub async fn verify_password(password: &str, hash: &str) -> crate::AutumnResult<
         "$2b$12$KIXe8K4j1sH6/xH.x9d71uJ5Jk8t6O4m6Q110g4H8y1r6J6O6O6O6".to_string()
     };
 
-    let result = tokio::task::spawn_blocking(move || bcrypt::verify(&password, &hash_to_verify))
+    let result = crate::time::spawn_blocking(move || bcrypt::verify(&password, &hash_to_verify))
         .await
         .map_err(|e| crate::AutumnError::from(std::io::Error::other(e.to_string())))?;
 
@@ -1463,6 +1463,13 @@ fn jwk_allowed_algorithms(
         AlgorithmParameters::OctetKeyPair(_) => Ok(vec![Algorithm::EdDSA]),
         AlgorithmParameters::OctetKey(_) => Err(crate::AutumnError::unauthorized_msg(
             "symmetric jwk not allowed for id_token verification",
+        )),
+        // `Other` (a `kty` this crate does not recognise) and any variant a
+        // future `jsonwebtoken` adds — the enum is `#[non_exhaustive]` since
+        // 11.0 — cannot verify a signature here, so fail closed rather than
+        // guess an algorithm family.
+        _ => Err(crate::AutumnError::unauthorized_msg(
+            "unsupported jwk key type for id_token verification",
         )),
     }
 }
@@ -3193,6 +3200,25 @@ mod tests {
             jwk["alg"] = serde_json::json!(alg);
         }
         jwk
+    }
+
+    /// A JWKS entry with a `kty` this crate does not know (jsonwebtoken 11's
+    /// `AlgorithmParameters::Other`) must be rejected, not mapped to a
+    /// signature algorithm.
+    #[cfg(feature = "oauth2")]
+    #[test]
+    fn unknown_jwk_key_type_is_rejected() {
+        let jwk: jsonwebtoken::jwk::Jwk = serde_json::from_value(serde_json::json!({
+            "kty": "AKP",
+            "kid": "post-quantum-1",
+            "pub": "AAAA"
+        }))
+        .expect("unknown kty deserializes into AlgorithmParameters::Other");
+        let err = jwk_allowed_algorithms(&jwk).expect_err("unknown key type must be refused");
+        assert_eq!(
+            err.status(),
+            crate::reexports::http::StatusCode::UNAUTHORIZED
+        );
     }
 
     #[cfg(feature = "oauth2")]

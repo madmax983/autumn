@@ -528,6 +528,10 @@ struct FieldAttrs {
     /// `#[translatable]` (issue #1384). The type lowers to plain `Text`, so
     /// this marker is the only carrier of the column's empty-container default.
     is_translatable: bool,
+    /// `#[collaborative]` (issue #1806). Same shape as `is_translatable`: the
+    /// type lowers to plain `Text`, so the marker carries the column's
+    /// empty-document default.
+    is_collaborative: bool,
     reference: ReferenceSpec,
 }
 
@@ -536,6 +540,12 @@ struct FieldAttrs {
 /// `generate model` writes into the migration.
 const TRANSLATABLE_COLUMN_DEFAULT: &str = "'{}'";
 
+/// The SQL default a `#[collaborative]` column's storage requires — the empty
+/// document, which is what `CollabText::new()` encodes to. Kept identical to
+/// `autumn_web::collab::EMPTY_DOCUMENT`; a bare `'{}'` would not do, because
+/// the stored shape requires `elems` and would read as prose.
+const COLLABORATIVE_COLUMN_DEFAULT: &str = r#"'{"elems":[]}'"#;
+
 fn parse_field_attrs(field: &syn::Field) -> FieldAttrs {
     let mut out = FieldAttrs {
         is_id: false,
@@ -543,6 +553,7 @@ fn parse_field_attrs(field: &syn::Field) -> FieldAttrs {
         is_unique: false,
         is_default: false,
         is_translatable: false,
+        is_collaborative: false,
         reference: ReferenceSpec::None,
     };
     for attr in &field.attrs {
@@ -565,6 +576,9 @@ fn parse_field_attrs(field: &syn::Field) -> FieldAttrs {
             // NULL` with no DEFAULT: potentially blocking on Postgres, and
             // refused outright by `emit_add_column` on SQLite.
             "translatable" => out.is_translatable = true,
+            // #1806: same storage contract as `#[translatable]` — `TEXT NOT
+            // NULL` with an empty-container default the type cannot carry.
+            "collaborative" => out.is_collaborative = true,
             "references" => {
                 let mut target = None;
                 if !matches!(attr.meta, syn::Meta::Path(_)) {
@@ -668,6 +682,17 @@ fn build_table(
         let is_reference = raw.attrs.reference != ReferenceSpec::None;
         let column_ty = if is_reference {
             Some(ColumnType::Int64)
+        } else if raw.attrs.is_translatable
+            && ColumnType::rust_type_leaf(&raw.rust_type) == "Translated"
+        {
+            // #2292: the `#[translatable]` MARKER is what makes a
+            // `Translated`-typed field a managed `TEXT` column — not the type
+            // name. `ColumnType::from_rust_type` no longer claims the
+            // `Translated` leaf, so an unmarked look-alike
+            // (`domain::Translated`, or a bare `Translated` without the
+            // marker) falls through to the type-driven mapping below and is
+            // skipped with a diagnostic, exactly like any other unknown type.
+            Some(ColumnType::Text)
         } else {
             ColumnType::from_rust_type(&raw.rust_type)
         };
@@ -711,6 +736,11 @@ fn build_table(
                 raw.attrs
                     .is_translatable
                     .then(|| ColumnDefault::Sql(TRANSLATABLE_COLUMN_DEFAULT.to_owned()))
+                    .or_else(|| {
+                        raw.attrs
+                            .is_collaborative
+                            .then(|| ColumnDefault::Sql(COLLABORATIVE_COLUMN_DEFAULT.to_owned()))
+                    })
             })
             .or_else(|| convention_default(&raw.name, &ty, is_pk, raw.attrs.is_default, backend));
 
@@ -1024,6 +1054,36 @@ mod tests {
         assert_eq!(slug.default, None);
     }
 
+    /// #1806: `CollabText` lowers to plain `Text` for the same reason, so the
+    /// `#[collaborative]` marker is what carries the empty-document default.
+    #[test]
+    fn collaborative_column_carries_the_empty_document_default() {
+        let src = r#"
+            #[autumn_web::model]
+            pub struct Note {
+                #[id]
+                pub id: i64,
+                #[collaborative]
+                pub body: autumn_web::collab::CollabText,
+                pub title: String,
+            }
+        "#;
+        let table = parse_one(src);
+
+        let body = col(&table, "body");
+        assert_eq!(body.ty, ColumnType::Text, "storage is a plain TEXT column");
+        assert!(!body.nullable);
+        assert_eq!(
+            body.default,
+            Some(ColumnDefault::Sql(r#"'{"elems":[]}'"#.to_owned())),
+            "the empty-document default is part of the storage contract"
+        );
+
+        let title = col(&table, "title");
+        assert_eq!(title.ty, ColumnType::Text);
+        assert_eq!(title.default, None);
+    }
+
     /// The default is emitted for the marker, not for the type name: a field
     /// that happens to be `Text` gains nothing.
     #[test]
@@ -1037,6 +1097,67 @@ mod tests {
             }
         "#;
         assert_eq!(col(&parse_one(src), "title").default, None);
+    }
+
+    /// #2292: the `Translated` leaf alone does not make a managed column. An
+    /// application type that happens to share the name (`domain::Translated`)
+    /// — or even a bare `Translated` — is skipped with a diagnostic unless the
+    /// field carries the `#[translatable]` marker.
+    #[test]
+    fn unmarked_translated_lookalikes_are_skipped() {
+        for rust_type in ["domain::Translated", "Translated"] {
+            let src = format!(
+                r#"
+                #[autumn_web::model]
+                pub struct Post {{
+                    #[id]
+                    pub id: i64,
+                    pub title: {rust_type},
+                }}
+                "#
+            );
+            let parsed = parse_model_source(&src, Backend::Postgres).expect("parse");
+            let table = &parsed.tables[0];
+            assert!(
+                table.columns.iter().all(|c| c.name != "title"),
+                "`{rust_type}` without `#[translatable]` must be skipped"
+            );
+            assert!(
+                parsed.diagnostics.iter().any(|d| d.field == "title"),
+                "a diagnostic must name the skipped `{rust_type}` field"
+            );
+        }
+    }
+
+    /// #2292: the marker still wins for the real container, however the path is
+    /// spelled — including the `quote!`-introduced spacing the parser sees.
+    #[test]
+    fn marked_translated_maps_to_text_for_any_path_spelling() {
+        for rust_type in [
+            "autumn_web::i18n::Translated",
+            "crate::i18n::Translated",
+            "Translated",
+        ] {
+            let src = format!(
+                r#"
+                #[autumn_web::model]
+                pub struct Post {{
+                    #[id]
+                    pub id: i64,
+                    #[translatable]
+                    pub title: {rust_type},
+                }}
+                "#
+            );
+            let table = parse_one(&src);
+            let title = col(&table, "title");
+            assert_eq!(title.ty, ColumnType::Text, "`{rust_type}` storage");
+            assert_eq!(
+                title.default,
+                Some(ColumnDefault::Sql("'{}'".to_owned())),
+                "`{rust_type}` keeps the empty-container default"
+            );
+        }
     }
 
     #[test]

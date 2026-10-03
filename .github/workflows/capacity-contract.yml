@@ -66,7 +66,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.99.0
       - uses: Swatinem/rust-cache@v2.7.8
 
       - name: Run capacity contract unit tests
@@ -101,7 +101,7 @@ jobs:
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.99.0
       - uses: Swatinem/rust-cache@v2.7.8
 
       - name: Build CLI
@@ -125,7 +125,10 @@ jobs:
         # this runner class, not that the app regressed.
         shell: bash
         run: |
-          N="${{ inputs.noop_rebuilds || '3' }}"
+          # `inputs` is empty on the schedule trigger, so the literal fallback
+          # below IS the scheduled probe's sample size — it must stay equal to
+          # the `workflow_dispatch` default ("20") for `noop_rebuilds`.
+          N="${{ inputs.noop_rebuilds || '20' }}"
           for i in $(seq 1 "$N"); do
             echo "── no-op rebuild $i/$N ──"
             PKG="$(basename "${{ inputs.example || 'examples/hello' }}")"

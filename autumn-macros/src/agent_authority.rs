@@ -1439,8 +1439,9 @@ impl Analyzer {
                 // one keystroke wide.
                 let scrutinee = self.container_handle(&m.expr);
                 for arm in &m.arms {
-                    let saved = self.enter_binding_scope(&arm.pat, scrutinee.as_ref());
-                    if let Some((_, guard)) = &arm.guard {
+                    let (pat, guard) = crate::parse::arm_pat_and_guard(arm);
+                    let saved = self.enter_binding_scope(pat, scrutinee.as_ref());
+                    if let Some(guard) = guard {
                         self.expr(guard);
                     }
                     if let Some(spec) = self.annotation(&arm.attrs) {
@@ -3207,7 +3208,7 @@ fn path_qualifier(call: &ExprCall) -> Option<Expr> {
     };
     let mut segments = path.path.segments.clone();
     segments.pop();
-    let last = segments.pop()?.into_value();
+    let last = segments.pop()?;
     Some(Expr::Path(syn::ExprPath {
         attrs: Vec::new(),
         qself: None,
@@ -3352,11 +3353,9 @@ fn is_framework_prologue_call(call: &ExprCall) -> bool {
     // `crate = "..."` override (#1828) means an earlier-expanded guard's own
     // (already-finalized) prologue call is rooted at the actively resolved
     // name instead.
-    let rooted = path
-        .path
-        .segments
-        .first()
-        .is_some_and(|first| first.ident == crate::crate_path::current_target_path_segment());
+    let rooted = path.path.segments.first().is_some_and(|first| {
+        first.ident == autumn_macros_support::crate_path::current_target_path_segment()
+    });
     rooted
         && path.path.segments.len() > 1
         && path
@@ -3503,6 +3502,7 @@ fn collect_pat_idents(pat: &Pat, out: &mut HashSet<String>) {
         Pat::Type(p) => collect_pat_idents(&p.pat, out),
         Pat::Reference(p) => collect_pat_idents(&p.pat, out),
         Pat::Paren(p) => collect_pat_idents(&p.pat, out),
+        Pat::Guard(p) => collect_pat_idents(&p.pat, out),
         Pat::Tuple(p) => p.elems.iter().for_each(|e| collect_pat_idents(e, out)),
         Pat::TupleStruct(p) => p.elems.iter().for_each(|e| collect_pat_idents(e, out)),
         Pat::Slice(p) => p.elems.iter().for_each(|e| collect_pat_idents(e, out)),

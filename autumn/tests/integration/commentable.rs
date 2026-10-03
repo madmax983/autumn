@@ -104,6 +104,50 @@ pub struct CmtPhoto {
 pub trait CmtPhotoRepository {}
 
 diesel::table! {
+    cmt_renamed_authors (id) {
+        id -> Int8,
+        screen_name -> Text,
+    }
+}
+
+/// An author model whose display-name field is renamed from its column with
+/// `#[diesel(column_name = …)]` — the Rust field is `username`, the column is
+/// `screen_name`. Hand-written (no `#[model]`), as author structs often are.
+#[derive(diesel::Queryable, diesel::Selectable)]
+#[diesel(table_name = cmt_renamed_authors)]
+pub struct CmtRenamedAuthor {
+    pub id: i64,
+    #[diesel(column_name = screen_name)]
+    pub username: String,
+}
+
+diesel::table! {
+    cmt_renamed_parents (id) {
+        id -> Int8,
+        title -> Text,
+        comment_count -> Int8,
+    }
+}
+
+/// `author_name` is the column the SQL selects; `author_name_field` is the
+/// author struct's field the compile-time guard reads. Without it, this model
+/// would not compile: the guard would look for a `screen_name` field.
+#[autumn_web::model(table = "cmt_renamed_parents")]
+#[commentable(
+    by = CmtRenamedAuthor,
+    table = cmt_comments,
+    author_name = screen_name,
+    author_name_field = username
+)]
+pub struct CmtRenamedParent {
+    #[id]
+    pub id: i64,
+    pub title: String,
+    #[default]
+    pub comment_count: i64,
+}
+
+diesel::table! {
     cmt_shallows (id) {
         id -> Int8,
         title -> Text,
@@ -553,6 +597,11 @@ fn commentable_spec_uses_the_documented_conventions() {
     assert_eq!(CmtShallow::commentable_spec().max_depth, 1);
     assert_eq!(CmtShallow::commentable_spec().author_name_column, None);
     assert_eq!(CmtUncounted::commentable_spec().counter_column, None);
+
+    // A diesel-renamed author field: the SQL reads the physical column.
+    let renamed = CmtRenamedParent::commentable_spec();
+    assert_eq!(renamed.author_name_column, Some("screen_name"));
+    assert_eq!(renamed.author_table, Some("cmt_renamed_authors"));
 }
 
 /// AC5: every `#[commentable]` model registers itself, so a generic router can
@@ -1090,6 +1139,127 @@ async fn a_hard_delete_comments_table_removes_the_subtree_outright() {
         .expect("count")
         .count;
     assert_eq!(remaining, 0, "hard delete leaves nothing behind");
+}
+
+/// Issue #2275: a hard delete must not cascade into another record.
+///
+/// The walk skips a reply on another record, but the `parent_id` cascade does
+/// not. The delete would remove that reply, report a smaller count, and leave
+/// the other record's counter too high. The delete must fail and remove
+/// nothing.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_hard_delete_refuses_a_subtree_with_a_reply_on_another_record() {
+    let (pool, _container) = setup_pool().await;
+    let repo = PgCmtHardRepository::with_pool_untracked(pool.clone());
+    let mut conn = pool.get().await.expect("conn");
+    let author = seed_user(&mut conn, "ada").await;
+    let mine = seed_one_col(&mut conn, "cmt_hards", "title", "a").await;
+    let other = seed_one_col(&mut conn, "cmt_hards", "title", "b").await;
+
+    let root = repo
+        .add_comment(mine, author, "a", None)
+        .await
+        .expect("root");
+    let reply = repo
+        .add_comment(mine, author, "a1", Some(root.id))
+        .await
+        .expect("reply");
+    let foreign = repo
+        .add_comment(other, author, "b", None)
+        .await
+        .expect("foreign");
+    repo.add_comment(other, author, "b1", Some(foreign.id))
+        .await
+        .expect("foreign reply");
+
+    // The framework cannot write this edge. Imported data or raw SQL can.
+    diesel::sql_query("UPDATE cmt_hard_comments SET parent_id = $1 WHERE id = $2")
+        .bind::<BigInt, _>(reply.id)
+        .bind::<BigInt, _>(foreign.id)
+        .execute(&mut conn)
+        .await
+        .expect("graft across records");
+
+    let err = repo
+        .delete_comment(mine, root.id)
+        .await
+        .expect_err("the cascade would cross into another record");
+    assert_eq!(err.status().as_u16(), 422, "{err}");
+    let message = err.to_string();
+    assert!(message.contains("not on this record"), "{message}");
+    assert!(
+        message.contains(&format!("reply {} ", foreign.id)),
+        "{message}"
+    );
+
+    assert_eq!(counter(&mut conn, "cmt_hards", mine).await, 2);
+    assert_eq!(counter(&mut conn, "cmt_hards", other).await, 2);
+    let remaining = diesel::sql_query("SELECT COUNT(*) AS count FROM cmt_hard_comments")
+        .get_result::<CountRow>(&mut conn)
+        .await
+        .expect("count")
+        .count;
+    assert_eq!(remaining, 4, "a refused delete removes nothing");
+
+    // Repair the edge as the message says. The delete then succeeds.
+    diesel::sql_query("UPDATE cmt_hard_comments SET parent_id = NULL WHERE id = $1")
+        .bind::<BigInt, _>(foreign.id)
+        .execute(&mut conn)
+        .await
+        .expect("repair the edge");
+    assert_eq!(
+        repo.delete_comment(mine, root.id)
+            .await
+            .expect("delete after repair"),
+        2
+    );
+    assert_eq!(counter(&mut conn, "cmt_hards", mine).await, 0);
+    assert_eq!(counter(&mut conn, "cmt_hards", other).await, 2);
+}
+
+/// Issue #2275, soft path: a soft delete fires no cascade.
+///
+/// A reply on another record stays live and counted. The soft path must keep
+/// that behavior and must not refuse the delete.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_soft_delete_leaves_a_reply_on_another_record_live() {
+    let (pool, _container) = setup_pool().await;
+    let repo = PgCmtPostRepository::with_pool_untracked(pool.clone());
+    let mut conn = pool.get().await.expect("conn");
+    let author = seed_user(&mut conn, "ada").await;
+    let mine = seed_one_col(&mut conn, "cmt_posts", "title", "a").await;
+    let other = seed_one_col(&mut conn, "cmt_posts", "title", "b").await;
+
+    let root = repo
+        .add_comment(mine, author, "a", None)
+        .await
+        .expect("root");
+    let foreign = repo
+        .add_comment(other, author, "b", None)
+        .await
+        .expect("foreign");
+
+    diesel::sql_query("UPDATE cmt_comments SET parent_id = $1 WHERE id = $2")
+        .bind::<BigInt, _>(root.id)
+        .bind::<BigInt, _>(foreign.id)
+        .execute(&mut conn)
+        .await
+        .expect("graft across records");
+
+    assert_eq!(repo.delete_comment(mine, root.id).await.expect("delete"), 1);
+    assert_eq!(counter(&mut conn, "cmt_posts", mine).await, 0);
+    assert_eq!(counter(&mut conn, "cmt_posts", other).await, 1);
+    assert_eq!(
+        row_count(
+            &mut conn,
+            &format!("id = {} AND deleted_at IS NULL", foreign.id)
+        )
+        .await,
+        1,
+        "the other record's reply stays live"
+    );
 }
 
 /// The body cap is enforced in **bytes**, as documented — a multi-byte body

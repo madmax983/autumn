@@ -2244,7 +2244,7 @@ fn plan_scaffold_with_options_impl(
     if !options_with_key.api || metadata.has_validator_rules() {
         combined.push((
             "validator",
-            "{ version = \"0.20\", features = [\"derive\"] }",
+            "{ version = \"0.21\", features = [\"derive\"] }",
         ));
     }
     // Not re-checked for missing features here: `plan` above *is* the
@@ -3759,6 +3759,19 @@ fn render_routes_file(
     } else {
         ""
     };
+    // Referenced two ways: the i18n `delete_confirm_js` JS-escaping `@let`
+    // (see the comment at its definition) uses `serde_json::to_string`, and
+    // `into_new`'s JSON-field arms (see `FieldKind::Json` below) parse into
+    // bare `serde_json::Value` — the base project template has no direct
+    // `serde_json` dependency, only autumn-web's re-export. Importing it
+    // unconditionally left every scaffold with neither i18n nor a JSON field
+    // (the documented, default case) with an unused import.
+    let has_json_field = fields.iter().any(|f| f.kind == FieldKind::Json);
+    let serde_json_import = if labels.enabled() || has_json_field {
+        "use autumn_web::reexports::serde_json;\n"
+    } else {
+        ""
+    };
     // Empty-state copy. `DataTableConfig::new` takes `&str`, and the config is a
     // temporary borrowed only for the `data_table(...)` call, so an inline
     // `&t!(…)` is fine here — no binding needed.
@@ -4002,6 +4015,22 @@ fn render_routes_file(
     let lock_version_ty: String = lock_version.map(Field::rust_type).unwrap_or_default();
     let update_columns = render_update_columns(plural, fields);
     let nullable_field_match = render_nullable_field_match(fields);
+    // With no nullable (or synthetic constrained-required-numeric) fields,
+    // `render_nullable_field_match` renders a bare `false` that never reads
+    // its `name` argument — the overwhelmingly common case for a first
+    // scaffold, since every documented example field is required. Name the
+    // parameter `_name` in exactly that case so the generated helper compiles
+    // without an unused-variable warning; every other case still binds `name`,
+    // matching the `matches!(name, ...)` body `render_nullable_field_match`
+    // emits.
+    let nullable_form_field_param = if fields
+        .iter()
+        .any(|f| f.nullable || is_constrained_required_numeric(f))
+    {
+        "name"
+    } else {
+        "_name"
+    };
     let has_attachments = has_attachment_fields(fields);
     // Issue #1125/#1830: inline record-level authorization on the mutating HTML
     // handlers + owner-scoped index. The caller sets `authorize` whenever an
@@ -4398,6 +4427,17 @@ fn render_routes_file(
                 let _ = write!(out, ", {ty}");
                 out
             });
+    // `Update{pascal_name}` is only constructed below by `update_stmt`'s
+    // `--live` branch (`render_update_changeset_expr`) — the default,
+    // non-`--live` path writes the update through a raw `diesel::update(...)`
+    // column tuple (`render_update_columns`) and never names the type. Import
+    // it only when `--live` will actually reference it, or every non-`--live`
+    // scaffold (the documented default) carries an unused import.
+    let update_model_import: String = if live {
+        format!(", Update{pascal_name}")
+    } else {
+        String::new()
+    };
     // The destroy handler must honour the resource's delete semantics: when the
     // scaffold was generated with `--soft-delete`, mark `deleted_at` (matching
     // the soft-delete repository) instead of issuing a physical `DELETE`.
@@ -6465,7 +6505,7 @@ mod attachment_read_back_tests {{
         //
         // Excluded means: named on the upload page as a column the import cannot set,
         // listed in `CSV_DISCARDED_COLUMNS` so the report says so when a file supplies
-        // one, and absent from `CSV_REQUIRED_COLUMNS` so a file that omits it is accepted.
+        // one, and absent from `csv_required_columns()` so a file that omits it is accepted.
         let form_carried: BTreeSet<&str> = fields
             .iter()
             .filter(|f| !f.kind.is_attachment() && f.kind != FieldKind::Bytea)
@@ -6482,7 +6522,7 @@ mod attachment_read_back_tests {{
         // The exact complement of `ignored_columns` within `csv_columns()`: every
         // exported column the form CAN set. Derived from the same `form_carried`
         // set, so the two lists can never disagree about a column.
-        let required_columns: Vec<&str> = all_fields
+        let settable_columns: Vec<&str> = all_fields
             .iter()
             .filter(|f| !f.is_encrypted() && form_carried.contains(f.name.as_str()))
             .map(|f| f.name.as_str())
@@ -6493,7 +6533,6 @@ mod attachment_read_back_tests {{
             .map(|f| (f.name.as_str(), !f.nullable))
             .collect();
         render_csv_import_section(
-            &required_columns,
             pascal_name,
             plural,
             snake_name,
@@ -6504,6 +6543,7 @@ mod attachment_read_back_tests {{
             &authz_call,
             &text_columns,
             &ignored_columns,
+            &settable_columns,
             &bool_columns,
             labels,
         )
@@ -7856,14 +7896,13 @@ pub async fn search(
 use autumn_web::extract::Path;
 {i18n_imports}use autumn_web::pagination::{{Page, PageRequest}};
 {sort_imports}use autumn_web::reexports::axum::body::Bytes;
-use autumn_web::reexports::serde_json;
-use autumn_web::security::{{CsrfFormField, CsrfToken, SubmitFormField, SubmitToken}};
+{serde_json_import}use autumn_web::security::{{CsrfFormField, CsrfToken, SubmitFormField, SubmitToken}};
 use autumn_web::ui::pagination::{{PagerOptions, pagination_nav}};
 {db_import}
 use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
 
-use crate::models::{snake_name}::{{{pascal_name}, New{pascal_name}, Update{pascal_name}{enum_import_suffix}}};
+use crate::models::{snake_name}::{{{pascal_name}, New{pascal_name}{update_model_import}{enum_import_suffix}}};
 use crate::repositories::{snake_name}::{{{pascal_name}Repository, Pg{pascal_name}Repository}};
 use crate::schema::{schema_import};",
         attachment_note = if has_attachments {
@@ -8386,7 +8425,7 @@ pub async fn destroy(
     Ok(form)
 }}
 
-fn is_nullable_form_field(name: &str) -> bool {{
+fn is_nullable_form_field({nullable_form_field_param}: &str) -> bool {{
     {nullable_field_match}
 }}
 {lock_version_parser}"#
@@ -10563,6 +10602,51 @@ fn csv_unguard_cell<'a>(column: &str, value: &'a str) -> &'a str {
 /// [`scaffold_i18n::ViewLabels`], so this template is literal-free under
 /// `--i18n` and byte-identical without it. [`CSV_UNGUARD_CELL_FN`] fills
 /// `__UNGUARD_FN__` when the export actually guards a cell.
+/// The `csv_required_columns()` helper, spliced into [`CSV_IMPORT_TEMPLATE`]
+/// at `__REQUIRED_COLUMNS_CONST__`.
+///
+/// A plain `fn`, deliberately not a `const`: the required set is derived at
+/// request time from the LIVE `CsvSchema::csv_columns()` minus the columns
+/// the import cannot set, so editing the export's schema can never leave a
+/// stale baked requirement behind that rejects this app's own export (issue
+/// #2331).
+const CSV_REQUIRED_COLUMNS_FN: &str = r"/// The columns an uploaded file must carry: every exported column
+/// `{Pascal}Form` can actually set.
+///
+/// DERIVED from the live `CsvSchema::csv_columns()`, kept only where the form
+/// can set the column — not baked at generation time. Dropping a column from
+/// the export's schema therefore can never leave a stale requirement behind
+/// that rejects this app's own export, and adding a computed, export-only
+/// column never makes an upload need it (issue #2331).
+///
+/// Checked against the header BEFORE any row is decoded, because a
+/// missing column is a property of the FILE, not of its rows. It also
+/// catches the case row-level validation cannot: `decode_form` ignores
+/// headers it does not know and defaults fields that are absent, so a
+/// spreadsheet sharing no column names with this model would otherwise
+/// decode into a run of blank records and report them as insertable.
+fn csv_required_columns() -> Vec<&'static str> {
+    // The columns `{Pascal}Form` carries, as generated.
+    const SETTABLE: &[&str] = &[__SETTABLE_COLUMNS__];
+    let exported = <__PASCAL__ as autumn_web::data::csv::CsvSchema>::csv_columns();
+    let live: Vec<&'static str> = exported
+        .iter()
+        .copied()
+        .filter(|column| SETTABLE.contains(column))
+        .collect();
+    // A hand-written `csv_columns()` that exports none of the settable columns
+    // would leave nothing to require, and an unrelated file would then decode
+    // into rows of defaults. Keep the wrong-file guard armed: require what the
+    // form can set, which such an export cannot supply anyway.
+    if live.is_empty() {
+        SETTABLE.to_vec()
+    } else {
+        live
+    }
+}
+
+";
+
 const CSV_IMPORT_TEMPLATE: &str = r#"
 
 // ── CSV import: upload → dry-run preview → commit (issue #1393) ─────────────
@@ -11013,7 +11097,7 @@ __HEADER_CHECK__    if autumn_web::data::csv::count_data_rows(&uploaded[..]) > M
                 // meant to fill, so without this a padded header would import a
                 // column's values as `false`/`None` while reporting success.
                 //
-                // This MUST match how `CSV_REQUIRED_COLUMNS` is compared against
+                // This MUST match how `csv_required_columns()` is compared against
                 // the header above: that check trims too, so a padded file gets
                 // past it, and the two have to agree about what a column is
                 // called or the check would be guaranteeing something this line
@@ -11142,9 +11226,6 @@ __HEADER_CHECK__    if autumn_web::data::csv::count_data_rows(&uploaded[..]) > M
               the template's placeholders and their values in different functions"
 )]
 fn render_csv_import_section(
-    // Issue #1393: every exported column `{Pascal}Form` can set — what an
-    // uploaded file's header is checked against before any row is decoded.
-    required_columns: &[&str],
     pascal_name: &str,
     plural: &str,
     snake_name: &str,
@@ -11168,6 +11249,12 @@ fn render_csv_import_section(
     // way in, so the upload page names them rather than letting an operator edit
     // one and watch nothing happen.
     ignored_columns: &[&str],
+    // Every exported column `{Pascal}Form` can set, as of generation. The
+    // required header set is the LIVE `csv_columns()` intersected with this
+    // (issue #2331), so a column later dropped from the export stops being
+    // required, and an export-only computed column later added to it never
+    // becomes required.
+    settable_columns: &[&str],
     // The boolean columns, paired with whether a BLANK cell means `false` for
     // them (true for a non-nullable column, false for a nullable one). A
     // spreadsheet writes `TRUE`/`1`/`yes`/blank where serde's `bool` accepts
@@ -11225,58 +11312,45 @@ fn render_csv_import_section(
     // underscore, because an unused binding is a warning in the user's app and the
     // scaffold's contract is that generated code compiles clean.
     //
-    // `required_columns` are the columns an uploaded file must carry: every exported
-    // column the form can set. Without this check a file that shares no column names with
-    // the model still imports — `decode_form` ignores headers it does not know, and a form
+    // Issue #2331: the required set is DERIVED, not baked.
+    // `csv_required_columns()` subtracts the columns the import cannot set from
+    // the live `CsvSchema::csv_columns()` at request time, so dropping a column
+    // from the export's schema can never leave a stale requirement behind that
+    // rejects this app's own export. Emitted unconditionally: with nothing
+    // settable the check finds no missing columns, and the fn is always called,
+    // so the scaffold's compiles-clean contract holds either way.
+    //
+    // Without this check a file that shares no column names with the model
+    // still imports — `decode_form` ignores headers it does not know, and a form
     // whose every field can be defaulted (an unchecked checkbox's `bool`, an optional
     // column) then decodes an unrelated row into a blank record. `junk\nx` would preview as
     // "1 row would insert" and commit a row of defaults. Comparing the header up front
     // makes that one file-level refusal, which is what it is: the operator picked the wrong
     // file.
-    let (required_columns_const, header_check) = if required_columns.is_empty() {
-        // Every exported column is one the form cannot set (a model whose columns
-        // are all `--default`ed). There is nothing a file could be missing, so
-        // emitting the const and the check would be dead code.
-        (String::new(), String::new())
-    } else {
-        let names = required_columns
-            .iter()
-            .map(|name| format!("\"{name}\""))
-            .collect::<Vec<_>>()
-            .join(", ");
-        (
-            format!(
-                "/// The columns an uploaded file must carry: every exported column\n\
-                 /// `{{Pascal}}Form` can actually set.\n\
-                 ///\n\
-                 /// Checked against the header BEFORE any row is decoded, because a\n\
-                 /// missing column is a property of the FILE, not of its rows. It also\n\
-                 /// catches the case row-level validation cannot: `decode_form` ignores\n\
-                 /// headers it does not know and defaults fields that are absent, so a\n\
-                 /// spreadsheet sharing no column names with this model would otherwise\n\
-                 /// decode into a run of blank records and report them as insertable.\n\
-                 const CSV_REQUIRED_COLUMNS: &[&str] = &[{names}];\n\n"
-            ),
-            [
-                "    let header = autumn_web::data::csv::read_header(&uploaded[..]);",
-                "    let missing: Vec<&str> = CSV_REQUIRED_COLUMNS",
-                "        .iter()",
-                "        .copied()",
-                "        .filter(|column| !header.iter().any(|found| found.trim() == *column))",
-                "        .collect();",
-                "    if !missing.is_empty() {",
-                "        let page = __LAYOUT__(__L_TITLE__, __CP_IMPORT____FLASH_ARG__, html! {",
-                "            h1 { __L_HEADING__ }",
-                "            (import_form_body(__LOCALE_ARG__csrf.as_ref(), csrf_field.as_ref(), submit_token.as_ref(), submit_field.as_ref(), false, Some(&format!(\"{}: {}\", __L_MISSING_COLUMNS__, missing.join(\", \")))))",
-                "            (autumn_web::a11y::Link::new(paths::index(), __L_BACK__))",
-                "        });",
-                "        return Ok((autumn_web::reexports::http::StatusCode::UNPROCESSABLE_ENTITY, page).into_response());",
-                "    }",
-                "",
-            ]
-            .join("\n"),
-        )
-    };
+    let settable_names = settable_columns
+        .iter()
+        .map(|name| format!("\"{name}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let required_columns_const =
+        CSV_REQUIRED_COLUMNS_FN.replace("__SETTABLE_COLUMNS__", &settable_names);
+    let header_check = [
+        "    let header = autumn_web::data::csv::read_header(&uploaded[..]);",
+        "    let missing: Vec<&str> = csv_required_columns()",
+        "        .into_iter()",
+        "        .filter(|column| !header.iter().any(|found| found.trim() == *column))",
+        "        .collect();",
+        "    if !missing.is_empty() {",
+        "        let page = __LAYOUT__(__L_TITLE__, __CP_IMPORT____FLASH_ARG__, html! {",
+        "            h1 { __L_HEADING__ }",
+        "            (import_form_body(__LOCALE_ARG__csrf.as_ref(), csrf_field.as_ref(), submit_token.as_ref(), submit_field.as_ref(), false, Some(&format!(\"{}: {}\", __L_MISSING_COLUMNS__, missing.join(\", \")))))",
+        "            (autumn_web::a11y::Link::new(paths::index(), __L_BACK__))",
+        "        });",
+        "        return Ok((autumn_web::reexports::http::StatusCode::UNPROCESSABLE_ENTITY, page).into_response());",
+        "    }",
+        "",
+    ]
+    .join("\n");
     let (discarded_mut, discarded_param) = if discarded_columns.is_empty() {
         ("", "_discarded_seen")
     } else {
@@ -11310,7 +11384,15 @@ fn render_csv_import_section(
             ),
             "\n        if !discarded_seen {\n            \
              discarded_seen = CSV_DISCARDED_COLUMNS.iter().any(|column| {\n                \
-             row.get(*column).is_some_and(|value| !value.trim().is_empty())\n            \
+             row.iter().any(|(key, value)| {\n                    \
+             // The row map is keyed by the header's RAW names, while the\n                    \
+             // header check and the decoder below both trim — a file headed\n                    \
+             // `title, tag` (the space RFC 4180 keeps) decodes fine but\n                    \
+             // `row.get(\"tag\")` would miss the `\" tag\"` entry and the\n                    \
+             // alert would never fire. Probe the trimmed keys so all three\n                    \
+             // consumers agree about what a column is called.\n                    \
+             key.trim() == *column && !value.trim().is_empty()\n                \
+             })\n            \
              });\n        }"
                 .to_owned(),
             [
@@ -12133,6 +12215,21 @@ fn render_changeset_build(
     )
 }
 
+/// Whether `f`'s Rust type implements `Copy`, restricted to the primitive
+/// kinds this generator is certain are `Copy` regardless of nullability
+/// (`Option<T>` is `Copy` whenever `T` is). Used only to decide whether
+/// [`render_update_columns`] needs a `.clone()` to move a field out of a
+/// shared `&New{Model}` reference — deliberately conservative: every other
+/// `FieldKind` (`String`, `Uuid`, `Decimal`, …) keeps its `.clone()` even
+/// where the underlying type happens to also be `Copy`, since verifying that
+/// per-kind is not this helper's job.
+const fn is_copy_field_kind(f: &Field) -> bool {
+    matches!(
+        f.kind,
+        FieldKind::Bool | FieldKind::I32 | FieldKind::I64 | FieldKind::F32 | FieldKind::F64
+    )
+}
+
 /// A required numeric carrying a `{min,max}` range (issue #1388) that is
 /// represented as `Option<T>` on the form struct (issue #1748). Extracted so
 /// both the struct/`into_new` emission in [`render_model_form`] and the
@@ -12215,6 +12312,13 @@ fn render_update_columns(plural: &str, fields: &[Field]) -> String {
                 name = f.name,
                 wrapper = encryption_wrapper_type(mode),
             ),
+            None if is_copy_field_kind(f) => {
+                // `clippy::clone_on_copy`: `new` is only ever a shared
+                // reference here, but a `Copy` field (`bool`, `i32`, …) can be
+                // read out of it directly — `.clone()` would just be a
+                // same-cost copy through a different name.
+                write!(out, "{plural}::{name}.eq(new.{name})", name = f.name)
+            }
             None => write!(
                 out,
                 "{plural}::{name}.eq(new.{name}.clone())",
@@ -15884,7 +15988,11 @@ async fn main() {
         plan.execute(Flags::default()).unwrap();
 
         let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
-        assert!(routes.contains("use crate::models::post::{Post, NewPost, UpdatePost};"));
+        // Non-`--live` scaffolds write updates through a raw diesel column
+        // tuple, never constructing `UpdatePost` — importing it unconditionally
+        // left every non-`--live` scaffold with an unused import (Onramp).
+        assert!(routes.contains("use crate::models::post::{Post, NewPost};"));
+        assert!(!routes.contains("UpdatePost"), "{routes}");
         assert!(routes.contains("#[get(\"/posts\")]"));
         assert!(routes.contains("#[get(\"/posts/{id}\")]"));
         assert!(
@@ -15922,6 +16030,58 @@ async fn main() {
         assert!(!routes.contains("#[delete("));
         // The HTML delete route must be present and use POST (not DELETE).
         assert!(routes.contains(r#"#[post("/posts/{id}/delete", name = "delete")]"#));
+    }
+
+    /// Companion to `execute_writes_a_routes_file_referencing_model`: a
+    /// `--live` scaffold's `update_stmt` DOES construct `Update{Model}`
+    /// (`render_update_changeset_expr`), so its import must stay — this is
+    /// the one branch `update_model_import` must render non-empty.
+    #[test]
+    fn live_scaffold_routes_file_imports_update_model() {
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &["title:String".into()],
+            "20260427000000",
+            &ScaffoldOptions {
+                live: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+        assert!(
+            routes.contains("use crate::models::post::{Post, NewPost, UpdatePost};"),
+            "{routes}"
+        );
+        assert!(routes.contains("UpdatePost {"), "{routes}");
+    }
+
+    /// A nullable field flips `is_nullable_form_field`'s body from a bare
+    /// `false` to a real `matches!` on its `name` argument — the parameter
+    /// must be named (not `_name`) in exactly this case, or the match arm
+    /// itself would not compile.
+    #[test]
+    fn scaffold_with_nullable_field_names_the_form_field_param() {
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "subtitle:Option<String>".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
+        assert!(
+            routes.contains("fn is_nullable_form_field(name: &str) -> bool {"),
+            "{routes}"
+        );
+        assert!(routes.contains("matches!(name, \"subtitle\")"), "{routes}");
     }
 
     // ── enum field: form widgets, boundary validation, imports (issue #1030) ─
@@ -16004,8 +16164,10 @@ async fn main() {
         plan_and_execute_post_scaffold_with_status_enum(&tmp);
         let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
 
+        // Non-`--live` (see `execute_writes_a_routes_file_referencing_model`):
+        // no `UpdatePost` import.
         assert!(
-            routes.contains("use crate::models::post::{Post, NewPost, UpdatePost, Status};"),
+            routes.contains("use crate::models::post::{Post, NewPost, Status};"),
             "got:\n{routes}"
         );
     }

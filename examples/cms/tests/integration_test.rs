@@ -642,6 +642,24 @@ async fn import_export(client: &TestClient, cookie: &str, payload: &str) -> Test
         .await
 }
 
+/// The post's current `lock_version`, read directly from the database.
+///
+/// Split out from [`edit_form`] so a staleness test can capture a version
+/// stamp *before* a later request changes it — `edit_form` always reads the
+/// current value, which is right for every ordinary test but cannot express
+/// "the form this stale request carries."
+async fn lock_version_of(id: i64) -> i32 {
+    use diesel::prelude::*;
+    use diesel_async::RunQueryDsl;
+    let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+    cms::schema::posts::table
+        .find(id)
+        .select(cms::schema::posts::lock_version)
+        .first::<i32>(&mut conn)
+        .await
+        .expect("the post")
+}
+
 /// Encode an editor form, stamping the post's current `lock_version`.
 ///
 /// The editor renders that hidden field on every edit and the update handler
@@ -649,19 +667,8 @@ async fn import_export(client: &TestClient, cookie: &str, payload: &str) -> Test
 /// make — and, before the check existed, one that silently skipped the
 /// stale-edit guard.
 async fn edit_form(id: &impl std::fmt::Display, fields: &[(&str, &str)]) -> String {
-    use diesel::prelude::*;
-    use diesel_async::RunQueryDsl;
     let id: i64 = id.to_string().parse().expect("a post id");
-    let version = {
-        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
-        cms::schema::posts::table
-            .find(id)
-            .select(cms::schema::posts::lock_version)
-            .first::<i32>(&mut conn)
-            .await
-            .expect("the post")
-            .to_string()
-    };
+    let version = lock_version_of(id).await.to_string();
     let mut all: Vec<(&str, &str)> = fields.to_vec();
     all.push(("lock_version", version.as_str()));
     form(&all)
@@ -701,6 +708,236 @@ async fn create_post(
         .expect("id is the last path segment")
         .parse()
         .expect("id is numeric")
+}
+
+/// A blank/whitespace-only title on a status that requires one (`publish`,
+/// `private`, `future`) used to reach `AutumnError::unprocessable_msg` three
+/// layers into the create transaction — the state machine's `can_publish`
+/// guard for private/future, `normalize_post`'s direct-create check for
+/// publish — producing the generic `application/problem+json`/error-page
+/// response and discarding whatever body, excerpt and taxonomy picks the
+/// author had already entered. It is now caught pre-flight and redisplays the
+/// editor at 422 with the draft intact and a message next to Title.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn create_with_a_blank_title_redisplays_the_editor_with_the_draft_intact() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    for status in ["publish", "private", "future"] {
+        let mut fields = vec![
+            ("title", "   "),
+            ("slug", ""),
+            ("excerpt", ""),
+            ("body", "A body nobody should lose."),
+            ("status", status),
+            ("password", ""),
+            ("taxonomy_names[post_tag]", ""),
+            ("comment_status", "open"),
+        ];
+        if status == "future" {
+            fields.push(("publish_at", "2999-01-01T00:00"));
+        }
+        let resp = client
+            .post("/admin/content/post")
+            .header("cookie", &cookie)
+            .form(&form(&fields))
+            .send()
+            .await;
+        resp.assert_status(422);
+        assert!(
+            resp.header("location").is_none(),
+            "a rejected {status} submission must not redirect"
+        );
+        resp.assert_body_contains("A body nobody should lose.")
+            .assert_body_contains("must have a title");
+    }
+}
+
+/// The same redisplay, exercised on `update` against an existing post — the
+/// state machine's `can_publish` guard is what `update` hits (see
+/// [`create_with_a_blank_title_redisplays_the_editor_with_the_draft_intact`]),
+/// and the post must still be a draft afterwards: a rejected transition must
+/// not have partially applied.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn update_with_a_blank_title_redisplays_the_editor_and_leaves_the_post_a_draft() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+    let id = create_post(
+        &client,
+        &cookie,
+        "Original Title",
+        "Original body.",
+        "draft",
+    )
+    .await;
+
+    let resp = client
+        .post(&format!("/admin/content/post/{id}"))
+        .header("cookie", &cookie)
+        .form(
+            &edit_form(
+                &id,
+                &[
+                    ("title", "   "),
+                    ("slug", ""),
+                    ("excerpt", ""),
+                    ("body", "An edit nobody should lose."),
+                    ("status", "publish"),
+                    ("password", ""),
+                    ("taxonomy_names[post_tag]", ""),
+                    ("comment_status", "open"),
+                ],
+            )
+            .await,
+        )
+        .send()
+        .await;
+    resp.assert_status(422);
+    resp.assert_body_contains("An edit nobody should lose.")
+        .assert_body_contains("must have a title");
+
+    // Not published — the rejected transition never reached the write path.
+    sign_out(&client);
+    let front = client.get("/original-title").send().await;
+    assert_eq!(
+        front.status, 404,
+        "the post must still be an unreachable draft"
+    );
+}
+
+/// The redisplay must not silently repair a stale edit.
+///
+/// `EditorContext`/`editor` are shared between the GET routes (which always
+/// want the row's *current* `lock_version`) and the validation-error 422
+/// branch (which must echo back exactly what was submitted, stale or not) —
+/// see `EditorValues::lock_version`. Getting this backwards would make a
+/// rejected-then-corrected submission pass optimistic locking against an
+/// edit it never actually saw, silently overwriting it.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_rejected_submission_does_not_launder_a_stale_lock_version() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+    let id = create_post(&client, &cookie, "Concurrent Post", "v1", "draft").await;
+    let stale_version = lock_version_of(id).await;
+
+    // A concurrent edit lands and succeeds, bumping `lock_version`.
+    let bump = client
+        .post(&format!("/admin/content/post/{id}"))
+        .header("cookie", &cookie)
+        .form(
+            &edit_form(
+                &id,
+                &[
+                    ("title", "Concurrent Post"),
+                    ("slug", ""),
+                    ("excerpt", ""),
+                    ("body", "v2, from someone else"),
+                    ("status", "draft"),
+                    ("password", ""),
+                    ("taxonomy_names[post_tag]", ""),
+                    ("comment_status", "open"),
+                ],
+            )
+            .await,
+        )
+        .send()
+        .await;
+    assert_eq!(bump.status, 303, "the concurrent edit should succeed");
+    assert_ne!(
+        lock_version_of(id).await,
+        stale_version,
+        "the concurrent edit must have advanced the lock version"
+    );
+
+    // The original editor, unaware of the concurrent edit, submits the stale
+    // `lock_version` it loaded with — but also a blank title while trying to
+    // publish, which the pre-flight check rejects. The redisplay must carry
+    // the *stale* version back, not the row's now-current one.
+    let stale_form = form(&[
+        ("title", "   "),
+        ("slug", ""),
+        ("excerpt", ""),
+        ("body", "v1, edited but never saved"),
+        ("status", "publish"),
+        ("password", ""),
+        ("taxonomy_names[post_tag]", ""),
+        ("comment_status", "open"),
+        ("lock_version", &stale_version.to_string()),
+    ]);
+    let rejected = client
+        .post(&format!("/admin/content/post/{id}"))
+        .header("cookie", &cookie)
+        .form(&stale_form)
+        .send()
+        .await;
+    rejected
+        .assert_status(422)
+        .assert_body_contains(&format!(r#"value="{stale_version}""#));
+
+    // Correcting just the title and resubmitting the same (still-stale) form
+    // must now be caught by optimistic locking — not silently accepted.
+    let resubmitted = client
+        .post(&format!("/admin/content/post/{id}"))
+        .header("cookie", &cookie)
+        .form(&stale_form.replacen("title=+++", "title=Fixed", 1))
+        .send()
+        .await;
+    resubmitted.assert_status(409);
+}
+
+/// A scheduled post's date needs to be both present and in the future — see
+/// `require_future_publish_date`. Both failures used to reach the same
+/// generic error page via `?`; both now redisplay the editor.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn scheduling_with_a_past_or_missing_date_redisplays_the_editor() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    // A past date.
+    let past = client
+        .post("/admin/content/post")
+        .header("cookie", &cookie)
+        .form(&form(&[
+            ("title", "Backdated"),
+            ("slug", ""),
+            ("excerpt", ""),
+            ("body", "Scheduled body."),
+            ("status", "future"),
+            ("publish_at", "2000-01-01T00:00"),
+            ("password", ""),
+            ("taxonomy_names[post_tag]", ""),
+            ("comment_status", "open"),
+        ]))
+        .send()
+        .await;
+    past.assert_status(422)
+        .assert_body_contains("Scheduled body.")
+        .assert_body_contains("publish date in the future");
+
+    // No date at all.
+    let missing = client
+        .post("/admin/content/post")
+        .header("cookie", &cookie)
+        .form(&form(&[
+            ("title", "Undated"),
+            ("slug", ""),
+            ("excerpt", ""),
+            ("body", "Scheduled body."),
+            ("status", "future"),
+            ("password", ""),
+            ("taxonomy_names[post_tag]", ""),
+            ("comment_status", "open"),
+        ]))
+        .send()
+        .await;
+    missing
+        .assert_status(422)
+        .assert_body_contains("Scheduled body.")
+        .assert_body_contains("Pick a publish date");
 }
 
 #[tokio::test]
@@ -8988,6 +9225,315 @@ async fn a_scheduled_date_is_read_in_the_sites_timezone() {
     );
 }
 
+/// Creating a post with `status=future` and no publish date redisplays the
+/// editor with the author's draft intact, instead of bouncing to the generic
+/// error page `require_future_publish_date`'s `?` used to produce.
+///
+/// See [`cms::routes::admin::posts`]'s `PostForm::validate_fields`: the same
+/// anti-pattern already fixed for `examples/wiki`'s page forms (#2773),
+/// `examples/blog`'s post editor (#2687) and `reddit-clone`'s
+/// create-community form (#2665).
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn scheduling_a_post_with_no_publish_date_redisplays_the_editor() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    let resp = client
+        .post("/admin/content/post")
+        .header("cookie", &cookie)
+        .form(&form(&[
+            ("title", "A future post"),
+            ("slug", ""),
+            ("excerpt", ""),
+            ("body", "A body worth keeping."),
+            ("status", "future"),
+            ("password", ""),
+            ("publish_at", ""),
+        ]))
+        .send()
+        .await;
+    resp.assert_status(422);
+    let body = resp.text();
+    assert!(
+        body.contains("Pick a publish date for a scheduled post"),
+        "the field-specific message must be shown: {body}"
+    );
+    assert!(
+        body.contains("A future post") && body.contains("A body worth keeping."),
+        "the author's title and body must round-trip rather than be lost: {body}"
+    );
+    assert!(
+        body.contains(r#"aria-describedby="publish_at-error""#),
+        "the publish-date field must be wired to its error for assistive tech: {body}"
+    );
+
+    use diesel::prelude::*;
+    use diesel_async::RunQueryDsl;
+    let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+    let count: i64 = cms::schema::posts::table
+        .count()
+        .get_result(&mut conn)
+        .await
+        .expect("count");
+    assert_eq!(count, 0, "a rejected submission must not create a row");
+}
+
+/// Same rejection, for a publish date that has already passed.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn scheduling_a_post_with_a_past_publish_date_redisplays_the_editor() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    let past = (chrono::Utc::now() - chrono::Duration::days(1))
+        .naive_utc()
+        .format("%Y-%m-%dT%H:%M")
+        .to_string();
+    let resp = client
+        .post("/admin/content/post")
+        .header("cookie", &cookie)
+        .form(&form(&[
+            ("title", "Already due"),
+            ("slug", ""),
+            ("excerpt", ""),
+            ("body", "Still a draft."),
+            ("status", "future"),
+            ("password", ""),
+            ("publish_at", past.as_str()),
+        ]))
+        .send()
+        .await;
+    resp.assert_status(422);
+    let body = resp.text();
+    assert!(
+        body.contains("A scheduled post needs a publish date in the future"),
+        "the field-specific message must be shown: {body}"
+    );
+    assert!(
+        body.contains(&past),
+        "the exact wall clock the author typed must round-trip, not a reformatted or blanked \
+         value: {body}"
+    );
+}
+
+/// The same rejection on the *update* path: editing an already-published
+/// post's title/body while switching its status to "Scheduled" without
+/// picking a publish date must redisplay the editor with the edit intact
+/// rather than discard it. `require_future_publish_date`'s own doc comment
+/// names this general shape as an easy, ordinary editing mistake — not a
+/// crafted request — since the field is not required and nothing prompts an
+/// editor to fill it in before switching to "Scheduled".
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn rescheduling_an_edit_with_no_publish_date_redisplays_the_editor() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    let created = client
+        .post("/admin/content/post")
+        .header("cookie", &cookie)
+        .form(&form(&[
+            ("title", "Once live"),
+            ("slug", "once-live"),
+            ("excerpt", ""),
+            ("body", "Original body."),
+            ("status", "publish"),
+            ("password", ""),
+        ]))
+        .send()
+        .await;
+    created.assert_status(303);
+    let id = created
+        .header("location")
+        .expect("redirect")
+        .rsplit('/')
+        .next()
+        .expect("id")
+        .to_owned();
+
+    let resp = client
+        .post(&format!("/admin/content/post/{id}"))
+        .header("cookie", &cookie)
+        .form(
+            &edit_form(
+                &id,
+                &[
+                    ("title", "Once live, edited"),
+                    ("slug", "once-live"),
+                    ("excerpt", ""),
+                    ("body", "Edited body worth keeping."),
+                    ("status", "future"),
+                    ("password", ""),
+                ],
+            )
+            .await,
+        )
+        .send()
+        .await;
+    resp.assert_status(422);
+    let body = resp.text();
+    assert!(
+        body.contains("Pick a publish date for a scheduled post"),
+        "the field-specific message must be shown: {body}"
+    );
+    assert!(
+        body.contains("Once live, edited") && body.contains("Edited body worth keeping."),
+        "the just-typed edit must round-trip, not the previously-saved content: {body}"
+    );
+
+    use diesel::prelude::*;
+    use diesel_async::RunQueryDsl;
+    let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+    let stored_title: String = cms::schema::posts::table
+        .find(id.parse::<i64>().expect("id"))
+        .select(cms::schema::posts::title)
+        .first(&mut conn)
+        .await
+        .expect("the post");
+    assert_eq!(
+        stored_title, "Once live",
+        "a rejected submission must not write the edit"
+    );
+}
+
+/// A validation-rejected redisplay must carry the *submitted* `lock_version`
+/// forward, not the row's current one — otherwise a stale edit's retry
+/// silently stops being stale.
+///
+/// Concretely: editor A loads the form at version 1. Editor B saves first,
+/// advancing the row to version 2. A submits their (now-stale) version-1 form
+/// with a scheduling mistake (`status=future`, no date); `validate_fields`
+/// rejects it and redisplays the editor. If that redisplay's hidden
+/// `lock_version` field were stamped from the freshly-reloaded row (version 2)
+/// instead of from A's own stale submission (version 1), fixing the date and
+/// resubmitting would pass the stale-edit check it should fail, silently
+/// overwriting B's edit — exactly the loss `expected_lock_version` exists to
+/// prevent. This must still return 409, not 303.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn validation_redisplay_keeps_the_submitted_stale_lock_version() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    let created = client
+        .post("/admin/content/post")
+        .header("cookie", &cookie)
+        .form(&form(&[
+            ("title", "Editor A's starting point"),
+            ("slug", "race"),
+            ("excerpt", ""),
+            ("body", "Original body."),
+            ("status", "draft"),
+            ("password", ""),
+        ]))
+        .send()
+        .await;
+    created.assert_status(303);
+    let id = created
+        .header("location")
+        .expect("redirect")
+        .rsplit('/')
+        .next()
+        .expect("id")
+        .to_owned();
+
+    use diesel::prelude::*;
+    use diesel_async::RunQueryDsl;
+    let stale_version: i32 = {
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        cms::schema::posts::table
+            .find(id.parse::<i64>().expect("id"))
+            .select(cms::schema::posts::lock_version)
+            .first(&mut conn)
+            .await
+            .expect("the post")
+    };
+
+    // Editor B saves first, advancing the row past the version A's form was
+    // rendered from.
+    client
+        .post(&format!("/admin/content/post/{id}"))
+        .header("cookie", &cookie)
+        .form(
+            &edit_form(
+                &id,
+                &[
+                    ("title", "Editor B's save"),
+                    ("slug", "race"),
+                    ("excerpt", ""),
+                    ("body", "Editor B's body."),
+                    ("status", "draft"),
+                    ("password", ""),
+                ],
+            )
+            .await,
+        )
+        .send()
+        .await
+        .assert_status(303);
+
+    // Editor A submits their stale version-1 form with a scheduling mistake.
+    let resp = client
+        .post(&format!("/admin/content/post/{id}"))
+        .header("cookie", &cookie)
+        .form(&form(&[
+            ("title", "Editor A's edit"),
+            ("slug", "race"),
+            ("excerpt", ""),
+            ("body", "Editor A's body."),
+            ("status", "future"),
+            ("password", ""),
+            ("lock_version", &stale_version.to_string()),
+        ]))
+        .send()
+        .await;
+    resp.assert_status(422);
+    let body = resp.text();
+    assert!(
+        body.contains(&format!(r#"name="lock_version" value="{stale_version}""#)),
+        "the redisplay must stamp back the version A actually submitted, not the row's current \
+         (already-advanced) version: {body}"
+    );
+
+    // A fixes the date and resubmits the same (still-stale) lock_version, as
+    // the redisplayed form's hidden field instructs them to.
+    let future = (chrono::Utc::now() + chrono::Duration::days(1))
+        .naive_utc()
+        .format("%Y-%m-%dT%H:%M")
+        .to_string();
+    let retry = client
+        .post(&format!("/admin/content/post/{id}"))
+        .header("cookie", &cookie)
+        .form(&form(&[
+            ("title", "Editor A's edit"),
+            ("slug", "race"),
+            ("excerpt", ""),
+            ("body", "Editor A's body."),
+            ("status", "future"),
+            ("password", ""),
+            ("lock_version", &stale_version.to_string()),
+            ("publish_at", future.as_str()),
+        ]))
+        .send()
+        .await;
+    retry.assert_status(409);
+
+    let stored_title: String = {
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        cms::schema::posts::table
+            .find(id.parse::<i64>().expect("id"))
+            .select(cms::schema::posts::title)
+            .first(&mut conn)
+            .await
+            .expect("the post")
+    };
+    assert_eq!(
+        stored_title, "Editor B's save",
+        "editor A's stale retry must not overwrite editor B's save"
+    );
+}
+
 /// A completed import is not reconciled again.
 ///
 /// The source marker says "an import created this row" and is written before
@@ -14189,6 +14735,239 @@ async fn a_menu_assigned_to_the_footer_is_rendered() {
     );
 }
 
+/// `Menu::name` declares `#[validate(length(min = 1, max = 200))]`, but
+/// `replace_menu_at_location` writes the row through a raw
+/// `diesel::insert_into` that never runs the model's generated
+/// `validator::Validate` — so `create_menu` was the only place left to
+/// enforce it, and it did not. A blank (including whitespace-only, which the
+/// browser's `required` attribute does not reject) or overlong name is now
+/// refused at 422, with the "New menu" card's location choice preserved,
+/// instead of being silently persisted — an empty name previously fell back
+/// to a hashed slug and inserted a menu with a blank display name.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn an_invalid_menu_name_is_refused_and_redisplayed() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    for name in ["   ", &"x".repeat(201)] {
+        let resp = client
+            .post("/admin/appearance/menus")
+            .header("cookie", &cookie)
+            .form(&form(&[("name", name), ("location", "primary")]))
+            .send()
+            .await;
+        resp.assert_status(422);
+        assert!(
+            resp.header("location").is_none(),
+            "a rejected submission must not redirect"
+        );
+        resp.assert_body_contains("must be between 1 and 200 characters")
+            .assert_body_contains(r#"value="primary" selected"#);
+    }
+
+    let count: i64 = {
+        use diesel::prelude::*;
+        use diesel_async::RunQueryDsl;
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        cms::schema::menus::table
+            .count()
+            .get_result(&mut conn)
+            .await
+            .expect("the count")
+    };
+    assert_eq!(count, 0, "neither invalid name may be persisted");
+}
+
+/// A refused menu item or widget is redisplayed in its own card, not replaced
+/// by the generic error page.
+///
+/// `create_menu_item` and `create_widget` reported every refusal — a blank
+/// label (which `required` does not reject when it is whitespace), a parent
+/// that vanished since the form was rendered, a full sidebar — by returning
+/// the error, so the administrator lost the whole Appearance screen and
+/// everything typed into the card. Each is now a 422 that keeps the values and
+/// puts the reason (`role="alert"`) inside the card it belongs to.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_refused_menu_item_or_widget_is_redisplayed_with_its_input() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    client
+        .post("/admin/appearance/menus")
+        .header("cookie", &cookie)
+        .form(&form(&[("name", "Main"), ("location", "primary")]))
+        .send()
+        .await
+        .assert_status(303);
+
+    // Blank label: the URL the administrator typed survives.
+    let blank = client
+        .post("/admin/appearance/menus/1/items")
+        .header("cookie", &cookie)
+        .form(&form(&[("label", "   "), ("url", "/keep-me")]))
+        .send()
+        .await;
+    blank.assert_status(422);
+    assert!(blank.header("location").is_none());
+    blank
+        .assert_body_contains("A menu item needs a label")
+        .assert_body_contains(r#"role="alert""#)
+        .assert_body_contains(r#"value="/keep-me""#)
+        .assert_body_contains("autofocus");
+
+    // A parent that does not exist (deleted in another tab) is refused with the
+    // label and URL intact.
+    let stale = client
+        .post("/admin/appearance/menus/1/items")
+        .header("cookie", &cookie)
+        .form(&form(&[
+            ("label", "Products"),
+            ("url", "/products"),
+            ("parent_id", "999"),
+        ]))
+        .send()
+        .await;
+    stale.assert_status(422);
+    stale
+        .assert_body_contains("can only nest under a top-level item")
+        .assert_body_contains(r#"value="Products""#)
+        .assert_body_contains(r#"value="/products""#);
+
+    // An oversized widget title: kind, text and position survive.
+    let long_title = client
+        .post("/admin/appearance/widgets")
+        .header("cookie", &cookie)
+        .form(&form(&[
+            ("kind", "text"),
+            ("title", &"t".repeat(201)),
+            ("text", "Keep this blurb."),
+            ("position", "7"),
+        ]))
+        .send()
+        .await;
+    long_title.assert_status(422);
+    long_title
+        .assert_body_contains("A widget title must be at most 200 characters")
+        .assert_body_contains(r#"role="alert""#)
+        .assert_body_contains("Keep this blurb.")
+        .assert_body_contains(r#"value="7""#)
+        .assert_body_contains(r#"value="text" selected"#);
+
+    // A full sidebar: the refusal is the store's own message, shown in the card.
+    for _ in 0..30 {
+        client
+            .post("/admin/appearance/widgets")
+            .header("cookie", &cookie)
+            .form(&form(&[("kind", "text"), ("text", "x"), ("position", "0")]))
+            .send()
+            .await
+            .assert_status(303);
+    }
+    let full = client
+        .post("/admin/appearance/widgets")
+        .header("cookie", &cookie)
+        .form(&form(&[("kind", "text"), ("text", "One too many.")]))
+        .send()
+        .await;
+    full.assert_status(422);
+    full.assert_body_contains("Remove one before adding another")
+        .assert_body_contains("One too many.");
+
+    let (items, widgets): (i64, i64) = {
+        use diesel::prelude::*;
+        use diesel_async::RunQueryDsl;
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        (
+            cms::schema::menu_items::table
+                .count()
+                .get_result(&mut conn)
+                .await
+                .expect("item count"),
+            cms::schema::widgets::table
+                .count()
+                .get_result(&mut conn)
+                .await
+                .expect("widget count"),
+        )
+    };
+    assert_eq!(items, 0, "no refused item may be stored");
+    assert_eq!(widgets, 30, "only the widgets that fit were stored");
+}
+
+/// A refused item is redisplayed beside its own menu even when that menu is
+/// not on the first page of the Appearance screen — the page is resolved from
+/// the menu, not from the (possibly stale) page the form was rendered on.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_refused_item_on_a_later_menu_page_still_shows_its_message() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    for n in 1..=21 {
+        client
+            .post("/admin/appearance/menus")
+            .header("cookie", &cookie)
+            .form(&form(&[
+                ("name", &format!("Menu {n:02}")),
+                ("location", ""),
+            ]))
+            .send()
+            .await
+            .assert_status(303);
+    }
+
+    // Menu 21 is id 21 and sorts last: page 2 at 20 menus per page.
+    let refused = client
+        .post("/admin/appearance/menus/21/items")
+        .header("cookie", &cookie)
+        .form(&form(&[("label", " "), ("url", "/kept")]))
+        .send()
+        .await;
+    refused.assert_status(422);
+    refused
+        .assert_body_contains("A menu item needs a label")
+        .assert_body_contains("Menu 21")
+        .assert_body_contains(r#"value="/kept""#);
+}
+
+/// A refused item keeps its category target even when the bounded category
+/// list no longer includes it — otherwise the browser would select "No
+/// category" and the resubmitted item would silently lose its target.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_refused_item_keeps_a_target_outside_the_bounded_lists() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+    client
+        .post("/admin/appearance/menus")
+        .header("cookie", &cookie)
+        .form(&form(&[("name", "Primary"), ("location", "primary")]))
+        .send()
+        .await
+        .assert_status(303);
+    try_execute(
+        TestDb::shared().await,
+        "INSERT INTO terms (taxonomy, name, slug, description, post_count)
+         SELECT 'category', 'cat-' || lpad(g::text, 3, '0'),
+                'cat-' || lpad(g::text, 3, '0'), '', 0
+         FROM generate_series(1, 250) AS g",
+    )
+    .await
+    .expect("seed the terms");
+
+    // cat-250 (id 250) is beyond the first 200 offered.
+    let refused = client
+        .post("/admin/appearance/menus/1/items")
+        .header("cookie", &cookie)
+        .form(&form(&[("label", " "), ("term_id", "250")]))
+        .send()
+        .await;
+    refused.assert_status(422);
+    refused.assert_body_contains(r#"<option value="250" selected>cat-250"#);
+}
+
 /// Only one menu can hold a theme location, under concurrency.
 ///
 /// The replacement cleared the incumbent and inserted, with nothing
@@ -14812,6 +15591,83 @@ async fn a_post_is_locked_before_its_terms() {
     save.await.expect("the task").expect("the save succeeds");
 }
 
+/// A term id can go stale between when a caller resolved it and when
+/// `set_post_terms` actually runs — an editor's form round trip, or (the
+/// case that motivated this) an import that batch-resolves every post's
+/// term references up front and then assigns them one post at a time, so a
+/// term deleted midway through a long-running import is still in a later
+/// post's `wanted` list. `lock_terms` already tolerates a missing row for
+/// locking and recounting; `set_post_terms` must not then try to insert a
+/// `post_terms` row for it, which would violate the foreign key and abort
+/// the whole save (and, in the batched-import case, every post still to
+/// come) instead of just silently omitting that one stale reference —
+/// exactly what the old unbatched per-post lookup did by finding nothing.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_term_deleted_after_resolution_is_dropped_not_a_hard_failure() {
+    use diesel::prelude::*;
+    use diesel_async::RunQueryDsl;
+
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+    let post_id = create_post(&client, &cookie, "Tagged", "Body.", "publish").await;
+
+    for slug in ["kept", "vanishes"] {
+        client
+            .post("/admin/terms/category")
+            .header("cookie", &cookie)
+            .form(&form(&[("name", slug), ("slug", slug)]))
+            .send()
+            .await
+            .assert_status(303);
+    }
+    let (kept_id, vanishing_id): (i64, i64) = {
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        let kept = cms::schema::terms::table
+            .filter(cms::schema::terms::slug.eq("kept"))
+            .select(cms::schema::terms::id)
+            .first(&mut conn)
+            .await
+            .expect("the kept term");
+        let vanishing = cms::schema::terms::table
+            .filter(cms::schema::terms::slug.eq("vanishes"))
+            .select(cms::schema::terms::id)
+            .first(&mut conn)
+            .await
+            .expect("the vanishing term");
+        (kept, vanishing)
+    };
+
+    // Stands in for another admin deleting the term between when a caller
+    // resolved `vanishing_id` and when this save runs.
+    {
+        let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+        diesel::delete(cms::schema::terms::table.filter(cms::schema::terms::id.eq(vanishing_id)))
+            .execute(&mut conn)
+            .await
+            .expect("delete the term out from under the save");
+    }
+
+    let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+    cms::content::set_post_terms(&mut conn, post_id, vec![kept_id, vanishing_id])
+        .await
+        .expect(
+            "the save succeeds despite the stale reference, instead of failing its foreign key",
+        );
+
+    let filed: Vec<i64> = cms::schema::post_terms::table
+        .filter(cms::schema::post_terms::post_id.eq(post_id))
+        .select(cms::schema::post_terms::term_id)
+        .load(&mut conn)
+        .await
+        .expect("the post's filed terms");
+    assert_eq!(
+        filed,
+        vec![kept_id],
+        "the deleted term must be silently dropped, and the still-live one still filed"
+    );
+}
+
 /// The export reads every table from one snapshot.
 ///
 /// The reads were separate repository calls, each on its own pooled connection
@@ -15118,12 +15974,13 @@ async fn granted_locks(pid: i32, relation: &str, mode: &str) -> i64 {
     rows.into_iter().next().map_or(0, |row| row.n)
 }
 
-/// A comment the page cannot render is not promised an anchor.
+/// A comment the page cannot render is refused rather than anchored.
 ///
 /// A page is capped at `MAX_THREAD_COMMENTS`, so on a thread past the cap a new
-/// reply can belong to a page with no room left for it. Sending the browser to
-/// `#comment-<id>` for a comment that is not on the page it lands on is the
-/// same broken promise as sending it to the wrong page.
+/// reply can belong to a page with no room left for it. Redirecting to
+/// `#comment-<id>` for a comment that is not on the page it lands on is a
+/// broken promise, and accepting it counts a comment no reader can reach; the
+/// write path refuses it with a 422.
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn a_comment_the_page_cannot_render_is_not_anchored() {
@@ -15180,23 +16037,12 @@ async fn a_comment_the_page_cannot_render_is_not_anchored() {
         ]))
         .send()
         .await;
-    let location = posted
-        .assert_status(303)
-        .header("location")
-        .expect("a redirect");
-    assert!(
-        !location.contains("#comment-"),
-        "the redirect must not promise an anchor the page does not render: {location}"
-    );
-
-    // The comment really was accepted — the page just cannot show it, and says
-    // so through the truncation notice.
-    client
-        .get(location)
-        .send()
-        .await
-        .assert_ok()
-        .assert_body_contains("some replies are not shown");
+    // Accepting it would count a comment no reader can reach, and redirect to
+    // an anchor the page does not render. The write path refuses instead, so
+    // there is no such comment to promise an anchor for.
+    posted
+        .assert_status(422)
+        .assert_body_contains("This conversation has reached its display limit");
 }
 
 /// A comment URL survives the one permalink structure that is already a query.
@@ -15501,4 +16347,298 @@ async fn every_approved_comment_stays_reachable() {
         "and a reply renders on the page its root is on:\n{second}"
     );
     assert!(!second.contains("Root 001"), "page two is not page one");
+}
+
+/// A visitor's comment must not read as a finished import.
+///
+/// `import_comments` used to skip the whole backup thread when the post
+/// already had *any* comment — so a crash (or a concurrent visitor) between
+/// the status transition committing and the comment import running made the
+/// retry drop the backup's discussion and mark the post complete. Completion
+/// is now a dedicated marker written in the same transaction as the rows, and
+/// only the marker skips the import.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn import_comments_ignores_unrelated_existing_comments() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+    let post_id = create_post(&client, &cookie, "Thread", "Body.", "publish").await;
+    let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+
+    // A visitor comment that has nothing to do with the backup.
+    cms::content::create_comment(
+        &mut conn,
+        cms::models::NewComment {
+            post_id,
+            parent_id: None,
+            author_id: None,
+            author_name: "Visitor".to_owned(),
+            author_email: "visitor@example.com".to_owned(),
+            author_url: String::new(),
+            author_ip: String::new(),
+            body: "Unrelated visitor comment".to_owned(),
+            status: "approved".to_owned(),
+        },
+        "",
+    )
+    .await
+    .expect("visitor comment");
+
+    let incoming = vec![cms::content::ImportedComment {
+        author_username: None,
+        author_name: "Archivist".to_owned(),
+        author_email: "archivist@example.com".to_owned(),
+        author_url: String::new(),
+        body: "From the backup".to_owned(),
+        status: "approved".to_owned(),
+        created_at: chrono::NaiveDate::from_ymd_opt(2024, 1, 15)
+            .expect("date")
+            .and_hms_opt(12, 0, 0)
+            .expect("time"),
+        replies: vec![],
+    }];
+
+    // The backup's discussion still imports — one row, not zero.
+    let created = cms::content::import_comments(&mut conn, post_id, &incoming)
+        .await
+        .expect("import");
+    assert_eq!(created, 1, "the backup's thread must not be dropped");
+
+    // And the retry is still safe: the marker — not the count — skips it, so
+    // no second copy is appended.
+    let again = cms::content::import_comments(&mut conn, post_id, &incoming)
+        .await
+        .expect("retry");
+    assert_eq!(again, 0, "a re-run must not append a second copy");
+}
+
+/// Create a page through the admin editor and return its id.
+async fn create_page(client: &TestClient, cookie: &str, title: &str) -> i64 {
+    let resp = client
+        .post("/admin/content/page")
+        .header("cookie", cookie)
+        .form(&form(&[
+            ("title", title),
+            ("slug", ""),
+            ("excerpt", ""),
+            ("body", "Body."),
+            ("status", "publish"),
+            ("password", ""),
+        ]))
+        .send()
+        .await;
+    assert_eq!(resp.status, 303, "create should redirect: {}", resp.text());
+    resp.header("location")
+        .expect("redirect to the editor")
+        .rsplit('/')
+        .next()
+        .expect("id is the last path segment")
+        .parse()
+        .expect("id is numeric")
+}
+
+/// A refused parent is a skipped link; a failed check is a failed import.
+///
+/// `set_post_parent` used to treat *any* `validate_parent` error as an
+/// expected refusal and return `Ok(false)` — so an operational failure (a
+/// query error, a timeout) read as a deliberate orphaning, and the import
+/// marked the page complete at the top level instead of failing and staying
+/// resumable. Refusals still return `Ok(false)`; the failure half of the
+/// distinction is pinned without a database by
+/// `content::parent_check_tests`.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn set_post_parent_distinguishes_refusal_from_failure() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+    let parent = create_page(&client, &cookie, "Parent").await;
+    let child = create_page(&client, &cookie, "Child").await;
+    let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+
+    // A good link applies.
+    assert!(
+        cms::content::set_post_parent(&mut conn, child, parent)
+            .await
+            .expect("a valid link applies"),
+        "the link must be applied"
+    );
+
+    // A cycle is an expected refusal: Ok(false), not an error.
+    assert!(
+        !cms::content::set_post_parent(&mut conn, parent, child)
+            .await
+            .expect("a refusal is not an error"),
+        "a cycle must decline the link, not fail the import"
+    );
+
+    // A parent that does not exist is an expected refusal too.
+    assert!(
+        !cms::content::set_post_parent(&mut conn, child, 999_999_999)
+            .await
+            .expect("a refusal is not an error"),
+        "a missing parent must decline the link, not fail the import"
+    );
+}
+
+/// A reply past the thread's display budget is refused, not silently dropped.
+///
+/// `approved_thread_page` caps a page at `MAX_THREAD_COMMENTS`, keeping the
+/// oldest rows where the budget runs out — so an accepted reply past the cap
+/// was counted in `comment_count` but appeared on no page. The write path now
+/// refuses it, and moderation refuses to approve one, under the post's lock.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_reply_past_the_display_budget_is_refused() {
+    use cms::schema::comments;
+    use diesel::prelude::*;
+    use diesel_async::RunQueryDsl;
+
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+    let post_id = create_post(&client, &cookie, "Crowded", "Body.", "publish").await;
+    let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+
+    // One root, then enough approved children to fill the page's budget: the
+    // root takes one slot of `MAX_THREAD_COMMENTS`, so 999 children fill it
+    // and the thousandth reply has no renderable window.
+    let root_id: i64 = diesel::insert_into(comments::table)
+        .values((
+            comments::post_id.eq(post_id),
+            comments::parent_id.eq(None::<i64>),
+            comments::author_id.eq(None::<i64>),
+            comments::author_name.eq("Crowd"),
+            comments::author_email.eq("crowd@example.com"),
+            comments::author_url.eq(""),
+            comments::author_ip.eq(""),
+            comments::body.eq("Root"),
+            comments::status.eq("approved"),
+        ))
+        .returning(comments::id)
+        .get_result(&mut conn)
+        .await
+        .expect("seed root");
+    let children: Vec<_> = (0..999)
+        .map(|i| {
+            (
+                comments::post_id.eq(post_id),
+                comments::parent_id.eq(Some(root_id)),
+                comments::author_id.eq(None::<i64>),
+                comments::author_name.eq("Crowd"),
+                comments::author_email.eq("crowd@example.com"),
+                comments::author_url.eq(""),
+                comments::author_ip.eq(""),
+                comments::body.eq(format!("Child {i}")),
+                comments::status.eq("approved"),
+            )
+        })
+        .collect();
+    diesel::insert_into(comments::table)
+        .values(&children)
+        .execute(&mut conn)
+        .await
+        .expect("seed children");
+
+    let refused = cms::content::create_comment(
+        &mut conn,
+        cms::models::NewComment {
+            post_id,
+            parent_id: Some(root_id),
+            author_id: None,
+            author_name: "Latecomer".to_owned(),
+            author_email: "late@example.com".to_owned(),
+            author_url: String::new(),
+            author_ip: String::new(),
+            body: "One too many".to_owned(),
+            status: "approved".to_owned(),
+        },
+        "",
+    )
+    .await;
+    assert!(
+        refused.is_err(),
+        "a reply past the display budget must be refused, not accepted and left unreadable"
+    );
+
+    // Approving a pending reply onto the same full thread is refused too.
+    let pending_id: i64 = diesel::insert_into(comments::table)
+        .values((
+            comments::post_id.eq(post_id),
+            comments::parent_id.eq(Some(root_id)),
+            comments::author_id.eq(None::<i64>),
+            comments::author_name.eq("Waiting"),
+            comments::author_email.eq("waiting@example.com"),
+            comments::author_url.eq(""),
+            comments::author_ip.eq(""),
+            comments::body.eq("Pending past the budget"),
+            comments::status.eq("pending"),
+        ))
+        .returning(comments::id)
+        .get_result(&mut conn)
+        .await
+        .expect("seed pending");
+    let approval = cms::content::moderate_comment(&mut conn, pending_id, "approved").await;
+    assert!(
+        approval.is_err(),
+        "approving a reply with no renderable window must be refused"
+    );
+}
+
+/// The moderation queue pages, and the pager keeps the selected queue.
+///
+/// 51 pending comments spill onto a second page. The first page links to the
+/// second with the status preserved; a stale far-future page clamps to the
+/// last page instead of rendering an empty one.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn moderation_queue_renders_a_pager() {
+    use cms::schema::comments;
+    use diesel::prelude::*;
+    use diesel_async::RunQueryDsl;
+
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+    let post_id = create_post(&client, &cookie, "Flood", "Body.", "publish").await;
+    let mut conn = TestDb::shared().await.pool().get().await.expect("conn");
+
+    let pending: Vec<_> = (0..51)
+        .map(|i| {
+            (
+                comments::post_id.eq(post_id),
+                comments::parent_id.eq(None::<i64>),
+                comments::author_id.eq(None::<i64>),
+                comments::author_name.eq("Spammer"),
+                comments::author_email.eq("spam@example.com"),
+                comments::author_url.eq(""),
+                comments::author_ip.eq(""),
+                comments::body.eq(format!("Spam {i}")),
+                comments::status.eq("pending"),
+            )
+        })
+        .collect();
+    diesel::insert_into(comments::table)
+        .values(&pending)
+        .execute(&mut conn)
+        .await
+        .expect("seed queue");
+
+    let first = client
+        .get("/admin/comments?status=pending")
+        .header("cookie", &cookie)
+        .send()
+        .await;
+    first
+        .assert_ok()
+        .assert_body_contains("Page 1 of 2")
+        .assert_body_contains("/admin/comments?status=pending&amp;page=2");
+
+    // A stale bookmark past the end clamps to the last page.
+    let stale = client
+        .get("/admin/comments?status=pending&page=99")
+        .header("cookie", &cookie)
+        .send()
+        .await;
+    stale
+        .assert_ok()
+        .assert_body_contains("Page 2 of 2")
+        .assert_body_contains("/admin/comments?status=pending&amp;page=1");
 }

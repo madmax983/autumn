@@ -9,7 +9,6 @@ use std::sync::Arc;
 use autumn_web::runtime_config::RuntimeConfigService;
 use std::collections::HashMap;
 use std::convert::Infallible;
-use std::sync::LazyLock;
 
 use autumn_web::extract::Multipart;
 use autumn_web::flash::{Flash, FlashLevel, FlashMessage};
@@ -105,32 +104,16 @@ impl<S: Send + Sync> FromRequestParts<S> for AdminCsrf {
     }
 }
 
-/// Plugin-owned JS. Served as an external file (not inline) so it works
-/// under the default CSP `script-src 'self'`.
-const ADMIN_JS: &str = include_str!("admin.js");
-
-/// FNV-1a 64-bit hash of the shipped JS, computed at compile time. Used to
-/// fingerprint the asset path so the browser cache can be `immutable` for
-/// a year without risking a post-deploy mismatch between cached client JS
-/// and newer server templates — bumping the JS bumps the URL.
-const ADMIN_JS_HASH: u64 = fnv1a_64(ADMIN_JS.as_bytes());
-
-const fn fnv1a_64(bytes: &[u8]) -> u64 {
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    let mut i = 0;
-    while i < bytes.len() {
-        hash ^= bytes[i] as u64;
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-        i += 1;
-    }
-    hash
-}
-
-/// Route path (relative to the plugin prefix) where [`ADMIN_JS`] is served.
-/// Format: `/static/admin.<hash>.js`. Built at startup from the compile-time
-/// content hash; stable for the lifetime of the process.
-pub static ADMIN_JS_PATH: LazyLock<String> =
-    LazyLock::new(|| format!("/static/admin.{ADMIN_JS_HASH:016x}.js"));
+/// Plugin-owned JS, served as an external file (not inline) so it works
+/// under the default CSP `script-src 'self'`. Installed with
+/// `AppBuilder::plugin_assets`, which gives it a content-hashed URL under
+/// `/static/_plugins/autumn-admin/` cached `immutable` for a year: changing
+/// the JS changes the URL, so cached client JS never outlives the server
+/// templates that call it.
+pub static ASSETS: autumn_web::assets::PluginAssets = autumn_web::assets::PluginAssets::from_files(
+    "autumn-admin",
+    &[("admin.js", include_bytes!("admin.js"))],
+);
 
 // ── Router construction ─────────────────────────────────────────────
 
@@ -208,7 +191,6 @@ pub fn admin_router(
             "/{slug}/import",
             routing::get(model_import_form).post(model_import_csv),
         )
-        .route(&ADMIN_JS_PATH, routing::get(serve_admin_js))
         .layer(axum::Extension(HasRuntimeConfig(has_config)))
         .layer(axum::Extension(AdminPrefix(prefix.to_owned())))
         .layer(axum::Extension(ActuatorPrefix(actuator_prefix)))
@@ -276,18 +258,6 @@ struct ActuatorPrefix(String);
 /// user's identity, so config-mutation handlers can record a real actor.
 #[derive(Clone)]
 struct AdminAuthSessionKey(String);
-
-/// Serve the plugin's static JS with long-cache headers.
-async fn serve_admin_js() -> Response {
-    (
-        [
-            (header::CONTENT_TYPE, "application/javascript"),
-            (header::CACHE_CONTROL, "public, max-age=31536000, immutable"),
-        ],
-        ADMIN_JS,
-    )
-        .into_response()
-}
 
 // ── Query params ────────────────────────────────────────────────────
 
@@ -1300,7 +1270,16 @@ async fn model_export_csv(
 
     // Page through records in batches to avoid buffering the entire dataset
     // as JSON in memory at once.
-    let columns = model.csv_export_columns();
+    // #1771: `csv_export_columns` is overridable, and an override that returns a
+    // curated list never runs the default's filter. The export is the one admin
+    // surface that leaves the database in a file built for sharing, so the
+    // confidential columns and their blind-index companions are dropped here,
+    // where no model can opt back in.
+    let columns: Vec<&'static str> = model
+        .csv_export_columns()
+        .into_iter()
+        .filter(|name| !::autumn_web::confidential::is_confidential_column_name(name))
+        .collect();
     let mut buf = Vec::new();
     {
         let mut wtr = csv::WriterBuilder::new()

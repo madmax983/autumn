@@ -27,6 +27,13 @@
 //! an oversize body is not partially captured, it is abandoned and counted, so
 //! a streaming endpoint cannot grow the process.
 
+// autumn-determinism-gate: production code in this module must read time and
+// mint identifiers through the framework's injected seams (ClockSource /
+// Entropy), never `Instant::now()` / `Utc::now()` / `SystemTime::now()` /
+// `Uuid::new_v4()` directly. See CONTRIBUTING.md "Determinism seam gate"
+// (issue #1797). Justify exceptions with
+// #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
+#![cfg_attr(not(test), deny(clippy::disallowed_methods))]
 // autumn-panic-gate: request-path module — production code path must be panic-free.
 // See CONTRIBUTING.md "Request-path panic gate". Justify exceptions with
 // #[allow(clippy::<lint>, reason = "…")] at the narrowest scope.
@@ -65,7 +72,7 @@ use crate::shadow::diff::{
     Comparison, DivergenceKind, ResponseFacts, compare, redact_path_and_query,
 };
 use crate::shadow::registry::{Recorded, RequestContext, ShadowRegistry};
-use crate::shadow::sample::{MirrorDecision, MirrorSelector, roll_from};
+use crate::shadow::sample::{MirrorDecision, MirrorSelector, SkipReason, roll_from};
 use crate::shadow::transport::{
     ShadowError, ShadowRequest, ShadowTransport, forwarded_headers, shadow_url,
 };
@@ -191,6 +198,10 @@ pub struct ShadowMirrorService<S> {
 impl<S, ReqBody> Service<Request<ReqBody>> for ShadowMirrorService<S>
 where
     S: Service<Request<ReqBody>, Response = Response<Body>>,
+    // The body gate in `decide` needs the body's own end-of-stream signal to
+    // catch *undeclared* bodies (issue #2332): the request type must be an
+    // `http_body::Body`, which every real server body is.
+    ReqBody: http_body::Body,
 {
     type Response = Response<Body>;
     type Error = S::Error;
@@ -203,12 +214,17 @@ where
     fn call(&mut self, req: Request<ReqBody>) -> Self::Future {
         let target = request_target(&req);
         let ctx = Arc::clone(&self.ctx);
-        let decision = self
-            .ctx
-            .selector
-            .decide(req.method(), &target, req.headers(), || {
-                roll_from(ctx.entropy.as_ref())
-            });
+        let decision = self.ctx.selector.decide(
+            req.method(),
+            &target,
+            req.headers(),
+            // The body's own end-of-stream signal: the undeclared-body half
+            // of the #2332 gate. A body that is already at end-of-stream (a
+            // normal bodiless GET, which the transport knows from framing)
+            // mirrors as before; anything else sits out.
+            http_body::Body::is_end_stream(req.body()),
+            || roll_from(ctx.entropy.as_ref()),
+        );
 
         let pending = match decision {
             MirrorDecision::Mirror => Some(PendingMirror {
@@ -237,8 +253,17 @@ where
             }),
             // Not mirrored: the request is forwarded with no wrapper at all, so
             // the overwhelmingly common path costs one decision and nothing
-            // else — no body wrapper, no allocation, no metric.
+            // else — no body wrapper, no allocation. The one exception is the
+            // conditional skip, which the mirror layer counts: unlike the
+            // other skip reasons (configuration facts), conditional traffic is
+            // the coverage the mirror is silently giving up on cache-heavy
+            // routes, and the operator needs to see how much (issue #2335).
+            // The increment fires only on this rare path, never on the
+            // request path at large.
             MirrorDecision::Skip(reason) => {
+                if reason == SkipReason::Conditional {
+                    self.ctx.registry.record_skipped_conditional();
+                }
                 tracing::trace!(
                     target: "autumn::shadow",
                     reason = reason.as_str(),
@@ -567,6 +592,10 @@ impl InFlightPermit {
 }
 
 impl Drop for InFlightPermit {
+    #[allow(
+        deprecated,
+        reason = "`fetch_update` is renamed `try_update` on rustc 1.99, but `try_update` is newer than the 1.88 MSRV"
+    )]
     fn drop(&mut self) {
         let _ = self
             .counter
@@ -942,13 +971,48 @@ mod tests {
         Response = Response<Body>,
         Error = std::convert::Infallible,
     > + Clone {
+        primary_responding(StatusCode::OK, body)
+    }
+
+    /// A primary handler that always answers with `status` and `body`.
+    fn primary_responding(
+        status: StatusCode,
+        body: &'static str,
+    ) -> impl tower::Service<
+        Request<Body>,
+        Response = Response<Body>,
+        Error = std::convert::Infallible,
+    > + Clone {
         service_fn(move |_req: Request<Body>| async move {
             Ok::<_, std::convert::Infallible>(
                 Response::builder()
-                    .status(StatusCode::OK)
+                    .status(status)
                     .header("content-type", "application/json")
                     .body(Body::from(body))
                     .expect("valid response"),
+            )
+        })
+    }
+
+    /// A primary handler that *consumes* the request body and echoes it back —
+    /// the search-API shape issue #2332 is about. A mirror that replayed the
+    /// request without its body would hand the candidate a different request
+    /// than this handler answered, manufacturing a divergence.
+    fn echo_primary()
+    -> impl tower::Service<
+        Request<Body>,
+        Response = Response<Body>,
+        Error = std::convert::Infallible,
+    > + Clone {
+        service_fn(|req: Request<Body>| async move {
+            let bytes = axum::body::to_bytes(req.into_body(), 64 * 1024)
+                .await
+                .expect("request body");
+            Ok::<_, std::convert::Infallible>(
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .body(Body::from(bytes))
+                    .expect("response"),
             )
         })
     }
@@ -998,6 +1062,146 @@ mod tests {
 
         assert!(transport.seen().is_empty());
         assert_eq!(registry.stats().mirrored, 0);
+    }
+
+    /// Issue #2335, the false-positive end: the client revalidates with the
+    /// primary's validator, the primary answers `304`, and the candidate —
+    /// whose validator is scoped to its own build — correctly answers `200`
+    /// with the full body for byte-identical content. Before the fix the
+    /// mirror replayed the conditional request and recorded a `status_class`
+    /// divergence on ordinary cache traffic; now the request is never
+    /// mirrored, so no divergence can be recorded.
+    #[tokio::test]
+    async fn a_conditional_revalidation_is_not_mirrored_and_records_no_divergence() {
+        let transport = FakeTransport::new(Behaviour::Reply {
+            status: 200,
+            body: r#"{"ok":true}"#,
+        });
+        let registry = ShadowRegistry::new(10);
+        let service = layer(transport.clone(), &registry, settings())
+            .layer(primary_responding(StatusCode::NOT_MODIFIED, ""));
+
+        let request = Request::builder()
+            .uri("/api/orders")
+            .header(axum::http::header::IF_NONE_MATCH, "\"abc123\"")
+            .body(Body::empty())
+            .expect("request");
+        let response = service.oneshot(request).await.expect("response");
+        assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+
+        // The skip happens synchronously in `decide`: no detached mirror task
+        // is ever spawned, so asserting immediately is sound — there is
+        // nothing to settle.
+        assert!(
+            transport.seen().is_empty(),
+            "a conditional request must never reach the candidate"
+        );
+        let stats = registry.stats();
+        assert_eq!(stats.mirrored, 0);
+        assert_eq!(stats.compared, 0);
+        assert_eq!(stats.diverged, 0);
+        assert_eq!(stats.skipped_conditional, 1);
+    }
+
+    /// Issue #2335, the masking end: both builds revalidate, so the differ
+    /// would compare two empty `304` bodies and record a `match` — while
+    /// comparing nothing, hiding a genuine body regression on exactly the
+    /// traffic that revalidates. Conditional requests are excluded from the
+    /// mirror, so no vacuous comparison is recorded.
+    #[tokio::test]
+    async fn a_conditional_revalidation_is_not_compared_vacuously() {
+        let transport = FakeTransport::new(Behaviour::Reply {
+            status: 304,
+            body: "",
+        });
+        let registry = ShadowRegistry::new(10);
+        let service = layer(transport.clone(), &registry, settings())
+            .layer(primary_responding(StatusCode::NOT_MODIFIED, ""));
+
+        let request = Request::builder()
+            .uri("/api/orders")
+            .header(
+                axum::http::header::IF_MODIFIED_SINCE,
+                "Wed, 21 Oct 2015 07:28:00 GMT",
+            )
+            .body(Body::empty())
+            .expect("request");
+        let response = service.oneshot(request).await.expect("response");
+        assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+
+        assert!(transport.seen().is_empty());
+        let stats = registry.stats();
+        assert_eq!(stats.compared, 0, "no comparison may be recorded");
+        assert_eq!(
+            stats.matched, 0,
+            "an empty-vs-empty 304 pair is not a match"
+        );
+        assert_eq!(stats.skipped_conditional, 1);
+    }
+
+    #[tokio::test]
+    async fn a_get_carrying_a_body_is_never_mirrored() {
+        let transport = FakeTransport::new(Behaviour::Reply {
+            status: 200,
+            body: "{}",
+        });
+        let registry = ShadowRegistry::new(10);
+        let service = layer(transport.clone(), &registry, settings()).layer(echo_primary());
+
+        // A GET carrying a request body is legal (RFC 9110 does not forbid
+        // it) and search APIs do use it. The primary consumes the body and
+        // answers from it, but nothing is mirrored: the mirror replays
+        // method, target, and headers but no body, so mirroring it would ask
+        // the candidate a different request and record the manufactured
+        // difference as a divergence (issue #2332).
+        let body = r#"{"query":"shoes"}"#;
+        let request = Request::builder()
+            .uri("/api/orders")
+            .header("content-length", body.len())
+            .body(Body::from(body))
+            .expect("request");
+        let response = service.oneshot(request).await.expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        // The live request passes through untouched: the primary saw the
+        // whole body.
+        assert_eq!(read_body(response).await, body);
+
+        // And the candidate never saw it: zero mirrored, zero compared,
+        // zero divergences.
+        assert!(transport.seen().is_empty());
+        let stats = registry.stats();
+        assert_eq!(stats.mirrored, 0);
+        assert_eq!(stats.compared, 0);
+        assert_eq!(stats.diverged, 0);
+    }
+
+    #[tokio::test]
+    async fn a_get_with_an_undeclared_body_is_never_mirrored() {
+        let transport = FakeTransport::new(Behaviour::Reply {
+            status: 200,
+            body: "{}",
+        });
+        let registry = ShadowRegistry::new(10);
+        let service = layer(transport.clone(), &registry, settings()).layer(echo_primary());
+
+        // No `Content-Length`, no `Transfer-Encoding`: on HTTP/2 a client can
+        // legally send DATA frames on a GET stream without declaring them.
+        // The headers alone would wave this through — the body's own
+        // end-of-stream signal is what sits it out (issue #2332, option 1).
+        let body = r#"{"query":"shoes"}"#;
+        let request = Request::builder()
+            .uri("/api/orders")
+            .body(Body::from(body))
+            .expect("request");
+        let response = service.oneshot(request).await.expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(read_body(response).await, body);
+
+        assert!(transport.seen().is_empty());
+        let stats = registry.stats();
+        assert_eq!(stats.mirrored, 0);
+        assert_eq!(stats.compared, 0);
+        assert_eq!(stats.diverged, 0);
     }
 
     #[tokio::test]

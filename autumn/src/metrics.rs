@@ -52,6 +52,14 @@
 //!
 //! Narrative guide: `docs/guide/metrics.md`.
 
+// autumn-determinism-gate: production code in this module must read time and
+// mint identifiers through the framework's injected seams (ClockSource /
+// Entropy), never `Instant::now()` / `Utc::now()` / `SystemTime::now()` /
+// `Uuid::new_v4()` directly. See CONTRIBUTING.md "Determinism seam gate"
+// (issue #1797). Justify exceptions with
+// #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
+#![cfg_attr(not(test), deny(clippy::disallowed_methods))]
+
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -882,6 +890,10 @@ impl Series {
     /// Saturating rather than wrapping: a wrapped total looks to `PromQL`
     /// exactly like a counter reset, so `rate()` would report an enormous
     /// phantom spike. A pinned total is obviously broken instead.
+    #[allow(
+        deprecated,
+        reason = "`fetch_update` is renamed `try_update` on rustc 1.99, but `try_update` is newer than the 1.88 MSRV"
+    )]
     fn add(&self, amount: u64) {
         if let Self::Counter(total) = self {
             let _ = total.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
@@ -947,6 +959,10 @@ impl Series {
 }
 
 /// Add `delta` to the `f64` held as a bit pattern in `cell`, atomically.
+#[allow(
+    deprecated,
+    reason = "`fetch_update` is renamed `try_update` on rustc 1.99, but `try_update` is newer than the 1.88 MSRV"
+)]
 fn add_f64(cell: &AtomicU64, delta: f64) {
     let _ = cell.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |bits| {
         // Both operands are finite (deltas and observations are validated,
@@ -1782,7 +1798,7 @@ impl Timer {
     /// unwinding panics.
     pub fn start(&self) -> TimerGuard {
         TimerGuard {
-            started: Instant::now(),
+            started: crate::time::ambient_instant(),
             timer: Some(self.clone()),
         }
     }
@@ -1826,7 +1842,7 @@ impl TimerGuard {
     // also want to log or assert on it.
     #[allow(clippy::must_use_candidate)]
     pub fn stop(mut self) -> Duration {
-        let elapsed = self.started.elapsed();
+        let elapsed = crate::time::ambient_instant().saturating_duration_since(self.started);
         // Taking the timer latches the measurement: `Drop` finds `None` and
         // will not record it a second time.
         if let Some(timer) = self.timer.take() {
@@ -1838,14 +1854,14 @@ impl TimerGuard {
 
 impl Drop for TimerGuard {
     fn drop(&mut self) {
-        // `Instant::elapsed` is monotonic and saturating, and nothing below
-        // unwraps, indexes or divides. It is not *provably* panic-free: a
+        // `saturating_duration_since` is monotonic and saturating, and nothing
+        // below unwraps, indexes or divides. It is not *provably* panic-free: a
         // labelled guard canonicalizes its labels, which allocates, and a
         // rejected value calls into the `tracing` subscriber — either can
         // panic in principle. Neither is on the path a guard normally takes,
         // which records a finite duration into an already-registered series.
         if let Some(timer) = self.timer.take() {
-            timer.record(self.started.elapsed());
+            timer.record(crate::time::ambient_instant().saturating_duration_since(self.started));
         }
     }
 }

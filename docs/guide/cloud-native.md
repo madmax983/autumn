@@ -33,14 +33,19 @@ The scaffold now includes:
 That is container scaffolding, not a full cluster deployment. You still need to
 decide your runtime topology.
 
-## Probes
+## Probes: liveness, readiness, and startup
 
-Autumn mounts:
+Autumn mounts four probe endpoints. The paths below are the defaults; each is
+configurable under `[health]` (`live_path`, `ready_path`, `startup_path`,
+`path`), and `[health] enabled = false` suppresses all four so an app can own
+those paths itself.
 
-- `/live`
-- `/ready`
-- `/startup`
-- `/health`
+| Endpoint | Probe | What it reflects |
+| --- | --- | --- |
+| `/live` | liveness | Only that the process is up. Ignores startup and dependency state, so it answers `200` whenever the process is running. |
+| `/ready` | readiness | Startup completion, shutdown draining, connection-pool saturation, a configured read replica (unless `replica_fallback = "primary"`), and any readiness indicators you register. `503` when any is not ready. |
+| `/startup` | startup | Stays unavailable until startup hooks complete. |
+| `/health` | — | Compatibility alias for readiness: same checks and same status as `/ready`. |
 
 Recommended use:
 
@@ -49,6 +54,23 @@ Recommended use:
 - startup probe -> `/startup`
 
 Do not point all three at `/health` just because it was easy in older apps.
+`/health` is a readiness answer, so it returns `503` for conditions a restart
+does not fix: a saturated connection pool, a read replica that cannot safely
+serve reads, a readiness indicator of your own reporting down, or a drain
+already in progress. A *liveness* probe reading one of those has the
+orchestrator kill a process that was working — a busy minute becomes a restart
+loop, which is the failure mode separate probes exist to prevent. Point
+liveness at `/live`, which reports on the process and nothing else.
+
+Readiness does **not** ping the primary database. The built-in `db` indicator
+reports pool *availability* — whether a connection is free, or nobody is queued
+for one — so a primary that has become unreachable while the pool still holds
+idle connections can leave `/ready` at `200`. A configured read replica is
+different: it is probed with a real `SELECT 1`. If you need readiness to gate
+on primary connectivity, register an indicator that runs a query.
+
+For readiness that also reflects your own subsystems, see
+[Health Indicators](health-indicators.md).
 
 ## Telemetry
 
@@ -639,7 +661,7 @@ autumn_web::app()
 ```toml
 # Cargo.toml
 [dependencies]
-autumn-cache-redis = "0.7"
+autumn-cache-redis = "0.8"
 ```
 
 `CacheResponseLayer::from_app(&state)` returns `Some(layer)` wired to the
@@ -841,7 +863,7 @@ timeout.
 | 2 | **ready_draining** | `/ready` flips to `503 Service Unavailable` **strictly before** the TCP listener closes. Upstream load balancers can now deregister the replica. |
 | 3 | **prestop_grace** | Autumn sleeps `server.prestop_grace_secs` (default `5`). Set this to at least your LB's health-check interval plus deregistration propagation time. |
 | 4 | **ws_closing** | The WebSocket shutdown token fires. Handlers that opt into `WithShutdown` should send a `1001 Going Away` close frame so clients can reconnect to another replica. Handlers that do not use `WithShutdown` will have their connections closed without a close frame. |
-| 5 | **listener_stopping** | The TCP listener stops accepting new connections. `#[job]` workers and `#[scheduled]` tasks stop dequeuing/launching new work — they share the same cancellation token as the listener. |
+| 5 | **listener_stopping** | The TCP listener stops accepting new connections. `#[job]` workers and `#[scheduled]` tasks stop dequeuing/launching new work — they share the same cancellation token as the listener. The HTTP drain then starts after a 100 ms settle window, so a connection accepted just before the stop has its request read and served rather than being closed as idle. |
 | 6 | **in_flight_drain** | In-flight HTTP requests complete for up to `server.shutdown_timeout_secs` (default `30`). Requests still running at the deadline are aborted and counted in `autumn_shutdown_aborted_requests_total`. The process exits with code `1` and a structured log line naming the exceeded phase. |
 | 7 | **app_hooks** | `on_shutdown` hooks run in **LIFO registration order** with a per-hook and total budget equal to `shutdown_timeout_secs`. Plugin hooks registered during `build()` run after app hooks (LIFO means last-registered runs first). Overruns are logged at WARN but do not block the remaining budget. |
 | 8 | **telemetry_flush** | OpenTelemetry span exporter flushes buffered spans (handled by the `_telemetry_guard` drop). |
@@ -922,8 +944,9 @@ concurrently during drain but is not awaited at shutdown.
 ### WebSocket drain contract
 
 Every `#[ws]` handler that uses `WithShutdown` receives a `CancellationToken`
-that is cancelled at phase 4. Handlers should send a close frame on
-cancellation:
+that is cancelled at phase 4. `#[ws]` is behind the non-default `ws` feature
+(`features = ["ws"]`); see [WebSockets](websockets.md). Handlers should send a
+close frame on cancellation:
 
 ```rust
 #[ws("/chat")]

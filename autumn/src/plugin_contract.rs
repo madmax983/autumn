@@ -41,7 +41,7 @@
 //!         Some(
 //!             PluginContract::new(env!("CARGO_PKG_NAME"))
 //!                 .plugin_version(env!("CARGO_PKG_VERSION"))
-//!                 .autumn_web("0.7"),
+//!                 .autumn_web("0.8"),
 //!         )
 //!     }
 //!
@@ -165,6 +165,11 @@ pub const PLUGIN_SURFACES: &[PluginSurface] = &[
         name: "AppBuilder::plugin",
         tier: SurfaceTier::Stable,
         note: "Mount a plugin. Also the seam a cooperative plugin uses to mount a plugin of its own.",
+    },
+    PluginSurface {
+        name: "AppBuilder::plugin_assets",
+        tier: SurfaceTier::Stable,
+        note: "Serve a `PluginAssets` bundle of files compiled into the plugin crate under `/static/_plugins/<namespace>/`, at content-hashed `immutable` URLs with SRI hashes, and declare its routes. Build the bundle with `plugin_assets!` (requires the `embed-assets` feature) or `PluginAssets::from_files`.",
     },
     PluginSurface {
         name: "AppBuilder::plugin_contracts",

@@ -16,6 +16,7 @@ fn compile_fail_tests() {
     t.compile_fail("tests/compile-fail/non_async_main.rs");
     t.compile_fail("tests/compile-fail/non_function.rs");
     t.compile_fail("tests/compile-fail/routes_nonexistent.rs");
+    t.compile_fail("tests/compile-fail/route_attr_error_cascades_through_routes.rs");
 
     // An attribute matching #[authorize]'s argument grammar under a
     // different name is refused rather than guessed at, whether it's really
@@ -293,6 +294,23 @@ fn compile_fail_tests() {
     #[cfg(feature = "db")]
     t.compile_fail("tests/compile-fail/classified_factory_leak.rs");
 
+    // Operator-blind confidential fields (#1771). A `#[confidential]` column is
+    // sealed under a key the server never holds, so anything that would make the
+    // operator read, index or compare the value is a build failure rather than a
+    // query that silently matches nothing.
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/confidential_find_by.rs");
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/confidential_searchable.rs");
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/confidential_plain_string.rs");
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/confidential_missing_blind_index.rs");
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/confidential_find_or_create_by.rs");
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/confidential_cursor_key.rs");
+
     // Typed accessible UI primitives (#1706): an accessible name is a
     // compile-time obligation, so inaccessible construction does not build.
     #[cfg(feature = "maud")]
@@ -524,6 +542,16 @@ fn cache_coherence_compile_fail_tests() {
     t.compile_fail("tests/compile-fail/repository_acknowledge_stale_blank_reason.rs");
 }
 
+/// SLA obligations (#1826): `#[obligation]` checks its arguments at compile
+/// time.
+#[cfg(feature = "sla")]
+#[test]
+fn obligation_compile_fail_tests() {
+    let t = trybuild::TestCases::new();
+    t.compile_fail("tests/compile-fail/obligation_bad_within.rs");
+    t.compile_fail("tests/compile-fail/obligation_missing_starts.rs");
+}
+
 /// Wire contracts (#1755), in their own `#[test]` so the shard that owns them
 /// is the `rest` filter in ci.yml's `trybuild` job rather than the big
 /// `compile_fail_tests` one.
@@ -657,6 +685,9 @@ fn compile_pass_tests_a() {
     // convention-derived names asserted at run time.
     #[cfg(feature = "db")]
     t.pass("tests/compile-pass/model_counter_cache.rs");
+    // #2662: the `parent_pk` override reaches the preload loader.
+    #[cfg(feature = "db")]
+    t.pass("tests/compile-pass/model_counter_cache_parent_pk.rs");
 
     // Model draft accessors (requires db feature)
     #[cfg(feature = "db")]
@@ -686,6 +717,12 @@ fn compile_pass_tests_a() {
     // caller that reads only produced fields and supplies every required one
     // compiles, including across a serde rename and a `skip_serializing_if`.
     t.pass("tests/compile-pass/wire_contract_holds.rs");
+
+    // #1771: the escape hatch the confidential build failure names. A finder
+    // over the blind-index companion column has to compile, or the diagnostic
+    // sends authors somewhere that does not work.
+    #[cfg(feature = "db")]
+    t.pass("tests/compile-pass/confidential_blind_index_finder.rs");
 }
 
 // The second half of the `compile_pass` fixture list; see `compile_pass_tests_a`.

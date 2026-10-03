@@ -227,8 +227,8 @@ qualifier naming where they actually came from.
 
 The sidecar SBOM is generated from `cargo metadata` and is therefore *broader*:
 it covers the whole resolved graph for the image's own target triple and
-feature set, including dev-dependencies, which are resolved but never linked
-into the release binary.
+feature set — minus dev-dependencies, which are resolved but never linked into
+the release binary and are therefore excluded from the inventory.
 
 (The image's SBOM is narrowed with `--filter-platform` to the target that built
 it — without that, it would list every platform's target-specific dependencies,
@@ -239,8 +239,9 @@ it would understate what was published.)
 (`--all-features` widens it further, to crates no single build can contain — it
 is available deliberately, and deliberately not the default.) The embedded list
 is what actually went into the binary. Entries appearing only in
-`from-image.txt` are expected; an entry appearing only in `from-binary.txt` is
-not, and is worth investigating.
+`from-image.txt` are expected only for optional features that were resolved
+but not linked into this build; an entry appearing only in `from-binary.txt`
+is not, and is worth investigating.
 
 ### 2.4 Verify the image's provenance
 
@@ -307,7 +308,7 @@ Run the same gate yourself against any checkout:
 
 ```bash
 ./scripts/check-sbom.sh                     # against the working tree
-RELEASE_TAG=v0.7.0 ./scripts/check-sbom.sh  # also enforce tag agreement
+RELEASE_TAG=v0.8.0 ./scripts/check-sbom.sh  # also enforce tag agreement
 ```
 
 **Downloads during an image build are checksum-verified.** Every artifact the
@@ -385,7 +386,7 @@ error[vulnerability]: Marvin Attack: potential key recovery through timing sidec
     ├ Solution: No safe upgrade is available!
     ├ rsa v0.9.10
       └── jsonwebtoken v10.1.0
-          └── autumn-web v0.7.0
+          └── autumn-web v0.8.0
               └── my-app v0.1.0
 
 advisories FAILED
@@ -704,6 +705,7 @@ them. Doctor reads that path and ages it the same way.
 | `autumn sbom --all-features` | …with every optional feature on (broader than any single build). |
 | `autumn sbom --binary FILE` | What is compiled into this binary? (no source tree) |
 | `autumn sbom --features F` | …resolving the features the build used. |
+| `autumn sbom --no-default-features` | …with the `default` feature disabled (slimmed builds). |
 | `autumn sbom --filter-platform T` | …restricted to one target triple. |
 | `autumn doctor` | Does this app's lockfile pass its own dependency policy? |
 | `autumn doctor --json` | …as machine-readable output, ids and severities included. |

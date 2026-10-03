@@ -54,6 +54,42 @@ changes — see CLAUDE.md "CI test sharding" for the two cases that do matter
 (renaming a `compile_fail.rs` test function, and what branch protection should
 require).
 
+## Changelog notes
+
+A release note does **not** go into `CHANGELOG.md`. It goes into its own file:
+
+```
+changelog.d/<slug>.md
+```
+
+Every PR used to write its note to the top of the `## [Unreleased]` section.
+That is the same few lines every other open PR writes to, so every PR
+conflicted with every other PR, and the conflict was never about the code. A
+fragment is a file of its own, which two PRs never both edit.
+
+A fragment holds the markdown the section holds — a `### <Kind>` heading and
+its bullets:
+
+```markdown
+### Added
+
+- **money:** typed `Money<C>` and an enforced double-entry ledger
+  (issue #1837). `Money<Usd>` plus `Money<Eur>` does not compile.
+```
+
+Write one for a change a user of the framework can see. Skip it for an
+internal refactor that changes nothing on the outside.
+
+A breaking entry keeps the `**Breaking:**` marker and links its migration
+guide, `docs/migrations/next.md`. The migration-guide gate reads the fragments
+together with the changelog, so a break without a guide fails the PR that makes
+it, not the release that ships it.
+
+`./scripts/check-changelog-fragments.sh` gates the shape, and fails a PR that
+edits `CHANGELOG.md`. `./scripts/update-changelog.sh` folds the fragments into
+the changelog when a release is cut. See
+[`changelog.d/README.md`](changelog.d/README.md).
+
 ## Generator conformance gate
 
 Autumn's headline DX promise is that `autumn new` and `autumn generate` emit
@@ -424,12 +460,55 @@ file, and `scripts/check-panic-gate.sh` rejects it as a spoof of the gate.
 ### Toolchain caveat
 
 `arithmetic_side_effects`, `string_slice` and `indexing_slicing` are clippy
-**restriction** lints: their exact firing set can shift between clippy releases,
-so a routine `dtolnay/rust-toolchain@stable` bump can turn an unrelated PR red in
-a gated module nobody touched. When that happens, do **not** delete a lint from
-the headers to get green. Pin the toolchain action to the previous version
-(`dtolnay/rust-toolchain@<ver>`), land the PR, and file a burn-down issue for the
-new findings. Losing a lint is permanent; a pin is a week.
+**restriction** lints: their exact firing set can shift between clippy releases.
+CI is pinned to one Rust version (see "Bumping the toolchain" below), so a Rust
+release cannot turn an unrelated PR red in a gated module nobody touched; the
+new findings surface on the scheduled drift run instead. When a bump does move
+the firing set, do **not** delete a lint from the headers to get green. Fix or
+`#[allow(..., reason = "...")]` the findings on purpose, in the bump PR. Losing
+a lint is permanent.
+
+## Bumping the toolchain
+
+CI compiles with a pinned Rust version, not `stable`. A floating `stable` meant a
+Rust release could turn every open PR red with no change in the repo (the 1.98
+and 1.99 clippy rollovers, #2252 and #3082), and the trybuild goldens, which are
+the compiler's diagnostic text verbatim, are only valid for one compiler.
+
+- The pin is the single line in `.github/RUST_TOOLCHAIN`. Every
+  `dtolnay/rust-toolchain@<version>` in `.github/workflows/` repeats it.
+  `./scripts/check-toolchain-pin.sh` (run by the `MSRV` job) fails if any
+  reference disagrees, or if something floats on `stable` again.
+- The matrix jobs keep `stable` as their *label*, so required-check names like
+  `Compile-and-serve gates (stable)` do not change, and map it to the pin.
+- `.github/workflows/toolchain-drift.yml` is the only workflow that floats on
+  `stable`. It runs `cargo fmt` and clippy weekly (and on demand), so the next
+  release's fallout is a dedicated, non-blocking signal. It is not a PR gate.
+- The MSRV (`rust-version`, currently 1.88.0) is a separate floor and is checked by
+  `scripts/check-msrv.sh`. Do not use an API newer than it because the pin has it:
+  `cargo +<msrv> check -p autumn-web -p autumn-cli` catches that.
+- `publish-gate.yml` pins its own older toolchain for `cargo-semver-checks`, for
+  the reason written next to it. `check-toolchain-pin.sh` allows exactly that one.
+
+To move to a newer Rust, in one PR targeting `trunk-dev`:
+
+1. `rustup toolchain install <version> --profile minimal -c clippy -c rustfmt`.
+2. Find what breaks on the new compiler before touching CI:
+   `cargo +<version> fmt --all -- --check`,
+   `cargo +<version> clippy --workspace --all-targets -- -D warnings`, and the
+   feature lanes in `ci.yml`'s `lint` job (the gated-feature list,
+   `plugin-sandbox`, and the `SQLite runtime` clippy steps). Fix what it finds;
+   grandfather a lint in `[workspace.lints.clippy]` only with a written reason
+   (the examples carry their own `[lints.clippy]` tables).
+3. `./scripts/check-toolchain-pin.sh --bump <version>` moves the pin and every
+   reference together and re-checks.
+4. Re-bless any trybuild goldens whose wording changed:
+   `TRYBUILD=overwrite cargo +<version> test --workspace --test integration_tests -- compile_fail::`
+   (use `--workspace`; the cases depend on the unified feature set), and review
+   the diff. It should be rustc's phrasing only, never a different error.
+
+Run local checks with the pinned version (`rustup toolchain install $(cat
+.github/RUST_TOOLCHAIN)`, then `cargo +<that>`) so they match CI.
 
 ## Determinism seam gate
 
@@ -451,6 +530,7 @@ The gate makes that a compile error instead of a code-review hope.
 | `std::time::Instant::now()` (a deadline whose counterparty is `tokio::time::sleep`) | `tokio::time::Instant::now()` | anywhere — tokio's paused runtime already virtualizes it |
 | `std::time::SystemTime::now()` | `time::clock_unix_secs(clock)` / `time::clock_unix_duration(clock)` | same |
 | `uuid::Uuid::new_v4()` | `state.entropy().uuid_v4()`; the `Rng` extractor in a handler | same |
+| `tokio::task::spawn_blocking` | `crate::time::spawn_blocking`, which carries the running `Sim`'s ambient clock into the blocking thread | framework code |
 
 Two notes on the monotonic seam, because they are the parts that surprise people:
 
@@ -465,9 +545,15 @@ Two notes on the monotonic seam, because they are the parts that surprise people
   monotonicity for testability.
 
 When no clock is reachable at all — a constructor that runs before one is
-installed, a free function with no state argument — `time::monotonic_now()` is the
-sanctioned fallback. It is real time and never follows a simulation, so prefer
-threading a real handle whenever that is possible.
+installed, a free function with no state argument — use the ambient clock:
+`time::ambient_now()`, `ambient_monotonic()`, `ambient_instant()`,
+`ambient_system_time()` or `time::AmbientClock` (issue #2967). A `Sim` installs
+its virtual clock as its thread's ambient clock while it lives, so these follow
+the simulation; with no `Sim` on the thread they read the system clock. Measure
+an `ambient_instant()` with `ambient_instant().saturating_duration_since(start)`,
+never `start.elapsed()`: `Instant::elapsed` reads the OS clock, and clippy does not
+flag it. Prefer a real handle whenever one is in scope. `time::monotonic_now()`
+stays real time and never follows a simulation.
 
 ### What the gate covers
 
@@ -498,31 +584,24 @@ carrying the header above.
 
 **Honest scoping — the manifest is the *enforced* subset.** The modules listed in
 `GATED_MODULES` in `scripts/check-determinism-gate.sh` are the ones enforced
-today, not a claim that the rest of the crate is on-seam. `autumn/src` still
-contains roughly 150 ungated production call sites. The highest-value next batch
-is the code whose elapsed-time reads gate *control flow* or are observable in a
-response: `idempotency.rs` (replay-window TTLs — note its `IdempotencyEntry`
-exposes `expires_at: Instant` as a **public** field, so migrating it is a
-breaking change and needs a migration-guide entry), `circuit_breaker.rs`
-(open/half-open transitions), and the per-request `middleware/access_log.rs`,
-`middleware/metrics.rs`, and `middleware/server_timing.rs` timers. Then
-`webhook_outbound.rs`, `notifications.rs`, `storage/local.rs`, and the rest. The
-manifest grows monotonically and never shrinks (`MODULE_COUNT_FLOOR`); do not
-read a module's absence from it as a promise that it is on-seam.
+today. Since issue #2967 almost every `autumn/src` module with a production
+clock read is on the seam and gated. The rest keep a raw read on purpose (real
+browsers in `system_test.rs`, a real Postgres process in `managed_pg.rs`, the
+`strict_wall_clock` guard in `sim.rs`), or still mint ids with `Uuid::new_v4()`
+and so cannot take the header yet: `storage/local.rs`, `cache/read_through.rs`,
+`repository_commit_hooks.rs`, `mail.rs`, `test.rs`, `sync/store.rs`, `hooks.rs`
+and `channels.rs`. Their clock reads are migrated. The manifest grows
+monotonically and never shrinks (`MODULE_COUNT_FLOOR`); do not read a module's
+absence from it as a promise that it is on-seam.
 
-Known-open gaps, named rather than hidden:
+Sites that cannot reach the app clock, named rather than hidden:
 
-- **`db::run_instrumented`** is a published `pub` function taking no state, so
-  threading a clock in would break the public API. Its `Instant::now()` carries a
-  per-site `#[allow]` with that reason; the instant never escapes (only
-  `elapsed_ms` does) and the framework has no caller of its own.
-- **`#[repository]`-generated writes.** The macro emits
-  `chrono::Utc::now()` for soft-delete and timestamp columns, and the generated
-  repository holds only a pool — no `AppState`, so no clock is reachable. The
-  expansion carries its own `#[allow(clippy::disallowed_methods, reason = "…")]`
-  so it never trips the lint in the *calling* crate, whose author did not write
-  it. That is a suppression, not a fix: a soft-deleted row's `deleted_at` is
-  still non-deterministic under simulation.
+- **`db::run_instrumented`** is a published `pub` function taking no state. It
+  times the query on `time::AmbientClock` (issue #2967), so a running `Sim`
+  controls it with no API change.
+- **`#[repository]`-generated writes** read `time::ambient_now()` (issue #2967).
+  The generated repository holds only a pool, so it cannot reach the app's
+  clock, but the ambient clock follows a running `Sim`.
 - **`app.rs`'s TLS `now_unix`** reads real wall time on purpose. Certificate
   validity is a fact about the real world; a simulation clock pinned to the sim
   epoch must not be able to declare a live certificate expired.

@@ -688,7 +688,8 @@ pub fn check_deprecated_keys_impl(found: &[DoctorDeprecation]) -> CheckResult {
 /// Check signing-secret readiness (pure, injectable for tests).
 ///
 /// - **Dev/test** (`is_production = false`): warns when no secret is configured
-///   (an ephemeral per-process key is in use) and passes when a secret is set.
+///   — sessions and CSRF tokens ride unsigned, and local-storage signed URLs
+///   use an ephemeral per-process key — and passes when a secret is set.
 /// - **Production** (`is_production = true`): fails when the secret is missing,
 ///   below the minimum entropy floor, or matches a known demo/template value.
 pub fn check_signing_secret_impl(secret: Option<&str>, is_production: bool) -> CheckResult {
@@ -705,8 +706,9 @@ pub fn check_signing_secret_impl(secret: Option<&str>, is_production: bool) -> C
             name: "signing_secret",
             status: CheckStatus::Warn,
             detail: Some(
-                "using an ephemeral per-process signing secret (dev/test only; \
-                 sessions and signed URLs will not survive restarts or be shared across replicas)"
+                "no signing secret configured (dev/test only): sessions and \
+                 CSRF tokens ride unsigned; local-storage signed URLs use an \
+                 ephemeral per-process key instead"
                     .into(),
             ),
             hint: Some("Set AUTUMN_SECURITY__SIGNING_SECRET before deploying to production"),
@@ -1092,6 +1094,13 @@ pub enum ClientAuthDoctorData {
         ca_count: usize,
         /// Whether a CRL is configured, and whether its `nextUpdate` has passed.
         crl_stale: Option<bool>,
+        /// Subject DNs of the CAs in the bundle that no CRL in the configured
+        /// CRL file is issued by (issue #2706). Empty when no CRL is
+        /// configured. Once any CRL is configured, the runtime refuses
+        /// handshakes whose revocation status is unknown, so these CAs'
+        /// clients would be rejected — and the server refuses to boot on this,
+        /// so `--strict` fails the run.
+        crl_coverage_gaps: Vec<String>,
         /// How many route prefixes demand a certificate.
         required_path_count: usize,
     },
@@ -1108,8 +1117,10 @@ pub enum ClientAuthDoctorData {
 ///   boot on exactly these).
 /// - Any CA in the bundle already expired → **Fail**: it verifies nothing, so a
 ///   bundle of only-expired CAs rejects every client.
-/// - A CA expiring within 30 days, a stale CRL, or `optional` with no route
-///   requiring a certificate → **Warn**.
+/// - A CRL set that does not cover every CA in the bundle, a CA expiring
+///   within 30 days, a stale CRL, or `optional` with no route requiring a
+///   certificate → **Warn**. The coverage gap is the severest Warn: the
+///   runtime refuses to boot on it, so `--strict` fails the run.
 /// - Otherwise → **Pass**.
 #[must_use]
 pub fn check_client_auth_impl(data: &ClientAuthDoctorData) -> CheckResult {
@@ -1162,6 +1173,27 @@ pub fn check_client_auth_impl(data: &ClientAuthDoctorData) -> CheckResult {
 /// Split out of [`check_client_auth_impl`] so each function stays readable; the
 /// caller has already handled every not-loadable state, so the fallthrough arm
 /// here is unreachable in practice.
+/// The `tls_client_auth` result when the CRL set leaves some bundle CAs
+/// uncovered (issue #2706): the runtime refuses to boot on this, so doctor
+/// warns (and fails under `--strict`).
+fn grade_crl_coverage_gaps(crl_coverage_gaps: &[String]) -> CheckResult {
+    CheckResult {
+        name: "tls_client_auth",
+        status: CheckStatus::Warn,
+        detail: Some(format!(
+            "the [server.tls.client_auth] revocation list has no CRL issued by {} — once any \
+             CRL is configured, the server refuses handshakes whose revocation status is \
+             unknown, so the clients of these CAs would be rejected, and the server refuses \
+             to boot on this",
+            crl_coverage_gaps.join(", ")
+        )),
+        hint: Some(
+            "Publish a CRL for each CA in the bundle, or remove the uncovered CA. Under \
+             `--strict` this warning fails the run, matching the runtime",
+        ),
+    }
+}
+
 fn grade_healthy_client_auth(data: &ClientAuthDoctorData) -> CheckResult {
     match data {
         ClientAuthDoctorData::Healthy {
@@ -1182,6 +1214,9 @@ fn grade_healthy_client_auth(data: &ClientAuthDoctorData) -> CheckResult {
                  nothing",
             ),
         },
+        ClientAuthDoctorData::Healthy {
+            crl_coverage_gaps, ..
+        } if !crl_coverage_gaps.is_empty() => grade_crl_coverage_gaps(crl_coverage_gaps),
         ClientAuthDoctorData::Healthy {
             crl_stale: Some(true),
             ..
@@ -2002,6 +2037,158 @@ pub fn check_custom_domain_dns_impl(probe: &CustomDomainProbe) -> CheckResult {
     }
 }
 
+/// What `autumn doctor` read at a pending domain's ownership TXT record
+/// (#2642).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CustomDomainTxt {
+    /// A resolver saw this registration's token.
+    Present,
+    /// Resolvers answered, and no TXT value is published.
+    Missing,
+    /// Resolvers answered with TXT values, none of them this registration's
+    /// token.
+    Stale {
+        /// How many values were seen.
+        values: usize,
+    },
+    /// No resolver answered.
+    Unanswerable(String),
+}
+
+/// One pending domain's ownership record, for [`check_custom_domain_txt_impl`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CustomDomainOwnershipProbe {
+    /// The registered hostname.
+    pub hostname: String,
+    /// The tenant it belongs to.
+    pub tenant: String,
+    /// The registration's token.
+    pub token: String,
+    /// What the TXT lookup found.
+    pub txt: CustomDomainTxt,
+}
+
+/// Grade TXT answers from several resolvers against `token` (pure).
+///
+/// The runtime passes a domain when ANY server shows the token, so doctor
+/// does the same: one stale cache must not read as a missing record.
+#[must_use]
+pub fn grade_custom_domain_txt(
+    token: &str,
+    answers: &[Result<Vec<String>, String>],
+) -> CustomDomainTxt {
+    let mut last_error = "no resolvers are configured".to_owned();
+    let mut answered = false;
+    let mut values = 0;
+    for answer in answers {
+        match answer {
+            Ok(seen) if seen.iter().any(|v| v.trim() == token) => return CustomDomainTxt::Present,
+            Ok(seen) => {
+                answered = true;
+                values = values.max(seen.len());
+            }
+            Err(e) => last_error.clone_from(e),
+        }
+    }
+    match (answered, values) {
+        (false, _) => CustomDomainTxt::Unanswerable(last_error),
+        (true, 0) => CustomDomainTxt::Missing,
+        (true, values) => CustomDomainTxt::Stale { values },
+    }
+}
+
+/// Grade one pending domain's ownership TXT record (pure; injectable).
+///
+/// A separate check from `custom_domain_dns`, so an operator can tell "the
+/// address record is wrong" from "the address is right, the TXT token is
+/// missing or stale". Each is a Warn: a pending domain is expected to be
+/// incomplete for a while.
+#[must_use]
+pub fn check_custom_domain_txt_impl(probe: &CustomDomainOwnershipProbe) -> CheckResult {
+    let CustomDomainOwnershipProbe {
+        hostname,
+        tenant,
+        token,
+        txt,
+    } = probe;
+    let record = autumn_web::custom_domain::verification_record_name(hostname);
+    let publish = "Publish the TXT record from the domain's DNS instructions; the address record \
+                   alone does not verify a domain";
+    match txt {
+        CustomDomainTxt::Present => CheckResult {
+            name: "custom_domain_txt",
+            status: CheckStatus::Pass,
+            detail: Some(format!(
+                "{record} carries the ownership token for {hostname} (tenant {tenant})"
+            )),
+            hint: None,
+        },
+        CustomDomainTxt::Missing => CheckResult {
+            name: "custom_domain_txt",
+            status: CheckStatus::Warn,
+            detail: Some(format!(
+                "{hostname} (tenant {tenant}) is pending_dns: its ownership TXT record is not \
+                 published. Expected `{record}` TXT `{token}`"
+            )),
+            hint: Some(publish),
+        },
+        CustomDomainTxt::Stale { values } => CheckResult {
+            name: "custom_domain_txt",
+            status: CheckStatus::Warn,
+            detail: Some(format!(
+                "{hostname} (tenant {tenant}) is pending_dns: {record} carries {values} value(s), \
+                 none of them this registration's token `{token}`. A token from an earlier \
+                 registration proves nothing for this one"
+            )),
+            hint: Some(publish),
+        },
+        CustomDomainTxt::Unanswerable(reason) => CheckResult {
+            name: "custom_domain_txt",
+            status: CheckStatus::Warn,
+            detail: Some(format!(
+                "cannot read {record} for {hostname} (tenant {tenant}): {reason}"
+            )),
+            hint: Some(
+                "Check [server.tls.acme.custom_domains] resolvers and that outbound DNS (UDP/53) \
+                 is allowed",
+            ),
+        },
+    }
+}
+
+/// Read `hostname`'s ownership TXT record the way the runtime does, and grade
+/// it against `token`.
+///
+/// Uses the runtime's lookup: the zone's authoritative servers too, not only
+/// `resolvers`. A recursive resolver can cache a negative answer from before
+/// the tenant published, and doctor must not warn about a record the runtime
+/// already sees.
+#[cfg(feature = "tls")]
+#[must_use]
+pub fn resolve_custom_domain_txt(
+    hostname: &str,
+    token: &str,
+    resolvers: &[std::net::SocketAddr],
+) -> CustomDomainTxt {
+    use autumn_web::acme::dns::resolver::{UdpDnsLookup, txt_values};
+
+    let record = autumn_web::custom_domain::verification_record_name(hostname);
+    let lookup = UdpDnsLookup::new(std::time::Duration::from_secs(3));
+    let answer = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime.block_on(txt_values(
+            &record,
+            resolvers,
+            &lookup,
+            std::time::Duration::from_secs(6),
+        )),
+        Err(e) => Err(format!("could not start a runtime for the TXT lookup: {e}")),
+    };
+    grade_custom_domain_txt(token, &[answer])
+}
+
 /// Grade port 80 on one ingress target, for tenant custom domains.
 ///
 /// Deliberately independent of the deployment certificate's challenge mode.
@@ -2141,7 +2328,11 @@ pub fn resolve_custom_domain_dns(
     // that prose is reworded.
     let verdict = grade_dns_verification(&ObservedTarget::Addresses(observed.clone()), &expected);
     match verdict {
-        VerificationOutcome::PointsHere => CustomDomainDns::PointsHere,
+        // The address grader never returns `OwnershipUnproven`; the TXT token
+        // is graded by `custom_domain_txt`.
+        VerificationOutcome::PointsHere | VerificationOutcome::OwnershipUnproven { .. } => {
+            CustomDomainDns::PointsHere
+        }
         VerificationOutcome::Unresolved => CustomDomainDns::Unresolved,
         VerificationOutcome::PointsElsewhere { .. } => CustomDomainDns::PointsElsewhere {
             seen: observed
@@ -2176,7 +2367,7 @@ fn resolve_addresses(host: &str) -> Vec<std::net::IpAddr> {
 
 /// Read the custom-domain registry off disk, where the runtime store writes it.
 ///
-/// Returns `(hostname, tenant, status)` per record, sorted. A file that will
+/// Returns `(hostname, tenant, status, token)` per record, sorted. A file that will
 /// not parse is skipped — the same treatment the runtime store gives it — so
 /// one corrupt record does not blind the check to the rest.
 #[must_use]
@@ -2212,6 +2403,7 @@ pub fn read_custom_domain_registry(store_dir: &std::path::Path) -> CustomDomainR
                 domain.hostname,
                 domain.tenant,
                 domain.status.as_str().to_owned(),
+                domain.verification_token,
             )),
             // The runtime skips a record it cannot read and serves the rest, so
             // doctor counts it rather than failing the run over it.
@@ -2230,8 +2422,9 @@ pub fn read_custom_domain_registry(store_dir: &std::path::Path) -> CustomDomainR
 /// the runtime skips, serving the rest).
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct CustomDomainRegistryRead {
-    /// `(hostname, tenant, status)` per readable record, sorted.
-    pub domains: Vec<(String, String, String)>,
+    /// `(hostname, tenant, status, ownership token)` per readable record,
+    /// sorted. The token is `None` on a record stored before tokens existed.
+    pub domains: Vec<(String, String, String, Option<String>)>,
     /// Why the directory could not be enumerated, if it could not.
     pub unreadable: Option<String>,
     /// Records that could not be read or parsed, one message each.
@@ -4071,20 +4264,46 @@ pub fn check_rust_toolchain_impl(current_output: &str, required: &str) -> CheckR
 // ─── IO-dependent checks ──────────────────────────────────────────────────────
 
 fn check_rust_toolchain(msrv: &str) -> CheckResult {
-    match std::process::Command::new("rustc")
-        .arg("--version")
-        .output()
-    {
+    // `rustc` is rustup's shim, and doctor runs its checks at the same time. If
+    // the project pins a toolchain this machine lacks, rustup errors instead of
+    // installing it: concurrent installs leave a toolchain half-installed.
+    let mut rustc = std::process::Command::new("rustc");
+    rustc.arg("--version");
+    crate::deps::no_toolchain_installs(&mut rustc);
+    match rustc.output() {
         Ok(out) if out.status.success() => {
             let ver = String::from_utf8_lossy(&out.stdout).into_owned();
             check_rust_toolchain_impl(ver.trim(), msrv)
         }
-        _ => CheckResult {
+        Ok(out) => rust_toolchain_failure(&String::from_utf8_lossy(&out.stderr)),
+        Err(_) => CheckResult {
             name: "rust_toolchain",
             status: CheckStatus::Fail,
             detail: Some("`rustc --version` failed".into()),
             hint: Some("Install Rust via https://rustup.rs/"),
         },
+    }
+}
+
+/// The `rust_toolchain` result when `rustc --version` exits non-zero.
+///
+/// Rust can be installed while the project's pinned toolchain is not: rustup
+/// then says "toolchain '…' is not installed". That needs `rustup toolchain
+/// install`, not a fresh Rust install.
+fn rust_toolchain_failure(stderr: &str) -> CheckResult {
+    let reason = stderr.lines().map(str::trim).find(|line| !line.is_empty());
+    CheckResult {
+        name: "rust_toolchain",
+        status: CheckStatus::Fail,
+        detail: Some(reason.map_or_else(
+            || "`rustc --version` failed".to_owned(),
+            |reason| format!("`rustc --version` failed: {reason}"),
+        )),
+        hint: Some(if stderr.contains("is not installed") {
+            "Run `rustup toolchain install` in this project to install its pinned toolchain"
+        } else {
+            "Install Rust via https://rustup.rs/"
+        }),
     }
 }
 
@@ -4222,13 +4441,44 @@ fn tailwind_file_is_executable(_path: &std::path::Path, _metadata: &std::fs::Met
 }
 
 fn check_tailwind_binary() -> CheckResult {
-    let path = if cfg!(windows) {
-        std::path::PathBuf::from("target/autumn/tailwindcss.exe")
-    } else {
-        std::path::PathBuf::from("target/autumn/tailwindcss")
+    // Resolve the SAME `<target_dir>/autumn` directory `autumn setup` writes
+    // to and `autumn dev`/the scaffold's `build.rs` read from (issue #2457):
+    // a `target`-relative literal reports the binary missing whenever
+    // `CARGO_TARGET_DIR` points elsewhere, even though `setup` put it exactly
+    // where `dev` expects it. Tolerant, not `resolve_target_directory`'s
+    // hard-exit form: one unreadable check must not abort every other check
+    // `doctor` still has to report.
+    let binary = |target_dir: std::path::PathBuf| {
+        target_dir.join("autumn").join(if cfg!(windows) {
+            "tailwindcss.exe"
+        } else {
+            "tailwindcss"
+        })
     };
+    crate::dev::try_resolve_target_directory().map_or_else(tailwind_not_evaluated, |target_dir| {
+        check_tailwind_binary_at(&binary(target_dir))
+    })
+}
 
-    check_tailwind_binary_at(&path)
+/// The Tailwind check when `cargo metadata` could not name the target
+/// directory, for example because the pinned toolchain is not installed.
+///
+/// Any path doctor picked instead would be a guess: Cargo also reads
+/// `CARGO_TARGET_DIR`, `CARGO_BUILD_TARGET_DIR` and `[build] target-dir` from
+/// every `.cargo/config.toml` up the tree. Whatever is or is not at a guessed
+/// path says nothing about the binary `autumn setup` installed, so the check
+/// is not evaluated.
+fn tailwind_not_evaluated() -> CheckResult {
+    CheckResult {
+        name: "tailwind_binary",
+        status: CheckStatus::Pass,
+        detail: Some(
+            "not evaluated — `cargo metadata` could not name the target directory".to_owned(),
+        ),
+        hint: Some(
+            "Fix what stops `cargo metadata` (see the `rust_toolchain` check), then run `autumn doctor` again",
+        ),
+    }
 }
 
 fn check_stale_artifacts() -> CheckResult {
@@ -4908,7 +5158,28 @@ fn check_queue_coverage_topology(
     pin: &[String],
     declared_queues: &[String],
     fleet: Option<&FleetTopology>,
+    declared_queues_manifest_error: Option<&DeclaredQueuesManifestError>,
 ) -> CheckResult {
+    // A corrupt jobs manifest cannot contribute its declared set: Fail rather
+    // than reason about a silently narrowed one (#2419). The writer (`autumn
+    // jobs manifest`) refuses to emit this shape, so the reader refuses to
+    // trust it.
+    if let Some(err) = declared_queues_manifest_error {
+        return CheckResult {
+            name: "jobs_queue_coverage",
+            status: CheckStatus::Fail,
+            detail: Some(format!(
+                "[jobs.fleet] manifest at `{}` is corrupt ({}), so doctor cannot \
+                 determine the #[job(queue)]-declared queue set and refuses to \
+                 guess rather than silently narrowing it",
+                err.manifest_path, err.detail
+            )),
+            hint: Some(
+                "Regenerate the manifest with `autumn jobs manifest`, or unset \
+                 `[jobs.fleet] manifest` to fall back to `declared_queues`",
+            ),
+        };
+    }
     // No topology declared → informational-only, exactly as today. The hard-fail
     // only activates once the operator supplies the topology that makes coverage
     // provable, so existing deployments never regress.
@@ -6167,6 +6438,20 @@ fn resolve_fleet_topology(table: Option<&toml::Table>) -> Option<FleetTopology> 
     })
 }
 
+/// A `[jobs.fleet] manifest` file doctor could read, whose `queues` array is
+/// corrupt in exactly the shape `autumn jobs manifest` refuses to emit (a
+/// non-array `queues`, or a non-string element). The reader must be as strict
+/// as the emitter (#2419): silently dropping the element narrows the declared
+/// set, and the coverage check then Passes a deployment with an uncovered
+/// queue — the exact failure the check exists to catch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DeclaredQueuesManifestError {
+    /// The `[jobs.fleet] manifest` path whose `queues` array was corrupt.
+    manifest_path: String,
+    /// What was wrong with it.
+    detail: String,
+}
+
 /// Resolve the compiled `#[job(queue = "…")]`-declared queue set for the
 /// coverage check (#1756), so doctor's view of "queues that must be drained"
 /// matches what the runtime actually drains. Two sources, in precedence order:
@@ -6183,13 +6468,21 @@ fn resolve_fleet_topology(table: Option<&toml::Table>) -> Option<FleetTopology> 
 /// unreadable, unparseable, or no `queues` array) falls through to the inline
 /// list.
 ///
-/// Returns an empty `Vec` when neither is present; an unknown declared set only
-/// shrinks the needed set, so it can never cause a false failure.
-fn resolve_declared_queues(table: Option<&toml::Table>) -> Vec<String> {
+/// A manifest that says something *corrupt* — `queues` present but not an array
+/// of strings — is an `Err` naming the path, never a silently narrowed list
+/// (#2419). The emitter rejects exactly this shape, so the reader must too.
+///
+/// Returns an empty `Vec` when neither source is present.
+fn resolve_declared_queues(
+    table: Option<&toml::Table>,
+) -> Result<Vec<String>, DeclaredQueuesManifestError> {
     resolve_declared_queues_from_sources(|p| std::fs::read_to_string(p).ok(), table)
 }
 
-fn resolve_declared_queues_from_sources<F>(read_file: F, table: Option<&toml::Table>) -> Vec<String>
+fn resolve_declared_queues_from_sources<F>(
+    read_file: F,
+    table: Option<&toml::Table>,
+) -> Result<Vec<String>, DeclaredQueuesManifestError>
 where
     F: Fn(&str) -> Option<String>,
 {
@@ -6199,7 +6492,7 @@ where
         .and_then(|j| j.get("fleet"))
         .and_then(toml::Value::as_table)
     else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
 
     // 1. A jobs manifest the app emits: TOML `queues = [...]`.
@@ -6213,20 +6506,28 @@ where
     //
     // The fall-through is reserved for a manifest that genuinely says nothing: an
     // absent path, an unreadable file, unparseable TOML, or no `queues` array.
+    // A manifest whose `queues` array is *present but malformed* is corrupt, not
+    // silent — fail loudly (#2419).
     if let Some(path) = fleet.get("manifest").and_then(toml::Value::as_str)
         && let Some(contents) = read_file(path)
-        && let Ok(manifest) = toml::from_str::<toml::Table>(&contents)
-        && let Some(queues) = manifest.get("queues").and_then(toml::Value::as_array)
     {
-        return queues
-            .iter()
-            .filter_map(toml::Value::as_str)
-            .map(str::to_owned)
-            .collect();
+        match crate::jobs::parse_manifest_queues(&contents) {
+            Ok(crate::jobs::ManifestQueues::Present(queues)) => return Ok(queues),
+            Ok(crate::jobs::ManifestQueues::Absent)
+            | Err(crate::jobs::ManifestQueuesError::NotToml(_)) => {
+                // Says nothing: fall through to the inline list.
+            }
+            Err(crate::jobs::ManifestQueuesError::BadQueuesArray(detail)) => {
+                return Err(DeclaredQueuesManifestError {
+                    manifest_path: path.to_owned(),
+                    detail,
+                });
+            }
+        }
     }
 
     // 2. Inline declared-queues list (MVP).
-    fleet
+    Ok(fleet
         .get("declared_queues")
         .and_then(toml::Value::as_array)
         .map(|a| {
@@ -6235,7 +6536,7 @@ where
                 .map(str::to_owned)
                 .collect()
         })
-        .unwrap_or_default()
+        .unwrap_or_default())
 }
 
 fn first_env<F>(env_var: &F, keys: &[&str]) -> Option<String>
@@ -6986,18 +7287,35 @@ fn grade_client_auth_trust_store(
                 };
             }
         };
-        let crl_stale = match crl {
+        let (crl_stale, crl_coverage_gaps) = match crl {
             Some(path) => {
-                match autumn_web::tls::client_auth::inspect_crl(std::path::Path::new(path)) {
-                    Ok(inspection) => Some(inspection.is_stale(now)),
+                let path = std::path::Path::new(path);
+                let inspection = match autumn_web::tls::client_auth::inspect_crl(path) {
+                    Ok(inspection) => inspection,
                     Err(e) => {
                         return ClientAuthDoctorData::Invalid {
                             detail: e.to_string(),
                         };
                     }
-                }
+                };
+                // The #2706 coverage gap: a CRL set that covers only some of
+                // the bundle's CAs makes the runtime refuse the clients of the
+                // rest (and refuse to boot). Both files already loaded through
+                // the runtime paths above, so this only compares names.
+                let gaps = match autumn_web::tls::client_auth::crl_coverage_gaps(
+                    std::path::Path::new(bundle),
+                    path,
+                ) {
+                    Ok(gaps) => gaps,
+                    Err(e) => {
+                        return ClientAuthDoctorData::Invalid {
+                            detail: e.to_string(),
+                        };
+                    }
+                };
+                (Some(inspection.is_stale(now)), gaps)
             }
-            None => None,
+            None => (None, Vec::new()),
         };
 
         let expired_cas: Vec<String> = cas
@@ -7018,6 +7336,7 @@ fn grade_client_auth_trust_store(
             near_expiry_cas,
             ca_count: cas.len(),
             crl_stale,
+            crl_coverage_gaps,
             required_path_count,
         }
     }
@@ -8704,7 +9023,7 @@ where
             .and_then(|p| p.get("alerts"))
             .and_then(toml::Value::as_table)
             .and_then(|a| a.get("error_rate_threshold"))
-            .and_then(&stringify)
+            .and_then(stringify)
     {
         return v;
     }
@@ -8786,7 +9105,7 @@ fn resolve_compression_enabled() -> bool {
             .get("profile")
             .and_then(|v| v.get(&profile))
             .and_then(toml::Value::as_table)
-            .and_then(&parse_enabled)
+            .and_then(parse_enabled)
     {
         return enabled;
     }
@@ -8948,7 +9267,6 @@ const DEPLOY_HOST_SPELLING_REACHABILITY_HINT: &str = "Fix the [deploy] host spel
 ///    Results are joined back in display order.
 #[allow(clippy::too_many_lines)]
 pub fn run(opts: DoctorOptions) {
-    use std::thread;
     type Task = Box<dyn FnOnce() -> CheckResult + Send>;
 
     let cli_version = env!("CARGO_PKG_VERSION");
@@ -9079,7 +9397,13 @@ pub fn run(opts: DoctorOptions) {
     // informational-only per-process report, so existing deployments never
     // regress.
     let fleet_topology = resolve_fleet_topology(Some(&merged_jobs_toml));
-    let declared_queues = resolve_declared_queues(Some(&merged_jobs_toml));
+    let (declared_queues, declared_queues_manifest_error) =
+        match resolve_declared_queues(Some(&merged_jobs_toml)) {
+            Ok(queues) => (queues, None),
+            // A corrupt manifest is a hard Fail below, never a silently narrowed
+            // declared set (#2419).
+            Err(err) => (Vec::new(), Some(err)),
+        };
     tasks.push(Box::new(move || {
         check_queue_coverage_topology(
             queue_coverage_role,
@@ -9087,6 +9411,7 @@ pub fn run(opts: DoctorOptions) {
             &jobs_pin,
             &declared_queues,
             fleet_topology.as_ref(),
+            declared_queues_manifest_error.as_ref(),
         )
     }));
 
@@ -9768,6 +10093,11 @@ pub fn run(opts: DoctorOptions) {
                     .chain(ing.ipv6.iter().map(ToString::to_string))
                     .collect()
             });
+            #[cfg(feature = "tls")]
+            let txt_resolvers = cd_cfg
+                .as_ref()
+                .and_then(|cd| cd.resolver_addrs().ok())
+                .unwrap_or_default();
             let registry_read = registered.clone();
             tasks.push(Box::new(move || {
                 check_custom_domains_config_impl(
@@ -9800,11 +10130,31 @@ pub fn run(opts: DoctorOptions) {
                 // The ingress every registered domain is graded against — the
                 // deployment's, not this CLI host's.
                 let probe_ingress = cd_ingress.unwrap_or_default();
-                for (index, (hostname, tenant, status)) in registered
+                for (index, (hostname, tenant, status, token)) in registered
                     .into_iter()
                     .take(MAX_CUSTOM_DOMAIN_PROBES)
                     .enumerate()
                 {
+                    // A pending domain also needs its ownership TXT token
+                    // (#2642). A settled one proved it already, and a record
+                    // with no token is either grandfathered or given one at
+                    // the next start.
+                    #[cfg(feature = "tls")]
+                    if let (Some(token), "pending_dns") = (token, status.as_str()) {
+                        let (hostname, tenant) = (hostname.clone(), tenant.clone());
+                        let resolvers = txt_resolvers.clone();
+                        tasks.push(Box::new(move || {
+                            let txt = resolve_custom_domain_txt(&hostname, &token, &resolvers);
+                            check_custom_domain_txt_impl(&CustomDomainOwnershipProbe {
+                                hostname,
+                                tenant,
+                                token,
+                                txt,
+                            })
+                        }));
+                    }
+                    #[cfg(not(feature = "tls"))]
+                    let _ = token;
                     let probe_ingress = probe_ingress.clone();
                     tasks.push(Box::new(move || {
                         let dns = resolve_custom_domain_dns(&hostname, &probe_ingress);
@@ -10192,9 +10542,13 @@ pub fn run(opts: DoctorOptions) {
     }));
 
     // ── Phase 3: spawn all tasks concurrently ────────────────────────────────
+    run_doctor_tasks(tasks, opts);
+}
+
+fn run_doctor_tasks(tasks: Vec<Box<dyn FnOnce() -> CheckResult + Send>>, opts: DoctorOptions) {
     #[allow(clippy::needless_collect)]
-    let handles: Vec<thread::JoinHandle<CheckResult>> =
-        tasks.into_iter().map(thread::spawn).collect();
+    let handles: Vec<std::thread::JoinHandle<CheckResult>> =
+        tasks.into_iter().map(std::thread::spawn).collect();
 
     // ── Phase 4: join in order (preserves display ordering) ──────────────────
     let results: Vec<CheckResult> = handles
@@ -12702,6 +13056,7 @@ pub struct Vault {
             near_expiry_cas: Vec::new(),
             ca_count: 1,
             crl_stale: None,
+            crl_coverage_gaps: Vec::new(),
             required_path_count,
         }
     }
@@ -12810,8 +13165,47 @@ pub struct Vault {
             near_expiry_cas: vec![("CN=Aging CA".to_owned(), 3)],
             ca_count: 2,
             crl_stale: Some(true),
+            crl_coverage_gaps: vec!["CN=Uncovered CA".to_owned()],
             required_path_count: 0,
         };
+        let r = check_client_auth_impl(&data);
+        assert!(matches!(r.status, CheckStatus::Fail));
+        assert!(r.detail.unwrap().contains("expired"));
+    }
+
+    #[test]
+    fn client_auth_warns_on_a_crl_coverage_gap() {
+        // Issue #2706: the CRL set names only some of the bundle's CAs, so
+        // the runtime would refuse the uncovered CAs' clients — and refuse
+        // to boot at all.
+        let mut data = healthy_client_auth("required", 1);
+        if let ClientAuthDoctorData::Healthy {
+            crl_coverage_gaps, ..
+        } = &mut data
+        {
+            crl_coverage_gaps.push("CN=New CA".to_owned());
+        }
+        let r = check_client_auth_impl(&data);
+        assert!(matches!(r.status, CheckStatus::Warn));
+        let detail = r.detail.unwrap();
+        assert!(detail.contains("CN=New CA"), "{detail}");
+        assert!(detail.contains("refuses to boot"), "{detail}");
+    }
+
+    #[test]
+    fn client_auth_grades_an_expired_ca_above_a_crl_coverage_gap() {
+        // Worst problem first: the expired CA is a Fail, the coverage gap a
+        // Warn, so the Fail must win.
+        let mut data = healthy_client_auth("required", 1);
+        if let ClientAuthDoctorData::Healthy {
+            expired_cas,
+            crl_coverage_gaps,
+            ..
+        } = &mut data
+        {
+            expired_cas.push("CN=Retired CA".to_owned());
+            crl_coverage_gaps.push("CN=New CA".to_owned());
+        }
         let r = check_client_auth_impl(&data);
         assert!(matches!(r.status, CheckStatus::Fail));
         assert!(r.detail.unwrap().contains("expired"));
@@ -13837,6 +14231,7 @@ pub struct Vault {
                         format!("d{i}.clientco.com"),
                         "tenant-a".to_owned(),
                         "active".to_owned(),
+                        None,
                     )
                 })
                 .collect(),
@@ -14169,6 +14564,54 @@ pub struct Vault {
         );
     }
 
+    // #2642: a pending domain's TXT token is graded apart from its address.
+    #[test]
+    fn the_txt_grader_tells_missing_from_stale_from_present() {
+        let ok = |values: &[&str]| Ok(values.iter().map(|v| (*v).to_owned()).collect());
+        assert_eq!(
+            grade_custom_domain_txt("tok", &[Err("timeout".to_owned()), ok(&["tok"])]),
+            CustomDomainTxt::Present
+        );
+        assert_eq!(
+            grade_custom_domain_txt("tok", &[ok(&[])]),
+            CustomDomainTxt::Missing
+        );
+        assert_eq!(
+            grade_custom_domain_txt("tok", &[ok(&["old-token"]), ok(&[])]),
+            CustomDomainTxt::Stale { values: 1 }
+        );
+        assert_eq!(
+            grade_custom_domain_txt("tok", &[Err("REFUSED".to_owned())]),
+            CustomDomainTxt::Unanswerable("REFUSED".to_owned())
+        );
+    }
+
+    #[test]
+    fn the_txt_check_names_the_record_and_the_token_to_publish() {
+        let probe = |txt| CustomDomainOwnershipProbe {
+            hostname: "app.clientco.com".to_owned(),
+            tenant: "tenant-b".to_owned(),
+            token: "tok".to_owned(),
+            txt,
+        };
+        let present = check_custom_domain_txt_impl(&probe(CustomDomainTxt::Present));
+        assert_eq!(present.name, "custom_domain_txt");
+        assert_eq!(present.status, CheckStatus::Pass);
+
+        let missing = check_custom_domain_txt_impl(&probe(CustomDomainTxt::Missing));
+        assert_eq!(missing.status, CheckStatus::Warn);
+        let detail = missing.detail.unwrap();
+        assert!(detail.contains("not published"), "{detail}");
+        assert!(
+            detail.contains("`_autumn-challenge.app.clientco.com` TXT `tok`"),
+            "{detail}"
+        );
+
+        let stale = check_custom_domain_txt_impl(&probe(CustomDomainTxt::Stale { values: 1 }));
+        assert_eq!(stale.status, CheckStatus::Warn);
+        assert!(stale.detail.unwrap().contains("earlier registration"));
+    }
+
     #[test]
     fn the_registry_reader_skips_unreadable_records_and_sorts() {
         let dir = tempfile::tempdir().unwrap();
@@ -14211,6 +14654,8 @@ pub struct Vault {
         );
         assert_eq!(records[0].0, "a.clientco.com");
         assert_eq!(records[1].0, "b.clientco.com");
+        // Records from before #2642 carry no token.
+        assert_eq!(records[0].3, None);
     }
 
     #[test]
@@ -17624,6 +18069,68 @@ foo = "bar"
         assert!(r.detail.as_deref().unwrap_or("").contains("8080"));
     }
 
+    // ── no toolchain installs ────────────────────────────────────────────────
+
+    /// The body of the first `fn` whose signature starts with `signature`.
+    /// Line endings are normalized first: a Windows checkout has CRLF.
+    fn fn_body(source: &str, signature: &str) -> String {
+        let source = source.replace("\r\n", "\n");
+        let start = source.find(signature).expect("function present");
+        let end = source[start..].find("\n}\n").expect("function end");
+        source[start..start + end].to_owned()
+    }
+
+    #[test]
+    fn fn_body_reads_a_crlf_checkout() {
+        let source = "fn a() {\r\n    body();\r\n}\r\nfn b() {}\r\n";
+        assert_eq!(fn_body(source, "fn a("), "fn a() {\n    body();");
+    }
+
+    #[test]
+    fn doctor_checks_never_make_rustup_install_a_toolchain() {
+        // Regression, caught by the Windows Tier 1 journey: doctor runs its
+        // checks at the same time, and `rustc`/`cargo` there are rustup's shims,
+        // which install the project's pinned toolchain on first use. Several
+        // checks installing it at once left it half-installed, and the next
+        // `cargo` failed with "the 'cargo.exe' binary ... is not applicable to
+        // the '1.88.0' toolchain". A check must not install anything.
+        let doctor = include_str!("doctor.rs");
+        assert!(
+            fn_body(doctor, "fn check_rust_toolchain(msrv").contains("no_toolchain_installs(&mut"),
+            "the rust_toolchain check must forbid a toolchain install"
+        );
+        let dev = include_str!("dev.rs");
+        assert!(
+            fn_body(dev, "pub fn try_resolve_target_directory(")
+                .contains("no_toolchain_installs(&mut"),
+            "doctor's target-dir lookup must forbid a toolchain install"
+        );
+    }
+
+    #[test]
+    fn a_missing_pinned_toolchain_points_at_rustup_toolchain_install() {
+        let r = rust_toolchain_failure(
+            "error: toolchain '1.88.0-x86_64-pc-windows-msvc' is not installed\n\
+             help: run `rustup toolchain install` to install it\n",
+        );
+        assert_eq!(r.status, CheckStatus::Fail);
+        assert_eq!(
+            r.detail.as_deref(),
+            Some(
+                "`rustc --version` failed: error: toolchain \
+                 '1.88.0-x86_64-pc-windows-msvc' is not installed"
+            )
+        );
+        assert!(r.hint.expect("a hint").contains("rustup toolchain install"));
+    }
+
+    #[test]
+    fn any_other_rustc_failure_still_points_at_installing_rust() {
+        let r = rust_toolchain_failure("");
+        assert_eq!(r.detail.as_deref(), Some("`rustc --version` failed"));
+        assert_eq!(r.hint, Some("Install Rust via https://rustup.rs/"));
+    }
+
     // ── check_rust_toolchain_impl ────────────────────────────────────────────
 
     #[test]
@@ -18310,6 +18817,7 @@ foo = "bar"
             &pin,
             &[],  // no declared queues
             None, // no fleet topology → informational fallback
+            None, // no manifest error
         );
         assert_eq!(result.status, CheckStatus::Pass);
         // Same detail the informational-only path produces (names the unclaimed).
@@ -18343,6 +18851,7 @@ foo = "bar"
             &["critical".to_string()],
             &[],
             Some(&fleet),
+            None,
         );
         assert_eq!(result.status, CheckStatus::Pass, "{:?}", result.detail);
         let summary = Summary {
@@ -18378,6 +18887,7 @@ foo = "bar"
             &["critical".to_string()],
             &[],
             Some(&fleet),
+            None,
         );
         assert_ne!(
             result.status,
@@ -18408,6 +18918,7 @@ foo = "bar"
             &["critical".to_string()],
             &[],
             Some(&fleet),
+            None,
         );
         assert_eq!(result.status, CheckStatus::Fail, "{:?}", result.detail);
         assert!(
@@ -18441,6 +18952,7 @@ foo = "bar"
             &["critical".to_string()],
             &[],
             Some(&fleet),
+            None,
         );
         assert_eq!(result.status, CheckStatus::Pass, "{:?}", result.detail);
     }
@@ -18464,6 +18976,7 @@ foo = "bar"
             &["default".to_string(), "email".to_string()],
             &declared,
             Some(&fleet),
+            None,
         );
         assert_eq!(result.status, CheckStatus::Pass, "{:?}", result.detail);
 
@@ -18475,6 +18988,7 @@ foo = "bar"
             &["default".to_string(), "email".to_string()],
             &[],
             Some(&fleet),
+            None,
         );
         assert_eq!(
             result_no_manifest.status,
@@ -18554,7 +19068,8 @@ foo = "bar"
 
             let fleet = resolve_fleet_topology(Some(&table))
                 .expect("a block containing [jobs.fleet] tiers declares a topology");
-            let declared = resolve_declared_queues_from_sources(|_| None, Some(&table));
+            let declared = resolve_declared_queues_from_sources(|_| None, Some(&table))
+                .expect("docs example manifests are well-formed");
             let configured: Vec<String> = table
                 .get("jobs")
                 .and_then(|j| j.get("queues"))
@@ -18570,6 +19085,7 @@ foo = "bar"
                 &pin,
                 &declared,
                 Some(&fleet),
+                None,
             );
             assert_eq!(
                 result.status,
@@ -18598,6 +19114,7 @@ foo = "bar"
             &["default".to_string()],
             &declared,
             Some(&fleet),
+            None,
         );
         assert_eq!(result.status, CheckStatus::Fail, "{:?}", result.detail);
         assert!(result.detail.unwrap().contains("email"));
@@ -18618,6 +19135,7 @@ foo = "bar"
             &["critical".to_string()],
             &[],
             Some(&fleet),
+            None,
         );
         assert_eq!(result.status, CheckStatus::Pass, "{:?}", result.detail);
     }
@@ -18669,7 +19187,8 @@ foo = "bar"
             "doctor and the app must read the same `tiers` from one autumn.toml",
         );
         assert_eq!(
-            resolve_declared_queues_from_sources(|_| None, Some(&table)),
+            resolve_declared_queues_from_sources(|_| None, Some(&table))
+                .expect("docs example has a well-formed manifest"),
             app_view.declared_queues,
             "doctor and the app must read the same `declared_queues`",
         );
@@ -18721,6 +19240,7 @@ foo = "bar"
                 &["critical".to_string()],
                 &[],
                 Some(&fleet),
+                None,
             );
             assert_eq!(
                 result.status,
@@ -18764,6 +19284,7 @@ foo = "bar"
                 &[],
                 &[],
                 Some(&unpinned),
+                None,
             )
             .status,
             CheckStatus::Pass,
@@ -18804,7 +19325,8 @@ foo = "bar"
             "[jobs.fleet]\ntiers = [[\"default\"]]\ndeclared_queues = [\"email\", \"sms\"]\n",
         )
         .expect("parse toml");
-        let declared = resolve_declared_queues_from_sources(|_| None, Some(&inline));
+        let declared = resolve_declared_queues_from_sources(|_| None, Some(&inline))
+            .expect("inline list is well-formed");
         assert_eq!(declared, vec!["email".to_string(), "sms".to_string()]);
 
         // Emitted manifest takes precedence over the inline list.
@@ -18818,7 +19340,8 @@ foo = "bar"
                     .then(|| "queues = [\"critical\", \"email\"]\n".to_string())
             },
             Some(&with_manifest),
-        );
+        )
+        .expect("well-formed manifest is authoritative");
         assert_eq!(
             declared_from_manifest,
             vec!["critical".to_string(), "email".to_string()]
@@ -18832,7 +19355,8 @@ foo = "bar"
         let empty_manifest = resolve_declared_queues_from_sources(
             |path| (path == "target/jobs-manifest.toml").then(|| "queues = []\n".to_string()),
             Some(&with_manifest),
-        );
+        )
+        .expect("empty manifest is a real answer");
         assert!(
             empty_manifest.is_empty(),
             "an empty manifest must win over declared_queues, got {empty_manifest:?}",
@@ -18846,7 +19370,8 @@ foo = "bar"
             ("no queues key", Some("other = 1\n".to_string())),
         ] {
             let fell_through =
-                resolve_declared_queues_from_sources(|_| read.clone(), Some(&with_manifest));
+                resolve_declared_queues_from_sources(|_| read.clone(), Some(&with_manifest))
+                    .expect("a silent manifest falls through to the inline list");
             assert_eq!(
                 fell_through,
                 vec!["stale".to_string()],
@@ -18857,7 +19382,77 @@ foo = "bar"
         // No `[jobs.fleet]` → empty.
         let none: toml::Table =
             toml::from_str("[jobs]\nqueues = [\"critical\"]\n").expect("parse toml");
-        assert!(resolve_declared_queues_from_sources(|_| None, Some(&none)).is_empty());
+        assert!(
+            resolve_declared_queues_from_sources(|_| None, Some(&none))
+                .expect("absent section reads empty")
+                .is_empty()
+        );
+    }
+
+    /// #2419: a jobs manifest whose `queues` array carries a non-string element
+    /// is corrupt, not partially readable — doctor must fail loudly, naming the
+    /// manifest, instead of silently narrowing the declared set.
+    #[test]
+    fn resolve_declared_queues_rejects_a_manifest_with_non_string_queues() {
+        let with_manifest: toml::Table = toml::from_str(
+            "[jobs.fleet]\nmanifest = \"target/jobs-manifest.toml\"\ndeclared_queues = [\"stale\"]\n",
+        )
+        .expect("parse toml");
+
+        for (label, manifest) in [
+            (
+                "non-string element",
+                "queues = [\"critical\", \"thumbnails\", 1]\n",
+            ),
+            ("all non-string", "queues = [1]\n"),
+            ("non-array queues", "queues = \"critical\"\n"),
+        ] {
+            let err = resolve_declared_queues_from_sources(
+                |path| (path == "target/jobs-manifest.toml").then(|| manifest.to_string()),
+                Some(&with_manifest),
+            )
+            .expect_err("a corrupt manifest must not be trusted");
+            assert_eq!(
+                err.manifest_path, "target/jobs-manifest.toml",
+                "the failure must name the manifest ({label})"
+            );
+            // …and must NOT fall through to the stale inline list.
+            assert!(
+                !err.detail.is_empty(),
+                "the failure must say what was wrong ({label})"
+            );
+        }
+    }
+
+    /// #2419: the issue's reproduction — a corrupt manifest must turn the
+    /// topology coverage check into a hard Fail, even on a topology that would
+    /// otherwise Pass.
+    #[test]
+    fn check_queue_coverage_topology_fails_on_corrupt_manifest() {
+        let err = DeclaredQueuesManifestError {
+            manifest_path: "target/jobs-manifest.toml".to_string(),
+            detail: "`queues` is not an array of strings".to_string(),
+        };
+        let fleet = FleetTopology {
+            // Every needed queue IS drained — the verdict must still Fail,
+            // because the declared set is unreadable.
+            tiers: vec![vec!["critical".to_string(), "thumbnails".to_string()]],
+            malformed: false,
+        };
+        let result = check_queue_coverage_topology(
+            ProcessRole::Worker,
+            &["critical".to_string()],
+            &["critical".to_string()],
+            &[],
+            Some(&fleet),
+            Some(&err),
+        );
+        assert_eq!(result.status, CheckStatus::Fail, "{:?}", result.detail);
+        let detail = result.detail.expect("detail names the manifest");
+        assert!(
+            detail.contains("target/jobs-manifest.toml"),
+            "the failure must name the manifest, got: {detail}"
+        );
     }
 
     // ── Jobs manifest emit → consume loop (#1756) ──────────────────────────
@@ -18887,7 +19482,8 @@ foo = "bar"
         .expect("parse toml");
 
         // Doctor reads the emitted manifest, not the stale inline list.
-        let declared = resolve_declared_queues(Some(&table));
+        let declared =
+            resolve_declared_queues(Some(&table)).expect("the emitted manifest is well-formed");
         assert_eq!(
             declared,
             vec!["critical".to_string(), "email".to_string()],
@@ -18901,6 +19497,7 @@ foo = "bar"
             &["critical".to_string()],
             &declared,
             Some(&fleet),
+            None,
         );
         assert_eq!(result.status, CheckStatus::Fail, "{:?}", result.detail);
         assert!(
@@ -18929,7 +19526,8 @@ foo = "bar"
         ))
         .expect("parse toml");
 
-        let declared = resolve_declared_queues(Some(&table));
+        let declared =
+            resolve_declared_queues(Some(&table)).expect("the emitted manifest is well-formed");
         let fleet = resolve_fleet_topology(Some(&table)).expect("topology declared");
         let result = check_queue_coverage_topology(
             ProcessRole::Worker,
@@ -18937,6 +19535,7 @@ foo = "bar"
             &["critical".to_string()],
             &declared,
             Some(&fleet),
+            None,
         );
         assert_eq!(result.status, CheckStatus::Pass, "{:?}", result.detail);
     }
@@ -19758,6 +20357,16 @@ foo = "bar"
     }
 
     #[test]
+    fn an_unknown_target_dir_leaves_the_tailwind_check_unevaluated() {
+        // `cargo metadata` gave no answer, so doctor does not know where Cargo
+        // builds. It must not judge the binary at any guessed path.
+        let r = tailwind_not_evaluated();
+        assert_eq!(r.status, CheckStatus::Pass);
+        let detail = r.detail.expect("a detail");
+        assert!(detail.contains("not evaluated"), "{detail}");
+    }
+
+    #[test]
     fn check_tailwind_not_found() {
         let temp = tempfile::tempdir().expect("temp dir");
         let r = check_tailwind_binary_at(&temp_tailwind_path(&temp));
@@ -19838,9 +20447,14 @@ foo = "bar"
 
     #[test]
     fn check_signing_secret_impl_dev_no_secret_warns() {
+        // #2152: sessions and CSRF tokens ride UNSIGNED with no configured
+        // secret (see docs/guide/signing-secrets.md) — they are not signed
+        // with an ephemeral key. Only local-storage signed URLs get one.
         let r = check_signing_secret_impl(None, false);
         assert_eq!(r.status, CheckStatus::Warn);
-        assert!(r.detail.as_deref().unwrap_or("").contains("ephemeral"));
+        let detail = r.detail.as_deref().unwrap_or("");
+        assert!(detail.contains("unsigned"), "{detail}");
+        assert!(detail.contains("local-storage"), "{detail}");
     }
 
     #[test]

@@ -7,6 +7,13 @@
 //! result or a user-safe error. A [`JobTrackingStore`] persists that state,
 //! keyed by a hash of the token, with a configurable TTL.
 
+// autumn-determinism-gate: production code in this module must read time and
+// mint identifiers through the framework's injected seams (ClockSource /
+// Entropy), never `Instant::now()` / `Utc::now()` / `SystemTime::now()` /
+// `Uuid::new_v4()` directly. See CONTRIBUTING.md "Determinism seam gate"
+// (issue #1797). Justify exceptions with
+// #[allow(clippy::disallowed_methods, reason = "…")] at the narrowest scope.
+#![cfg_attr(not(test), deny(clippy::disallowed_methods))]
 // autumn-panic-gate: request-path module — production code path must be panic-free.
 // See CONTRIBUTING.md "Request-path panic gate". Justify exceptions with
 // #[allow(clippy::<lint>, reason = "…")] at the narrowest scope.
@@ -950,13 +957,15 @@ pub(crate) fn global_tracking_store() -> Option<Arc<dyn JobTrackingStore>> {
 
 /// Reset the process-global tracking store, mirroring
 /// [`crate::job::clear_global_job_client`].
+///
+/// Uses `get_or_init` rather than a `get()`-then-`set()` pair: with the
+/// latter, a concurrent [`install_tracking_store`] could publish its slot
+/// between the two calls, the `set` would fail silently, and the clear
+/// would be lost (modelled in `chaos_job_tracking_store_loom`).
 pub(crate) fn clear_global_tracking_store() {
-    if let Some(lock) = GLOBAL_TRACKING_STORE.get() {
-        if let Ok(mut guard) = lock.write() {
-            *guard = None;
-        }
-    } else {
-        let _ = GLOBAL_TRACKING_STORE.set(RwLock::new(None));
+    let lock = GLOBAL_TRACKING_STORE.get_or_init(|| RwLock::new(None));
+    if let Ok(mut guard) = lock.write() {
+        *guard = None;
     }
 }
 
@@ -1664,7 +1673,7 @@ impl RedisJobTrackingStore {
             return Ok(());
         };
         f(&mut record);
-        record.updated_at = chrono::Utc::now();
+        record.updated_at = crate::time::ambient_now();
         self.write(key, &record).await
     }
 
@@ -1733,7 +1742,7 @@ impl JobTrackingStore for RedisJobTrackingStore {
                 result: None,
                 error: None,
                 owner,
-                updated_at: chrono::Utc::now(),
+                updated_at: crate::time::ambient_now(),
             };
             self.write(key, &record).await
         })
@@ -1786,7 +1795,7 @@ impl JobTrackingStore for RedisJobTrackingStore {
                 result: None,
                 error: None,
                 owner,
-                updated_at: chrono::Utc::now(),
+                updated_at: crate::time::ambient_now(),
             };
             self.write_if_unchanged(key, expected_updated_at, &record)
                 .await

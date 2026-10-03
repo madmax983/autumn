@@ -510,6 +510,16 @@ container, another port, another machine) and point `target` at it.
 - **Only idempotent methods are mirrored.** `GET` and `HEAD`, and the set is not
   configurable. Mirroring a `POST` would let the candidate's writes land for
   real; that needs effect virtualization, which is a follow-up.
+- **A `GET`/`HEAD` carrying a request body is not mirrored.** The mirror
+  replays method, target, and headers but no body, so mirroring one would ask
+  the candidate a different request than the live build answered and record
+  the manufactured difference as a divergence. Both declared bodies (a
+  non-zero `Content-Length`, any `Transfer-Encoding`) and undeclared ones
+  (body frames with no declaring headers, reachable on HTTP/2) sit out
+  quietly (skip reason `has_request_body`) until the mutating-traffic
+  follow-up brings real request-body replay — see
+  [#2332](https://github.com/autumn-foundation/autumn/issues/2332).
+
 - **Mirrored requests never touch primary state.** The mirror path performs no
   database, cache, mail, or job work of its own — it copies request bytes and
   compares response bytes.
@@ -531,6 +541,18 @@ container, another port, another machine) and point `target` at it.
   normally and every request through a planned maintenance window would look
   like a status-class divergence. The trade is that a genuine handler-produced
   `429`/`503` divergence is not reported either.
+- **Conditional requests are not mirrored.** A `GET`/`HEAD` carrying
+  `If-None-Match`, `If-Modified-Since`, or `If-Range` (or `If-Match` /
+  `If-Unmodified-Since`) is a cache revalidation, and a validator is scoped to
+  the build that issued it: the primary answers `304` while the candidate —
+  whose validator legitimately differs — answers `200`, so replaying the
+  primary's validator to the candidate records a `status_class` divergence on
+  ordinary cache traffic. Worse, when both builds *do* revalidate, the differ
+  compares two empty `304` bodies and records a `match` while comparing
+  nothing, hiding a genuine body regression on exactly the traffic that
+  revalidates. These requests are skipped and counted as `skipped_conditional`.
+  The trade is that on a cache-heavy route the revalidating share of traffic
+  gets no coverage — the counter shows how much.
 - **A mirror's waiting is bounded.** One deadline, stamped at dispatch, covers
   both the shadow request and the wait for the mirrored primary response, so a
   client that stops reading — or a long-lived `text/event-stream` — cannot pin
@@ -661,8 +683,8 @@ $ curl -s localhost:3000/actuator/shadow | jq
 }
 ```
 
-`stats` also carries `skipped_refused` and `primary_incomplete` (see the
-outcomes below).
+`stats` also carries `skipped_refused`, `skipped_conditional`, and
+`primary_incomplete` (see the outcomes below).
 
 `/actuator/shadow` is a **sensitive** endpoint (`[actuator] sensitive = true`),
 like `/actuator/tasks` — the samples are excerpts of real production responses.

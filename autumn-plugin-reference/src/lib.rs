@@ -47,7 +47,7 @@ pub const PREFIX: &str = "/reference";
 /// Derived from the crate's own version rather than hard-coded, because the
 /// reference plugin ships *inside* the framework repository and is by
 /// construction always in lockstep with it. A real out-of-tree plugin either
-/// writes a literal (`"0.7"`) or, if it too releases in lockstep, calls this
+/// writes a literal (`"0.8"`) or, if it too releases in lockstep, calls this
 /// same helper.
 #[must_use]
 pub fn declared_autumn_web_range() -> String {
@@ -58,6 +58,12 @@ pub fn declared_autumn_web_range() -> String {
 async fn index() -> &'static str {
     "autumn plugin reference"
 }
+
+/// A one-file asset bundle, installed through `AppBuilder::plugin_assets`.
+static ASSETS: autumn_web::assets::PluginAssets = autumn_web::assets::PluginAssets::from_files(
+    "autumn-plugin-reference",
+    &[("reference.js", b"window.autumnPluginReference = true;\n")],
+);
 
 /// A plugin that exercises every stable plugin-facing API.
 #[derive(Debug, Default, Clone, Copy)]
@@ -130,6 +136,13 @@ impl Plugin for ReferencePlugin {
                 ),
                 ..Default::default()
             }]);
+
+        // surface: AppBuilder::plugin_assets
+        //
+        // Files compiled into the plugin, served at content-hashed URLs under
+        // `/static/_plugins/autumn-plugin-reference/` with their routes
+        // declared for the listing.
+        let app = app.plugin_assets(&ASSETS);
 
         // surface: AppBuilder::merge
         let app = app.merge(autumn_web::reexports::axum::Router::new());

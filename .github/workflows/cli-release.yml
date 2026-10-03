@@ -83,18 +83,18 @@ jobs:
             cross: false
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           ref: ${{ inputs.tag || github.ref }}
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.99.0
         with:
           targets: ${{ matrix.target }}
 
       - name: Install cross
         if: ${{ matrix.cross }}
-        uses: taiki-e/install-action@v2.87.5
+        uses: taiki-e/install-action@v2.87.20
         with:
           tool: cross
 
@@ -144,7 +144,7 @@ jobs:
 
       # Glob covers both the Linux/macOS `.tar.gz(.sha256)` and Windows `.zip(.sha256)` assets.
       - name: Upload workflow artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: autumn-${{ matrix.target }}
           path: autumn-${{ matrix.target }}.*
@@ -170,7 +170,7 @@ jobs:
         # provenance record for bytes nobody can obtain is just noise in the
         # transparency log.
         if: ${{ inputs.tag != '' }}
-        uses: actions/attest-build-provenance@v3
+        uses: actions/attest-build-provenance@v4
         with:
           subject-path: autumn-${{ matrix.target }}.*
 

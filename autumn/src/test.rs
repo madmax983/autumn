@@ -722,6 +722,9 @@ pub struct TestApp {
     /// whose manifest collides with a host route would mount cleanly in tests
     /// and panic at boot in production.
     declared_routes: Vec<crate::route_listing::RouteInfo>,
+    /// Asset bundles installed by plugins, so a second bundle claiming a
+    /// taken namespace is refused here exactly as `AppBuilder` refuses it.
+    plugin_asset_bundles: Vec<&'static crate::assets::PluginAssets>,
     custom_layers: Vec<crate::app::CustomLayerRegistration>,
     static_gate_layers: Vec<crate::app::CustomLayerRegistration>,
     config: AutumnConfig,
@@ -771,8 +774,13 @@ pub struct TestApp {
     /// handler intercepts matching requests.
     #[cfg(feature = "http-client")]
     http_mock_registry: Option<std::sync::Arc<crate::http_client::MockRegistry>>,
+    /// The sim network, installed with the mock registry and before any state
+    /// initializer, so every client built from state sends through it.
+    #[cfg(feature = "http-client")]
+    sim_net: Option<crate::sim::SimNet>,
     state_initializers: Vec<Box<dyn FnOnce(&AppState) + Send>>,
     jobs: Vec<crate::job::JobInfo>,
+    tasks: Vec<crate::task::TaskInfo>,
     listeners: Vec<crate::events::ListenerInfo>,
     exception_filters: Vec<std::sync::Arc<dyn crate::middleware::ExceptionFilter>>,
     #[cfg(feature = "mail")]
@@ -819,6 +827,7 @@ impl TestApp {
             merge_routers: Vec::new(),
             nest_routers: Vec::new(),
             declared_routes: Vec::new(),
+            plugin_asset_bundles: Vec::new(),
             custom_layers: Vec::new(),
             static_gate_layers: Vec::new(),
             config,
@@ -853,8 +862,11 @@ impl TestApp {
             http_interceptor: None,
             #[cfg(feature = "http-client")]
             http_mock_registry: None,
+            #[cfg(feature = "http-client")]
+            sim_net: None,
             state_initializers: Vec::new(),
             jobs: Vec::new(),
+            tasks: Vec::new(),
             listeners: Vec::new(),
             exception_filters: Vec::new(),
             #[cfg(feature = "mail")]
@@ -1142,6 +1154,7 @@ impl TestApp {
             probes: crate::probe::ProbeState::ready_for_test(),
             state,
             _job_runtime: None,
+            _task_scheduler: None,
             clock_as_any: None,
             #[cfg(feature = "mail")]
             mail_recorder: None,
@@ -1279,6 +1292,9 @@ impl TestApp {
         app_builder
             .registered_plugins
             .clone_from(&self.registered_plugins);
+        app_builder
+            .plugin_asset_bundles
+            .clone_from(&self.plugin_asset_bundles);
         app_builder.extensions = self.extensions;
         app_builder.state_initializers = std::mem::take(&mut self.state_initializers);
 
@@ -1294,10 +1310,12 @@ impl TestApp {
         self.merge_routers.extend(app_builder.merge_routers);
         self.nest_routers.extend(app_builder.nest_routers);
         self.declared_routes.extend(app_builder.declared_routes);
+        self.plugin_asset_bundles = app_builder.plugin_asset_bundles;
         self.custom_layers.extend(app_builder.custom_layers);
         self.static_gate_layers
             .extend(app_builder.static_gate_layers);
         self.jobs.extend(app_builder.jobs);
+        self.tasks.extend(app_builder.tasks);
         self.listeners.extend(app_builder.listeners);
         self.exception_filters.extend(app_builder.exception_filters);
         self.metrics_sources.extend(app_builder.metrics_sources);
@@ -1494,6 +1512,44 @@ impl TestApp {
     #[must_use]
     pub fn with_fault_plan(mut self, plan: crate::sim::fault::FaultPlan) -> Self {
         self.fault_plan = Some(plan);
+        self
+    }
+
+    /// Register background jobs with the test app.
+    ///
+    /// Collect them with `jobs![..]`, exactly as in `AppBuilder::jobs`. They
+    /// run under the in-process test job runtime that [`build`](Self::build)
+    /// starts.
+    #[must_use]
+    pub fn jobs(mut self, jobs: Vec<crate::job::JobInfo>) -> Self {
+        self.jobs.extend(jobs);
+        self
+    }
+
+    /// Register `#[scheduled]` tasks with the test app.
+    ///
+    /// Collect them with `tasks![..]`, exactly as in `AppBuilder::tasks`.
+    /// [`build`](Self::build) starts them on the in-process scheduler, and
+    /// dropping the [`TestClient`] stops them. Their timers are tokio timers
+    /// and they read the injected clock, so under a `#[sim_test]` a tick fires
+    /// when [`crate::sim::Sim::advance`] crosses its deadline.
+    #[must_use]
+    pub fn tasks(mut self, tasks: Vec<crate::task::TaskInfo>) -> Self {
+        self.tasks.extend(tasks);
+        self
+    }
+
+    /// Install `entropy` unless the test already injected a source with
+    /// [`with_entropy`](Self::with_entropy). [`crate::sim::Sim::build`] uses
+    /// this to seed the app from the simulation seed by default.
+    #[must_use]
+    pub(crate) fn with_default_entropy(
+        mut self,
+        entropy: std::sync::Arc<dyn crate::entropy::Entropy>,
+    ) -> Self {
+        if self.entropy.is_none() {
+            self.entropy = Some(entropy);
+        }
         self
     }
 
@@ -1750,6 +1806,13 @@ impl TestApp {
         }
     }
 
+    /// Route outbound HTTP through `net`. Set by [`Sim::net`](crate::sim::Sim::net).
+    #[cfg(feature = "http-client")]
+    pub(crate) fn with_sim_net(mut self, net: crate::sim::SimNet) -> Self {
+        self.sim_net = Some(net);
+        self
+    }
+
     /// Build the application and return a [`TestClient`] ready for requests.
     ///
     /// This constructs the full Axum router with all middleware applied,
@@ -1944,6 +2007,9 @@ impl TestApp {
         let probes = crate::probe::ProbeState::ready_for_test();
         #[cfg(feature = "ws")]
         let test_channels = crate::channels::Channels::new(32);
+        // Shared with the collaboration hub, for the reason `app.rs` gives.
+        #[cfg(feature = "presence")]
+        let test_presence = crate::presence::Presence::new(test_channels.clone());
         // Resolve the injected clock BEFORE the state literal so `started_at`
         // is stamped on the same timeline the app will read time from. A sim
         // installs a virtual clock here, and uptime has to start at that
@@ -2018,8 +2084,10 @@ impl TestApp {
             config_props: crate::actuator::ConfigProperties::default(),
             metrics_source_registry: crate::actuator::MetricsSourceRegistry::new(),
             health_indicator_registry: crate::actuator::HealthIndicatorRegistry::new(),
+            #[cfg(all(feature = "collab", feature = "presence"))]
+            collab: crate::collab::CollabHub::new(test_channels.clone(), test_presence.clone()),
             #[cfg(feature = "presence")]
-            presence: crate::presence::Presence::new(test_channels.clone()),
+            presence: test_presence,
             #[cfg(feature = "ws")]
             channels: test_channels,
 
@@ -2170,6 +2238,14 @@ impl TestApp {
                 #[cfg(feature = "presence")]
                 {
                     state.presence = crate::presence::Presence::new(state.channels.clone());
+                    // Same reason as `app.rs`: the hub captured the old pair.
+                    #[cfg(feature = "collab")]
+                    {
+                        state.collab = crate::collab::CollabHub::new(
+                            state.channels.clone(),
+                            state.presence.clone(),
+                        );
+                    }
                 }
             }
             recorder_for_client
@@ -2210,6 +2286,10 @@ impl TestApp {
         #[cfg(feature = "http-client")]
         if let Some(registry) = self.http_mock_registry {
             state.insert_extension(crate::http_client::HttpMockRegistryExt(registry));
+        }
+        #[cfg(feature = "http-client")]
+        if let Some(net) = self.sim_net.take() {
+            state.insert_extension(net);
         }
 
         // Register metrics sources before state initializers — mirrors production
@@ -2295,6 +2375,23 @@ impl TestApp {
             )
             .expect("Failed to start job runtime in test");
             Some(TestJobRuntime { shutdown })
+        };
+
+        // Start `#[scheduled]` tasks on the in-process scheduler. Their loops
+        // sleep on tokio timers and read the injected clock, so under a
+        // `#[sim_test]` they tick in virtual time.
+        let task_scheduler = if self.tasks.is_empty() {
+            None
+        } else {
+            let shutdown = tokio_util::sync::CancellationToken::new();
+            crate::app::start_task_scheduler_with_config(
+                std::mem::take(&mut self.tasks),
+                &state,
+                &shutdown,
+                &self.config.scheduler,
+            )
+            .expect("Failed to start scheduled tasks in test");
+            Some(TestTaskScheduler { shutdown })
         };
 
         // Retain the registered job metadata so `perform_enqueued_jobs` can look
@@ -2438,6 +2535,7 @@ impl TestApp {
             probes,
             state,
             _job_runtime: job_runtime,
+            _task_scheduler: task_scheduler,
             clock_as_any: self.clock_as_any,
             #[cfg(feature = "mail")]
             mail_recorder: Some(mail_recorder_for_client),
@@ -2500,6 +2598,8 @@ pub struct TestClient {
     probes: crate::probe::ProbeState,
     pub(crate) state: AppState,
     _job_runtime: Option<TestJobRuntime>,
+    /// Stops the `#[scheduled]` task loops [`TestApp::build`] started.
+    _task_scheduler: Option<TestTaskScheduler>,
     /// Retained so `advance_clock` can downcast to [`crate::time::TickingClock`].
     clock_as_any: Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>,
     /// `None` when built via [`TestApp::from_router`], which bypasses recorder
@@ -2569,6 +2669,17 @@ type CookieJar = std::sync::Arc<std::sync::Mutex<std::collections::HashMap<Strin
 
 struct TestJobRuntime {
     shutdown: tokio_util::sync::CancellationToken,
+}
+
+/// Cancels the scheduled-task loops of one [`TestClient`] when it drops.
+struct TestTaskScheduler {
+    shutdown: tokio_util::sync::CancellationToken,
+}
+
+impl Drop for TestTaskScheduler {
+    fn drop(&mut self) {
+        self.shutdown.cancel();
+    }
 }
 
 impl Drop for TestJobRuntime {
@@ -3412,7 +3523,7 @@ pub struct RequestBuilder {
     /// without a client (not reachable through the public API today).
     cookie_jar: Option<CookieJar>,
     /// The originating client's clock, used to evaluate `Expires` when folding
-    /// `Set-Cookie` back into the jar. `None` falls back to [`chrono::Utc::now`].
+    /// `Set-Cookie` back into the jar. `None` falls back to [`crate::time::ambient_now`].
     clock: Option<std::sync::Arc<dyn crate::time::ClockSource>>,
     /// Default N+1 detection threshold (`dev.inspector_n_plus_one_threshold`),
     /// propagated to the resulting [`TestResponse`] so
@@ -3522,7 +3633,7 @@ impl RequestBuilder {
             let now = self
                 .clock
                 .as_ref()
-                .map_or_else(chrono::Utc::now, |c| c.now());
+                .map_or_else(crate::time::ambient_now, |c| c.now());
             let cookie_header = {
                 let mut jar = jar.lock().expect("cookie jar mutex poisoned");
                 jar.retain(|_, cookie| cookie.expires_at.is_none_or(|t| t > now));
@@ -3615,7 +3726,7 @@ impl RequestBuilder {
             let now = self
                 .clock
                 .as_ref()
-                .map_or_else(chrono::Utc::now, |c| c.now());
+                .map_or_else(crate::time::ambient_now, |c| c.now());
             let mut jar = jar.lock().expect("cookie jar mutex poisoned");
             for (name, value) in &headers {
                 if name.eq_ignore_ascii_case("set-cookie") {

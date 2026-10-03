@@ -147,6 +147,7 @@ pub fn app() -> AppBuilder {
         #[cfg(feature = "maud")]
         story_gallery: None,
         declared_routes: Vec::new(),
+        plugin_asset_bundles: Vec::new(),
         idempotency_enabled: false,
         #[cfg(feature = "mail")]
         mail_interceptor: None,
@@ -420,7 +421,7 @@ pub struct AppBuilder {
     /// Non-None while a plugin's `build()` is executing; routes and scoped
     /// groups added during that window are attributed to this plugin.
     current_plugin: Option<String>,
-    tasks: Vec<crate::task::TaskInfo>,
+    pub(crate) tasks: Vec<crate::task::TaskInfo>,
     one_off_tasks: Vec<crate::task::OneOffTaskInfo>,
     pub(crate) jobs: Vec<crate::job::JobInfo>,
     /// Registered event listeners; durable ones are synthesized into jobs at
@@ -589,6 +590,10 @@ pub struct AppBuilder {
     /// harness that dropped them would mount a colliding plugin cleanly in
     /// tests and panic at boot in production.
     pub(crate) declared_routes: Vec<crate::route_listing::RouteInfo>,
+    /// Asset bundles installed via [`plugin_assets`](Self::plugin_assets),
+    /// kept so a second bundle claiming a taken namespace is refused.
+    /// `pub(crate)` so [`TestApp`](crate::test::TestApp) can carry them.
+    pub(crate) plugin_asset_bundles: Vec<&'static crate::assets::PluginAssets>,
     /// Whether `.idempotent()` was called on this builder. Applied to the
     /// loaded `AutumnConfig` before router assembly so that startup validation
     /// and `apply_middleware` both see `config.idempotency.enabled = true`.
@@ -1579,17 +1584,93 @@ impl AppBuilder {
         mut self,
         routes: impl IntoIterator<Item = crate::route_listing::RouteInfo>,
     ) -> Self {
-        let source = self
-            .current_plugin
-            .as_deref()
-            .map_or(crate::route_listing::RouteSource::User, |name| {
-                crate::route_listing::RouteSource::Plugin(name.to_owned())
-            });
+        let source = self.current_route_source();
         for mut route in routes {
             route.source = source.clone();
+            // The asset-bundle marker is the framework's to set: only routes
+            // `plugin_assets` generated may carry it, because the conformance
+            // checks exempt a route that does.
+            route
+                .middleware
+                .retain(|label| label != crate::assets::PLUGIN_ASSETS_ROUTE_MARKER);
             self.declared_routes.push(route);
         }
         self
+    }
+
+    /// The `RouteSource` a route declared right now is attributed to: the
+    /// plugin whose `build` is running, or the user.
+    fn current_route_source(&self) -> crate::route_listing::RouteSource {
+        self.current_plugin
+            .as_deref()
+            .map_or(crate::route_listing::RouteSource::User, |name| {
+                crate::route_listing::RouteSource::Plugin(name.to_owned())
+            })
+    }
+
+    /// Serve a [`PluginAssets`](crate::assets::PluginAssets) bundle: files
+    /// compiled into a crate, with content-hashed URLs.
+    ///
+    /// Call this from [`Plugin::build`](crate::plugin::Plugin::build). The
+    /// bundle is mounted under `/static/_plugins/<namespace>/`, each file at
+    /// its plain URL (`must-revalidate`) and its fingerprinted URL (`immutable`
+    /// for a year), and its routes are declared for `autumn routes` as public
+    /// static files. After this,
+    /// [`asset_url("_plugins/<namespace>/<file>")`](crate::assets::asset_url)
+    /// returns the fingerprinted URL.
+    ///
+    /// ```rust,ignore
+    /// use autumn_web::assets::PluginAssets;
+    ///
+    /// pub static ASSETS: PluginAssets = autumn_web::plugin_assets!("motion");
+    ///
+    /// impl Plugin for MotionPlugin {
+    ///     fn build(self, app: AppBuilder) -> AppBuilder {
+    ///         app.plugin_assets(&ASSETS)
+    ///     }
+    /// }
+    /// ```
+    ///
+    /// Installing the same bundle twice is a no-op.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a *different* bundle with the same namespace is already
+    /// installed. The two would fight over the same URLs.
+    #[must_use]
+    pub fn plugin_assets(mut self, assets: &'static crate::assets::PluginAssets) -> Self {
+        if let Some(existing) = self
+            .plugin_asset_bundles
+            .iter()
+            .find(|installed| installed.namespace() == assets.namespace())
+        {
+            assert!(
+                std::ptr::eq(*existing, assets),
+                "two different PluginAssets bundles use the namespace `{}`; each bundle needs \
+                 its own namespace because it becomes the URL path {}",
+                assets.namespace(),
+                assets.mount_path(),
+            );
+            return self;
+        }
+        self.plugin_asset_bundles.push(assets);
+        crate::assets::plugin::register(assets);
+        if assets.iter().next().is_none() {
+            tracing::warn!(
+                namespace = assets.namespace(),
+                "PluginAssets bundle has no files; nothing to serve"
+            );
+            return self;
+        }
+        // Declared directly rather than through `declare_plugin_routes`, which
+        // strips the asset-bundle marker these routes carry.
+        let source = self.current_route_source();
+        for mut route in assets.route_infos() {
+            route.source = source.clone();
+            self.declared_routes.push(route);
+        }
+        let mount = assets.mount_path();
+        self.nest(&mount, assets.nested_router())
     }
 
     /// The route manifest this builder would dump for `autumn routes` —
@@ -2282,6 +2363,19 @@ impl AppBuilder {
         // plumbing `install_i18n_bundle_layer` uses. No adapter needed, and the
         // injection type stays an implementation detail of `autumn-edge`.
         self.layer(autumn_edge::EdgeCache::layer(kv))
+    }
+
+    /// Install an arbitrary host-side edge identity source.
+    ///
+    /// The provider remains in the native application graph; capsules receive
+    /// only the resulting [`EdgeIdentity`](crate::edge_support::EdgeIdentity).
+    #[cfg(feature = "edge")]
+    #[must_use]
+    pub fn with_edge_identity_provider<P>(self, provider: P) -> Self
+    where
+        P: crate::edge_support::EdgeIdentityProvider,
+    {
+        self.layer(crate::edge_support::EdgeIdentityLayer::new(provider))
     }
 
     /// Register an [`ErrorReporter`](crate::reporting::ErrorReporter) for
@@ -3663,6 +3757,7 @@ impl AppBuilder {
             #[cfg(feature = "maud")]
             story_gallery,
             declared_routes,
+            plugin_asset_bundles: _,
             idempotency_enabled,
             #[cfg(feature = "mail")]
             mail_interceptor,
@@ -4028,7 +4123,7 @@ impl AppBuilder {
             let interval = std::time::Duration::from_millis(500);
             loop {
                 let poll_path = path.clone();
-                let load_res = tokio::task::spawn_blocking(move || {
+                let load_res = crate::time::spawn_blocking(move || {
                     crate::maintenance::MaintenanceState::load_from_file(&poll_path)
                 })
                 .await;
@@ -4104,6 +4199,16 @@ impl AppBuilder {
             #[cfg(feature = "presence")]
             {
                 state.presence = crate::presence::Presence::new(state.channels.clone());
+                // The collaboration hub holds the channel registry and the
+                // presence tracker it was built with, so replacing either
+                // leaves it publishing into the old backend (#1806).
+                #[cfg(feature = "collab")]
+                {
+                    state.collab = crate::collab::CollabHub::new(
+                        state.channels.clone(),
+                        state.presence.clone(),
+                    );
+                }
             }
         }
         #[cfg(feature = "oauth2")]
@@ -4171,7 +4276,7 @@ impl AppBuilder {
             // read from it, so a test that freezes time moves them all (#1797).
             let clock = state.clock_arc();
 
-            let built = tokio::task::spawn_blocking(move || {
+            let built = crate::time::spawn_blocking(move || {
                 crate::replication::build(
                     &replication_config,
                     &database_url,
@@ -5341,33 +5446,71 @@ impl AppBuilder {
         // A duplicate of the listening socket is kept aside so a `SIGUSR2`
         // in-place upgrade (#1674) can hand it to a successor while this process
         // keeps serving through the original. Only a plain TCP listener can be
-        // handed over in this release.
+        // handed over in this release. This runs up front, before the match
+        // consumes `bound_listener` to build the (not yet spawned) accept-loop
+        // future below.
         #[cfg(unix)]
         let mut handoff_socket: Option<crate::upgrade::HandoffSocket> = None;
+        #[cfg(unix)]
+        if let BoundListener::Tcp(listener) = &bound_listener {
+            match crate::upgrade::HandoffSocket::from_listener(listener) {
+                Ok(socket) => handoff_socket = Some(socket),
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    "could not duplicate the listening socket; in-place upgrade \
+                     (SIGUSR2) will be refused for this process"
+                ),
+            }
+        }
 
-        let server_task = match bound_listener {
+        // Build the accept-loop future per transport; when it goes live
+        // depends on how this process started (see below). The arms differ
+        // only in the connect-info type baked into the
+        // make-service (`SocketAddr` for TCP, `UdsConnectInfo` for Unix
+        // sockets); the shutdown wiring and the resulting `io::Result<()>` are
+        // identical. Handlers extracting `ConnectInfo<SocketAddr>` are
+        // unsupported under a Unix socket — daemon mode is local and
+        // loopback-equivalent.
+        //
+        // The deferred half of #2368: adopting the inherited fd still happens
+        // up front (so a failure to adopt aborts early, as today), but during
+        // an in-place upgrade the successor must not compete for connections
+        // before it can actually serve them: every connection it wins in that
+        // window is answered by the startup barrier with a 503 while the
+        // predecessor is right there, healthy. The predecessor keeps serving
+        // for the whole window; the successor's accept loop goes live once
+        // `run_startup_hooks` has returned `Ok`.
+        //
+        // The deferral applies ONLY to an upgrade successor
+        // (`handoff_requested()`): a cold start spawns its accept loop
+        // immediately, as before, so `/live` and `/startup` stay reachable
+        // behind the startup barrier while the hooks run — a hook that
+        // outlasts a probe threshold must not read as a dead pod.
+        let server_future: std::pin::Pin<
+            Box<dyn std::future::Future<Output = std::io::Result<()>> + Send + 'static>,
+        > = match bound_listener {
             BoundListener::Tcp(listener) => {
-                #[cfg(unix)]
-                {
-                    match crate::upgrade::HandoffSocket::from_listener(&listener) {
-                        Ok(socket) => handoff_socket = Some(socket),
-                        Err(e) => tracing::warn!(
-                            error = %e,
-                            "could not duplicate the listening socket; in-place upgrade \
-                             (SIGUSR2) will be refused for this process"
-                        ),
-                    }
-                }
+                // The listener is wrapped (`StopAcceptingOnShutdown`), so the
+                // connect info is `TcpPeer`; this re-stamps the
+                // `ConnectInfo<SocketAddr>` everything below reads.
+                let service = tower::Layer::layer(
+                    &axum::middleware::from_fn(crate::accept_drain::stamp_tcp_peer),
+                    service,
+                );
                 let make_service =
                     axum::ServiceExt::<axum::extract::Request>::into_make_service_with_connect_info::<
-                        std::net::SocketAddr,
+                        crate::accept_drain::TcpPeer,
                     >(service);
-                tokio::spawn(async move {
-                    axum::serve(listener, make_service)
-                        .with_graceful_shutdown(async move {
-                            server_shutdown_wait.cancelled().await;
-                        })
-                        .await
+                Box::pin(async move {
+                    axum::serve(
+                        crate::accept_drain::StopAcceptingOnShutdown::new(
+                            listener,
+                            server_shutdown_wait.clone(),
+                        ),
+                        make_service,
+                    )
+                    .with_graceful_shutdown(crate::accept_drain::drain_signal(server_shutdown_wait))
+                    .await
                 })
             }
             #[cfg(unix)]
@@ -5384,12 +5527,16 @@ impl AppBuilder {
                     axum::ServiceExt::<axum::extract::Request>::into_make_service_with_connect_info::<
                         UdsConnectInfo,
                     >(service);
-                tokio::spawn(async move {
-                    axum::serve(listener, make_service)
-                        .with_graceful_shutdown(async move {
-                            server_shutdown_wait.cancelled().await;
-                        })
-                        .await
+                Box::pin(async move {
+                    axum::serve(
+                        crate::accept_drain::StopAcceptingOnShutdown::new(
+                            listener,
+                            server_shutdown_wait.clone(),
+                        ),
+                        make_service,
+                    )
+                    .with_graceful_shutdown(crate::accept_drain::drain_signal(server_shutdown_wait))
+                    .await
                 })
             }
             // HTTPS arm: mirrors the TCP arm. The connect info is
@@ -5420,15 +5567,39 @@ impl AppBuilder {
                     axum::ServiceExt::<axum::extract::Request>::into_make_service_with_connect_info::<
                         crate::tls::TlsConnectInfo,
                     >(service);
-                tokio::spawn(async move {
-                    axum::serve(listener, make_service)
-                        .with_graceful_shutdown(async move {
-                            server_shutdown_wait.cancelled().await;
-                        })
-                        .await
+                Box::pin(async move {
+                    axum::serve(
+                        crate::accept_drain::StopAcceptingOnShutdown::new(
+                            listener,
+                            server_shutdown_wait.clone(),
+                        ),
+                        make_service,
+                    )
+                    .with_graceful_shutdown(crate::accept_drain::drain_signal(server_shutdown_wait))
+                    .await
                 })
             }
         };
+
+        // Whether this process is the successor half of an in-place upgrade
+        // (#1674). Only a successor shares its listening socket with a live
+        // predecessor, so only a successor defers its accept loop past the
+        // startup hooks (#2368). A cold start spawns immediately, exactly as
+        // before this change.
+        let defer_accept_loop = crate::upgrade::handoff_requested();
+        // The accept-loop future while it is not yet live; `None` once it has
+        // been taken to spawn `server_task`.
+        let mut pending_accept: Option<
+            std::pin::Pin<
+                Box<dyn std::future::Future<Output = std::io::Result<()>> + Send + 'static>,
+            >,
+        > = None;
+        let mut server_task: Option<tokio::task::JoinHandle<std::io::Result<()>>> = None;
+        if defer_accept_loop {
+            pending_accept = Some(server_future);
+        } else {
+            server_task = Some(tokio::spawn(server_future));
+        }
 
         // Cancelled by the in-place upgrade watcher once a successor has taken
         // over the listening socket; the drain below then runs without the
@@ -5611,13 +5782,37 @@ impl AppBuilder {
 
         if let Err(error) = run_startup_hooks(&startup_hooks, state.clone()).await {
             tracing::error!(error = %error, "startup hook failed");
+            // A cold start already spawned the accept loop above, so stop it.
+            // An upgrade successor (#2368) never spawned one, so there is
+            // nothing to abort: the predecessor simply keeps serving through
+            // the adopted socket while this process exits, and no user ever
+            // sees a 503.
+            if let Some(task) = server_task.take() {
+                task.abort();
+            }
             server_shutdown.cancel();
-            server_task.abort();
             // `process::exit` skips `on_shutdown`; stop any managed Postgres.
             #[cfg(feature = "managed-pg")]
             crate::managed_pg::emergency_stop_async().await;
             std::process::exit(1);
         }
+
+        // Go live on the accept loop. An upgrade successor (#2368) deferred it
+        // past the hooks; they have now succeeded, so it can serve the
+        // connections it wins on the shared socket — the predecessor has been
+        // serving them until now. A cold start spawned the loop up front, so
+        // `/live` and `/startup` stayed reachable behind the startup barrier
+        // while the hooks ran.
+        let server_task: tokio::task::JoinHandle<std::io::Result<()>> =
+            match (server_task.take(), pending_accept.take()) {
+                (Some(task), _) => task,
+                (None, Some(future)) => tokio::spawn(future),
+                // Unreachable: `pending_accept` is `None` only once it has
+                // been taken to spawn `server_task` on the cold-start path.
+                (None, None) => {
+                    unreachable!("accept-loop future consumed without spawning its task")
+                }
+            };
 
         if !state.probes().is_shutting_down() {
             // Web role runs no cron scheduler (workers/combined only). Skipping
@@ -5902,6 +6097,7 @@ impl AppBuilder {
             #[cfg(feature = "maud")]
             story_gallery,
             declared_routes: _,
+            plugin_asset_bundles: _,
             idempotency_enabled,
             #[cfg(feature = "mail")]
             mail_interceptor,
@@ -6095,6 +6291,16 @@ impl AppBuilder {
             #[cfg(feature = "presence")]
             {
                 state.presence = crate::presence::Presence::new(state.channels.clone());
+                // The collaboration hub holds the channel registry and the
+                // presence tracker it was built with, so replacing either
+                // leaves it publishing into the old backend (#1806).
+                #[cfg(feature = "collab")]
+                {
+                    state.collab = crate::collab::CollabHub::new(
+                        state.channels.clone(),
+                        state.presence.clone(),
+                    );
+                }
             }
         }
         #[cfg(feature = "oauth2")]
@@ -6163,6 +6369,22 @@ impl AppBuilder {
         let custom_layers =
             install_i18n_bundle_layer(custom_layers, &state, i18n_bundle, &config.i18n);
 
+        // #2405: render through the pre-layer router — the same layer
+        // composition the ISR regeneration path uses
+        // (`partition_custom_layers_for_static_render`, shared with the SSG
+        // serve path) — so the recorded Content-Type and the body on disk are
+        // the handler's own, not the app layer stack's post-layer output. The
+        // serve path applies the drained layers to the cached response at
+        // request time, outside the static-first middleware, so recording the
+        // post-layer output both double-applies the layers (once at
+        // generation, once per request) and — because ISR's type guard sees
+        // the pre-layer response — refuses every regeneration for an app with
+        // a Content-Type-rewriting layer, freezing the route until the next
+        // build. The drained set is dropped: this process exits after the
+        // render; serving is a separate invocation.
+        let (custom_layers, _drained) =
+            crate::router::partition_custom_layers_for_static_render(custom_layers);
+
         // Install the preflighted storage and remember the serving
         // router so static generation hits the same `/_blobs/...`
         // routes the server path serves.
@@ -6180,13 +6402,18 @@ impl AppBuilder {
             .collect();
         finalize_event_bus(sync_listeners, &mut Vec::new(), &state);
 
-        // Build the full router (same as production). Use the inner builder
+        // Build the router for static rendering. Use the inner builder
         // so the custom session store installed via with_session_store(...)
         // is honored during static generation — apps that swap in a custom
         // store specifically to avoid Redis/external backends at build time
         // would otherwise silently fall back to the config-driven backend.
-        // Custom Tower layers registered via .layer(...) are likewise
-        // applied so static output matches the production response pipeline.
+        // Custom Tower layers registered via .layer(...) are deliberately
+        // NOT applied here (#2405): they were drained above, so the render
+        // sees the handler's own response — the same pre-layer composition
+        // ISR regeneration uses. The serve path applies those layers to the
+        // cached response at request time, which is what makes the recorded
+        // Content-Type and the body on disk mean "what the handler declared"
+        // rather than "what the layer stack happened to produce".
         #[cfg_attr(not(feature = "storage"), allow(unused_mut))]
         let mut merge_routers: Vec<axum::Router<AppState>> = Vec::new();
         #[cfg(feature = "storage")]
@@ -6880,7 +7107,7 @@ impl AppBuilder {
 
         // The diesel harness and the advisory-lock poll block, so apply off the
         // Tokio worker threads. Each target's failure exits non-zero from inside.
-        let applied_total = tokio::task::spawn_blocking(move || {
+        let applied_total = crate::time::spawn_blocking(move || {
             let mut total = 0_usize;
             if let Some(url) = &control_url {
                 // SQLite single-writer control target (issue #1614, PR3): apply with
@@ -7206,6 +7433,21 @@ impl AppBuilder {
         if let Some(logger) = audit_logger {
             state.insert_extension::<crate::audit::AuditLogger>((*logger).clone());
         }
+        // Custom domains (#2652): the `custom_domains` retention dataset looks
+        // up the same pruner the server installs, but the TLS bind path that
+        // installs it never runs in a one-shot `run_framework_retention_mode`
+        // — without this the dataset always reported "custom domains are not
+        // enabled". The pruner carries no ACME issuer: pruning only touches
+        // the registry and the certificate store, so no order is placed and
+        // no CA is contacted.
+        #[cfg(feature = "acme")]
+        install_custom_domain_retention_pruner(
+            config.server.tls.as_ref().and_then(|tls| tls.acme.as_ref()),
+            config.tenancy.base_domain.as_deref(),
+            &state,
+            mode != FrameworkRetentionMode::Report,
+        )
+        .await;
         // The app's own state initializers are what install the GDPR registry
         // a legal hold lives in. Skipping them would make `autumn db
         // retention` report a sweep the running app would actually refuse.
@@ -7454,6 +7696,16 @@ impl AppBuilder {
             #[cfg(feature = "presence")]
             {
                 state.presence = crate::presence::Presence::new(state.channels.clone());
+                // The collaboration hub holds the channel registry and the
+                // presence tracker it was built with, so replacing either
+                // leaves it publishing into the old backend (#1806).
+                #[cfg(feature = "collab")]
+                {
+                    state.collab = crate::collab::CollabHub::new(
+                        state.channels.clone(),
+                        state.presence.clone(),
+                    );
+                }
             }
         }
         #[cfg(feature = "oauth2")]
@@ -8557,7 +8809,7 @@ fn start_task_scheduler(
 
 #[allow(clippy::cast_possible_truncation)]
 #[allow(clippy::cognitive_complexity)]
-fn start_task_scheduler_with_config(
+pub(crate) fn start_task_scheduler_with_config(
     tasks: Vec<crate::task::TaskInfo>,
     state: &AppState,
     shutdown: &tokio_util::sync::CancellationToken,
@@ -8685,6 +8937,8 @@ async fn execute_task_result(
     name: &str,
     schedule: &'static str,
 ) -> Result<u64, (u64, String)> {
+    // A tick is work a sim drain must see (issue #2967).
+    crate::sim::note_drain_progress();
     // A fresh span per run so OTLP-enabled deployments see each invocation
     // as its own trace rather than inheriting whatever was current on the
     // scheduler thread.
@@ -9564,22 +9818,7 @@ async fn build_acme_tls_listener(
     // so the deployment's certificate keeps serving its own names unchanged.
     let custom_domains = match acme_cfg.custom_domains.as_ref() {
         Some(cd_cfg) if cd_cfg.enabled => {
-            // Reserve everything this deployment already serves. Without it a
-            // tenant registers another tenant's subdomain — which the
-            // operator's own wildcard already points here, so it verifies and
-            // issues — and every request for that host then resolves to
-            // whoever registered it.
-            let mut reserved = acme_cfg.domains.clone();
-            reserved.extend(tenancy_base_domain.map(ToOwned::to_owned));
-            // The ingress hostname is the sharpest of the three. It ALREADY
-            // resolves to the ingress addresses, so a tenant who registers it
-            // needs no DNS change at all: verification passes on the first
-            // tick, HTTP-01 validates, and from then on every request to the
-            // deployment's own infrastructure hostname routes to that tenant.
-            // It is not necessarily covered by `domains` — an operator may run
-            // ingress under a separate infrastructure zone — so it is reserved
-            // explicitly rather than by assuming overlap.
-            reserved.extend(cd_cfg.ingress_hostname.clone());
+            let reserved = custom_domain_reserved_names(acme_cfg, tenancy_base_domain);
             let registry = std::sync::Arc::new(
                 crate::custom_domain::CustomDomainRegistry::new(
                     std::sync::Arc::new(crate::custom_domain::FsCustomDomainStore::new(
@@ -9870,6 +10109,127 @@ fn compose_acme_alert_reporter(
     })
 }
 
+/// The hostnames custom-domain registration must never claim: the
+/// deployment's own ACME domains, the tenancy base domain, and the ingress
+/// hostname.
+///
+/// Shared by the TLS bind path and the one-shot `autumn db retention` path so
+/// the two registries agree on what is reserved (#2652).
+#[cfg(feature = "acme")]
+fn custom_domain_reserved_names(
+    acme_cfg: &crate::config::AcmeConfig,
+    tenancy_base_domain: Option<&str>,
+) -> Vec<String> {
+    // Reserve everything this deployment already serves. Without it a
+    // tenant registers another tenant's subdomain — which the
+    // operator's own wildcard already points here, so it verifies and
+    // issues — and every request for that host then resolves to
+    // whoever registered it.
+    let mut reserved = acme_cfg.domains.clone();
+    reserved.extend(tenancy_base_domain.map(ToOwned::to_owned));
+    // The ingress hostname is the sharpest of the three. It ALREADY
+    // resolves to the ingress addresses, so a tenant who registers it
+    // needs no DNS change at all: verification passes on the first
+    // tick, HTTP-01 validates, and from then on every request to the
+    // deployment's own infrastructure hostname routes to that tenant.
+    // It is not necessarily covered by `domains` — an operator may run
+    // ingress under a separate infrastructure zone — so it is reserved
+    // explicitly rather than by assuming overlap.
+    if let Some(cd_cfg) = acme_cfg.custom_domains.as_ref() {
+        reserved.extend(cd_cfg.ingress_hostname.clone());
+    }
+    reserved
+}
+
+/// Install the custom-domain retention pruner for a one-shot
+/// `autumn db retention` run (#2652).
+///
+/// The `dyn CustomDomainPruner` extension is normally installed by
+/// [`spawn_custom_domain_task`] on the TLS bind path, which a one-shot run
+/// never takes — without this the `custom_domains` dataset always reported
+/// "custom domains are not enabled". The pruner carries no ACME issuer:
+/// pruning only touches the registry and the certificate store, so no order
+/// is placed and no CA is contacted.
+#[cfg(feature = "acme")]
+async fn install_custom_domain_retention_pruner(
+    acme: Option<&crate::config::AcmeConfig>,
+    tenancy_base_domain: Option<&str>,
+    state: &AppState,
+    migrate: bool,
+) {
+    let Some(acme_cfg) = acme else {
+        return;
+    };
+    let Some(cd_cfg) = acme_cfg.custom_domains.as_ref() else {
+        return;
+    };
+    if !cd_cfg.enabled {
+        return;
+    }
+    let registry = std::sync::Arc::new(
+        crate::custom_domain::CustomDomainRegistry::new(
+            std::sync::Arc::new(crate::custom_domain::FsCustomDomainStore::new(
+                cd_cfg.store_dir.clone(),
+            )),
+            cd_cfg.max_domains,
+        )
+        .with_reserved(custom_domain_reserved_names(acme_cfg, tenancy_base_domain)),
+    );
+    // A report (`--dry-run` or no flag) must write nothing: `load` gives a
+    // pre-token record its ownership token, which also resets its status and
+    // registration time — the very fields retention eligibility is judged on.
+    // Only a purge, which is about to write anyway, runs the boot migration.
+    let loaded = if migrate {
+        registry.load().await
+    } else {
+        registry.load_without_migration().await
+    };
+    match loaded {
+        Ok(count) => tracing::info!(count, "loaded tenant custom domains"),
+        // A registry that cannot be read is not fatal to the deployment: its
+        // own certificate still serves. It IS fatal to pruning, though — an
+        // index that hydrated nothing cannot tell whether a hostname is
+        // already owned, so `prune` refuses rather than deleting every stored
+        // key.
+        Err(e) => tracing::error!(
+            "failed to load the tenant custom-domain registry: {e}; the custom_domains \
+             retention dataset will refuse to prune until this is fixed"
+        ),
+    }
+    let store = std::sync::Arc::new(crate::acme::store::FsAcmeStore::new(
+        acme_cfg.cache_dir.clone(),
+        crate::acme::directory_label(&acme_cfg.directory),
+    ));
+    let pruner = crate::acme::tenant_domains::PruneOnlyCustomDomainPruner {
+        registry,
+        cache: std::sync::Arc::new(crate::custom_domain::CustomDomainCertCache::new(
+            cd_cfg.cert_cache_size,
+        )),
+        certs: std::sync::Arc::clone(&store) as std::sync::Arc<dyn crate::acme::store::AcmeStore>,
+        limiter: std::sync::Arc::new(crate::custom_domain::IssuanceLimiter::new(
+            cd_cfg.issuance_per_domain_per_day,
+            cd_cfg.issuance_global_per_hour,
+            cd_cfg.failure_backoff_secs,
+            cd_cfg.max_failure_backoff_secs,
+        )),
+        cert_store_paths: Some(store),
+        // The deployment's own certificate shares this store and has no
+        // registry record; naming it keeps the retention prune from deleting
+        // the certificate the listener is serving.
+        retained_cert_ids: std::iter::once(
+            crate::acme::store::CertId::from_domains(&acme_cfg.domains)
+                .as_str()
+                .to_owned(),
+        )
+        .collect(),
+        reporter: make_custom_domain_reporter(state),
+        recovery: Some(make_custom_domain_recovery(state)),
+    };
+    state
+        .insert_extension(std::sync::Arc::new(pruner)
+            as std::sync::Arc<dyn crate::custom_domain::CustomDomainPruner>);
+}
+
 /// Publish the custom-domain registry and spawn its orchestrator (#1635).
 ///
 /// The registry goes into `AppState` so tenancy resolution can route a
@@ -9915,7 +10275,10 @@ fn spawn_custom_domain_task(
         cache,
         certs: std::sync::Arc::clone(&store) as std::sync::Arc<dyn crate::acme::store::AcmeStore>,
         provider,
-        verifier: std::sync::Arc::new(crate::custom_domain::SystemDomainVerifier),
+        // `validate` already refused an unparseable entry at boot.
+        verifier: std::sync::Arc::new(crate::custom_domain::SystemDomainVerifier::new(
+            config.resolver_addrs().unwrap_or_default(),
+        )),
         issuer,
         limiter: std::sync::Arc::new(crate::custom_domain::IssuanceLimiter::new(
             config.issuance_per_domain_per_day,
@@ -9943,7 +10306,9 @@ fn spawn_custom_domain_task(
         .collect(),
     });
 
-    state.insert_extension(std::sync::Arc::clone(&task)
+    // The pruner is the retention half of the task, not the task itself: the
+    // same small type the one-shot `autumn db retention` path installs (#2652).
+    state.insert_extension(std::sync::Arc::new(task.pruner())
         as std::sync::Arc<dyn crate::custom_domain::CustomDomainPruner>);
 
     let interval = std::time::Duration::from_secs(config.poll_interval_secs.max(1));
@@ -10008,6 +10373,27 @@ impl
     > for UdsConnectInfo
 {
     fn connect_info(_stream: axum::serve::IncomingStream<'_, tokio::net::UnixListener>) -> Self {
+        Self
+    }
+}
+
+/// The UDS serve path wraps its listener in `StopAcceptingOnShutdown` (see
+/// `accept_drain`), so the connect info must be available for the wrapper too.
+#[cfg(unix)]
+impl
+    axum::extract::connect_info::Connected<
+        axum::serve::IncomingStream<
+            '_,
+            crate::accept_drain::StopAcceptingOnShutdown<tokio::net::UnixListener>,
+        >,
+    > for UdsConnectInfo
+{
+    fn connect_info(
+        _stream: axum::serve::IncomingStream<
+            '_,
+            crate::accept_drain::StopAcceptingOnShutdown<tokio::net::UnixListener>,
+        >,
+    ) -> Self {
         Self
     }
 }
@@ -11039,8 +11425,28 @@ async fn resolve_shard_set(
             // no-database path. A shard set establishing SQLite pools under a
             // nonzero timeout still fails closed.
             #[cfg(feature = "sqlite")]
-            crate::db::reject_sqlite_statement_timeout(config.database.statement_timeout)
+            {
+                // Scope the lock-wait wording to a `cache=shared` shard when
+                // any shard is one (issue #2881). Each returned topology pairs
+                // positionally with its configured shard; prefer the target
+                // the provider actually resolved, as the control-pool guard
+                // does.
+                let target = topologies
+                    .iter()
+                    .zip(&config.database.shards)
+                    .map(|(topology, shard)| {
+                        topology
+                            .migration_url()
+                            .unwrap_or(shard.primary_url.as_str())
+                    })
+                    .find(|url| crate::db::sqlite_target_is_shared_cache(url))
+                    .unwrap_or_default();
+                crate::db::reject_sqlite_statement_timeout(
+                    config.database.statement_timeout,
+                    target,
+                )
                 .map_err(|e| format!("Failed to create shard pools: {e}"))?;
+            }
             crate::sharding::build_shard_set(&config.database, topologies, router)
         }
         None => crate::sharding::create_shard_set(&config.database, router)
@@ -11122,8 +11528,15 @@ async fn setup_database(
     // that opt-out. The check is idempotent with the built-in factories' own, and
     // `resolve_shard_set` applies the same Some-gated guard for shards.
     #[cfg(feature = "sqlite")]
-    if topology.is_some() {
-        crate::db::reject_sqlite_statement_timeout(config.database.statement_timeout)
+    if let Some(topology) = topology.as_ref() {
+        // Prefer the provider-resolved target (a custom provider may have no
+        // static URL, or a different one) so the message describes the pool
+        // that was actually built, as the migration path below does.
+        let target = topology
+            .migration_url()
+            .or_else(|| config.database.effective_primary_url())
+            .unwrap_or_default();
+        crate::db::reject_sqlite_statement_timeout(config.database.statement_timeout, target)
             .map_err(|e| format!("Failed to create database pool: {e}"))?;
     }
 
@@ -11847,7 +12260,7 @@ async fn run_startup_migrations(
     let disambiguated = crate::migrate::compute_migration_disambiguation(&disambiguation_sets);
     #[cfg(feature = "sqlite")]
     let sqlite_history_sets = crate::migrate::sqlite_collision_pairs(&disambiguation_sets);
-    let migration_result = tokio::task::spawn_blocking(move || {
+    let migration_result = crate::time::spawn_blocking(move || {
         // SQLite single-writer startup-migration path (#1614, PR3): apply the
         // registered migrations to a `sqlite://` control target with no advisory
         // lock. Sharding — directory, shard-map, per-shard fan-out — is
@@ -12700,13 +13113,12 @@ fn validate_repository_api_policies(
              Add `policy = SomePolicy` to each, or set `[security] allow_unauthorized_repository_api = true` to opt out explicitly."
         );
         std::process::exit(1);
-    } else {
-        tracing::warn!(
-            "the following #[repository(api = ...)] mutating endpoints have no paired `policy = ...` argument; \
-             auto-generated POST/PUT/PATCH/DELETE handlers will accept writes from any authenticated user:\n{listing}\n\
-             This will become a startup-time error in `prod` profile builds."
-        );
     }
+    tracing::warn!(
+        "the following #[repository(api = ...)] mutating endpoints have no paired `policy = ...` argument; \
+         auto-generated POST/PUT/PATCH/DELETE handlers will accept writes from any authenticated user:\n{listing}\n\
+         This will become a startup-time error in `prod` profile builds."
+    );
 }
 
 /// Refuse to start when a `#[repository(policy = X)]`-annotated
@@ -13384,6 +13796,12 @@ fn build_state(
         crate::channels::Channels::with_shared_backend,
     );
 
+    // One tracker, shared with the collaboration hub: a hub built on a second
+    // `Presence` would report a participant list that disagrees with
+    // `state.presence()` (#1806).
+    #[cfg(feature = "presence")]
+    let presence = crate::presence::Presence::new(channels.clone());
+
     let state = AppState {
         extensions: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
         #[cfg(feature = "db")]
@@ -13407,8 +13825,10 @@ fn build_state(
         config_props: crate::actuator::ConfigProperties::from_config(config),
         metrics_source_registry: crate::actuator::MetricsSourceRegistry::new(),
         health_indicator_registry: crate::actuator::HealthIndicatorRegistry::new(),
+        #[cfg(all(feature = "collab", feature = "presence"))]
+        collab: crate::collab::CollabHub::new(channels.clone(), presence.clone()),
         #[cfg(feature = "presence")]
-        presence: crate::presence::Presence::new(channels.clone()),
+        presence,
         #[cfg(feature = "ws")]
         channels,
         #[cfg(feature = "ws")]
@@ -15405,6 +15825,81 @@ mod tests {
                  and hooks ({hooks:?}) would spend more"
             );
         }
+    }
+
+    /// The accept loop must go live only after the startup hooks succeed —
+    /// but only for an in-place-upgrade successor.
+    ///
+    /// During an in-place upgrade (#1674) the successor adopts the
+    /// predecessor's listening socket up front, so both processes are
+    /// accepting on the same socket and the kernel hands new connections to
+    /// either — and every connection the successor wins before it can serve is
+    /// answered by the startup barrier with a 503 while the predecessor is
+    /// right there, healthy. Spawning the accept loop only once
+    /// `run_startup_hooks` has returned `Ok` keeps the predecessor serving for
+    /// the whole window, so a slow or failing successor can no longer 503 real
+    /// users (#2368).
+    ///
+    /// The deferral must NOT apply to a cold start: nothing accepts until the
+    /// loop is polled, so holding it back would leave `/live` and `/startup`
+    /// unreachable behind the startup barrier for the whole hook window, and a
+    /// hook that outlasts a probe threshold would read as a dead pod. Source-
+    /// order test in the house style: the ordering is a property of this
+    /// function, and a two-process upgrade test with fd handoff cannot run in
+    /// CI.
+    #[test]
+    fn accept_loop_defers_only_for_upgrade_successor() {
+        let source = include_str!("app.rs").replace("\r\n", "\n");
+        let server_start = source
+            .find("pub async fn run(self)")
+            .expect("normal server path should exist");
+        // Bounded at the next path so the search cannot match this test's own
+        // source, which necessarily quotes the strings it is looking for.
+        let build_mode_start = source
+            .find("async fn run_build_mode(self)")
+            .expect("static build path should follow server path");
+        let server_source = &source[server_start..build_mode_start];
+
+        let bound = server_source
+            .find("let server_future:")
+            .expect("the accept-loop future must be built from the bound listener");
+        // The deferral is gated on this process being an upgrade successor —
+        // the one shape where the socket is shared with a live predecessor.
+        let gate = server_source
+            .find("let defer_accept_loop = crate::upgrade::handoff_requested();")
+            .expect("the deferral must be gated on the upgrade handoff");
+        let cold_spawn = server_source
+            .find("server_task = Some(tokio::spawn(server_future));")
+            .expect("a cold start must spawn the accept loop up front, as before");
+        let hooks = server_source
+            .find("run_startup_hooks(&startup_hooks, state.clone())")
+            .expect("startup hooks must run on the normal server path");
+        let deferred_spawn = server_source
+            .find("tokio::spawn(future)")
+            .expect("an upgrade successor must spawn its deferred accept loop after the hooks");
+
+        assert!(
+            bound < gate && gate < cold_spawn && cold_spawn < hooks && hooks < deferred_spawn,
+            "ordering must be: bound listener -> deferral gate -> cold-start spawn \
+             -> startup hooks -> successor's deferred spawn \
+             (bound={bound}, gate={gate}, cold_spawn={cold_spawn}, hooks={hooks}, \
+             deferred_spawn={deferred_spawn})"
+        );
+        // A cold start that already spawned must still abort its loop when a
+        // hook fails; a successor has nothing to abort.
+        assert!(
+            server_source.contains("if let Some(task) = server_task.take()"),
+            "the hook-failure path must abort the cold-start accept loop"
+        );
+        // The old shapes must not come back.
+        assert!(
+            !server_source.contains("let server_task = match bound_listener"),
+            "the accept loop must not be spawned from the bound-listener match"
+        );
+        assert!(
+            !server_source.contains("let server_task = tokio::spawn(server_future);"),
+            "the accept loop must not be unconditionally deferred past the hooks"
+        );
     }
 
     #[test]
@@ -17799,72 +18294,59 @@ mod tests {
         assert_eq!(&body[..], b"created");
     }
 
+    /// Through the full router, so the global `AssetCacheControlLayer` (which
+    /// re-stamps `Cache-Control` on every successful `/static/` response) is
+    /// in play: the plain htmx path revalidates and the hashed one, which
+    /// that layer must recognise as fingerprinted, stays `immutable`.
     #[cfg(feature = "htmx")]
     #[tokio::test]
-    async fn htmx_handler_returns_javascript_with_correct_headers() {
-        let app = axum::Router::new().route(
-            crate::htmx::HTMX_JS_PATH,
-            axum::routing::get(crate::router::htmx_handler),
-        );
+    async fn htmx_is_served_at_plain_and_fingerprinted_paths_with_matching_cache_policy() {
+        let router = test_router(vec![test_get_route("/dummy", "dummy")]);
+        let get = |uri: String| {
+            let router = router.clone();
+            async move {
+                router
+                    .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                    .await
+                    .unwrap()
+            }
+        };
 
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri(crate::htmx::HTMX_JS_PATH)
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+        let plain = get(crate::htmx::HTMX_JS_PATH.to_owned()).await;
+        assert_eq!(plain.status(), StatusCode::OK);
+        let content_type = plain.headers()["content-type"].to_str().unwrap();
+        assert!(
+            content_type.contains("javascript"),
+            "Expected JavaScript, got {content_type}"
+        );
+        let cache_control = plain.headers()["cache-control"].to_str().unwrap();
+        assert_eq!(cache_control, "public, max-age=0, must-revalidate");
+        assert!(plain.headers().contains_key("etag"));
+        let body = axum::body::to_bytes(plain.into_body(), usize::MAX)
             .await
             .unwrap();
+        assert_eq!(&body[..], crate::htmx::HTMX_JS);
 
-        assert_eq!(response.status(), StatusCode::OK);
-
-        let content_type = response
-            .headers()
-            .get("content-type")
-            .unwrap()
-            .to_str()
-            .unwrap();
-        assert!(
-            content_type.contains("application/javascript"),
-            "Expected application/javascript, got {content_type}"
+        let hashed_url = crate::assets::asset_url("js/htmx.min.js");
+        assert_ne!(hashed_url, crate::htmx::HTMX_JS_PATH);
+        let hashed = get(hashed_url).await;
+        assert_eq!(hashed.status(), StatusCode::OK);
+        assert_eq!(
+            hashed.headers()["cache-control"].to_str().unwrap(),
+            "public, max-age=31536000, immutable"
         );
-
-        let cache_control = response
-            .headers()
-            .get("cache-control")
-            .unwrap()
-            .to_str()
-            .unwrap();
-        assert!(
-            cache_control.contains("immutable"),
-            "Expected immutable cache, got {cache_control}"
-        );
-
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        let body = axum::body::to_bytes(hashed.into_body(), usize::MAX)
             .await
             .unwrap();
-
-        // Body length matches the embedded file
-        assert_eq!(body.len(), crate::htmx::HTMX_JS.len());
-
-        // Body starts with valid JavaScript
-        let start = std::str::from_utf8(&body[..50]).expect("htmx should be valid UTF-8");
-        assert!(
-            start.contains("htmx") || start.contains("function"),
-            "Response doesn't look like htmx JavaScript: {start}"
-        );
+        assert_eq!(&body[..], crate::htmx::HTMX_JS);
     }
 
     #[cfg(feature = "htmx")]
     #[tokio::test]
-    async fn htmx_csrf_handler_returns_csp_compatible_javascript() {
-        let app = axum::Router::new().route(
-            crate::htmx::HTMX_CSRF_JS_PATH,
-            axum::routing::get(crate::router::htmx_csrf_handler),
-        );
+    async fn htmx_csrf_helper_is_csp_compatible_javascript() {
+        let router = test_router(vec![test_get_route("/dummy", "dummy")]);
 
-        let response = app
+        let response = router
             .oneshot(
                 Request::builder()
                     .uri(crate::htmx::HTMX_CSRF_JS_PATH)
@@ -17880,7 +18362,7 @@ mod tests {
                 .headers()
                 .get("content-type")
                 .and_then(|value| value.to_str().ok()),
-            Some("application/javascript")
+            Some("text/javascript; charset=utf-8")
         );
 
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
@@ -19691,5 +20173,65 @@ mod unix_socket_tests {
         let err = prepare_unix_socket_path(&path).expect_err("must refuse a non-socket file");
         assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
         assert!(path.exists(), "regular file must not be removed");
+    }
+
+    /// Regression (#2652): the one-shot `autumn db retention` path must
+    /// install the same `dyn CustomDomainPruner` the server installs — the
+    /// TLS bind path that used to do it never runs in a one-shot, so the
+    /// `custom_domains` retention dataset always reported "custom domains
+    /// are not enabled".
+    #[cfg(feature = "acme")]
+    #[tokio::test]
+    async fn retention_mode_installs_the_custom_domain_pruner() {
+        fn acme_with_custom_domains(enabled: bool) -> crate::config::AcmeConfig {
+            let toml = format!(
+                "domains = [\"app.example.com\"]\ncontact_email = \"ops@example.com\"\n\
+                 [custom_domains]\nenabled = {enabled}\n"
+            );
+            toml::from_str(&toml).expect("test ACME config parses")
+        }
+
+        // Enabled custom domains: the pruner is installed. It carries no ACME
+        // issuer — pruning only touches the registry and the certificate
+        // store, so no order is placed and no CA is contacted.
+        let state = crate::state::AppState::for_test();
+        super::install_custom_domain_retention_pruner(
+            Some(&acme_with_custom_domains(true)),
+            None,
+            &state,
+            true,
+        )
+        .await;
+        assert!(
+            state
+                .extension::<std::sync::Arc<dyn crate::custom_domain::CustomDomainPruner>>()
+                .is_some(),
+            "one-shot retention must install the custom-domain pruner"
+        );
+
+        // Custom domains disabled: nothing is installed, and the dataset keeps
+        // its honest "not enabled" report.
+        let state = crate::state::AppState::for_test();
+        super::install_custom_domain_retention_pruner(
+            Some(&acme_with_custom_domains(false)),
+            None,
+            &state,
+            true,
+        )
+        .await;
+        assert!(
+            state
+                .extension::<std::sync::Arc<dyn crate::custom_domain::CustomDomainPruner>>()
+                .is_none()
+        );
+
+        // No ACME at all: nothing is installed.
+        let state = crate::state::AppState::for_test();
+        super::install_custom_domain_retention_pruner(None, None, &state, true).await;
+        assert!(
+            state
+                .extension::<std::sync::Arc<dyn crate::custom_domain::CustomDomainPruner>>()
+                .is_none()
+        );
     }
 }

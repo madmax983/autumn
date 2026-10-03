@@ -716,7 +716,8 @@ on the first successful renewal.
 Wildcard certificates cover `tenant42.myapp.com`. A B2B customer who wants
 `app.clientco.com` needs a certificate of their own. Turn the feature on and
 autumn does the whole journey: it hands each tenant exact DNS instructions,
-independently confirms the hostname points here, orders one certificate per
+independently confirms the hostname points here and that the tenant controls
+it, orders one certificate per
 hostname, serves it by SNI, routes requests on that `Host` to the owning
 tenant, and renews it. There is no per-domain configuration — a thousand
 tenants use the same twenty lines.
@@ -740,11 +741,15 @@ ingress_ipv4     = ["203.0.113.10"]      # A records, for tenant APEX domains
 # failure_backoff_secs        = 300      # doubles per consecutive failure
 # max_failure_backoff_secs    = 86400
 # poll_interval_secs          = 60
+# resolvers = ["1.1.1.1:53", "8.8.8.8:53"]  # read ownership TXT records
 ```
 
 `ingress_hostname` is what tenants CNAME at. An **apex** domain
 (`clientco.com`) cannot carry a CNAME, so it needs `ingress_ipv4` /
 `ingress_ipv6` instead; set both kinds if you accept both.
+
+`resolvers` are the recursive resolvers autumn asks for each domain's
+ownership TXT record. The server must reach them on UDP/53.
 
 ### The tenant journey
 
@@ -772,8 +777,10 @@ let ingress = config.server.tls.as_ref()
 let domain = registry.register("app.clientco.com", &tenant_id, now_unix).await?;
 
 // 2. Show the tenant exactly what to publish. Fields are tab-separated.
-let instructions = DnsInstructions::for_hostname(&domain.hostname, &ingress)?;
-println!("{}", instructions.render());   // app.clientco.com\tCNAME\tingress.myapp.com
+let instructions = DnsInstructions::for_domain(&domain, &ingress)?;
+println!("{}", instructions.render());
+// app.clientco.com                     CNAME  ingress.myapp.com
+// _autumn-challenge.app.clientco.com   TXT    <this registration's token>
 
 // 3. Render status, including why it is stuck.
 for d in registry.list_for_tenant(&tenant_id) {
@@ -790,6 +797,31 @@ domains.offboard_tenant_domains(&tenant_id).await?;   // every domain the tenant
 the certificate stays in the ACME store. Offboard through `CustomDomainPruner`
 so the private key goes too.
 
+### Ownership proof: the TXT token
+
+A hostname that points here proves nothing on its own. A tenant who leaves
+does not delete their DNS records, so their hostname still points here, and
+without more proof the next tenant to register it would get a certificate for
+it. So each registration gets a random token, and the tenant publishes it as a
+TXT record at `_autumn-challenge.<hostname>`. A domain verifies only when its
+address record points here **and** that TXT record carries this registration's
+token. Each registration mints a new token, so a record a previous tenant left
+behind proves nothing.
+
+The TXT record may also be a CNAME to a name that carries the token. It is
+needed until the domain is `active`. Renewals check only the address record.
+
+Domains connected before this rule are handled at the first start after the
+upgrade:
+
+- An `active` domain is **grandfathered**. It proved control under the old
+  rule, so it keeps serving and renewing with no token.
+- Any other domain gets a token and goes back to `pending_dns`, with a
+  `failure_reason` that asks for the TXT record. Show the tenant the DNS
+  instructions again. Its `registered_at_unix` restarts, so the
+  `custom_domains` retention window does not delete it before the tenant can
+  publish.
+
 The states are `pending_dns` → `verified` → `issuing` → `active`. There is no
 separate failed state: a domain that fails carries a `failure_reason` and a
 `next_attempt_unix`, and one that already reached `active` **stays** `active`
@@ -798,6 +830,22 @@ while it retries — a failed renewal never takes a live tenant offline.
 Once a domain is `active`, requests carrying that `Host` resolve to its tenant.
 The usual `[tenancy] base_domain` rejection does not apply to a registered
 domain, and subdomain tenancy is unchanged for every other host.
+
+### Connected domains and the host allow-list
+
+[`[security.trusted_hosts] hosts`](deployment.md#trusted-hosts-host-header-allow-list)
+is mandatory in production, and a tenant hostname is never in it — a thousand
+tenants must not mean a thousand configuration lines. So the ingress layer asks
+the registry about each host its static rules do not match:
+
+- An `active` domain is trusted, and the request reaches your handler.
+- A domain that is still `pending_dns`, `verified` or `issuing` is not. It gets
+  `400 Invalid Host header`, the same answer SNI gives at the handshake.
+- A hostname nobody registered gets the same `400`.
+
+Connect or offboard a domain and the answer changes at once. **Do not set
+`hosts = ["*"]` for this**: that turns host validation off for the whole
+deployment.
 
 ### Abuse posture toward the CA
 
@@ -808,9 +856,11 @@ three gates stand between a hostname and Let's Encrypt:
    SNI hostname nobody registered is refused at the TLS handshake, and no code
    path from there reaches the ACME provider.
 2. **Verification.** No order is created until autumn independently resolves
-   the hostname and finds it pointing at this deployment. A domain whose DNS
-   points elsewhere sits at `pending_dns` with the observed address in its
-   `failure_reason` and costs the CA nothing.
+   the hostname and finds it pointing at this deployment, and finds this
+   registration's token in its `_autumn-challenge` TXT record. A domain whose
+   DNS points elsewhere, or whose TXT record is missing or stale, sits at
+   `pending_dns` with the reason in its `failure_reason` and costs the CA
+   nothing.
 3. **Budget.** At the defaults, at most **5 orders per domain per day** and
    **50 across the whole deployment per hour** — comfortably inside Let's
    Encrypt's 300-new-orders-per-account-per-3-hours limit. Failures back off
@@ -834,6 +884,14 @@ on the first request. Certificates load **incrementally**: at most
 its certificate back from the store and caches it. Nothing requires every
 certificate to be resident, so `cert_cache_size` is a memory knob, not a
 correctness one.
+
+A stored pair that rots *while its certificate is still cached* is not
+re-read until the cache stops holding it: the repair pass re-reads and
+re-parses the pair on the first tick after an eviction (or a restart), and a
+pair that will not load is treated as missing and re-ordered. So a
+corrupted-on-disk certificate is detected within one tick of the eviction
+that exposes it — never earlier, never silently permanent — but also never
+proactively while the cached copy is still serving.
 
 Custom domains live **inside** the ACME TLS listener, so they exist only where
 autumn terminates TLS itself. Behind
@@ -876,6 +934,7 @@ the store and restart.
 |---|---|
 | `custom_domains` | The section loads, has somewhere for tenants to point, and its cap is not already exceeded. **Fail** on anything the server would exit at boot on. |
 | `custom_domain_dns` | (`--online`) Each registered domain still points here. **Fail** for an `active` or `verified` domain whose DNS has moved away or vanished — it is serving a certificate nobody can reach and will fail its next renewal. **Warn** for one still `pending_dns`. Probes the first 25 domains and says so. |
+| `custom_domain_txt` | (`--online`) Each `pending_dns` domain's `_autumn-challenge` TXT record carries its token. **Warn** when the record is missing, or carries only other values (for example a token from an earlier registration). A separate check from `custom_domain_dns`, so a wrong address and a missing token read differently. |
 | `custom_domain_http01` | (`--online`) Port 80 is reachable on **every address** each configured ingress target resolves to — one member of a load-balancer record set that drops it fails HTTP-01 for whatever share of tenants lands there. **Fail** when any is unreachable — tenant certificates are always issued over HTTP-01, so a closed port 80 blocks every one of them **even under a DNS-01 deployment**, where `acme_ports` rightly calls it optional for the deployment's own certificate. |
 
 ### Failure surfaces through health and alerts
@@ -1099,6 +1158,27 @@ Two deliberate choices:
   honoring the list rather than failing every handshake — the revocations it
   names stay enforced. `autumn doctor` warns so the staleness is not silent.
 
+And one hard rule:
+
+- **Every CA in the bundle needs a CRL.** Once `crl_path` is set, rustls
+  denies handshakes whose revocation status is *unknown*, so a CRL that names
+  only some of the bundle's CAs would silently refuse the clients of the rest
+  — exactly the availability trap the rotation above walks into if the new
+  CA's CRL is published late. The server **fails fast at startup**, naming the
+  uncovered CAs, rather than serving half the clients. During a rotation,
+  publish the new CA's CRL (an empty one counts — a CRL with zero revoked
+  certificates) before, or together with, the bundle edit that adds the new
+  CA. A CRL-file change that breaks coverage hot-reloads the same way any bad
+  bundle does: it logs an error and keeps the previous trust store.
+
+  A CRL counts for a CA only if it is signed by that CA's key: a renewed CA
+  that keeps its name under a new key needs a CRL from the new key. If your
+  client certificates chain through an intermediate whose CRL you configure
+  (the bundle holds only the root), the check stands down — revocation is
+  checked against the issuing intermediate, which the bundle cannot show. A
+  root shipped in the bundle alongside its intermediate needs no CRL of its
+  own; the intermediate does.
+
 **OCSP and OCSP stapling are not supported.** CRL plus short-lived certificates
 first.
 
@@ -1154,7 +1234,8 @@ Both surface through the usual metrics/actuator endpoints.
 
 Startup **fails fast** with the offending path in the message on a missing,
 unparseable, or empty CA bundle or CRL — the listener never binds trusting
-nobody.
+nobody. It also fails fast when the CRL does not cover every CA in the bundle
+(see above), naming the uncovered CAs.
 
 ### `autumn doctor`
 
@@ -1162,9 +1243,11 @@ nobody.
 
 - **Fail** — the bundle or CRL is missing, unparseable, or empty (the same
   conditions the runtime refuses to boot on), or a CA in the bundle has expired.
-- **Warn** — a CA expires within 30 days, the CRL's `nextUpdate` has passed, or
-  `mode = "optional"` with no route requiring a certificate (client auth
-  configured and enforcing nothing).
+- **Warn** — the CRL has no entry for every CA in the bundle (the runtime
+  refuses to boot on this too, so `--strict` fails the run), a CA expires
+  within 30 days, the CRL's `nextUpdate` has passed, or `mode = "optional"`
+  with no route requiring a certificate (client auth configured and enforcing
+  nothing).
 - **Pass** — otherwise, reporting the mode, the CA count, and how many route
   prefixes demand a certificate.
 
