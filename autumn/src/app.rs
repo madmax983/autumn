@@ -10270,6 +10270,16 @@ fn spawn_custom_domain_task(
         std::sync::Arc::clone(&store) as std::sync::Arc<dyn crate::acme::store::AcmeStore>,
         tokens,
     ));
+    let limiter = std::sync::Arc::new(crate::custom_domain::IssuanceLimiter::new(
+        config.issuance_per_domain_per_day,
+        config.issuance_global_per_hour,
+        config.failure_backoff_secs,
+        config.max_failure_backoff_secs,
+    ));
+    // A restart inside the budget window must not forget the orders already
+    // placed: rebuild the limiter's windows from the records' persisted
+    // attempt timestamps before the orchestrator ticks (#3102).
+    limiter.hydrate_from_records(&registry.list(), crate::custom_domain::now_unix());
     let task = std::sync::Arc::new(crate::acme::tenant_domains::CustomDomainTask {
         registry,
         cache,
@@ -10280,12 +10290,8 @@ fn spawn_custom_domain_task(
             config.resolver_addrs().unwrap_or_default(),
         )),
         issuer,
-        limiter: std::sync::Arc::new(crate::custom_domain::IssuanceLimiter::new(
-            config.issuance_per_domain_per_day,
-            config.issuance_global_per_hour,
-            config.failure_backoff_secs,
-            config.max_failure_backoff_secs,
-        )),
+        limiter,
+        clock: std::sync::Arc::new(crate::acme::tenant_domains::SystemIssuanceClock),
         ingress: config.ingress(),
         renew_before_days: acme.renew_before_days,
         // A per-domain failure is a framework-scheduled operation failing, so

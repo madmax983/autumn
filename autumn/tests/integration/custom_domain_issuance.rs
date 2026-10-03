@@ -12,11 +12,11 @@ use std::sync::{Arc, Mutex};
 
 use autumn_web::acme::store::{AcmeStore as _, CertId, FsAcmeStore};
 
-use autumn_web::acme::tenant_domains::CustomDomainTask;
+use autumn_web::acme::tenant_domains::{CustomDomainTask, ManualIssuanceClock};
 use autumn_web::custom_domain::{
     CustomDomainCertCache, CustomDomainRegistry, DomainIssuer, DomainStatus, DomainVerifier,
-    ExpectedIngress, IssuanceLimiter, IssuedCertificate, MemoryCustomDomainStore, ObservedTarget,
-    ObservedTxt,
+    ExpectedIngress, IssuanceDecision, IssuanceLimiter, IssuedCertificate, MemoryCustomDomainStore,
+    ObservedTarget, ObservedTxt,
 };
 use futures::future::BoxFuture;
 
@@ -171,6 +171,27 @@ impl DomainIssuer for ScriptedIssuer {
     }
 }
 
+/// An issuer that moves a shared [`ManualIssuanceClock`] forward before
+/// answering, simulating a slow CA deterministically (#3102).
+#[derive(Debug)]
+struct SlowIssuer {
+    clock: Arc<ManualIssuanceClock>,
+    inner: Arc<ScriptedIssuer>,
+    delay_secs: i64,
+}
+
+impl DomainIssuer for SlowIssuer {
+    fn issue<'a>(&'a self, hostname: &'a str) -> BoxFuture<'a, Result<IssuedCertificate, String>> {
+        let clock = Arc::clone(&self.clock);
+        let inner = Arc::clone(&self.inner);
+        let delay = self.delay_secs;
+        Box::pin(async move {
+            clock.advance(delay);
+            inner.issue(hostname).await
+        })
+    }
+}
+
 // ── Harness ──────────────────────────────────────────────────────────────
 
 struct Harness {
@@ -184,7 +205,13 @@ struct Harness {
 }
 
 fn harness(verifier: Arc<dyn DomainVerifier>, issuer: Arc<dyn DomainIssuer>) -> Harness {
-    harness_with_limiter(verifier, issuer, IssuanceLimiter::new(5, 50, 300, 86_400))
+    let clock = Arc::new(ManualIssuanceClock::new(NOW));
+    harness_with_clock(
+        verifier,
+        issuer,
+        IssuanceLimiter::new(5, 50, 300, 86_400),
+        clock,
+    )
 }
 
 fn harness_with_limiter(
@@ -192,7 +219,19 @@ fn harness_with_limiter(
     issuer: Arc<dyn DomainIssuer>,
     limiter: IssuanceLimiter,
 ) -> Harness {
-    build_harness(verifier, issuer, limiter, true)
+    let clock = Arc::new(ManualIssuanceClock::new(NOW));
+    harness_with_clock(verifier, issuer, limiter, clock)
+}
+
+/// A harness sharing `clock` with the caller, so an issuer can move time
+/// mid-order to simulate a slow CA deterministically (#3102).
+fn harness_with_clock(
+    verifier: Arc<dyn DomainVerifier>,
+    issuer: Arc<dyn DomainIssuer>,
+    limiter: IssuanceLimiter,
+    clock: Arc<ManualIssuanceClock>,
+) -> Harness {
+    build_harness(verifier, issuer, limiter, true, clock)
 }
 
 /// A harness whose verifier answers TXT exactly as given, for the #2642 tests.
@@ -202,6 +241,7 @@ fn strict_harness(verifier: Arc<dyn DomainVerifier>, issuer: Arc<dyn DomainIssue
         issuer,
         IssuanceLimiter::new(5, 50, 300, 86_400),
         false,
+        Arc::new(ManualIssuanceClock::new(NOW)),
     )
 }
 
@@ -210,6 +250,7 @@ fn build_harness(
     issuer: Arc<dyn DomainIssuer>,
     limiter: IssuanceLimiter,
     owners_publish: bool,
+    clock: Arc<ManualIssuanceClock>,
 ) -> Harness {
     let dir = tempfile::tempdir().unwrap();
     let store = Arc::new(FsAcmeStore::new(dir.path(), "staging"));
@@ -239,6 +280,7 @@ fn build_harness(
         verifier,
         issuer,
         limiter: Arc::new(limiter),
+        clock,
         ingress: ExpectedIngress {
             hostname: Some("ingress.myapp.com".to_owned()),
             ipv4: vec!["203.0.113.10".parse().unwrap()],
@@ -284,6 +326,7 @@ fn task_over(
         provider: autumn_web::tls::crypto_provider(),
         issuer,
         limiter: Arc::new(IssuanceLimiter::new(5, 5000, 300, 86_400)),
+        clock: Arc::new(ManualIssuanceClock::new(NOW)),
         ingress: ExpectedIngress {
             hostname: Some("ingress.myapp.com".to_owned()),
             ipv4: vec!["203.0.113.10".parse().unwrap()],
@@ -480,9 +523,91 @@ async fn a_spent_issuance_budget_defers_the_order_without_contacting_the_ca() {
     assert_eq!(issuer.count(), 0, "a spent budget must not reach the CA");
     let record = h.registry.get("app.clientco.com").unwrap();
     assert_eq!(record.status, DomainStatus::Verified);
+    // A budget deferral is not an issuance failure: no order was placed, so
+    // the failure count must not move and no failure reason is recorded — the
+    // domain is parked until the budget's own window rolls (#3102).
+    assert_eq!(record.consecutive_failures, 0);
+    assert_eq!(record.failure_reason, None);
+    assert_eq!(record.next_attempt_unix, Some(NOW + 3600));
+    assert!(!record.is_due(NOW + 3599));
+    assert!(record.is_due(NOW + 3600));
+    // No operator alert: the budget already explains the wait.
+    assert!(h.alerts.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_slow_order_does_not_backdate_the_failure_retry() {
+    // #3102 item 2: the order takes 600s against the CA. The failure's retry
+    // must be stamped at completion, not at the tick's start — otherwise
+    // `next_attempt_unix` lands in the past and the next tick spends quota
+    // instead of backing off.
+    let clock = Arc::new(ManualIssuanceClock::new(NOW));
+    let issuer = ScriptedIssuer::new(&["slow.clientco.com"]);
+    let slow = Arc::new(SlowIssuer {
+        clock: Arc::clone(&clock),
+        inner: Arc::clone(&issuer),
+        delay_secs: 600,
+    });
+    let h = harness_with_clock(
+        TableVerifier::new(&[("slow.clientco.com", points_here())]),
+        slow as Arc<dyn DomainIssuer>,
+        IssuanceLimiter::new(5, 50, 300, 86_400),
+        Arc::clone(&clock),
+    );
+    h.registry
+        .register("slow.clientco.com", "tenant-a", NOW)
+        .await
+        .unwrap();
+
+    h.task.tick(NOW).await;
+
+    assert_eq!(issuer.count(), 1);
+    let record = h.registry.get("slow.clientco.com").unwrap();
+    assert_eq!(record.status, DomainStatus::Verified);
+    assert_eq!(record.consecutive_failures, 1);
+    // Stamped at completion (NOW + 600) plus the first-failure backoff, not
+    // at the tick's start.
+    assert_eq!(record.next_attempt_unix, Some(NOW + 600 + 300));
+    assert!(!record.is_due(NOW + 899));
+    assert!(record.is_due(NOW + 900));
+}
+
+#[tokio::test]
+async fn orders_persist_their_attempts_so_a_rebuilt_limiter_refuses() {
+    // #3102 item 3, end to end: the order persists its attempt on the record,
+    // so a limiter rebuilt from the stored records — the restart path in
+    // `spawn_custom_domain_task` — still refuses the spent per-domain budget.
+    let issuer = ScriptedIssuer::new(&["a.clientco.com"]);
+    let h = harness_with_limiter(
+        TableVerifier::new(&[("a.clientco.com", points_here())]),
+        Arc::clone(&issuer) as Arc<dyn DomainIssuer>,
+        IssuanceLimiter::new(1, 5000, 300, 86_400),
+    );
+    h.registry
+        .register("a.clientco.com", "tenant-a", NOW)
+        .await
+        .unwrap();
+
+    h.task.tick(NOW).await;
+    assert_eq!(issuer.count(), 1, "the order must have been placed");
+
+    // The attempt was persisted on the record by the order itself.
+    let record = h.registry.get("a.clientco.com").unwrap();
+    assert_eq!(record.issuance_attempts, vec![NOW]);
+
+    let rebuilt = IssuanceLimiter::new(1, 5000, 300, 86_400);
+    rebuilt.hydrate_from_records(&h.registry.list(), NOW + 301);
     assert!(
-        record.failure_reason.as_deref().unwrap().contains("budget"),
-        "{record:?}"
+        matches!(
+            rebuilt.check("a.clientco.com", NOW + 301),
+            IssuanceDecision::PerDomainLimit { .. }
+        ),
+        "a restart inside the window must not forget the spent budget"
+    );
+    // The old window having rolled, the rebuilt limiter allows again.
+    assert_eq!(
+        rebuilt.check("a.clientco.com", NOW + 86_400 + 1),
+        IssuanceDecision::Allow
     );
 }
 
@@ -1471,6 +1596,7 @@ async fn a_stale_order_does_not_delete_the_successors_certificate() {
         ),
         issuer: ScriptedIssuer::new(&[]) as Arc<dyn DomainIssuer>,
         limiter: Arc::new(IssuanceLimiter::new(5, 50, 300, 86_400)),
+        clock: Arc::new(ManualIssuanceClock::new(NOW)),
         ingress: ExpectedIngress {
             hostname: Some("ingress.myapp.com".to_owned()),
             ipv4: vec!["203.0.113.10".parse().unwrap()],
@@ -1740,6 +1866,7 @@ async fn an_order_is_not_placed_when_the_issuing_state_cannot_be_persisted() {
         ),
         issuer: Arc::clone(&issuer) as Arc<dyn DomainIssuer>,
         limiter: Arc::new(IssuanceLimiter::new(5, 50, 300, 86_400)),
+        clock: Arc::new(ManualIssuanceClock::new(NOW)),
         ingress: ExpectedIngress {
             hostname: Some("ingress.myapp.com".to_owned()),
             ipv4: vec!["203.0.113.10".parse().unwrap()],
@@ -1953,6 +2080,7 @@ async fn an_order_is_abandoned_when_the_hostname_stops_being_this_tenants() {
         ),
         issuer: Arc::clone(&issuer) as Arc<dyn DomainIssuer>,
         limiter: Arc::new(IssuanceLimiter::new(5, 50, 300, 86_400)),
+        clock: Arc::new(ManualIssuanceClock::new(NOW)),
         ingress: ExpectedIngress {
             hostname: Some("ingress.myapp.com".to_owned()),
             ipv4: vec!["203.0.113.10".parse().unwrap()],
@@ -2246,6 +2374,7 @@ async fn the_prune_refuses_to_run_when_the_registry_never_hydrated() {
         verifier: TableVerifier::new(&[]),
         issuer: ScriptedIssuer::new(&[]),
         limiter: Arc::new(IssuanceLimiter::new(5, 50, 300, 86_400)),
+        clock: Arc::new(ManualIssuanceClock::new(NOW)),
         ingress: ExpectedIngress::default(),
         renew_before_days: 30,
         reporter: Arc::new(|_| {}),

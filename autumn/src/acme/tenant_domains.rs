@@ -53,6 +53,82 @@ pub const CUSTOM_DOMAIN_TASK: &str = "custom_domain_certificates";
 /// How many pending domains one tick verifies at the same time.
 const VERIFY_CONCURRENCY: usize = 16;
 
+/// Where [`CustomDomainTask`] reads "now" for the timestamps it writes.
+///
+/// Production injects [`SystemIssuanceClock`], which samples the wall clock
+/// fresh at each decision point: the verification pass runs concurrently
+/// ahead of the sequential orders, and one order can take minutes, so the
+/// tick's own sample can be arbitrarily stale by the time a later domain is
+/// reached. Stale stamps age budget entries early and can land a failure's
+/// `next_attempt_unix` in the past, which the next tick reads as "due now"
+/// and spends quota instead of backing off (#3102).
+///
+/// Tests inject [`ManualIssuanceClock`]: [`tick`](CustomDomainTask::tick)
+/// adopts its own `now_unix` argument into the clock first, so a tick driven
+/// at a fake time stamps everything with that same fake time, and an issuer
+/// can advance the clock mid-order to simulate a slow CA deterministically.
+pub trait IssuanceClock: Send + Sync + std::fmt::Debug {
+    /// Sample the current time as Unix seconds.
+    fn now_unix(&self) -> i64;
+    /// Adopt the tick's own time sample. The wall clock ignores this; a test
+    /// clock returns it from [`now_unix`](Self::now_unix) until the next tick
+    /// or until the test moves it again.
+    fn adopt_tick_time(&self, now_unix: i64);
+}
+
+/// [`IssuanceClock`] reading the real wall clock.
+#[derive(Debug, Default)]
+pub struct SystemIssuanceClock;
+
+impl IssuanceClock for SystemIssuanceClock {
+    fn now_unix(&self) -> i64 {
+        crate::custom_domain::now_unix()
+    }
+
+    fn adopt_tick_time(&self, _now_unix: i64) {}
+}
+
+/// [`IssuanceClock`] for tests: returns the last adopted tick time.
+///
+/// An issuer holding a clone can also move it forward with
+/// [`advance`](Self::advance) to simulate a slow CA — the orchestrator's
+/// post-order samples then see the later time, deterministically.
+#[derive(Debug, Default)]
+pub struct ManualIssuanceClock {
+    now: std::sync::atomic::AtomicI64,
+}
+
+impl ManualIssuanceClock {
+    /// A clock pinned at `now_unix` until the first tick adopts its time.
+    #[must_use]
+    pub const fn new(now_unix: i64) -> Self {
+        Self {
+            now: std::sync::atomic::AtomicI64::new(now_unix),
+        }
+    }
+
+    /// Move the clock forward by `secs` seconds. Never moves it backwards.
+    pub fn advance(&self, secs: i64) {
+        self.now.fetch_max(
+            self.now
+                .load(std::sync::atomic::Ordering::SeqCst)
+                .saturating_add(secs),
+            std::sync::atomic::Ordering::SeqCst,
+        );
+    }
+}
+
+impl IssuanceClock for ManualIssuanceClock {
+    fn now_unix(&self) -> i64 {
+        self.now.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn adopt_tick_time(&self, now_unix: i64) {
+        self.now
+            .store(now_unix, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 /// Callback that dispatches a custom-domain failure to the operator (#1610).
 pub type ReporterFn = Arc<dyn Fn(String) + Send + Sync>;
 
@@ -163,6 +239,11 @@ pub struct CustomDomainTask {
     pub issuer: Arc<dyn DomainIssuer>,
     /// Per-domain and deployment-wide order budgets.
     pub limiter: Arc<IssuanceLimiter>,
+    /// Where "now" comes from for the timestamps this task writes.
+    ///
+    /// Production injects [`SystemIssuanceClock`]; tests inject
+    /// [`ManualIssuanceClock`]. See [`IssuanceClock`].
+    pub clock: Arc<dyn IssuanceClock>,
     /// What tenants are told to point DNS at.
     pub ingress: ExpectedIngress,
     /// Renew once a certificate has fewer than this many days left.
@@ -580,6 +661,11 @@ impl CustomDomainTask {
 
     /// One pass over every registered domain.
     pub async fn tick(&self, now_unix: i64) {
+        // The orchestrator's time authority for this pass. Candidate
+        // selection below reads `now_unix` directly; everything `issue_one`
+        // writes samples the clock instead, which a test tick drives at its
+        // fake time while production samples the wall clock fresh (#3102).
+        self.clock.adopt_tick_time(now_unix);
         // Each check can wait out a DNS timeout, so checks run
         // `VERIFY_CONCURRENCY` at a time instead of adding up. Each write goes
         // through the registry's per-hostname gate.
@@ -594,7 +680,6 @@ impl CustomDomainTask {
                 &domain.hostname,
                 &domain.tenant,
                 domain.verification_token.as_deref(),
-                now_unix,
             )
             .await;
         }
@@ -613,7 +698,6 @@ impl CustomDomainTask {
                 &domain.hostname,
                 &domain.tenant,
                 domain.verification_token.as_deref(),
-                now_unix,
             )
             .await;
         }
@@ -634,7 +718,6 @@ impl CustomDomainTask {
                     &domain.hostname,
                     &domain.tenant,
                     domain.verification_token.as_deref(),
-                    now_unix,
                 )
                 .await;
             }
@@ -825,7 +908,15 @@ impl CustomDomainTask {
     }
 
     /// Order (or renew) one hostname's certificate, budget permitting.
-    async fn issue_one(&self, hostname: &str, tenant: &str, token: Option<&str>, now_unix: i64) {
+    async fn issue_one(&self, hostname: &str, tenant: &str, token: Option<&str>) {
+        // Every timestamp below is sampled fresh from the task's clock, not
+        // from the tick's start: the verification pass runs concurrently ahead
+        // of the sequential orders, and one order can take minutes, so the
+        // tick's sample can be arbitrarily stale by the time a later domain is
+        // reached. A test tick drives the clock at its fake time, so these
+        // reads stay deterministic there too (#3102).
+        let now_unix = self.clock.now_unix();
+
         // A distributed scheduler backend was configured but this process fell
         // back to a per-process coordinator. Ordering now would give every
         // replica its own lease, so all of them would order the SAME
@@ -850,9 +941,36 @@ impl CustomDomainTask {
         // `is_due` on the record, so the budget is the only thing left to ask.
         let decision = self.limiter.check(hostname, now_unix);
         if !decision.is_allowed() {
-            if let Some(reason) = decision.reason() {
-                self.record_failure(hostname, tenant, token, now_unix, reason, false)
-                    .await;
+            // A spent budget is not an issuance failure: no order was placed,
+            // so the failure count and its exponential backoff must not move.
+            // Park the domain until the budget's own window rolls instead — a
+            // domain examined repeatedly while the global budget is full would
+            // otherwise climb to the maximum backoff and stay unavailable long
+            // after the budget reopened (#3102).
+            let retry_after = decision.retry_after_secs().unwrap_or(0).max(1);
+            let next_attempt = now_unix.saturating_add(retry_after);
+            let reason = decision
+                .reason()
+                .unwrap_or_else(|| "issuance budget is spent".to_owned());
+            match self
+                .registry
+                .defer_for_budget(hostname, tenant, token, next_attempt)
+                .await
+            {
+                Ok(true) => tracing::debug!(
+                    hostname,
+                    retry_after,
+                    reason,
+                    "custom-domain order deferred until the issuance budget rolls"
+                ),
+                Ok(false) => tracing::debug!(
+                    hostname,
+                    "custom-domain order deferred, but the registration moved on; leaving it"
+                ),
+                Err(e) => tracing::warn!(
+                    hostname,
+                    "could not persist a custom-domain budget deferral: {e}"
+                ),
             }
             return;
         }
@@ -928,7 +1046,24 @@ impl CustomDomainTask {
                 return;
             }
         }
+        // Sample again: the lease acquisition and the issuing-state write
+        // above awaited, and the budget entry must be stamped when the order
+        // is actually placed, not when this domain's turn came up — otherwise
+        // the entry ages early and the window frees before the CA's own
+        // accounting does (#3102).
+        let now_unix = self.clock.now_unix();
         self.limiter.record_attempt(hostname, now_unix);
+        // The durable half of the budget: without it a restart inside the
+        // window forgets this order and the shared account quota can be spent
+        // again. A store failure only degrades restart recovery — the limiter
+        // above already counted the attempt for this process's lifetime.
+        if let Err(e) = self
+            .registry
+            .record_issuance_attempt(hostname, now_unix)
+            .await
+        {
+            tracing::warn!(hostname, "could not persist the issuance attempt: {e}");
+        }
 
         let outcome = self.issuer.issue(hostname).await;
         // Always release the lease, whatever the order did.
@@ -936,6 +1071,11 @@ impl CustomDomainTask {
             tracing::warn!(hostname, error = %e, "failed to release the custom-domain lease");
         }
 
+        // And again: the order itself is the slow step — minutes against a
+        // real CA. Stamping its outcome with an earlier sample would land
+        // `next_attempt_unix` in the past, which the next tick reads as "due
+        // now" and spends quota instead of backing off (#3102).
+        let now_unix = self.clock.now_unix();
         let issued = match outcome {
             Ok(issued) => issued,
             Err(e) => {

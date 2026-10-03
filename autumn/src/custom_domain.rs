@@ -597,6 +597,16 @@ pub struct CustomDomain {
     pub consecutive_failures: u32,
     /// Earliest time the orchestrator may retry this domain.
     pub next_attempt_unix: Option<i64>,
+    /// Unix timestamps of the ACME orders placed for this domain inside the
+    /// per-domain budget window, oldest first.
+    ///
+    /// The durable half of the issuance budget: [`IssuanceLimiter`] counts
+    /// orders in memory, and these timestamps let a restart inside the window
+    /// rebuild its windows via [`IssuanceLimiter::hydrate_from_records`]
+    /// instead of forgetting every order already placed. Trimmed to the
+    /// window on every write, so it stays bounded by the per-domain cap.
+    #[serde(default)]
+    pub issuance_attempts: Vec<i64>,
     /// This registration's ownership token, which the tenant publishes as TXT
     /// at [`verification_record_name`]. Each registration mints a new one.
     ///
@@ -622,6 +632,7 @@ impl CustomDomain {
             cert_not_after_unix: None,
             consecutive_failures: 0,
             next_attempt_unix: None,
+            issuance_attempts: Vec::new(),
             verification_token: Some(token),
         }
     }
@@ -1791,6 +1802,73 @@ impl CustomDomainRegistry {
             true
         }))
     }
+
+    /// Park a domain until its issuance budget rolls, without charging a failure.
+    ///
+    /// A budget deferral means NO order was placed, so `consecutive_failures`
+    /// stays exactly where it was and no failure backoff engages: the only
+    /// thing written is the next attempt time, taken from the budget's own
+    /// `retry_after_secs`. Charging the deferral instead would climb a domain
+    /// examined while the global budget is full to the maximum backoff and
+    /// keep it unavailable long after the budget reopened (#3102).
+    ///
+    /// Guarded on the registration still holding the hostname, like every
+    /// other failure-path write. Returns whether it applied.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the store's write error.
+    pub async fn defer_for_budget(
+        &self,
+        hostname: &str,
+        tenant: &str,
+        token: Option<&str>,
+        next_attempt_unix: i64,
+    ) -> io::Result<bool> {
+        self.mutate_if(
+            hostname,
+            |d| {
+                d.tenant == tenant
+                    && d.verification_token.as_deref() == token
+                    && Self::is_orderable_state(d.status)
+            },
+            |d| {
+                d.next_attempt_unix = Some(next_attempt_unix);
+            },
+        )
+        .await
+    }
+
+    /// Persist one issuance attempt's timestamp on the record.
+    ///
+    /// The durable half of the issuance budget: [`IssuanceLimiter::record_attempt`]
+    /// counts the order in memory, and this write lets a restart inside the
+    /// window rebuild it via [`IssuanceLimiter::hydrate_from_records`] instead
+    /// of forgetting the order and spending the shared account quota again
+    /// (#3102). Timestamps outside the per-domain window are dropped, keeping
+    /// the vector bounded by the per-domain cap.
+    ///
+    /// A missing hostname is a no-op: between the order's ownership check and
+    /// this write the domain may have been offboarded, and offboarding drops
+    /// the budget history too, so there is nothing to record against.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the store's write error.
+    pub async fn record_issuance_attempt(&self, hostname: &str, now_unix: i64) -> io::Result<()> {
+        self.mutate(hostname, |d| {
+            let cutoff = now_unix.saturating_sub(PER_DOMAIN_WINDOW_SECS);
+            let mut kept: Vec<i64> = d
+                .issuance_attempts
+                .iter()
+                .copied()
+                .filter(|at| *at > cutoff)
+                .collect();
+            kept.push(now_unix);
+            d.issuance_attempts = kept;
+        })
+        .await
+    }
 }
 
 // ── Issuance budget ──────────────────────────────────────────────────────
@@ -1880,6 +1958,21 @@ impl IssuanceDecision {
             Self::GlobalLimit { retry_after_secs } => Some(format!(
                 "deployment-wide issuance budget is spent; retrying in {retry_after_secs}s"
             )),
+        }
+    }
+
+    /// Seconds until the spent budget's window rolls; `None` when allowed.
+    ///
+    /// A refused domain is parked until exactly this long has passed — the
+    /// deferral path schedules its retry from here rather than from the
+    /// failure backoff, which a deferral must not engage (#3102).
+    #[must_use]
+    pub const fn retry_after_secs(&self) -> Option<i64> {
+        match self {
+            Self::Allow => None,
+            Self::PerDomainLimit { retry_after_secs } | Self::GlobalLimit { retry_after_secs } => {
+                Some(*retry_after_secs)
+            }
         }
     }
 }
@@ -2009,6 +2102,40 @@ impl IssuanceLimiter {
     /// re-registration of the same hostname is not charged for the old one.
     pub fn forget(&self, hostname: &str) {
         write_lock(&self.attempts).per_domain.remove(hostname);
+    }
+
+    /// Rebuild the attempt windows from durable records after a restart.
+    ///
+    /// Each record's persisted [`CustomDomain::issuance_attempts`] re-seed its
+    /// per-domain window; the global window is the union of every record's
+    /// attempts. Timestamps outside the windows are dropped. Whatever the
+    /// limiter held is replaced — call once, right after the registry loads,
+    /// before the orchestrator ticks (#3102).
+    ///
+    /// Without this a restart inside the one-hour or one-day window forgets
+    /// every order already placed, so a crash loop or repeated deploys admit
+    /// a fresh batch each time and exhaust the shared ACME account quota for
+    /// all tenants.
+    pub fn hydrate_from_records(&self, records: &[CustomDomain], now_unix: i64) {
+        let mut per_domain = HashMap::new();
+        let mut global = Vec::new();
+        let global_cutoff = now_unix.saturating_sub(GLOBAL_WINDOW_SECS);
+        let domain_cutoff = now_unix.saturating_sub(PER_DOMAIN_WINDOW_SECS);
+        for record in records {
+            let kept: Vec<i64> = record
+                .issuance_attempts
+                .iter()
+                .copied()
+                .filter(|at| *at > domain_cutoff)
+                .collect();
+            global.extend(kept.iter().copied().filter(|at| *at > global_cutoff));
+            if !kept.is_empty() {
+                per_domain.insert(record.hostname.clone(), kept);
+            }
+        }
+        let mut attempts = write_lock(&self.attempts);
+        attempts.per_domain = per_domain;
+        attempts.global = global;
     }
 }
 
@@ -2724,5 +2851,139 @@ mod tests {
         let limiter = IssuanceLimiter::new(10, 10, 300, 3600);
         assert_eq!(limiter.check("a.test", 1000), IssuanceDecision::Allow);
         assert_eq!(limiter.backoff_for(3), 1200);
+    }
+
+    #[test]
+    fn a_refusal_names_its_own_retry_delay() {
+        let limiter = IssuanceLimiter::new(1, 10, 300, 3600);
+        limiter.record_attempt("a.test", 1000);
+        let decision = limiter.check("a.test", 1500);
+        assert_eq!(
+            decision.retry_after_secs(),
+            Some(1000 + PER_DOMAIN_WINDOW_SECS - 1500)
+        );
+        assert_eq!(IssuanceDecision::Allow.retry_after_secs(), None);
+    }
+
+    #[test]
+    fn a_hydrated_limiter_refuses_a_budget_spent_before_the_restart() {
+        // The acceptance case for #3102 item 3: the attempts lived on the
+        // records, the process restarted, and the rebuilt limiter still
+        // refuses until the windows roll.
+        let per_domain = 2;
+        let global = 3;
+        let mut a = CustomDomain::new("a.test".to_string(), "t1".to_string(), 0, "tok".to_string());
+        a.issuance_attempts = vec![1000, 1100];
+        let mut b = CustomDomain::new("b.test".to_string(), "t1".to_string(), 0, "tok".to_string());
+        b.issuance_attempts = vec![1200];
+        let records = vec![a, b];
+
+        let rebuilt = IssuanceLimiter::new(per_domain, global, 300, 3600);
+        rebuilt.hydrate_from_records(&records, 1500);
+        assert!(matches!(
+            rebuilt.check("a.test", 1500),
+            IssuanceDecision::PerDomainLimit { .. }
+        ));
+        // b.test spent 1 of its 2 per-domain but the union hits the global 3.
+        assert!(matches!(
+            rebuilt.check("b.test", 1500),
+            IssuanceDecision::GlobalLimit { .. }
+        ));
+        // Once both windows have rolled, the rebuilt limiter allows again.
+        assert_eq!(
+            rebuilt.check("a.test", 1000 + PER_DOMAIN_WINDOW_SECS + 1),
+            IssuanceDecision::Allow
+        );
+        // Hydration replaces, not merges: a second call drops the old windows.
+        rebuilt.hydrate_from_records(&[], 1500);
+        assert_eq!(rebuilt.check("a.test", 1500), IssuanceDecision::Allow);
+    }
+
+    #[tokio::test]
+    async fn a_budget_deferral_parks_the_domain_without_charging_a_failure() {
+        let registry = CustomDomainRegistry::new(Arc::new(MemoryCustomDomainStore::new()), 10);
+        registry.load().await.unwrap();
+        let domain = registry
+            .register("app.clientco.com", "t1", 100)
+            .await
+            .unwrap();
+        registry
+            .record_verified("app.clientco.com", 100)
+            .await
+            .unwrap();
+
+        assert!(
+            registry
+                .defer_for_budget(
+                    "app.clientco.com",
+                    "t1",
+                    domain.verification_token.as_deref(),
+                    100 + 3600,
+                )
+                .await
+                .unwrap()
+        );
+        let record = registry.get("app.clientco.com").unwrap();
+        assert_eq!(record.next_attempt_unix, Some(3700));
+        assert_eq!(record.consecutive_failures, 0);
+        assert_eq!(record.failure_reason, None);
+        assert!(!record.is_due(3699));
+        assert!(record.is_due(3700));
+    }
+
+    #[tokio::test]
+    async fn a_budget_deferral_is_discarded_when_the_registration_moved_on() {
+        let registry = CustomDomainRegistry::new(Arc::new(MemoryCustomDomainStore::new()), 10);
+        registry.load().await.unwrap();
+        let domain = registry
+            .register("app.clientco.com", "t1", 100)
+            .await
+            .unwrap();
+        assert!(
+            !registry
+                .defer_for_budget(
+                    "app.clientco.com",
+                    "t2",
+                    domain.verification_token.as_deref(),
+                    9999
+                )
+                .await
+                .unwrap()
+        );
+        let record = registry.get("app.clientco.com").unwrap();
+        assert_eq!(record.next_attempt_unix, None);
+    }
+
+    #[tokio::test]
+    async fn recorded_attempts_persist_and_stay_within_the_window() {
+        let registry = CustomDomainRegistry::new(Arc::new(MemoryCustomDomainStore::new()), 10);
+        registry.load().await.unwrap();
+        registry
+            .register("app.clientco.com", "t1", 100)
+            .await
+            .unwrap();
+        registry
+            .record_issuance_attempt("app.clientco.com", 100)
+            .await
+            .unwrap();
+        registry
+            .record_issuance_attempt("app.clientco.com", 200)
+            .await
+            .unwrap();
+        // An attempt older than the window is dropped, not kept forever.
+        registry
+            .record_issuance_attempt("app.clientco.com", 100 + PER_DOMAIN_WINDOW_SECS + 1)
+            .await
+            .unwrap();
+        let record = registry.get("app.clientco.com").unwrap();
+        assert_eq!(
+            record.issuance_attempts,
+            vec![200, 100 + PER_DOMAIN_WINDOW_SECS + 1]
+        );
+        // A missing hostname is a no-op, not an error (offboarded mid-order).
+        registry
+            .record_issuance_attempt("gone.clientco.com", 300)
+            .await
+            .unwrap();
     }
 }
