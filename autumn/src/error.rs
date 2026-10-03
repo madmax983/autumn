@@ -208,6 +208,28 @@ where
             };
         }
 
+        // #2573: a unique-constraint violation is a client state conflict,
+        // not a server bug — a concurrent identical-title write to a
+        // generated JSON API (or any other `?`-propagated insert/update) is
+        // `409 Conflict`, not an unhandled `500`. Handled by returning for
+        // the same reason as the NUL arm above: the `409` response renders
+        // the message verbatim, so the raw database message (which names the
+        // violated constraint) is re-wrapped behind
+        // [`UNIQUE_VIOLATION_REJECTED_MESSAGE`] while the original stays
+        // reachable as `source()`.
+        #[cfg(feature = "db")]
+        if error_chain_is_unique_violation(&err) {
+            return Self {
+                inner: Box::new(UniqueViolationConflict(err)),
+                status: StatusCode::CONFLICT,
+                details: None,
+                problem_type: None,
+                cache_idempotency_response: false,
+                #[cfg(debug_assertions)]
+                backtrace_string: Some(format!("{}", std::backtrace::Backtrace::force_capture())),
+            };
+        }
+
         let mut status = StatusCode::INTERNAL_SERVER_ERROR;
         let any_err: &dyn std::any::Any = &err;
 
@@ -949,16 +971,20 @@ impl AutumnError {
 ///
 /// Returns `None` for any other error, or for an unrecognized constraint
 /// name — both cases the caller should propagate normally (`?`/[`From`]),
-/// which falls through to the blanket `500` mapping. This is the single
-/// shared place this classification happens; generated `create`/`update`
-/// handlers call it instead of hand-rolling a `DatabaseErrorKind` match
-/// per scaffold.
+/// which falls through to the blanket `409` mapping (#2573). This is the
+/// single shared place this classification happens; generated
+/// `create`/`update` handlers call it instead of hand-rolling a
+/// `DatabaseErrorKind` match per scaffold.
 ///
 /// Works whether `err` wraps a raw `diesel::result::Error` directly (a bare
 /// `.execute(...).await?`) or one already converted by a generated
 /// repository method (`repo.save(...).await?`) — both route the original
-/// diesel error through the `?` operator's blanket [`From`] impl, so
-/// [`AutumnError::downcast_ref`] recovers it either way.
+/// diesel error through the `?` operator's blanket [`From`] impl. The match
+/// walks the full `source()` chain ([`AutumnError::downcast_chain_ref`])
+/// rather than the top level only, because the blanket [`From`] impl now
+/// classifies a unique violation as `409 Conflict` by wrapping the diesel
+/// error in a message-neutral classifier (#2573): a top-level-only downcast
+/// would stop seeing the diesel error the moment it was classified.
 ///
 /// # Examples
 ///
@@ -991,7 +1017,7 @@ pub fn unique_violation_field<'a>(
     let diesel::result::Error::DatabaseError(
         diesel::result::DatabaseErrorKind::UniqueViolation,
         info,
-    ) = err.downcast_ref::<diesel::result::Error>()?
+    ) = err.downcast_chain_ref::<diesel::result::Error>()?
     else {
         return None;
     };
@@ -1093,6 +1119,101 @@ impl<E: std::error::Error + 'static> std::error::Error for NulByteRejected<E> {
 #[must_use]
 pub fn is_nul_byte_violation(err: &AutumnError) -> bool {
     error_chain_is_pg_nul_rejection(err.inner.as_ref())
+}
+
+// ── #2573: a unique-constraint violation is `409 Conflict` ────────────────
+
+/// The client-facing message substituted for a unique-constraint violation.
+///
+/// The raw database message names the violated constraint (and, on some
+/// backends, the conflicting values). A `409` response renders `detail`
+/// verbatim — unlike the redacted `500` page — so the classified message
+/// stands in for it, exactly as [`NUL_BYTE_REJECTED_MESSAGE`] does for the
+/// NUL-byte rejection (#2423). The original error stays reachable as
+/// `source()`, so logs, error reporting, [`unique_violation_field`], and
+/// [`AutumnError::downcast_chain_ref`] still reach the underlying diesel
+/// error.
+pub const UNIQUE_VIOLATION_REJECTED_MESSAGE: &str = "A record with these values already exists.";
+
+/// Wrapper that gives a classified unique violation
+/// [`UNIQUE_VIOLATION_REJECTED_MESSAGE`] as its `Display` while keeping the
+/// original error as its `source()`, so logs, error reporting and
+/// [`AutumnError::downcast_chain_ref`] still reach the underlying diesel
+/// error.
+#[cfg(feature = "db")]
+#[derive(Debug)]
+pub(crate) struct UniqueViolationConflict<E>(E);
+
+#[cfg(feature = "db")]
+impl<E> std::fmt::Display for UniqueViolationConflict<E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(UNIQUE_VIOLATION_REJECTED_MESSAGE)
+    }
+}
+
+#[cfg(feature = "db")]
+impl<E: std::error::Error + 'static> std::error::Error for UniqueViolationConflict<E> {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
+
+/// Whether `err`, or anything in its `source()` chain, is a database
+/// unique-constraint violation (issue #2573) — a client state conflict
+/// rather than a server bug.
+///
+/// The blanket [`From`] impl already downgrades such an error to
+/// `409 Conflict`; this predicate is for handlers that want to inspect one
+/// themselves — e.g. to retry with a fresh candidate value the way the
+/// reddit-clone's `is_post_slug_conflict` does — the way
+/// [`unique_violation_field`] maps one to a field error.
+///
+/// Walks the whole `source()` chain — the same walk the [`From`] impl makes,
+/// through the one shared helper, so the two can never disagree about
+/// whether a given error is this one. The chain walk also matters because
+/// the classified `409` wraps the original diesel error in
+/// [`UniqueViolationConflict`]: a top-level-only downcast would stop seeing
+/// the diesel error the moment the blanket [`From`] impl classified it.
+///
+/// # Examples
+///
+/// ```rust
+/// use autumn_web::error::{AutumnError, is_unique_violation};
+///
+/// let err = AutumnError::internal_server_error_msg("not a db error");
+/// assert!(!is_unique_violation(&err));
+/// ```
+#[cfg(feature = "db")]
+#[must_use]
+pub fn is_unique_violation(err: &AutumnError) -> bool {
+    error_chain_is_unique_violation(err.inner.as_ref())
+}
+
+/// Whether `err`, or anything in its `source()` chain, is a diesel
+/// `DatabaseError` with [`diesel::result::DatabaseErrorKind::UniqueViolation`].
+///
+/// The single definition of "a unique constraint fired", shared by
+/// [`is_unique_violation`] and the blanket [`From`] impl. The chain walk
+/// matters because a repository or service may wrap the diesel error in its
+/// own type, and because the [`From`] impl itself wraps the diesel error in
+/// [`UniqueViolationConflict`] when it classifies the `409` — the walk
+/// continues past that wrapper to the diesel error underneath.
+#[cfg(feature = "db")]
+pub(crate) fn error_chain_is_unique_violation(err: &(dyn std::error::Error + 'static)) -> bool {
+    let mut current = Some(err);
+    while let Some(cause) = current {
+        if matches!(
+            cause.downcast_ref::<diesel::result::Error>(),
+            Some(diesel::result::Error::DatabaseError(
+                diesel::result::DatabaseErrorKind::UniqueViolation,
+                _
+            ))
+        ) {
+            return true;
+        }
+        current = cause.source();
+    }
+    false
 }
 
 /// Whether `err`, or anything in its `source()` chain, is Postgres refusing an
@@ -2083,6 +2204,86 @@ mod tests {
                 unique_violation_field(&err, MAPPING),
                 Some(("email", "has already been taken"))
             );
+        }
+
+        // ── #2573: a unique violation is `409 Conflict`, not `500` ────────
+        //
+        // A concurrent identical-title write to a generated JSON API used to
+        // surface as an unhandled 500; the blanket `From` impl now classifies
+        // the diesel unique violation as a client state conflict.
+
+        #[test]
+        fn blanket_from_maps_a_unique_violation_to_409() {
+            let err: AutumnError = unique_violation(Some("idx_users_email_unique")).into();
+            assert_eq!(err.status(), StatusCode::CONFLICT);
+        }
+
+        #[test]
+        fn classified_409_carries_the_neutral_client_message() {
+            // The raw database message names the violated constraint, and a
+            // 409 response renders `detail` verbatim — so the classified
+            // error stands behind the neutral message, mirroring the #2423
+            // NUL-byte precedent.
+            let err: AutumnError = unique_violation(Some("idx_users_email_unique")).into();
+            assert_eq!(err.message(), UNIQUE_VIOLATION_REJECTED_MESSAGE);
+            assert!(
+                !err.message().contains("idx_users_email_unique"),
+                "the constraint name must not reach the client; got: {}",
+                err.message()
+            );
+        }
+
+        #[test]
+        fn classified_409_keeps_the_diesel_error_reachable() {
+            let err: AutumnError = unique_violation(Some("idx_users_email_unique")).into();
+            assert!(
+                err.downcast_chain_ref::<diesel::result::Error>()
+                    .is_some_and(|diesel_err| matches!(
+                        diesel_err,
+                        diesel::result::Error::DatabaseError(
+                            diesel::result::DatabaseErrorKind::UniqueViolation,
+                            _
+                        )
+                    )),
+                "logs and error reporting must still reach the diesel error"
+            );
+            assert!(is_unique_violation(&err));
+        }
+
+        #[test]
+        fn blanket_from_maps_a_wrapped_unique_violation_to_409() {
+            // A repository or service may wrap the diesel error in its own
+            // type: the classification walks the `source()` chain, the same
+            // walk the `From` impl and `is_unique_violation` share.
+            #[derive(Debug)]
+            struct Outer(Box<dyn std::error::Error + Send + Sync>);
+            impl std::fmt::Display for Outer {
+                fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                    write!(f, "outer: {}", self.0)
+                }
+            }
+            impl std::error::Error for Outer {
+                fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                    Some(self.0.as_ref())
+                }
+            }
+            let wrapped = Outer(Box::new(unique_violation(Some("idx_users_email_unique"))));
+            let err: AutumnError = wrapped.into();
+            assert_eq!(err.status(), StatusCode::CONFLICT);
+            assert!(is_unique_violation(&err));
+        }
+
+        #[test]
+        fn blanket_from_leaves_non_unique_diesel_errors_at_500() {
+            let err: AutumnError = diesel::result::Error::NotFound.into();
+            assert_eq!(err.status(), StatusCode::INTERNAL_SERVER_ERROR);
+            assert!(!is_unique_violation(&err));
+        }
+
+        #[test]
+        fn is_unique_violation_rejects_non_db_errors() {
+            let err = AutumnError::internal_server_error_msg("plain string error");
+            assert!(!is_unique_violation(&err));
         }
     }
 

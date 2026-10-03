@@ -1699,9 +1699,16 @@ const MAX_SLUG_CONFLICT_RETRIES: u32 = 20;
 /// [`POSTS_SLUG_UNIQUE_CONSTRAINT`] specifically — the signal that another
 /// request just won the slug `unique_slug`/`unique_slug_excluding` proposed,
 /// as opposed to some unrelated database error that must propagate as-is.
+///
+/// Walks the full `source()` chain (`downcast_chain_ref`): since #2573 the
+/// blanket `From` impl classifies a unique violation as `409 Conflict` by
+/// wrapping the diesel error in a message-neutral classifier, so a
+/// top-level-only downcast would stop seeing the diesel error the moment the
+/// `?` in the `db.tx` closure above classified it — and the retry loop
+/// would never fire.
 fn is_post_slug_conflict(err: &AutumnError) -> bool {
     matches!(
-        err.downcast_ref::<diesel::result::Error>(),
+        err.downcast_chain_ref::<diesel::result::Error>(),
         Some(diesel::result::Error::DatabaseError(
             diesel::result::DatabaseErrorKind::UniqueViolation,
             info,
@@ -2377,6 +2384,31 @@ mod tests {
         assert!(is_post_slug_conflict(&unique_violation(Some(
             POSTS_SLUG_UNIQUE_CONSTRAINT
         ))));
+    }
+
+    #[test]
+    fn still_recognizes_the_slug_conflict_after_the_409_classification() {
+        // Since #2573 the `?` in the `db.tx` closure classifies the diesel
+        // unique violation as `409 Conflict` — wrapping it in a
+        // message-neutral classifier — before `is_post_slug_conflict` ever
+        // sees it. The retry loop must still fire: a top-level-only
+        // downcast would go blind here and the concurrent write would
+        // surface as a bare 409 instead of retrying with the next slug.
+        fn insert() -> Result<(), diesel::result::Error> {
+            Err(diesel::result::Error::DatabaseError(
+                diesel::result::DatabaseErrorKind::UniqueViolation,
+                Box::new(FakeDbErrorInfo {
+                    constraint: Some(POSTS_SLUG_UNIQUE_CONSTRAINT),
+                }),
+            ))
+        }
+        fn handler() -> Result<(), AutumnError> {
+            insert()?;
+            Ok(())
+        }
+        let err = handler().unwrap_err();
+        assert_eq!(err.status(), http::StatusCode::CONFLICT);
+        assert!(is_post_slug_conflict(&err));
     }
 
     #[test]
