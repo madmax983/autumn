@@ -1691,6 +1691,46 @@ mod tests {
     }
 
     #[test]
+    fn generated_build_rs_skips_relative_cargo_target_dir() {
+        // Issue #3108: a relative CARGO_TARGET_DIR is resolved by Cargo
+        // against the workspace root, but the build script runs with the
+        // member directory as CWD — pushing the raw env var as a candidate
+        // would resolve against the wrong base, and a stale member-local
+        // `target/autumn/tailwindcss` left by a standalone build would then
+        // be tried FIRST, shadowing the real `autumn setup` install. The
+        // template must only offer an absolute CARGO_TARGET_DIR; the OUT_DIR
+        // ancestors below are always absolute and stay unconditional.
+        let tmp = TempDir::new().unwrap();
+        generate("target-dir-check", tmp.path()).unwrap();
+
+        let content = fs::read_to_string(tmp.path().join("target-dir-check/build.rs")).unwrap();
+        let start = content
+            .find("fn candidate_target_dirs")
+            .expect("candidate_target_dirs in generated build.rs");
+        let rest = &content[start..];
+        let end = rest
+            .find("\nfn ")
+            .map(|i| start + i)
+            .unwrap_or(content.len());
+        let body = &content[start..end];
+
+        let guard = body.find("is_absolute()").expect("absolute guard");
+        let push = body
+            .find("candidates.push")
+            .expect("CARGO_TARGET_DIR candidate push");
+        assert!(
+            guard < push,
+            "the is_absolute() guard must gate the CARGO_TARGET_DIR push"
+        );
+        // No other CARGO_TARGET_DIR push may exist outside the guard.
+        assert_eq!(
+            body.matches("candidates.push").count(),
+            1,
+            "exactly one candidate push for CARGO_TARGET_DIR"
+        );
+    }
+
+    #[test]
     fn generated_build_rs_bakes_build_and_git_provenance() {
         // AC #4 of issue #1242: apps created by `autumn new` capture build + git
         // provenance with zero developer action — the generated build.rs emits

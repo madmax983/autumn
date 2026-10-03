@@ -335,11 +335,14 @@ fn tailwind_bin_name() -> &'static str {
 ///
 /// - `CARGO_TARGET_DIR`, when the *user* set it as an env var (not via
 ///   `.cargo/config.toml`), is inherited directly into this process's
-///   environment and matches `cargo metadata` exactly, triple or not — EXCEPT
-///   when it is a *relative* path and the generated crate is a workspace
-///   member: Cargo then still resolves it against the workspace root, but
-///   runs this build script with the member directory as CWD, so re-joining
-///   the raw env var here would resolve against the wrong base. It is tried
+///   environment and matches `cargo metadata` exactly, triple or not — but
+///   ONLY when it is an absolute path. A *relative* value is skipped
+///   outright: Cargo resolves it against the workspace root, but this build
+///   script runs with the member directory as CWD, so re-joining the raw
+///   env var would resolve against the wrong base — and a stale
+///   member-local `target/autumn/tailwindcss` left behind by a standalone
+///   (non-workspace) build of that one member would then be tried FIRST,
+///   shadowing the real `autumn setup` install. An absolute value is tried
 ///   first because it is the more direct answer when it applies, but it is
 ///   never the ONLY candidate for exactly that reason.
 /// - `OUT_DIR` is always absolute and already resolved by Cargo itself
@@ -352,7 +355,16 @@ fn candidate_target_dirs() -> Vec<std::path::PathBuf> {
     let mut candidates = Vec::new();
 
     if let Ok(dir) = std::env::var("CARGO_TARGET_DIR") {
-        candidates.push(std::path::PathBuf::from(dir));
+        let dir = std::path::PathBuf::from(dir);
+        // Skip a relative CARGO_TARGET_DIR (issue #3108): Cargo resolves it
+        // against the workspace root, but this script's CWD is the member
+        // directory — re-joining it here would resolve against the wrong
+        // base, and a stale member-local `target/autumn/tailwindcss` would
+        // win over the real install. The OUT_DIR ancestors below are always
+        // absolute and already resolved by Cargo itself.
+        if dir.is_absolute() {
+            candidates.push(dir);
+        }
     }
 
     if let Ok(out_dir) = std::env::var("OUT_DIR") {
