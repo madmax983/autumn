@@ -139,6 +139,29 @@ pub fn validate_room_segment(segment: &str) -> Result<(), RoomError> {
     }
 }
 
+/// Enforce [`MAX_DISPLAY_NAME_CHARS`] on a join's `display_name` before the
+/// store admits it.
+///
+/// The count is over Unicode scalar values (not bytes): a length byte-bound
+/// would let a 64-character multibyte name pass at a multiple of the intended
+/// memory cost. An absent name is fine.
+///
+/// # Errors
+///
+/// Returns [`RoomError::DisplayNameTooLong`] when the name exceeds the bound.
+pub fn validate_display_name(display_name: Option<&str>) -> Result<(), RoomError> {
+    if let Some(name) = display_name {
+        let chars = name.chars().count();
+        if chars > MAX_DISPLAY_NAME_CHARS {
+            return Err(RoomError::DisplayNameTooLong {
+                max: MAX_DISPLAY_NAME_CHARS,
+                got: chars,
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Compose the `MediaMTX` path for a room participant, validating every
 /// caller-influenced segment first.
 ///
@@ -257,6 +280,19 @@ pub enum RoomError {
         cap: usize,
     },
 
+    /// A join's `display_name` exceeded [`MAX_DISPLAY_NAME_CHARS`] characters.
+    /// The name is stored with the room and cloned into every roster snapshot,
+    /// so an unbounded name is a memory-amplification vector (see issue
+    /// #3104); refused at the join boundary with a `400`. Neither the name
+    /// nor its length is a secret, so both appear in the message.
+    #[error("display_name is too long ({got} characters; max {max})")]
+    DisplayNameTooLong {
+        /// The accepted maximum, in characters.
+        max: usize,
+        /// The rejected name's length, in characters.
+        got: usize,
+    },
+
     /// The in-memory room registry is at its capacity backstop of [`MAX_ROOMS`]
     /// rooms, so no new room can be created right now. A transient overload
     /// condition, not a client error — mapped to a `503`. The message names no
@@ -299,9 +335,9 @@ impl RoomError {
                 AutumnError::service_unavailable_msg(self.to_string())
             }
             Self::Unauthorized => AutumnError::unauthorized_msg(self.to_string()),
-            Self::InvalidSegment { .. } | Self::InvalidMaxParticipants { .. } => {
-                AutumnError::bad_request_msg(self.to_string())
-            }
+            Self::InvalidSegment { .. }
+            | Self::InvalidMaxParticipants { .. }
+            | Self::DisplayNameTooLong { .. } => AutumnError::bad_request_msg(self.to_string()),
         }
     }
 }
@@ -600,6 +636,14 @@ pub trait RoomStore: Send + Sync {
 /// in-memory registries), **not** a substitute for host rate limiting — see the
 /// module-level *Security & host responsibilities* note.
 pub const MAX_ROOMS: usize = 10_000;
+
+/// Maximum `display_name` length accepted on a room join, in Unicode scalar
+/// values. A joined name is stored with the room (until leave or the idle
+/// reaper) and cloned into every roster snapshot, so an unbounded name is a
+/// memory-amplification vector — the six-seat cap bounds seats, not bytes, and
+/// the registry cap bounds room count, not bytes. Joins whose name exceeds
+/// this bound are refused with a `400` (see [`validate_display_name`]).
+pub const MAX_DISPLAY_NAME_CHARS: usize = 64;
 
 /// A single-process, in-memory [`RoomStore`].
 ///
@@ -1093,12 +1137,15 @@ impl RoomService {
     /// # Errors
     ///
     /// Propagates any [`RoomError`] from the store, or
-    /// [`RoomError::InvalidSegment`] if a path cannot be composed.
+    /// [`RoomError::InvalidSegment`] if a path cannot be composed, or
+    /// [`RoomError::DisplayNameTooLong`] if the join's display name exceeds
+    /// [`MAX_DISPLAY_NAME_CHARS`] characters.
     pub async fn join(
         &self,
         room_id: &str,
         display_name: Option<String>,
     ) -> Result<JoinResponse, RoomError> {
+        validate_display_name(display_name.as_deref())?;
         let record = self
             .store
             .join_room(&self.namespace, room_id, display_name, self.token_ttl)
@@ -1223,7 +1270,9 @@ impl RoomService {
 /// Body of a room-join request.
 #[derive(Debug, serde::Deserialize)]
 pub struct JoinRequest {
-    /// Optional display name for the joining participant.
+    /// Optional display name for the joining participant. Limited to
+    /// [`MAX_DISPLAY_NAME_CHARS`] characters; longer names are refused with
+    /// a `400`.
     #[serde(default)]
     pub display_name: Option<String>,
 }
@@ -1460,10 +1509,11 @@ fn room_route(method: &str, path: String, handler: &str) -> RouteInfo {
 #[cfg(test)]
 mod tests {
     use super::{
-        HeartbeatRequest, InMemoryRoomStore, LeaveRequest, MAX_REAPER_TTL_SECONDS, ReapStats, Room,
-        RoomError, RoomParticipant, RoomService, RoomStore, SessionToken, bearer_token,
-        clamp_reaper_ttl, room_participant_path, room_route_infos, room_router, room_service,
-        rooms_heartbeat, rooms_roster, validate_room_segment,
+        HeartbeatRequest, InMemoryRoomStore, LeaveRequest, MAX_DISPLAY_NAME_CHARS,
+        MAX_REAPER_TTL_SECONDS, ReapStats, Room, RoomError, RoomParticipant, RoomService,
+        RoomStore, SessionToken, bearer_token, clamp_reaper_ttl, room_participant_path,
+        room_route_infos, room_router, room_service, rooms_heartbeat, rooms_roster,
+        validate_display_name, validate_room_segment,
     };
     use crate::config::MediaMtxConfig;
     use crate::transport::MediaUrls;
@@ -1585,6 +1635,16 @@ mod tests {
                 .into_autumn()
                 .status(),
             StatusCode::SERVICE_UNAVAILABLE
+        );
+        // An overlong display name is a client error → 400.
+        assert_eq!(
+            RoomError::DisplayNameTooLong {
+                max: MAX_DISPLAY_NAME_CHARS,
+                got: MAX_DISPLAY_NAME_CHARS + 1,
+            }
+            .into_autumn()
+            .status(),
+            StatusCode::BAD_REQUEST
         );
     }
 
@@ -1747,6 +1807,107 @@ mod tests {
             service.join(&room.id, None).await,
             Err(RoomError::RoomFull { max: 6 })
         ));
+    }
+
+    // ── Display-name bound (issue #3104) ─────────────────────────────────────
+
+    #[test]
+    fn display_name_guard_counts_characters_not_bytes() {
+        // An absent name is fine.
+        assert!(validate_display_name(None).is_ok());
+        // Exactly the bound passes.
+        let at_bound = "x".repeat(MAX_DISPLAY_NAME_CHARS);
+        assert_eq!(at_bound.chars().count(), MAX_DISPLAY_NAME_CHARS);
+        assert!(validate_display_name(Some(&at_bound)).is_ok());
+        // One character over is refused, naming the bound and the length.
+        let over = "x".repeat(MAX_DISPLAY_NAME_CHARS + 1);
+        assert!(matches!(
+            validate_display_name(Some(&over)),
+            Err(RoomError::DisplayNameTooLong {
+                max: MAX_DISPLAY_NAME_CHARS,
+                got
+            }) if got == MAX_DISPLAY_NAME_CHARS + 1
+        ));
+        // Multibyte names are measured in characters, not bytes: 64 two-byte
+        // characters pass even though they are 128 bytes on the wire.
+        let multibyte = "é".repeat(MAX_DISPLAY_NAME_CHARS);
+        assert!(validate_display_name(Some(&multibyte)).is_ok());
+        assert!(validate_display_name(Some(&format!("{multibyte}x"))).is_err());
+    }
+
+    #[tokio::test]
+    async fn join_rejects_an_overlong_display_name() {
+        let service = RoomService::new(
+            Arc::new(InMemoryRoomStore::new(6)),
+            urls(),
+            "",
+            Duration::seconds(300),
+            6,
+        );
+        let room = service.create().await.unwrap();
+        // The name is refused before the store admits it, so the seat is
+        // still free afterwards.
+        assert!(matches!(
+            service
+                .join(&room.id, Some("x".repeat(MAX_DISPLAY_NAME_CHARS + 1)))
+                .await,
+            Err(RoomError::DisplayNameTooLong { .. })
+        ));
+        let response = service
+            .join(&room.id, Some("x".repeat(MAX_DISPLAY_NAME_CHARS)))
+            .await
+            .expect("a name at the bound joins");
+        assert_eq!(
+            response.room.participants[0].display_name.as_deref(),
+            Some("x".repeat(MAX_DISPLAY_NAME_CHARS).as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn join_handler_returns_400_for_an_overlong_display_name() {
+        let store = MemoryStore::new();
+        store
+            .save(
+                "member-session",
+                HashMap::from([("user_id".to_owned(), "member-1".to_owned())]),
+            )
+            .await
+            .expect("save authenticated session");
+
+        let state = AppState::for_test();
+        let service = service("tenant-a");
+        let room_id = service.create().await.expect("create room").id;
+        state.insert_extension(service);
+        let app = room_router()
+            .layer(SessionLayer::new(store, SessionConfig::default()))
+            .with_state(state);
+
+        let overlong = "x".repeat(MAX_DISPLAY_NAME_CHARS + 1);
+        let refused = app
+            .clone()
+            .oneshot(
+                Request::post(format!("/rooms/{room_id}/join"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, "autumn.sid=member-session")
+                    .body(Body::from(format!(r#"{{"display_name":"{overlong}"}}"#)))
+                    .expect("join request"),
+            )
+            .await
+            .expect("join response");
+        assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+
+        let at_bound = "x".repeat(MAX_DISPLAY_NAME_CHARS);
+        let accepted = app
+            .oneshot(
+                Request::post(format!("/rooms/{room_id}/join"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::COOKIE, "autumn.sid=member-session")
+                    .body(Body::from(format!(r#"{{"display_name":"{at_bound}"}}"#)))
+                    .expect("join request"),
+            )
+            .await
+            .expect("join response");
+        assert_eq!(accepted.status(), StatusCode::OK);
     }
 
     // ── Fail-closed namespace isolation ──────────────────────────────────────

@@ -250,10 +250,13 @@ Room state lives behind the `RoomStore` trait, selected by
   so the app still boots.
 
 Both backends enforce the absolute 6-seat mesh ceiling and cap the registry, and
-a background reaper (`spawn_room_reaper_loop`) reclaims stale participants and
-idle rooms by `last_seen_at` / `created_at`. The `DbRoomStore` reaper is a
-last-write-wins sweep, so concurrent reapers across processes converge with no
-corruption.
+every join's `display_name` is bounded to 64 characters (`MAX_DISPLAY_NAME_CHARS`)
+before the store admits it — an unbounded name stored with the room and cloned
+into every roster snapshot is a memory-amplification vector. Over-limit joins
+are refused with a `400` (`RoomError::DisplayNameTooLong`). A background reaper
+(`spawn_room_reaper_loop`) reclaims stale participants and idle rooms by
+`last_seen_at` / `created_at`. The `DbRoomStore` reaper is a last-write-wins
+sweep, so concurrent reapers across processes converge with no corruption.
 
 Two client signals refresh `last_seen_at`: an explicit heartbeat, and — as a
 side effect — a member-gated roster poll. Do either on any interval well under
