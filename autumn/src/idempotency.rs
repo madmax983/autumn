@@ -1313,6 +1313,33 @@ struct DeferredIdempotencyState {
     body_hash: Vec<u8>,
     ttl: Duration,
     lock_guard: InFlightLockGuard,
+    /// The in-flight TTL configured on the [`IdempotencyLayer`], so the
+    /// session-alias reservation below uses the same expiry as the primary
+    /// lock.
+    in_flight_ttl: Duration,
+    /// In-flight lock for the session-alias storage key, reserved by
+    /// [`DeferredIdempotencyCommit::reserve_session_alias_lock`] *before* the
+    /// session layer persists the mutated session. `None` when the alias
+    /// collapses onto the primary key (the primary lock already covers it) or
+    /// when no session alias was reserved.
+    alias_lock_guard: Option<InFlightLockGuard>,
+}
+
+impl DeferredIdempotencyState {
+    /// The storage key a retry presenting `session_id` will compute — the
+    /// same key [`DeferredIdempotencyCommit::add_session_alias`] registers —
+    /// or `None` when the retry would land on the primary key, in which case
+    /// the primary in-flight lock already covers it and no alias lock is
+    /// needed.
+    fn session_alias_key(&self, session_id: &str, tenant_override: Option<&str>) -> Option<String> {
+        // Mirrors `add_session_alias`'s tenant filter: only honor the override
+        // when the request itself resolved a tenant.
+        let tenant_override = tenant_override.filter(|_| self.key_context.tenant.is_some());
+        let storage_key = self
+            .key_context
+            .storage_key(Some(session_id), tenant_override);
+        (storage_key != self.storage_key).then_some(storage_key)
+    }
 }
 
 impl DeferredIdempotencyCommit {
@@ -1351,6 +1378,9 @@ impl DeferredIdempotencyCommit {
                 "Deferred idempotency persistence failed after finalized session response; failing closed"
             );
             state.lock_guard.keep_locked_until_ttl();
+            if let Some(alias_guard) = state.alias_lock_guard.as_mut() {
+                alias_guard.keep_locked_until_ttl();
+            }
             return Err(error);
         }
         let alias_record = finalized_session_record(state.record, FINALIZED_SESSION_CURRENT_SCOPE);
@@ -1367,10 +1397,16 @@ impl DeferredIdempotencyCommit {
                     "Deferred idempotency persistence failed after finalized session response; failing closed"
                 );
                 state.lock_guard.keep_locked_until_ttl();
+                if let Some(alias_guard) = state.alias_lock_guard.as_mut() {
+                    alias_guard.keep_locked_until_ttl();
+                }
                 return Err(error);
             }
         }
         state.lock_guard.unlock_now();
+        if let Some(alias_guard) = state.alias_lock_guard.as_mut() {
+            alias_guard.unlock_now();
+        }
         Ok(())
     }
 
@@ -1418,6 +1454,73 @@ impl DeferredIdempotencyCommit {
             return;
         };
         state.lock_guard.keep_locked_until_ttl();
+        if let Some(alias_guard) = state.alias_lock_guard.as_mut() {
+            alias_guard.keep_locked_until_ttl();
+        }
+    }
+
+    /// Reserve the in-flight lock for the session-alias storage key.
+    ///
+    /// The session layer calls this *before* persisting the mutated session:
+    /// the instant `save` lands, a concurrent request presenting the same
+    /// (unrotated) session id resolves the finalized tenant and computes this
+    /// alias key. Without a lock held on it, that request would find neither
+    /// a cached record nor an in-flight marker and re-run the handler while
+    /// this commit is still writing.
+    ///
+    /// Returns `true` when no distinct alias needs protection (the retry lands
+    /// on the primary key, which the primary lock already covers) or the
+    /// alias lock was acquired. Returns `false` when the alias key is already
+    /// locked — the caller must fail closed rather than clobber another
+    /// request's in-flight lock.
+    fn reserve_session_alias_lock(&self, session_id: &str, tenant_override: Option<&str>) -> bool {
+        // Compute the key under the mutex, then release it before touching the
+        // store: `try_lock_owned` can block on a backend, and the guard must
+        // not be held across it.
+        let reservation = {
+            let mut guard = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+            let Some(state) = guard.as_mut() else {
+                // The commit was already finalized or taken: nothing left to protect.
+                return true;
+            };
+            if state.alias_lock_guard.is_some() {
+                return true;
+            }
+            let Some(alias_key) = state.session_alias_key(session_id, tenant_override) else {
+                return true;
+            };
+            let reservation = (
+                alias_key,
+                state.lock_guard.owner.clone(),
+                state.store.clone(),
+                state.in_flight_ttl,
+                state.idempotency_key.clone(),
+            );
+            drop(guard);
+            reservation
+        };
+        let (alias_key, owner, store, in_flight_ttl, idempotency_key) = reservation;
+        if !store.try_lock_owned(&alias_key, &owner, in_flight_ttl) {
+            tracing::warn!(
+                idempotency.key = %idempotency_key,
+                "Session alias key already in flight; failing closed rather than \
+                 clobbering another request's lock"
+            );
+            return false;
+        }
+        {
+            let mut guard = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+            match guard.as_mut() {
+                Some(state) if state.alias_lock_guard.is_none() => {
+                    state.alias_lock_guard = Some(InFlightLockGuard::new(store, alias_key, owner));
+                }
+                // The commit was finalized between the two locks, or a second
+                // reservation installed its own guard first: release the spare
+                // lock rather than leaving it to the TTL.
+                _ => store.unlock_owned(&alias_key, &owner),
+            }
+        }
+        true
     }
 }
 
@@ -1467,6 +1570,21 @@ pub(crate) fn keep_deferred_session_commit_locked(response: &mut Response<Body>)
     {
         commit.keep_locked_until_ttl();
     }
+}
+
+/// Reserve the deferred commit's session-alias in-flight lock before the
+/// session layer persists the mutated session (see
+/// [`DeferredIdempotencyCommit::reserve_session_alias_lock`]). A no-op
+/// returning `true` when the response carries no deferred commit.
+pub(crate) fn reserve_deferred_session_alias_lock(
+    response: &Response<Body>,
+    session_id: &str,
+    tenant_override: Option<&str>,
+) -> bool {
+    response
+        .extensions()
+        .get::<DeferredIdempotencyCommit>()
+        .is_none_or(|commit| commit.reserve_session_alias_lock(session_id, tenant_override))
 }
 
 fn request_idempotency_key(req: &Request<Body>) -> Option<String> {
@@ -1688,13 +1806,23 @@ where
         }
     }
 
-    handle_cache_miss(inner, store, ttl, prepared, metrics.as_ref(), lock_guard).await
+    handle_cache_miss(
+        inner,
+        store,
+        ttl,
+        in_flight_ttl,
+        prepared,
+        metrics.as_ref(),
+        lock_guard,
+    )
+    .await
 }
 
 async fn handle_cache_miss<S>(
     mut inner: S,
     store: Arc<dyn IdempotencyStore>,
     ttl: Duration,
+    in_flight_ttl: Duration,
     prepared: PreparedIdempotencyRequest,
     metrics: Option<&crate::middleware::MetricsCollector>,
     mut lock_guard: InFlightLockGuard,
@@ -1790,6 +1918,8 @@ where
                     body_hash,
                     ttl,
                     lock_guard,
+                    in_flight_ttl,
+                    alias_lock_guard: None,
                 },
             ));
             if let Some(m) = metrics {

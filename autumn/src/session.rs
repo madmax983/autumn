@@ -981,6 +981,23 @@ where
                 let finalized_tenant = tenancy_session_key
                     .as_deref()
                     .and_then(|key| data.get(key).cloned());
+                // Reserve the alias's in-flight lock *before* the session
+                // save below makes the finalized tenant visible: from `save`
+                // on, a concurrent request presenting this same (unrotated)
+                // session id resolves the new tenant and computes the same
+                // alias key — without a lock held on it, it would find no
+                // record, no lock, and re-run the handler while this request's
+                // commit is still writing. Fail closed (503, primary lock
+                // retained) rather than clobbering another request's lock.
+                if !crate::idempotency::reserve_deferred_session_alias_lock(
+                    &response,
+                    &sid,
+                    finalized_tenant.as_deref(),
+                ) {
+                    drop(inner_guard);
+                    crate::idempotency::keep_deferred_session_commit_locked(&mut response);
+                    return Ok(crate::idempotency::persistence_failed_response());
+                }
                 if let Some(ref old_id) = inner_guard.old_id
                     && let Err(error) = store.destroy(old_id).await
                 {
