@@ -1480,6 +1480,18 @@ jobs:
             /usr/share/swift
           sudo docker image prune --all --force || true
           df -h
+      - name: Pre-pull testcontainer images
+        if: runner.os == 'Linux'
+        # #3112: the prune above wipes the runner's image cache, and nothing
+        # used to re-seed it — every one of the 100+ `Postgres::default()`
+        # (`postgres:11-alpine`) call sites then pulled the same image in
+        # parallel at the same moment, and one parallel pull could die
+        # mid-stream ("bytes remaining on stream"), failing a random unrelated
+        # test before its body ran. Serial pre-pull with retries moves the
+        # flake into this step, which retries and fails loudly with the image
+        # named. Must stay AFTER the prune above and BEFORE "Run
+        # Docker-dependent tests".
+        run: scripts/ci-prepull-images.sh postgres:11-alpine postgres:16-alpine
       - uses: dtolnay/rust-toolchain@1.99.0
       - uses: Swatinem/rust-cache@v2.7.8
         continue-on-error: true
@@ -2095,6 +2107,15 @@ jobs:
           cargo llvm-cov --no-report -p autumn-admin-plugin --features autumn-web/sqlite \
             --test custom_admin_model -- --ignored
           cargo llvm-cov report --lcov --output-path lcov.info
+      - name: Pre-pull testcontainer images (db-ignored)
+        if: matrix.lane == 'db-ignored'
+        # #3112: same pre-pull as the `Test (Docker)` job — the prune in "Free
+        # disk space" wipes the image cache, and this lane's `--ignored` legs
+        # spin testcontainers too, so without it the same mid-stream parallel
+        # pull flake ("bytes remaining on stream") can fail a random test here.
+        # Deliberately only for the db-ignored lane: the other lanes never
+        # start a container.
+        run: scripts/ci-prepull-images.sh postgres:11-alpine postgres:16-alpine
       - name: Generate coverage (Docker/testcontainer --ignored legs)
         if: matrix.lane == 'db-ignored'
         run: |

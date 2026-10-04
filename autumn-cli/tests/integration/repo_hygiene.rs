@@ -9459,3 +9459,97 @@ fn capacity_contract_scheduled_probe_uses_declared_defaults() {
         }
     }
 }
+
+// ── testcontainer image pre-pull (issue #3112) ─────────────────────────────
+
+/// The Postgres images every CI job/lane that spins testcontainers must
+/// pre-pull. `11-alpine` is the testcontainers-modules default
+/// (`Postgres::default()`, 100+ call sites); `16-alpine` is what tests pin
+/// explicitly (`.with_tag("16-alpine")`, e.g. the bulk-delete batch-profile
+/// suites, `db_scrub.rs`, `schema_pull.rs`).
+const TESTCONTAINER_POSTGRES_IMAGES: &[&str] = &["postgres:11-alpine", "postgres:16-alpine"];
+
+/// The body of one top-level CI job: everything after the `  <job>:` header
+/// line up to (not including) the next two-space-indented line.
+fn ci_job_body<'a>(ci_yml: &'a str, job: &str) -> &'a str {
+    let marker = format!("\n  {job}:");
+    let start = ci_yml
+        .find(&marker)
+        .unwrap_or_else(|| panic!("ci.yml must contain a `{job}` job; see #3112"))
+        + marker.len();
+    let rest = &ci_yml[start..];
+    let mut end = 0;
+    for line in rest.lines() {
+        let bytes = line.as_bytes();
+        if bytes.len() > 2 && bytes[0] == b' ' && bytes[1] == b' ' && bytes[2] != b' ' {
+            break;
+        }
+        end += line.len() + 1; // +1 for the newline `lines()` strips
+    }
+    &rest[..end.min(rest.len())]
+}
+
+#[test]
+fn container_test_jobs_pre_pull_their_images() {
+    let root = workspace_root();
+    let ci_path = root.join(".github/workflows/ci.yml");
+    let ci_yml = std::fs::read_to_string(&ci_path)
+        .unwrap_or_else(|err| panic!("failed to read {}: {err}", ci_path.display()));
+
+    // Collapse every whitespace run so line-wrapping in the `run:` block
+    // cannot dodge the match; the invocation is matched whole, so deleting
+    // the step while the script name stays mentioned in prose still fails.
+    let invocation = ci_yml.split_whitespace().collect::<Vec<_>>().join(" ");
+    let expected_invocation = format!(
+        "scripts/ci-prepull-images.sh {}",
+        TESTCONTAINER_POSTGRES_IMAGES.join(" ")
+    );
+
+    // Both container-spinning CI paths must pre-pull: the `Test (Docker)`
+    // job and the `db-ignored` coverage lane. Without either, the #3112
+    // mid-stream parallel-pull flake returns for that lane.
+    for job in ["test-docker", "coverage"] {
+        let body = ci_job_body(&ci_yml, job);
+        let body_invocation = body.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            body_invocation.contains(&expected_invocation),
+            "ci.yml's `{job}` job must run `{expected_invocation}`; without it, \
+             every testcontainer spins its own parallel pull of the same image \
+             on a cache-pruned runner and one can die mid-stream (\"bytes \
+             remaining on stream\"), failing a random unrelated test; see #3112",
+        );
+    }
+
+    // Placement: the pre-pull must run AFTER the image-cache prune in the
+    // same job — pulling before the prune just re-seeds a cache the prune
+    // then wipes.
+    let docker_job = ci_job_body(&ci_yml, "test-docker");
+    let prune_pos = docker_job
+        .find("docker image prune")
+        .expect("test-docker must still prune the image cache; see #3112");
+    let prepull_pos = docker_job
+        .find("scripts/ci-prepull-images.sh")
+        .expect("test-docker must run the pre-pull script; see #3112");
+    assert!(
+        prune_pos < prepull_pos,
+        "test-docker must pre-pull the testcontainer images AFTER the \
+         `docker image prune` step, not before; see #3112",
+    );
+
+    // The script itself must exist and be executable.
+    let script = root.join("scripts/ci-prepull-images.sh");
+    let metadata = std::fs::metadata(&script)
+        .unwrap_or_else(|err| panic!("failed to stat {}: {err}", script.display()));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert!(
+            metadata.permissions().mode() & 0o111 != 0,
+            "scripts/ci-prepull-images.sh must be executable",
+        );
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+    }
+}
