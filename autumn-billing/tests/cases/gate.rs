@@ -45,6 +45,15 @@ async fn sso(_e: Entitled<Sso>) -> &'static str {
     "sso ok"
 }
 
+#[get("/sso-plan")]
+async fn sso_plan(e: Entitled<Sso>) -> String {
+    e.view
+        .plan
+        .as_ref()
+        .map(|plan| plan.id.to_string())
+        .unwrap_or_default()
+}
+
 #[get("/any")]
 async fn any_plan(_e: Entitled<AnyPlan>) -> &'static str {
     "any ok"
@@ -61,7 +70,7 @@ const fn hours(n: i64) -> chrono::Duration {
 
 fn gate_routes(app: TestApp) -> TestApp {
     app.with_clock(FixedClock::at(now()))
-        .routes(routes![pro, sso, any_plan])
+        .routes(routes![pro, sso, sso_plan, any_plan])
 }
 
 fn build() -> Harness {
@@ -540,4 +549,130 @@ async fn billing_extractor_is_503_without_the_plugin() {
         .send()
         .await
         .assert_status(503);
+}
+
+/// The gate looks past the newest row: a rule satisfied only by an older
+/// entitled subscription is allowed (#3114).
+#[tokio::test]
+async fn older_subscription_satisfies_a_rule_the_newer_one_does_not() {
+    let h = build();
+    let customer = seed_customer(&h.store, "7").await;
+    // Newest row: active pro — entitled, but grants no `sso`.
+    h.store
+        .upsert_subscription(sub(
+            &customer,
+            "newer",
+            Some(PRO_PRICE),
+            SubscriptionStatus::Active,
+            Some(now() + hours(24 * 30)),
+            now(),
+        ))
+        .await
+        .unwrap();
+    // Older row: active team — grants `sso`.
+    h.store
+        .upsert_subscription(sub(
+            &customer,
+            "older",
+            Some(TEAM_PRICE),
+            SubscriptionStatus::Active,
+            Some(now() + hours(24 * 30)),
+            now() - hours(48),
+        ))
+        .await
+        .unwrap();
+    h.client.acting_as("7").await;
+    h.client.get("/sso").send().await.assert_status(200);
+    // The newest row still satisfies the rules it matches.
+    h.client.get("/pro").send().await.assert_status(200);
+}
+
+/// `require` returns the satisfying subscription, not the newest row (#3114).
+#[tokio::test]
+async fn require_returns_the_satisfying_subscription_not_the_newest() {
+    let h = build();
+    let customer = seed_customer(&h.store, "7").await;
+    h.store
+        .upsert_subscription(sub(
+            &customer,
+            "newer",
+            Some(PRO_PRICE),
+            SubscriptionStatus::Active,
+            Some(now() + hours(24 * 30)),
+            now(),
+        ))
+        .await
+        .unwrap();
+    h.store
+        .upsert_subscription(sub(
+            &customer,
+            "older",
+            Some(TEAM_PRICE),
+            SubscriptionStatus::Active,
+            Some(now() + hours(24 * 30)),
+            now() - hours(48),
+        ))
+        .await
+        .unwrap();
+    h.client.acting_as("7").await;
+    let resp = h.client.get("/sso-plan").send().await;
+    resp.assert_status(200);
+    assert_eq!(resp.text(), "team");
+}
+
+/// A canceled row never grants access, even when the gate scans every view;
+/// and a rule no live row satisfies is still denied (#3114).
+#[tokio::test]
+async fn a_canceled_row_never_grants_access() {
+    let h = build();
+    let customer = seed_customer(&h.store, "7").await;
+    // Newest row: canceled team — would grant `sso` if it were live.
+    h.store
+        .upsert_subscription(sub(
+            &customer,
+            "canceled",
+            Some(TEAM_PRICE),
+            SubscriptionStatus::Canceled,
+            Some(now() + hours(24 * 30)),
+            now(),
+        ))
+        .await
+        .unwrap();
+    // Older row: active pro — entitled, but grants no `sso`.
+    h.store
+        .upsert_subscription(sub(
+            &customer,
+            "active",
+            Some(PRO_PRICE),
+            SubscriptionStatus::Active,
+            Some(now() + hours(24 * 30)),
+            now() - hours(48),
+        ))
+        .await
+        .unwrap();
+    h.client.acting_as("7").await;
+    h.client.get("/sso").send().await.assert_status(403);
+    // The live pro row still satisfies what it satisfies.
+    h.client.get("/any").send().await.assert_status(200);
+}
+
+/// An `incomplete` row never grants access (#3114).
+#[tokio::test]
+async fn an_incomplete_row_never_grants_access() {
+    let h = build();
+    let customer = seed_customer(&h.store, "7").await;
+    h.store
+        .upsert_subscription(sub(
+            &customer,
+            "abandoned",
+            Some(TEAM_PRICE),
+            SubscriptionStatus::Incomplete,
+            Some(now() + hours(24 * 30)),
+            now(),
+        ))
+        .await
+        .unwrap();
+    h.client.acting_as("7").await;
+    h.client.get("/sso").send().await.assert_status(403);
+    h.client.get("/any").send().await.assert_status(403);
 }

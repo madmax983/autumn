@@ -29,6 +29,7 @@ use std::sync::Arc;
 use autumn_web::session::Session;
 use autumn_web::{AppState, AutumnError};
 use axum_core_reexport::FromRequestParts;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::BillingService;
@@ -180,6 +181,12 @@ impl Billing {
     /// newest event within that group. An abandoned `incomplete` checkout
     /// never hides an active subscription.
     ///
+    /// This is a *presentation* pick ("which one do I show"). The plan gate
+    /// ([`is_entitled`](Self::is_entitled)/[`require`](Self::require))
+    /// evaluates the rule against *every* subscription view instead — a
+    /// newer subscription on the wrong plan must not deny a rule an older
+    /// one satisfies.
+    ///
     /// `user_id` is looked up against `Customer.user_id` verbatim — under
     /// Autumn's tenancy feature that is the tenant-scoped identity
     /// [`current_user`](Self::current_user)/[`session_user_id`] returns, not
@@ -189,7 +196,8 @@ impl Billing {
     /// build it explicitly with [`crate::gate::scope_identity`] if it isn't
     /// already at hand — or this always misses and denies entitlement for an
     /// otherwise-paying tenant user. [`is_entitled`](Self::is_entitled) and
-    /// [`require`](Self::require) share this contract; both call this method.
+    /// [`require`](Self::require) share this contract; they evaluate every
+    /// view rather than only this pick.
     ///
     /// # Errors
     ///
@@ -198,36 +206,53 @@ impl Billing {
         &self,
         user_id: &str,
     ) -> Result<Option<SubscriptionView>, BillingError> {
-        let store = self.service.store();
-        let Some(customer) = store.customer_by_user(user_id).await? else {
-            return Ok(None);
-        };
-        let rows = store.subscriptions_for_customer(&customer.id).await?;
-        Ok(rows
+        Ok(self
+            .subscription_views(user_id)
+            .await?
             .into_iter()
-            .map(|row| self.view(row))
-            .max_by_key(|view| {
-                (
-                    view.entitled,
-                    view.subscription.status.is_live(),
-                    view.subscription.last_event_at,
-                )
-            }))
+            .max_by_key(display_rank))
     }
 
-    /// `true` when `user_id` satisfies `rule`. Default deny.
+    /// Every subscription view for `user_id` from the mirror, joined with the
+    /// catalog and the entitlement evaluation. The presentation pick and the
+    /// plan gate both start here.
+    ///
+    /// # Errors
+    ///
+    /// Returns the store error.
+    async fn subscription_views(
+        &self,
+        user_id: &str,
+    ) -> Result<Vec<SubscriptionView>, BillingError> {
+        let store = self.service.store();
+        let Some(customer) = store.customer_by_user(user_id).await? else {
+            return Ok(Vec::new());
+        };
+        let rows = store.subscriptions_for_customer(&customer.id).await?;
+        Ok(rows.into_iter().map(|row| self.view(row)).collect())
+    }
+
+    /// `true` when any of `user_id`'s subscription views satisfies `rule`.
+    /// Default deny: a customer whose newest subscription is on the wrong
+    /// plan is still entitled when an older one satisfies the rule.
     ///
     /// # Errors
     ///
     /// Returns the store error.
     pub async fn is_entitled(&self, user_id: &str, rule: &PlanRule) -> Result<bool, BillingError> {
         Ok(self
-            .current_subscription(user_id)
+            .subscription_views(user_id)
             .await?
-            .is_some_and(|view| view.satisfies(rule)))
+            .iter()
+            .any(|view| view.satisfies(rule)))
     }
 
-    /// The entitled subscription, or [`BillingError::Forbidden`].
+    /// The entitled subscription that satisfies `rule`, or
+    /// [`BillingError::Forbidden`].
+    ///
+    /// Returns the best-ranked view among the ones satisfying the rule (the
+    /// same ranking [`current_subscription`](Self::current_subscription)
+    /// uses for display), not necessarily the newest row.
     ///
     /// # Errors
     ///
@@ -237,10 +262,12 @@ impl Billing {
         user_id: &str,
         rule: &PlanRule,
     ) -> Result<SubscriptionView, BillingError> {
-        match self.current_subscription(user_id).await? {
-            Some(view) if view.satisfies(rule) => Ok(view),
-            _ => Err(BillingError::Forbidden(rule.describe())),
-        }
+        self.subscription_views(user_id)
+            .await?
+            .into_iter()
+            .filter(|view| view.satisfies(rule))
+            .max_by_key(display_rank)
+            .ok_or_else(|| BillingError::Forbidden(rule.describe()))
     }
 
     /// Join the plan and evaluate entitlement.
@@ -281,6 +308,17 @@ fn resolve_plan<'a>(catalog: &'a PlanCatalog, subscription: &Subscription) -> Op
         .as_ref()
         .and_then(|price| catalog.by_price_id(price))
         .or_else(|| subscription.plan_id.as_ref().and_then(|id| catalog.get(id)))
+}
+
+/// Presentation ranking for a subscription view: entitled first, then live,
+/// then the newest event. A single definition so the plan gate and the
+/// display helper order the same rows identically.
+const fn display_rank(view: &SubscriptionView) -> (bool, bool, DateTime<Utc>) {
+    (
+        view.entitled,
+        view.subscription.status.is_live(),
+        view.subscription.last_event_at,
+    )
 }
 
 impl FromRequestParts<AppState> for Billing {
