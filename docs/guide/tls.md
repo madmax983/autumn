@@ -744,6 +744,13 @@ ingress_ipv4     = ["203.0.113.10"]      # A records, for tenant APEX domains
 # resolvers = ["1.1.1.1:53", "8.8.8.8:53"]  # read ownership TXT records
 ```
 
+The two issuance budgets — per-domain per day and deployment-wide per hour —
+protect your ACME account quota. Both survive a restart: each order is stamped
+on its domain's record, and when a domain is offboarded its recent attempts move
+to a deployment-wide ledger, so an issue/offboard cycle around a deploy or a
+crash cannot spend the same hour's budget twice. Ledger entries age out with the
+hourly window.
+
 `ingress_hostname` is what tenants CNAME at. An **apex** domain
 (`clientco.com`) cannot carry a CNAME, so it needs `ingress_ipv4` /
 `ingress_ipv6` instead; set both kinds if you accept both.

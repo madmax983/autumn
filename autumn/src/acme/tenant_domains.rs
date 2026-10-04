@@ -573,7 +573,11 @@ impl CustomDomainTask {
         // Warm the cache before the first tick so a restart serves stored
         // certificates on the first handshake instead of after an order.
         self.warm_all().await;
-        self.hydrate_limiter(crate::custom_domain::now_unix());
+        if let Err(e) = self.hydrate_limiter(crate::custom_domain::now_unix()).await {
+            tracing::warn!(
+                "issuance ledger unreadable; the deployment-wide budget starts under-counted for this boot: {e}"
+            );
+        }
         loop {
             // The tick is inside the `select!`: a pass over a thousand domains
             // is long, and shutdown must not wait for it.
@@ -1086,10 +1090,16 @@ impl CustomDomainTask {
     }
 
     /// Seed the issuance budget from the attempts persisted on each domain
-    /// record, so a restart does not hand the shared ACME account a fresh
+    /// record and from the deployment-wide ledger of offboarded domains'
+    /// attempts, so a restart does not hand the shared ACME account a fresh
     /// quota. Called once before the first pass of [`Self::run`]; safe to call
     /// again.
-    pub fn hydrate_limiter(&self, now_unix: i64) {
+    ///
+    /// # Errors
+    ///
+    /// Propagates the store's ledger read error. The per-record attempts are
+    /// hydrated first, so retrying after a ledger failure is idempotent.
+    pub async fn hydrate_limiter(&self, now_unix: i64) -> std::io::Result<()> {
         self.limiter.hydrate(
             self.registry.list().into_iter().flat_map(|d| {
                 let hostname = d.hostname;
@@ -1099,6 +1109,9 @@ impl CustomDomainTask {
             }),
             now_unix,
         );
+        let ledger = self.registry.load_global_attempts().await?;
+        self.limiter.hydrate_global(ledger, now_unix);
+        Ok(())
     }
 
     /// Is there issuance budget for `hostname`? A refusal defers the domain

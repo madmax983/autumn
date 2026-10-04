@@ -678,6 +678,30 @@ pub trait CustomDomainStore: Send + Sync + std::fmt::Debug {
     fn save<'a>(&'a self, domain: &'a CustomDomain) -> StoreFuture<'a, io::Result<()>>;
     /// Delete one record. Deleting an absent record succeeds.
     fn delete<'a>(&'a self, hostname: &'a str) -> StoreFuture<'a, io::Result<()>>;
+    /// Append `(hostname, attempt_unix)` pairs to the deployment-wide issuance
+    /// ledger: orders placed for domains whose records are being deleted
+    /// (offboarded). The ledger is what keeps those orders counting against
+    /// the shared ACME account's hourly budget across a restart, after the
+    /// records that carried them are gone.
+    ///
+    /// Entries older than the global issuance window at `now_unix` are pruned.
+    /// The default implementation stores nothing, so hand-written stores keep
+    /// compiling; their deployments simply do not get the restart-durable
+    /// global budget for offboarded domains.
+    fn record_global_attempts<'a>(
+        &'a self,
+        attempts: &'a [(String, i64)],
+        now_unix: i64,
+    ) -> StoreFuture<'a, io::Result<()>> {
+        let _ = (attempts, now_unix);
+        Box::pin(async move { Ok(()) })
+    }
+    /// Every `(hostname, attempt_unix)` pair in the deployment-wide issuance
+    /// ledger. Called once at boot to seed the limiter's global window; the
+    /// default implementation reports an empty ledger.
+    fn load_global_attempts(&self) -> StoreFuture<'_, io::Result<Vec<(String, i64)>>> {
+        Box::pin(async move { Ok(Vec::new()) })
+    }
 }
 
 /// In-memory [`CustomDomainStore`], for tests and for a deployment that
@@ -685,6 +709,9 @@ pub trait CustomDomainStore: Send + Sync + std::fmt::Debug {
 #[derive(Debug, Default)]
 pub struct MemoryCustomDomainStore {
     records: RwLock<HashMap<String, CustomDomain>>,
+    /// The deployment-wide issuance ledger: `(hostname, attempt_unix)` pairs
+    /// for orders placed for domains whose records have since been deleted.
+    global_attempts: RwLock<Vec<(String, i64)>>,
 }
 
 impl MemoryCustomDomainStore {
@@ -720,6 +747,25 @@ impl CustomDomainStore for MemoryCustomDomainStore {
             Ok(())
         })
     }
+
+    fn record_global_attempts<'a>(
+        &'a self,
+        attempts: &'a [(String, i64)],
+        now_unix: i64,
+    ) -> StoreFuture<'a, io::Result<()>> {
+        Box::pin(async move {
+            let cutoff = now_unix.saturating_sub(GLOBAL_WINDOW_SECS);
+            let mut ledger = write_lock(&self.global_attempts);
+            ledger.extend(attempts.iter().cloned());
+            ledger.retain(|(_, at)| *at > cutoff);
+            drop(ledger);
+            Ok(())
+        })
+    }
+
+    fn load_global_attempts(&self) -> StoreFuture<'_, io::Result<Vec<(String, i64)>>> {
+        Box::pin(async move { Ok(read_lock(&self.global_attempts).clone()) })
+    }
 }
 
 /// Filesystem [`CustomDomainStore`]: one `0600` JSON file per domain under a
@@ -746,6 +792,16 @@ impl FsCustomDomainStore {
     /// legal in DNS but awkward on a filesystem cannot escape `dir`.
     fn path_for(&self, hostname: &str) -> PathBuf {
         self.dir.join(format!("{}.json", file_stem(hostname)))
+    }
+
+    /// The file holding the deployment-wide issuance ledger: `(hostname,
+    /// attempt_unix)` pairs for orders placed for domains whose records have
+    /// since been deleted.
+    ///
+    /// Extensionless on purpose: [`load_all`](CustomDomainStore::load_all)
+    /// only reads `*.json`, so the ledger never parses as a domain record.
+    fn ledger_path(&self) -> PathBuf {
+        self.dir.join("issuance-ledger")
     }
 }
 
@@ -811,6 +867,67 @@ impl CustomDomainStore for FsCustomDomainStore {
                 Ok(()) => Ok(()),
                 Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
                 Err(e) => Err(e),
+            }
+        })
+    }
+
+    fn record_global_attempts<'a>(
+        &'a self,
+        attempts: &'a [(String, i64)],
+        now_unix: i64,
+    ) -> StoreFuture<'a, io::Result<()>> {
+        let dir = self.dir.clone();
+        let path = self.ledger_path();
+        let attempts = attempts.to_vec();
+        Box::pin(async move {
+            let mut ledger: Vec<(String, i64)> = match tokio::fs::read(&path).await {
+                Ok(bytes) => match serde_json::from_slice(&bytes) {
+                    Ok(ledger) => ledger,
+                    Err(e) => {
+                        tracing::warn!(
+                            path = %path.display(),
+                            "issuance ledger unreadable, starting fresh: {e}"
+                        );
+                        Vec::new()
+                    }
+                },
+                Err(e) if e.kind() == io::ErrorKind::NotFound => Vec::new(),
+                Err(e) => return Err(e),
+            };
+            ledger.extend(attempts);
+            let cutoff = now_unix.saturating_sub(GLOBAL_WINDOW_SECS);
+            ledger.retain(|(_, at)| *at > cutoff);
+            let bytes = serde_json::to_vec(&ledger)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            crate::fs_atomic::blocking(move || {
+                crate::fs_atomic::ensure_owner_only_dir(&dir)?;
+                crate::fs_atomic::write_owner_only(&path, &bytes)
+            })
+            .await
+        })
+    }
+
+    fn load_global_attempts(&self) -> StoreFuture<'_, io::Result<Vec<(String, i64)>>> {
+        let path = self.ledger_path();
+        Box::pin(async move {
+            let bytes = match tokio::fs::read(&path).await {
+                Ok(bytes) => bytes,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+                Err(e) => return Err(e),
+            };
+            match serde_json::from_slice::<Vec<(String, i64)>>(&bytes) {
+                Ok(ledger) => Ok(ledger),
+                // A corrupt ledger must not stop the other domains from being
+                // served; it is logged and treated as empty, and the next
+                // offboard rewrites it. The per-record attempts still hydrate
+                // the budget.
+                Err(e) => {
+                    tracing::warn!(
+                        path = %path.display(),
+                        "skipping unreadable issuance ledger: {e}"
+                    );
+                    Ok(Vec::new())
+                }
             }
         })
     }
@@ -1298,6 +1415,19 @@ impl CustomDomainRegistry {
         all
     }
 
+    /// The deployment-wide issuance ledger: `(hostname, attempt_unix)` pairs
+    /// for orders placed for domains whose records have since been deleted.
+    /// Feeds the limiter's global window at boot, so an offboarded domain's
+    /// orders keep counting against the shared ACME account until their window
+    /// rolls.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the store's read error.
+    pub async fn load_global_attempts(&self) -> io::Result<Vec<(String, i64)>> {
+        self.store.load_global_attempts().await
+    }
+
     /// How many domains are registered.
     #[must_use]
     pub fn len(&self) -> usize {
@@ -1746,6 +1876,13 @@ impl CustomDomainRegistry {
     /// # Errors
     ///
     /// Propagates the store's delete error.
+    ///
+    /// A removed record's recent issuance attempts are appended to the store's
+    /// deployment-wide ledger first: the shared ACME account's hourly budget
+    /// outlives any one registration, and without the ledger a restart after
+    /// an offboard would hand that budget back. A ledger write that fails is
+    /// logged, not fatal — the record is already gone, so failing the
+    /// offboarding would be worse than an under-counted budget.
     pub async fn remove_if(
         &self,
         hostname: &str,
@@ -1767,7 +1904,30 @@ impl CustomDomainRegistry {
             return Ok(false);
         }
         self.store.delete(&host).await?;
-        Ok(write_lock(&self.index).remove(&host).is_some())
+        let removed = write_lock(&self.index).remove(&host);
+        if let Some(record) = &removed {
+            // The deployment-wide budget outlives the record: an order placed
+            // for this hostname still counts against the shared ACME account
+            // until its window rolls, even across a restart. Persist its recent
+            // attempts to the store's global ledger before the record is gone.
+            let attempts: Vec<(String, i64)> = record
+                .issuance_attempts_unix
+                .iter()
+                .map(|at| (host.clone(), *at))
+                .collect();
+            if !attempts.is_empty()
+                && let Err(e) = self
+                    .store
+                    .record_global_attempts(&attempts, now_unix())
+                    .await
+            {
+                tracing::warn!(
+                    hostname = %host,
+                    "issuance ledger write failed; the deployment-wide budget may be under-counted after a restart: {e}"
+                );
+            }
+        }
+        Ok(removed.is_some())
     }
 
     /// Offboard every domain a tenant owns. Returns how many were removed.
@@ -2003,7 +2163,12 @@ struct Attempts {
     /// Attempt timestamps per domain, within the per-domain window.
     per_domain: HashMap<String, Vec<i64>>,
     /// Attempt timestamps across all domains, within the global window.
-    global: Vec<i64>,
+    ///
+    /// Carries the hostname alongside each instant so hydration can tell an
+    /// offboarded domain's ledger entry apart from a surviving domain's
+    /// record: two orders placed in the same second are two attempts, and
+    /// collapsing them would hand budget back on the next restart.
+    global: Vec<(String, i64)>,
 }
 
 impl IssuanceLimiter {
@@ -2065,7 +2230,8 @@ impl IssuanceLimiter {
                 .get(hostname)
                 .map(|hits| within(hits, now_unix, PER_DOMAIN_WINDOW_SECS))
                 .unwrap_or_default();
-            let global_hits = within(&attempts.global, now_unix, GLOBAL_WINDOW_SECS);
+            let instants: Vec<i64> = attempts.global.iter().map(|(_, at)| *at).collect();
+            let global_hits = within(&instants, now_unix, GLOBAL_WINDOW_SECS);
             drop(attempts);
             (domain_hits, global_hits)
         };
@@ -2085,9 +2251,14 @@ impl IssuanceLimiter {
     /// Record that an order was placed for `hostname`.
     pub fn record_attempt(&self, hostname: &str, now_unix: i64) {
         let mut attempts = write_lock(&self.attempts);
-        let global = within(&attempts.global, now_unix, GLOBAL_WINDOW_SECS);
+        let global: Vec<(String, i64)> = attempts
+            .global
+            .iter()
+            .filter(|(_, at)| *at > now_unix.saturating_sub(GLOBAL_WINDOW_SECS))
+            .cloned()
+            .collect();
         attempts.global = global;
-        attempts.global.push(now_unix);
+        attempts.global.push((hostname.to_owned(), now_unix));
         let hits = attempts.per_domain.entry(hostname.to_owned()).or_default();
         let mut kept = within(hits, now_unix, PER_DOMAIN_WINDOW_SECS);
         kept.push(now_unix);
@@ -2115,11 +2286,47 @@ impl IssuanceLimiter {
         }
         let mut state = write_lock(&self.attempts);
         for ((hostname, at), want) in persisted {
-            let hits = state.per_domain.entry(hostname).or_default();
+            let hits = state.per_domain.entry(hostname.clone()).or_default();
             let have = hits.iter().filter(|known| **known == at).count();
             let missing = want.saturating_sub(have);
             hits.extend(std::iter::repeat_n(at, missing));
-            state.global.extend(std::iter::repeat_n(at, missing));
+            state
+                .global
+                .extend(std::iter::repeat_n((hostname, at), missing));
+        }
+        drop(state);
+    }
+
+    /// Seed the global window from the deployment-wide issuance ledger: orders
+    /// placed for domains whose records have since been deleted (offboarded).
+    ///
+    /// Each `(hostname, at)` is one order already placed. The hostname is
+    /// provenance only — it keeps a ledger entry from collapsing into a
+    /// surviving domain's record when both ordered in the same second, and it
+    /// never seeds the per-domain window, so a re-registered hostname is not
+    /// charged for its predecessor's orders. Entries outside the global window
+    /// at `now_unix` are ignored. Like [`hydrate`](Self::hydrate), raising each
+    /// `(hostname, at)` count to the persisted one and never past it, so
+    /// calling this twice is harmless.
+    pub fn hydrate_global(&self, attempts: impl IntoIterator<Item = (String, i64)>, now_unix: i64) {
+        let oldest = now_unix.saturating_sub(GLOBAL_WINDOW_SECS);
+        let mut persisted: HashMap<(String, i64), usize> = HashMap::new();
+        for (hostname, at) in attempts {
+            if at > oldest {
+                *persisted.entry((hostname, at)).or_default() += 1;
+            }
+        }
+        let mut state = write_lock(&self.attempts);
+        for ((hostname, at), want) in persisted {
+            let have = state
+                .global
+                .iter()
+                .filter(|(known_host, known_at)| *known_host == hostname && *known_at == at)
+                .count();
+            let missing = want.saturating_sub(have);
+            state
+                .global
+                .extend(std::iter::repeat_n((hostname, at), missing));
         }
         drop(state);
     }
@@ -2892,5 +3099,176 @@ mod tests {
         let limiter = IssuanceLimiter::new(10, 10, 300, 3600);
         assert_eq!(limiter.check("a.test", 1000), IssuanceDecision::Allow);
         assert_eq!(limiter.backoff_for(3), 1200);
+    }
+
+    #[test]
+    fn hydrate_global_counts_ledger_attempts_without_seeding_per_domain() {
+        let limiter = IssuanceLimiter::new(1, 2, 300, 3600);
+        let now = 5000;
+        // One surviving domain with one order inside the hour.
+        limiter.hydrate([("a.test".to_owned(), 4800)], now);
+        // One offboarded domain's order, from the ledger.
+        limiter.hydrate_global([("gone.test".to_owned(), 4900)], now);
+        // Two orders inside the hour: the global budget of 2 is spent.
+        assert!(matches!(
+            limiter.check("c.test", now),
+            IssuanceDecision::GlobalLimit { .. }
+        ));
+        // But the ledger never seeds a per-domain window: re-registering the
+        // offboarded hostname starts clean instead of inheriting a refusal.
+        assert!(matches!(
+            limiter.check("gone.test", now),
+            IssuanceDecision::GlobalLimit { .. }
+        ));
+        // And the surviving domain's own per-domain budget is untouched.
+        assert!(matches!(
+            limiter.check("a.test", now),
+            IssuanceDecision::PerDomainLimit { .. }
+        ));
+    }
+
+    #[test]
+    fn hydrate_global_keeps_same_second_attempts_distinct_by_hostname() {
+        // A crash loop places orders in the same Unix second; the ledger must
+        // not collapse an offboarded domain's attempt into a surviving
+        // domain's record from the same second.
+        let limiter = IssuanceLimiter::new(10, 3, 300, 3600);
+        let now = 5000;
+        limiter.hydrate(
+            [("a.test".to_owned(), 4900), ("b.test".to_owned(), 4900)],
+            now,
+        );
+        limiter.hydrate_global([("gone.test".to_owned(), 4900)], now);
+        assert!(matches!(
+            limiter.check("c.test", now),
+            IssuanceDecision::GlobalLimit { .. }
+        ));
+    }
+
+    #[test]
+    fn hydrate_global_is_idempotent() {
+        let limiter = IssuanceLimiter::new(10, 2, 300, 3600);
+        let now = 5000;
+        let ledger = vec![
+            ("gone.test".to_owned(), 4900),
+            ("gone.test".to_owned(), 4900),
+        ];
+        limiter.hydrate_global(ledger.clone(), now);
+        limiter.hydrate_global(ledger, now);
+        assert!(matches!(
+            limiter.check("c.test", now),
+            IssuanceDecision::GlobalLimit { .. }
+        ));
+        // Exactly two, not four: with a budget of 3 the hour is still open.
+        let roomier = IssuanceLimiter::new(10, 3, 300, 3600);
+        roomier.hydrate_global(
+            [
+                ("gone.test".to_owned(), 4900),
+                ("gone.test".to_owned(), 4900),
+            ],
+            now,
+        );
+        roomier.hydrate_global([("gone.test".to_owned(), 4900)], now);
+        assert_eq!(roomier.check("c.test", now), IssuanceDecision::Allow);
+    }
+
+    #[test]
+    fn hydrate_global_ignores_attempts_outside_the_global_window() {
+        let limiter = IssuanceLimiter::new(10, 1, 300, 3600);
+        let now = 5000;
+        limiter.hydrate_global([("gone.test".to_owned(), now - GLOBAL_WINDOW_SECS)], now);
+        assert_eq!(limiter.check("c.test", now), IssuanceDecision::Allow);
+        limiter.hydrate_global(
+            [("gone.test".to_owned(), now - GLOBAL_WINDOW_SECS + 1)],
+            now,
+        );
+        assert!(matches!(
+            limiter.check("c.test", now),
+            IssuanceDecision::GlobalLimit { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn memory_store_prunes_the_global_ledger_past_the_window() {
+        let store = MemoryCustomDomainStore::new();
+        let now = 1_000_000;
+        store
+            .record_global_attempts(
+                &[
+                    ("stale.test".to_owned(), now - GLOBAL_WINDOW_SECS),
+                    ("fresh.test".to_owned(), now),
+                ],
+                now,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store.load_global_attempts().await.unwrap(),
+            vec![("fresh.test".to_owned(), now)]
+        );
+    }
+
+    #[tokio::test]
+    async fn fs_store_round_trips_the_global_ledger_and_hides_it_from_load_all() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FsCustomDomainStore::new(dir.path());
+        let domain = CustomDomain::new(
+            "app.clientco.com".to_owned(),
+            "t1".to_owned(),
+            100,
+            "token".to_owned(),
+        );
+        store.save(&domain).await.unwrap();
+        let now = 1_000_000;
+        store
+            .record_global_attempts(
+                &[
+                    ("stale.test".to_owned(), now - GLOBAL_WINDOW_SECS),
+                    ("gone.test".to_owned(), now - 10),
+                ],
+                now,
+            )
+            .await
+            .unwrap();
+
+        // A fresh store over the same directory: the restart case.
+        let reopened = FsCustomDomainStore::new(dir.path());
+        assert_eq!(
+            reopened.load_global_attempts().await.unwrap(),
+            vec![("gone.test".to_owned(), now - 10)]
+        );
+        // The ledger file is extensionless, so load_all never parses it as a
+        // domain record.
+        assert_eq!(reopened.load_all().await.unwrap(), vec![domain]);
+    }
+
+    #[tokio::test]
+    async fn remove_if_moves_recent_attempts_to_the_global_ledger() {
+        let backing = Arc::new(MemoryCustomDomainStore::new());
+        let registry =
+            CustomDomainRegistry::new(Arc::clone(&backing) as Arc<dyn CustomDomainStore>, 100);
+        registry.load().await.unwrap();
+        let now = now_unix();
+        let mut domain = CustomDomain::new(
+            "gone.test".to_owned(),
+            "t1".to_owned(),
+            now,
+            "token".to_owned(),
+        );
+        domain.issuance_attempts_unix = vec![now - 10, now - 20];
+        backing.save(&domain).await.unwrap();
+        registry.load().await.unwrap();
+
+        assert!(registry.remove("gone.test").await.unwrap());
+        assert!(registry.get("gone.test").is_none());
+        let mut ledger = backing.load_global_attempts().await.unwrap();
+        ledger.sort_unstable();
+        assert_eq!(
+            ledger,
+            vec![
+                ("gone.test".to_owned(), now - 20),
+                ("gone.test".to_owned(), now - 10),
+            ]
+        );
     }
 }

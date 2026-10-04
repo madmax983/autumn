@@ -622,7 +622,7 @@ async fn the_issuance_budget_survives_a_restart() {
         Arc::clone(&issuer) as Arc<dyn DomainIssuer>,
     );
     after.limiter = Arc::new(IssuanceLimiter::new(5, 1, 300, 86_400));
-    after.hydrate_limiter(NOW + 10);
+    after.hydrate_limiter(NOW + 10).await.unwrap();
     restarted
         .register("second.clientco.com", "tenant-b", NOW + 10)
         .await
@@ -634,6 +634,79 @@ async fn the_issuance_budget_survives_a_restart() {
         issuer.count(),
         1,
         "a restart must not hand the ACME account a fresh quota"
+    );
+    let second = restarted.get("second.clientco.com").unwrap();
+    assert_eq!(second.consecutive_failures, 0, "{second:?}");
+    assert!(
+        second.failure_reason.as_deref().unwrap().contains("budget"),
+        "{second:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_offboarded_domains_orders_still_count_against_the_global_budget_after_a_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let certs = Arc::new(FsAcmeStore::new(dir.path(), "staging"));
+    let backing = Arc::new(MemoryCustomDomainStore::new());
+    let registry = Arc::new(CustomDomainRegistry::new(
+        Arc::clone(&backing) as Arc<dyn autumn_web::custom_domain::CustomDomainStore>,
+        100,
+    ));
+    registry.load().await.unwrap();
+    let cache = Arc::new(CustomDomainCertCache::new(8));
+    let issuer = ScriptedIssuer::new(&[]);
+    let verifier = TableVerifier::new(&[
+        ("first.clientco.com", points_here()),
+        ("second.clientco.com", points_here()),
+    ]);
+
+    // First process: one order uses the deployment's whole hourly budget.
+    let mut before = task_over(
+        Arc::clone(&registry),
+        Arc::clone(&cache),
+        Arc::clone(&certs),
+        Arc::clone(&verifier) as Arc<dyn DomainVerifier>,
+        Arc::clone(&issuer) as Arc<dyn DomainIssuer>,
+    );
+    before.limiter = Arc::new(IssuanceLimiter::new(5, 1, 300, 86_400));
+    registry
+        .register("first.clientco.com", "tenant-a", NOW)
+        .await
+        .unwrap();
+    before.tick(NOW).await;
+    assert_eq!(issuer.count(), 1);
+
+    // Offboard the domain: its record is deleted, and its attempts move to
+    // the deployment-wide ledger.
+    assert!(before.offboard("first.clientco.com").await.unwrap());
+    assert!(registry.get("first.clientco.com").is_none());
+
+    // Restart: a new process over the same durable store and an EMPTY limiter.
+    let restarted = Arc::new(CustomDomainRegistry::new(
+        backing as Arc<dyn autumn_web::custom_domain::CustomDomainStore>,
+        100,
+    ));
+    restarted.load().await.unwrap();
+    let mut after = task_over(
+        Arc::clone(&restarted),
+        cache,
+        certs,
+        verifier as Arc<dyn DomainVerifier>,
+        Arc::clone(&issuer) as Arc<dyn DomainIssuer>,
+    );
+    after.limiter = Arc::new(IssuanceLimiter::new(5, 1, 300, 86_400));
+    after.hydrate_limiter(NOW + 10).await.unwrap();
+    restarted
+        .register("second.clientco.com", "tenant-b", NOW + 10)
+        .await
+        .unwrap();
+
+    after.tick(NOW + 10).await;
+
+    assert_eq!(
+        issuer.count(),
+        1,
+        "an offboarded domain's order must still count against the global budget after a restart"
     );
     let second = restarted.get("second.clientco.com").unwrap();
     assert_eq!(second.consecutive_failures, 0, "{second:?}");
