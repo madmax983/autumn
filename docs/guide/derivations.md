@@ -426,8 +426,14 @@ $ AUTUMN_TEST_PG_URL=postgres://postgres:postgres@127.0.0.1:5432/postgres \
   parent's deltas are ordered so no running sum leaves the span of zero and
   their total), but a parent already sitting at `i64::MIN` or `i64::MAX` that
   receives weights of the same magnitude can still refuse an intermediate
-  value, and SQLite's integer `SUM` raises `integer overflow` when a
-  scan's running total leaves `i64` even if the final aggregate fits. A
+  value. The repair paths (recompute, the drift probe, backfill, bulk
+  deletion) share one aggregate expression with the delta paths, and on
+  SQLite that expression folds each contribution in halves
+  (`x = (x / 1_000_000) * 1_000_000 + (x % 1_000_000)`, exact in integer
+  arithmetic) so a partial sum can only overflow at a million times the old
+  threshold: a value the deltas maintain, like `MAX, 1, -1` in row order, no
+  longer fails repair with `integer overflow`. On Postgres `sum(bigint)`
+  already returns `numeric`, so the plain `SUM` stays. A
   summed column whose values approach 2^63 is outside what a derivation is
   for; keep weights small enough that any partial sum of them fits.
 - **No configuration keys.** Reconciliation and the boot backfill are automatic

@@ -1631,12 +1631,20 @@ mod tests {
     #[test]
     fn a_sum_recompute_sums_the_contribution() {
         let sql = crate::counter_cache::recompute_update_sql(&sum_def().sql_view(), "5");
+        // SQLite folds the weighted sum in halves so a partial sum can only
+        // overflow at `SQLITE_SUM_SPLIT` times the old threshold (#2663);
+        // Postgres keeps the plain `SUM`.
+        #[cfg(not(feature = "sqlite"))]
+        let aggregate = "COALESCE(SUM(__autumn_cc_child.\"score\"), 0)";
+        #[cfg(feature = "sqlite")]
+        let aggregate = "(COALESCE(SUM(__autumn_cc_child.\"score\" / 1000000), 0) * 1000000) \
+             + COALESCE(SUM(__autumn_cc_child.\"score\" % 1000000), 0)";
         assert!(
-            sql.starts_with(
+            sql.starts_with(&format!(
                 "UPDATE \"dv_posts\" SET \"visible_score\" = \
-                 (SELECT COALESCE(SUM(__autumn_cc_child.\"score\"), 0) \
+                 (SELECT {aggregate} \
                   FROM \"dv_comments\" AS __autumn_cc_child"
-            ),
+            )),
             "{sql}"
         );
         assert!(

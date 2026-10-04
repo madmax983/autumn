@@ -1172,3 +1172,56 @@ async fn a_resweep_re_enqueues_a_finished_derivation_under_its_own_hash() {
         .await
         .expect_err("an unregistered name is refused");
 }
+
+#[tokio::test]
+async fn a_weighted_sum_whose_partial_sums_leave_i64_still_recomputes() {
+    // #2663: SQLite's integer `SUM` raises `integer overflow` the moment a
+    // scan's *partial* sum leaves `i64` — even when the total is well inside
+    // it. The delta paths fold in `i128` and maintain the issue's
+    // `(MAX, 1, -1)` shape happily; the repair paths share `aggregate_expr`,
+    // so without the split-sum they could neither verify nor rebuild the
+    // same value, and a derivation introduced over such a column would never
+    // finish its backfill.
+    let pool = boot_pool("sd_split_sum").await;
+    let mut conn = pool.get().await.expect("conn");
+    ensure_derivations(&mut conn).await.expect("enqueue");
+    run_backfill(&mut conn, &BackfillOptions::default())
+        .await
+        .expect("backfill an empty table");
+
+    let post = seed_post(&pool, "heavy").await;
+    // Inserted in this order (and read back in rowid order), the partial sum
+    // leaves `i64` before the +1/-1 cancel it — the exact row order from the
+    // issue. The rows land through raw SQL, so only the set-based paths see
+    // them: the deltas never get a chance to paper over the repair.
+    for score in [i64::MAX, 1, -1] {
+        diesel::sql_query("INSERT INTO sd_comments (post_id, published, score) VALUES (?, 1, ?)")
+            .bind::<BigInt, _>(post)
+            .bind::<BigInt, _>(score)
+            .execute(&mut conn)
+            .await
+            .expect("legacy comment");
+    }
+
+    assert_eq!(
+        recompute(&mut conn, SUM_DERIVATION)
+            .await
+            .expect("recompute"),
+        1,
+        "the repair path must not raise `integer overflow` on the issue's example"
+    );
+    assert_eq!(
+        derived(&pool, "visible_score", post).await,
+        i64::MAX,
+        "the rebuilt value is the exact total, not a REAL-rounded one"
+    );
+
+    // The drift probe shares the same aggregate: it must report the parent
+    // healthy rather than failing its scan.
+    for entry in derivation_status(&mut conn).await.expect("status") {
+        if entry.name == SUM_DERIVATION {
+            assert_eq!(entry.drift, Some(0), "{entry:?}");
+            assert_eq!(entry.drift_error, None, "{entry:?}");
+        }
+    }
+}

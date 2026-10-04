@@ -449,11 +449,50 @@ fn contrib_expr(view: &SqlView, alias: &str) -> String {
 /// `COUNT(*)` for a count: the filter is in the surrounding `WHERE`, so every
 /// counted row already qualifies. `COALESCE(SUM(...), 0)` for a weighted sum,
 /// because `SUM` over an empty set is NULL and the maintained column is not.
+#[cfg(not(feature = "sqlite"))]
 fn aggregate_expr(view: &SqlView, alias: &str) -> String {
     if view.counts_rows() {
         "COUNT(*)".to_owned()
     } else {
         format!("COALESCE(SUM({}), 0)", contrib_expr(view, alias))
+    }
+}
+
+/// The radix the SQLite weighted sum splits each contribution across.
+///
+/// `SUM` accumulates row by row, and SQLite raises `integer overflow` the
+/// moment a *partial* sum leaves `i64` — even when the total is well inside it.
+/// The set-based repair paths (recompute, the drift probe, bulk deletion)
+/// share [`aggregate_expr`], while the delta paths fold in `i128`; without a
+/// wider accumulation a value the incremental path maintains happily (e.g.
+/// `MAX, 1, -1` in row order) would fail repair — the trap #2663 describes.
+///
+/// Splitting each contribution as `x = (x / SPLIT) * SPLIT + (x % SPLIT)` and
+/// summing the halves separately is exact — SQLite truncates integer division
+/// toward zero and gives `%` the sign of the dividend, which is what makes the
+/// identity hold term by term — and it raises the overflow threshold by
+/// `SPLIT`, the same shape `money::ledger` uses for balances. A summed column
+/// whose values approach 2^63 is still outside what a derivation is for; the
+/// guide asks callers to keep weights small enough that any partial sum of
+/// them fits.
+#[cfg(feature = "sqlite")]
+const SQLITE_SUM_SPLIT: i64 = 1_000_000;
+
+/// SQLite's [`aggregate_expr`]: the same fold, but each contribution is summed
+/// in halves (`x / SPLIT`, `x % SPLIT`) so a partial sum can only overflow at
+/// `SPLIT` times the old threshold. The two `SUM`s sit in one select list, so
+/// every statement that embeds the aggregate (`recompute`, the drift probe,
+/// bulk deletion) keeps its shape; `COUNT(*)` is untouched.
+#[cfg(feature = "sqlite")]
+fn aggregate_expr(view: &SqlView, alias: &str) -> String {
+    if view.counts_rows() {
+        "COUNT(*)".to_owned()
+    } else {
+        let contrib = contrib_expr(view, alias);
+        format!(
+            "(COALESCE(SUM({contrib} / {SQLITE_SUM_SPLIT}), 0) * {SQLITE_SUM_SPLIT}) \
+             + COALESCE(SUM({contrib} % {SQLITE_SUM_SPLIT}), 0)"
+        )
     }
 }
 
@@ -2877,21 +2916,30 @@ mod tests {
     fn a_sum_recompute_assigns_the_summed_contribution() {
         let sum = view(&sum_spec());
         assert!(!sum.counts_rows());
+        // SQLite folds the weighted sum in halves so a partial sum can only
+        // overflow at `SQLITE_SUM_SPLIT` times the old threshold (#2663);
+        // Postgres keeps the plain `SUM`.
+        #[cfg(not(feature = "sqlite"))]
+        let aggregate = "COALESCE(SUM(__autumn_cc_child.\"score\"), 0)".to_owned();
+        #[cfg(feature = "sqlite")]
+        let aggregate = "(COALESCE(SUM(__autumn_cc_child.\"score\" / 1000000), 0) * 1000000) \
+             + COALESCE(SUM(__autumn_cc_child.\"score\" % 1000000), 0)"
+            .to_owned();
         assert_eq!(
             recompute_update_sql(&sum, "1,2"),
-            "UPDATE \"posts\" SET \"visible_score\" = \
-             (SELECT COALESCE(SUM(__autumn_cc_child.\"score\"), 0) \
+            format!(
+                "UPDATE \"posts\" SET \"visible_score\" = \
+             (SELECT {aggregate} \
               FROM \"comments\" AS __autumn_cc_child \
               WHERE __autumn_cc_child.\"post_id\" = \"posts\".\"id\" \
                 AND (__autumn_cc_child.\"published\" = TRUE)) \
              WHERE \"posts\".\"id\" IN (1,2) \
-               AND \"posts\".\"visible_score\" "
-                .to_owned()
-                + IS_DISTINCT_FROM
-                + " (SELECT COALESCE(SUM(__autumn_cc_child.\"score\"), 0) \
+               AND \"posts\".\"visible_score\" {IS_DISTINCT_FROM} \
+             (SELECT {aggregate} \
               FROM \"comments\" AS __autumn_cc_child \
               WHERE __autumn_cc_child.\"post_id\" = \"posts\".\"id\" \
                 AND (__autumn_cc_child.\"published\" = TRUE))"
+            )
         );
     }
 

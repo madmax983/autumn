@@ -1,0 +1,3 @@
+### Fixed
+
+- **derivations:** on SQLite the repair paths (`recompute`, the drift probe, backfill, bulk deletion) no longer raise `integer overflow` on a weighted sum whose scan's *partial* sum leaves `i64` even though the total fits — e.g. `MAX, 1, -1` in row order. The shared aggregate now folds each contribution in exact integer halves (`x = (x / 1_000_000) * 1_000_000 + (x % 1_000_000)`), so a partial sum can only overflow at a million times the old threshold, matching the tolerance the delta paths already had by folding in `i128` (issue #2663). The maintained value stays an exact `i64`; Postgres keeps its plain `SUM`, which already widens to `numeric`.
