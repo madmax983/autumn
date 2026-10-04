@@ -773,11 +773,14 @@ impl BillingStore for DbBillingStore {
                             current_status.is_terminal(),
                             upsert.occurred_at,
                             upsert.status.rank(),
+                            upsert.status.is_terminal(),
                             upsert.authoritative,
+                            upsert.tie_ranked,
                         ) {
                             Guard::Apply => {}
                             Guard::Unchanged => return Ok(Write::Unchanged(current)),
                             Guard::Stale => return Ok(Write::Stale(current)),
+                            Guard::Tie => return Ok(Write::Tie(current)),
                         }
                         let mut row = SubscriptionRow::from_upsert(
                             current.id.clone(),
@@ -925,6 +928,10 @@ impl BillingStore for DbBillingStore {
                         Guard::Apply => {}
                         Guard::Unchanged => return Ok(Write::Unchanged(current)),
                         Guard::Stale => return Ok(Write::Stale(current)),
+                        // Unreachable: `guard` never reports a tie for
+                        // invoices, but the decision type is shared with
+                        // subscriptions.
+                        Guard::Tie => return Ok(Write::Tie(current)),
                     }
                     // `None` keeps the stored link.
                     let subscription_id =

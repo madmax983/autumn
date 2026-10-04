@@ -204,6 +204,11 @@ impl Ctx<'_> {
     /// paused`) and leave the mirror wrong until some later event arrived, so
     /// ask the provider for the subscription's current state instead.
     ///
+    /// The tie is detected atomically inside the store's guarded write (see
+    /// [`Write::Tie`]): the row the write compared against is passed as
+    /// `previous`, so two concurrent webhooks both land here instead of one
+    /// reading a stale row and missing the tie entirely.
+    ///
     /// Returns the live snapshot, to be written as authoritative at the tied
     /// instant itself. No timestamp is invented: the stored instant stays the
     /// provider's, so an event created after the tie compares against a real
@@ -242,24 +247,17 @@ impl Ctx<'_> {
         Ok(live)
     }
 
-    async fn subscription(
+    /// The guarded subscription upsert for one event: price/plan resolution
+    /// and period end are identical whether the snapshot comes from the event
+    /// or from a tie-breaking provider lookup.
+    fn subscription_upsert(
         &self,
+        customer: &Customer,
         snapshot: &SubscriptionSnapshot,
         status: SubscriptionStatus,
         occurred_at: DateTime<Utc>,
-    ) -> Result<(), BillingError> {
-        let store = self.service.store();
-        let customer = self.customer(&snapshot.provider_customer_id, None).await?;
-        let previous = store
-            .subscription_by_provider_id(&snapshot.provider_subscription_id)
-            .await?;
-        let live = self
-            .resolve_tie(previous.as_ref(), snapshot, status, occurred_at)
-            .await?;
-        let authoritative = live.is_some();
-        let (snapshot, status) = live
-            .as_ref()
-            .map_or((snapshot, status), |live| (live, live.status));
+        authoritative: bool,
+    ) -> SubscriptionUpsert {
         let mut upsert = SubscriptionUpsert::new(
             self.new_id(),
             customer.id.clone(),
@@ -287,8 +285,107 @@ impl Ctx<'_> {
         if let Some(end) = snapshot.current_period_end {
             upsert = upsert.with_period_end(end);
         }
-        let subscription = match store.upsert_subscription(upsert).await? {
-            StoreWrite::Applied(subscription) => subscription,
+        upsert
+    }
+
+    /// Settle a [`Write::Tie`] reported by the atomic upsert: ask the
+    /// provider for the subscription's current state and re-submit it as an
+    /// authoritative write at the tied instant. When the provider cannot be
+    /// asked, fall back to ranking the event's own snapshot (`tie_ranked`),
+    /// the pre-#3111 behavior.
+    ///
+    /// Returns the written subscription and the row the tie was detected
+    /// against (the hook's `previous`), or `None` when the mirror did not
+    /// move and the caller should stop before notifications and hooks —
+    /// the same early return the `Unchanged`/`Stale` arms take.
+    async fn settle_tie(
+        &self,
+        customer: &Customer,
+        snapshot: &SubscriptionSnapshot,
+        status: SubscriptionStatus,
+        occurred_at: DateTime<Utc>,
+        current: Subscription,
+    ) -> Result<Option<(Subscription, Option<Subscription>)>, BillingError> {
+        let store = self.service.store();
+        let Some(live) = self
+            .resolve_tie(Some(&current), snapshot, status, occurred_at)
+            .await?
+        else {
+            // The provider cannot settle this tie: rank the event's own
+            // snapshot. `tie_ranked` keeps the store from reporting the
+            // same tie again.
+            tracing::debug!(
+                provider_subscription_id = %snapshot.provider_subscription_id,
+                "🍂 Autumn Billing: tie without a provider lookup; ranking the event"
+            );
+            let ranked = self
+                .subscription_upsert(customer, snapshot, status, occurred_at, false)
+                .with_tie_ranked();
+            return match store.upsert_subscription(ranked).await? {
+                StoreWrite::Applied(subscription) => Ok(Some((subscription, Some(current)))),
+                // Same idempotent-step-only repeat as the main
+                // `Unchanged` arm: notifications and hooks ran, or never
+                // will, with the first delivery.
+                StoreWrite::Unchanged(subscription) => {
+                    if subscription.status == SubscriptionStatus::Canceled {
+                        self.close_dunning_for(&subscription.id).await?;
+                    }
+                    Ok(None)
+                }
+                StoreWrite::Stale(_) => {
+                    tracing::debug!(
+                        provider_subscription_id = %snapshot.provider_subscription_id,
+                        "🍂 Autumn Billing: stale subscription event; mirror unchanged"
+                    );
+                    Ok(None)
+                }
+                // The bundled stores never report a tie for a `tie_ranked`
+                // write; a custom store that does anyway leaves the mirror
+                // exactly as the first write found it.
+                StoreWrite::Tie(_) => {
+                    tracing::warn!(
+                        provider_subscription_id = %snapshot.provider_subscription_id,
+                        "🍂 Autumn Billing: store reported a tie for a tie_ranked write; mirror unchanged"
+                    );
+                    Ok(None)
+                }
+            };
+        };
+        let authoritative =
+            self.subscription_upsert(customer, &live, live.status, occurred_at, true);
+        match store.upsert_subscription(authoritative).await? {
+            StoreWrite::Applied(subscription) | StoreWrite::Unchanged(subscription) => {
+                Ok(Some((subscription, Some(current))))
+            }
+            // The bundled stores always apply an authoritative same-instant
+            // write over a non-terminal row; a custom store that refuses
+            // leaves the mirror as the first write found it.
+            StoreWrite::Stale(_) | StoreWrite::Tie(_) => {
+                tracing::warn!(
+                    provider_subscription_id = %snapshot.provider_subscription_id,
+                    "🍂 Autumn Billing: authoritative tie write did not apply; mirror unchanged"
+                );
+                Ok(None)
+            }
+        }
+    }
+
+    async fn subscription(
+        &self,
+        snapshot: &SubscriptionSnapshot,
+        status: SubscriptionStatus,
+        occurred_at: DateTime<Utc>,
+    ) -> Result<(), BillingError> {
+        let store = self.service.store();
+        let customer = self.customer(&snapshot.provider_customer_id, None).await?;
+        // Hook context only: tie detection no longer depends on this read
+        // (see `Write::Tie` below), so it may lag a concurrent writer.
+        let previous = store
+            .subscription_by_provider_id(&snapshot.provider_subscription_id)
+            .await?;
+        let upsert = self.subscription_upsert(&customer, snapshot, status, occurred_at, false);
+        let (subscription, previous) = match store.upsert_subscription(upsert).await? {
+            StoreWrite::Applied(subscription) => (subscription, previous),
             // A redelivery after a failure past the write: repeat the
             // idempotent step only. Notifications and hooks ran, or never
             // will, with the first delivery.
@@ -304,6 +401,17 @@ impl Ctx<'_> {
                     "🍂 Autumn Billing: stale subscription event; mirror unchanged"
                 );
                 return Ok(());
+            }
+            StoreWrite::Tie(current) => {
+                match self
+                    .settle_tie(&customer, snapshot, status, occurred_at, current)
+                    .await?
+                {
+                    Some(pair) => pair,
+                    // The mirror did not move: stop before notifications
+                    // and hooks, like the `Unchanged`/`Stale` arms.
+                    None => return Ok(()),
+                }
             }
         };
         if subscription.status == SubscriptionStatus::Canceled {
@@ -386,7 +494,9 @@ impl Ctx<'_> {
         let (customer, write) = self.upsert_invoice(snapshot, occurred_at).await?;
         let (invoice, applied) = match write {
             StoreWrite::Applied(invoice) => (invoice, true),
-            StoreWrite::Unchanged(invoice) => (invoice, false),
+            // Unreachable: invoice upserts use `guard`, which never reports
+            // a tie. Treated as not-applied, like `Unchanged`.
+            StoreWrite::Unchanged(invoice) | StoreWrite::Tie(invoice) => (invoice, false),
             StoreWrite::Stale(_) => {
                 tracing::debug!(
                     provider_invoice_id = %snapshot.provider_invoice_id,
@@ -503,7 +613,9 @@ impl Ctx<'_> {
         let (customer, write) = self.upsert_invoice(snapshot, occurred_at).await?;
         let (invoice, applied) = match write {
             StoreWrite::Applied(invoice) => (invoice, true),
-            StoreWrite::Unchanged(invoice) => (invoice, false),
+            // Unreachable: invoice upserts use `guard`, which never reports
+            // a tie. Treated as not-applied, like `Unchanged`.
+            StoreWrite::Unchanged(invoice) | StoreWrite::Tie(invoice) => (invoice, false),
             StoreWrite::Stale(_) => return Ok(()),
         };
         let store = self.service.store();

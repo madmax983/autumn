@@ -259,11 +259,14 @@ impl BillingStore for MemoryBillingStore {
                     current.status.is_terminal(),
                     upsert.occurred_at,
                     upsert.status.rank(),
+                    upsert.status.is_terminal(),
                     upsert.authoritative,
+                    upsert.tie_ranked,
                 ) {
                     Guard::Apply => {}
                     Guard::Unchanged => return Write::Unchanged(current),
                     Guard::Stale => return Write::Stale(current),
+                    Guard::Tie => return Write::Tie(current),
                 }
                 // A snapshot without these fields keeps the stored values.
                 let row = Subscription {
@@ -370,6 +373,9 @@ impl BillingStore for MemoryBillingStore {
                     Guard::Apply => {}
                     Guard::Unchanged => return Write::Unchanged(current),
                     Guard::Stale => return Write::Stale(current),
+                    // Unreachable: `guard` never reports a tie for invoices,
+                    // but the decision type is shared with subscriptions.
+                    Guard::Tie => return Write::Tie(current),
                 }
                 let row = Invoice {
                     id: current.id.clone(),
@@ -545,6 +551,7 @@ mod tests {
             cancel_at_period_end: false,
             occurred_at: at(occurred),
             authoritative: false,
+            tie_ranked: false,
             now: at(1000),
         }
     }
@@ -603,7 +610,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn same_instant_prefers_higher_rank() {
+    async fn same_instant_terminal_cases_keep_the_exact_rule() {
         let store = MemoryBillingStore::new();
         store
             .upsert_subscription(upsert(SubscriptionStatus::Canceled, 100))
@@ -613,6 +620,7 @@ mod tests {
             .upsert_subscription(upsert(SubscriptionStatus::Active, 100))
             .await
             .unwrap();
+        assert!(!w.is_tie(), "a terminal row is never a tie");
         assert!(!w.is_applied());
 
         let store = MemoryBillingStore::new();
@@ -624,6 +632,10 @@ mod tests {
             .upsert_subscription(upsert(SubscriptionStatus::Canceled, 100))
             .await
             .unwrap();
+        assert!(
+            !w.is_tie(),
+            "an incoming terminal status is ranked, not tied"
+        );
         assert!(w.is_applied());
     }
 

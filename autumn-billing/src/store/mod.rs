@@ -51,6 +51,11 @@ pub enum Write<T> {
     /// A newer event was already applied. Nothing was written. `T` is the
     /// stored row.
     Stale(T),
+    /// The stored row is at the same instant with a different, non-terminal
+    /// status: a same-second tie the store will not rank. Nothing was
+    /// written. `T` is the stored row. The caller resolves the tie (for
+    /// subscriptions: ask the provider) and re-submits the winning snapshot.
+    Tie(T),
 }
 
 impl<T> Write<T> {
@@ -58,7 +63,7 @@ impl<T> Write<T> {
     #[must_use]
     pub fn into_inner(self) -> T {
         match self {
-            Self::Applied(row) | Self::Unchanged(row) | Self::Stale(row) => row,
+            Self::Applied(row) | Self::Unchanged(row) | Self::Stale(row) | Self::Tie(row) => row,
         }
     }
 
@@ -75,12 +80,20 @@ impl<T> Write<T> {
         matches!(self, Self::Unchanged(_))
     }
 
+    /// `true` when the write stopped at a same-instant tie that still needs
+    /// resolving.
+    #[must_use]
+    pub const fn is_tie(&self) -> bool {
+        matches!(self, Self::Tie(_))
+    }
+
     /// The row wrapped in the same variant, or the first error.
     pub(crate) fn try_map<U, E>(self, f: impl FnOnce(T) -> Result<U, E>) -> Result<Write<U>, E> {
         Ok(match self {
             Self::Applied(row) => Write::Applied(f(row)?),
             Self::Unchanged(row) => Write::Unchanged(f(row)?),
             Self::Stale(row) => Write::Stale(f(row)?),
+            Self::Tie(row) => Write::Tie(f(row)?),
         })
     }
 }
@@ -94,6 +107,9 @@ pub(crate) enum Guard {
     Unchanged,
     /// The stored snapshot is newer. Do not write.
     Stale,
+    /// Same instant, different non-terminal status: the store will not rank
+    /// this. Do not write; the caller resolves the tie.
+    Tie,
 }
 
 /// Ordering guard shared by every store.
@@ -123,7 +139,8 @@ pub(crate) fn guard(
 }
 
 /// [`guard`] for a subscription write that may carry the provider's own
-/// current state (see [`SubscriptionUpsert::authoritative`]).
+/// current state (see [`SubscriptionUpsert::authoritative`]) or a resolved
+/// tie the store should rank (see [`SubscriptionUpsert::tie_ranked`]).
 ///
 /// An authoritative write replaces the stored row at the SAME instant, which
 /// is how two events that tie to the second are settled by the provider's
@@ -133,17 +150,41 @@ pub(crate) fn guard(
 /// never goes back in time, and it does not move the stored instant, so no
 /// timestamp is invented and a provider event created after the tie still
 /// compares against a real provider time.
+///
+/// A non-authoritative write at the same instant as the stored row, with a
+/// different status and neither side terminal, is a [`Guard::Tie`]: the
+/// store reports it instead of ranking, so tie detection is atomic with the
+/// write and two concurrent webhooks cannot both miss it. The terminal
+/// cases keep the store's exact rule (never leave a terminal status; the
+/// incoming terminal status is ranked), and a same-rank instant stays a
+/// redelivery.
 #[must_use]
+#[allow(
+    clippy::too_many_arguments,
+    clippy::fn_params_excessive_bools,
+    reason = "the guard is one predicate over both rows"
+)]
 pub(crate) fn guard_subscription(
     existing_at: DateTime<Utc>,
     existing_rank: u8,
     existing_terminal: bool,
     incoming_at: DateTime<Utc>,
     incoming_rank: u8,
+    incoming_terminal: bool,
     authoritative: bool,
+    tie_ranked: bool,
 ) -> Guard {
     if authoritative && !existing_terminal && incoming_at == existing_at {
         return Guard::Apply;
+    }
+    if !authoritative
+        && !tie_ranked
+        && incoming_at == existing_at
+        && incoming_rank != existing_rank
+        && !existing_terminal
+        && !incoming_terminal
+    {
+        return Guard::Tie;
     }
     guard(
         existing_at,
@@ -234,6 +275,11 @@ pub struct SubscriptionUpsert {
     /// it settles a same-instant tie instead of being ranked against it. See
     /// [`SubscriptionUpsert::with_authoritative`].
     pub authoritative: bool,
+    /// The caller already resolved a same-instant tie (for example the
+    /// provider could not be asked) and wants the store's rank ordering
+    /// instead of another [`Write::Tie`]. See
+    /// [`SubscriptionUpsert::with_tie_ranked`].
+    pub tie_ranked: bool,
     /// App clock.
     pub now: DateTime<Utc>,
 }
@@ -261,6 +307,7 @@ impl SubscriptionUpsert {
             cancel_at_period_end: false,
             occurred_at,
             authoritative: false,
+            tie_ranked: false,
             now,
         }
     }
@@ -271,6 +318,16 @@ impl SubscriptionUpsert {
     #[must_use]
     pub const fn with_authoritative(mut self) -> Self {
         self.authoritative = true;
+        self
+    }
+
+    /// Mark a same-instant tie as already resolved by the caller: the store
+    /// ranks the snapshot instead of reporting [`Write::Tie`] again. For the
+    /// fallback when the provider cannot be asked to settle the tie; the
+    /// pre-#3111 behavior was exactly this ranking.
+    #[must_use]
+    pub const fn with_tie_ranked(mut self) -> Self {
+        self.tie_ranked = true;
         self
     }
 

@@ -375,8 +375,9 @@ pub async fn subscription_authoritative_settles_a_same_instant_tie(store: &dyn B
         ))
         .await
         .unwrap();
-    // Ranked, Active (3) loses to PastDue (4) at the same instant.
-    let ranked = store
+    // Unranked, a different status at the same instant is a tie: the store
+    // reports it instead of ranking, so the caller settles it.
+    let tie = store
         .upsert_subscription(sub_upsert(
             "sub-auth",
             &customer,
@@ -386,7 +387,8 @@ pub async fn subscription_authoritative_settles_a_same_instant_tie(store: &dyn B
         ))
         .await
         .unwrap();
-    assert!(!ranked.is_applied());
+    assert!(tie.is_tie());
+    assert!(!tie.is_applied());
     // Authoritative, it wins, and the stored instant stays the provider's.
     let live = store
         .upsert_subscription(
@@ -450,12 +452,22 @@ pub async fn subscription_authoritative_settles_a_same_instant_tie(store: &dyn B
     assert!(!after_terminal.is_applied());
 }
 
-/// At the same instant the higher rank wins; a lower rank is stale.
-pub async fn subscription_same_instant_higher_rank_wins(store: &dyn BillingStore) {
-    let customer = seed_customer(store, "sub-b", None).await;
+/// At the same instant a different non-terminal status is a tie, not a
+/// ranking: tie detection is atomic with the write, so two concurrent
+/// webhooks cannot both miss it. `tie_ranked` opts back into rank ordering
+/// for the fallback when the provider cannot settle the tie. A terminal
+/// status on either side keeps the store's exact rule, never a tie.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one scenario per tie rule, kept together"
+)]
+pub async fn subscription_same_instant_tie_is_reported_and_ranked_on_request(
+    store: &dyn BillingStore,
+) {
+    let customer = seed_customer(store, "sub-tie", None).await;
     store
         .upsert_subscription(sub_upsert(
-            "sub-b",
+            "sub-tie",
             &customer,
             "k",
             SubscriptionStatus::Active,
@@ -463,41 +475,160 @@ pub async fn subscription_same_instant_higher_rank_wins(store: &dyn BillingStore
         ))
         .await
         .unwrap();
-    let lower = store
+    // Either direction reports a tie; nothing is written.
+    for status in [SubscriptionStatus::PastDue, SubscriptionStatus::Trialing] {
+        let tie = store
+            .upsert_subscription(sub_upsert("sub-tie", &customer, "k", status, 100))
+            .await
+            .unwrap();
+        assert!(
+            tie.is_tie(),
+            "{status:?} at the same instant is a tie, not a ranking"
+        );
+        assert!(!tie.is_applied());
+        assert_eq!(tie.into_inner().status, SubscriptionStatus::Active);
+    }
+    // Same instant, same status is still a redelivery, not a tie.
+    let same = store
         .upsert_subscription(sub_upsert(
-            "sub-b",
+            "sub-tie",
+            &customer,
+            "k",
+            SubscriptionStatus::Active,
+            100,
+        ))
+        .await
+        .unwrap();
+    assert!(!same.is_tie());
+    assert!(!same.is_applied());
+    // A terminal status is never left or tied: the incoming terminal wins
+    // by rank, and nothing revives the row after.
+    let to_terminal = store
+        .upsert_subscription(sub_upsert(
+            "sub-tie",
+            &customer,
+            "k",
+            SubscriptionStatus::Canceled,
+            100,
+        ))
+        .await
+        .unwrap();
+    assert!(!to_terminal.is_tie());
+    assert!(to_terminal.is_applied());
+    let from_terminal = store
+        .upsert_subscription(sub_upsert(
+            "sub-tie",
+            &customer,
+            "k",
+            SubscriptionStatus::Active,
+            100,
+        ))
+        .await
+        .unwrap();
+    assert!(!from_terminal.is_tie());
+    assert!(!from_terminal.is_applied());
+    assert_eq!(
+        from_terminal.into_inner().status,
+        SubscriptionStatus::Canceled
+    );
+    // `tie_ranked` ranks again: the higher rank applies, the lower is stale.
+    let ranked_customer = seed_customer(store, "sub-tier", None).await;
+    store
+        .upsert_subscription(sub_upsert(
+            "sub-tier",
+            &ranked_customer,
+            "k",
+            SubscriptionStatus::Active,
+            100,
+        ))
+        .await
+        .unwrap();
+    let higher = store
+        .upsert_subscription(
+            sub_upsert(
+                "sub-tier",
+                &ranked_customer,
+                "k",
+                SubscriptionStatus::PastDue,
+                100,
+            )
+            .with_tie_ranked(),
+        )
+        .await
+        .unwrap();
+    assert!(!higher.is_tie());
+    assert!(higher.is_applied());
+    assert_eq!(higher.into_inner().status, SubscriptionStatus::PastDue);
+    let lower = store
+        .upsert_subscription(
+            sub_upsert(
+                "sub-tier",
+                &ranked_customer,
+                "k",
+                SubscriptionStatus::Trialing,
+                100,
+            )
+            .with_tie_ranked(),
+        )
+        .await
+        .unwrap();
+    assert!(!lower.is_tie());
+    assert!(!lower.is_applied());
+    assert_eq!(lower.into_inner().status, SubscriptionStatus::PastDue);
+}
+
+/// Two writers racing at the same instant both see the tie: neither ranks
+/// through, and the stored row is untouched. This is the #3111 regression
+/// shape — the old read-outside-the-write let one writer miss the tie and
+/// apply its rank.
+pub async fn subscription_concurrent_same_second_writes_both_report_tie(store: &dyn BillingStore) {
+    let customer = seed_customer(store, "sub-ctie", None).await;
+    store
+        .upsert_subscription(sub_upsert(
+            "sub-ctie",
+            &customer,
+            "k",
+            SubscriptionStatus::Active,
+            100,
+        ))
+        .await
+        .unwrap();
+    let (first, second) = tokio::join!(
+        store.upsert_subscription(sub_upsert(
+            "sub-ctie",
+            &customer,
+            "k",
+            SubscriptionStatus::PastDue,
+            100,
+        )),
+        store.upsert_subscription(sub_upsert(
+            "sub-ctie",
             &customer,
             "k",
             SubscriptionStatus::Trialing,
             100,
-        ))
+        )),
+    );
+    let first = first.unwrap();
+    let second = second.unwrap();
+    assert!(
+        first.is_tie(),
+        "a concurrent writer reports the tie instead of ranking"
+    );
+    assert!(
+        second.is_tie(),
+        "a concurrent writer reports the tie instead of ranking"
+    );
+    let row = store
+        .subscription_by_provider_id(&ProviderId::new("sub_sub-ctie_k"))
         .await
-        .unwrap();
-    assert!(!lower.is_applied());
-    assert_eq!(lower.into_inner().status, SubscriptionStatus::Active);
-    let higher = store
-        .upsert_subscription(sub_upsert(
-            "sub-b",
-            &customer,
-            "k",
-            SubscriptionStatus::PastDue,
-            100,
-        ))
-        .await
-        .unwrap();
-    assert!(higher.is_applied());
-    assert_eq!(higher.into_inner().status, SubscriptionStatus::PastDue);
-    let same = store
-        .upsert_subscription(sub_upsert(
-            "sub-b",
-            &customer,
-            "k",
-            SubscriptionStatus::PastDue,
-            100,
-        ))
-        .await
-        .unwrap();
-    assert!(!same.is_applied(), "same instant and same rank is stale");
+        .unwrap()
+        .expect("seeded subscription");
+    assert_eq!(
+        row.status,
+        SubscriptionStatus::Active,
+        "no concurrent write ranked through"
+    );
 }
 
 /// A terminal status is never left, even by a newer event.
@@ -1394,7 +1525,8 @@ pub async fn run_contract(store: &dyn BillingStore) {
     customer_link_never_replaced_email_replaced(store).await;
     customer_lookups(store).await;
     subscription_newer_wins_older_stale(store).await;
-    subscription_same_instant_higher_rank_wins(store).await;
+    subscription_same_instant_tie_is_reported_and_ranked_on_request(store).await;
+    subscription_concurrent_same_second_writes_both_report_tie(store).await;
     subscription_authoritative_settles_a_same_instant_tie(store).await;
     subscription_terminal_never_left(store).await;
     subscriptions_for_customer_newest_first(store).await;
@@ -1439,7 +1571,8 @@ mod memory {
         customer_link_never_replaced_email_replaced,
         customer_lookups,
         subscription_newer_wins_older_stale,
-        subscription_same_instant_higher_rank_wins,
+        subscription_same_instant_tie_is_reported_and_ranked_on_request,
+        subscription_concurrent_same_second_writes_both_report_tie,
         subscription_authoritative_settles_a_same_instant_tie,
         subscription_terminal_never_left,
         subscriptions_for_customer_newest_first,

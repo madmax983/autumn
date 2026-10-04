@@ -389,6 +389,73 @@ async fn a_provider_that_cannot_look_up_falls_back_to_ranking_the_events() {
 }
 
 #[tokio::test]
+async fn concurrent_same_second_events_for_a_new_subscription_end_in_the_providers_status() {
+    // #3111: the tie used to be detected by a read outside the guarded
+    // write, so two concurrent webhooks could both miss it and fall back to
+    // ranking (PastDue would win). Now the write itself reports the tie and
+    // the provider settles it.
+    let h = linked_harness().await;
+    h.provider.script_live_subscription(
+        SubscriptionSnapshot::new("sub_1", "cus_1", SubscriptionStatus::Active)
+            .with_price(PRO_PRICE)
+            .with_quantity(2),
+    );
+    let (first, second) = tokio::join!(
+        apply_event(
+            &h.client,
+            event("evt_a", at(100), sub_changed(SubscriptionStatus::PastDue)),
+        ),
+        apply_event(
+            &h.client,
+            event("evt_b", at(100), sub_changed(SubscriptionStatus::Active)),
+        ),
+    );
+    first.unwrap();
+    second.unwrap();
+    let sub = subscription(&h).await;
+    assert_eq!(sub.status, SubscriptionStatus::Active);
+    assert_eq!(sub.quantity, 2, "the authoritative snapshot won, not a rank");
+    assert!(
+        h.provider.fetch_calls() >= 1,
+        "at least one writer hit the tie and asked the provider"
+    );
+}
+
+#[tokio::test]
+async fn concurrent_same_second_events_for_an_existing_subscription_end_in_the_providers_status() {
+    // #3111, second acceptance case: the tie is against a stored row, not an
+    // insert, and both concurrent writers still converge on the provider.
+    let h = linked_harness().await;
+    apply_event(
+        &h.client,
+        event("evt_0", at(100), sub_changed(SubscriptionStatus::PastDue)),
+    )
+    .await
+    .unwrap();
+    h.provider.script_live_subscription(
+        SubscriptionSnapshot::new("sub_1", "cus_1", SubscriptionStatus::Paused)
+            .with_price(PRO_PRICE),
+    );
+    let (first, second) = tokio::join!(
+        apply_event(
+            &h.client,
+            event("evt_1", at(100), sub_changed(SubscriptionStatus::Active)),
+        ),
+        apply_event(
+            &h.client,
+            event("evt_2", at(100), sub_changed(SubscriptionStatus::Trialing)),
+        ),
+    );
+    first.unwrap();
+    second.unwrap();
+    assert_eq!(subscription(&h).await.status, SubscriptionStatus::Paused);
+    assert!(
+        h.provider.fetch_calls() >= 1,
+        "at least one writer hit the tie and asked the provider"
+    );
+}
+
+#[tokio::test]
 async fn same_second_deleted_and_updated_stays_canceled() {
     // deleted first, then updated
     let h = linked_harness().await;
