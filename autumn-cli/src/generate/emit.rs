@@ -1460,25 +1460,34 @@ fn autumn_web_feature_markers(feature: &str) -> &'static [&'static str] {
         // `MultipartField` and `MultipartError`, themselves part of the multipart API
         // surface, so over-retaining on them is harmless.
         "multipart" => &["Multipart"],
-        // `autumn_web::storage::` covers the model's blob column type
+        // `autumn_web::storage` covers the model's blob column type
         // (`autumn_web::storage::Blob`) as well as route usage of the store
         // (`autumn_web::storage::BlobStoreState`, `save_to_blob_store`
         // call sites that reference the `autumn_web::storage::` path, etc.).
         // Unlike `multipart`, the prelude does NOT re-export any storage type
         // (`Blob`, `BlobStore`, `BlobStoreState`, …), so a hand-written
-        // storage user must reach them through a `autumn_web::storage::…`
-        // path — either fully qualified or via a `use autumn_web::storage::{…}`
-        // import line — both of which this marker already catches. There is no
-        // prelude-unqualified spelling to miss, so no extra marker is needed.
-        "storage" => &["autumn_web::storage::"],
+        // storage user must reach them through the `autumn_web::storage`
+        // path — fully qualified, via a `use autumn_web::storage::{…}`
+        // import, or via a module import (`use autumn_web::storage;` /
+        // `… as store;`), whose line ends at the module name. Deliberately
+        // no trailing `::` (as with `csv` below): an author importing the
+        // module would otherwise read as "unused", and destroying the last
+        // attachment scaffold would strip a feature surviving code still
+        // needs. Dropping the `::` costs only over-retention, which is the
+        // harmless direction.
+        "storage" => &["autumn_web::storage"],
         // A `richtext` scaffold (issue #1255) enables `markdown` for the
         // sanitizing `render_user_content` its show/preview paths call, but a
         // hand-written route can render trusted Markdown through the same
-        // feature's `render`/`MarkdownRegistry`. `autumn_web::markdown::`
+        // feature's `render`/`MarkdownRegistry`. `autumn_web::markdown`
         // catches every spelling: the prelude re-exports none of these types,
-        // so any user must reach them through that path — fully qualified or
-        // via a `use autumn_web::markdown::{…};` import line.
-        "markdown" => &["autumn_web::markdown::"],
+        // so any user must reach them through that path — fully qualified,
+        // via a `use autumn_web::markdown::{…};` import, or via a module
+        // import (`use autumn_web::markdown;` / `… as md;`). Deliberately no
+        // trailing `::` (as with `csv` below): a missed module import would
+        // strip a feature surviving code still needs, while the extra hits
+        // only over-retain.
+        "markdown" => &["autumn_web::markdown"],
         // A scaffolded CSV export (issue #1315) enables `csv` for the
         // `CsvSchema` impl and `export_csv` call its `export.csv` route emits,
         // but a hand-written route, job or task can use the same module —
@@ -3650,9 +3659,71 @@ mod tests {
 
         let storage = autumn_web_feature_markers("storage");
         assert!(
-            storage.contains(&"autumn_web::storage::"),
-            "storage marker must catch `autumn_web::storage::` usage, got {storage:?}"
+            storage.contains(&"autumn_web::storage"),
+            "storage marker must catch `autumn_web::storage` usage (incl. module imports), got {storage:?}"
         );
+        let markdown = autumn_web_feature_markers("markdown");
+        assert!(
+            markdown.contains(&"autumn_web::markdown"),
+            "markdown marker must catch `autumn_web::markdown` usage (incl. module imports), got {markdown:?}"
+        );
+    }
+
+    #[test]
+    fn storage_and_markdown_markers_match_module_imports() {
+        // `autumn destroy scaffold` keeps an `autumn-web` feature only if the
+        // remaining source contains its marker. A module import
+        // (`use autumn_web::storage;`, `use autumn_web::markdown as md;`)
+        // ends at the module name, so the old trailing-`::` markers missed
+        // it, `destroy` removed the feature, and the build broke in a file
+        // the generator did not write (issue #2186). The markers deliberately
+        // carry no trailing `::` (as `csv`'s already did for #2184).
+        for (feature, imports) in [
+            (
+                "storage",
+                [
+                    "use autumn_web::storage;\n",
+                    "use autumn_web::storage as store;\n",
+                ],
+            ),
+            (
+                "markdown",
+                [
+                    "use autumn_web::markdown;\n",
+                    "use autumn_web::markdown as md;\n",
+                ],
+            ),
+        ] {
+            for import in imports {
+                let tmp = tempfile::TempDir::new().unwrap();
+                fs::create_dir_all(tmp.path().join("src")).unwrap();
+                fs::write(tmp.path().join("src/handwritten.rs"), import).unwrap();
+                assert!(
+                    autumn_web_feature_still_needed_elsewhere(
+                        feature,
+                        tmp.path(),
+                        &[],
+                        &HashMap::new()
+                    ),
+                    "{feature} must be retained for a module import ({import:?})"
+                );
+            }
+        }
+
+        // An empty tree references nothing — the feature stays removable.
+        let tmp = tempfile::TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("src")).unwrap();
+        for feature in ["storage", "markdown"] {
+            assert!(
+                !autumn_web_feature_still_needed_elsewhere(
+                    feature,
+                    tmp.path(),
+                    &[],
+                    &HashMap::new()
+                ),
+                "{feature} must be removable when nothing references it"
+            );
+        }
     }
 
     #[test]
