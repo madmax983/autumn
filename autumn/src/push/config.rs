@@ -76,11 +76,25 @@ pub struct PushConfig {
 /// RFC 8292 §2.1 requires a `mailto:` or `https:` URI — it is how a push
 /// service operator reaches you about your traffic, so a bare email address or
 /// a name is not enough.
+///
+/// The `mailto:` arm is deliberately stricter than RFC 5322: one addr-spec,
+/// no whitespace, exactly one `@`, both halves non-empty. A push service
+/// will certainly refuse anything looser, and a boot rejection beats every
+/// delivery failing silently. Single-label domains are accepted on purpose:
+/// the shipped default is `mailto:admin@localhost`.
 pub(super) fn is_valid_vapid_subject(subject: &str) -> bool {
     let subject = subject.trim();
     if let Some(rest) = subject.strip_prefix("mailto:") {
-        // `mailto:` with nothing after it names nobody.
-        return rest.contains('@') && !rest.starts_with('@') && !rest.ends_with('@');
+        let mut parts = rest.splitn(2, '@');
+        return match (parts.next(), parts.next()) {
+            (Some(local), Some(domain)) => {
+                !local.is_empty()
+                    && !domain.is_empty()
+                    && !domain.contains('@')
+                    && !rest.chars().any(char::is_whitespace)
+            }
+            _ => false,
+        };
     }
     url::Url::parse(subject).is_ok_and(|parsed| parsed.scheme() == "https" && parsed.has_host())
 }
@@ -366,7 +380,15 @@ mod tests {
 
     #[test]
     fn a_malformed_mailto_is_rejected() {
-        for subject in ["mailto:", "mailto:@example.com", "mailto:ops@"] {
+        for subject in [
+            "mailto:",
+            "mailto:@example.com",
+            "mailto:ops@",
+            // A space in the local part and a doubled `@` both pass the old
+            // `@`-position check, but no push service will accept them.
+            "mailto:ops team@example.com",
+            "mailto:a@@example.com",
+        ] {
             assert!(
                 config(&format!("subject = \"{subject}\""))
                     .validated_subject()

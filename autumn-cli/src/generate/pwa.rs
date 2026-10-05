@@ -393,14 +393,26 @@ self.addEventListener('push', (event) => {
 
 self.addEventListener('notificationclick', (event) => {
   event.notification.close();
-  const target = new URL(
-    (event.notification.data && event.notification.data.url) || '/',
-    self.location.origin
-  );
-  // Cross-origin targets are dropped: the payload travels through a third-party
-  // push service, so a notification must never be able to navigate this app's
-  // users off-origin.
-  const url = target.origin === self.location.origin ? target.href : self.location.origin + '/';
+  // The payload travels through a third-party push service, so a malformed
+  // `url` must not leave the click dead: `new URL()` throws synchronously for
+  // values like `http://[`, after the notification is dismissed but before
+  // `waitUntil` is registered. Fall back to the app root, the same default
+  // the cross-origin check below uses.
+  let url = self.location.origin + '/';
+  try {
+    const target = new URL(
+      (event.notification.data && event.notification.data.url) || '/',
+      self.location.origin
+    );
+    // Cross-origin targets are dropped: the payload travels through a third-party
+    // push service, so a notification must never be able to navigate this app's
+    // users off-origin.
+    if (target.origin === self.location.origin) {
+      url = target.href;
+    }
+  } catch (e) {
+    // Malformed url in the payload — keep the app-root fallback.
+  }
   event.waitUntil(
     self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then((windows) => {
       // Prefer focusing a tab that is already on the target rather than
@@ -2218,6 +2230,39 @@ async fn main() {
         assert!(
             sw.contains("notification.close()"),
             "the notification must be dismissed on click:\n{sw}"
+        );
+    }
+
+    #[test]
+    fn notificationclick_survives_a_malformed_payload_url() {
+        // `new URL()` throws synchronously for a malformed absolute URL like
+        // `http://[` — after `notification.close()` but before `waitUntil`
+        // is registered — leaving the click dead with no navigation and no
+        // visible error. The parse must be guarded, with the same app-root
+        // fallback the cross-origin check uses.
+        let sw = render_service_worker();
+        let region = sw
+            .split("addEventListener('notificationclick'")
+            .nth(1)
+            .expect("the notificationclick handler must exist");
+        let parse_at = region
+            .find("const target = new URL(")
+            .expect("the handler must parse the payload's target URL");
+        let before = &region[..parse_at];
+        assert!(
+            before.rfind("try {").is_some(),
+            "the URL parse must sit inside a try block:\n{region}"
+        );
+        // The app-root fallback is the `url` default before parsing: a throw
+        // in `new URL()` leaves `url` at the origin root, so the click can
+        // never die silently.
+        assert!(
+            before.contains("let url = self.location.origin + '/'"),
+            "the app root must be the default before the URL is parsed:\n{region}"
+        );
+        assert!(
+            region[parse_at..].contains("} catch"),
+            "a malformed URL must be caught rather than killing the handler:\n{region}"
         );
     }
 
