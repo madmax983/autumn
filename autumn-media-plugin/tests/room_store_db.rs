@@ -534,3 +534,281 @@ async fn heartbeat_on_a_seat_reaped_concurrently_reports_it_gone() {
         Err(RoomError::RoomNotFound)
     ));
 }
+
+/// One `count(*)` column, for asserting row presence straight from SQL.
+#[derive(diesel::QueryableByName)]
+struct CountRow {
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    c: i64,
+}
+
+/// Poll `pg_stat_activity` until some backend is blocked on a lock while its
+/// query touches `media_rooms` (or time out and fail: without the block, the
+/// race below would not actually be exercised and the test could pass
+/// vacuously).
+async fn wait_for_room_lock_wait(pool: &Pool<AsyncPgConnection>) {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        let mut conn = pool.get().await.expect("conn");
+        let rows: Vec<CountRow> = diesel::sql_query(
+            "SELECT count(*) AS c FROM pg_stat_activity \
+             WHERE wait_event_type = 'Lock' AND query ILIKE '%media_rooms%'",
+        )
+        .load::<CountRow>(&mut conn)
+        .await
+        .expect("pg_stat_activity");
+        // NOTE: do not call `rows.first()` here — `diesel_async::RunQueryDsl`
+        // is in scope and its `first` (limit-1 query) shadows the slice method
+        // at method-probing time.
+        let blocked = rows.into_iter().next().map_or(0, |r| r.c) > 0;
+        if blocked {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "reaper's phase-2 DELETE never blocked on the room row lock"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
+/// Issue #2407, deterministic: a join whose transaction holds the room row
+/// lock *and a new row version* (the `SET created_at = created_at` touch)
+/// defeats a concurrent `reap_stale` phase-2 `DELETE`.
+///
+/// The `DELETE` evaluates the room as empty under its statement snapshot,
+/// then blocks on the join's row lock. When the join commits, the delete
+/// wakes to a new row version, so READ COMMITTED's `EvalPlanQual` recheck
+/// re-evaluates the `NOT EXISTS` empty-room predicate against a fresh
+/// snapshot, sees the committed participant, and skips the room. The room
+/// and the brand-new participant both survive.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn reap_phase2_delete_rechecks_emptiness_after_a_concurrent_join_commits() {
+    let (pool, _container) = setup_pool().await;
+    let now = Utc::now();
+    let ttl = Duration::minutes(30);
+
+    // An old, empty room: reap-eligible on the reaper's own snapshot.
+    seed(&pool, "", "race-room", now - Duration::hours(2), &[]).await;
+
+    // T1: BEGIN, then exactly the touch join_room performs — takes the room
+    // row lock and mints a new row version, holding both to commit.
+    let mut tx = pool.get().await.expect("tx conn");
+    diesel::sql_query("BEGIN")
+        .execute(&mut tx)
+        .await
+        .expect("begin");
+    let touched: usize = diesel::sql_query(
+        "UPDATE media_rooms SET created_at = created_at \
+         WHERE namespace = '' AND room_id = 'race-room'",
+    )
+    .execute(&mut tx)
+    .await
+    .expect("touch");
+    assert_eq!(touched, 1, "touch must hit the seeded room");
+
+    // T2: the real reaper. Its phase-2 DELETE evaluates the room as empty,
+    // then blocks on T1's row lock.
+    let store = DbRoomStore::new(pool.clone(), 6);
+    let reap = tokio::spawn(async move { store.reap_stale(now, ttl).await });
+    wait_for_room_lock_wait(&pool).await;
+
+    // T1: the join's participant INSERT lands, then commit.
+    let joined_at = now.naive_utc().format("%Y-%m-%d %H:%M:%S%.6f");
+    diesel::sql_query(format!(
+        "INSERT INTO media_room_participants \
+         (namespace, room_id, participant_id, display_name, token, \
+          joined_at, token_expires_at, last_seen_at) \
+         VALUES ('', 'race-room', 'p1', NULL, 'tok', \
+                 '{joined_at}', '{joined_at}', '{joined_at}')"
+    ))
+    .execute(&mut tx)
+    .await
+    .expect("insert participant");
+    diesel::sql_query("COMMIT")
+        .execute(&mut tx)
+        .await
+        .expect("commit");
+
+    let stats = reap.await.expect("reap task");
+    assert_eq!(
+        stats.rooms_reaped, 0,
+        "reaper must skip the room the concurrent join claimed"
+    );
+
+    // The room and the brand-new participant both survive.
+    let mut conn = pool.get().await.expect("conn");
+    let rooms: Vec<CountRow> =
+        diesel::sql_query("SELECT count(*) AS c FROM media_rooms WHERE room_id = 'race-room'")
+            .load::<CountRow>(&mut conn)
+            .await
+            .expect("count rooms");
+    assert_eq!(rooms[0].c, 1, "room must survive the concurrent reap");
+    let seat_rows: Vec<CountRow> = diesel::sql_query(
+        "SELECT count(*) AS c FROM media_room_participants WHERE participant_id = 'p1'",
+    )
+    .load::<CountRow>(&mut conn)
+    .await
+    .expect("count participants");
+    assert_eq!(
+        seat_rows[0].c, 1,
+        "the join's participant must survive the reap"
+    );
+}
+
+/// Companion to the test above: documents *why* the touch is needed. A
+/// lock-only `SELECT ... FOR NO KEY UPDATE` (the naive fix) does NOT stop
+/// the reaper — a lock-only `xmax` triggers no `EvalPlanQual` recheck, so the
+/// `DELETE` proceeds on its stale snapshot and the room (plus the new
+/// participant, via the cascade) is gone. If this ever starts failing, the
+/// premise of the touch has changed and the fix deserves a re-think.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_lock_without_a_touch_does_not_stop_the_reaper() {
+    let (pool, _container) = setup_pool().await;
+    let now = Utc::now();
+    let ttl = Duration::minutes(30);
+
+    seed(&pool, "", "race-room", now - Duration::hours(2), &[]).await;
+
+    // T1: BEGIN, lock the room row *without* touching it, hold to commit.
+    let mut tx = pool.get().await.expect("tx conn");
+    diesel::sql_query("BEGIN")
+        .execute(&mut tx)
+        .await
+        .expect("begin");
+    diesel::sql_query(
+        "SELECT namespace FROM media_rooms \
+         WHERE namespace = '' AND room_id = 'race-room' FOR NO KEY UPDATE",
+    )
+    .execute(&mut tx)
+    .await
+    .expect("lock");
+
+    let store = DbRoomStore::new(pool.clone(), 6);
+    let reap = tokio::spawn(async move { store.reap_stale(now, ttl).await });
+    wait_for_room_lock_wait(&pool).await;
+
+    let joined_at = now.naive_utc().format("%Y-%m-%d %H:%M:%S%.6f");
+    diesel::sql_query(format!(
+        "INSERT INTO media_room_participants \
+         (namespace, room_id, participant_id, display_name, token, \
+          joined_at, token_expires_at, last_seen_at) \
+         VALUES ('', 'race-room', 'p1', NULL, 'tok', \
+                 '{joined_at}', '{joined_at}', '{joined_at}')"
+    ))
+    .execute(&mut tx)
+    .await
+    .expect("insert participant");
+    diesel::sql_query("COMMIT")
+        .execute(&mut tx)
+        .await
+        .expect("commit");
+
+    let stats = reap.await.expect("reap task");
+    // The naive lock-only shape loses: the DELETE saw no new row version, so
+    // no EPQ recheck ran and the stale snapshot deleted the room.
+    assert_eq!(stats.rooms_reaped, 1, "lock-only must NOT save the room");
+
+    let mut conn = pool.get().await.expect("conn");
+    let rooms: Vec<CountRow> =
+        diesel::sql_query("SELECT count(*) AS c FROM media_rooms WHERE room_id = 'race-room'")
+            .load::<CountRow>(&mut conn)
+            .await
+            .expect("count rooms");
+    assert_eq!(rooms[0].c, 0, "room is gone under the lock-only shape");
+}
+
+/// Issue #2407, end to end: hammer real `join_room` calls against a
+/// hard-sweeping reaper and assert the strict invariant — every join that
+/// reported `Ok` still has its participant row and its room row afterwards.
+/// A join that loses the race must fail loud (`RoomNotFound` / `RoomFull`),
+/// never a phantom success whose seat silently vanishes.
+///
+/// Strict on fixed code (no flaky failures: a later reap can never delete a
+/// room that holds fresh participants); probabilistic detection on unfixed
+/// code (the barrier + hammer make the snapshot-to-delete window very likely
+/// to catch at least one join).
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn concurrent_joins_racing_the_reaper_never_silently_vanish() {
+    const JOINERS: usize = 8;
+    const JOINS_EACH: usize = 10;
+    const REAP_TICKS: usize = 40;
+
+    let (pool, _container) = setup_pool().await;
+    let now = Utc::now();
+    let ttl = Duration::minutes(30);
+
+    // One old, empty room: reap-eligible and joinable.
+    seed(&pool, "", "hammer-room", now - Duration::hours(2), &[]).await;
+
+    let barrier = Arc::new(tokio::sync::Barrier::new(JOINERS + 2));
+    let mut handles = Vec::with_capacity(JOINERS);
+    for _ in 0..JOINERS {
+        let pool = pool.clone();
+        let barrier = Arc::clone(&barrier);
+        handles.push(tokio::spawn(async move {
+            barrier.wait().await;
+            let store = DbRoomStore::new(pool, 64);
+            let mut oks = Vec::new();
+            for _ in 0..JOINS_EACH {
+                match store
+                    .join_room("", "hammer-room", None, Duration::seconds(300))
+                    .await
+                {
+                    Ok(rec) => oks.push(rec.participant_id),
+                    // Loud losses: the reaper won (room gone) or the cap hit.
+                    Err(RoomError::RoomNotFound | RoomError::RoomFull { .. }) => {}
+                    Err(other) => panic!("unexpected join error: {other:?}"),
+                }
+            }
+            oks
+        }));
+    }
+    let reaper_pool = pool.clone();
+    let reaper_barrier = Arc::clone(&barrier);
+    let reaper = tokio::spawn(async move {
+        reaper_barrier.wait().await;
+        let store = DbRoomStore::new(reaper_pool, 64);
+        for _ in 0..REAP_TICKS {
+            store.reap_stale(now, ttl).await;
+        }
+    });
+
+    barrier.wait().await;
+    let mut ok_ids = Vec::new();
+    for handle in handles {
+        ok_ids.extend(handle.await.expect("join task panicked"));
+    }
+    reaper.await.expect("reaper task panicked");
+
+    assert!(
+        !ok_ids.is_empty(),
+        "expected at least one join to succeed under the hammer"
+    );
+    let mut conn = pool.get().await.expect("conn");
+    for pid in &ok_ids {
+        let rows: Vec<CountRow> = diesel::sql_query(format!(
+            "SELECT count(*) AS c FROM media_room_participants \
+             WHERE participant_id = '{pid}'"
+        ))
+        .load::<CountRow>(&mut conn)
+        .await
+        .expect("count participant");
+        assert_eq!(
+            rows[0].c, 1,
+            "join {pid} reported Ok but its seat silently vanished"
+        );
+    }
+    let rooms: Vec<CountRow> =
+        diesel::sql_query("SELECT count(*) AS c FROM media_rooms WHERE room_id = 'hammer-room'")
+            .load::<CountRow>(&mut conn)
+            .await
+            .expect("count rooms");
+    assert_eq!(
+        rooms[0].c, 1,
+        "room vanished out from under successful joins"
+    );
+}

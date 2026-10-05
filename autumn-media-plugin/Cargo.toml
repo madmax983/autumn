@@ -23,6 +23,7 @@ chrono = { workspace = true }
 diesel = { workspace = true }
 diesel-async = { workspace = true }
 percent-encoding = "2"
+scoped-futures = "0.1.4"
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

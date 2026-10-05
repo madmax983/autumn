@@ -719,6 +719,7 @@ dependencies = [
  "diesel-async",
  "percent-encoding",
  "reqwest 0.12.28",
+ "scoped-futures",
  "serde",
  "serde_json",
  "tempfile",
